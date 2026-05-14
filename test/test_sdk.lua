@@ -262,15 +262,100 @@ local function test_token_provider_failure()
 	assert_equal(client:snapshot().last_error, "token_unavailable")
 end
 
-local function test_unauthorized_invalidates_token()
+local function test_async_token_provider_retains_queued_events()
+	reset()
+	local token_callback = nil
+	local token_requests = 0
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			token_requests = token_requests + 1
+			token_callback = callback
+		end,
+	})))
+	client:identify("user-example")
+	assert_true(client:track("async_token_event"))
+
+	assert_equal(client:flush(), false)
+	assert_equal(token_requests, 1)
+	assert_equal(client.token_request_in_flight, true)
+	assert_equal(#client.queue.items, 1)
+	assert_equal(#requests, 0)
+
+	token_callback("async-token", nil, nil)
+	assert_equal(client.token_request_in_flight, false)
+	assert_equal(client.token, "async-token")
+
+	assert_true(client:flush())
+	assert_equal(#client.queue.items, 0)
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].headers["Authorization"], "Bearer async-token")
+	assert_contains(requests[1].body, '"event_name":"async_token_event"')
+end
+
+local function test_unauthorized_invalidates_token_and_retains_batch()
 	reset()
 	next_status = 401
 	local client = assert(sdk.new(config()))
 	client:identify("user-example")
 	client:track("screen_view", { screen_name = "menu" })
-	assert_true(client:flush())
+	assert_equal(client:flush(), false)
 	assert_equal(client.token, nil)
 	assert_equal(client:snapshot().failed_batches, 1)
+	assert_equal(#client.in_flight_batch, 1)
+	local failed_body = requests[1].body
+
+	next_status = 202
+	assert_true(client:flush())
+	assert_equal(client.in_flight_batch, nil)
+	assert_equal(#requests, 2)
+	assert_equal(requests[2].body, failed_body)
+	assert_contains(requests[2].body, '"event_name":"screen_view"')
+end
+
+local function assert_retryable_status_retains_batch(status)
+	reset()
+	next_status = status
+	local client = assert(sdk.new(config()))
+	client:identify("user-example")
+	assert_true(client:track("retryable_event"))
+
+	assert_equal(client:flush(), false)
+	assert_equal(#requests, 1)
+	assert_equal(#client.queue.items, 0)
+	assert_equal(#client.in_flight_batch, 1)
+	assert_equal(client:snapshot().failed_batches, 1)
+	local failed_body = requests[1].body
+
+	next_status = 202
+	assert_true(client:flush())
+	assert_equal(client.in_flight_batch, nil)
+	assert_equal(#requests, 2)
+	assert_equal(requests[2].body, failed_body)
+	assert_contains(requests[2].body, '"event_name":"retryable_event"')
+end
+
+local function test_retryable_failures_retain_batch()
+	assert_retryable_status_retains_batch(500)
+	assert_retryable_status_retains_batch(429)
+	assert_retryable_status_retains_batch(0)
+end
+
+local function test_non_retryable_failure_drops_batch()
+	reset()
+	next_status = 400
+	local client = assert(sdk.new(config()))
+	client:identify("user-example")
+	assert_true(client:track("validation_error_event"))
+
+	assert_equal(client:flush(), false)
+	assert_equal(client.in_flight_batch, nil)
+	assert_equal(#client.queue.items, 0)
+	assert_equal(client:snapshot().failed_batches, 1)
+	assert_equal(client:snapshot().dropped, 1)
+
+	next_status = 202
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
 end
 
 local function test_token_expiry_refresh()
@@ -395,7 +480,10 @@ local tests = {
 	test_session_start_renews_session_and_resets_sequence,
 	test_bounded_queue_drop,
 	test_token_provider_failure,
-	test_unauthorized_invalidates_token,
+	test_async_token_provider_retains_queued_events,
+	test_unauthorized_invalidates_token_and_retains_batch,
+	test_retryable_failures_retain_batch,
+	test_non_retryable_failure_drops_batch,
 	test_token_expiry_refresh,
 	test_update_honors_flush_interval,
 	test_perf_and_network_summaries,

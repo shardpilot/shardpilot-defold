@@ -131,6 +131,9 @@ function M.new(config)
 		},
 		token = nil,
 		token_expires_at_ms = nil,
+		token_request_in_flight = false,
+		in_flight_batch = nil,
+		publish_in_flight = false,
 		user_id = config.user_id,
 		anonymous_id = config.anonymous_id,
 		session_id = nil,
@@ -242,22 +245,29 @@ function Client:enqueue_summaries()
 end
 
 function Client:refresh_token()
-	local token, expires_at, provider_error = nil, nil, nil
+	if self.token_request_in_flight then
+		return false
+	end
+	self.token_request_in_flight = true
 	local ok, err = pcall(self.config.token_provider, function(new_token, new_expires_at, callback_error)
-		token = new_token
-		expires_at = new_expires_at
-		provider_error = callback_error
+		self.token_request_in_flight = false
+		if callback_error or type(new_token) ~= "string" or new_token == "" then
+			self.token = nil
+			self.token_expires_at_ms = nil
+			self.stats.last_error = "token_unavailable"
+			return
+		end
+		self.token = new_token
+		self.token_expires_at_ms = new_expires_at
 	end)
 	if not ok then
-		provider_error = err
-	end
-	if provider_error or not token or token == "" then
+		self.token_request_in_flight = false
+		self.token = nil
+		self.token_expires_at_ms = nil
 		self.stats.last_error = "token_unavailable"
 		return false
 	end
-	self.token = token
-	self.token_expires_at_ms = expires_at
-	return true
+	return self.token ~= nil
 end
 
 function Client:can_publish()
@@ -275,6 +285,61 @@ function Client:can_publish()
 	return true
 end
 
+local function is_retryable_publish_failure(err, unauthorized, retryable)
+	if retryable ~= nil then
+		return retryable
+	end
+	if unauthorized then
+		return true
+	end
+	return err == "http_0" or err == "http_unavailable" or err == "unauthorized" or err == "transient_429" or
+		(type(err) == "string" and err:match("^transient_5%d%d$") ~= nil)
+end
+
+function Client:start_publish_batch()
+	if self.publish_in_flight or not self.in_flight_batch or #self.in_flight_batch == 0 then
+		return true, false, true
+	end
+	local events = self.in_flight_batch
+	if not events.payload then
+		local envelopes = {}
+		for i, event in ipairs(events) do
+			envelopes[i] = envelope.build(self.config, self, event)
+		end
+		events.payload = { events = envelopes }
+	end
+	self.publish_in_flight = true
+	local completed = false
+	local succeeded = false
+	local dispatched = transport.publish(self.config, self.token, events.payload, function(ok, err, unauthorized, retryable)
+		completed = true
+		succeeded = ok == true
+		self.publish_in_flight = false
+		if ok then
+			self.stats.published = self.stats.published + #events
+			self.stats.accepted = self.stats.accepted + #events
+			if self.in_flight_batch == events then
+				self.in_flight_batch = nil
+			end
+			return
+		end
+		self.stats.failed_batches = self.stats.failed_batches + 1
+		self.stats.last_error = err
+		if unauthorized then
+			self.token = nil
+			self.token_expires_at_ms = nil
+		end
+		if not is_retryable_publish_failure(err, unauthorized, retryable) and self.in_flight_batch == events then
+			self.stats.dropped = self.stats.dropped + #events
+			self.in_flight_batch = nil
+		end
+	end)
+	if not dispatched and self.publish_in_flight then
+		self.publish_in_flight = false
+	end
+	return dispatched, completed, succeeded
+end
+
 function Client:flush(options)
 	if type(options) ~= "table" then
 		options = {}
@@ -283,37 +348,31 @@ function Client:flush(options)
 		self:enqueue_summaries()
 	end
 	self.flush_elapsed_seconds = 0
-	if queue.size(self.queue) == 0 then
+	if self.publish_in_flight then
 		return true
 	end
-	if not self:can_publish() then
-		return false
-	end
 
-	local all_dispatched = true
-	while queue.size(self.queue) > 0 do
-		local events = queue.drain(self.queue, self.config.batch_size)
-		local envelopes = {}
-		for i, event in ipairs(events) do
-			envelopes[i] = envelope.build(self.config, self, event)
-		end
-		local payload = { events = envelopes }
-		local dispatched = transport.publish(self.config, self.token, payload, function(ok, err, unauthorized)
-			if ok then
-				self.stats.published = self.stats.published + #events
-				self.stats.accepted = self.stats.accepted + #events
-			else
-				self.stats.failed_batches = self.stats.failed_batches + 1
-				self.stats.last_error = err
-				if unauthorized then
-					self.token = nil
-					self.token_expires_at_ms = nil
-				end
+	while true do
+		if not self.in_flight_batch then
+			if queue.size(self.queue) == 0 then
+				return true
 			end
-		end)
-		all_dispatched = all_dispatched and dispatched
+			if not self:can_publish() then
+				return false
+			end
+			self.in_flight_batch = queue.drain(self.queue, self.config.batch_size)
+		end
+		if not self:can_publish() then
+			return false
+		end
+		local dispatched, completed, succeeded = self:start_publish_batch()
+		if not dispatched or (completed and not succeeded) then
+			return false
+		end
+		if self.publish_in_flight then
+			return true
+		end
 	end
-	return all_dispatched
 end
 
 function Client:shutdown(reason)
