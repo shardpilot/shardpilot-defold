@@ -539,11 +539,11 @@ function Client:shutdown(reason)
 	if self.session_active then
 		self:session_end(reason or "app_final")
 	end
-	local ok = self:flush({ include_summaries = true })
+	local ok, err = self:flush({ include_summaries = true })
 	if ok then
 		self.initialized = false
 	end
-	return ok
+	return ok, err
 end
 
 function Client:snapshot()
