@@ -162,6 +162,10 @@ local function test_config_validation()
 		{ { workspace_id = 42 }, "invalid_workspace_id" },
 		{ { app_id = false }, "invalid_app_id" },
 		{ { environment_id = {} }, "invalid_environment_id" },
+		{ { ingest_url = "https:///" }, "invalid_ingest_url" },
+		{ { ingest_url = "https://?x" }, "invalid_ingest_url" },
+		{ { ingest_url = "https://#fragment" }, "invalid_ingest_url" },
+		{ { ingest_url = "https://ingest.example.com/path" }, "invalid_ingest_url" },
 		{ { batch_size = 0 }, "invalid_batch_size" },
 		{ { batch_size = -1 }, "invalid_batch_size" },
 		{ { batch_size = 101 }, "invalid_batch_size" },
@@ -272,6 +276,43 @@ local function test_session_start_renews_session_and_resets_sequence()
 	assert_contains(requests[3].body, '"event_name":"session_start"')
 	assert_contains(requests[3].body, '"session_id":"' .. second_session_id .. '"')
 	assert_contains(requests[3].body, '"session_sequence":1')
+end
+
+local function test_session_start_rolls_back_on_enqueue_failure()
+	reset()
+	local client = assert(sdk.new(config({ buffer_size = 1 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:session_start())
+	local previous_session_id = client.session_id
+	local previous_sequence = client.session_sequence
+	local previous_active = client.session_active
+
+	local ok, err = client:session_start()
+	assert_equal(ok, false)
+	assert_equal(err, "queue_full")
+	assert_equal(client.session_id, previous_session_id)
+	assert_equal(client.session_sequence, previous_sequence)
+	assert_equal(client.session_active, previous_active)
+end
+
+local function test_session_start_rolls_back_on_invalid_props()
+	reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:session_start())
+	assert_true(client:flush())
+	local previous_session_id = client.session_id
+	local previous_sequence = client.session_sequence
+	local previous_active = client.session_active
+	local cyclic = {}
+	cyclic.self = cyclic
+
+	local ok, err = client:session_start(cyclic)
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_props")
+	assert_equal(client.session_id, previous_session_id)
+	assert_equal(client.session_sequence, previous_sequence)
+	assert_equal(client.session_active, previous_active)
 end
 
 local function test_track_snapshots_identity_session_and_time()
@@ -584,6 +625,52 @@ local function test_shutdown_emits_session_end()
 	assert_equal(client.initialized, false)
 end
 
+local function test_flush_and_shutdown_wait_for_async_publish()
+	reset()
+	local original_request = http.request
+	local callbacks = {}
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = {
+			url = url,
+			method = method,
+			headers = headers,
+			body = body,
+			options = options,
+		}
+		callbacks[#callbacks + 1] = callback
+	end
+
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:session_start())
+	local ok, err = client:flush()
+	assert_equal(ok, false)
+	assert_equal(err, "pending")
+	assert_equal(client.publish_in_flight, true)
+	assert_equal(#callbacks, 1)
+
+	assert_true(client:track("queued_while_publish_pending"))
+	ok, err = client:shutdown("app_final")
+	assert_equal(ok, false)
+	assert_equal(err, "pending")
+	assert_equal(client.initialized, true)
+	assert_equal(#client.queue.items, 2)
+	assert_contains(client.queue.items[2].event_name, "session_end")
+
+	callbacks[1](nil, nil, { status = 202, response = '{"accepted":1}' })
+	assert_equal(client.publish_in_flight, false)
+
+	ok, err = client:flush()
+	assert_equal(ok, false)
+	assert_equal(err, "pending")
+	assert_equal(#callbacks, 2)
+	callbacks[2](nil, nil, { status = 202, response = '{"accepted":2}' })
+
+	assert_true(client:shutdown("app_final"))
+	assert_equal(client.initialized, false)
+	http.request = original_request
+end
+
 local function test_singleton_shutdown_keeps_client_after_retryable_failure()
 	reset()
 	next_status = 500
@@ -662,6 +749,8 @@ local tests = {
 	test_app_first_payload,
 	test_screen_view_does_not_mutate_caller_props,
 	test_session_start_renews_session_and_resets_sequence,
+	test_session_start_rolls_back_on_enqueue_failure,
+	test_session_start_rolls_back_on_invalid_props,
 	test_track_snapshots_identity_session_and_time,
 	test_track_snapshots_timestamp_props_context_and_sequence_order,
 	test_track_rejects_cyclic_or_too_deep_snapshots,
@@ -677,6 +766,7 @@ local tests = {
 	test_perf_and_ping_samples_are_bounded,
 	test_perf_and_network_summaries,
 	test_shutdown_emits_session_end,
+	test_flush_and_shutdown_wait_for_async_publish,
 	test_singleton_shutdown_keeps_client_after_retryable_failure,
 }
 

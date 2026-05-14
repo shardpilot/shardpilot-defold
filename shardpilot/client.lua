@@ -16,23 +16,68 @@ local function local_http_host(host)
 	return host == "localhost" or host == "127.0.0.1" or host == "::1"
 end
 
+local function parse_authority(authority)
+	if authority == "" or authority:find("@", 1, true) then
+		return nil
+	end
+	local host = nil
+	if authority:sub(1, 1) == "[" then
+		local rest = nil
+		host, rest = authority:match("^%[([^%]]+)%](.*)$")
+		if not host then
+			return nil
+		end
+		if rest ~= "" and not rest:match("^:%d+$") then
+			return nil
+		end
+	else
+		local colon = authority:find(":", 1, true)
+		if colon then
+			host = authority:sub(1, colon - 1)
+			local port = authority:sub(colon + 1)
+			if port == "" or not port:match("^%d+$") then
+				return nil
+			end
+		else
+			host = authority
+		end
+		if host:find(":", 1, true) then
+			return nil
+		end
+	end
+	if not host or host == "" or host:match("%s") then
+		return nil
+	end
+	return host
+end
+
 local function valid_ingest_url(value)
+	if type(value) ~= "string" or value == "" then
+		return false
+	end
+	if value:find("?", 1, true) or value:find("#", 1, true) then
+		return false
+	end
 	local scheme, rest = value:match("^(https?)://(.+)$")
 	if not scheme then
 		return false
 	end
-	if scheme == "https" then
-		return true
+	local authority = rest
+	local path = nil
+	local slash = rest:find("/", 1, true)
+	if slash then
+		authority = rest:sub(1, slash - 1)
+		path = rest:sub(slash)
 	end
-	local host_port = rest:match("^([^/%?]+)")
-	if not host_port then
+	if path and path ~= "/" then
 		return false
 	end
-	local host = host_port
-	if host:sub(1, 1) == "[" then
-		host = host:match("^%[([^%]]+)%]")
-	else
-		host = host:match("^([^:]+)")
+	local host = parse_authority(authority or "")
+	if not host then
+		return false
+	end
+	if scheme == "https" then
+		return true
 	end
 	return local_http_host(host)
 end
@@ -233,10 +278,21 @@ function Client:set_anonymous_id(anonymous_id)
 end
 
 function Client:session_start(props)
+	local previous_session_id = self.session_id
+	local previous_session_sequence = self.session_sequence
+	local previous_session_active = self.session_active
+
 	self.session_id = "session-" .. id.uuid()
 	self.session_sequence = 0
 	self.session_active = true
-	return self:track("session_start", props)
+	local ok, err = self:track("session_start", props)
+	if not ok then
+		self.session_id = previous_session_id
+		self.session_sequence = previous_session_sequence
+		self.session_active = previous_session_active
+		return false, err
+	end
+	return true
 end
 
 function Client:session_end(reason)
@@ -448,6 +504,9 @@ function Client:flush(options)
 	end
 	self.flush_elapsed_seconds = 0
 	if self.publish_in_flight then
+		if self.in_flight_batch or queue.size(self.queue) > 0 then
+			return false, "pending"
+		end
 		return true
 	end
 
@@ -471,7 +530,7 @@ function Client:flush(options)
 			return false
 		end
 		if self.publish_in_flight then
-			return true
+			return false, "pending"
 		end
 	end
 end
