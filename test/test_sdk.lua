@@ -96,6 +96,12 @@ local function assert_equal(actual, expected, message)
 	end
 end
 
+local function assert_not_equal(actual, expected, message)
+	if actual == expected then
+		error((message or "values unexpectedly match") .. ": " .. tostring(actual), 2)
+	end
+end
+
 local function assert_contains(haystack, needle)
 	if not string.find(haystack, needle, 1, true) then
 		error("expected to find " .. needle .. " in " .. haystack, 2)
@@ -145,6 +151,10 @@ local function test_config_validation()
 	assert_equal(err, "ingest_url_required")
 
 	local invalid_cases = {
+		{ { ingest_url = 42 }, "invalid_ingest_url" },
+		{ { workspace_id = 42 }, "invalid_workspace_id" },
+		{ { app_id = false }, "invalid_app_id" },
+		{ { environment_id = {} }, "invalid_environment_id" },
 		{ { batch_size = 0 }, "invalid_batch_size" },
 		{ { batch_size = -1 }, "invalid_batch_size" },
 		{ { batch_size = 101 }, "invalid_batch_size" },
@@ -196,6 +206,35 @@ local function test_app_first_payload()
 	assert_not_contains(request.body, '"event_ts_server"')
 	assert_not_contains(request.body, '"event_seq_session"')
 	assert_not_contains(request.body, '"build_version"')
+end
+
+local function test_session_start_renews_session_and_resets_sequence()
+	reset()
+	local client = assert(sdk.new(config()))
+	client:identify("user-example")
+
+	assert_true(client:session_start())
+	local first_session_id = client.session_id
+	assert_equal(client.session_sequence, 0)
+	assert_true(client:flush())
+	assert_contains(requests[1].body, '"event_name":"session_start"')
+	assert_contains(requests[1].body, '"session_id":"' .. first_session_id .. '"')
+	assert_contains(requests[1].body, '"session_sequence":1')
+
+	assert_true(client:session_end("complete"))
+	assert_true(client:flush())
+	assert_contains(requests[2].body, '"event_name":"session_end"')
+	assert_contains(requests[2].body, '"session_id":"' .. first_session_id .. '"')
+	assert_contains(requests[2].body, '"session_sequence":2')
+
+	assert_true(client:session_start())
+	local second_session_id = client.session_id
+	assert_not_equal(second_session_id, first_session_id)
+	assert_equal(client.session_sequence, 0)
+	assert_true(client:flush())
+	assert_contains(requests[3].body, '"event_name":"session_start"')
+	assert_contains(requests[3].body, '"session_id":"' .. second_session_id .. '"')
+	assert_contains(requests[3].body, '"session_sequence":1')
 end
 
 local function test_bounded_queue_drop()
@@ -251,6 +290,19 @@ local function test_token_expiry_refresh()
 	assert_equal(token_calls, 2)
 	assert_equal(requests[1].headers["Authorization"], "Bearer client-token-1")
 	assert_equal(requests[2].headers["Authorization"], "Bearer client-token-2")
+end
+
+local function test_update_honors_flush_interval()
+	reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 0.5 })))
+	client:identify("user-example")
+	assert_true(client:session_start())
+	client:update(0.25)
+	assert_equal(#requests, 0)
+	client:update(0.25)
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"event_name":"session_start"')
+	assert_not_contains(requests[1].body, '"event_name":"perf_summary"')
 end
 
 local function test_perf_and_network_summaries()
@@ -340,10 +392,12 @@ local tests = {
 	test_config_validation,
 	test_singleton_guard,
 	test_app_first_payload,
+	test_session_start_renews_session_and_resets_sequence,
 	test_bounded_queue_drop,
 	test_token_provider_failure,
 	test_unauthorized_invalidates_token,
 	test_token_expiry_refresh,
+	test_update_honors_flush_interval,
 	test_perf_and_network_summaries,
 	test_shutdown_emits_session_end,
 }

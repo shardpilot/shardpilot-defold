@@ -1,5 +1,6 @@
 local envelope = require "shardpilot.envelope"
 local clock = require "shardpilot.clock"
+local id = require "shardpilot.id"
 local platform = require "shardpilot.platform"
 local queue = require "shardpilot.queue"
 local sampling = require "shardpilot.sampling"
@@ -48,10 +49,13 @@ local function validate_config(config)
 	if type(config) ~= "table" then
 		return nil, "config_required"
 	end
-	local required = { "ingest_url", "workspace_id", "app_id", "environment_id", "token_provider" }
+	local required = { "ingest_url", "workspace_id", "app_id", "environment_id" }
 	for _, key in ipairs(required) do
-		if not config[key] or config[key] == "" then
+		if config[key] == nil or config[key] == "" then
 			return nil, key .. "_required"
+		end
+		if type(config[key]) ~= "string" then
+			return nil, "invalid_" .. key
 		end
 	end
 	if type(config.token_provider) ~= "function" then
@@ -134,6 +138,7 @@ function M.new(config)
 		session_active = false,
 		perf = sampling.new_perf(),
 		network = sampling.new_network(),
+		flush_elapsed_seconds = 0,
 		initialized = true,
 	}, Client)
 end
@@ -149,7 +154,8 @@ function Client:set_anonymous_id(anonymous_id)
 end
 
 function Client:session_start(props)
-	self.session_id = self.session_id or ("session-" .. tostring(math.random(100000, 999999)))
+	self.session_id = "session-" .. id.uuid()
+	self.session_sequence = 0
 	self.session_active = true
 	return self:track("session_start", props)
 end
@@ -201,8 +207,18 @@ function Client:track(event_name, props, context)
 end
 
 function Client:update(dt)
-	if self.initialized and self.session_active then
+	if not self.initialized then
+		return
+	end
+	if type(dt) == "number" and dt > 0 then
+		self.flush_elapsed_seconds = self.flush_elapsed_seconds + dt
+	end
+	if self.session_active and type(dt) == "number" then
 		sampling.sample_frame(self.perf, dt)
+	end
+	if queue.size(self.queue) >= self.config.batch_size or self.flush_elapsed_seconds >= self.config.flush_interval_seconds then
+		self.flush_elapsed_seconds = 0
+		self:flush({ include_summaries = false })
 	end
 end
 
@@ -259,8 +275,14 @@ function Client:can_publish()
 	return true
 end
 
-function Client:flush()
-	self:enqueue_summaries()
+function Client:flush(options)
+	if type(options) ~= "table" then
+		options = {}
+	end
+	if options.include_summaries ~= false then
+		self:enqueue_summaries()
+	end
+	self.flush_elapsed_seconds = 0
 	if queue.size(self.queue) == 0 then
 		return true
 	end
@@ -298,8 +320,7 @@ function Client:shutdown(reason)
 	if self.session_active then
 		self:session_end(reason or "app_final")
 	end
-	self:enqueue_summaries()
-	local ok = self:flush()
+	local ok = self:flush({ include_summaries = true })
 	self.initialized = false
 	return ok
 end
