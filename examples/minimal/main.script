@@ -1,0 +1,23 @@
+local shardpilot = require "shardpilot.sdk"
+
+function init(self)
+	shardpilot.init({
+		ingest_url = "http://localhost:8080",
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		token_provider = function(callback)
+			callback("client-token-placeholder", nil, nil)
+		end,
+	})
+	shardpilot.identify("user-example")
+	shardpilot.session_start()
+end
+
+function update(self, dt)
+	shardpilot.update(dt)
+end
+
+function final(self)
+	shardpilot.shutdown("app_final")
+end
