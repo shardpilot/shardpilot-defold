@@ -81,6 +81,7 @@ json = {
 }
 
 local sdk = require "shardpilot.sdk"
+local sampling = require "shardpilot.sampling"
 
 local function assert_true(value, message)
 	if not value then
@@ -175,6 +176,18 @@ local function test_config_validation()
 		assert_equal(client, nil, entry[2])
 		assert_equal(err, entry[2])
 	end
+	client, err = sdk.new(config({ ingest_url = "http://example.com" }))
+	assert_equal(client, nil)
+	assert_equal(err, "invalid_ingest_url")
+
+	client, err = sdk.new(config({ ingest_url = "https://ingest.example.com" }))
+	assert_true(client, err)
+	client, err = sdk.new(config({ ingest_url = "http://localhost:8080" }))
+	assert_true(client, err)
+	client, err = sdk.new(config({ ingest_url = "http://127.0.0.1:8080" }))
+	assert_true(client, err)
+	client, err = sdk.new(config({ ingest_url = "http://[::1]:8080" }))
+	assert_true(client, err)
 
 	client, err = sdk.new(config())
 	assert_true(client, err)
@@ -212,6 +225,15 @@ local function test_app_first_payload()
 	assert_not_contains(request.body, '"event_ts_server"')
 	assert_not_contains(request.body, '"event_seq_session"')
 	assert_not_contains(request.body, '"build_version"')
+end
+
+local function test_screen_view_does_not_mutate_caller_props()
+	reset()
+	local client = assert(sdk.new(config()))
+	local props = { origin = "menu" }
+	assert_true(client:screen_view("settings", props))
+	assert_equal(props.screen_name, nil)
+	assert_equal(props.origin, "menu")
 end
 
 local function test_id_generator_seeds_without_caller()
@@ -282,12 +304,14 @@ local function test_track_snapshots_timestamp_props_context_and_sequence_order()
 	reset()
 	local client = assert(sdk.new(config()))
 	assert_true(client:identify("user-example"))
-	local props = { surface = "before" }
-	local context = { screen = "menu" }
+	local props = { surface = "before", loadout = { weapon = "sword" } }
+	local context = { screen = "menu", nested = { zone = "lobby" } }
 	assert_true(client:track("first_event", props, context))
 	local event_ts = client.queue.items[1].event_ts
 	props.surface = "after"
+	props.loadout.weapon = "axe"
 	context.screen = "gameplay"
+	context.nested.zone = "arena"
 	socket.now = socket.now + 1000
 	assert_true(client:track("second_event"))
 	assert_true(client:track("third_event"))
@@ -300,12 +324,37 @@ local function test_track_snapshots_timestamp_props_context_and_sequence_order()
 	local body = requests[1].body
 	assert_contains(body, '"event_ts":"' .. event_ts .. '"')
 	assert_contains(body, '"surface":"before"')
+	assert_contains(body, '"weapon":"sword"')
 	assert_contains(body, '"screen":"menu"')
+	assert_contains(body, '"zone":"lobby"')
 	assert_not_contains(body, '"surface":"after"')
+	assert_not_contains(body, '"weapon":"axe"')
 	assert_not_contains(body, '"screen":"gameplay"')
+	assert_not_contains(body, '"zone":"arena"')
 	assert_ordered_contains(body, '"event_name":"first_event"', '"session_sequence":1')
 	assert_ordered_contains(body, '"event_name":"second_event"', '"session_sequence":2')
 	assert_ordered_contains(body, '"event_name":"third_event"', '"session_sequence":3')
+end
+
+local function test_track_rejects_cyclic_or_too_deep_snapshots()
+	reset()
+	local client = assert(sdk.new(config()))
+	local cyclic = {}
+	cyclic.self = cyclic
+	local ok, err = client:track("cyclic_props", cyclic)
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_props")
+
+	local deep = { a = { b = { c = { d = { e = "too-deep" } } } } }
+	ok, err = client:track("deep_props", deep)
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_props")
+
+	local context_cycle = {}
+	context_cycle.self = context_cycle
+	ok, err = client:track("cyclic_context", nil, context_cycle)
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_context")
 end
 
 local function test_bounded_queue_drop()
@@ -487,6 +536,23 @@ local function test_update_honors_flush_interval()
 	assert_not_contains(requests[1].body, '"event_name":"perf_summary"')
 end
 
+local function test_perf_and_ping_samples_are_bounded()
+	reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:session_start())
+	for _ = 1, sampling.max_perf_samples + 50 do
+		client:update(0.016)
+		client:observe_ping_ms(42)
+	end
+	if #client.perf.frames > sampling.max_perf_samples then
+		error("perf samples exceeded cap", 2)
+	end
+	if #client.network.pings > sampling.max_ping_samples then
+		error("ping samples exceeded cap", 2)
+	end
+end
+
 local function test_perf_and_network_summaries()
 	reset()
 	local client = assert(sdk.new(config({ transport = "websocket" })))
@@ -516,6 +582,25 @@ local function test_shutdown_emits_session_end()
 	assert_true(client:shutdown("app_final"))
 	assert_contains(requests[1].body, '"event_name":"session_end"')
 	assert_equal(client.initialized, false)
+end
+
+local function test_singleton_shutdown_keeps_client_after_retryable_failure()
+	reset()
+	next_status = 500
+	local ok, err = sdk.init(config())
+	assert_true(ok, err)
+	assert_true(sdk.identify("user-example"))
+	assert_true(sdk.session_start())
+	ok, err = sdk.shutdown("app_final")
+	assert_equal(ok, false)
+	local snapshot, snapshot_err = sdk.snapshot()
+	assert_true(type(snapshot) == "table", snapshot_err)
+
+	next_status = 202
+	assert_true(sdk.shutdown("app_final"))
+	local missing, missing_err = sdk.snapshot()
+	assert_equal(missing, false)
+	assert_equal(missing_err, "not_initialized")
 end
 
 local function test_singleton_guard()
@@ -575,9 +660,11 @@ local tests = {
 	test_singleton_guard,
 	test_id_generator_seeds_without_caller,
 	test_app_first_payload,
+	test_screen_view_does_not_mutate_caller_props,
 	test_session_start_renews_session_and_resets_sequence,
 	test_track_snapshots_identity_session_and_time,
 	test_track_snapshots_timestamp_props_context_and_sequence_order,
+	test_track_rejects_cyclic_or_too_deep_snapshots,
 	test_bounded_queue_drop,
 	test_token_provider_failure,
 	test_identity_validation,
@@ -587,8 +674,10 @@ local tests = {
 	test_non_retryable_failure_drops_batch,
 	test_token_expiry_refresh,
 	test_update_honors_flush_interval,
+	test_perf_and_ping_samples_are_bounded,
 	test_perf_and_network_summaries,
 	test_shutdown_emits_session_end,
+	test_singleton_shutdown_keeps_client_after_retryable_failure,
 }
 
 for _, test in ipairs(tests) do

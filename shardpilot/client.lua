@@ -12,15 +12,67 @@ local function trim_slash(value)
 	return (value:gsub("/+$", ""))
 end
 
-local function copy_table(value)
-	if type(value) ~= "table" then
-		return nil
+local function local_http_host(host)
+	return host == "localhost" or host == "127.0.0.1" or host == "::1"
+end
+
+local function valid_ingest_url(value)
+	local scheme, rest = value:match("^(https?)://(.+)$")
+	if not scheme then
+		return false
 	end
+	if scheme == "https" then
+		return true
+	end
+	local host_port = rest:match("^([^/%?]+)")
+	if not host_port then
+		return false
+	end
+	local host = host_port
+	if host:sub(1, 1) == "[" then
+		host = host:match("^%[([^%]]+)%]")
+	else
+		host = host:match("^([^:]+)")
+	end
+	return local_http_host(host)
+end
+
+local max_snapshot_depth = 4
+
+local function copy_value(value, depth, seen)
+	if type(value) ~= "table" then
+		return value, nil
+	end
+	if depth >= max_snapshot_depth or seen[value] then
+		return nil, "invalid_table"
+	end
+	seen[value] = true
 	local out = {}
 	for k, v in pairs(value) do
-		out[k] = v
+		if type(k) == "table" then
+			seen[value] = nil
+			return nil, "invalid_table"
+		end
+		local copied, err = copy_value(v, depth + 1, seen)
+		if err then
+			seen[value] = nil
+			return nil, err
+		end
+		out[k] = copied
 	end
-	return out
+	seen[value] = nil
+	return out, nil
+end
+
+local function copy_table(value, error_code)
+	if value == nil or type(value) ~= "table" then
+		return nil, nil
+	end
+	local copied, err = copy_value(value, 0, {})
+	if err then
+		return nil, error_code
+	end
+	return copied, nil
 end
 
 local function valid_identity(value)
@@ -72,6 +124,9 @@ local function validate_config(config)
 		if type(config[key]) ~= "string" then
 			return nil, "invalid_" .. key
 		end
+	end
+	if not valid_ingest_url(config.ingest_url) then
+		return nil, "invalid_ingest_url"
 	end
 	if type(config.token_provider) ~= "function" then
 		return nil, "token_provider_required"
@@ -191,9 +246,14 @@ function Client:session_end(reason)
 end
 
 function Client:screen_view(screen_name, props)
-	props = props or {}
-	props.screen_name = screen_name
-	return self:track("screen_view", props)
+	local out = {}
+	if type(props) == "table" then
+		for key, value in pairs(props) do
+			out[key] = value
+		end
+	end
+	out.screen_name = screen_name
+	return self:track("screen_view", out)
 end
 
 function Client:tutorial_start(tutorial_id)
@@ -217,6 +277,16 @@ function Client:track(event_name, props, context)
 		self.stats.dropped = self.stats.dropped + 1
 		return false, "event_name_required"
 	end
+	local props_snapshot, props_err = copy_table(props, "invalid_props")
+	if props_err then
+		self.stats.dropped = self.stats.dropped + 1
+		return false, props_err
+	end
+	local context_snapshot, context_err = copy_table(context, "invalid_context")
+	if context_err then
+		self.stats.dropped = self.stats.dropped + 1
+		return false, context_err
+	end
 	local event = {
 		event_id = id.uuid(),
 		event_name = event_name,
@@ -225,8 +295,8 @@ function Client:track(event_name, props, context)
 		anonymous_id = self.anonymous_id,
 		session_id = self.session_id,
 		session_sequence = self.session_sequence + 1,
-		props = copy_table(props),
-		context = copy_table(context),
+		props = props_snapshot,
+		context = context_snapshot,
 	}
 	local ok = queue.push(self.queue, event)
 	if not ok then
@@ -411,7 +481,9 @@ function Client:shutdown(reason)
 		self:session_end(reason or "app_final")
 	end
 	local ok = self:flush({ include_summaries = true })
-	self.initialized = false
+	if ok then
+		self.initialized = false
+	end
 	return ok
 end
 

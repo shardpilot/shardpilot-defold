@@ -1,6 +1,15 @@
 local clock = require "shardpilot.clock"
 
 local M = {}
+M.max_perf_samples = 300
+M.max_ping_samples = 300
+
+local function append_bounded(values, value, limit)
+	if #values >= limit then
+		table.remove(values, 1)
+	end
+	values[#values + 1] = value
+end
 
 local function percentile(sorted, p)
 	if #sorted == 0 then
@@ -36,7 +45,7 @@ function M.sample_frame(state, dt)
 	if not dt or dt <= 0 then
 		return
 	end
-	state.frames[#state.frames + 1] = dt * 1000
+	append_bounded(state.frames, dt * 1000, M.max_perf_samples)
 end
 
 function M.perf_summary(state)
@@ -76,7 +85,7 @@ end
 
 function M.sample_ping(state, ms)
 	if type(ms) == "number" and ms >= 0 then
-		state.pings[#state.pings + 1] = ms
+		append_bounded(state.pings, ms, M.max_ping_samples)
 	end
 end
 

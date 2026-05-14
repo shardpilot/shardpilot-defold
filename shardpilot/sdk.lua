@@ -69,8 +69,11 @@ function M.shutdown(reason)
 	if not client then
 		return false, "not_initialized"
 	end
-	default_client = nil
-	return client:shutdown(reason)
+	local ok, err = client:shutdown(reason)
+	if ok then
+		default_client = nil
+	end
+	return ok, err
 end
 
 function M.snapshot()
