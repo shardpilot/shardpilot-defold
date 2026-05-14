@@ -82,6 +82,7 @@ json = {
 
 local sdk = require "shardpilot.sdk"
 local sampling = require "shardpilot.sampling"
+local platform = require "shardpilot.platform"
 
 local function assert_true(value, message)
 	if not value then
@@ -234,10 +235,20 @@ end
 local function test_screen_view_does_not_mutate_caller_props()
 	reset()
 	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
 	local props = { origin = "menu" }
 	assert_true(client:screen_view("settings", props))
 	assert_equal(props.screen_name, nil)
 	assert_equal(props.origin, "menu")
+end
+
+local function test_platform_maps_html5_to_web()
+	local original_get_sys_info = sys.get_sys_info
+	sys.get_sys_info = function()
+		return { system_name = "html5" }
+	end
+	assert_equal(platform.detect(), "web")
+	sys.get_sys_info = original_get_sys_info
 end
 
 local function test_id_generator_seeds_without_caller()
@@ -380,6 +391,7 @@ end
 local function test_track_rejects_cyclic_or_too_deep_snapshots()
 	reset()
 	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
 	local cyclic = {}
 	cyclic.self = cyclic
 	local ok, err = client:track("cyclic_props", cyclic)
@@ -401,6 +413,7 @@ end
 local function test_bounded_queue_drop()
 	reset()
 	local client = assert(sdk.new(config({ buffer_size = 1 })))
+	assert_true(client:identify("user-example"))
 	local ok, err = client:track("one")
 	assert_true(ok, err)
 	ok, err = client:track("two")
@@ -439,14 +452,21 @@ local function test_identity_validation()
 	assert_equal(ok, false)
 	assert_equal(err, "invalid_anonymous_id")
 
-	assert_true(client:track("needs_identity"))
-	assert_equal(client:flush(), false)
+	ok, err = client:track("needs_identity")
+	assert_equal(ok, false)
+	assert_equal(err, "identity_required")
+	assert_equal(#client.queue.items, 0)
 	assert_equal(#requests, 0)
 	assert_equal(client:snapshot().last_error, "identity_required")
 
 	assert_true(client:identify("user-example"))
 	assert_true(client:flush())
+	assert_equal(#requests, 0)
+
+	assert_true(client:track("after_identity"))
+	assert_true(client:flush())
 	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"event_name":"after_identity"')
 end
 
 local function test_async_token_provider_retains_queued_events()
@@ -564,6 +584,24 @@ local function test_token_expiry_refresh()
 	assert_equal(requests[2].headers["Authorization"], "Bearer client-token-2")
 end
 
+local function test_token_provider_rejects_non_numeric_expiry()
+	reset()
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			callback("client-token-placeholder", "not-a-number", nil)
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("invalid_expiry_token_event"))
+
+	assert_equal(client:flush(), false)
+	assert_equal(client.token, nil)
+	assert_equal(client.token_expires_at_ms, nil)
+	assert_equal(client.token_request_in_flight, false)
+	assert_equal(client:snapshot().last_error, "token_unavailable")
+	assert_equal(#requests, 0)
+end
+
 local function test_update_honors_flush_interval()
 	reset()
 	local client = assert(sdk.new(config({ flush_interval_seconds = 0.5 })))
@@ -622,6 +660,37 @@ local function test_shutdown_emits_session_end()
 	client:session_start()
 	assert_true(client:shutdown("app_final"))
 	assert_contains(requests[1].body, '"event_name":"session_end"')
+	assert_equal(client.initialized, false)
+end
+
+local function test_session_end_queue_full_keeps_session_active()
+	reset()
+	local client = assert(sdk.new(config({ buffer_size = 1 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:session_start())
+	local session_id = client.session_id
+
+	local ok, err = client:session_end("queue_full")
+	assert_equal(ok, false)
+	assert_equal(err, "queue_full")
+	assert_equal(client.session_active, true)
+	assert_equal(client.session_id, session_id)
+end
+
+local function test_shutdown_queue_full_does_not_finalize_and_can_retry()
+	reset()
+	local client = assert(sdk.new(config({ buffer_size = 1 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:session_start())
+
+	local ok, err = client:shutdown("app_final")
+	assert_equal(ok, false)
+	assert_equal(err, "queue_full")
+	assert_equal(client.initialized, true)
+	assert_equal(client.session_active, true)
+
+	assert_true(client:flush())
+	assert_true(client:shutdown("app_final"))
 	assert_equal(client.initialized, false)
 end
 
@@ -746,6 +815,7 @@ local tests = {
 	test_config_validation,
 	test_singleton_guard,
 	test_id_generator_seeds_without_caller,
+	test_platform_maps_html5_to_web,
 	test_app_first_payload,
 	test_screen_view_does_not_mutate_caller_props,
 	test_session_start_renews_session_and_resets_sequence,
@@ -762,10 +832,13 @@ local tests = {
 	test_retryable_failures_retain_batch,
 	test_non_retryable_failure_drops_batch,
 	test_token_expiry_refresh,
+	test_token_provider_rejects_non_numeric_expiry,
 	test_update_honors_flush_interval,
 	test_perf_and_ping_samples_are_bounded,
 	test_perf_and_network_summaries,
 	test_shutdown_emits_session_end,
+	test_session_end_queue_full_keeps_session_active,
+	test_shutdown_queue_full_does_not_finalize_and_can_retry,
 	test_flush_and_shutdown_wait_for_async_publish,
 	test_singleton_shutdown_keeps_client_after_retryable_failure,
 }

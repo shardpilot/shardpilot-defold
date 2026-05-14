@@ -296,9 +296,12 @@ function Client:session_start(props)
 end
 
 function Client:session_end(reason)
-	local ok = self:track("session_end", { reason = reason or "session_end" })
+	local ok, err = self:track("session_end", { reason = reason or "session_end" })
+	if not ok then
+		return false, err
+	end
 	self.session_active = false
-	return ok
+	return true
 end
 
 function Client:screen_view(screen_name, props)
@@ -332,6 +335,11 @@ function Client:track(event_name, props, context)
 	if type(event_name) ~= "string" or event_name == "" then
 		self.stats.dropped = self.stats.dropped + 1
 		return false, "event_name_required"
+	end
+	if not valid_identity(self.user_id) and not valid_identity(self.anonymous_id) then
+		self.stats.dropped = self.stats.dropped + 1
+		self.stats.last_error = "identity_required"
+		return false, "identity_required"
 	end
 	local props_snapshot, props_err = copy_table(props, "invalid_props")
 	if props_err then
@@ -407,6 +415,12 @@ function Client:refresh_token()
 	local ok, err = pcall(self.config.token_provider, function(new_token, new_expires_at, callback_error)
 		self.token_request_in_flight = false
 		if callback_error or type(new_token) ~= "string" or new_token == "" then
+			self.token = nil
+			self.token_expires_at_ms = nil
+			self.stats.last_error = "token_unavailable"
+			return
+		end
+		if new_expires_at ~= nil and type(new_expires_at) ~= "number" then
 			self.token = nil
 			self.token_expires_at_ms = nil
 			self.stats.last_error = "token_unavailable"
@@ -537,7 +551,10 @@ end
 
 function Client:shutdown(reason)
 	if self.session_active then
-		self:session_end(reason or "app_final")
+		local session_ok, session_err = self:session_end(reason or "app_final")
+		if not session_ok then
+			return false, session_err
+		end
 	end
 	local ok, err = self:flush({ include_summaries = true })
 	if ok then

@@ -13,6 +13,7 @@ local map = {
 	darwin = "macos",
 	osx = "macos",
 	linux = "linux",
+	html5 = "web",
 }
 
 function M.detect()
