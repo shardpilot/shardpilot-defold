@@ -12,6 +12,21 @@ local function trim_slash(value)
 	return (value:gsub("/+$", ""))
 end
 
+local function copy_table(value)
+	if type(value) ~= "table" then
+		return nil
+	end
+	local out = {}
+	for k, v in pairs(value) do
+		out[k] = v
+	end
+	return out
+end
+
+local function valid_identity(value)
+	return type(value) == "string" and value ~= ""
+end
+
 local function normalize_integer(value, default_value, min_value, max_value, error_code)
 	if value == nil then
 		return default_value
@@ -134,8 +149,8 @@ function M.new(config)
 		token_request_in_flight = false,
 		in_flight_batch = nil,
 		publish_in_flight = false,
-		user_id = config.user_id,
-		anonymous_id = config.anonymous_id,
+		user_id = valid_identity(config.user_id) and config.user_id or nil,
+		anonymous_id = valid_identity(config.anonymous_id) and config.anonymous_id or nil,
 		session_id = nil,
 		session_sequence = 0,
 		session_active = false,
@@ -147,11 +162,17 @@ function M.new(config)
 end
 
 function Client:identify(user_id)
+	if not valid_identity(user_id) then
+		return false, "invalid_user_id"
+	end
 	self.user_id = user_id
 	return true
 end
 
 function Client:set_anonymous_id(anonymous_id)
+	if not valid_identity(anonymous_id) then
+		return false, "invalid_anonymous_id"
+	end
 	self.anonymous_id = anonymous_id
 	return true
 end
@@ -196,15 +217,23 @@ function Client:track(event_name, props, context)
 		self.stats.dropped = self.stats.dropped + 1
 		return false, "event_name_required"
 	end
-	local ok = queue.push(self.queue, {
+	local event = {
+		event_id = id.uuid(),
 		event_name = event_name,
-		props = props,
-		context = context,
-	})
+		event_ts = clock.iso_utc(),
+		user_id = self.user_id,
+		anonymous_id = self.anonymous_id,
+		session_id = self.session_id,
+		session_sequence = self.session_sequence + 1,
+		props = copy_table(props),
+		context = copy_table(context),
+	}
+	local ok = queue.push(self.queue, event)
 	if not ok then
 		self.stats.dropped = self.stats.dropped + 1
 		return false, "queue_full"
 	end
+	self.session_sequence = event.session_sequence
 	self.stats.enqueued = self.stats.enqueued + 1
 	return true
 end
@@ -271,7 +300,7 @@ function Client:refresh_token()
 end
 
 function Client:can_publish()
-	if not self.user_id and not self.anonymous_id then
+	if not valid_identity(self.user_id) and not valid_identity(self.anonymous_id) then
 		self.stats.last_error = "identity_required"
 		return false
 	end

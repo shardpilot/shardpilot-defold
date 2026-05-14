@@ -1,7 +1,5 @@
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
-math.randomseed(13)
-
 socket = {
 	now = 1000,
 	gettime = function()
@@ -114,6 +112,14 @@ local function assert_not_contains(haystack, needle)
 	end
 end
 
+local function assert_ordered_contains(haystack, first, second)
+	local first_index = string.find(haystack, first, 1, true)
+	local second_index = string.find(haystack, second, 1, true)
+	if not first_index or not second_index or second_index < first_index then
+		error("expected to find " .. first .. " before " .. second .. " in " .. haystack, 2)
+	end
+end
+
 local function assert_not_initialized(label, fn)
 	local ok, err = fn()
 	assert_equal(ok, false, label)
@@ -208,6 +214,15 @@ local function test_app_first_payload()
 	assert_not_contains(request.body, '"build_version"')
 end
 
+local function test_id_generator_seeds_without_caller()
+	local id_mod = require "shardpilot.id"
+	local first = id_mod.uuid()
+	local second = id_mod.uuid()
+	assert_equal(#first, 36)
+	assert_equal(#second, 36)
+	assert_not_equal(first, second)
+end
+
 local function test_session_start_renews_session_and_resets_sequence()
 	reset()
 	local client = assert(sdk.new(config()))
@@ -215,7 +230,7 @@ local function test_session_start_renews_session_and_resets_sequence()
 
 	assert_true(client:session_start())
 	local first_session_id = client.session_id
-	assert_equal(client.session_sequence, 0)
+	assert_equal(client.session_sequence, 1)
 	assert_true(client:flush())
 	assert_contains(requests[1].body, '"event_name":"session_start"')
 	assert_contains(requests[1].body, '"session_id":"' .. first_session_id .. '"')
@@ -230,11 +245,67 @@ local function test_session_start_renews_session_and_resets_sequence()
 	assert_true(client:session_start())
 	local second_session_id = client.session_id
 	assert_not_equal(second_session_id, first_session_id)
-	assert_equal(client.session_sequence, 0)
+	assert_equal(client.session_sequence, 1)
 	assert_true(client:flush())
 	assert_contains(requests[3].body, '"event_name":"session_start"')
 	assert_contains(requests[3].body, '"session_id":"' .. second_session_id .. '"')
 	assert_contains(requests[3].body, '"session_sequence":1')
+end
+
+local function test_track_snapshots_identity_session_and_time()
+	reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-a"))
+	assert_true(client:session_start())
+	local session_a = client.session_id
+	assert_true(client:flush())
+	reset()
+
+	assert_true(client:track("snapshot_event"))
+	local snapshot_sequence = client.session_sequence
+	assert_true(client:identify("user-b"))
+	assert_true(client:session_start())
+	local session_b = client.session_id
+	assert_not_equal(session_b, session_a)
+	assert_true(client:flush())
+
+	local body = requests[1].body
+	assert_ordered_contains(body, '"event_name":"snapshot_event"', '"user_id":"user-a"')
+	assert_ordered_contains(body, '"event_name":"snapshot_event"', '"session_id":"' .. session_a .. '"')
+	assert_ordered_contains(body, '"event_name":"snapshot_event"', '"session_sequence":' .. tostring(snapshot_sequence))
+	assert_contains(body, '"event_name":"session_start"')
+	assert_contains(body, '"user_id":"user-b"')
+	assert_contains(body, '"session_id":"' .. session_b .. '"')
+end
+
+local function test_track_snapshots_timestamp_props_context_and_sequence_order()
+	reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	local props = { surface = "before" }
+	local context = { screen = "menu" }
+	assert_true(client:track("first_event", props, context))
+	local event_ts = client.queue.items[1].event_ts
+	props.surface = "after"
+	context.screen = "gameplay"
+	socket.now = socket.now + 1000
+	assert_true(client:track("second_event"))
+	assert_true(client:track("third_event"))
+
+	assert_equal(client.queue.items[1].session_sequence, 1)
+	assert_equal(client.queue.items[2].session_sequence, 2)
+	assert_equal(client.queue.items[3].session_sequence, 3)
+	assert_true(client:flush())
+
+	local body = requests[1].body
+	assert_contains(body, '"event_ts":"' .. event_ts .. '"')
+	assert_contains(body, '"surface":"before"')
+	assert_contains(body, '"screen":"menu"')
+	assert_not_contains(body, '"surface":"after"')
+	assert_not_contains(body, '"screen":"gameplay"')
+	assert_ordered_contains(body, '"event_name":"first_event"', '"session_sequence":1')
+	assert_ordered_contains(body, '"event_name":"second_event"', '"session_sequence":2')
+	assert_ordered_contains(body, '"event_name":"third_event"', '"session_sequence":3')
 end
 
 local function test_bounded_queue_drop()
@@ -260,6 +331,32 @@ local function test_token_provider_failure()
 	assert_equal(client:flush(), false)
 	assert_equal(#requests, 0)
 	assert_equal(client:snapshot().last_error, "token_unavailable")
+end
+
+local function test_identity_validation()
+	reset()
+	local client = assert(sdk.new(config()))
+	local ok, err = client:identify("")
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_user_id")
+	ok, err = client:identify(42)
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_user_id")
+	ok, err = client:set_anonymous_id("")
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_anonymous_id")
+	ok, err = client:set_anonymous_id({})
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_anonymous_id")
+
+	assert_true(client:track("needs_identity"))
+	assert_equal(client:flush(), false)
+	assert_equal(#requests, 0)
+	assert_equal(client:snapshot().last_error, "identity_required")
+
+	assert_true(client:identify("user-example"))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
 end
 
 local function test_async_token_provider_retains_queued_events()
@@ -476,10 +573,14 @@ end
 local tests = {
 	test_config_validation,
 	test_singleton_guard,
+	test_id_generator_seeds_without_caller,
 	test_app_first_payload,
 	test_session_start_renews_session_and_resets_sequence,
+	test_track_snapshots_identity_session_and_time,
+	test_track_snapshots_timestamp_props_context_and_sequence_order,
 	test_bounded_queue_drop,
 	test_token_provider_failure,
+	test_identity_validation,
 	test_async_token_provider_retains_queued_events,
 	test_unauthorized_invalidates_token_and_retains_batch,
 	test_retryable_failures_retain_batch,

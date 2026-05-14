@@ -69,8 +69,9 @@ client:shutdown("app_final")
 
 The SDK sends `POST {ingest_url}/v1/events:batch` with app-first fields:
 `event_id`, `schema_version`, `event_name`, `source`, `event_ts`,
-`workspace_id`, `app_id`, `environment_id`, `session_sequence`, `platform`,
-`app_version`, `app_build`, `props`, and optional `context`.
+`workspace_id`, `app_id`, `environment_id`, `session_id`,
+`session_sequence`, `platform`, `app_version`, `app_build`, `props`, and
+optional `context`.
 
 It does not expose or send legacy public SDK fields such as `project_id`,
 `game_id`, `env`, `event_ts_server`, `event_seq_session`, or top-level
