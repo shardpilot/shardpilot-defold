@@ -353,6 +353,7 @@ function Client:flush(options)
 	end
 
 	while true do
+		local token_ready = false
 		if not self.in_flight_batch then
 			if queue.size(self.queue) == 0 then
 				return true
@@ -360,9 +361,10 @@ function Client:flush(options)
 			if not self:can_publish() then
 				return false
 			end
+			token_ready = true
 			self.in_flight_batch = queue.drain(self.queue, self.config.batch_size)
 		end
-		if not self:can_publish() then
+		if not token_ready and not self:can_publish() then
 			return false
 		end
 		local dispatched, completed, succeeded = self:start_publish_batch()
