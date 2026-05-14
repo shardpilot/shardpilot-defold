@@ -20,50 +20,61 @@ local function default()
 	return default_client
 end
 
+local function with_default(method, ...)
+	local client = default()
+	if not client then
+		return false, "not_initialized"
+	end
+	return client[method](client, ...)
+end
+
 function M.identify(user_id)
-	return default():identify(user_id)
+	return with_default("identify", user_id)
 end
 
 function M.set_anonymous_id(anonymous_id)
-	return default():set_anonymous_id(anonymous_id)
+	return with_default("set_anonymous_id", anonymous_id)
 end
 
 function M.session_start(props)
-	return default():session_start(props)
+	return with_default("session_start", props)
 end
 
 function M.screen_view(screen_name, props)
-	return default():screen_view(screen_name, props)
+	return with_default("screen_view", screen_name, props)
 end
 
 function M.track(event_name, props, context)
-	return default():track(event_name, props, context)
+	return with_default("track", event_name, props, context)
 end
 
 function M.update(dt)
-	return default():update(dt)
+	return with_default("update", dt)
 end
 
 function M.observe_ping_ms(ms)
-	return default():observe_ping_ms(ms)
+	return with_default("observe_ping_ms", ms)
 end
 
 function M.observe_disconnect(reason)
-	return default():observe_disconnect(reason)
+	return with_default("observe_disconnect", reason)
 end
 
 function M.flush()
-	return default():flush()
+	return with_default("flush")
 end
 
 function M.shutdown(reason)
 	local client = default()
+	if not client then
+		return false, "not_initialized"
+	end
 	default_client = nil
 	return client:shutdown(reason)
 end
 
 function M.snapshot()
-	return default():snapshot()
+	return with_default("snapshot")
 end
 
 return M

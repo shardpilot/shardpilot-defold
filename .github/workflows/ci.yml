@@ -25,10 +25,10 @@ jobs:
       - name: Static library checks
         run: ./scripts/check_library.sh
 
-      - name: Lua tests
+      - name: Install Lua 5.4
         run: |
-          if command -v lua >/dev/null 2>&1; then
-            lua test/test_sdk.lua
-          else
-            echo "lua not available; static checks completed"
-          fi
+          sudo apt-get update
+          sudo apt-get install -y lua5.4
+
+      - name: Lua tests
+        run: lua5.4 test/test_sdk.lua

@@ -1,4 +1,5 @@
 local envelope = require "shardpilot.envelope"
+local clock = require "shardpilot.clock"
 local platform = require "shardpilot.platform"
 local queue = require "shardpilot.queue"
 local sampling = require "shardpilot.sampling"
@@ -8,6 +9,39 @@ local M = {}
 
 local function trim_slash(value)
 	return (value:gsub("/+$", ""))
+end
+
+local function normalize_integer(value, default_value, min_value, max_value, error_code)
+	if value == nil then
+		return default_value
+	end
+	if type(value) ~= "number" or value ~= math.floor(value) or value < min_value then
+		return nil, error_code
+	end
+	if max_value and value > max_value then
+		return nil, error_code
+	end
+	return value
+end
+
+local function normalize_positive_number(value, default_value, error_code)
+	if value == nil then
+		return default_value
+	end
+	if type(value) ~= "number" or value <= 0 then
+		return nil, error_code
+	end
+	return value
+end
+
+local function normalize_non_negative_number(value, default_value, error_code)
+	if value == nil then
+		return default_value
+	end
+	if type(value) ~= "number" or value < 0 then
+		return nil, error_code
+	end
+	return value
 end
 
 local function validate_config(config)
@@ -27,6 +61,29 @@ local function validate_config(config)
 	if source ~= "client" and source ~= "server" and source ~= "backend" then
 		return nil, "invalid_source"
 	end
+	local batch_size, batch_size_err = normalize_integer(config.batch_size, 25, 1, 100, "invalid_batch_size")
+	if not batch_size then
+		return nil, batch_size_err
+	end
+	local buffer_size, buffer_size_err = normalize_integer(config.buffer_size, 200, 1, nil, "invalid_buffer_size")
+	if not buffer_size then
+		return nil, buffer_size_err
+	end
+	local flush_interval_seconds, flush_interval_err =
+		normalize_positive_number(config.flush_interval_seconds, 1, "invalid_flush_interval_seconds")
+	if not flush_interval_seconds then
+		return nil, flush_interval_err
+	end
+	local publish_timeout_seconds, publish_timeout_err =
+		normalize_positive_number(config.publish_timeout_seconds, 2, "invalid_publish_timeout_seconds")
+	if not publish_timeout_seconds then
+		return nil, publish_timeout_err
+	end
+	local token_refresh_lead_ms, token_refresh_lead_err =
+		normalize_non_negative_number(config.token_refresh_lead_ms, 60000, "invalid_token_refresh_lead_ms")
+	if token_refresh_lead_ms == nil then
+		return nil, token_refresh_lead_err
+	end
 	local out = {
 		ingest_url = trim_slash(config.ingest_url),
 		workspace_id = config.workspace_id,
@@ -38,10 +95,11 @@ local function validate_config(config)
 		platform = config.platform or platform.detect(),
 		transport = config.transport,
 		token_provider = config.token_provider,
-		batch_size = math.min(config.batch_size or 25, 100),
-		buffer_size = config.buffer_size or 200,
-		flush_interval_seconds = config.flush_interval_seconds or 1,
-		publish_timeout_seconds = config.publish_timeout_seconds or 2,
+		batch_size = batch_size,
+		buffer_size = buffer_size,
+		flush_interval_seconds = flush_interval_seconds,
+		publish_timeout_seconds = publish_timeout_seconds,
+		token_refresh_lead_ms = token_refresh_lead_ms,
 	}
 	return out
 end
@@ -191,7 +249,11 @@ function Client:can_publish()
 		self.stats.last_error = "identity_required"
 		return false
 	end
-	if not self.token and not self:refresh_token() then
+	local needs_token = not self.token
+	if self.token and self.token_expires_at_ms then
+		needs_token = clock.unix_ms() >= self.token_expires_at_ms - self.config.token_refresh_lead_ms
+	end
+	if needs_token and not self:refresh_token() then
 		return false
 	end
 	return true

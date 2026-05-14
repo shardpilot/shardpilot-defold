@@ -108,6 +108,12 @@ local function assert_not_contains(haystack, needle)
 	end
 end
 
+local function assert_not_initialized(label, fn)
+	local ok, err = fn()
+	assert_equal(ok, false, label)
+	assert_equal(err, "not_initialized", label)
+end
+
 local function config(overrides)
 	local out = {
 		ingest_url = "http://localhost:8080",
@@ -138,11 +144,28 @@ local function test_config_validation()
 	assert_equal(client, nil)
 	assert_equal(err, "ingest_url_required")
 
+	local invalid_cases = {
+		{ { batch_size = 0 }, "invalid_batch_size" },
+		{ { batch_size = -1 }, "invalid_batch_size" },
+		{ { batch_size = 101 }, "invalid_batch_size" },
+		{ { batch_size = 1.5 }, "invalid_batch_size" },
+		{ { buffer_size = 0 }, "invalid_buffer_size" },
+		{ { flush_interval_seconds = 0 }, "invalid_flush_interval_seconds" },
+		{ { publish_timeout_seconds = -1 }, "invalid_publish_timeout_seconds" },
+		{ { token_refresh_lead_ms = -1 }, "invalid_token_refresh_lead_ms" },
+	}
+	for _, entry in ipairs(invalid_cases) do
+		client, err = sdk.new(config(entry[1]))
+		assert_equal(client, nil, entry[2])
+		assert_equal(err, entry[2])
+	end
+
 	client, err = sdk.new(config())
 	assert_true(client, err)
 	assert_equal(client.config.batch_size, 25)
 	assert_equal(client.config.buffer_size, 200)
 	assert_equal(client.config.platform, "linux")
+	assert_equal(client.config.token_refresh_lead_ms, 60000)
 end
 
 local function test_app_first_payload()
@@ -211,6 +234,25 @@ local function test_unauthorized_invalidates_token()
 	assert_equal(client:snapshot().failed_batches, 1)
 end
 
+local function test_token_expiry_refresh()
+	reset()
+	local token_calls = 0
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			token_calls = token_calls + 1
+			callback("client-token-" .. tostring(token_calls), math.floor(socket.now * 1000) + 1000, nil)
+		end,
+	})))
+	client:identify("user-example")
+	client:track("first_event")
+	assert_true(client:flush())
+	client:track("second_event")
+	assert_true(client:flush())
+	assert_equal(token_calls, 2)
+	assert_equal(requests[1].headers["Authorization"], "Bearer client-token-1")
+	assert_equal(requests[2].headers["Authorization"], "Bearer client-token-2")
+end
+
 local function test_perf_and_network_summaries()
 	reset()
 	local client = assert(sdk.new(config({ transport = "websocket" })))
@@ -242,12 +284,66 @@ local function test_shutdown_emits_session_end()
 	assert_equal(client.initialized, false)
 end
 
+local function test_singleton_guard()
+	reset()
+	local calls = {
+		{ "identify", function()
+			return sdk.identify("user-example")
+		end },
+		{ "set_anonymous_id", function()
+			return sdk.set_anonymous_id("anonymous-example")
+		end },
+		{ "session_start", function()
+			return sdk.session_start()
+		end },
+		{ "screen_view", function()
+			return sdk.screen_view("menu")
+		end },
+		{ "track", function()
+			return sdk.track("event")
+		end },
+		{ "update", function()
+			return sdk.update(0.016)
+		end },
+		{ "observe_ping_ms", function()
+			return sdk.observe_ping_ms(42)
+		end },
+		{ "observe_disconnect", function()
+			return sdk.observe_disconnect("offline")
+		end },
+		{ "flush", function()
+			return sdk.flush()
+		end },
+		{ "shutdown", function()
+			return sdk.shutdown("app_final")
+		end },
+		{ "snapshot", function()
+			return sdk.snapshot()
+		end },
+	}
+	for _, entry in ipairs(calls) do
+		assert_not_initialized("pre-init " .. entry[1], entry[2])
+	end
+
+	local ok, err = sdk.init(config())
+	assert_true(ok, err)
+	assert_true(sdk.identify("user-example"))
+	assert_true(sdk.track("singleton_event"))
+	assert_true(sdk.shutdown("app_final"))
+
+	for _, entry in ipairs(calls) do
+		assert_not_initialized("post-shutdown " .. entry[1], entry[2])
+	end
+end
+
 local tests = {
 	test_config_validation,
+	test_singleton_guard,
 	test_app_first_payload,
 	test_bounded_queue_drop,
 	test_token_provider_failure,
 	test_unauthorized_invalidates_token,
+	test_token_expiry_refresh,
 	test_perf_and_network_summaries,
 	test_shutdown_emits_session_end,
 }
