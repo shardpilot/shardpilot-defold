@@ -36,7 +36,7 @@ shardpilot.init({
   workspace_id = "workspace",
   app_id = "app",
   environment_id = "production",
-  app_version = "0.1.1",
+  app_version = "game-version",
   app_build = "100",
   source = "client",
   token_provider = function(callback)
