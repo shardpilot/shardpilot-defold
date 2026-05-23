@@ -1,8 +1,8 @@
 # ShardPilot Defold SDK
 
 ShardPilot Defold SDK is a pure Lua v0 public-preview source SDK for app-first
-telemetry. The API is pre-1.0 and may change before v1. v0.1.0 is an early alpha
-pre-release.
+telemetry. The API is unstable and may change before v1. v0.1.1 is an early
+alpha pre-release.
 
 ## Defold Library
 
@@ -13,14 +13,15 @@ pre-release.
 include_dirs = shardpilot
 ```
 
-After the maintainer publishes the v0.1.0 tag and GitHub Release page, use this
+After the maintainer publishes the v0.1.1 tag and GitHub Release page, use this
 recommended alpha Defold dependency URL:
 
 ```text
-https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.1.0.zip
+https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.1.1.zip
 ```
 
-v0.1.0 is an early alpha pre-release; the API is unstable and may change before v1.
+v0.1.1 is an early alpha pre-release; the API is unstable and may change before v1.
+Use v0.1.1 over v0.1.0 for the clean documentation archive.
 
 After the tag exists, add the URL under Defold dependencies and use
 `Project -> Fetch Libraries`.
@@ -35,7 +36,7 @@ shardpilot.init({
   workspace_id = "workspace",
   app_id = "app",
   environment_id = "production",
-  app_version = "1.0.0",
+  app_version = "game-version",
   app_build = "100",
   source = "client",
   token_provider = function(callback)
