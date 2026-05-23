@@ -13,7 +13,8 @@ Phase 1 alpha milestone tied to ADR-0176.
 include_dirs = shardpilot
 ```
 
-Recommended v0.1.0 alpha Defold dependency URL:
+After the maintainer publishes the v0.1.0 tag and GitHub Release page, use this
+recommended alpha Defold dependency URL:
 
 ```text
 https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.1.0.zip
@@ -21,7 +22,8 @@ https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.1.0.zip
 
 v0.1.0 is a Phase 1 alpha milestone tied to ADR-0176; it is not a GA or 1.0 release.
 
-Add the URL under Defold dependencies and use `Project -> Fetch Libraries`.
+After the tag exists, add the URL under Defold dependencies and use
+`Project -> Fetch Libraries`.
 
 ## Singleton API
 
