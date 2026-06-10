@@ -17,12 +17,16 @@ state for the process lifetime.
 events at enqueue, clears the pending queue, and discards in-flight batches
 on completion instead of retrying them. Explicit decisions are reported
 fire-and-forget to `POST {ingest_url}/v1/consent` and never ride the event
-envelope; a decision made before an auth token is available is retained and
-sent at the next dispatch point.
+envelope; a decision made before an auth token is available — or rejected as
+unauthorized — is retained (latest decision wins) and retried at the next
+dispatch point, and `shutdown` will not tear the client down while a decision
+is still waiting on a token.
 
 - No durable local event queue.
 - No file writes outside the single identity record.
-- No browser storage or local storage equivalent.
+- Identity/consent persistence goes through Defold `sys.save` only; on HTML5
+  builds Defold backs `sys.save` with browser storage, still limited to that
+  single identity record. No cookies and no other browser or tracking storage.
 - No token logging.
 - No full event payload logging.
 - No anonymous stitching by default.

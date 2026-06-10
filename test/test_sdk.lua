@@ -684,6 +684,169 @@ local function test_consent_decision_defers_until_token_arrives()
 	storage.reset()
 end
 
+local function test_session_end_while_denied_completes_locally()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:session_start())
+	assert_true(client:flush())
+	assert_true(client:set_consent(false))
+	assert_equal(client.session_active, true)
+
+	-- the local session teardown must complete while denied; only the wire
+	-- event is suppressed
+	local ok, err = client:session_end("denied_end")
+	assert_true(ok, err)
+	assert_equal(client.session_active, false)
+	for _, request in ipairs(requests) do
+		assert_not_contains(request.body, '"event_name":"session_end"')
+	end
+	storage.reset()
+end
+
+local function test_consent_retained_after_unauthorized_and_resent_with_fresh_token()
+	reset()
+	storage.reset()
+	local token_calls = 0
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			token_calls = token_calls + 1
+			callback("token-" .. tostring(token_calls), nil, nil)
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+
+	next_status = 401
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
+	assert_equal(client.token, nil, "401 must clear the token")
+	assert_true(client.pending_consent ~= nil, "an auth failure must not lose the decision")
+	assert_equal(client:snapshot().consent_failed, 1)
+	assert_equal(client:snapshot().last_consent_error, "unauthorized")
+
+	-- the next dispatch point refreshes the token and retries the decision
+	next_status = 202
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(#requests, 2)
+	assert_equal(requests[2].url, "http://localhost:8080/v1/consent")
+	assert_equal(requests[2].headers["Authorization"], "Bearer token-2")
+	assert_contains(requests[2].body, '"categories":{"analytics":true}')
+	assert_equal(client.pending_consent, nil)
+	assert_equal(client:snapshot().consent_recorded, 1)
+	storage.reset()
+end
+
+local function test_stale_unauthorized_consent_does_not_resurrect_old_decision()
+	reset()
+	storage.reset()
+	local original_request = http.request
+	local callbacks = {}
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = {
+			url = url,
+			method = method,
+			headers = headers,
+			body = body,
+			options = options,
+		}
+		callbacks[#callbacks + 1] = callback
+	end
+
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:set_consent(false))
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 2)
+	assert_equal(#callbacks, 2)
+
+	-- the newer (granted) decision completes first
+	callbacks[2](nil, nil, { status = 202, response = "" })
+	assert_equal(client:snapshot().consent_recorded, 1)
+
+	-- the stale (denied) dispatch comes back unauthorized: the token is
+	-- invalidated but the stale decision must NOT be resurrected over the
+	-- newer one
+	callbacks[1](nil, nil, { status = 401, response = "" })
+	assert_equal(client.token, nil)
+	assert_equal(client.pending_consent, nil, "a stale decision must not be resurrected")
+
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(#requests, 2, "the stale decision must not be replayed")
+	http.request = original_request
+	storage.reset()
+end
+
+local function test_shutdown_waits_for_deferred_consent()
+	reset()
+	storage.reset()
+	local token_callback = nil
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			token_callback = callback
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:set_consent(true))
+	assert_true(client.pending_consent ~= nil)
+	assert_equal(#requests, 0)
+
+	-- no queued events, but the deferred decision must keep the client
+	-- alive instead of being dropped at teardown
+	local ok, err = client:shutdown("app_final")
+	assert_equal(ok, false)
+	assert_equal(err, "consent_pending")
+	assert_equal(client.initialized, true)
+
+	token_callback("late-token", nil, nil)
+	assert_true(client:shutdown("app_final"))
+	assert_equal(client.initialized, false)
+	assert_equal(client.pending_consent, nil)
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
+	assert_equal(requests[1].headers["Authorization"], "Bearer late-token")
+	assert_contains(requests[1].body, '"categories":{"analytics":true}')
+	assert_equal(client:snapshot().consent_recorded, 1)
+	storage.reset()
+end
+
+local function test_set_consent_reports_persist_failure()
+	reset()
+	storage.reset()
+	sys.get_save_file = function(application_id, file_name)
+		return application_id .. "/" .. file_name
+	end
+	sys.save = function()
+		return false
+	end
+	sys.load = function()
+		return nil
+	end
+
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	local ok, err = client:set_consent(false)
+	assert_equal(ok, false)
+	assert_equal(err, "consent_persist_failed")
+	assert_equal(client:snapshot().consent_persist_failed, 1)
+	assert_equal(client:snapshot().last_consent_error, "consent_persist_failed")
+
+	-- the decision still applies in memory and still reaches the wire
+	assert_equal(client.consent_state, "denied")
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
+	assert_contains(requests[1].body, '"categories":{"analytics":false}')
+	local track_ok, track_err = client:track("denied_event")
+	assert_equal(track_ok, false)
+	assert_equal(track_err, "consent_denied")
+
+	sys.get_save_file = nil
+	sys.save = nil
+	sys.load = nil
+	storage.reset()
+end
+
 local function test_storage_namespace_varies_with_app_config()
 	reset()
 	storage.reset()
@@ -1141,6 +1304,11 @@ local tests = {
 	test_consent_send_failure_is_quiet,
 	test_consent_denied_drops_in_flight_batch_on_retryable_failure,
 	test_consent_decision_defers_until_token_arrives,
+	test_session_end_while_denied_completes_locally,
+	test_consent_retained_after_unauthorized_and_resent_with_fresh_token,
+	test_stale_unauthorized_consent_does_not_resurrect_old_decision,
+	test_shutdown_waits_for_deferred_consent,
+	test_set_consent_reports_persist_failure,
 	test_storage_namespace_varies_with_app_config,
 	test_storage_uses_app_scoped_save_file,
 	test_shutdown_completes_when_consent_denied,

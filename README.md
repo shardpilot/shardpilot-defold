@@ -83,11 +83,22 @@ user.
 `set_consent(analytics_granted)` records a tri-state analytics consent
 decision: `unknown` (default, fully open), `granted`, or `denied`. Denied
 drops events at enqueue, clears the pending queue, and discards in-flight
-batches on completion instead of retrying them. The decision is persisted
-next to the anonymous ID and reported fire-and-forget to
-`POST {ingest_url}/v1/consent` over the same authenticated transport as the
-events batch; a decision made before an auth token is available is retained
-and sent at the next dispatch point. Consent never rides the event envelope.
+batches on completion instead of retrying them; `session_end()` while denied
+still completes the local session teardown and returns `true` — only the wire
+event is suppressed. The decision is persisted next to the anonymous ID and
+reported fire-and-forget to `POST {ingest_url}/v1/consent` over the same
+authenticated transport as the events batch; a decision made before an auth
+token is available — or rejected as unauthorized — is retained (latest
+decision wins) and retried at the next dispatch point, and `shutdown` returns
+`false, "consent_pending"` instead of tearing down while a decision is still
+waiting on a token. Consent never rides the event envelope.
+
+`set_consent` returns `ok, err` like `track`. When the durable write of the
+decision fails (a `sys.save` failure), it returns
+`false, "consent_persist_failed"` and records
+`stats.consent_persist_failed`/`stats.last_consent_error`; the decision still
+applies in memory for the running session and is still reported to
+`/v1/consent`, and calling `set_consent` again retries persistence.
 
 ## Boundary
 

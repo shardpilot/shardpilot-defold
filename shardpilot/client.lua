@@ -258,6 +258,7 @@ function M.new(config)
 			duplicates = 0,
 			consent_recorded = 0,
 			consent_failed = 0,
+			consent_persist_failed = 0,
 			last_consent_error = nil,
 			last_error = nil,
 		},
@@ -269,6 +270,7 @@ function M.new(config)
 		user_id = valid_identity(config.user_id) and config.user_id or nil,
 		anonymous_id = anonymous_id,
 		consent_state = consent_state,
+		consent_decision_seq = 0,
 		session_id = nil,
 		session_sequence = 0,
 		session_active = false,
@@ -288,7 +290,7 @@ function Client:persist_identity()
 	if self.consent_state == "granted" or self.consent_state == "denied" then
 		record.consent_analytics = self.consent_state
 	end
-	storage.save(self.config, record)
+	return storage.save(self.config, record)
 end
 
 function Client:identify(user_id)
@@ -329,14 +331,26 @@ function Client:set_consent(analytics_granted)
 			self.stats.dropped = self.stats.dropped + cleared
 		end
 	end
-	self:persist_identity()
+	local persisted = self:persist_identity()
+	if not persisted then
+		self.stats.consent_persist_failed = self.stats.consent_persist_failed + 1
+		self.stats.last_consent_error = "consent_persist_failed"
+	end
 	self:send_consent_decision()
+	if not persisted then
+		-- The decision is applied in memory and reported to the wire, but
+		-- the durable write failed: surface it like track does (ok, err).
+		-- Calling set_consent again retries persistence.
+		return false, "consent_persist_failed"
+	end
 	return true
 end
 
 function Client:send_consent_decision()
 	-- Snapshot the decision at decision time; a later set_consent call
-	-- replaces the pending payload (the latest decision wins).
+	-- replaces the pending payload (the latest decision wins). The sequence
+	-- lets async result callbacks detect that their decision is stale.
+	self.consent_decision_seq = self.consent_decision_seq + 1
 	self.pending_consent = {
 		workspace_id = self.config.workspace_id,
 		app_id = self.config.app_id,
@@ -365,6 +379,7 @@ function Client:try_send_pending_consent()
 	if not self:can_publish() then
 		return false
 	end
+	local decision_seq = self.consent_decision_seq
 	self.pending_consent = nil
 	return transport.send_consent(self.config, self.token, payload, function(ok, err, unauthorized)
 		if ok then
@@ -376,6 +391,13 @@ function Client:try_send_pending_consent()
 		if unauthorized then
 			self.token = nil
 			self.token_expires_at_ms = nil
+			-- An auth failure must not lose the decision: retain it for a
+			-- retry with a fresh token at the next dispatch point — unless a
+			-- newer set_consent decision superseded it meanwhile (the latest
+			-- decision wins; a stale payload is never resurrected).
+			if self.consent_decision_seq == decision_seq and self.pending_consent == nil then
+				self.pending_consent = payload
+			end
 		end
 	end)
 end
@@ -399,6 +421,16 @@ function Client:session_start(props)
 end
 
 function Client:session_end(reason)
+	if not self.initialized then
+		return false, "shutdown"
+	end
+	if self.consent_state == "denied" then
+		-- Consent denied: suppress the wire event but still complete the
+		-- local session teardown (the same posture as shutdown) so session
+		-- state never stays stuck active for a denied user.
+		self.session_active = false
+		return true
+	end
 	local ok, err = self:track("session_end", { reason = reason or "session_end" })
 	if not ok then
 		return false, err
@@ -668,22 +700,27 @@ end
 function Client:shutdown(reason)
 	local denied = self.consent_state == "denied"
 	if self.session_active then
-		if denied then
-			-- Consent was denied: suppress the session_end event (and the
-			-- summary events below) but still complete the local teardown.
-			self.session_active = false
-		else
-			local session_ok, session_err = self:session_end(reason or "app_final")
-			if not session_ok then
-				return false, session_err
-			end
+		-- session_end completes the local teardown even while consent is
+		-- denied (the wire event is suppressed inside session_end); summary
+		-- events are suppressed below via include_summaries.
+		local session_ok, session_err = self:session_end(reason or "app_final")
+		if not session_ok then
+			return false, session_err
 		end
 	end
 	local ok, err = self:flush({ include_summaries = not denied })
-	if ok then
-		self.initialized = false
+	if not ok then
+		return false, err
 	end
-	return ok, err
+	if self.pending_consent then
+		-- A consent decision deferred behind an async token participates in
+		-- shutdown's wait semantics the same way queued events do: keep the
+		-- client alive so the host can retry shutdown once the token lands,
+		-- instead of silently dropping the decision at teardown.
+		return false, "consent_pending"
+	end
+	self.initialized = false
+	return true
 end
 
 function Client:snapshot()
