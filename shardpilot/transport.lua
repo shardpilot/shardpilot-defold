@@ -4,7 +4,7 @@ local function trim_slash(value)
 	return (value:gsub("/+$", ""))
 end
 
-function M.publish(config, token, payload, callback)
+local function dispatch(config, token, route, payload, callback)
 	if not http or not http.request then
 		callback(false, "http_unavailable", false, true)
 		return false
@@ -28,7 +28,7 @@ function M.publish(config, token, payload, callback)
 		timeout = config.publish_timeout_seconds,
 	}
 
-	http.request(trim_slash(config.ingest_url) .. "/v1/events:batch", "POST", function(_, _, response)
+	http.request(trim_slash(config.ingest_url) .. route, "POST", function(_, _, response)
 		local status = response and response.status or 0
 		if status == 401 then
 			callback(false, "unauthorized", true, true)
@@ -49,6 +49,14 @@ function M.publish(config, token, payload, callback)
 		callback(false, "http_" .. tostring(status), false, false)
 	end, headers, encoded, options)
 	return true
+end
+
+function M.publish(config, token, payload, callback)
+	return dispatch(config, token, "/v1/events:batch", payload, callback)
+end
+
+function M.send_consent(config, token, payload, callback)
+	return dispatch(config, token, "/v1/consent", payload, callback)
 end
 
 return M

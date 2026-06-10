@@ -17,6 +17,7 @@ required_files=(
   shardpilot/id.lua
   shardpilot/platform.lua
   shardpilot/sampling.lua
+  shardpilot/storage.lua
   shardpilot/version.lua
   test/harness.collection
   test/harness.script
@@ -49,8 +50,13 @@ if grep -RInE 'project_id|game_id|event_ts_server|event_seq_session|build_versio
   exit 1
 fi
 
-if grep -RInE 'io\.|os\.execute|sys\.save|sys\.load|localStorage|IndexedDB|sessionStorage' shardpilot; then
+if grep -RInE 'io\.|os\.execute|localStorage|IndexedDB|sessionStorage' shardpilot; then
   echo "durable local storage or file writes are not allowed in SDK source" >&2
+  exit 1
+fi
+
+if grep -RInE 'sys\.save|sys\.load|sys\.get_save_file' --exclude=storage.lua shardpilot; then
+  echo "sys persistence calls are only allowed in shardpilot/storage.lua" >&2
   exit 1
 fi
 
