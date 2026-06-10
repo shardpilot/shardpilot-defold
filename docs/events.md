@@ -21,11 +21,12 @@ All events use app-first ShardPilot ingest fields:
 Do not use legacy public SDK fields: `project_id`, `game_id`, `env`,
 `event_ts_server`, `event_seq_session`, or top-level `build_version`.
 
-Built-in helpers enqueue:
+Built-in helpers enqueue (wire `event_name`, with the helper in parentheses
+where it differs):
 
-- `session_start`
+- `app.session_started` (from the `session_start()` helper)
 - `session_end`
-- `screen_view`
+- `app.screen_view` (from the `screen_view()` helper)
 - `tutorial_start`
 - `tutorial_step_complete`
 - `tutorial_complete`

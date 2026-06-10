@@ -83,6 +83,7 @@ json = {
 local sdk = require "shardpilot.sdk"
 local sampling = require "shardpilot.sampling"
 local platform = require "shardpilot.platform"
+local storage = require "shardpilot.storage"
 
 local function assert_true(value, message)
 	if not value then
@@ -222,6 +223,10 @@ local function test_app_first_payload()
 	assert_contains(request.body, '"environment_id":"develop"')
 	assert_contains(request.body, '"event_ts":')
 	assert_contains(request.body, '"session_sequence":')
+	assert_contains(request.body, '"event_name":"app.session_started"')
+	assert_contains(request.body, '"event_name":"app.screen_view"')
+	assert_not_contains(request.body, '"event_name":"session_start"')
+	assert_not_contains(request.body, '"event_name":"screen_view"')
 	assert_contains(request.body, '"app_version":"0.1.0"')
 	assert_contains(request.body, '"app_build":"100"')
 	assert_not_contains(request.body, '"project_id"')
@@ -269,7 +274,7 @@ local function test_session_start_renews_session_and_resets_sequence()
 	local first_session_id = client.session_id
 	assert_equal(client.session_sequence, 1)
 	assert_true(client:flush())
-	assert_contains(requests[1].body, '"event_name":"session_start"')
+	assert_contains(requests[1].body, '"event_name":"app.session_started"')
 	assert_contains(requests[1].body, '"session_id":"' .. first_session_id .. '"')
 	assert_contains(requests[1].body, '"session_sequence":1')
 
@@ -284,7 +289,7 @@ local function test_session_start_renews_session_and_resets_sequence()
 	assert_not_equal(second_session_id, first_session_id)
 	assert_equal(client.session_sequence, 1)
 	assert_true(client:flush())
-	assert_contains(requests[3].body, '"event_name":"session_start"')
+	assert_contains(requests[3].body, '"event_name":"app.session_started"')
 	assert_contains(requests[3].body, '"session_id":"' .. second_session_id .. '"')
 	assert_contains(requests[3].body, '"session_sequence":1')
 end
@@ -347,7 +352,7 @@ local function test_track_snapshots_identity_session_and_time()
 	assert_ordered_contains(body, '"event_name":"snapshot_event"', '"user_id":"user-a"')
 	assert_ordered_contains(body, '"event_name":"snapshot_event"', '"session_id":"' .. session_a .. '"')
 	assert_ordered_contains(body, '"event_name":"snapshot_event"', '"session_sequence":' .. tostring(snapshot_sequence))
-	assert_contains(body, '"event_name":"session_start"')
+	assert_contains(body, '"event_name":"app.session_started"')
 	assert_contains(body, '"user_id":"user-b"')
 	assert_contains(body, '"session_id":"' .. session_b .. '"')
 end
@@ -430,7 +435,7 @@ local function test_token_provider_failure()
 		end,
 	})))
 	client:identify("user-example")
-	client:track("screen_view", { screen_name = "menu" })
+	client:track("app.screen_view", { screen_name = "menu" })
 	assert_equal(client:flush(), false)
 	assert_equal(#requests, 0)
 	assert_equal(client:snapshot().last_error, "token_unavailable")
@@ -452,21 +457,148 @@ local function test_identity_validation()
 	assert_equal(ok, false)
 	assert_equal(err, "invalid_anonymous_id")
 
-	ok, err = client:track("needs_identity")
-	assert_equal(ok, false)
-	assert_equal(err, "identity_required")
-	assert_equal(#client.queue.items, 0)
-	assert_equal(#requests, 0)
-	assert_equal(client:snapshot().last_error, "identity_required")
-
-	assert_true(client:identify("user-example"))
-	assert_true(client:flush())
-	assert_equal(#requests, 0)
-
-	assert_true(client:track("after_identity"))
+	-- an anonymous ID is auto-provisioned, so events publish before identify
+	assert_equal(type(client.anonymous_id), "string")
+	assert_equal(#client.anonymous_id, 36)
+	assert_true(client:track("before_identify"))
 	assert_true(client:flush())
 	assert_equal(#requests, 1)
-	assert_contains(requests[1].body, '"event_name":"after_identity"')
+	assert_contains(requests[1].body, '"anonymous_id":"' .. client.anonymous_id .. '"')
+	assert_not_contains(requests[1].body, '"user_id"')
+
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("after_identity"))
+	assert_true(client:flush())
+	assert_equal(#requests, 2)
+	assert_contains(requests[2].body, '"event_name":"after_identity"')
+	assert_contains(requests[2].body, '"user_id":"user-example"')
+end
+
+local function test_anonymous_id_in_memory_round_trip()
+	reset()
+	storage.reset()
+	local first = assert(sdk.new(config()))
+	local anon = first.anonymous_id
+	assert_equal(type(anon), "string")
+	assert_equal(#anon, 36)
+	assert_equal(anon:sub(15, 15), "7", "anonymous id must be a UUIDv7")
+
+	-- sys storage is unavailable under plain lua, so the in-memory record
+	-- must round-trip to the next client in the same process
+	local second = assert(sdk.new(config()))
+	assert_equal(second.anonymous_id, anon)
+
+	storage.reset()
+	local third = assert(sdk.new(config()))
+	assert_not_equal(third.anonymous_id, anon)
+	storage.reset()
+end
+
+local function test_configured_anonymous_id_overrides_and_persists()
+	reset()
+	storage.reset()
+	local configured = assert(sdk.new(config({ anonymous_id = "anon-configured" })))
+	assert_equal(configured.anonymous_id, "anon-configured")
+	local follower = assert(sdk.new(config()))
+	assert_equal(follower.anonymous_id, "anon-configured")
+	storage.reset()
+end
+
+local function test_consent_tri_state_gating_and_queue_clear()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_equal(client.consent_state, "unknown")
+	assert_true(client:track("open_while_unknown"))
+	assert_equal(#client.queue.items, 1)
+
+	local ok, err = client:set_consent("yes")
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_consent")
+	assert_equal(client.consent_state, "unknown")
+
+	assert_true(client:set_consent(false))
+	assert_equal(client.consent_state, "denied")
+	assert_equal(#client.queue.items, 0, "denied must clear the pending queue")
+	assert_equal(client:snapshot().dropped, 1)
+	assert_equal(#requests, 1)
+	local consent_request = requests[1]
+	assert_equal(consent_request.url, "http://localhost:8080/v1/consent")
+	assert_equal(consent_request.method, "POST")
+	assert_equal(consent_request.headers["Authorization"], "Bearer client-token-placeholder")
+	assert_contains(consent_request.body, '"workspace_id":"workspace-example"')
+	assert_contains(consent_request.body, '"app_id":"app-example"')
+	assert_contains(consent_request.body, '"environment_id":"develop"')
+	assert_contains(consent_request.body, '"actor_identifier":"user-example"')
+	assert_contains(consent_request.body, '"categories":{"analytics":false}')
+	assert_contains(consent_request.body, '"decided_at":"')
+	assert_contains(consent_request.body, '"idempotency_key":"')
+	assert_not_contains(consent_request.body, '"event_name"')
+
+	ok, err = client:track("denied_event")
+	assert_equal(ok, false)
+	assert_equal(err, "consent_denied")
+	assert_equal(client:snapshot().dropped, 2)
+	assert_equal(#requests, 1)
+
+	-- the denied decision persists for the next client
+	local follower = assert(sdk.new(config()))
+	assert_equal(follower.consent_state, "denied")
+	ok, err = follower:track("denied_for_follower")
+	assert_equal(ok, false)
+	assert_equal(err, "consent_denied")
+
+	assert_true(client:set_consent(true))
+	assert_equal(client.consent_state, "granted")
+	assert_equal(#requests, 2)
+	assert_equal(requests[2].url, "http://localhost:8080/v1/consent")
+	assert_contains(requests[2].body, '"categories":{"analytics":true}')
+	assert_true(client:track("granted_event"))
+	assert_true(client:flush())
+	assert_equal(#requests, 3)
+	assert_equal(requests[3].url, "http://localhost:8080/v1/events:batch")
+	assert_contains(requests[3].body, '"event_name":"granted_event"')
+	assert_equal(client:snapshot().consent_recorded, 2)
+
+	-- the granted decision persists for the next client
+	local granted_follower = assert(sdk.new(config()))
+	assert_equal(granted_follower.consent_state, "granted")
+	storage.reset()
+end
+
+local function test_consent_denied_clears_retained_batch()
+	reset()
+	storage.reset()
+	next_status = 500
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("retained_event"))
+	assert_equal(client:flush(), false)
+	assert_equal(#client.in_flight_batch, 1)
+
+	next_status = 202
+	assert_true(client:set_consent(false))
+	assert_equal(client.in_flight_batch, nil)
+	assert_equal(client:snapshot().dropped, 1)
+	assert_true(client:flush())
+	assert_equal(#requests, 2)
+	assert_equal(requests[2].url, "http://localhost:8080/v1/consent")
+	storage.reset()
+end
+
+local function test_consent_send_failure_is_quiet()
+	reset()
+	storage.reset()
+	next_status = 500
+	local client = assert(sdk.new(config()))
+	assert_true(client:set_consent(true))
+	assert_equal(client.consent_state, "granted")
+	assert_equal(client:snapshot().consent_failed, 1)
+	assert_equal(client:snapshot().last_consent_error, "transient_500")
+	assert_contains(requests[1].body, '"actor_identifier":"' .. client.anonymous_id .. '"')
+	next_status = 202
+	storage.reset()
 end
 
 local function test_async_token_provider_retains_queued_events()
@@ -504,7 +636,7 @@ local function test_unauthorized_invalidates_token_and_retains_batch()
 	next_status = 401
 	local client = assert(sdk.new(config()))
 	client:identify("user-example")
-	client:track("screen_view", { screen_name = "menu" })
+	client:track("app.screen_view", { screen_name = "menu" })
 	assert_equal(client:flush(), false)
 	assert_equal(client.token, nil)
 	assert_equal(client:snapshot().failed_batches, 1)
@@ -516,7 +648,7 @@ local function test_unauthorized_invalidates_token_and_retains_batch()
 	assert_equal(client.in_flight_batch, nil)
 	assert_equal(#requests, 2)
 	assert_equal(requests[2].body, failed_body)
-	assert_contains(requests[2].body, '"event_name":"screen_view"')
+	assert_contains(requests[2].body, '"event_name":"app.screen_view"')
 end
 
 local function assert_retryable_status_retains_batch(status)
@@ -611,7 +743,7 @@ local function test_update_honors_flush_interval()
 	assert_equal(#requests, 0)
 	client:update(0.25)
 	assert_equal(#requests, 1)
-	assert_contains(requests[1].body, '"event_name":"session_start"')
+	assert_contains(requests[1].body, '"event_name":"app.session_started"')
 	assert_not_contains(requests[1].body, '"event_name":"perf_summary"')
 end
 
@@ -768,6 +900,9 @@ local function test_singleton_guard()
 		{ "set_anonymous_id", function()
 			return sdk.set_anonymous_id("anonymous-example")
 		end },
+		{ "set_consent", function()
+			return sdk.set_consent(true)
+		end },
 		{ "session_start", function()
 			return sdk.session_start()
 		end },
@@ -827,6 +962,11 @@ local tests = {
 	test_bounded_queue_drop,
 	test_token_provider_failure,
 	test_identity_validation,
+	test_anonymous_id_in_memory_round_trip,
+	test_configured_anonymous_id_overrides_and_persists,
+	test_consent_tri_state_gating_and_queue_clear,
+	test_consent_denied_clears_retained_batch,
+	test_consent_send_failure_is_quiet,
 	test_async_token_provider_retains_queued_events,
 	test_unauthorized_invalidates_token_and_retains_batch,
 	test_retryable_failures_retain_batch,

@@ -27,5 +27,6 @@ release explicitly publishes production infrastructure.
 
 Required fields are `ingest_url`, `workspace_id`, `app_id`, `environment_id`,
 and `token_provider`. Client tokens are memory-only. The SDK requires a token
-and either `identify(user_id)` or `set_anonymous_id(anonymous_id)` before
-publishing queued events.
+before publishing queued events. A UUIDv7 anonymous ID is generated and
+persisted automatically (config `anonymous_id` or `set_anonymous_id` override
+it); `identify(user_id)` upgrades attribution to a known user.

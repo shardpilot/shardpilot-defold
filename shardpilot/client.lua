@@ -4,6 +4,7 @@ local id = require "shardpilot.id"
 local platform = require "shardpilot.platform"
 local queue = require "shardpilot.queue"
 local sampling = require "shardpilot.sampling"
+local storage = require "shardpilot.storage"
 local transport = require "shardpilot.transport"
 
 local M = {}
@@ -231,7 +232,20 @@ function M.new(config)
 	if not normalized then
 		return nil, err
 	end
-	return setmetatable({
+	local stored = storage.load() or {}
+	local anonymous_id
+	if valid_identity(config.anonymous_id) then
+		anonymous_id = config.anonymous_id
+	elseif valid_identity(stored.anonymous_id) then
+		anonymous_id = stored.anonymous_id
+	else
+		anonymous_id = id.uuid_v7()
+	end
+	local consent_state = "unknown"
+	if stored.consent_analytics == "granted" or stored.consent_analytics == "denied" then
+		consent_state = stored.consent_analytics
+	end
+	local client = setmetatable({
 		config = normalized,
 		queue = queue.new(normalized.buffer_size),
 		stats = {
@@ -242,6 +256,9 @@ function M.new(config)
 			accepted = 0,
 			rejected = 0,
 			duplicates = 0,
+			consent_recorded = 0,
+			consent_failed = 0,
+			last_consent_error = nil,
 			last_error = nil,
 		},
 		token = nil,
@@ -250,7 +267,8 @@ function M.new(config)
 		in_flight_batch = nil,
 		publish_in_flight = false,
 		user_id = valid_identity(config.user_id) and config.user_id or nil,
-		anonymous_id = valid_identity(config.anonymous_id) and config.anonymous_id or nil,
+		anonymous_id = anonymous_id,
+		consent_state = consent_state,
 		session_id = nil,
 		session_sequence = 0,
 		session_active = false,
@@ -259,6 +277,18 @@ function M.new(config)
 		flush_elapsed_seconds = 0,
 		initialized = true,
 	}, Client)
+	if stored.anonymous_id ~= anonymous_id then
+		client:persist_identity()
+	end
+	return client
+end
+
+function Client:persist_identity()
+	local record = { anonymous_id = self.anonymous_id }
+	if self.consent_state == "granted" or self.consent_state == "denied" then
+		record.consent_analytics = self.consent_state
+	end
+	storage.save(record)
 end
 
 function Client:identify(user_id)
@@ -274,7 +304,63 @@ function Client:set_anonymous_id(anonymous_id)
 		return false, "invalid_anonymous_id"
 	end
 	self.anonymous_id = anonymous_id
+	self:persist_identity()
 	return true
+end
+
+function Client:set_consent(analytics_granted)
+	if not self.initialized then
+		return false, "shutdown"
+	end
+	if type(analytics_granted) ~= "boolean" then
+		return false, "invalid_consent"
+	end
+	self.consent_state = analytics_granted and "granted" or "denied"
+	if not analytics_granted then
+		local cleared = queue.size(self.queue)
+		if cleared > 0 then
+			queue.drain(self.queue, cleared)
+		end
+		if self.in_flight_batch and not self.publish_in_flight then
+			cleared = cleared + #self.in_flight_batch
+			self.in_flight_batch = nil
+		end
+		if cleared > 0 then
+			self.stats.dropped = self.stats.dropped + cleared
+		end
+	end
+	self:persist_identity()
+	self:send_consent_decision()
+	return true
+end
+
+function Client:send_consent_decision()
+	if not self:can_publish() then
+		self.stats.consent_failed = self.stats.consent_failed + 1
+		self.stats.last_consent_error = self.stats.last_error or "token_unavailable"
+		return false
+	end
+	local payload = {
+		workspace_id = self.config.workspace_id,
+		app_id = self.config.app_id,
+		environment_id = self.config.environment_id,
+		actor_identifier = valid_identity(self.user_id) and self.user_id or self.anonymous_id,
+		categories = { analytics = self.consent_state == "granted" },
+		decided_at = clock.iso_utc(),
+		idempotency_key = id.uuid_v7(),
+	}
+	return transport.send_consent(self.config, self.token, payload, function(ok, err, unauthorized)
+		if ok then
+			self.stats.consent_recorded = self.stats.consent_recorded + 1
+			return
+		end
+		self.stats.consent_failed = self.stats.consent_failed + 1
+		self.stats.last_consent_error = err
+		if unauthorized then
+			self.token = nil
+			self.token_expires_at_ms = nil
+		end
+	end)
 end
 
 function Client:session_start(props)
@@ -285,7 +371,7 @@ function Client:session_start(props)
 	self.session_id = "session-" .. id.uuid()
 	self.session_sequence = 0
 	self.session_active = true
-	local ok, err = self:track("session_start", props)
+	local ok, err = self:track("app.session_started", props)
 	if not ok then
 		self.session_id = previous_session_id
 		self.session_sequence = previous_session_sequence
@@ -312,7 +398,7 @@ function Client:screen_view(screen_name, props)
 		end
 	end
 	out.screen_name = screen_name
-	return self:track("screen_view", out)
+	return self:track("app.screen_view", out)
 end
 
 function Client:tutorial_start(tutorial_id)
@@ -335,6 +421,10 @@ function Client:track(event_name, props, context)
 	if type(event_name) ~= "string" or event_name == "" then
 		self.stats.dropped = self.stats.dropped + 1
 		return false, "event_name_required"
+	end
+	if self.consent_state == "denied" then
+		self.stats.dropped = self.stats.dropped + 1
+		return false, "consent_denied"
 	end
 	if not valid_identity(self.user_id) and not valid_identity(self.anonymous_id) then
 		self.stats.dropped = self.stats.dropped + 1

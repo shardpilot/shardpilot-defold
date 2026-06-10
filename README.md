@@ -45,8 +45,9 @@ shardpilot.init({
 })
 
 shardpilot.identify("user-123")
-shardpilot.session_start()
-shardpilot.screen_view("menu")
+shardpilot.set_consent(true) -- analytics consent: granted
+shardpilot.session_start() -- emits canonical "app.session_started"
+shardpilot.screen_view("menu") -- emits canonical "app.screen_view"
 shardpilot.track("play_cta_click", { cta_source = "main_menu" })
 shardpilot.update(dt)
 shardpilot.observe_ping_ms(42)
@@ -62,11 +63,26 @@ local sdk = require "shardpilot.sdk"
 local client = sdk.new(config)
 
 client:identify("user-123")
-client:track("screen_view", { screen_name = "menu" })
+client:screen_view("menu")
 client:update(dt)
 client:flush()
 client:shutdown("app_final")
 ```
+
+## Identity And Consent
+
+The SDK generates a UUIDv7 anonymous ID on first init and persists it through
+`sys.get_save_file("shardpilot", "identity")` with `sys.save`/`sys.load`. When
+the Defold `sys` API is unavailable (for example plain Lua test hosts), the
+record degrades gracefully to in-memory state for the process lifetime.
+`identify(user_id)` upgrades attribution to a known user.
+
+`set_consent(analytics_granted)` records a tri-state analytics consent
+decision: `unknown` (default, fully open), `granted`, or `denied`. Denied
+drops events at enqueue and clears the pending queue. The decision is
+persisted next to the anonymous ID and reported fire-and-forget to
+`POST {ingest_url}/v1/consent` over the same authenticated transport as the
+events batch; consent never rides the event envelope.
 
 ## Boundary
 
@@ -80,9 +96,15 @@ It does not expose or send legacy public SDK fields such as `project_id`,
 `game_id`, `env`, `event_ts_server`, `event_seq_session`, or top-level
 `build_version`.
 
-Tokens and queues are memory-only in v0. The SDK does not write files, use local
-storage, include a native extension, call providers/models/GitHub/billing, or
-execute automatic actions. Project Tower can use generic `track()` calls later,
-but Project Tower event names are not hardcoded into SDK core.
+Built-in helpers emit canonical wire names: `session_start()` emits
+`app.session_started` and `screen_view(...)` emits `app.screen_view`. Helper
+API names are unchanged.
+
+Tokens and queues are memory-only in v0. Durable storage is limited to a
+single identity record (anonymous ID + consent state) written through Defold
+`sys.save`. The SDK does not include a native extension, call
+providers/models/GitHub/billing, or execute automatic actions. Project Tower
+can use generic `track()` calls later, but Project Tower event names are not
+hardcoded into SDK core.
 
 See `docs/` for configuration, events, privacy, and release notes.
