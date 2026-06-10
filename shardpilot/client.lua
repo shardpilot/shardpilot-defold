@@ -232,7 +232,7 @@ function M.new(config)
 	if not normalized then
 		return nil, err
 	end
-	local stored = storage.load() or {}
+	local stored = storage.load(normalized) or {}
 	local anonymous_id
 	if valid_identity(config.anonymous_id) then
 		anonymous_id = config.anonymous_id
@@ -288,7 +288,7 @@ function Client:persist_identity()
 	if self.consent_state == "granted" or self.consent_state == "denied" then
 		record.consent_analytics = self.consent_state
 	end
-	storage.save(record)
+	storage.save(self.config, record)
 end
 
 function Client:identify(user_id)
@@ -335,12 +335,9 @@ function Client:set_consent(analytics_granted)
 end
 
 function Client:send_consent_decision()
-	if not self:can_publish() then
-		self.stats.consent_failed = self.stats.consent_failed + 1
-		self.stats.last_consent_error = self.stats.last_error or "token_unavailable"
-		return false
-	end
-	local payload = {
+	-- Snapshot the decision at decision time; a later set_consent call
+	-- replaces the pending payload (the latest decision wins).
+	self.pending_consent = {
 		workspace_id = self.config.workspace_id,
 		app_id = self.config.app_id,
 		environment_id = self.config.environment_id,
@@ -349,6 +346,26 @@ function Client:send_consent_decision()
 		decided_at = clock.iso_utc(),
 		idempotency_key = id.uuid_v7(),
 	}
+	local sent = self:try_send_pending_consent()
+	if not sent and self.pending_consent then
+		-- No token yet (for example an async token_provider still in flight):
+		-- the decision stays retained and is retried at the next dispatch
+		-- point (update/flush/shutdown) without another set_consent call.
+		self.stats.consent_failed = self.stats.consent_failed + 1
+		self.stats.last_consent_error = self.stats.last_error or "token_unavailable"
+	end
+	return sent
+end
+
+function Client:try_send_pending_consent()
+	local payload = self.pending_consent
+	if not payload then
+		return true
+	end
+	if not self:can_publish() then
+		return false
+	end
+	self.pending_consent = nil
 	return transport.send_consent(self.config, self.token, payload, function(ok, err, unauthorized)
 		if ok then
 			self.stats.consent_recorded = self.stats.consent_recorded + 1
@@ -588,7 +605,12 @@ function Client:start_publish_batch()
 			self.token = nil
 			self.token_expires_at_ms = nil
 		end
-		if not is_retryable_publish_failure(err, unauthorized, retryable) and self.in_flight_batch == events then
+		-- A batch is retained for retry only when the failure is retryable
+		-- AND consent has not been denied meanwhile; a denial recorded while
+		-- the publish was in flight must drop the batch here instead of
+		-- letting the next flush republish it.
+		local retain = is_retryable_publish_failure(err, unauthorized, retryable) and self.consent_state ~= "denied"
+		if not retain and self.in_flight_batch == events then
 			self.stats.dropped = self.stats.dropped + #events
 			self.in_flight_batch = nil
 		end
@@ -603,6 +625,10 @@ function Client:flush(options)
 	if type(options) ~= "table" then
 		options = {}
 	end
+	-- A consent decision retained while no token was available rides the
+	-- same dispatch cadence as queued events; its outcome never affects the
+	-- flush result.
+	self:try_send_pending_consent()
 	if options.include_summaries ~= false then
 		self:enqueue_summaries()
 	end
@@ -640,13 +666,20 @@ function Client:flush(options)
 end
 
 function Client:shutdown(reason)
+	local denied = self.consent_state == "denied"
 	if self.session_active then
-		local session_ok, session_err = self:session_end(reason or "app_final")
-		if not session_ok then
-			return false, session_err
+		if denied then
+			-- Consent was denied: suppress the session_end event (and the
+			-- summary events below) but still complete the local teardown.
+			self.session_active = false
+		else
+			local session_ok, session_err = self:session_end(reason or "app_final")
+			if not session_ok then
+				return false, session_err
+			end
 		end
 	end
-	local ok, err = self:flush({ include_summaries = true })
+	local ok, err = self:flush({ include_summaries = not denied })
 	if ok then
 		self.initialized = false
 	end

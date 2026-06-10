@@ -72,17 +72,22 @@ client:shutdown("app_final")
 ## Identity And Consent
 
 The SDK generates a UUIDv7 anonymous ID on first init and persists it through
-`sys.get_save_file("shardpilot", "identity")` with `sys.save`/`sys.load`. When
-the Defold `sys` API is unavailable (for example plain Lua test hosts), the
-record degrades gracefully to in-memory state for the process lifetime.
-`identify(user_id)` upgrades attribution to a known user.
+`sys.get_save_file("shardpilot.<workspace_id>.<app_id>", "identity")`
+(segments sanitized) with `sys.save`/`sys.load`. The record is namespaced per
+configured app, so two games on the same device never share an anonymous ID
+or consent decision. When the Defold `sys` API is unavailable (for example
+plain Lua test hosts), the record degrades gracefully to in-memory state for
+the process lifetime. `identify(user_id)` upgrades attribution to a known
+user.
 
 `set_consent(analytics_granted)` records a tri-state analytics consent
 decision: `unknown` (default, fully open), `granted`, or `denied`. Denied
-drops events at enqueue and clears the pending queue. The decision is
-persisted next to the anonymous ID and reported fire-and-forget to
+drops events at enqueue, clears the pending queue, and discards in-flight
+batches on completion instead of retrying them. The decision is persisted
+next to the anonymous ID and reported fire-and-forget to
 `POST {ingest_url}/v1/consent` over the same authenticated transport as the
-events batch; consent never rides the event envelope.
+events batch; a decision made before an auth token is available is retained
+and sent at the next dispatch point. Consent never rides the event envelope.
 
 ## Boundary
 

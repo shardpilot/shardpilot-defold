@@ -6,14 +6,18 @@
   emits `app.session_started` and `screen_view(...)` emits `app.screen_view`.
   Helper API names are unchanged.
 - Generates a UUIDv7 anonymous ID on first init and persists it through
-  `sys.get_save_file("shardpilot", "identity")` with `sys.save`/`sys.load`,
-  degrading gracefully to in-memory state when the Defold `sys` API is
-  unavailable.
+  `sys.get_save_file("shardpilot.<workspace_id>.<app_id>", "identity")`
+  (segments sanitized) with `sys.save`/`sys.load`, degrading gracefully to
+  in-memory state when the Defold `sys` API is unavailable. The record is
+  namespaced per configured app so two games on the same device never share
+  an anonymous ID or consent decision.
 - Adds `set_consent(analytics_granted)` with tri-state consent
   {unknown, granted, denied} persisted next to the anonymous ID. Denied drops
-  events at enqueue and clears the pending queue. Explicit decisions are
-  reported fire-and-forget to `POST {ingest_url}/v1/consent` over the same
-  authenticated transport as the events batch.
+  events at enqueue, clears the pending queue, and discards in-flight batches
+  on completion instead of retrying them. Explicit decisions are reported
+  fire-and-forget to `POST {ingest_url}/v1/consent` over the same
+  authenticated transport as the events batch; a decision made before an auth
+  token is available is retained and sent at the next dispatch point.
 - This is an early alpha pre-release. The API is unstable and may change before v1.
 
 ## v0.1.1 — 2026-05-23 — early alpha

@@ -601,6 +601,178 @@ local function test_consent_send_failure_is_quiet()
 	storage.reset()
 end
 
+local function test_consent_denied_drops_in_flight_batch_on_retryable_failure()
+	reset()
+	storage.reset()
+	local original_request = http.request
+	local callbacks = {}
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = {
+			url = url,
+			method = method,
+			headers = headers,
+			body = body,
+			options = options,
+		}
+		callbacks[#callbacks + 1] = callback
+	end
+
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("in_flight_event"))
+	local ok, err = client:flush()
+	assert_equal(ok, false)
+	assert_equal(err, "pending")
+	assert_equal(client.publish_in_flight, true)
+	assert_equal(#callbacks, 1)
+
+	-- consent is denied while the publish is still in flight; the batch
+	-- cannot be aborted mid-flight, so it stays attached for now
+	assert_true(client:set_consent(false))
+	assert_true(client.in_flight_batch ~= nil)
+	assert_equal(#callbacks, 2, "the consent decision dispatches immediately")
+	assert_equal(requests[2].url, "http://localhost:8080/v1/consent")
+
+	-- the in-flight publish completes with a retryable failure: the batch
+	-- must be dropped at the completion callback, not retained for retry
+	callbacks[1](nil, nil, { status = 500, response = "" })
+	assert_equal(client.publish_in_flight, false)
+	assert_equal(client.in_flight_batch, nil, "denied consent must drop the retryable batch")
+	assert_equal(client:snapshot().dropped, 1)
+	assert_equal(client:snapshot().failed_batches, 1)
+	callbacks[2](nil, nil, { status = 202, response = "" })
+
+	-- the next flush must not republish the dropped batch
+	assert_true(client:flush())
+	assert_equal(#requests, 2)
+	http.request = original_request
+	storage.reset()
+end
+
+local function test_consent_decision_defers_until_token_arrives()
+	reset()
+	storage.reset()
+	local token_callback = nil
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			token_callback = callback
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+
+	-- the decision is made before the async token provider has answered:
+	-- it must be retained, not lost
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 0, "no consent request can go out before the token arrives")
+	assert_true(client.pending_consent ~= nil, "the decision must be retained")
+	assert_equal(client:snapshot().consent_failed, 1)
+	assert_equal(client:snapshot().consent_recorded, 0)
+
+	token_callback("deferred-token", nil, nil)
+	assert_equal(client.token, "deferred-token")
+	assert_true(client.pending_consent ~= nil, "still pending until the next dispatch point")
+
+	-- the next dispatch point (the update-driven flush) transmits it
+	-- without a second set_consent call
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
+	assert_equal(requests[1].headers["Authorization"], "Bearer deferred-token")
+	assert_contains(requests[1].body, '"categories":{"analytics":true}')
+	assert_equal(client.pending_consent, nil)
+	assert_equal(client:snapshot().consent_recorded, 1)
+	storage.reset()
+end
+
+local function test_storage_namespace_varies_with_app_config()
+	reset()
+	storage.reset()
+	local first = assert(sdk.new(config()))
+	local other = assert(sdk.new(config({ app_id = "app-other" })))
+	assert_not_equal(other.anonymous_id, first.anonymous_id, "different apps must not share an anonymous id")
+	local sibling = assert(sdk.new(config()))
+	assert_equal(sibling.anonymous_id, first.anonymous_id)
+
+	-- consent must not bleed across apps either
+	assert_true(first:set_consent(false))
+	local denied_follower = assert(sdk.new(config()))
+	assert_equal(denied_follower.consent_state, "denied")
+	local other_follower = assert(sdk.new(config({ app_id = "app-other" })))
+	assert_equal(other_follower.consent_state, "unknown", "another app must not inherit the denial")
+	storage.reset()
+end
+
+local function test_storage_uses_app_scoped_save_file()
+	reset()
+	storage.reset()
+	local namespaces = {}
+	local stores = {}
+	sys.get_save_file = function(application_id, file_name)
+		namespaces[#namespaces + 1] = application_id
+		return application_id .. "/" .. file_name
+	end
+	sys.save = function(path, record)
+		stores[path] = record
+		return true
+	end
+	sys.load = function(path)
+		return stores[path]
+	end
+
+	local client = assert(sdk.new(config()))
+	local record = stores["shardpilot.workspace-example.app-example/identity"]
+	assert_equal(type(record), "table", "identity must persist under the app-scoped namespace")
+	assert_equal(record.anonymous_id, client.anonymous_id)
+
+	local other = assert(sdk.new(config({ app_id = "app-other" })))
+	local other_record = stores["shardpilot.workspace-example.app-other/identity"]
+	assert_equal(type(other_record), "table")
+	assert_equal(other_record.anonymous_id, other.anonymous_id)
+	assert_not_equal(other.anonymous_id, client.anonymous_id)
+
+	-- a sibling with the same config reloads the persisted identity
+	local sibling = assert(sdk.new(config()))
+	assert_equal(sibling.anonymous_id, client.anonymous_id)
+
+	-- scope segments are sanitized before reaching sys.get_save_file
+	assert(sdk.new(config({ workspace_id = "ws/../evil", app_id = "app one" })))
+	assert_equal(type(stores["shardpilot.ws____evil.app_one/identity"]), "table")
+	for _, application_id in ipairs(namespaces) do
+		assert_equal(application_id:find("/", 1, true), nil, "namespace must not contain path separators")
+		assert_equal(application_id:find("..", 1, true), nil, "namespace must not contain dot-dot")
+	end
+
+	sys.get_save_file = nil
+	sys.save = nil
+	sys.load = nil
+	storage.reset()
+end
+
+local function test_shutdown_completes_when_consent_denied()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:session_start())
+	assert_true(client:flush())
+	assert_true(client:set_consent(false))
+	assert_equal(client.session_active, true)
+
+	-- a denied user must still be able to tear the client down; the
+	-- session_end event is suppressed, not transmitted
+	assert_true(client:shutdown("app_final"))
+	assert_equal(client.initialized, false)
+	assert_equal(client.session_active, false)
+	for _, request in ipairs(requests) do
+		assert_not_contains(request.body, '"event_name":"session_end"')
+	end
+
+	local ok, err = client:track("after_shutdown")
+	assert_equal(ok, false)
+	assert_equal(err, "shutdown")
+	storage.reset()
+end
+
 local function test_async_token_provider_retains_queued_events()
 	reset()
 	local token_callback = nil
@@ -967,6 +1139,11 @@ local tests = {
 	test_consent_tri_state_gating_and_queue_clear,
 	test_consent_denied_clears_retained_batch,
 	test_consent_send_failure_is_quiet,
+	test_consent_denied_drops_in_flight_batch_on_retryable_failure,
+	test_consent_decision_defers_until_token_arrives,
+	test_storage_namespace_varies_with_app_config,
+	test_storage_uses_app_scoped_save_file,
+	test_shutdown_completes_when_consent_denied,
 	test_async_token_provider_retains_queued_events,
 	test_unauthorized_invalidates_token_and_retains_batch,
 	test_retryable_failures_retain_batch,
