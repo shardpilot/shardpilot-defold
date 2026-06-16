@@ -18,6 +18,25 @@
   fire-and-forget to `POST {ingest_url}/v1/consent` over the same
   authenticated transport as the events batch; a decision made before an auth
   token is available is retained and sent at the next dispatch point.
+- Parses the per-event status array in a `202` events-batch response
+  (`{ accepted, rejected, duplicates, events:[{event_id, status, code, message}] }`)
+  instead of assuming a `202` means full per-event success. Aggregate counters
+  are kept on the snapshot and each non-accepted outcome
+  (`observed`, `duplicate`, `rejected`, `suppressed_no_consent`) is surfaced
+  through the new optional `diagnostics` config hook and `snapshot()`
+  (`observed`, `suppressed`, `last_event_issue`), so integrators learn when
+  their events are unregistered, blocked, or consent-suppressed. A `duplicate`
+  is terminal and is never re-sent.
+- Honors `429` backpressure: reads the `Retry-After` response header (whole
+  seconds) and defers the next publish attempt by at least that long
+  (clamped to a sane upper bound), retaining the batch. When the header is
+  absent on a transient failure, falls back to exponential backoff with full
+  jitter; a successful publish resets the backoff. A `401` still refreshes the
+  token and retries immediately.
+- Parses the `{ error: { code, message, details:[{field, code, message}] } }`
+  envelope on a non-2xx response and surfaces `error.code` plus the detail
+  codes via the `diagnostics` hook and `last_error`, instead of reporting only
+  the bare HTTP status. No token material is included in the surfaced issue.
 - This is an early alpha pre-release. The API is unstable and may change before v1.
 
 ## v0.1.1 — 2026-05-23 — early alpha

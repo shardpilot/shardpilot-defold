@@ -16,6 +16,8 @@ sys = {
 
 local requests = {}
 local next_status = 202
+local next_response_body = nil
+local next_response_headers = nil
 
 http = {
 	request = function(url, method, callback, headers, body, options)
@@ -26,7 +28,11 @@ http = {
 			body = body,
 			options = options,
 		}
-		callback(nil, nil, { status = next_status, response = '{"accepted":1}' })
+		local response = { status = next_status, response = next_response_body or '{"accepted":1}' }
+		if next_response_headers then
+			response.headers = next_response_headers
+		end
+		callback(nil, nil, response)
 	end,
 }
 
@@ -76,8 +82,114 @@ local function encode_value(value)
 	return encode_string(value)
 end
 
+-- A minimal recursive-descent JSON decoder, sufficient for the server bodies
+-- the SDK parses in tests (objects, arrays, strings, numbers, booleans, null).
+-- Real Defold ships json.decode; the SDK uses it only when present.
+local function json_decode(text)
+	local pos = 1
+	local parse_value
+
+	local function skip_ws()
+		local _, stop = string.find(text, "^[ \t\r\n]*", pos)
+		pos = stop + 1
+	end
+
+	local function parse_string()
+		pos = pos + 1 -- opening quote
+		local parts = {}
+		while pos <= #text do
+			local ch = string.sub(text, pos, pos)
+			if ch == '"' then
+				pos = pos + 1
+				return table.concat(parts)
+			elseif ch == "\\" then
+				local esc = string.sub(text, pos + 1, pos + 1)
+				local map = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", n = "\n", t = "\t", r = "\r", b = "\b", f = "\f" }
+				parts[#parts + 1] = map[esc] or esc
+				pos = pos + 2
+			else
+				parts[#parts + 1] = ch
+				pos = pos + 1
+			end
+		end
+		error("unterminated string")
+	end
+
+	local function parse_object()
+		pos = pos + 1 -- {
+		local out = {}
+		skip_ws()
+		if string.sub(text, pos, pos) == "}" then
+			pos = pos + 1
+			return out
+		end
+		while true do
+			skip_ws()
+			local key = parse_string()
+			skip_ws()
+			pos = pos + 1 -- :
+			skip_ws()
+			out[key] = parse_value()
+			skip_ws()
+			local ch = string.sub(text, pos, pos)
+			pos = pos + 1
+			if ch == "}" then
+				return out
+			end
+		end
+	end
+
+	local function parse_array()
+		pos = pos + 1 -- [
+		local out = {}
+		skip_ws()
+		if string.sub(text, pos, pos) == "]" then
+			pos = pos + 1
+			return out
+		end
+		while true do
+			skip_ws()
+			out[#out + 1] = parse_value()
+			skip_ws()
+			local ch = string.sub(text, pos, pos)
+			pos = pos + 1
+			if ch == "]" then
+				return out
+			end
+		end
+	end
+
+	parse_value = function()
+		skip_ws()
+		local ch = string.sub(text, pos, pos)
+		if ch == "{" then
+			return parse_object()
+		elseif ch == "[" then
+			return parse_array()
+		elseif ch == '"' then
+			return parse_string()
+		elseif ch == "t" then
+			pos = pos + 4
+			return true
+		elseif ch == "f" then
+			pos = pos + 5
+			return false
+		elseif ch == "n" then
+			pos = pos + 4
+			return nil
+		else
+			local number = string.match(text, "^%-?%d+%.?%d*[eE]?[%+%-]?%d*", pos)
+			pos = pos + #number
+			return tonumber(number)
+		end
+	end
+
+	return parse_value()
+end
+
 json = {
 	encode = encode_value,
+	decode = json_decode,
 }
 
 local sdk = require "shardpilot.sdk"
@@ -152,6 +264,8 @@ end
 local function reset()
 	requests = {}
 	next_status = 202
+	next_response_body = nil
+	next_response_headers = nil
 end
 
 local function test_config_validation()
@@ -1281,6 +1395,226 @@ local function test_singleton_guard()
 	end
 end
 
+-- L1 §5: a 202 body carries a per-event events[] array; non-accepted outcomes
+-- (observed / rejected / duplicate / suppressed_no_consent) must be surfaced
+-- through the diagnostics hook and the snapshot, not silently counted as
+-- accepted.
+local function test_batch_response_surfaces_per_event_outcomes()
+	reset()
+	storage.reset()
+	local issues = {}
+	local client = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	for i = 1, 4 do
+		assert_true(client:track("event_" .. tostring(i)))
+	end
+
+	next_response_body = '{"accepted":1,"rejected":1,"duplicates":1,"events":['
+		.. '{"event_id":"e1","status":"accepted"},'
+		.. '{"event_id":"e2","status":"observed","code":"event_not_registered"},'
+		.. '{"event_id":"e3","status":"rejected","code":"blocked_event","message":"blocked"},'
+		.. '{"event_id":"e4","status":"duplicate","code":"duplicate_event_id"}'
+		.. ']}'
+	assert_true(client:flush())
+
+	local snapshot = client:snapshot()
+	assert_equal(snapshot.accepted, 1, "aggregate accepted is kept from the body")
+	assert_equal(snapshot.rejected, 1)
+	assert_equal(snapshot.duplicates, 1)
+	assert_equal(snapshot.observed, 1)
+
+	-- three non-accepted per-event outcomes must reach the diagnostics hook
+	assert_equal(#issues, 3)
+	local by_status = {}
+	for _, issue in ipairs(issues) do
+		by_status[issue.status] = issue
+	end
+	assert_true(by_status.observed ~= nil)
+	assert_equal(by_status.observed.event_id, "e2")
+	assert_equal(by_status.observed.code, "event_not_registered")
+	assert_true(by_status.rejected ~= nil)
+	assert_equal(by_status.rejected.code, "blocked_event")
+	assert_true(by_status.duplicate ~= nil)
+	assert_equal(by_status.duplicate.code, "duplicate_event_id")
+	storage.reset()
+end
+
+-- L1 §5: a suppressed_no_consent per-event status surfaces distinctly.
+local function test_batch_response_surfaces_suppressed_no_consent()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("suppressed_event"))
+
+	next_response_body = '{"accepted":0,"rejected":1,"duplicates":0,"events":['
+		.. '{"event_id":"e1","status":"suppressed_no_consent","code":"suppressed_no_consent"}'
+		.. ']}'
+	assert_true(client:flush())
+
+	local snapshot = client:snapshot()
+	assert_equal(snapshot.accepted, 0)
+	assert_equal(snapshot.suppressed, 1)
+	assert_equal(snapshot.last_event_issue, "suppressed_no_consent:suppressed_no_consent")
+	storage.reset()
+end
+
+-- L1 §5: a 202 with no parseable events[] must not regress the accepted count.
+local function test_batch_response_without_events_array_keeps_accepted()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("only_aggregate"))
+
+	next_response_body = '{"accepted":1,"rejected":0,"duplicates":0}'
+	assert_true(client:flush())
+	assert_equal(client:snapshot().accepted, 1)
+	storage.reset()
+end
+
+-- L1 §6: a 429 Retry-After (whole seconds) defers the next publish attempt at
+-- least that long; the batch is retained, not dropped or re-sent immediately.
+local function test_retry_after_defers_next_publish()
+	reset()
+	storage.reset()
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "120" }
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("rate_limited_event"))
+
+	assert_equal(client:flush(), false)
+	assert_equal(#requests, 1)
+	assert_equal(#client.in_flight_batch, 1, "the rate-limited batch is retained")
+	assert_true(client.publish_retry_after_ms ~= nil, "a retry-after deadline is set")
+	assert_true(client:publish_deferred(), "publishing is deferred until the deadline")
+
+	-- a flush during the deferral window must NOT re-send the batch
+	next_status = 202
+	next_response_headers = nil
+	assert_equal(client:flush(), false)
+	assert_equal(#requests, 1, "no publish during the retry-after window")
+
+	-- once the deadline passes the batch is republished
+	client.publish_retry_after_ms = nil
+	assert_true(client:flush())
+	assert_equal(#requests, 2)
+	assert_equal(client.in_flight_batch, nil)
+	storage.reset()
+end
+
+-- L1 §6: a successful publish clears any active backpressure deferral. A
+-- deferral whose deadline has already elapsed does not block the publish.
+local function test_successful_publish_clears_deferral()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	client.publish_retry_after_ms = 1 -- a deadline in the distant past
+	client.publish_backoff_attempt = 3
+	assert_true(not client:publish_deferred(), "an elapsed deadline does not defer")
+	assert_true(client:track("recovered_event"))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_equal(client.publish_retry_after_ms, nil)
+	assert_equal(client.publish_backoff_attempt, 0)
+	storage.reset()
+end
+
+-- L1 §6: sustained transient failures with no Retry-After header back off; the
+-- first failure retries promptly, repeats wait.
+local function test_backoff_on_sustained_transient_failures()
+	reset()
+	storage.reset()
+	next_status = 500
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("transient_event"))
+
+	-- first transient failure: no deferral, retries on the next flush
+	assert_equal(client:flush(), false)
+	assert_equal(client.publish_backoff_attempt, 1)
+	assert_true(not client:publish_deferred(), "first failure does not defer")
+
+	-- second consecutive failure: backs off
+	assert_equal(client:flush(), false)
+	assert_equal(client.publish_backoff_attempt, 2)
+	assert_true(client:publish_deferred(), "sustained failure backs off")
+
+	-- recovery clears the backoff
+	client.publish_retry_after_ms = nil
+	next_status = 202
+	assert_true(client:flush())
+	assert_equal(client.publish_backoff_attempt, 0)
+	storage.reset()
+end
+
+-- L1 §6: the { error: { code, message, details } } envelope on a non-2xx is
+-- parsed and surfaced (error.code + detail codes), not just the bare status.
+local function test_error_envelope_is_surfaced()
+	reset()
+	storage.reset()
+	local issues = {}
+	next_status = 400
+	next_response_body = '{"error":{"code":"validation_failed","message":"bad batch","details":['
+		.. '{"field":"props.level","code":"unknown_property","message":"not allowed"},'
+		.. '{"field":"event_name","code":"blocked_event","message":"blocked"}'
+		.. ']}}'
+	local client = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("invalid_event"))
+
+	assert_equal(client:flush(), false)
+	assert_equal(client:snapshot().last_error, "http_400:validation_failed")
+	assert_equal(#issues, 1)
+	local issue = issues[1]
+	assert_equal(issue.scope, "batch")
+	assert_equal(issue.code, "validation_failed")
+	assert_true(issue.detail_codes ~= nil)
+	assert_equal(issue.detail_codes[1], "unknown_property")
+	assert_equal(issue.detail_codes[2], "blocked_event")
+	-- a 400 stays non-retryable: the batch is dropped, not retained
+	assert_equal(client.in_flight_batch, nil)
+	storage.reset()
+end
+
+-- A diagnostics hook that throws must never break the publish path.
+local function test_diagnostics_hook_errors_are_swallowed()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		diagnostics = function()
+			error("hook blew up")
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("observed_event"))
+	next_response_body = '{"accepted":0,"rejected":0,"duplicates":0,"events":['
+		.. '{"event_id":"e1","status":"observed","code":"event_not_registered"}'
+		.. ']}'
+	assert_true(client:flush(), "a throwing hook must not break flush")
+	assert_equal(client:snapshot().observed, 1)
+	storage.reset()
+end
+
+local function test_invalid_diagnostics_rejected()
+	local client, err = sdk.new(config({ diagnostics = 42 }))
+	assert_equal(client, nil)
+	assert_equal(err, "invalid_diagnostics")
+end
+
 local tests = {
 	test_config_validation,
 	test_singleton_guard,
@@ -1326,6 +1660,15 @@ local tests = {
 	test_shutdown_queue_full_does_not_finalize_and_can_retry,
 	test_flush_and_shutdown_wait_for_async_publish,
 	test_singleton_shutdown_keeps_client_after_retryable_failure,
+	test_batch_response_surfaces_per_event_outcomes,
+	test_batch_response_surfaces_suppressed_no_consent,
+	test_batch_response_without_events_array_keeps_accepted,
+	test_retry_after_defers_next_publish,
+	test_successful_publish_clears_deferral,
+	test_backoff_on_sustained_transient_failures,
+	test_error_envelope_is_surfaced,
+	test_diagnostics_hook_errors_are_swallowed,
+	test_invalid_diagnostics_rejected,
 }
 
 for _, test in ipairs(tests) do

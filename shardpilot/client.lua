@@ -125,6 +125,48 @@ local function valid_identity(value)
 	return type(value) == "string" and value ~= ""
 end
 
+-- Decode a server JSON body when a decoder is available (the real Defold
+-- runtime exposes json.decode; the test stub may not). Returns the decoded
+-- table or nil; never throws.
+local function decode_body(body)
+	if type(body) ~= "string" or body == "" then
+		return nil
+	end
+	if not json or type(json.decode) ~= "function" then
+		return nil
+	end
+	local ok, decoded = pcall(json.decode, body)
+	if not ok or type(decoded) ~= "table" then
+		return nil
+	end
+	return decoded
+end
+
+local function to_count(value)
+	if type(value) == "number" and value >= 0 then
+		return math.floor(value)
+	end
+	return 0
+end
+
+-- Defer the next publish attempt by at least the given whole seconds. Clamped
+-- to a sane upper bound so a hostile/garbage header cannot park the client for
+-- a month; a missing value leaves the deadline untouched.
+local max_publish_defer_seconds = 86400
+
+local function defer_publish(client, seconds)
+	if type(seconds) ~= "number" or seconds <= 0 then
+		return
+	end
+	if seconds > max_publish_defer_seconds then
+		seconds = max_publish_defer_seconds
+	end
+	local deadline = clock.unix_ms() + math.floor(seconds * 1000)
+	if not client.publish_retry_after_ms or deadline > client.publish_retry_after_ms then
+		client.publish_retry_after_ms = deadline
+	end
+end
+
 local function normalize_integer(value, default_value, min_value, max_value, error_code)
 	if value == nil then
 		return default_value
@@ -204,6 +246,9 @@ local function validate_config(config)
 	if token_refresh_lead_ms == nil then
 		return nil, token_refresh_lead_err
 	end
+	if config.diagnostics ~= nil and type(config.diagnostics) ~= "function" then
+		return nil, "invalid_diagnostics"
+	end
 	local out = {
 		ingest_url = trim_slash(config.ingest_url),
 		workspace_id = config.workspace_id,
@@ -215,6 +260,7 @@ local function validate_config(config)
 		platform = config.platform or platform.detect(),
 		transport = config.transport,
 		token_provider = config.token_provider,
+		diagnostics = config.diagnostics,
 		batch_size = batch_size,
 		buffer_size = buffer_size,
 		flush_interval_seconds = flush_interval_seconds,
@@ -256,17 +302,22 @@ function M.new(config)
 			accepted = 0,
 			rejected = 0,
 			duplicates = 0,
+			observed = 0,
+			suppressed = 0,
 			consent_recorded = 0,
 			consent_failed = 0,
 			consent_persist_failed = 0,
 			last_consent_error = nil,
 			last_error = nil,
+			last_event_issue = nil,
 		},
 		token = nil,
 		token_expires_at_ms = nil,
 		token_request_in_flight = false,
 		in_flight_batch = nil,
 		publish_in_flight = false,
+		publish_retry_after_ms = nil,
+		publish_backoff_attempt = 0,
 		user_id = valid_identity(config.user_id) and config.user_id or nil,
 		anonymous_id = anonymous_id,
 		consent_state = consent_state,
@@ -604,9 +655,133 @@ local function is_retryable_publish_failure(err, unauthorized, retryable)
 		(type(err) == "string" and err:match("^transient_5%d%d$") ~= nil)
 end
 
+-- Surface a per-event or batch issue through the optional diagnostics hook and
+-- record it on the snapshot so an integrator learns their events were
+-- observed/rejected/suppressed inside an otherwise "successful" 202.
+function Client:diagnose(issue)
+	self.stats.last_event_issue = issue.status .. (issue.code and (":" .. issue.code) or "")
+	local hook = self.config.diagnostics
+	if type(hook) == "function" then
+		-- The hook is integrator code; never let it break the publish path.
+		pcall(hook, issue)
+	end
+end
+
+-- Parse a 202 batch body: keep the aggregate counters and surface every
+-- non-accepted per-event outcome (observed / duplicate / rejected /
+-- suppressed_no_consent). A 202 is NOT treated as full per-event success.
+-- "duplicate" is terminal, not retryable: the batch is already cleared by the
+-- success path, so nothing is re-sent here.
+function Client:apply_batch_response(body, batch_count)
+	local decoded = decode_body(body)
+	if not decoded then
+		-- No parseable body (or no decoder in this runtime): fall back to the
+		-- legacy aggregate assumption so counters never regress.
+		self.stats.accepted = self.stats.accepted + batch_count
+		return
+	end
+	local accepted = to_count(decoded.accepted)
+	local rejected = to_count(decoded.rejected)
+	local duplicates = to_count(decoded.duplicates)
+	self.stats.accepted = self.stats.accepted + accepted
+	self.stats.rejected = self.stats.rejected + rejected
+	self.stats.duplicates = self.stats.duplicates + duplicates
+	if type(decoded.events) ~= "table" then
+		return
+	end
+	for _, entry in ipairs(decoded.events) do
+		if type(entry) == "table" then
+			local status = entry.status
+			if status == "observed" then
+				self.stats.observed = self.stats.observed + 1
+			elseif status == "suppressed_no_consent" then
+				self.stats.suppressed = self.stats.suppressed + 1
+			end
+			if status ~= nil and status ~= "accepted" then
+				self:diagnose({
+					scope = "event",
+					event_id = entry.event_id,
+					status = status,
+					code = entry.code,
+					message = entry.message,
+				})
+			end
+		end
+	end
+end
+
+-- Parse the { error: { code, message, details:[{field,code,message}] } }
+-- envelope on a non-2xx response and surface error.code plus the detail codes
+-- through diagnostics, instead of leaving only the bare transport status. Any
+-- token material stays out of the issue (only server-returned fields are read).
+function Client:apply_error_envelope(err, response)
+	local body = type(response) == "table" and response.response or nil
+	local decoded = decode_body(body)
+	local error_obj = decoded and decoded.error
+	if type(error_obj) ~= "table" then
+		return
+	end
+	local detail_codes = nil
+	if type(error_obj.details) == "table" then
+		for _, detail in ipairs(error_obj.details) do
+			if type(detail) == "table" and detail.code then
+				detail_codes = detail_codes or {}
+				detail_codes[#detail_codes + 1] = detail.code
+			end
+		end
+	end
+	if error_obj.code then
+		self.stats.last_error = err .. ":" .. tostring(error_obj.code)
+	end
+	self:diagnose({
+		scope = "batch",
+		status = "rejected",
+		code = error_obj.code,
+		message = error_obj.message,
+		detail_codes = detail_codes,
+	})
+end
+
+-- Exponential-backoff-with-jitter fallback used when a retryable transport /
+-- backpressure failure carries no Retry-After header. The first failure
+-- retries on the next flush cadence without an extra wait; sustained failures
+-- back off (doubling per consecutive failure up to a cap). A successful
+-- publish resets the attempt counter.
+local backoff_base_seconds = 1
+local backoff_cap_seconds = 60
+
+function Client:defer_backoff()
+	self.publish_backoff_attempt = self.publish_backoff_attempt + 1
+	if self.publish_backoff_attempt < 2 then
+		-- First consecutive failure: retry on the next dispatch without a wait.
+		return
+	end
+	local exp = self.publish_backoff_attempt - 2
+	if exp > 16 then
+		exp = 16
+	end
+	local ceiling = backoff_base_seconds * (2 ^ exp)
+	if ceiling > backoff_cap_seconds then
+		ceiling = backoff_cap_seconds
+	end
+	-- Full jitter in [base, ceiling]; never below the base so we always wait.
+	local seconds = backoff_base_seconds + math.random() * (ceiling - backoff_base_seconds)
+	defer_publish(self, seconds)
+end
+
+function Client:publish_deferred()
+	return self.publish_retry_after_ms ~= nil and clock.unix_ms() < self.publish_retry_after_ms
+end
+
 function Client:start_publish_batch()
 	if self.publish_in_flight or not self.in_flight_batch or #self.in_flight_batch == 0 then
 		return true, false, true
+	end
+	-- Backpressure: a 429 Retry-After (or backoff) deferral is still in effect.
+	-- Hold the batch (it stays retained in in_flight_batch) and report
+	-- not-dispatched so flush returns without republishing before the deadline.
+	if self:publish_deferred() then
+		return false, false, false
 	end
 	local events = self.in_flight_batch
 	if not events.payload then
@@ -619,13 +794,22 @@ function Client:start_publish_batch()
 	self.publish_in_flight = true
 	local completed = false
 	local succeeded = false
-	local dispatched = transport.publish(self.config, self.token, events.payload, function(ok, err, unauthorized, retryable)
+	local batch_count = #events
+	local dispatched = transport.publish(self.config, self.token, events.payload, function(ok, err, unauthorized, retryable, response, retry_after)
 		completed = true
 		succeeded = ok == true
 		self.publish_in_flight = false
 		if ok then
-			self.stats.published = self.stats.published + #events
-			self.stats.accepted = self.stats.accepted + #events
+			self.stats.published = self.stats.published + batch_count
+			-- A successful publish clears any backpressure deferral/backoff.
+			self.publish_retry_after_ms = nil
+			self.publish_backoff_attempt = 0
+			-- A 202 is NOT full per-event success: parse the body so observed /
+			-- rejected / suppressed_no_consent outcomes are surfaced instead of
+			-- silently counted as accepted. Duplicates are terminal; the batch
+			-- is cleared here either way and never re-sent.
+			local body = type(response) == "table" and response.response or nil
+			self:apply_batch_response(body, batch_count)
 			if self.in_flight_batch == events then
 				self.in_flight_batch = nil
 			end
@@ -633,9 +817,21 @@ function Client:start_publish_batch()
 		end
 		self.stats.failed_batches = self.stats.failed_batches + 1
 		self.stats.last_error = err
+		-- Surface the server error envelope (error.code + detail codes) on a
+		-- non-2xx instead of leaving only the bare transport status.
+		self:apply_error_envelope(err, response)
+		-- Backpressure: honor a 429 Retry-After (whole seconds) by deferring the
+		-- next publish attempt at least that long. Absent a header, fall back to
+		-- exponential backoff with jitter on a transient transport/backpressure
+		-- failure. A 401 is an auth problem, not backpressure: it refreshes the
+		-- token and retries immediately, so it is never deferred.
 		if unauthorized then
 			self.token = nil
 			self.token_expires_at_ms = nil
+		elseif retry_after and retry_after > 0 then
+			defer_publish(self, retry_after)
+		elseif is_retryable_publish_failure(err, unauthorized, retryable) then
+			self:defer_backoff()
 		end
 		-- A batch is retained for retry only when the failure is retryable
 		-- AND consent has not been denied meanwhile; a denial recorded while
@@ -643,7 +839,7 @@ function Client:start_publish_batch()
 		-- letting the next flush republish it.
 		local retain = is_retryable_publish_failure(err, unauthorized, retryable) and self.consent_state ~= "denied"
 		if not retain and self.in_flight_batch == events then
-			self.stats.dropped = self.stats.dropped + #events
+			self.stats.dropped = self.stats.dropped + batch_count
 			self.in_flight_batch = nil
 		end
 	end)
