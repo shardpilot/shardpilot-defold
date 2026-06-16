@@ -811,8 +811,57 @@ local function test_singleton_guard()
 	end
 end
 
+local function test_client_source_omits_anonymous_id()
+	reset()
+	-- config() defaults source="client": the client-JWT trust tier rejects a
+	-- non-empty anonymous_id (400 anonymous_id_not_allowed), so it must never
+	-- reach the wire even when the host sets it.
+	local client = assert(sdk.new(config()))
+	assert_true(client:set_anonymous_id("anon-123"))
+	assert_true(client:track("client_event"))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_not_contains(requests[1].body, '"anonymous_id"')
+	assert_contains(requests[1].body, '"event_name":"client_event"')
+
+	-- Non-client (service trust tier) sources keep anonymous_id on the wire.
+	reset()
+	local server_client = assert(sdk.new(config({ source = "server" })))
+	assert_true(server_client:set_anonymous_id("anon-456"))
+	assert_true(server_client:track("server_event"))
+	assert_true(server_client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"anonymous_id":"anon-456"')
+end
+
+local function test_track_before_session_start_lazily_opens_session()
+	reset()
+	-- The server requires session_id for non-backend sources. A track() before
+	-- session_start() must still carry a synthesized session_id.
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("early_event"))
+	assert_not_equal(client.session_id, nil)
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"session_id":"session-')
+	assert_contains(requests[1].body, '"session_sequence":1')
+
+	-- Backend sources do not require a session and must not synthesize one.
+	reset()
+	local backend = assert(sdk.new(config({ source = "backend" })))
+	assert_true(backend:identify("user-example"))
+	assert_true(backend:track("backend_event"))
+	assert_equal(backend.session_id, nil)
+	assert_true(backend:flush())
+	assert_equal(#requests, 1)
+	assert_not_contains(requests[1].body, '"session_id"')
+end
+
 local tests = {
 	test_config_validation,
+	test_client_source_omits_anonymous_id,
+	test_track_before_session_start_lazily_opens_session,
 	test_singleton_guard,
 	test_id_generator_seeds_without_caller,
 	test_platform_maps_html5_to_web,

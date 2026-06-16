@@ -17,4 +17,13 @@
 
 ## Unreleased
 
-- No unreleased changes.
+- Fix client-JWT ingest trust-tier conformance:
+  - For `source = "client"`, `anonymous_id` is no longer sent on the wire. The
+    authenticated client ingest tier rejects any non-empty `anonymous_id` with
+    `400 anonymous_id_not_allowed` and drops the whole batch; the server derives
+    the actor from the token subject instead. `set_anonymous_id` still records
+    the identity in client state for the host's `token_provider`. Non-client
+    sources are unchanged and keep sending `anonymous_id`.
+  - `track()` now lazily opens a session (synthesizing `session_id`) for
+    non-backend sources, so events tracked before `session_start()` carry the
+    `session_id` the server requires instead of being whole-batch rejected.

@@ -18,6 +18,17 @@ function M.build(config, state, event)
 	local props = copy_table(event.props) or {}
 	local context = copy_table(event.context)
 
+	-- The authenticated client ingest trust tier (client-JWT) rejects any
+	-- non-empty anonymous_id with 400 anonymous_id_not_allowed and drops the
+	-- whole batch; the server derives the actor from the token subject (sub)
+	-- instead. So for source="client" we never put anonymous_id on the wire.
+	-- It is still retained in client state as an identity marker so the host's
+	-- token_provider knows which subject to mint a JWT for.
+	local anonymous_id = event.anonymous_id
+	if config.source == "client" then
+		anonymous_id = nil
+	end
+
 	return {
 		event_id = event.event_id or id.uuid(),
 		schema_version = 1,
@@ -28,7 +39,7 @@ function M.build(config, state, event)
 		app_id = config.app_id,
 		environment_id = config.environment_id,
 		user_id = event.user_id,
-		anonymous_id = event.anonymous_id,
+		anonymous_id = anonymous_id,
 		session_id = event.session_id,
 		session_sequence = event.session_sequence,
 		platform = config.platform,

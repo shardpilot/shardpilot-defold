@@ -351,6 +351,15 @@ function Client:track(event_name, props, context)
 		self.stats.dropped = self.stats.dropped + 1
 		return false, context_err
 	end
+	-- The server requires session_id for non-backend sources; an event tracked
+	-- before session_start() would otherwise ship with no session_id and the
+	-- whole batch would be 400-rejected. Lazily open a session so a session_id
+	-- is always present. An explicit session_start() still renews the session.
+	if self.session_id == nil and self.config.source ~= "backend" then
+		self.session_id = "session-" .. id.uuid()
+		self.session_sequence = 0
+		self.session_active = true
+	end
 	local event = {
 		event_id = id.uuid(),
 		event_name = event_name,
