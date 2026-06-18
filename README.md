@@ -228,7 +228,9 @@ Legacy public-SDK fields are **never** emitted: `project_id`, `game_id`, `env`,
 ## Conventions & boundaries
 
 - **No native extension.** No `.c`/`.cpp`/`.mm`/`.java` or Extender references in
-  SDK source (enforced by the guard).
+  SDK source. The guard greps file *contents* (`grep -RInE`) for these patterns,
+  so it flags native references inside tracked files but does not catch a native
+  source file added solely by filename — keep the boundary by convention.
 - **No durable I/O beyond the identity record.** `io.*`, `os.execute`, and
   browser/local storage are forbidden in source; `sys.save`/`sys.load`/
   `sys.get_save_file` are confined to `shardpilot/storage.lua`.
@@ -247,7 +249,11 @@ Legacy public-SDK fields are **never** emitted: `project_id`, `game_id`, `env`,
 - **Engine:** Defold (uses `sys`, `http.request`); degrades to in-memory
   identity state when `sys` is absent, and dispatch returns `http_unavailable`
   when `http.request` is absent.
-- **Lua:** Lua 5.4 (CI installs `lua5.4` to run `test/test_sdk.lua`).
+- **Lua runtime:** Defold's embedded runtime is LuaJIT / Lua 5.1-compatible;
+  write SDK source against Lua 5.1 language features so it runs in-game.
+- **Test runner:** CI installs `lua5.4` only as the host interpreter for
+  `test/test_sdk.lua`; it is not the in-Defold runtime target, so avoid relying
+  on Lua 5.4-only syntax or APIs that would fail inside the engine.
 - **License:** Apache-2.0.
 
 ## Roadmap
