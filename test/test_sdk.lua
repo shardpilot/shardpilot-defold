@@ -901,6 +901,98 @@ local function test_consent_retained_after_unauthorized_and_resent_with_fresh_to
 	storage.reset()
 end
 
+local function test_lazy_session_rolls_back_on_enqueue_failure()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a({ buffer_size = 1 })))
+	assert_true(client:identify("user-example"))
+	-- Saturate the single-slot queue directly so the FIRST real track() both
+	-- lazily opens a session AND then fails to enqueue.
+	client.queue.items[1] = { event_name = "filler" }
+	assert_equal(client.session_id, nil)
+	local ok, err = client:track("first")
+	assert_equal(ok, false)
+	assert_equal(err, "queue_full")
+	-- The lazy session opened for this event must be rolled back; otherwise a
+	-- later update()/session_end would reference a session that carries no
+	-- enqueued event.
+	assert_equal(client.session_id, nil, "lazy session must roll back on enqueue failure")
+	assert_equal(client.session_active, false)
+	assert_equal(client:snapshot().dropped, 1)
+	storage.reset()
+end
+
+local function test_mode_a_401_drops_batch_without_retry()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("e1"))
+	next_status = 401
+	client:flush()
+	assert_equal(#requests, 1)
+	-- A Mode A 401 means the static publishable key is revoked/misconfigured;
+	-- replaying it would loop forever, so the batch is dropped, not retained.
+	assert_equal(client.in_flight_batch, nil, "Mode A 401 must drop the batch")
+	assert_equal(client:snapshot().dropped, 1)
+	assert_equal(client:snapshot().failed_batches, 1)
+	next_status = 202
+	client:flush()
+	assert_equal(#requests, 1, "Mode A 401 batch must not be retried against the same key")
+	storage.reset()
+end
+
+local function test_mode_a_401_drops_pending_consent()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	next_status = 401
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 1)
+	-- Unlike Mode B (which retains for a fresh-token retry), a Mode A consent
+	-- 401 is terminal: the decision is dropped rather than replayed forever.
+	assert_equal(client.pending_consent, nil, "Mode A 401 must drop the decision")
+	assert_equal(client:snapshot().consent_failed, 1)
+	next_status = 202
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(#requests, 1, "Mode A 401 consent must not be retried against the same key")
+	storage.reset()
+end
+
+local function test_set_anonymous_id_rejected_while_events_pending_mode_b()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("queued"))
+	-- With a Mode B token_provider, rotating the anon while an event is queued
+	-- would bind the next minted token to the new anon while the queued payload
+	-- still carries the old one — a guaranteed server-side batch rejection.
+	local ok, err = client:set_anonymous_id("anon-new")
+	assert_equal(ok, false)
+	assert_equal(err, "events_pending")
+	-- Once the queue is drained the rotation is allowed.
+	next_status = 202
+	assert_true(client:flush())
+	assert_true(client:set_anonymous_id("anon-new"), "rotation allowed once drained")
+	assert_equal(client:get_anonymous_id(), "anon-new")
+	storage.reset()
+end
+
+local function test_set_anonymous_id_allowed_while_pending_mode_a()
+	reset()
+	storage.reset()
+	-- Mode A has no bind_anon enforcement, so the guard must NOT over-restrict:
+	-- rotating the anon while an event is queued stays allowed.
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("queued"))
+	assert_true(client:set_anonymous_id("anon-a"), "Mode A allows rotation while pending")
+	assert_equal(client:get_anonymous_id(), "anon-a")
+	storage.reset()
+end
+
 local function test_stale_unauthorized_consent_does_not_resurrect_old_decision()
 	reset()
 	storage.reset()
@@ -1804,6 +1896,11 @@ local tests = {
 	test_consent_decision_defers_until_token_arrives,
 	test_session_end_while_denied_completes_locally,
 	test_consent_retained_after_unauthorized_and_resent_with_fresh_token,
+	test_lazy_session_rolls_back_on_enqueue_failure,
+	test_mode_a_401_drops_batch_without_retry,
+	test_mode_a_401_drops_pending_consent,
+	test_set_anonymous_id_rejected_while_events_pending_mode_b,
+	test_set_anonymous_id_allowed_while_pending_mode_a,
 	test_stale_unauthorized_consent_does_not_resurrect_old_decision,
 	test_shutdown_waits_for_deferred_consent,
 	test_set_consent_reports_persist_failure,

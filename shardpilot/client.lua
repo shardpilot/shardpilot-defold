@@ -375,6 +375,17 @@ function Client:set_anonymous_id(anonymous_id)
 	if not valid_identity(anonymous_id) then
 		return false, "invalid_anonymous_id"
 	end
+	-- Mode B (ADR-0222): the host's token_provider mints `bind_anon` from the
+	-- anonymous_id returned by get_anonymous_id() at flush time, while events
+	-- already queued (or in flight) carry the previous anon snapshot taken at
+	-- track() time. Rotating the anon while a batch is pending would bind the
+	-- token to the new anon but ship a payload carrying the old one, and the
+	-- server rejects the whole batch. Require the host to flush first so the
+	-- queued/in-flight anon and the next minted bind_anon stay aligned.
+	if self.config.token_provider and anonymous_id ~= self.anonymous_id
+		and (queue.size(self.queue) > 0 or self.in_flight_batch ~= nil) then
+		return false, "events_pending"
+	end
 	self.anonymous_id = anonymous_id
 	self:persist_identity()
 	return true
@@ -469,11 +480,14 @@ function Client:try_send_pending_consent()
 		if unauthorized then
 			self.token = nil
 			self.token_expires_at_ms = nil
-			-- An auth failure must not lose the decision: retain it for a
-			-- retry with a fresh token at the next dispatch point — unless a
-			-- newer set_consent decision superseded it meanwhile (the latest
-			-- decision wins; a stale payload is never resurrected).
-			if self.consent_decision_seq == decision_seq and self.pending_consent == nil then
+			-- A Mode B auth failure must not lose the decision: retain it for a
+			-- retry with a freshly minted token at the next dispatch point —
+			-- unless a newer set_consent decision superseded it meanwhile (the
+			-- latest decision wins; a stale payload is never resurrected). In
+			-- Mode A the static key cannot change, so a 401 is terminal: drop the
+			-- decision rather than replaying it forever against the same key.
+			if self.config.token_provider ~= nil
+				and self.consent_decision_seq == decision_seq and self.pending_consent == nil then
 				self.pending_consent = payload
 			end
 		end
@@ -572,10 +586,12 @@ function Client:track(event_name, props, context)
 	-- before session_start() would otherwise ship with no session_id and the
 	-- whole batch would be 400-rejected. Lazily open a session so a session_id
 	-- is always present. An explicit session_start() still renews the session.
+	local opened_lazy_session = false
 	if self.session_id == nil and self.config.source ~= "backend" then
 		self.session_id = "session-" .. id.uuid()
 		self.session_sequence = 0
 		self.session_active = true
+		opened_lazy_session = true
 	end
 	local event = {
 		event_id = id.uuid(),
@@ -590,6 +606,15 @@ function Client:track(event_name, props, context)
 	}
 	local ok = queue.push(self.queue, event)
 	if not ok then
+		-- The lazy session above was committed before the push. If the push
+		-- fails the event never enters the queue, so roll the session back —
+		-- otherwise update()/shutdown() would later sample or emit a
+		-- session_end for a session that carries no events.
+		if opened_lazy_session then
+			self.session_id = nil
+			self.session_sequence = 0
+			self.session_active = false
+		end
 		self.stats.dropped = self.stats.dropped + 1
 		return false, "queue_full"
 	end
@@ -689,14 +714,21 @@ function Client:can_publish()
 	return true
 end
 
-local function is_retryable_publish_failure(err, unauthorized, retryable)
+local function is_retryable_publish_failure(err, unauthorized, retryable, mode_b)
+	-- An auth failure's retryability is a mode concern and overrides any
+	-- transport-supplied `retryable` hint (the transport is mode-agnostic and
+	-- flags every 401 as retryable). A 401 is only worth retrying when a
+	-- token_provider (Mode B) can mint a fresh JWT on the next attempt; in
+	-- Mode A the Bearer is the static publishable key, so a retry would replay
+	-- the same unauthorized request forever and wedge the retained batch —
+	-- treat it as terminal and drop.
+	if unauthorized or err == "unauthorized" then
+		return mode_b == true
+	end
 	if retryable ~= nil then
 		return retryable
 	end
-	if unauthorized then
-		return true
-	end
-	return err == "http_0" or err == "http_unavailable" or err == "unauthorized" or err == "transient_429" or
+	return err == "http_0" or err == "http_unavailable" or err == "transient_429" or
 		(type(err) == "string" and err:match("^transient_5%d%d$") ~= nil)
 end
 
@@ -868,21 +900,24 @@ function Client:start_publish_batch()
 		-- Backpressure: honor a 429 Retry-After (whole seconds) by deferring the
 		-- next publish attempt at least that long. Absent a header, fall back to
 		-- exponential backoff with jitter on a transient transport/backpressure
-		-- failure. A 401 is an auth problem, not backpressure: it refreshes the
-		-- token and retries immediately, so it is never deferred.
+		-- failure. A 401 is an auth problem, not backpressure: in Mode B it drops
+		-- the stale JWT and retries immediately with a freshly minted one (never
+		-- deferred); in Mode A the static key cannot change, so it is terminal.
+		local mode_b = self.config.token_provider ~= nil
 		if unauthorized then
 			self.token = nil
 			self.token_expires_at_ms = nil
 		elseif retry_after and retry_after > 0 then
 			defer_publish(self, retry_after)
-		elseif is_retryable_publish_failure(err, unauthorized, retryable) then
+		elseif is_retryable_publish_failure(err, unauthorized, retryable, mode_b) then
 			self:defer_backoff()
 		end
 		-- A batch is retained for retry only when the failure is retryable
 		-- AND consent has not been denied meanwhile; a denial recorded while
 		-- the publish was in flight must drop the batch here instead of
-		-- letting the next flush republish it.
-		local retain = is_retryable_publish_failure(err, unauthorized, retryable) and self.consent_state ~= "denied"
+		-- letting the next flush republish it. A Mode A 401 is non-retryable, so
+		-- the batch is dropped here rather than replayed against the same key.
+		local retain = is_retryable_publish_failure(err, unauthorized, retryable, mode_b) and self.consent_state ~= "denied"
 		if not retain and self.in_flight_batch == events then
 			self.stats.dropped = self.stats.dropped + batch_count
 			self.in_flight_batch = nil
