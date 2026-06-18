@@ -4,11 +4,11 @@
 > extension required. Buffers app-first analytics events in a Defold game and
 > publishes them to the ShardPilot analytics ingest API.
 
-See the platform guide [`../AGENTS.md`](../AGENTS.md) for ShardPilot's app-first
-model. Wire shape and identity rules follow ADR-0139 (app-first analytics) and
-ADR-0222 (dual-mode client ingest auth); games are a domain pack, not the
-platform boundary (ADR-0106). ADRs live in
-[`../docs/architecture/adr/`](../docs/architecture/adr/).
+ShardPilot is app-first: this SDK buffers analytics events and publishes them to
+the ingest API. Wire shape and identity rules follow ADR-0139 (app-first
+analytics) and ADR-0222 (dual-mode client ingest auth); games are a domain pack,
+not the platform boundary (ADR-0106). Those ADRs are internal to the ShardPilot
+docs repository and are not published with this SDK.
 
 ## Status
 
@@ -18,16 +18,18 @@ platform boundary (ADR-0106). ADRs live in
   this repo, and the production ingest domain is **not provisioned** yet. Use
   local/develop endpoints for evaluation.
 - **Version strings are inconsistent across files** (`shardpilot/version.lua`
-  reports `0.2.0`, `game.project` declares `0.1.0`). The latest unreleased work
-  is tracked as `v0.2.0` in [`CHANGELOG.md`](CHANGELOG.md); treat that as the
-  intent until the strings are reconciled.
+  reports `0.3.0`, `game.project` declares `0.1.0`). The latest unreleased work
+  is tracked as `v0.3.0 — unreleased` in [`CHANGELOG.md`](CHANGELOG.md); treat
+  that as the intent until the strings are reconciled.
 
 ## What it does
 
 - Provides a Defold library (`shardpilot/`) you consume as source — there is no
   C/C++/native extension.
 - Buffers app-first events in a bounded in-memory queue and publishes them in
-  batches over `http.request` (Defold) or an injectable transport.
+  batches over the Defold global `http.request`. When `http.request` is absent
+  (e.g. a plain Lua host) dispatch returns `http_unavailable` and events stay
+  queued.
 - Emits canonical helpers: `session_start()` → `app.session_started`,
   `screen_view(name)` → `app.screen_view`, plus arbitrary `track(name, props)`.
 - Generates and persists a UUIDv7 anonymous ID per configured app and supports
@@ -88,7 +90,15 @@ function update(self, dt)
 end
 
 function final(self)
-  shardpilot.shutdown("app_final")
+  -- shutdown() starts a flush and returns ok, err. In Defold builds where
+  -- http.request completes asynchronously it may return false, "pending"
+  -- (a batch is still in flight) or false, "consent_pending" (a consent
+  -- decision is awaiting a token). To avoid dropping the final batch, flush
+  -- earlier (e.g. on background) or retry shutdown until it returns true.
+  local ok, err = shardpilot.shutdown("app_final")
+  if not ok then
+    print("shardpilot shutdown not complete: " .. tostring(err))
+  end
 end
 ```
 
@@ -160,8 +170,10 @@ The SDK sends `POST {ingest_url}/v1/events:batch` with app-first fields:
 `platform`, `app_version`, `app_build`, `props`, and optional `context`.
 
 Legacy public-SDK fields are **never** emitted: `project_id`, `game_id`, `env`,
-`event_ts_server`, `event_seq_session`, and top-level `build_version` (CI-guarded
-by [`scripts/check_library.sh`](scripts/check_library.sh)). See
+`event_ts_server`, `event_seq_session`, and top-level `build_version`. Of these,
+`project_id`, `game_id`, `event_ts_server`, `event_seq_session`, and
+`build_version` are CI-guarded by
+[`scripts/check_library.sh`](scripts/check_library.sh). See
 [`docs/events.md`](docs/events.md).
 
 ## Privacy & consent
@@ -178,9 +190,19 @@ by [`scripts/check_library.sh`](scripts/check_library.sh)). See
   token-mint time (Mode B); the SDK always sends that same anonymous ID on the wire.
 - **`set_consent(analytics_granted)`** records `unknown` (default, fully open),
   `granted`, or `denied`. `denied` drops events at enqueue, clears the pending
-  queue, and discards in-flight batches instead of retrying. Explicit decisions
-  are reported fire-and-forget to `POST {ingest_url}/v1/consent` over the same
-  authenticated transport; consent never rides the event envelope.
+  queue, and discards in-flight batches instead of retrying. The decision is
+  applied in memory and persisted to the identity record; if that durable write
+  fails, `set_consent` returns `false, "consent_persist_failed"` (the in-memory
+  decision and the wire report still proceed). Call `set_consent` again to retry
+  persistence, otherwise the decision can be lost on restart.
+- Explicit consent decisions are reported to `POST {ingest_url}/v1/consent` over
+  the same authenticated transport; consent never rides the event envelope. The
+  report is **not** strictly fire-and-forget: if no token is available yet (e.g.
+  an async Mode B `token_provider` still in flight) or the POST returns 401, the
+  decision is retained as a pending consent and retried at the next dispatch
+  point (`update`/`flush`/`shutdown`). While a pending consent is outstanding,
+  `shutdown()` returns `false, "consent_pending"` instead of tearing down — call
+  it again once a token is available so the decision is not dropped at exit.
 - The SDK does not log tokens or full payloads, and makes no
   provider/model/GitHub/billing/control-plane write calls. See
   [`docs/privacy.md`](docs/privacy.md) and [`SECURITY.md`](SECURITY.md).
@@ -222,8 +244,9 @@ by [`scripts/check_library.sh`](scripts/check_library.sh)). See
 
 ## Compatibility
 
-- **Engine:** Defold (uses `sys`, `http.request`); degrades to in-memory state
-  and an injectable transport when those APIs are absent.
+- **Engine:** Defold (uses `sys`, `http.request`); degrades to in-memory
+  identity state when `sys` is absent, and dispatch returns `http_unavailable`
+  when `http.request` is absent.
 - **Lua:** Lua 5.4 (CI installs `lua5.4` to run `test/test_sdk.lua`).
 - **License:** Apache-2.0.
 
@@ -243,13 +266,14 @@ See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/release.md`](docs/release.md).
 
 ## Related repositories
 
-- [`../analytics-service`](../analytics-service) — ingest/query data plane that
-  receives `/v1/events:batch`.
-- [`../control-plane`](../control-plane) — mints/introspects the ingest tokens
+- The `analytics-service` (internal) — ingest/query data plane that receives
+  `/v1/events:batch`.
+- The `control-plane` service (internal) — mints/introspects the ingest tokens
   the `token_provider` supplies (ADR-0222).
-- [`../developers`](../developers) — public docs for the ingest API and SDKs.
-- [`../shardpilot-go`](../shardpilot-go) · [`../shardpilot-unity`](../shardpilot-unity)
-  · [`../shardpilot-unreal`](../shardpilot-unreal) — sibling client SDKs.
+- The `developers` site (internal) — public docs for the ingest API and SDKs.
+- [`shardpilot-go`](https://github.com/shardpilot/shardpilot-go) — the public Go
+  client SDK; `shardpilot-unity` and `shardpilot-unreal` (internal) are sibling
+  client SDKs.
 
 ## License
 
