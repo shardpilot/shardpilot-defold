@@ -1061,10 +1061,14 @@ local function test_set_anonymous_id_rejected_while_token_request_in_flight()
 	local ok, err = client:set_anonymous_id("anon-new")
 	assert_equal(ok, false)
 	assert_equal(err, "events_pending")
-	-- Once the token settles, rotation is allowed.
+	-- Once the token settles AND the deferred consent (old anon) is delivered,
+	-- rotation is allowed. The token arriving doesn't auto-send the consent; the
+	-- next dispatch does, clearing pending_consent.
 	next_status = 202
 	token_callback("token-1", nil, nil)
 	assert_equal(client.token_request_in_flight, false)
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(client.pending_consent, nil)
 	assert_true(client:set_anonymous_id("anon-new"))
 	assert_equal(client:get_anonymous_id(), "anon-new")
 	storage.reset()
@@ -1089,6 +1093,60 @@ local function test_consent_denial_clears_stale_publish_deferral()
 	assert_equal(client.in_flight_batch, nil)
 	assert_equal(client.publish_retry_after_ms, nil, "consent denial must clear the stale deferral")
 	assert_equal(client.publish_backoff_attempt, 0)
+	storage.reset()
+end
+
+local function test_denied_in_flight_429_sets_no_stale_deferral()
+	reset()
+	storage.reset()
+	local original_request = http.request
+	local callbacks = {}
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		callbacks[#callbacks + 1] = callback
+	end
+
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("in_flight_event"))
+	client:flush()
+	assert_equal(client.publish_in_flight, true)
+	assert_equal(#callbacks, 1)
+
+	-- Deny consent while the publish is in flight: the batch can't be aborted
+	-- mid-flight, so it stays attached until the callback completes.
+	assert_true(client:set_consent(false))
+	assert_true(client.in_flight_batch ~= nil)
+
+	-- The in-flight publish now completes with a 429 + Retry-After. Because
+	-- consent was denied, the batch is dropped — so NO deferral must be recorded
+	-- for it (it would otherwise block a later granted batch).
+	callbacks[1](nil, nil, { status = 429, headers = { ["retry-after"] = "3600" } })
+	assert_equal(client.in_flight_batch, nil, "denied batch must be dropped")
+	assert_equal(client.publish_retry_after_ms, nil, "a dropped denied batch must not set a deferral")
+	http.request = original_request
+	storage.reset()
+end
+
+local function test_set_anonymous_id_rejected_while_consent_pending_mode_b()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			-- Settle the request with an error: pending_consent stays queued but
+			-- token_request_in_flight returns to false.
+			callback(nil, nil, "no token")
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:set_consent(true))
+	assert_true(client.pending_consent ~= nil, "consent stays pending after a token error")
+	assert_equal(client.token_request_in_flight, false)
+	-- A consent receipt bound to the OLD anon is still pending, so rotation must
+	-- be blocked even though no token request is in flight.
+	local ok, err = client:set_anonymous_id("anon-new")
+	assert_equal(ok, false)
+	assert_equal(err, "events_pending")
 	storage.reset()
 end
 
@@ -2004,6 +2062,8 @@ local tests = {
 	test_diagnose_tolerates_non_string_fields,
 	test_set_anonymous_id_rejected_while_token_request_in_flight,
 	test_consent_denial_clears_stale_publish_deferral,
+	test_denied_in_flight_429_sets_no_stale_deferral,
+	test_set_anonymous_id_rejected_while_consent_pending_mode_b,
 	test_stale_unauthorized_consent_does_not_resurrect_old_decision,
 	test_shutdown_waits_for_deferred_consent,
 	test_set_consent_reports_persist_failure,

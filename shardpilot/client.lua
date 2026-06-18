@@ -382,14 +382,20 @@ function Client:set_anonymous_id(anonymous_id)
 	-- token to the new anon but ship a payload carrying the old one, and the
 	-- server rejects the whole batch. Require the host to flush first so the
 	-- queued/in-flight anon and the next minted bind_anon stay aligned.
-	-- token_request_in_flight: a Mode B token request may already be running (e.g.
-	-- a set_consent() receipt fetch) with the OLD anon. Its async callback would
-	-- store a JWT bound to the old bind_anon AFTER we rotate, so a later event
-	-- would ship the new anon under the stale token. Block rotation until it
-	-- settles (the host retries) rather than racing the in-flight mint.
+	-- Block rotation while any work bound to the OLD anon is pending, or a later
+	-- mint/send would pair the new anon with old-anon data and be rejected:
+	--   * queued / in-flight events carry the old anon snapshot;
+	--   * token_request_in_flight: an async mint (e.g. a set_consent receipt) is
+	--     running with the old anon and its callback would cache a stale-bind_anon
+	--     JWT after we rotate;
+	--   * pending_consent: a retained consent receipt carries the old anon
+	--     actor_identifier and survives even after the token request settles (e.g.
+	--     a token_provider error leaves it queued); its retry would mint for the
+	--     new anon but send the old actor.
+	-- The host retries the rotation once the pending work clears.
 	local rotating = self.config.token_provider and anonymous_id ~= self.anonymous_id
 	if rotating and (queue.size(self.queue) > 0 or self.in_flight_batch ~= nil
-		or self.token_request_in_flight) then
+		or self.token_request_in_flight or self.pending_consent ~= nil) then
 		return false, "events_pending"
 	end
 	self.anonymous_id = anonymous_id
@@ -946,20 +952,24 @@ function Client:start_publish_batch()
 		-- the stale JWT and retries immediately with a freshly minted one (never
 		-- deferred); in Mode A the static key cannot change, so it is terminal.
 		local mode_b = self.config.token_provider ~= nil
+		-- A batch is retained for retry only when the failure is retryable AND
+		-- consent has not been denied meanwhile; a denial recorded while the
+		-- publish was in flight must drop the batch instead of republishing it. A
+		-- Mode A 401 is non-retryable, so the batch is dropped here too. Compute
+		-- this FIRST so the deferral below is only set for a batch we keep.
+		local retain = is_retryable_publish_failure(err, unauthorized, retryable, mode_b) and self.consent_state ~= "denied"
 		if unauthorized then
 			self.token = nil
 			self.token_expires_at_ms = nil
-		elseif retry_after and retry_after > 0 then
+		-- Defer the next publish ONLY for a retained batch. Deferring for a batch
+		-- about to be dropped (denied meanwhile) would leave a stale deadline that
+		-- blocks a later granted batch for the whole Retry-After/backoff window
+		-- (up to the 24h clamp). A 401 is never deferred (handled above).
+		elseif retain and retry_after and retry_after > 0 then
 			defer_publish(self, retry_after)
-		elseif is_retryable_publish_failure(err, unauthorized, retryable, mode_b) then
+		elseif retain and is_retryable_publish_failure(err, unauthorized, retryable, mode_b) then
 			self:defer_backoff()
 		end
-		-- A batch is retained for retry only when the failure is retryable
-		-- AND consent has not been denied meanwhile; a denial recorded while
-		-- the publish was in flight must drop the batch here instead of
-		-- letting the next flush republish it. A Mode A 401 is non-retryable, so
-		-- the batch is dropped here rather than replayed against the same key.
-		local retain = is_retryable_publish_failure(err, unauthorized, retryable, mode_b) and self.consent_state ~= "denied"
 		if not retain and self.in_flight_batch == events then
 			self.stats.dropped = self.stats.dropped + batch_count
 			self.in_flight_batch = nil
