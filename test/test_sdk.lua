@@ -261,6 +261,15 @@ local function config(overrides)
 	return out
 end
 
+-- A Mode A (publishable-key) config: no token_provider, an sp_ingest_ api_key
+-- used directly as the Bearer. Starts from config() and strips token_provider.
+local function config_mode_a(overrides)
+	local out = config(overrides)
+	out.token_provider = nil
+	out.api_key = (overrides and overrides.api_key) or "sp_ingest_publishable_key"
+	return out
+end
+
 local function reset()
 	requests = {}
 	next_status = 202
@@ -315,6 +324,46 @@ local function test_config_validation()
 	assert_equal(client.config.buffer_size, 200)
 	assert_equal(client.config.platform, "linux")
 	assert_equal(client.config.token_refresh_lead_ms, 60000)
+
+	-- Dual-mode auth (ADR-0222): exactly one of token_provider / api_key.
+	-- Neither configured -> auth_required.
+	local no_auth = config()
+	no_auth.token_provider = nil
+	client, err = sdk.new(no_auth)
+	assert_equal(client, nil)
+	assert_equal(err, "auth_required")
+
+	-- Both configured -> auth_mode_conflict (the Bearer source is ambiguous).
+	client, err = sdk.new(config({ api_key = "sp_ingest_publishable_key" }))
+	assert_equal(client, nil)
+	assert_equal(err, "auth_mode_conflict")
+
+	-- An empty-string api_key with no token_provider is not a usable Bearer.
+	local empty_key = config()
+	empty_key.token_provider = nil
+	empty_key.api_key = ""
+	client, err = sdk.new(empty_key)
+	assert_equal(client, nil)
+	assert_equal(err, "auth_required")
+
+	-- A non-string api_key is rejected before mode selection.
+	local bad_key = config()
+	bad_key.token_provider = nil
+	bad_key.api_key = 42
+	client, err = sdk.new(bad_key)
+	assert_equal(client, nil)
+	assert_equal(err, "invalid_api_key")
+
+	-- A non-function token_provider is rejected.
+	client, err = sdk.new(config({ token_provider = "not-a-function" }))
+	assert_equal(client, nil)
+	assert_equal(err, "invalid_token_provider")
+
+	-- Mode A (api_key, no token_provider) is a VALID config.
+	client, err = sdk.new(config_mode_a())
+	assert_true(client, err)
+	assert_equal(client.config.api_key, "sp_ingest_publishable_key")
+	assert_equal(client.config.token_provider, nil)
 end
 
 local function test_app_first_payload()
@@ -1615,6 +1664,121 @@ local function test_invalid_diagnostics_rejected()
 	assert_equal(err, "invalid_diagnostics")
 end
 
+-- ADR-0222 Mode A: a publishable api_key (no token_provider) publishes events
+-- with the api_key as the Bearer, with no token round-trip.
+local function test_mode_a_api_key_is_bearer()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a({ api_key = "sp_ingest_abc123" })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("mode_a_event"))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].url, "http://localhost:8080/v1/events:batch")
+	assert_equal(requests[1].headers["Authorization"], "Bearer sp_ingest_abc123")
+	assert_contains(requests[1].body, '"event_name":"mode_a_event"')
+	storage.reset()
+end
+
+-- ADR-0222 Mode A: the consent decision also rides the publishable api_key.
+local function test_mode_a_consent_uses_api_key_bearer()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a({ api_key = "sp_ingest_consent" })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
+	assert_equal(requests[1].headers["Authorization"], "Bearer sp_ingest_consent")
+	assert_contains(requests[1].body, '"categories":{"analytics":true}')
+	storage.reset()
+end
+
+-- ADR-0222: anonymous_id is ALWAYS sent on the wire for source="client" in
+-- BOTH auth modes. The server requires it; the wave-1 anon-omit rule that the
+-- abandoned client-JWT branch conformed to was deleted server-side, so the SDK
+-- must never strip anonymous_id. (This replaces the abandoned
+-- test_client_source_omits_anonymous_id, asserting the inverse.)
+local function test_client_source_keeps_anonymous_id_both_modes()
+	-- Mode B (token_provider).
+	reset()
+	storage.reset()
+	local mode_b = assert(sdk.new(config()))
+	assert_equal(mode_b.config.source, "client")
+	assert_true(mode_b:set_anonymous_id("anon-mode-b"))
+	assert_true(mode_b:track("client_event_b"))
+	assert_true(mode_b:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"anonymous_id":"anon-mode-b"')
+	assert_contains(requests[1].body, '"event_name":"client_event_b"')
+
+	-- Mode A (publishable api_key).
+	reset()
+	storage.reset()
+	local mode_a = assert(sdk.new(config_mode_a()))
+	assert_equal(mode_a.config.source, "client")
+	assert_true(mode_a:set_anonymous_id("anon-mode-a"))
+	assert_true(mode_a:track("client_event_a"))
+	assert_true(mode_a:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"anonymous_id":"anon-mode-a"')
+	assert_contains(requests[1].body, '"event_name":"client_event_a"')
+
+	-- Non-client (service) source also keeps anonymous_id on the wire.
+	reset()
+	storage.reset()
+	local server_client = assert(sdk.new(config({ source = "server" })))
+	assert_true(server_client:set_anonymous_id("anon-server"))
+	assert_true(server_client:track("server_event"))
+	assert_true(server_client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"anonymous_id":"anon-server"')
+	storage.reset()
+end
+
+-- get_anonymous_id exposes the same anonymous ID the SDK sends on the wire, so
+-- the host can hand it to its backend at JWT-mint time (bind_anon consistency).
+local function test_get_anonymous_id_matches_wire()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:set_anonymous_id("anon-exposed"))
+	assert_equal(client:get_anonymous_id(), "anon-exposed")
+	assert_true(client:track("anon_exposed_event"))
+	assert_true(client:flush())
+	assert_contains(requests[1].body, '"anonymous_id":"anon-exposed"')
+	storage.reset()
+end
+
+-- Cherry-picked from defold#6 (176cfdf), GOOD half only: the server requires
+-- session_id for non-backend sources, so track() before session_start() must
+-- still carry a synthesized session_id. The anon-omit half of that commit is
+-- intentionally NOT applied.
+local function test_track_before_session_start_lazily_opens_session()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("early_event"))
+	assert_not_equal(client.session_id, nil)
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"session_id":"session-')
+	assert_contains(requests[1].body, '"session_sequence":1')
+
+	-- Backend sources do not require a session and must not synthesize one.
+	reset()
+	storage.reset()
+	local backend = assert(sdk.new(config({ source = "backend" })))
+	assert_true(backend:identify("user-example"))
+	assert_true(backend:track("backend_event"))
+	assert_equal(backend.session_id, nil)
+	assert_true(backend:flush())
+	assert_equal(#requests, 1)
+	assert_not_contains(requests[1].body, '"session_id"')
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_singleton_guard,
@@ -1669,6 +1833,11 @@ local tests = {
 	test_error_envelope_is_surfaced,
 	test_diagnostics_hook_errors_are_swallowed,
 	test_invalid_diagnostics_rejected,
+	test_mode_a_api_key_is_bearer,
+	test_mode_a_consent_uses_api_key_bearer,
+	test_client_source_keeps_anonymous_id_both_modes,
+	test_get_anonymous_id_matches_wire,
+	test_track_before_session_start_lazily_opens_session,
 }
 
 for _, test in ipairs(tests) do

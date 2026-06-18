@@ -216,8 +216,26 @@ local function validate_config(config)
 	if not valid_ingest_url(config.ingest_url) then
 		return nil, "invalid_ingest_url"
 	end
-	if type(config.token_provider) ~= "function" then
-		return nil, "token_provider_required"
+	-- Dual-mode auth (ADR-0222). EITHER a Mode B async `token_provider` (a
+	-- per-tenant ingest JWT minted by the host) OR a Mode A `api_key` (the
+	-- non-secret publishable `sp_ingest_...` key, safe to embed client-side)
+	-- satisfies the config. Mode is selected by presence: a configured
+	-- `token_provider` yields the Bearer (Mode B); otherwise the `api_key` is
+	-- the Bearer (Mode A). Configuring both is rejected so the auth source is
+	-- never ambiguous.
+	if config.token_provider ~= nil and type(config.token_provider) ~= "function" then
+		return nil, "invalid_token_provider"
+	end
+	if config.api_key ~= nil and type(config.api_key) ~= "string" then
+		return nil, "invalid_api_key"
+	end
+	local has_token_provider = type(config.token_provider) == "function"
+	local has_api_key = type(config.api_key) == "string" and config.api_key ~= ""
+	if has_token_provider and has_api_key then
+		return nil, "auth_mode_conflict"
+	end
+	if not has_token_provider and not has_api_key then
+		return nil, "auth_required"
 	end
 	local source = config.source or "client"
 	if source ~= "client" and source ~= "server" and source ~= "backend" then
@@ -260,6 +278,7 @@ local function validate_config(config)
 		platform = config.platform or platform.detect(),
 		transport = config.transport,
 		token_provider = config.token_provider,
+		api_key = has_api_key and config.api_key or nil,
 		diagnostics = config.diagnostics,
 		batch_size = batch_size,
 		buffer_size = buffer_size,
@@ -359,6 +378,14 @@ function Client:set_anonymous_id(anonymous_id)
 	self.anonymous_id = anonymous_id
 	self:persist_identity()
 	return true
+end
+
+-- Expose the persisted anonymous ID so the host can hand it to its own backend
+-- at JWT-mint time (the backend signs `bind_anon` = this value). The SDK
+-- guarantees CONSISTENCY — it always sends, on the wire, the same anonymous_id
+-- it returns here — but it does not itself verify the bind.
+function Client:get_anonymous_id()
+	return self.anonymous_id
 end
 
 function Client:set_consent(analytics_granted)
@@ -541,6 +568,15 @@ function Client:track(event_name, props, context)
 		self.stats.dropped = self.stats.dropped + 1
 		return false, context_err
 	end
+	-- The server requires session_id for non-backend sources; an event tracked
+	-- before session_start() would otherwise ship with no session_id and the
+	-- whole batch would be 400-rejected. Lazily open a session so a session_id
+	-- is always present. An explicit session_start() still renews the session.
+	if self.session_id == nil and self.config.source ~= "backend" then
+		self.session_id = "session-" .. id.uuid()
+		self.session_sequence = 0
+		self.session_active = true
+	end
 	local event = {
 		event_id = id.uuid(),
 		event_name = event_name,
@@ -598,6 +634,15 @@ function Client:enqueue_summaries()
 end
 
 function Client:refresh_token()
+	-- Mode A (ADR-0222): no async token_provider is configured, so the standing
+	-- Bearer is the non-secret publishable `api_key`. It never expires and is
+	-- restored synchronously here (including after a 401 clears self.token), so
+	-- the publish/consent paths treat the api_key exactly like a yielded JWT.
+	if self.config.api_key then
+		self.token = self.config.api_key
+		self.token_expires_at_ms = nil
+		return true
+	end
 	if self.token_request_in_flight then
 		return false
 	end

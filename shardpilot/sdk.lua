@@ -36,6 +36,10 @@ function M.set_anonymous_id(anonymous_id)
 	return with_default("set_anonymous_id", anonymous_id)
 end
 
+function M.get_anonymous_id()
+	return with_default("get_anonymous_id")
+end
+
 function M.set_consent(analytics_granted)
 	return with_default("set_consent", analytics_granted)
 end
