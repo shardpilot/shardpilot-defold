@@ -993,6 +993,55 @@ local function test_set_anonymous_id_allowed_while_pending_mode_a()
 	storage.reset()
 end
 
+local function test_set_anonymous_id_remints_token_after_rotation_mode_b()
+	reset()
+	storage.reset()
+	local token_calls = 0
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			token_calls = token_calls + 1
+			callback("token-" .. tostring(token_calls), nil, nil)
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("first"))
+	next_status = 202
+	assert_true(client:flush())
+	assert_equal(token_calls, 1)
+	assert_equal(requests[1].headers["Authorization"], "Bearer token-1")
+
+	-- Queue drained: rotate the anon. The cached token-1 was minted with
+	-- bind_anon = the old anon, so it must be dropped or the next publish would
+	-- ship the new anon under a Bearer bound to the old one.
+	assert_true(client:set_anonymous_id("anon-rotated"))
+	assert_equal(client.token, nil, "rotating the anon must drop the cached Mode B token")
+
+	assert_true(client:track("second"))
+	assert_true(client:flush())
+	assert_equal(token_calls, 2, "a rotated anon must force a fresh token mint")
+	assert_equal(requests[2].headers["Authorization"], "Bearer token-2")
+	storage.reset()
+end
+
+local function test_diagnose_tolerates_non_string_fields()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a()))
+	-- Server diagnostic fields come straight from the response; a malformed body
+	-- with a non-string status/code must never crash the publish path.
+	local ok = pcall(function()
+		client:diagnose({ scope = "event", status = { weird = true }, code = false })
+	end)
+	assert_true(ok, "diagnose must not error on non-string status/code")
+	-- Scalars are coerced; a numeric code is appended.
+	client:diagnose({ scope = "event", status = "rejected", code = 422 })
+	assert_equal(client:snapshot().last_event_issue, "rejected:422")
+	-- A boolean status coerces to its string form.
+	client:diagnose({ scope = "event", status = true })
+	assert_equal(client:snapshot().last_event_issue, "true")
+	storage.reset()
+end
+
 local function test_stale_unauthorized_consent_does_not_resurrect_old_decision()
 	reset()
 	storage.reset()
@@ -1901,6 +1950,8 @@ local tests = {
 	test_mode_a_401_drops_pending_consent,
 	test_set_anonymous_id_rejected_while_events_pending_mode_b,
 	test_set_anonymous_id_allowed_while_pending_mode_a,
+	test_set_anonymous_id_remints_token_after_rotation_mode_b,
+	test_diagnose_tolerates_non_string_fields,
 	test_stale_unauthorized_consent_does_not_resurrect_old_decision,
 	test_shutdown_waits_for_deferred_consent,
 	test_set_consent_reports_persist_failure,

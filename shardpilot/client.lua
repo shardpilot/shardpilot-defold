@@ -382,12 +382,21 @@ function Client:set_anonymous_id(anonymous_id)
 	-- token to the new anon but ship a payload carrying the old one, and the
 	-- server rejects the whole batch. Require the host to flush first so the
 	-- queued/in-flight anon and the next minted bind_anon stay aligned.
-	if self.config.token_provider and anonymous_id ~= self.anonymous_id
-		and (queue.size(self.queue) > 0 or self.in_flight_batch ~= nil) then
+	local rotating = self.config.token_provider and anonymous_id ~= self.anonymous_id
+	if rotating and (queue.size(self.queue) > 0 or self.in_flight_batch ~= nil) then
 		return false, "events_pending"
 	end
 	self.anonymous_id = anonymous_id
 	self:persist_identity()
+	if rotating then
+		-- A cached Mode B JWT was minted with bind_anon = the OLD anon. Even with
+		-- the queue drained, can_publish() would reuse that still-valid token on
+		-- the next flush, shipping the NEW anon under a Bearer bound to the old
+		-- one (server rejects). Drop the cached token so the next publish mints a
+		-- fresh one bound to the new anon.
+		self.token = nil
+		self.token_expires_at_ms = nil
+	end
 	return true
 end
 
@@ -732,11 +741,32 @@ local function is_retryable_publish_failure(err, unauthorized, retryable, mode_b
 		(type(err) == "string" and err:match("^transient_5%d%d$") ~= nil)
 end
 
+-- diag_field coerces a server-supplied diagnostic field (status/code) to a safe
+-- string for the snapshot. These values come straight from the ingest response,
+-- so a malformed or proxy-mangled body could carry a non-string (number/boolean/
+-- table). Concatenating a non-scalar raises a Lua error, which — happening inside
+-- the batch callback — would abort flush(); coerce scalars and drop the rest.
+local function diag_field(value)
+	local t = type(value)
+	if t == "string" then
+		return value
+	elseif t == "number" or t == "boolean" then
+		return tostring(value)
+	end
+	return ""
+end
+
 -- Surface a per-event or batch issue through the optional diagnostics hook and
 -- record it on the snapshot so an integrator learns their events were
 -- observed/rejected/suppressed inside an otherwise "successful" 202.
 function Client:diagnose(issue)
-	self.stats.last_event_issue = issue.status .. (issue.code and (":" .. issue.code) or "")
+	local status = diag_field(issue.status)
+	local code = diag_field(issue.code)
+	if code ~= "" then
+		self.stats.last_event_issue = status .. ":" .. code
+	else
+		self.stats.last_event_issue = status
+	end
 	local hook = self.config.diagnostics
 	if type(hook) == "function" then
 		-- The hook is integrator code; never let it break the publish path.
