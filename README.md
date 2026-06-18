@@ -39,9 +39,11 @@ shardpilot.init({
   app_version = "game-version",
   app_build = "100",
   source = "client",
+  -- Auth: configure exactly one of token_provider (Mode B) or api_key (Mode A).
   token_provider = function(callback)
     callback("client-token-placeholder", expires_at_unix_ms, nil)
   end,
+  -- api_key = "sp_ingest_...", -- Mode A alternative (publishable key)
 })
 
 shardpilot.identify("user-123")
@@ -69,6 +71,23 @@ client:flush()
 client:shutdown("app_final")
 ```
 
+## Authentication
+
+The ingest endpoint accepts two credential kinds and the SDK supports both
+(ADR-0222). Configure exactly one:
+
+- **Mode B — `token_provider`**: an async function that yields a short-lived
+  per-tenant ingest JWT minted by your backend. The SDK manages refresh,
+  expiry-lead, and 401-retry.
+- **Mode A — `api_key`**: the non-secret publishable `sp_ingest_...` key, used
+  directly as the `Bearer`. It is safe to embed client-side, never expires, and
+  needs no token round-trip.
+
+Mode is selected by presence: a configured `token_provider` is used (Mode B);
+otherwise the `api_key` is the standing Bearer (Mode A). Configuring both is
+rejected (`auth_mode_conflict`); configuring neither is rejected
+(`auth_required`). `anonymous_id` is always sent on the wire in both modes.
+
 ## Identity And Consent
 
 The SDK generates a UUIDv7 anonymous ID on first init and persists it through
@@ -78,7 +97,9 @@ configured app, so two games on the same device never share an anonymous ID
 or consent decision. When the Defold `sys` API is unavailable (for example
 plain Lua test hosts), the record degrades gracefully to in-memory state for
 the process lifetime. `identify(user_id)` upgrades attribution to a known
-user.
+user. `get_anonymous_id()` returns the persisted anonymous ID so a host can
+hand it to its own backend at token-mint time (Mode B); the SDK always sends,
+on the wire, the same anonymous ID it returns.
 
 `set_consent(analytics_granted)` records a tri-state analytics consent
 decision: `unknown` (default, fully open), `granted`, or `denied`. Denied

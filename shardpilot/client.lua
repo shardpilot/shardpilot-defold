@@ -125,6 +125,48 @@ local function valid_identity(value)
 	return type(value) == "string" and value ~= ""
 end
 
+-- Decode a server JSON body when a decoder is available (the real Defold
+-- runtime exposes json.decode; the test stub may not). Returns the decoded
+-- table or nil; never throws.
+local function decode_body(body)
+	if type(body) ~= "string" or body == "" then
+		return nil
+	end
+	if not json or type(json.decode) ~= "function" then
+		return nil
+	end
+	local ok, decoded = pcall(json.decode, body)
+	if not ok or type(decoded) ~= "table" then
+		return nil
+	end
+	return decoded
+end
+
+local function to_count(value)
+	if type(value) == "number" and value >= 0 then
+		return math.floor(value)
+	end
+	return 0
+end
+
+-- Defer the next publish attempt by at least the given whole seconds. Clamped
+-- to a sane upper bound so a hostile/garbage header cannot park the client for
+-- a month; a missing value leaves the deadline untouched.
+local max_publish_defer_seconds = 86400
+
+local function defer_publish(client, seconds)
+	if type(seconds) ~= "number" or seconds <= 0 then
+		return
+	end
+	if seconds > max_publish_defer_seconds then
+		seconds = max_publish_defer_seconds
+	end
+	local deadline = clock.unix_ms() + math.floor(seconds * 1000)
+	if not client.publish_retry_after_ms or deadline > client.publish_retry_after_ms then
+		client.publish_retry_after_ms = deadline
+	end
+end
+
 local function normalize_integer(value, default_value, min_value, max_value, error_code)
 	if value == nil then
 		return default_value
@@ -174,8 +216,26 @@ local function validate_config(config)
 	if not valid_ingest_url(config.ingest_url) then
 		return nil, "invalid_ingest_url"
 	end
-	if type(config.token_provider) ~= "function" then
-		return nil, "token_provider_required"
+	-- Dual-mode auth (ADR-0222). EITHER a Mode B async `token_provider` (a
+	-- per-tenant ingest JWT minted by the host) OR a Mode A `api_key` (the
+	-- non-secret publishable `sp_ingest_...` key, safe to embed client-side)
+	-- satisfies the config. Mode is selected by presence: a configured
+	-- `token_provider` yields the Bearer (Mode B); otherwise the `api_key` is
+	-- the Bearer (Mode A). Configuring both is rejected so the auth source is
+	-- never ambiguous.
+	if config.token_provider ~= nil and type(config.token_provider) ~= "function" then
+		return nil, "invalid_token_provider"
+	end
+	if config.api_key ~= nil and type(config.api_key) ~= "string" then
+		return nil, "invalid_api_key"
+	end
+	local has_token_provider = type(config.token_provider) == "function"
+	local has_api_key = type(config.api_key) == "string" and config.api_key ~= ""
+	if has_token_provider and has_api_key then
+		return nil, "auth_mode_conflict"
+	end
+	if not has_token_provider and not has_api_key then
+		return nil, "auth_required"
 	end
 	local source = config.source or "client"
 	if source ~= "client" and source ~= "server" and source ~= "backend" then
@@ -204,6 +264,9 @@ local function validate_config(config)
 	if token_refresh_lead_ms == nil then
 		return nil, token_refresh_lead_err
 	end
+	if config.diagnostics ~= nil and type(config.diagnostics) ~= "function" then
+		return nil, "invalid_diagnostics"
+	end
 	local out = {
 		ingest_url = trim_slash(config.ingest_url),
 		workspace_id = config.workspace_id,
@@ -215,6 +278,8 @@ local function validate_config(config)
 		platform = config.platform or platform.detect(),
 		transport = config.transport,
 		token_provider = config.token_provider,
+		api_key = has_api_key and config.api_key or nil,
+		diagnostics = config.diagnostics,
 		batch_size = batch_size,
 		buffer_size = buffer_size,
 		flush_interval_seconds = flush_interval_seconds,
@@ -256,17 +321,22 @@ function M.new(config)
 			accepted = 0,
 			rejected = 0,
 			duplicates = 0,
+			observed = 0,
+			suppressed = 0,
 			consent_recorded = 0,
 			consent_failed = 0,
 			consent_persist_failed = 0,
 			last_consent_error = nil,
 			last_error = nil,
+			last_event_issue = nil,
 		},
 		token = nil,
 		token_expires_at_ms = nil,
 		token_request_in_flight = false,
 		in_flight_batch = nil,
 		publish_in_flight = false,
+		publish_retry_after_ms = nil,
+		publish_backoff_attempt = 0,
 		user_id = valid_identity(config.user_id) and config.user_id or nil,
 		anonymous_id = anonymous_id,
 		consent_state = consent_state,
@@ -305,9 +375,49 @@ function Client:set_anonymous_id(anonymous_id)
 	if not valid_identity(anonymous_id) then
 		return false, "invalid_anonymous_id"
 	end
+	-- Mode B (ADR-0222): the host's token_provider mints `bind_anon` from the
+	-- anonymous_id returned by get_anonymous_id() at flush time, while events
+	-- already queued (or in flight) carry the previous anon snapshot taken at
+	-- track() time. Rotating the anon while a batch is pending would bind the
+	-- token to the new anon but ship a payload carrying the old one, and the
+	-- server rejects the whole batch. Require the host to flush first so the
+	-- queued/in-flight anon and the next minted bind_anon stay aligned.
+	-- Block rotation while any work bound to the OLD anon is pending, or a later
+	-- mint/send would pair the new anon with old-anon data and be rejected:
+	--   * queued / in-flight events carry the old anon snapshot;
+	--   * token_request_in_flight: an async mint (e.g. a set_consent receipt) is
+	--     running with the old anon and its callback would cache a stale-bind_anon
+	--     JWT after we rotate;
+	--   * pending_consent: a retained consent receipt carries the old anon
+	--     actor_identifier and survives even after the token request settles (e.g.
+	--     a token_provider error leaves it queued); its retry would mint for the
+	--     new anon but send the old actor.
+	-- The host retries the rotation once the pending work clears.
+	local rotating = self.config.token_provider and anonymous_id ~= self.anonymous_id
+	if rotating and (queue.size(self.queue) > 0 or self.in_flight_batch ~= nil
+		or self.token_request_in_flight or self.pending_consent ~= nil) then
+		return false, "events_pending"
+	end
 	self.anonymous_id = anonymous_id
 	self:persist_identity()
+	if rotating then
+		-- A cached Mode B JWT was minted with bind_anon = the OLD anon. Even with
+		-- the queue drained, can_publish() would reuse that still-valid token on
+		-- the next flush, shipping the NEW anon under a Bearer bound to the old
+		-- one (server rejects). Drop the cached token so the next publish mints a
+		-- fresh one bound to the new anon.
+		self.token = nil
+		self.token_expires_at_ms = nil
+	end
 	return true
+end
+
+-- Expose the persisted anonymous ID so the host can hand it to its own backend
+-- at JWT-mint time (the backend signs `bind_anon` = this value). The SDK
+-- guarantees CONSISTENCY — it always sends, on the wire, the same anonymous_id
+-- it returns here — but it does not itself verify the bind.
+function Client:get_anonymous_id()
+	return self.anonymous_id
 end
 
 function Client:set_consent(analytics_granted)
@@ -330,6 +440,12 @@ function Client:set_consent(analytics_granted)
 		if cleared > 0 then
 			self.stats.dropped = self.stats.dropped + cleared
 		end
+		-- Any 429/transport backoff deferral was set for the now-discarded batch,
+		-- so it is stale. Clear it (and the backoff attempt count) or a later
+		-- granted batch queued before the old deadline would be blocked until it
+		-- expires — up to a 24h Retry-After — even though that batch is gone.
+		self.publish_retry_after_ms = nil
+		self.publish_backoff_attempt = 0
 	end
 	local persisted = self:persist_identity()
 	if not persisted then
@@ -391,11 +507,14 @@ function Client:try_send_pending_consent()
 		if unauthorized then
 			self.token = nil
 			self.token_expires_at_ms = nil
-			-- An auth failure must not lose the decision: retain it for a
-			-- retry with a fresh token at the next dispatch point — unless a
-			-- newer set_consent decision superseded it meanwhile (the latest
-			-- decision wins; a stale payload is never resurrected).
-			if self.consent_decision_seq == decision_seq and self.pending_consent == nil then
+			-- A Mode B auth failure must not lose the decision: retain it for a
+			-- retry with a freshly minted token at the next dispatch point —
+			-- unless a newer set_consent decision superseded it meanwhile (the
+			-- latest decision wins; a stale payload is never resurrected). In
+			-- Mode A the static key cannot change, so a 401 is terminal: drop the
+			-- decision rather than replaying it forever against the same key.
+			if self.config.token_provider ~= nil
+				and self.consent_decision_seq == decision_seq and self.pending_consent == nil then
 				self.pending_consent = payload
 			end
 		end
@@ -490,6 +609,17 @@ function Client:track(event_name, props, context)
 		self.stats.dropped = self.stats.dropped + 1
 		return false, context_err
 	end
+	-- The server requires session_id for non-backend sources; an event tracked
+	-- before session_start() would otherwise ship with no session_id and the
+	-- whole batch would be 400-rejected. Lazily open a session so a session_id
+	-- is always present. An explicit session_start() still renews the session.
+	local opened_lazy_session = false
+	if self.session_id == nil and self.config.source ~= "backend" then
+		self.session_id = "session-" .. id.uuid()
+		self.session_sequence = 0
+		self.session_active = true
+		opened_lazy_session = true
+	end
 	local event = {
 		event_id = id.uuid(),
 		event_name = event_name,
@@ -503,6 +633,15 @@ function Client:track(event_name, props, context)
 	}
 	local ok = queue.push(self.queue, event)
 	if not ok then
+		-- The lazy session above was committed before the push. If the push
+		-- fails the event never enters the queue, so roll the session back —
+		-- otherwise update()/shutdown() would later sample or emit a
+		-- session_end for a session that carries no events.
+		if opened_lazy_session then
+			self.session_id = nil
+			self.session_sequence = 0
+			self.session_active = false
+		end
 		self.stats.dropped = self.stats.dropped + 1
 		return false, "queue_full"
 	end
@@ -547,6 +686,15 @@ function Client:enqueue_summaries()
 end
 
 function Client:refresh_token()
+	-- Mode A (ADR-0222): no async token_provider is configured, so the standing
+	-- Bearer is the non-secret publishable `api_key`. It never expires and is
+	-- restored synchronously here (including after a 401 clears self.token), so
+	-- the publish/consent paths treat the api_key exactly like a yielded JWT.
+	if self.config.api_key then
+		self.token = self.config.api_key
+		self.token_expires_at_ms = nil
+		return true
+	end
 	if self.token_request_in_flight then
 		return false
 	end
@@ -593,20 +741,172 @@ function Client:can_publish()
 	return true
 end
 
-local function is_retryable_publish_failure(err, unauthorized, retryable)
+local function is_retryable_publish_failure(err, unauthorized, retryable, mode_b)
+	-- An auth failure's retryability is a mode concern and overrides any
+	-- transport-supplied `retryable` hint (the transport is mode-agnostic and
+	-- flags every 401 as retryable). A 401 is only worth retrying when a
+	-- token_provider (Mode B) can mint a fresh JWT on the next attempt; in
+	-- Mode A the Bearer is the static publishable key, so a retry would replay
+	-- the same unauthorized request forever and wedge the retained batch —
+	-- treat it as terminal and drop.
+	if unauthorized or err == "unauthorized" then
+		return mode_b == true
+	end
 	if retryable ~= nil then
 		return retryable
 	end
-	if unauthorized then
-		return true
-	end
-	return err == "http_0" or err == "http_unavailable" or err == "unauthorized" or err == "transient_429" or
+	return err == "http_0" or err == "http_unavailable" or err == "transient_429" or
 		(type(err) == "string" and err:match("^transient_5%d%d$") ~= nil)
+end
+
+-- diag_field coerces a server-supplied diagnostic field (status/code) to a safe
+-- string for the snapshot. These values come straight from the ingest response,
+-- so a malformed or proxy-mangled body could carry a non-string (number/boolean/
+-- table). Concatenating a non-scalar raises a Lua error, which — happening inside
+-- the batch callback — would abort flush(); coerce scalars and drop the rest.
+local function diag_field(value)
+	local t = type(value)
+	if t == "string" then
+		return value
+	elseif t == "number" or t == "boolean" then
+		return tostring(value)
+	end
+	return ""
+end
+
+-- Surface a per-event or batch issue through the optional diagnostics hook and
+-- record it on the snapshot so an integrator learns their events were
+-- observed/rejected/suppressed inside an otherwise "successful" 202.
+function Client:diagnose(issue)
+	local status = diag_field(issue.status)
+	local code = diag_field(issue.code)
+	if code ~= "" then
+		self.stats.last_event_issue = status .. ":" .. code
+	else
+		self.stats.last_event_issue = status
+	end
+	local hook = self.config.diagnostics
+	if type(hook) == "function" then
+		-- The hook is integrator code; never let it break the publish path.
+		pcall(hook, issue)
+	end
+end
+
+-- Parse a 202 batch body: keep the aggregate counters and surface every
+-- non-accepted per-event outcome (observed / duplicate / rejected /
+-- suppressed_no_consent). A 202 is NOT treated as full per-event success.
+-- "duplicate" is terminal, not retryable: the batch is already cleared by the
+-- success path, so nothing is re-sent here.
+function Client:apply_batch_response(body, batch_count)
+	local decoded = decode_body(body)
+	if not decoded then
+		-- No parseable body (or no decoder in this runtime): fall back to the
+		-- legacy aggregate assumption so counters never regress.
+		self.stats.accepted = self.stats.accepted + batch_count
+		return
+	end
+	local accepted = to_count(decoded.accepted)
+	local rejected = to_count(decoded.rejected)
+	local duplicates = to_count(decoded.duplicates)
+	self.stats.accepted = self.stats.accepted + accepted
+	self.stats.rejected = self.stats.rejected + rejected
+	self.stats.duplicates = self.stats.duplicates + duplicates
+	if type(decoded.events) ~= "table" then
+		return
+	end
+	for _, entry in ipairs(decoded.events) do
+		if type(entry) == "table" then
+			local status = entry.status
+			if status == "observed" then
+				self.stats.observed = self.stats.observed + 1
+			elseif status == "suppressed_no_consent" then
+				self.stats.suppressed = self.stats.suppressed + 1
+			end
+			if status ~= nil and status ~= "accepted" then
+				self:diagnose({
+					scope = "event",
+					event_id = entry.event_id,
+					status = status,
+					code = entry.code,
+					message = entry.message,
+				})
+			end
+		end
+	end
+end
+
+-- Parse the { error: { code, message, details:[{field,code,message}] } }
+-- envelope on a non-2xx response and surface error.code plus the detail codes
+-- through diagnostics, instead of leaving only the bare transport status. Any
+-- token material stays out of the issue (only server-returned fields are read).
+function Client:apply_error_envelope(err, response)
+	local body = type(response) == "table" and response.response or nil
+	local decoded = decode_body(body)
+	local error_obj = decoded and decoded.error
+	if type(error_obj) ~= "table" then
+		return
+	end
+	local detail_codes = nil
+	if type(error_obj.details) == "table" then
+		for _, detail in ipairs(error_obj.details) do
+			if type(detail) == "table" and detail.code then
+				detail_codes = detail_codes or {}
+				detail_codes[#detail_codes + 1] = detail.code
+			end
+		end
+	end
+	if error_obj.code then
+		self.stats.last_error = err .. ":" .. tostring(error_obj.code)
+	end
+	self:diagnose({
+		scope = "batch",
+		status = "rejected",
+		code = error_obj.code,
+		message = error_obj.message,
+		detail_codes = detail_codes,
+	})
+end
+
+-- Exponential-backoff-with-jitter fallback used when a retryable transport /
+-- backpressure failure carries no Retry-After header. The first failure
+-- retries on the next flush cadence without an extra wait; sustained failures
+-- back off (doubling per consecutive failure up to a cap). A successful
+-- publish resets the attempt counter.
+local backoff_base_seconds = 1
+local backoff_cap_seconds = 60
+
+function Client:defer_backoff()
+	self.publish_backoff_attempt = self.publish_backoff_attempt + 1
+	if self.publish_backoff_attempt < 2 then
+		-- First consecutive failure: retry on the next dispatch without a wait.
+		return
+	end
+	local exp = self.publish_backoff_attempt - 2
+	if exp > 16 then
+		exp = 16
+	end
+	local ceiling = backoff_base_seconds * (2 ^ exp)
+	if ceiling > backoff_cap_seconds then
+		ceiling = backoff_cap_seconds
+	end
+	-- Full jitter in [base, ceiling]; never below the base so we always wait.
+	local seconds = backoff_base_seconds + math.random() * (ceiling - backoff_base_seconds)
+	defer_publish(self, seconds)
+end
+
+function Client:publish_deferred()
+	return self.publish_retry_after_ms ~= nil and clock.unix_ms() < self.publish_retry_after_ms
 end
 
 function Client:start_publish_batch()
 	if self.publish_in_flight or not self.in_flight_batch or #self.in_flight_batch == 0 then
 		return true, false, true
+	end
+	-- Backpressure: a 429 Retry-After (or backoff) deferral is still in effect.
+	-- Hold the batch (it stays retained in in_flight_batch) and report
+	-- not-dispatched so flush returns without republishing before the deadline.
+	if self:publish_deferred() then
+		return false, false, false
 	end
 	local events = self.in_flight_batch
 	if not events.payload then
@@ -619,13 +919,22 @@ function Client:start_publish_batch()
 	self.publish_in_flight = true
 	local completed = false
 	local succeeded = false
-	local dispatched = transport.publish(self.config, self.token, events.payload, function(ok, err, unauthorized, retryable)
+	local batch_count = #events
+	local dispatched = transport.publish(self.config, self.token, events.payload, function(ok, err, unauthorized, retryable, response, retry_after)
 		completed = true
 		succeeded = ok == true
 		self.publish_in_flight = false
 		if ok then
-			self.stats.published = self.stats.published + #events
-			self.stats.accepted = self.stats.accepted + #events
+			self.stats.published = self.stats.published + batch_count
+			-- A successful publish clears any backpressure deferral/backoff.
+			self.publish_retry_after_ms = nil
+			self.publish_backoff_attempt = 0
+			-- A 202 is NOT full per-event success: parse the body so observed /
+			-- rejected / suppressed_no_consent outcomes are surfaced instead of
+			-- silently counted as accepted. Duplicates are terminal; the batch
+			-- is cleared here either way and never re-sent.
+			local body = type(response) == "table" and response.response or nil
+			self:apply_batch_response(body, batch_count)
 			if self.in_flight_batch == events then
 				self.in_flight_batch = nil
 			end
@@ -633,17 +942,36 @@ function Client:start_publish_batch()
 		end
 		self.stats.failed_batches = self.stats.failed_batches + 1
 		self.stats.last_error = err
+		-- Surface the server error envelope (error.code + detail codes) on a
+		-- non-2xx instead of leaving only the bare transport status.
+		self:apply_error_envelope(err, response)
+		-- Backpressure: honor a 429 Retry-After (whole seconds) by deferring the
+		-- next publish attempt at least that long. Absent a header, fall back to
+		-- exponential backoff with jitter on a transient transport/backpressure
+		-- failure. A 401 is an auth problem, not backpressure: in Mode B it drops
+		-- the stale JWT and retries immediately with a freshly minted one (never
+		-- deferred); in Mode A the static key cannot change, so it is terminal.
+		local mode_b = self.config.token_provider ~= nil
+		-- A batch is retained for retry only when the failure is retryable AND
+		-- consent has not been denied meanwhile; a denial recorded while the
+		-- publish was in flight must drop the batch instead of republishing it. A
+		-- Mode A 401 is non-retryable, so the batch is dropped here too. Compute
+		-- this FIRST so the deferral below is only set for a batch we keep.
+		local retain = is_retryable_publish_failure(err, unauthorized, retryable, mode_b) and self.consent_state ~= "denied"
 		if unauthorized then
 			self.token = nil
 			self.token_expires_at_ms = nil
+		-- Defer the next publish ONLY for a retained batch. Deferring for a batch
+		-- about to be dropped (denied meanwhile) would leave a stale deadline that
+		-- blocks a later granted batch for the whole Retry-After/backoff window
+		-- (up to the 24h clamp). A 401 is never deferred (handled above).
+		elseif retain and retry_after and retry_after > 0 then
+			defer_publish(self, retry_after)
+		elseif retain and is_retryable_publish_failure(err, unauthorized, retryable, mode_b) then
+			self:defer_backoff()
 		end
-		-- A batch is retained for retry only when the failure is retryable
-		-- AND consent has not been denied meanwhile; a denial recorded while
-		-- the publish was in flight must drop the batch here instead of
-		-- letting the next flush republish it.
-		local retain = is_retryable_publish_failure(err, unauthorized, retryable) and self.consent_state ~= "denied"
 		if not retain and self.in_flight_batch == events then
-			self.stats.dropped = self.stats.dropped + #events
+			self.stats.dropped = self.stats.dropped + batch_count
 			self.in_flight_batch = nil
 		end
 	end)

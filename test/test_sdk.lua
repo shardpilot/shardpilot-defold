@@ -16,6 +16,8 @@ sys = {
 
 local requests = {}
 local next_status = 202
+local next_response_body = nil
+local next_response_headers = nil
 
 http = {
 	request = function(url, method, callback, headers, body, options)
@@ -26,7 +28,11 @@ http = {
 			body = body,
 			options = options,
 		}
-		callback(nil, nil, { status = next_status, response = '{"accepted":1}' })
+		local response = { status = next_status, response = next_response_body or '{"accepted":1}' }
+		if next_response_headers then
+			response.headers = next_response_headers
+		end
+		callback(nil, nil, response)
 	end,
 }
 
@@ -76,8 +82,114 @@ local function encode_value(value)
 	return encode_string(value)
 end
 
+-- A minimal recursive-descent JSON decoder, sufficient for the server bodies
+-- the SDK parses in tests (objects, arrays, strings, numbers, booleans, null).
+-- Real Defold ships json.decode; the SDK uses it only when present.
+local function json_decode(text)
+	local pos = 1
+	local parse_value
+
+	local function skip_ws()
+		local _, stop = string.find(text, "^[ \t\r\n]*", pos)
+		pos = stop + 1
+	end
+
+	local function parse_string()
+		pos = pos + 1 -- opening quote
+		local parts = {}
+		while pos <= #text do
+			local ch = string.sub(text, pos, pos)
+			if ch == '"' then
+				pos = pos + 1
+				return table.concat(parts)
+			elseif ch == "\\" then
+				local esc = string.sub(text, pos + 1, pos + 1)
+				local map = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", n = "\n", t = "\t", r = "\r", b = "\b", f = "\f" }
+				parts[#parts + 1] = map[esc] or esc
+				pos = pos + 2
+			else
+				parts[#parts + 1] = ch
+				pos = pos + 1
+			end
+		end
+		error("unterminated string")
+	end
+
+	local function parse_object()
+		pos = pos + 1 -- {
+		local out = {}
+		skip_ws()
+		if string.sub(text, pos, pos) == "}" then
+			pos = pos + 1
+			return out
+		end
+		while true do
+			skip_ws()
+			local key = parse_string()
+			skip_ws()
+			pos = pos + 1 -- :
+			skip_ws()
+			out[key] = parse_value()
+			skip_ws()
+			local ch = string.sub(text, pos, pos)
+			pos = pos + 1
+			if ch == "}" then
+				return out
+			end
+		end
+	end
+
+	local function parse_array()
+		pos = pos + 1 -- [
+		local out = {}
+		skip_ws()
+		if string.sub(text, pos, pos) == "]" then
+			pos = pos + 1
+			return out
+		end
+		while true do
+			skip_ws()
+			out[#out + 1] = parse_value()
+			skip_ws()
+			local ch = string.sub(text, pos, pos)
+			pos = pos + 1
+			if ch == "]" then
+				return out
+			end
+		end
+	end
+
+	parse_value = function()
+		skip_ws()
+		local ch = string.sub(text, pos, pos)
+		if ch == "{" then
+			return parse_object()
+		elseif ch == "[" then
+			return parse_array()
+		elseif ch == '"' then
+			return parse_string()
+		elseif ch == "t" then
+			pos = pos + 4
+			return true
+		elseif ch == "f" then
+			pos = pos + 5
+			return false
+		elseif ch == "n" then
+			pos = pos + 4
+			return nil
+		else
+			local number = string.match(text, "^%-?%d+%.?%d*[eE]?[%+%-]?%d*", pos)
+			pos = pos + #number
+			return tonumber(number)
+		end
+	end
+
+	return parse_value()
+end
+
 json = {
 	encode = encode_value,
+	decode = json_decode,
 }
 
 local sdk = require "shardpilot.sdk"
@@ -149,9 +261,20 @@ local function config(overrides)
 	return out
 end
 
+-- A Mode A (publishable-key) config: no token_provider, an sp_ingest_ api_key
+-- used directly as the Bearer. Starts from config() and strips token_provider.
+local function config_mode_a(overrides)
+	local out = config(overrides)
+	out.token_provider = nil
+	out.api_key = (overrides and overrides.api_key) or "sp_ingest_publishable_key"
+	return out
+end
+
 local function reset()
 	requests = {}
 	next_status = 202
+	next_response_body = nil
+	next_response_headers = nil
 end
 
 local function test_config_validation()
@@ -201,6 +324,46 @@ local function test_config_validation()
 	assert_equal(client.config.buffer_size, 200)
 	assert_equal(client.config.platform, "linux")
 	assert_equal(client.config.token_refresh_lead_ms, 60000)
+
+	-- Dual-mode auth (ADR-0222): exactly one of token_provider / api_key.
+	-- Neither configured -> auth_required.
+	local no_auth = config()
+	no_auth.token_provider = nil
+	client, err = sdk.new(no_auth)
+	assert_equal(client, nil)
+	assert_equal(err, "auth_required")
+
+	-- Both configured -> auth_mode_conflict (the Bearer source is ambiguous).
+	client, err = sdk.new(config({ api_key = "sp_ingest_publishable_key" }))
+	assert_equal(client, nil)
+	assert_equal(err, "auth_mode_conflict")
+
+	-- An empty-string api_key with no token_provider is not a usable Bearer.
+	local empty_key = config()
+	empty_key.token_provider = nil
+	empty_key.api_key = ""
+	client, err = sdk.new(empty_key)
+	assert_equal(client, nil)
+	assert_equal(err, "auth_required")
+
+	-- A non-string api_key is rejected before mode selection.
+	local bad_key = config()
+	bad_key.token_provider = nil
+	bad_key.api_key = 42
+	client, err = sdk.new(bad_key)
+	assert_equal(client, nil)
+	assert_equal(err, "invalid_api_key")
+
+	-- A non-function token_provider is rejected.
+	client, err = sdk.new(config({ token_provider = "not-a-function" }))
+	assert_equal(client, nil)
+	assert_equal(err, "invalid_token_provider")
+
+	-- Mode A (api_key, no token_provider) is a VALID config.
+	client, err = sdk.new(config_mode_a())
+	assert_true(client, err)
+	assert_equal(client.config.api_key, "sp_ingest_publishable_key")
+	assert_equal(client.config.token_provider, nil)
 end
 
 local function test_app_first_payload()
@@ -735,6 +898,255 @@ local function test_consent_retained_after_unauthorized_and_resent_with_fresh_to
 	assert_contains(requests[2].body, '"categories":{"analytics":true}')
 	assert_equal(client.pending_consent, nil)
 	assert_equal(client:snapshot().consent_recorded, 1)
+	storage.reset()
+end
+
+local function test_lazy_session_rolls_back_on_enqueue_failure()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a({ buffer_size = 1 })))
+	assert_true(client:identify("user-example"))
+	-- Saturate the single-slot queue directly so the FIRST real track() both
+	-- lazily opens a session AND then fails to enqueue.
+	client.queue.items[1] = { event_name = "filler" }
+	assert_equal(client.session_id, nil)
+	local ok, err = client:track("first")
+	assert_equal(ok, false)
+	assert_equal(err, "queue_full")
+	-- The lazy session opened for this event must be rolled back; otherwise a
+	-- later update()/session_end would reference a session that carries no
+	-- enqueued event.
+	assert_equal(client.session_id, nil, "lazy session must roll back on enqueue failure")
+	assert_equal(client.session_active, false)
+	assert_equal(client:snapshot().dropped, 1)
+	storage.reset()
+end
+
+local function test_mode_a_401_drops_batch_without_retry()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("e1"))
+	next_status = 401
+	client:flush()
+	assert_equal(#requests, 1)
+	-- A Mode A 401 means the static publishable key is revoked/misconfigured;
+	-- replaying it would loop forever, so the batch is dropped, not retained.
+	assert_equal(client.in_flight_batch, nil, "Mode A 401 must drop the batch")
+	assert_equal(client:snapshot().dropped, 1)
+	assert_equal(client:snapshot().failed_batches, 1)
+	next_status = 202
+	client:flush()
+	assert_equal(#requests, 1, "Mode A 401 batch must not be retried against the same key")
+	storage.reset()
+end
+
+local function test_mode_a_401_drops_pending_consent()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	next_status = 401
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 1)
+	-- Unlike Mode B (which retains for a fresh-token retry), a Mode A consent
+	-- 401 is terminal: the decision is dropped rather than replayed forever.
+	assert_equal(client.pending_consent, nil, "Mode A 401 must drop the decision")
+	assert_equal(client:snapshot().consent_failed, 1)
+	next_status = 202
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(#requests, 1, "Mode A 401 consent must not be retried against the same key")
+	storage.reset()
+end
+
+local function test_set_anonymous_id_rejected_while_events_pending_mode_b()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("queued"))
+	-- With a Mode B token_provider, rotating the anon while an event is queued
+	-- would bind the next minted token to the new anon while the queued payload
+	-- still carries the old one — a guaranteed server-side batch rejection.
+	local ok, err = client:set_anonymous_id("anon-new")
+	assert_equal(ok, false)
+	assert_equal(err, "events_pending")
+	-- Once the queue is drained the rotation is allowed.
+	next_status = 202
+	assert_true(client:flush())
+	assert_true(client:set_anonymous_id("anon-new"), "rotation allowed once drained")
+	assert_equal(client:get_anonymous_id(), "anon-new")
+	storage.reset()
+end
+
+local function test_set_anonymous_id_allowed_while_pending_mode_a()
+	reset()
+	storage.reset()
+	-- Mode A has no bind_anon enforcement, so the guard must NOT over-restrict:
+	-- rotating the anon while an event is queued stays allowed.
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("queued"))
+	assert_true(client:set_anonymous_id("anon-a"), "Mode A allows rotation while pending")
+	assert_equal(client:get_anonymous_id(), "anon-a")
+	storage.reset()
+end
+
+local function test_set_anonymous_id_remints_token_after_rotation_mode_b()
+	reset()
+	storage.reset()
+	local token_calls = 0
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			token_calls = token_calls + 1
+			callback("token-" .. tostring(token_calls), nil, nil)
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("first"))
+	next_status = 202
+	assert_true(client:flush())
+	assert_equal(token_calls, 1)
+	assert_equal(requests[1].headers["Authorization"], "Bearer token-1")
+
+	-- Queue drained: rotate the anon. The cached token-1 was minted with
+	-- bind_anon = the old anon, so it must be dropped or the next publish would
+	-- ship the new anon under a Bearer bound to the old one.
+	assert_true(client:set_anonymous_id("anon-rotated"))
+	assert_equal(client.token, nil, "rotating the anon must drop the cached Mode B token")
+
+	assert_true(client:track("second"))
+	assert_true(client:flush())
+	assert_equal(token_calls, 2, "a rotated anon must force a fresh token mint")
+	assert_equal(requests[2].headers["Authorization"], "Bearer token-2")
+	storage.reset()
+end
+
+local function test_diagnose_tolerates_non_string_fields()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a()))
+	-- Server diagnostic fields come straight from the response; a malformed body
+	-- with a non-string status/code must never crash the publish path.
+	local ok = pcall(function()
+		client:diagnose({ scope = "event", status = { weird = true }, code = false })
+	end)
+	assert_true(ok, "diagnose must not error on non-string status/code")
+	-- Scalars are coerced; a numeric code is appended.
+	client:diagnose({ scope = "event", status = "rejected", code = 422 })
+	assert_equal(client:snapshot().last_event_issue, "rejected:422")
+	-- A boolean status coerces to its string form.
+	client:diagnose({ scope = "event", status = true })
+	assert_equal(client:snapshot().last_event_issue, "true")
+	storage.reset()
+end
+
+local function test_set_anonymous_id_rejected_while_token_request_in_flight()
+	reset()
+	storage.reset()
+	local token_callback = nil
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			token_callback = callback -- capture, do NOT complete yet
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	-- A consent receipt triggers a Mode B token request that stays in flight
+	-- (bound to the current anon).
+	assert_true(client:set_consent(true))
+	assert_equal(client.token_request_in_flight, true)
+	-- Rotation must be rejected while that request is in flight, or its late
+	-- callback would cache a JWT bound to the pre-rotation anon.
+	local ok, err = client:set_anonymous_id("anon-new")
+	assert_equal(ok, false)
+	assert_equal(err, "events_pending")
+	-- Once the token settles AND the deferred consent (old anon) is delivered,
+	-- rotation is allowed. The token arriving doesn't auto-send the consent; the
+	-- next dispatch does, clearing pending_consent.
+	next_status = 202
+	token_callback("token-1", nil, nil)
+	assert_equal(client.token_request_in_flight, false)
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(client.pending_consent, nil)
+	assert_true(client:set_anonymous_id("anon-new"))
+	assert_equal(client:get_anonymous_id(), "anon-new")
+	storage.reset()
+end
+
+local function test_consent_denial_clears_stale_publish_deferral()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("e1"))
+	-- A 429 with a long Retry-After defers the next publish and retains the batch.
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "3600" }
+	client:flush()
+	assert_true(client.publish_retry_after_ms ~= nil, "429 Retry-After must set a deferral")
+	assert_true(client.in_flight_batch ~= nil, "a retryable 429 retains the batch")
+	-- Denying consent discards the batch; the deferral set for it must not linger
+	-- and block a later granted batch for up to the Retry-After window.
+	next_response_headers = nil
+	assert_true(client:set_consent(false))
+	assert_equal(client.in_flight_batch, nil)
+	assert_equal(client.publish_retry_after_ms, nil, "consent denial must clear the stale deferral")
+	assert_equal(client.publish_backoff_attempt, 0)
+	storage.reset()
+end
+
+local function test_denied_in_flight_429_sets_no_stale_deferral()
+	reset()
+	storage.reset()
+	local original_request = http.request
+	local callbacks = {}
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		callbacks[#callbacks + 1] = callback
+	end
+
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("in_flight_event"))
+	client:flush()
+	assert_equal(client.publish_in_flight, true)
+	assert_equal(#callbacks, 1)
+
+	-- Deny consent while the publish is in flight: the batch can't be aborted
+	-- mid-flight, so it stays attached until the callback completes.
+	assert_true(client:set_consent(false))
+	assert_true(client.in_flight_batch ~= nil)
+
+	-- The in-flight publish now completes with a 429 + Retry-After. Because
+	-- consent was denied, the batch is dropped — so NO deferral must be recorded
+	-- for it (it would otherwise block a later granted batch).
+	callbacks[1](nil, nil, { status = 429, headers = { ["retry-after"] = "3600" } })
+	assert_equal(client.in_flight_batch, nil, "denied batch must be dropped")
+	assert_equal(client.publish_retry_after_ms, nil, "a dropped denied batch must not set a deferral")
+	http.request = original_request
+	storage.reset()
+end
+
+local function test_set_anonymous_id_rejected_while_consent_pending_mode_b()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			-- Settle the request with an error: pending_consent stays queued but
+			-- token_request_in_flight returns to false.
+			callback(nil, nil, "no token")
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:set_consent(true))
+	assert_true(client.pending_consent ~= nil, "consent stays pending after a token error")
+	assert_equal(client.token_request_in_flight, false)
+	-- A consent receipt bound to the OLD anon is still pending, so rotation must
+	-- be blocked even though no token request is in flight.
+	local ok, err = client:set_anonymous_id("anon-new")
+	assert_equal(ok, false)
+	assert_equal(err, "events_pending")
 	storage.reset()
 end
 
@@ -1281,6 +1693,341 @@ local function test_singleton_guard()
 	end
 end
 
+-- L1 §5: a 202 body carries a per-event events[] array; non-accepted outcomes
+-- (observed / rejected / duplicate / suppressed_no_consent) must be surfaced
+-- through the diagnostics hook and the snapshot, not silently counted as
+-- accepted.
+local function test_batch_response_surfaces_per_event_outcomes()
+	reset()
+	storage.reset()
+	local issues = {}
+	local client = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	for i = 1, 4 do
+		assert_true(client:track("event_" .. tostring(i)))
+	end
+
+	next_response_body = '{"accepted":1,"rejected":1,"duplicates":1,"events":['
+		.. '{"event_id":"e1","status":"accepted"},'
+		.. '{"event_id":"e2","status":"observed","code":"event_not_registered"},'
+		.. '{"event_id":"e3","status":"rejected","code":"blocked_event","message":"blocked"},'
+		.. '{"event_id":"e4","status":"duplicate","code":"duplicate_event_id"}'
+		.. ']}'
+	assert_true(client:flush())
+
+	local snapshot = client:snapshot()
+	assert_equal(snapshot.accepted, 1, "aggregate accepted is kept from the body")
+	assert_equal(snapshot.rejected, 1)
+	assert_equal(snapshot.duplicates, 1)
+	assert_equal(snapshot.observed, 1)
+
+	-- three non-accepted per-event outcomes must reach the diagnostics hook
+	assert_equal(#issues, 3)
+	local by_status = {}
+	for _, issue in ipairs(issues) do
+		by_status[issue.status] = issue
+	end
+	assert_true(by_status.observed ~= nil)
+	assert_equal(by_status.observed.event_id, "e2")
+	assert_equal(by_status.observed.code, "event_not_registered")
+	assert_true(by_status.rejected ~= nil)
+	assert_equal(by_status.rejected.code, "blocked_event")
+	assert_true(by_status.duplicate ~= nil)
+	assert_equal(by_status.duplicate.code, "duplicate_event_id")
+	storage.reset()
+end
+
+-- L1 §5: a suppressed_no_consent per-event status surfaces distinctly.
+local function test_batch_response_surfaces_suppressed_no_consent()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("suppressed_event"))
+
+	next_response_body = '{"accepted":0,"rejected":1,"duplicates":0,"events":['
+		.. '{"event_id":"e1","status":"suppressed_no_consent","code":"suppressed_no_consent"}'
+		.. ']}'
+	assert_true(client:flush())
+
+	local snapshot = client:snapshot()
+	assert_equal(snapshot.accepted, 0)
+	assert_equal(snapshot.suppressed, 1)
+	assert_equal(snapshot.last_event_issue, "suppressed_no_consent:suppressed_no_consent")
+	storage.reset()
+end
+
+-- L1 §5: a 202 with no parseable events[] must not regress the accepted count.
+local function test_batch_response_without_events_array_keeps_accepted()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("only_aggregate"))
+
+	next_response_body = '{"accepted":1,"rejected":0,"duplicates":0}'
+	assert_true(client:flush())
+	assert_equal(client:snapshot().accepted, 1)
+	storage.reset()
+end
+
+-- L1 §6: a 429 Retry-After (whole seconds) defers the next publish attempt at
+-- least that long; the batch is retained, not dropped or re-sent immediately.
+local function test_retry_after_defers_next_publish()
+	reset()
+	storage.reset()
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "120" }
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("rate_limited_event"))
+
+	assert_equal(client:flush(), false)
+	assert_equal(#requests, 1)
+	assert_equal(#client.in_flight_batch, 1, "the rate-limited batch is retained")
+	assert_true(client.publish_retry_after_ms ~= nil, "a retry-after deadline is set")
+	assert_true(client:publish_deferred(), "publishing is deferred until the deadline")
+
+	-- a flush during the deferral window must NOT re-send the batch
+	next_status = 202
+	next_response_headers = nil
+	assert_equal(client:flush(), false)
+	assert_equal(#requests, 1, "no publish during the retry-after window")
+
+	-- once the deadline passes the batch is republished
+	client.publish_retry_after_ms = nil
+	assert_true(client:flush())
+	assert_equal(#requests, 2)
+	assert_equal(client.in_flight_batch, nil)
+	storage.reset()
+end
+
+-- L1 §6: a successful publish clears any active backpressure deferral. A
+-- deferral whose deadline has already elapsed does not block the publish.
+local function test_successful_publish_clears_deferral()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	client.publish_retry_after_ms = 1 -- a deadline in the distant past
+	client.publish_backoff_attempt = 3
+	assert_true(not client:publish_deferred(), "an elapsed deadline does not defer")
+	assert_true(client:track("recovered_event"))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_equal(client.publish_retry_after_ms, nil)
+	assert_equal(client.publish_backoff_attempt, 0)
+	storage.reset()
+end
+
+-- L1 §6: sustained transient failures with no Retry-After header back off; the
+-- first failure retries promptly, repeats wait.
+local function test_backoff_on_sustained_transient_failures()
+	reset()
+	storage.reset()
+	next_status = 500
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("transient_event"))
+
+	-- first transient failure: no deferral, retries on the next flush
+	assert_equal(client:flush(), false)
+	assert_equal(client.publish_backoff_attempt, 1)
+	assert_true(not client:publish_deferred(), "first failure does not defer")
+
+	-- second consecutive failure: backs off
+	assert_equal(client:flush(), false)
+	assert_equal(client.publish_backoff_attempt, 2)
+	assert_true(client:publish_deferred(), "sustained failure backs off")
+
+	-- recovery clears the backoff
+	client.publish_retry_after_ms = nil
+	next_status = 202
+	assert_true(client:flush())
+	assert_equal(client.publish_backoff_attempt, 0)
+	storage.reset()
+end
+
+-- L1 §6: the { error: { code, message, details } } envelope on a non-2xx is
+-- parsed and surfaced (error.code + detail codes), not just the bare status.
+local function test_error_envelope_is_surfaced()
+	reset()
+	storage.reset()
+	local issues = {}
+	next_status = 400
+	next_response_body = '{"error":{"code":"validation_failed","message":"bad batch","details":['
+		.. '{"field":"props.level","code":"unknown_property","message":"not allowed"},'
+		.. '{"field":"event_name","code":"blocked_event","message":"blocked"}'
+		.. ']}}'
+	local client = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("invalid_event"))
+
+	assert_equal(client:flush(), false)
+	assert_equal(client:snapshot().last_error, "http_400:validation_failed")
+	assert_equal(#issues, 1)
+	local issue = issues[1]
+	assert_equal(issue.scope, "batch")
+	assert_equal(issue.code, "validation_failed")
+	assert_true(issue.detail_codes ~= nil)
+	assert_equal(issue.detail_codes[1], "unknown_property")
+	assert_equal(issue.detail_codes[2], "blocked_event")
+	-- a 400 stays non-retryable: the batch is dropped, not retained
+	assert_equal(client.in_flight_batch, nil)
+	storage.reset()
+end
+
+-- A diagnostics hook that throws must never break the publish path.
+local function test_diagnostics_hook_errors_are_swallowed()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		diagnostics = function()
+			error("hook blew up")
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("observed_event"))
+	next_response_body = '{"accepted":0,"rejected":0,"duplicates":0,"events":['
+		.. '{"event_id":"e1","status":"observed","code":"event_not_registered"}'
+		.. ']}'
+	assert_true(client:flush(), "a throwing hook must not break flush")
+	assert_equal(client:snapshot().observed, 1)
+	storage.reset()
+end
+
+local function test_invalid_diagnostics_rejected()
+	local client, err = sdk.new(config({ diagnostics = 42 }))
+	assert_equal(client, nil)
+	assert_equal(err, "invalid_diagnostics")
+end
+
+-- ADR-0222 Mode A: a publishable api_key (no token_provider) publishes events
+-- with the api_key as the Bearer, with no token round-trip.
+local function test_mode_a_api_key_is_bearer()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a({ api_key = "sp_ingest_abc123" })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("mode_a_event"))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].url, "http://localhost:8080/v1/events:batch")
+	assert_equal(requests[1].headers["Authorization"], "Bearer sp_ingest_abc123")
+	assert_contains(requests[1].body, '"event_name":"mode_a_event"')
+	storage.reset()
+end
+
+-- ADR-0222 Mode A: the consent decision also rides the publishable api_key.
+local function test_mode_a_consent_uses_api_key_bearer()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a({ api_key = "sp_ingest_consent" })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
+	assert_equal(requests[1].headers["Authorization"], "Bearer sp_ingest_consent")
+	assert_contains(requests[1].body, '"categories":{"analytics":true}')
+	storage.reset()
+end
+
+-- ADR-0222: anonymous_id is ALWAYS sent on the wire for source="client" in
+-- BOTH auth modes. The server requires it; the wave-1 anon-omit rule that the
+-- abandoned client-JWT branch conformed to was deleted server-side, so the SDK
+-- must never strip anonymous_id. (This replaces the abandoned
+-- test_client_source_omits_anonymous_id, asserting the inverse.)
+local function test_client_source_keeps_anonymous_id_both_modes()
+	-- Mode B (token_provider).
+	reset()
+	storage.reset()
+	local mode_b = assert(sdk.new(config()))
+	assert_equal(mode_b.config.source, "client")
+	assert_true(mode_b:set_anonymous_id("anon-mode-b"))
+	assert_true(mode_b:track("client_event_b"))
+	assert_true(mode_b:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"anonymous_id":"anon-mode-b"')
+	assert_contains(requests[1].body, '"event_name":"client_event_b"')
+
+	-- Mode A (publishable api_key).
+	reset()
+	storage.reset()
+	local mode_a = assert(sdk.new(config_mode_a()))
+	assert_equal(mode_a.config.source, "client")
+	assert_true(mode_a:set_anonymous_id("anon-mode-a"))
+	assert_true(mode_a:track("client_event_a"))
+	assert_true(mode_a:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"anonymous_id":"anon-mode-a"')
+	assert_contains(requests[1].body, '"event_name":"client_event_a"')
+
+	-- Non-client (service) source also keeps anonymous_id on the wire.
+	reset()
+	storage.reset()
+	local server_client = assert(sdk.new(config({ source = "server" })))
+	assert_true(server_client:set_anonymous_id("anon-server"))
+	assert_true(server_client:track("server_event"))
+	assert_true(server_client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"anonymous_id":"anon-server"')
+	storage.reset()
+end
+
+-- get_anonymous_id exposes the same anonymous ID the SDK sends on the wire, so
+-- the host can hand it to its backend at JWT-mint time (bind_anon consistency).
+local function test_get_anonymous_id_matches_wire()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:set_anonymous_id("anon-exposed"))
+	assert_equal(client:get_anonymous_id(), "anon-exposed")
+	assert_true(client:track("anon_exposed_event"))
+	assert_true(client:flush())
+	assert_contains(requests[1].body, '"anonymous_id":"anon-exposed"')
+	storage.reset()
+end
+
+-- Cherry-picked from defold#6 (176cfdf), GOOD half only: the server requires
+-- session_id for non-backend sources, so track() before session_start() must
+-- still carry a synthesized session_id. The anon-omit half of that commit is
+-- intentionally NOT applied.
+local function test_track_before_session_start_lazily_opens_session()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("early_event"))
+	assert_not_equal(client.session_id, nil)
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"session_id":"session-')
+	assert_contains(requests[1].body, '"session_sequence":1')
+
+	-- Backend sources do not require a session and must not synthesize one.
+	reset()
+	storage.reset()
+	local backend = assert(sdk.new(config({ source = "backend" })))
+	assert_true(backend:identify("user-example"))
+	assert_true(backend:track("backend_event"))
+	assert_equal(backend.session_id, nil)
+	assert_true(backend:flush())
+	assert_equal(#requests, 1)
+	assert_not_contains(requests[1].body, '"session_id"')
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_singleton_guard,
@@ -1306,6 +2053,17 @@ local tests = {
 	test_consent_decision_defers_until_token_arrives,
 	test_session_end_while_denied_completes_locally,
 	test_consent_retained_after_unauthorized_and_resent_with_fresh_token,
+	test_lazy_session_rolls_back_on_enqueue_failure,
+	test_mode_a_401_drops_batch_without_retry,
+	test_mode_a_401_drops_pending_consent,
+	test_set_anonymous_id_rejected_while_events_pending_mode_b,
+	test_set_anonymous_id_allowed_while_pending_mode_a,
+	test_set_anonymous_id_remints_token_after_rotation_mode_b,
+	test_diagnose_tolerates_non_string_fields,
+	test_set_anonymous_id_rejected_while_token_request_in_flight,
+	test_consent_denial_clears_stale_publish_deferral,
+	test_denied_in_flight_429_sets_no_stale_deferral,
+	test_set_anonymous_id_rejected_while_consent_pending_mode_b,
 	test_stale_unauthorized_consent_does_not_resurrect_old_decision,
 	test_shutdown_waits_for_deferred_consent,
 	test_set_consent_reports_persist_failure,
@@ -1326,6 +2084,20 @@ local tests = {
 	test_shutdown_queue_full_does_not_finalize_and_can_retry,
 	test_flush_and_shutdown_wait_for_async_publish,
 	test_singleton_shutdown_keeps_client_after_retryable_failure,
+	test_batch_response_surfaces_per_event_outcomes,
+	test_batch_response_surfaces_suppressed_no_consent,
+	test_batch_response_without_events_array_keeps_accepted,
+	test_retry_after_defers_next_publish,
+	test_successful_publish_clears_deferral,
+	test_backoff_on_sustained_transient_failures,
+	test_error_envelope_is_surfaced,
+	test_diagnostics_hook_errors_are_swallowed,
+	test_invalid_diagnostics_rejected,
+	test_mode_a_api_key_is_bearer,
+	test_mode_a_consent_uses_api_key_bearer,
+	test_client_source_keeps_anonymous_id_both_modes,
+	test_get_anonymous_id_matches_wire,
+	test_track_before_session_start_lazily_opens_session,
 }
 
 for _, test in ipairs(tests) do
