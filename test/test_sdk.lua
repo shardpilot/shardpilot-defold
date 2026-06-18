@@ -1042,6 +1042,56 @@ local function test_diagnose_tolerates_non_string_fields()
 	storage.reset()
 end
 
+local function test_set_anonymous_id_rejected_while_token_request_in_flight()
+	reset()
+	storage.reset()
+	local token_callback = nil
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			token_callback = callback -- capture, do NOT complete yet
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	-- A consent receipt triggers a Mode B token request that stays in flight
+	-- (bound to the current anon).
+	assert_true(client:set_consent(true))
+	assert_equal(client.token_request_in_flight, true)
+	-- Rotation must be rejected while that request is in flight, or its late
+	-- callback would cache a JWT bound to the pre-rotation anon.
+	local ok, err = client:set_anonymous_id("anon-new")
+	assert_equal(ok, false)
+	assert_equal(err, "events_pending")
+	-- Once the token settles, rotation is allowed.
+	next_status = 202
+	token_callback("token-1", nil, nil)
+	assert_equal(client.token_request_in_flight, false)
+	assert_true(client:set_anonymous_id("anon-new"))
+	assert_equal(client:get_anonymous_id(), "anon-new")
+	storage.reset()
+end
+
+local function test_consent_denial_clears_stale_publish_deferral()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("e1"))
+	-- A 429 with a long Retry-After defers the next publish and retains the batch.
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "3600" }
+	client:flush()
+	assert_true(client.publish_retry_after_ms ~= nil, "429 Retry-After must set a deferral")
+	assert_true(client.in_flight_batch ~= nil, "a retryable 429 retains the batch")
+	-- Denying consent discards the batch; the deferral set for it must not linger
+	-- and block a later granted batch for up to the Retry-After window.
+	next_response_headers = nil
+	assert_true(client:set_consent(false))
+	assert_equal(client.in_flight_batch, nil)
+	assert_equal(client.publish_retry_after_ms, nil, "consent denial must clear the stale deferral")
+	assert_equal(client.publish_backoff_attempt, 0)
+	storage.reset()
+end
+
 local function test_stale_unauthorized_consent_does_not_resurrect_old_decision()
 	reset()
 	storage.reset()
@@ -1952,6 +2002,8 @@ local tests = {
 	test_set_anonymous_id_allowed_while_pending_mode_a,
 	test_set_anonymous_id_remints_token_after_rotation_mode_b,
 	test_diagnose_tolerates_non_string_fields,
+	test_set_anonymous_id_rejected_while_token_request_in_flight,
+	test_consent_denial_clears_stale_publish_deferral,
 	test_stale_unauthorized_consent_does_not_resurrect_old_decision,
 	test_shutdown_waits_for_deferred_consent,
 	test_set_consent_reports_persist_failure,

@@ -382,8 +382,14 @@ function Client:set_anonymous_id(anonymous_id)
 	-- token to the new anon but ship a payload carrying the old one, and the
 	-- server rejects the whole batch. Require the host to flush first so the
 	-- queued/in-flight anon and the next minted bind_anon stay aligned.
+	-- token_request_in_flight: a Mode B token request may already be running (e.g.
+	-- a set_consent() receipt fetch) with the OLD anon. Its async callback would
+	-- store a JWT bound to the old bind_anon AFTER we rotate, so a later event
+	-- would ship the new anon under the stale token. Block rotation until it
+	-- settles (the host retries) rather than racing the in-flight mint.
 	local rotating = self.config.token_provider and anonymous_id ~= self.anonymous_id
-	if rotating and (queue.size(self.queue) > 0 or self.in_flight_batch ~= nil) then
+	if rotating and (queue.size(self.queue) > 0 or self.in_flight_batch ~= nil
+		or self.token_request_in_flight) then
 		return false, "events_pending"
 	end
 	self.anonymous_id = anonymous_id
@@ -428,6 +434,12 @@ function Client:set_consent(analytics_granted)
 		if cleared > 0 then
 			self.stats.dropped = self.stats.dropped + cleared
 		end
+		-- Any 429/transport backoff deferral was set for the now-discarded batch,
+		-- so it is stale. Clear it (and the backoff attempt count) or a later
+		-- granted batch queued before the old deadline would be blocked until it
+		-- expires — up to a 24h Retry-After — even though that batch is gone.
+		self.publish_retry_after_ms = nil
+		self.publish_backoff_attempt = 0
 	end
 	local persisted = self:persist_identity()
 	if not persisted then
