@@ -70,9 +70,11 @@ function init(self)
     workspace_id = "workspace-example",
     app_id = "app-example",
     environment_id = "develop",
+    -- Auth: configure exactly one of token_provider (Mode B) or api_key (Mode A).
     token_provider = function(callback)
       callback("client-token-placeholder", nil, nil)
     end,
+    -- api_key = "sp_ingest_...", -- Mode A alternative (publishable key)
   })
   shardpilot.identify("user-example")
   shardpilot.set_consent(true)   -- analytics consent: granted
@@ -109,7 +111,8 @@ Most methods return `ok, err` so callers can branch on failures (e.g.
 ## Configuration
 
 `init(config)` / `new(config)` take a Lua table. Required: `ingest_url`,
-`workspace_id`, `app_id`, `environment_id`, `token_provider`.
+`workspace_id`, `app_id`, `environment_id`, and **exactly one** of
+`token_provider` (Mode B) or `api_key` (Mode A) — see [Authentication](#authentication).
 
 | Field | Default | Notes |
 |---|---|---|
@@ -117,7 +120,8 @@ Most methods return `ok, err` so callers can branch on failures (e.g.
 | `workspace_id` | — (required) | Tenant key |
 | `app_id` | — (required) | Product key |
 | `environment_id` | — (required) | Environment scope (e.g. `local` / `develop` / `stage` / `prod`); any non-empty string is accepted |
-| `token_provider` | — (required) | `function(callback)` → `callback(token, expires_at_unix_ms, err)` |
+| `token_provider` | — | **Mode B** (one of `token_provider`/`api_key` required): `function(callback)` → `callback(token, expires_at_unix_ms, err)` |
+| `api_key` | — | **Mode A** (one of `token_provider`/`api_key` required): non-secret publishable `sp_ingest_…` key used directly as the `Bearer` |
 | `source` | `"client"` | One of `client`, `server`, `backend` |
 | `app_version` | `nil` | Sent in the envelope |
 | `app_build` | `nil` | Sent in the envelope |
@@ -133,6 +137,20 @@ Most methods return `ok, err` so callers can branch on failures (e.g.
 > `ingest.shardpilot.com` is a **planned** public domain and is not provisioned.
 > Use local/develop endpoints until a release explicitly publishes production
 > infrastructure. See [`docs/configuration.md`](docs/configuration.md).
+
+## Authentication
+
+The ingest endpoint accepts two credential kinds (ADR-0222); configure **exactly one**:
+
+- **Mode B — `token_provider`**: an async function yielding a short-lived per-tenant
+  ingest JWT minted by your backend. The SDK manages refresh, expiry-lead, and 401-retry.
+- **Mode A — `api_key`**: the non-secret publishable `sp_ingest_…` key, used directly as
+  the `Bearer`. Safe to embed client-side, never expires, no token round-trip.
+
+Mode is selected by presence: a configured `token_provider` is used (Mode B); otherwise
+`api_key` is the standing `Bearer` (Mode A). Configuring both is rejected
+(`auth_mode_conflict`); configuring neither is rejected (`auth_required`). `anonymous_id`
+is always sent on the wire in both modes.
 
 ## Wire contract
 
@@ -155,7 +173,9 @@ by [`scripts/check_library.sh`](scripts/check_library.sh)). See
   `sys.get_save_file("shardpilot.<workspace_id>.<app_id>", "identity")` with
   `sys.save`/`sys.load`. The per-app namespace prevents two games on one device
   from sharing an anonymous ID or consent state. Outside Defold (e.g. a plain
-  Lua test host) it degrades gracefully to in-memory state.
+  Lua test host) it degrades gracefully to in-memory state. `get_anonymous_id()`
+  returns the persisted anonymous ID so a host can hand it to its own backend at
+  token-mint time (Mode B); the SDK always sends that same anonymous ID on the wire.
 - **`set_consent(analytics_granted)`** records `unknown` (default, fully open),
   `granted`, or `denied`. `denied` drops events at enqueue, clears the pending
   queue, and discards in-flight batches instead of retrying. Explicit decisions

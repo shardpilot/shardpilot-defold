@@ -4,6 +4,30 @@ local function trim_slash(value)
 	return (value:gsub("/+$", ""))
 end
 
+-- The real Defold http API lowercases response header keys; the test mock
+-- omits headers entirely. Read the Retry-After header (whole seconds) when
+-- present and return it as a non-negative number, otherwise nil.
+local function retry_after_seconds(response)
+	if type(response) ~= "table" or type(response.headers) ~= "table" then
+		return nil
+	end
+	local value = response.headers["retry-after"] or response.headers["Retry-After"]
+	if type(value) == "number" then
+		if value < 0 then
+			return nil
+		end
+		return math.floor(value)
+	end
+	if type(value) ~= "string" then
+		return nil
+	end
+	local seconds = tonumber(value:match("^%s*(%d+)%s*$"))
+	if not seconds or seconds < 0 then
+		return nil
+	end
+	return math.floor(seconds)
+end
+
 local function dispatch(config, token, route, payload, callback)
 	if not http or not http.request then
 		callback(false, "http_unavailable", false, true)
@@ -20,6 +44,11 @@ local function dispatch(config, token, route, payload, callback)
 		return false
 	end
 
+	-- Dual-mode Bearer (ADR-0222): `token` is the resolved Authorization
+	-- credential the client already selected — a per-tenant ingest JWT in
+	-- Mode B (yielded by token_provider) or the non-secret publishable
+	-- `sp_ingest_...` api_key in Mode A. The ingest endpoint accepts both, so
+	-- the transport stays mode-agnostic and always sends `Bearer <token>`.
 	local headers = {
 		["Content-Type"] = "application/json",
 		["Authorization"] = "Bearer " .. token,
@@ -31,7 +60,7 @@ local function dispatch(config, token, route, payload, callback)
 	http.request(trim_slash(config.ingest_url) .. route, "POST", function(_, _, response)
 		local status = response and response.status or 0
 		if status == 401 then
-			callback(false, "unauthorized", true, true)
+			callback(false, "unauthorized", true, true, response)
 			return
 		end
 		if status >= 200 and status < 300 then
@@ -39,14 +68,18 @@ local function dispatch(config, token, route, payload, callback)
 			return
 		end
 		if status == 0 then
-			callback(false, "http_0", false, true)
+			callback(false, "http_0", false, true, response)
 			return
 		end
-		if status == 429 or status >= 500 then
-			callback(false, "transient_" .. tostring(status), false, true)
+		if status == 429 then
+			callback(false, "transient_429", false, true, response, retry_after_seconds(response))
 			return
 		end
-		callback(false, "http_" .. tostring(status), false, false)
+		if status >= 500 then
+			callback(false, "transient_" .. tostring(status), false, true, response)
+			return
+		end
+		callback(false, "http_" .. tostring(status), false, false, response)
 	end, headers, encoded, options)
 	return true
 end
