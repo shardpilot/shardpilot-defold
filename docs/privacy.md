@@ -31,7 +31,7 @@ is still waiting on a token.
 - No full event payload logging.
 - No anonymous stitching by default.
 - No pre-auth publishing by default.
-- No provider, model, GitHub, billing, or control-plane write calls.
+- No provider, model, GitHub, billing, or account-management write calls.
 - No automatic actions.
 
 Do not send raw customer/player payloads, raw provider payloads, tokens,

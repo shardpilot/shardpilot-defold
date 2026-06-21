@@ -5,10 +5,9 @@
 > publishes them to the ShardPilot analytics ingest API.
 
 ShardPilot is app-first: this SDK buffers analytics events and publishes them to
-the ingest API. Wire shape and identity rules follow ADR-0139 (app-first
-analytics) and ADR-0222 (dual-mode client ingest auth); games are a domain pack,
-not the platform boundary (ADR-0106). Those ADRs are internal to the ShardPilot
-docs repository and are not published with this SDK.
+the ingest API. The wire shape and identity rules follow ShardPilot's app-first
+analytics model and its dual-mode client ingest auth; games are a domain pack,
+not the platform boundary.
 
 ## Status
 
@@ -150,7 +149,7 @@ Most methods return `ok, err` so callers can branch on failures (e.g.
 
 ## Authentication
 
-The ingest endpoint accepts two credential kinds (ADR-0222); configure **exactly one**:
+The ingest endpoint accepts two credential kinds; configure **exactly one**:
 
 - **Mode B — `token_provider`**: an async function yielding a short-lived per-tenant
   ingest JWT minted by your backend. The SDK manages refresh, expiry-lead, and 401-retry.
@@ -204,7 +203,7 @@ Legacy public-SDK fields are **never** emitted: `project_id`, `game_id`, `env`,
   `shutdown()` returns `false, "consent_pending"` instead of tearing down — call
   it again once a token is available so the decision is not dropped at exit.
 - The SDK does not log tokens or full payloads, and makes no
-  provider/model/GitHub/billing/control-plane write calls. See
+  provider/model/GitHub/billing/account-management write calls. See
   [`docs/privacy.md`](docs/privacy.md) and [`SECURITY.md`](SECURITY.md).
 
 ## Project layout
@@ -270,16 +269,14 @@ Planned / deferred (not yet implemented):
 
 See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/release.md`](docs/release.md).
 
-## Related repositories
+## Related
 
-- The `analytics-service` (internal) — ingest/query data plane that receives
-  `/v1/events:batch`.
-- The `control-plane` service (internal) — mints/introspects the ingest tokens
-  the `token_provider` supplies (ADR-0222).
-- The `developers` site (internal) — public docs for the ingest API and SDKs.
+- The **ShardPilot platform** — receives the event batches this SDK publishes
+  (`/v1/events:batch`) and issues and introspects the ingest credentials
+  (publishable `sp_ingest_…` keys and, for Mode B, the per-tenant signing secret
+  your backend uses to mint ingest JWTs).
 - [`shardpilot-go`](https://github.com/shardpilot/shardpilot-go) — the public Go
-  client SDK; `shardpilot-unity` and `shardpilot-unreal` (internal) are sibling
-  client SDKs.
+  client SDK.
 
 ## License
 

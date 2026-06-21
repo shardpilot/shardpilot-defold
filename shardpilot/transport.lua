@@ -44,7 +44,7 @@ local function dispatch(config, token, route, payload, callback)
 		return false
 	end
 
-	-- Dual-mode Bearer (ADR-0222): `token` is the resolved Authorization
+	-- Dual-mode Bearer: `token` is the resolved Authorization
 	-- credential the client already selected — a per-tenant ingest JWT in
 	-- Mode B (yielded by token_provider) or the non-secret publishable
 	-- `sp_ingest_...` api_key in Mode A. The ingest endpoint accepts both, so
