@@ -325,7 +325,7 @@ local function test_config_validation()
 	assert_equal(client.config.platform, "linux")
 	assert_equal(client.config.token_refresh_lead_ms, 60000)
 
-	-- Dual-mode auth (ADR-0222): exactly one of token_provider / api_key.
+	-- Dual-mode auth: exactly one of token_provider / api_key.
 	-- Neither configured -> auth_required.
 	local no_auth = config()
 	no_auth.token_provider = nil
@@ -1913,7 +1913,7 @@ local function test_invalid_diagnostics_rejected()
 	assert_equal(err, "invalid_diagnostics")
 end
 
--- ADR-0222 Mode A: a publishable api_key (no token_provider) publishes events
+-- Mode A: a publishable api_key (no token_provider) publishes events
 -- with the api_key as the Bearer, with no token round-trip.
 local function test_mode_a_api_key_is_bearer()
 	reset()
@@ -1929,7 +1929,7 @@ local function test_mode_a_api_key_is_bearer()
 	storage.reset()
 end
 
--- ADR-0222 Mode A: the consent decision also rides the publishable api_key.
+-- Mode A: the consent decision also rides the publishable api_key.
 local function test_mode_a_consent_uses_api_key_bearer()
 	reset()
 	storage.reset()
@@ -1943,7 +1943,7 @@ local function test_mode_a_consent_uses_api_key_bearer()
 	storage.reset()
 end
 
--- ADR-0222: anonymous_id is ALWAYS sent on the wire for source="client" in
+-- anonymous_id is ALWAYS sent on the wire for source="client" in
 -- BOTH auth modes. The server requires it; the wave-1 anon-omit rule that the
 -- abandoned client-JWT branch conformed to was deleted server-side, so the SDK
 -- must never strip anonymous_id. (This replaces the abandoned

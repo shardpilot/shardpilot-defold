@@ -216,7 +216,7 @@ local function validate_config(config)
 	if not valid_ingest_url(config.ingest_url) then
 		return nil, "invalid_ingest_url"
 	end
-	-- Dual-mode auth (ADR-0222). EITHER a Mode B async `token_provider` (a
+	-- Dual-mode auth. EITHER a Mode B async `token_provider` (a
 	-- per-tenant ingest JWT minted by the host) OR a Mode A `api_key` (the
 	-- non-secret publishable `sp_ingest_...` key, safe to embed client-side)
 	-- satisfies the config. Mode is selected by presence: a configured
@@ -375,7 +375,7 @@ function Client:set_anonymous_id(anonymous_id)
 	if not valid_identity(anonymous_id) then
 		return false, "invalid_anonymous_id"
 	end
-	-- Mode B (ADR-0222): the host's token_provider mints `bind_anon` from the
+	-- Mode B: the host's token_provider mints `bind_anon` from the
 	-- anonymous_id returned by get_anonymous_id() at flush time, while events
 	-- already queued (or in flight) carry the previous anon snapshot taken at
 	-- track() time. Rotating the anon while a batch is pending would bind the
@@ -686,7 +686,7 @@ function Client:enqueue_summaries()
 end
 
 function Client:refresh_token()
-	-- Mode A (ADR-0222): no async token_provider is configured, so the standing
+	-- Mode A: no async token_provider is configured, so the standing
 	-- Bearer is the non-secret publishable `api_key`. It never expires and is
 	-- restored synchronously here (including after a 401 clears self.token), so
 	-- the publish/consent paths treat the api_key exactly like a yielded JWT.

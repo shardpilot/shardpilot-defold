@@ -2,7 +2,7 @@
 
 ## v0.3.0 — unreleased — early alpha
 
-- Dual-mode ingest auth (ADR-0222). The SDK now supports BOTH:
+- Dual-mode ingest auth. The SDK now supports BOTH:
   - Mode B (existing): an async `token_provider` that yields a per-tenant
     ingest JWT (refresh, expiry-lead, 401-retry, in-flight race guard).
   - Mode A (new): a non-secret publishable `api_key` (the `sp_ingest_...`

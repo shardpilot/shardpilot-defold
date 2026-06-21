@@ -11,7 +11,7 @@ ShardPilot Defold SDK v0 is configured with a Lua table:
   app_version = "1.0.0",
   app_build = "100",
   source = "client",
-  -- Auth (ADR-0222): configure EXACTLY ONE of token_provider (Mode B) or
+  -- Auth: configure EXACTLY ONE of token_provider (Mode B) or
   -- api_key (Mode A). See "Authentication modes" below.
   token_provider = function(callback)
     callback("client-token-placeholder", expires_at_unix_ms, nil)
@@ -42,8 +42,8 @@ wire, the same anonymous ID it returns.
 
 ## Authentication modes
 
-The ingest endpoint accepts two credential kinds, and the SDK supports both
-(ADR-0222). Configure **exactly one**:
+The ingest endpoint accepts two credential kinds, and the SDK supports both.
+Configure **exactly one**:
 
 - **Mode B — `token_provider`** (async per-tenant JWT). A function that yields a
   short-lived ingest JWT minted by your backend. The SDK manages refresh,
