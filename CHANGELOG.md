@@ -13,9 +13,7 @@
   one auth source is required — configuring both is rejected with
   `auth_mode_conflict`, configuring neither with `auth_required`.
 - `anonymous_id` is ALWAYS sent on the wire for every source (client and
-  service) in both auth modes; the server requires it. (The previously
-  proposed client-JWT anon-omit was abandoned — the server rule that rejected
-  it was removed.)
+  service) in both auth modes; the server requires it.
 - `track()` now lazily opens a session (synthesizing `session_id`) for
   non-backend sources, so events tracked before `session_start()` carry the
   `session_id` the server requires instead of being whole-batch rejected.

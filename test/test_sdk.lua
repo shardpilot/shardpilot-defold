@@ -1944,10 +1944,8 @@ local function test_mode_a_consent_uses_api_key_bearer()
 end
 
 -- anonymous_id is ALWAYS sent on the wire for source="client" in
--- BOTH auth modes. The server requires it; the wave-1 anon-omit rule that the
--- abandoned client-JWT branch conformed to was deleted server-side, so the SDK
--- must never strip anonymous_id. (This replaces the abandoned
--- test_client_source_omits_anonymous_id, asserting the inverse.)
+-- BOTH auth modes: the server requires it, so the SDK must never strip
+-- anonymous_id.
 local function test_client_source_keeps_anonymous_id_both_modes()
 	-- Mode B (token_provider).
 	reset()
@@ -1999,10 +1997,8 @@ local function test_get_anonymous_id_matches_wire()
 	storage.reset()
 end
 
--- Cherry-picked from defold#6 (176cfdf), GOOD half only: the server requires
--- session_id for non-backend sources, so track() before session_start() must
--- still carry a synthesized session_id. The anon-omit half of that commit is
--- intentionally NOT applied.
+-- The server requires session_id for non-backend sources, so track()
+-- before session_start() must still carry a synthesized session_id.
 local function test_track_before_session_start_lazily_opens_session()
 	reset()
 	storage.reset()
