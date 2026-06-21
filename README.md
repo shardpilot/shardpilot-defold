@@ -272,10 +272,11 @@ See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/release.md`](docs/release.md).
 ## Related
 
 - The **ShardPilot platform** — receives the event batches this SDK publishes
-  (`/v1/events:batch`) and mints/introspects the ingest tokens the
-  `token_provider` supplies.
+  (`/v1/events:batch`) and issues and introspects the ingest credentials
+  (publishable `sp_ingest_…` keys and, for Mode B, the per-tenant signing secret
+  your backend uses to mint ingest JWTs).
 - [`shardpilot-go`](https://github.com/shardpilot/shardpilot-go) — the public Go
-  client SDK. Unity and Unreal client SDKs are also available.
+  client SDK.
 
 ## License
 
