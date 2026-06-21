@@ -17,8 +17,8 @@ not the platform boundary.
   this repo, and the production ingest domain is **not provisioned** yet. Use
   local/develop endpoints for evaluation.
 - **Version strings are inconsistent across files** (`shardpilot/version.lua`
-  reports `0.3.0`, `game.project` declares `0.1.0`). The latest unreleased work
-  is tracked as `v0.3.0 — unreleased` in [`CHANGELOG.md`](CHANGELOG.md); treat
+  reports `0.4.0`, `game.project` declares `0.1.0`). The latest unreleased work
+  is tracked as `v0.4.0 — unreleased` in [`CHANGELOG.md`](CHANGELOG.md); treat
   that as the intent until the strings are reconciled.
 
 ## What it does
@@ -37,6 +37,11 @@ not the platform boundary.
   `denied`) and enforces it at enqueue and dispatch time.
 - Samples basic runtime signals via `update(dt)`, `observe_ping_ms(ms)`, and
   `observe_disconnect(reason)`.
+- Reports **crashes** through a separate `require "shardpilot.crash"`
+  module to a dedicated crash ingest endpoint with a `crash:write` key — never as
+  an analytics event. Stamps a component-slug `source`, scrubs PII, samples
+  non-fatal reports while **always** sending fatal ones, and forwards a
+  previous-session native crash dump on next launch. See [`docs/crash.md`](docs/crash.md).
 
 ## Installation
 
@@ -175,12 +180,28 @@ Legacy public-SDK fields are **never** emitted: `project_id`, `game_id`, `env`,
 [`scripts/check_library.sh`](scripts/check_library.sh). See
 [`docs/events.md`](docs/events.md).
 
+## Crash wire contract
+
+Crashes use a **separate** module and endpoint. The crash client
+(`require "shardpilot.crash"`) sends one report per crash as
+`POST {crash_ingest_url}/api/v1/crashes/ingest` with a `crash:write` API key as
+the `Bearer`, carrying the crash report JSON body: `crash_id`
+(UUIDv7), `occurred_at`, `app{id,version,build_id}`, a component-slug `source`,
+`platform`, `os`, `exception`, `modules[]`, `threads[]`/`frames[]`,
+`breadcrumbs[]`, `fingerprint_components[]`, and `metadata`. A crash is **never**
+wrapped as a `mobile_crash` analytics event on `/v1/events:batch`. Fatal reports
+bypass sampling; a previous-session native crash dump is forwarded on next launch
+via `crash.capture_previous()`. See [`docs/crash.md`](docs/crash.md).
+
 ## Privacy & consent
 
 - **Memory-only by default.** Tokens and the event queue live only in memory;
-  there is no durable local queue in v0.
+  there is no durable local event queue in v0.
 - **Durable storage is a single identity record** (anonymous ID + consent
-  decision) per configured app, written through
+  decision) per configured app — plus a bounded, per-app, TTL'd crash-retry
+  sidecar (see the crash note below) that holds only an already-PII-scrubbed
+  previous-session crash report, resent then cleared on success. The identity
+  record is written through
   `sys.get_save_file("shardpilot.<workspace_id>.<app_id>", "identity")` with
   `sys.save`/`sys.load`. The per-app namespace prevents two games on one device
   from sharing an anonymous ID or consent state. Outside Defold (e.g. a plain
@@ -202,6 +223,13 @@ Legacy public-SDK fields are **never** emitted: `project_id`, `game_id`, `env`,
   point (`update`/`flush`/`shutdown`). While a pending consent is outstanding,
   `shutdown()` returns `false, "consent_pending"` instead of tearing down — call
   it again once a token is available so the decision is not dropped at exit.
+- **Crash-retry sidecar.** When a previous-session crash report cannot be sent on
+  the next launch (offline / rate-limited / server error), the
+  already-PII-scrubbed report is written to a small, bounded, per-app sidecar so
+  it can be resent later. A pending report older than about seven days is
+  discarded on read (a retention limit), and any entry is removed as soon as its
+  report is accepted or terminally rejected. See
+  [`docs/crash.md`](docs/crash.md#privacy).
 - The SDK does not log tokens or full payloads, and makes no
   provider/model/GitHub/billing/account-management write calls. See
   [`docs/privacy.md`](docs/privacy.md) and [`SECURITY.md`](SECURITY.md).
@@ -218,10 +246,17 @@ Legacy public-SDK fields are **never** emitted: `project_id`, `game_id`, `env`,
 | `shardpilot/storage.lua` | The **only** module allowed to call `sys.save`/`sys.load` |
 | `shardpilot/clock.lua` · `id.lua` · `platform.lua` · `sampling.lua` | Time, UUIDv7, platform detect, runtime sampling |
 | `shardpilot/version.lua` | Version string constant |
+| `shardpilot/crash.lua` | Public crash entrypoint: singleton API + `new()` factory |
+| `shardpilot/crash/client.lua` | Crash client: config, sampling, emit/emit_fatal/capture_previous |
+| `shardpilot/crash/event.lua` | Crash report JSON body shape, normalize, sanitize, validate |
+| `shardpilot/crash/sanitize.lua` | Crash PII scrubbing (emails, IPs, raw-id prefixes, tokens) |
+| `shardpilot/crash/breadcrumbs.lua` | Bounded breadcrumb ring |
+| `shardpilot/crash/transport.lua` | Crash dispatch (`/api/v1/crashes/ingest`) |
+| `shardpilot/crash/dump.lua` | Previous-session native dump → crash event |
 | `game.project` | Defold library metadata (`[library] include_dirs = shardpilot`) |
 | `examples/minimal/` | Copy-pasteable usage example |
-| `test/` | Lua test harness (`test_sdk.lua`) + Defold collection/script |
-| `docs/` | configuration · events · privacy · release |
+| `test/` | Lua test harness (`test_sdk.lua`, `test_crash.lua`) + Defold collection/script |
+| `docs/` | configuration · events · crash · privacy · release |
 | `scripts/` | `check_library.sh` (content guard), `package_release.sh` |
 
 ## Conventions & boundaries
@@ -230,9 +265,11 @@ Legacy public-SDK fields are **never** emitted: `project_id`, `game_id`, `env`,
   SDK source. The guard greps file *contents* (`grep -RInE`) for these patterns,
   so it flags native references inside tracked files but does not catch a native
   source file added solely by filename — keep the boundary by convention.
-- **No durable I/O beyond the identity record.** `io.*`, `os.execute`, and
-  browser/local storage are forbidden in source; `sys.save`/`sys.load`/
-  `sys.get_save_file` are confined to `shardpilot/storage.lua`.
+- **No durable I/O beyond the identity record and the crash-retry sidecar.**
+  `io.*`, `os.execute`, and browser/local storage are forbidden in source;
+  `sys.save`/`sys.load`/`sys.get_save_file` are confined to
+  `shardpilot/storage.lua`, which writes only the identity record and the
+  bounded, TTL'd crash-retry sidecar.
 - **No raw/provider/token/billing surface.** Terms like `raw_payload`, `prompt`,
   `access_token`, `github_token`, `billing` must not appear in SDK or example
   source.

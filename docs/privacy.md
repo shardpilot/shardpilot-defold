@@ -23,10 +23,32 @@ dispatch point, and `shutdown` will not tear the client down while a decision
 is still waiting on a token.
 
 - No durable local event queue.
-- No file writes outside the single identity record.
+- Durable storage is limited to two small records, both written through Defold
+  `sys.save`: the identity record described above, and a bounded crash-retry
+  sidecar (see below). No cookies and no other browser or tracking storage.
 - Identity/consent persistence goes through Defold `sys.save` only; on HTML5
-  builds Defold backs `sys.save` with browser storage, still limited to that
-  single identity record. No cookies and no other browser or tracking storage.
+  builds Defold backs `sys.save` with browser storage, still limited to those
+  two records.
+
+## Crash-retry sidecar
+
+If a previous-session crash report cannot be sent on the next launch because the
+network is temporarily unavailable (offline, rate-limited, or a server error),
+the prepared report is written to a small, per-app sidecar so it can be resent on
+a later launch. This sidecar:
+
+- stores only an **already PII-scrubbed** crash report (the same scrub applied
+  before any report leaves the device);
+- is **bounded** (a small fixed number of entries, each size-capped) so a
+  persistently failing send can never grow the file without limit;
+- is **per-app** (namespaced like the identity record) so two games on one
+  device never share a queue;
+- is **TTL-bounded**: a pending report older than about seven days is discarded
+  on read rather than resent;
+- is **local to the device** and goes through Defold `sys.save` only (browser
+  storage on HTML5); and
+- is **cleared on success** — an entry is removed as soon as its report is
+  accepted or terminally rejected, so it never accumulates.
 - No token logging.
 - No full event payload logging.
 - No anonymous stitching by default.

@@ -1,4 +1,5 @@
 local shardpilot = require "shardpilot.sdk"
+local crash = require "shardpilot.crash"
 
 function init(self)
 	shardpilot.init({
@@ -12,6 +13,17 @@ function init(self)
 	})
 	shardpilot.identify("user-example")
 	shardpilot.session_start()
+
+	-- Crash reporting. A separate module, endpoint, and crash:write
+	-- key — see docs/crash.md.
+	crash.init({
+		crash_ingest_url = "http://localhost:8080",
+		crash_api_key = "sp_crash_write_placeholder",
+		app_id = "app-example",
+		crash_source = "game-client",
+	})
+	-- Forward a previous-session native crash dump, if any.
+	crash.capture_previous()
 end
 
 function update(self, dt)
@@ -19,5 +31,16 @@ function update(self, dt)
 end
 
 function final(self)
-	shardpilot.shutdown("app_final")
+	-- shutdown() starts a flush and returns ok, err. In Defold builds where
+	-- http.request completes asynchronously it may return false, "pending" (a
+	-- report is still in flight). To avoid dropping the final report, flush earlier
+	-- (e.g. when the app backgrounds) or retry shutdown until it returns true.
+	local ok, err = shardpilot.shutdown("app_final")
+	if not ok then
+		print("shardpilot shutdown not complete: " .. tostring(err))
+	end
+	local crash_ok, crash_err = crash.shutdown()
+	if not crash_ok then
+		print("shardpilot crash shutdown not complete: " .. tostring(crash_err))
+	end
 end

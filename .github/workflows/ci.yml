@@ -32,3 +32,6 @@ jobs:
 
       - name: Lua tests
         run: lua5.4 test/test_sdk.lua
+
+      - name: Lua crash tests
+        run: lua5.4 test/test_crash.lua

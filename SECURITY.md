@@ -13,8 +13,13 @@ project channel.
 ## Boundaries
 
 - Client tokens are memory-only.
-- The queue is bounded and memory-only; there is no durable local queue in v0.
-- The SDK does not write files or use browser/local storage equivalents.
+- The event queue is bounded and memory-only; there is no durable local event
+  queue in v0.
+- Durable storage is limited to two small records written through Defold
+  `sys.save`: the per-app identity record (anonymous ID + consent), and a
+  bounded, per-app, TTL'd crash-retry sidecar that holds only an
+  already-PII-scrubbed previous-session crash report (resent then cleared on
+  success). No other file or browser/local-storage writes are made.
 - The SDK must not log tokens or full event payloads.
 - The SDK must not make provider, model, GitHub, billing, or account-management
   write calls.

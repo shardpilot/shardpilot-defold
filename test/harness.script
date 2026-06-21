@@ -1,5 +1,6 @@
 local shardpilot = require "shardpilot.sdk"
+local shardpilot_crash = require "shardpilot.crash"
 
 function init(self)
-	self.ok = shardpilot ~= nil
+	self.ok = shardpilot ~= nil and shardpilot_crash ~= nil
 end

@@ -1,5 +1,71 @@
 # Changelog
 
+## v0.4.0 — unreleased — early alpha
+
+- Adds **crash reporting** as a separate `require "shardpilot.crash"`
+  module. Crash reports
+  are sent — one per crash — to a **dedicated** crash ingest endpoint
+  `POST {crash_ingest_url}/api/v1/crashes/ingest` with a `crash:write` API key as
+  the `Bearer`, carrying the crash report JSON body. A crash is
+  **never** wrapped as a `mobile_crash` analytics event on `/v1/events:batch`. The
+  crash client has its own config (`crash_ingest_url`, `crash_api_key`, `app_id`,
+  `crash_source`, `sample_every`, …), independent of the analytics client.
+- Stamps the component-slug **`source`** on every crash report,
+  configured via `crash_source` (mirroring how the analytics `source` is
+  configured), defaulting to empty/bare-app, and validated as the slug
+  `^[a-z0-9][a-z0-9-]{0,62}$` (≤63 chars) before the wire. A per-report `source`
+  overrides the configured default.
+- **Fatal crashes are never sampled.** `emit_fatal` (and the dump-forward path)
+  bypass the sampler entirely; only non-fatal `emit` is subject to `sample_every`
+  / a custom `sampler`.
+- **PII scrubbing:** every caller-populated
+  string is stripped of emails, `player_`/`user_`/`customer_`/`device_`
+  raw-identifier prefixes (both a bare id like `user_4242` and one embedded in
+  free-form text like `failed for user_4242`, while ordinary prose such as
+  `user_id is null` is preserved), IPv4/IPv6 literals, and JWT-shaped dotted
+  tokens. A
+  frame `function` from the trusted native-dump path is scrubbed as a code symbol
+  (a package-qualified name survives; an embedded email/IP still blanks it); a
+  manual caller's frame `function` gets the full content scrub. The native crash
+  **trace text** (`raw_text`) is scrubbed as code (it is full of scoped/dotted
+  symbols like `Player::Update` and `java.lang.RuntimeException`), so a frame-less
+  fatal reported only as a trace is not blanked over a code symbol and dropped — a
+  real email/IP/token inside it is still removed. The app
+  version/build are scrubbed with a version-aware rule so a dotted version such as
+  `1.2.3.4` is kept rather than mistaken for an IP, and the operator-set `app_id`
+  is treated as product scope (a slug like `user_app`/`customer_portal` is kept,
+  not mistaken for a raw actor id). A
+  `context.session_id` carrying disallowed identifier material rejects the whole
+  report. Free-text fields also have the username segment of a user-home path
+  (`/Users/<name>/`, `/home/<name>/`, `C:\Users\<name>\`) replaced with
+  `<redacted>`, preserving the rest of the path. Crash state is held **in memory**,
+  except a small bounded per-app sidecar that retains a previous-session dump
+  report when its send fails for a temporary (retryable) reason, so it can be
+  resent on a later launch; that entry is cleared on success or terminal rejection.
+- **Auto-capture** of a previous-session **native** crash via Defold's built-in
+  `crash` module: `crash.capture_previous()` reads `crash.load_previous()` on next
+  launch and forwards a native crash event (`instruction_addr` frames + a module
+  map, signal-derived exception type, OS sys-fields) as a fatal report. Because a
+  native engine crash is unrecoverable in Lua, the model is
+  **load-on-next-launch**; limits (no per-frame module attribution, no debug IDs,
+  no breadcrumbs from the dead session, platform dependence) are documented in
+  [`docs/crash.md`](docs/crash.md). Because the native dump is one-shot
+  (consumed when it is read), a previous-session report whose send fails for a
+  **temporary** reason (offline, rate-limited, or a server error) is persisted to a
+  small per-app sidecar and resent on the next `capture_previous()` rather than
+  being lost; the queue is bounded (count + size) and a terminal rejection is not
+  retried. The sidecar uses the same guarded persistence as the identity record,
+  so a host without durable storage falls back to in-memory for the process.
+- Adds a manual emit API (`emit`, `emit_fatal`), a breadcrumb ring
+  (`record_breadcrumb`, bounded to 50), a `diagnostics` hook + `snapshot()` for
+  per-report outcomes, and both singleton and instance (`crash.new`) APIs.
+- **Config is validated up front** at `crash.init` / `crash.new`: an `app_id` that
+  carries PII/secret content, or a `platform` that is neither configured nor
+  auto-detectable on the current runtime, fails initialization with a clear error
+  (`invalid_app_id`, `platform_required`) instead of returning a client whose every
+  later report would be dropped.
+- This is an early alpha pre-release. The API is unstable and may change before v1.
+
 ## v0.3.0 — unreleased — early alpha
 
 - Dual-mode ingest auth. The SDK now supports BOTH:
