@@ -81,7 +81,7 @@ function M.ingest(config, api_key, event, callback)
 			return
 		end
 		if status >= 500 then
-			callback(false, "transient_" .. tostring(status), false, true, response)
+			callback(false, "transient_" .. tostring(status), false, true, response, retry_after_seconds(response))
 			return
 		end
 		callback(false, "http_" .. tostring(status), false, false, response)

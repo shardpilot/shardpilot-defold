@@ -84,8 +84,115 @@ local function encode_value(value)
 	return encode_string(value)
 end
 
+-- A minimal recursive-descent JSON decoder (verbatim from the analytics test
+-- harness): the real Defold runtime ships json.decode, the crash client uses it
+-- only when present, so the test stub must provide it to exercise response parsing.
+local function json_decode(text)
+	local pos = 1
+	local parse_value
+
+	local function skip_ws()
+		local _, stop = string.find(text, "^[ \t\r\n]*", pos)
+		pos = stop + 1
+	end
+
+	local function parse_string()
+		pos = pos + 1 -- opening quote
+		local parts = {}
+		while pos <= #text do
+			local ch = string.sub(text, pos, pos)
+			if ch == '"' then
+				pos = pos + 1
+				return table.concat(parts)
+			elseif ch == "\\" then
+				local esc = string.sub(text, pos + 1, pos + 1)
+				local map = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", n = "\n", t = "\t", r = "\r", b = "\b", f = "\f" }
+				parts[#parts + 1] = map[esc] or esc
+				pos = pos + 2
+			else
+				parts[#parts + 1] = ch
+				pos = pos + 1
+			end
+		end
+		error("unterminated string")
+	end
+
+	local function parse_object()
+		pos = pos + 1 -- {
+		local out = {}
+		skip_ws()
+		if string.sub(text, pos, pos) == "}" then
+			pos = pos + 1
+			return out
+		end
+		while true do
+			skip_ws()
+			local key = parse_string()
+			skip_ws()
+			pos = pos + 1 -- :
+			skip_ws()
+			out[key] = parse_value()
+			skip_ws()
+			local ch = string.sub(text, pos, pos)
+			pos = pos + 1
+			if ch == "}" then
+				return out
+			end
+		end
+	end
+
+	local function parse_array()
+		pos = pos + 1 -- [
+		local out = {}
+		skip_ws()
+		if string.sub(text, pos, pos) == "]" then
+			pos = pos + 1
+			return out
+		end
+		while true do
+			skip_ws()
+			out[#out + 1] = parse_value()
+			skip_ws()
+			local ch = string.sub(text, pos, pos)
+			pos = pos + 1
+			if ch == "]" then
+				return out
+			end
+		end
+	end
+
+	parse_value = function()
+		skip_ws()
+		local ch = string.sub(text, pos, pos)
+		if ch == "{" then
+			return parse_object()
+		elseif ch == "[" then
+			return parse_array()
+		elseif ch == '"' then
+			return parse_string()
+		elseif ch == "t" then
+			pos = pos + 4
+			return true
+		elseif ch == "f" then
+			pos = pos + 5
+			return false
+		elseif ch == "n" then
+			pos = pos + 4
+			return nil
+		else
+			local number = string.match(text, "^%-?%d+%.?%d*[eE]?[%+%-]?%d*", pos)
+			pos = pos + #number
+			return tonumber(number)
+		end
+	end
+
+	return parse_value()
+end
+
+
 json = {
 	encode = encode_value,
+	decode = json_decode,
 }
 
 local crash = require "shardpilot.crash"
@@ -1043,6 +1150,62 @@ local function test_unauthorized_surfaced()
 	assert_equal(client:snapshot().last_error, "unauthorized")
 	-- a 401 is an auth problem, not a content rejection
 	assert_equal(client:snapshot().rejected, 0)
+end
+
+local function test_suppressed_response_surfaced()
+	reset()
+	next_status = 202
+	next_response_body = '{"suppressed":true}'
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(client:snapshot().suppressed, 1,
+		"a consent-suppressed 2xx must be surfaced as suppressed")
+	assert_equal(client:snapshot().accepted, 0,
+		"a suppressed crash was not stored, so it must NOT count as accepted")
+end
+
+local function test_warning_surfaced()
+	reset()
+	next_status = 202
+	next_response_body = '{"crash_id":"x","warnings":["truncated breadcrumbs"]}'
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(client:snapshot().accepted, 1)
+	assert_equal(client:snapshot().suppressed, 0)
+	assert_equal(client:snapshot().last_warning, "truncated breadcrumbs")
+end
+
+local function test_garbage_2xx_body_still_accepted()
+	reset()
+	next_status = 202
+	next_response_body = "<<not json>>"
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(client:snapshot().accepted, 1,
+		"a 2xx with an unparseable body is still an accepted crash")
+	assert_equal(client:snapshot().suppressed, 0)
+end
+
+local function test_retry_after_recorded_on_429()
+	reset()
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "7" }
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(client:snapshot().failed, 1)
+	assert_equal(client:snapshot().last_retry_after, 7,
+		"the 429 Retry-After must be recorded")
+end
+
+local function test_retry_after_recorded_on_503()
+	reset()
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "3" }
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(client:snapshot().failed, 1)
+	assert_equal(client:snapshot().last_retry_after, 3,
+		"the 503 Retry-After must be recorded (previously dropped on the 5xx path)")
 end
 
 -- ── auto-capture (previous-session dump forward) ─────────────────────────────
@@ -3846,6 +4009,11 @@ local tests = {
 	test_breadcrumbs_attached_and_bounded,
 	test_breadcrumb_pii_name_dropped,
 	test_accepted_increments_snapshot,
+	test_suppressed_response_surfaced,
+	test_warning_surfaced,
+	test_garbage_2xx_body_still_accepted,
+	test_retry_after_recorded_on_429,
+	test_retry_after_recorded_on_503,
 	test_rejected_surfaced_via_diagnostics,
 	test_unauthorized_surfaced,
 	test_capture_previous_no_dump,

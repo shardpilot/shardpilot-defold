@@ -233,11 +233,18 @@ function M.new(config)
 			emitted = 0,
 			sampled_out = 0,
 			accepted = 0,
+			-- Crashes the server ACCEPTED (2xx) but did NOT store because the actor
+			-- withheld consent; counted separately from accepted-and-stored.
+			suppressed = 0,
 			failed = 0,
 			dropped = 0,
 			rejected = 0,
 			last_error = nil,
 			last_issue = nil,
+			-- Last non-fatal processing notice and last server-instructed Retry-After
+			-- (whole seconds, from a 429/503), surfaced via snapshot() for observability.
+			last_warning = nil,
+			last_retry_after = nil,
 		},
 		initialized = true,
 	}, Client)
@@ -287,6 +294,23 @@ function Client:remove_pending(token)
 	end
 end
 
+-- Decode a server JSON body when a decoder is available (the real Defold runtime
+-- exposes json.decode; the test stub may not). Returns the decoded table or nil;
+-- never throws — a 2xx with an unparseable body is still an accepted crash.
+local function decode_body(body)
+	if type(body) ~= "string" or body == "" then
+		return nil
+	end
+	if not json or type(json.decode) ~= "function" then
+		return nil
+	end
+	local ok, decoded = pcall(json.decode, body)
+	if not ok or type(decoded) ~= "table" then
+		return nil
+	end
+	return decoded
+end
+
 local function diagnose(self, issue)
 	if issue.code then
 		self.stats.last_issue = tostring(issue.status or "") .. ":" .. tostring(issue.code)
@@ -296,6 +320,37 @@ local function diagnose(self, issue)
 	local hook = self.config.diagnostics
 	if type(hook) == "function" then
 		pcall(hook, issue)
+	end
+end
+
+-- Surface the server's per-crash response from an accepted (2xx) send instead of
+-- discarding it: a `suppressed` crash was accepted but NOT stored (the actor withheld
+-- consent), and `warnings` are non-fatal processing notices. Both are exposed via
+-- snapshot(). Returns true iff the crash was suppressed, so the caller keeps it OUT of
+-- the accepted (delivered-and-stored) total. A 2xx with an unparseable body is not
+-- suppressed (returns false) and counts as a normal acceptance.
+function Client:record_accepted_response(response)
+	local result = decode_body(type(response) == "table" and response.response or nil)
+	if not result then
+		return false
+	end
+	if type(result.warnings) == "table" and type(result.warnings[1]) == "string" then
+		self.stats.last_warning = result.warnings[1]
+	end
+	if result.suppressed == true then
+		self.stats.suppressed = self.stats.suppressed + 1
+		return true
+	end
+	return false
+end
+
+-- Record a server-instructed Retry-After (whole seconds, from a 429/503) for
+-- observability. A pending report is resent on a later launch, well past any
+-- seconds-scale wait, so this is surfaced via snapshot() rather than used as an
+-- in-process backoff.
+function Client:record_retry_after(retry_after)
+	if type(retry_after) == "number" and retry_after >= 0 then
+		self.stats.last_retry_after = retry_after
 	end
 end
 
@@ -394,10 +449,14 @@ function Client:emit_internal(event, fatal, trusted_frame_functions, prepare_opt
 	end
 
 	local dispatched = transport.ingest(self.config, self.config.crash_api_key, prepared,
-		function(ok, transport_err, unauthorized, retryable, response)
+		function(ok, transport_err, unauthorized, retryable, response, retry_after)
 			settle()
 			if ok then
-				self.stats.accepted = self.stats.accepted + 1
+				-- A suppressed crash was accepted by the server but NOT stored (consent
+				-- withheld); count it as suppressed only, never in the accepted total.
+				if not self:record_accepted_response(response) then
+					self.stats.accepted = self.stats.accepted + 1
+				end
 				-- The send was accepted: the pre-dispatch pending copy (on-disk or the
 				-- in-memory fallback) is no longer needed.
 				if pending_token then
@@ -410,6 +469,7 @@ function Client:emit_internal(event, fatal, trusted_frame_functions, prepare_opt
 			if not unauthorized and not retryable then
 				self.stats.rejected = self.stats.rejected + 1
 			end
+			self:record_retry_after(retry_after)
 			-- A retryable failure leaves the pre-dispatch pending copy in place (on-disk
 			-- for a later launch, or in-memory for an in-session resend) so it can be
 			-- retried. A non-retryable reject (a 4xx other than rate-limit) is terminal:
@@ -422,6 +482,7 @@ function Client:emit_internal(event, fatal, trusted_frame_functions, prepare_opt
 				status = unauthorized and "unauthorized" or "rejected",
 				code = transport_err,
 				retryable = retryable,
+				retry_after = type(retry_after) == "number" and retry_after or nil,
 				response = type(response) == "table" and response.status or nil,
 			})
 		end)
@@ -536,10 +597,12 @@ function Client:dispatch_prepared(prepared, pending_token)
 	end
 
 	local dispatched = transport.ingest(self.config, self.config.crash_api_key, prepared,
-		function(ok, transport_err, unauthorized, retryable, response)
+		function(ok, transport_err, unauthorized, retryable, response, retry_after)
 			settle()
 			if ok then
-				self.stats.accepted = self.stats.accepted + 1
+				if not self:record_accepted_response(response) then
+					self.stats.accepted = self.stats.accepted + 1
+				end
 				if pending_token then
 					self:remove_pending(pending_token)
 				end
@@ -550,6 +613,7 @@ function Client:dispatch_prepared(prepared, pending_token)
 			if not unauthorized and not retryable then
 				self.stats.rejected = self.stats.rejected + 1
 			end
+			self:record_retry_after(retry_after)
 			-- Leave a retryable failure pending (on-disk or in-memory); remove a terminal
 			-- (non-retryable) reject so it is not retried forever.
 			if pending_token and not retryable then
@@ -560,6 +624,7 @@ function Client:dispatch_prepared(prepared, pending_token)
 				status = unauthorized and "unauthorized" or "rejected",
 				code = transport_err,
 				retryable = retryable,
+				retry_after = type(retry_after) == "number" and retry_after or nil,
 				response = type(response) == "table" and response.status or nil,
 			})
 		end)

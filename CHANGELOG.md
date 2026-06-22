@@ -18,6 +18,14 @@
 - **Fatal crashes are never sampled.** `emit_fatal` (and the dump-forward path)
   bypass the sampler entirely; only non-fatal `emit` is subject to `sample_every`
   / a custom `sampler`.
+- **Surfaces the ingest response and server backpressure.** `snapshot()` now reports
+  `suppressed` (crashes the server accepted but did NOT store because the actor withheld
+  consent — counted apart from `accepted`), `last_warning` (the most recent non-fatal
+  server processing notice), and `last_retry_after` (the most recent server-instructed
+  `Retry-After`, in whole seconds, from a `429`/`503` — previously the `503` value was
+  dropped); the diagnostics hook also receives `retry_after`. The response body was
+  previously discarded; it is now parsed best-effort (a `2xx` with an unparseable body is
+  still an accepted crash) and only when the runtime exposes `json.decode`.
 - **PII scrubbing:** every caller-populated
   string is stripped of emails, `player_`/`user_`/`customer_`/`device_`
   raw-identifier prefixes (both a bare id like `user_4242` and one embedded in
