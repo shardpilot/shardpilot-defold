@@ -19,9 +19,18 @@ required_files=(
   shardpilot/sampling.lua
   shardpilot/storage.lua
   shardpilot/version.lua
+  shardpilot/crash.lua
+  shardpilot/crash/client.lua
+  shardpilot/crash/event.lua
+  shardpilot/crash/sanitize.lua
+  shardpilot/crash/breadcrumbs.lua
+  shardpilot/crash/transport.lua
+  shardpilot/crash/dump.lua
   test/harness.collection
   test/harness.script
   test/test_sdk.lua
+  test/test_crash.lua
+  docs/crash.md
   examples/minimal/README.md
   examples/minimal/main.script
   docs/configuration.md
@@ -66,6 +75,7 @@ if grep -RInE 'provider_payload|raw_payload|prompt|completion|access_token|githu
 fi
 
 grep -q 'POST {ingest_url}/v1/events:batch' README.md || { echo "README missing wire contract" >&2; exit 1; }
+grep -q 'POST {crash_ingest_url}/api/v1/crashes/ingest' README.md || { echo "README missing crash wire contract" >&2; exit 1; }
 grep -q 'memory-only' docs/privacy.md || { echo "privacy doc missing memory-only boundary" >&2; exit 1; }
 grep -q 'does not publish tags, GitHub Releases' docs/release.md || { echo "release doc must state no release publication" >&2; exit 1; }
 
