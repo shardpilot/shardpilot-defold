@@ -72,6 +72,12 @@ function M.flush()
 	return with_default("flush")
 end
 
+-- Snapshot undelivered events into the durable offline spool without sending
+-- or tearing down — wire this to a window focus-lost/iconify listener.
+function M.persist()
+	return with_default("persist")
+end
+
 function M.shutdown(reason)
 	local client = default()
 	if not client then

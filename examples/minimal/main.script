@@ -24,6 +24,21 @@ function init(self)
 	})
 	-- Forward a previous-session native crash dump, if any.
 	crash.capture_previous()
+
+	-- Offline durability: snapshot undelivered events to the durable spool
+	-- when the app loses focus or is iconified — on mobile an iconified app
+	-- can be killed without final() ever running. The SDK never installs
+	-- global listeners itself. NOTE: Defold keeps a single window listener
+	-- (window.set_listener replaces any previously set one), so put the
+	-- persist() branch inside your game's existing listener.
+	if window and window.set_listener then
+		window.set_listener(function(self, event, data)
+			-- ... your existing resize/focus/iconify handling ...
+			if event == window.WINDOW_EVENT_ICONFIED or event == window.WINDOW_EVENT_FOCUS_LOST then
+				shardpilot.persist()
+			end
+		end)
+	end
 end
 
 function update(self, dt)
@@ -31,10 +46,12 @@ function update(self, dt)
 end
 
 function final(self)
-	-- shutdown() starts a flush and returns ok, err. In Defold builds where
-	-- http.request completes asynchronously it may return false, "pending" (a
-	-- report is still in flight). To avoid dropping the final report, flush earlier
-	-- (e.g. when the app backgrounds) or retry shutdown until it returns true.
+	-- shutdown() starts a final flush. Events it cannot deliver are written to
+	-- the durable offline spool and re-sent on the next launch, so shutdown
+	-- returns true even when the network is down. It still returns
+	-- false, "consent_pending" while a consent decision is awaiting a token
+	-- (retry shutdown once the token lands); with spool_enabled = false it
+	-- returns false, err whenever events remain undelivered.
 	local ok, err = shardpilot.shutdown("app_final")
 	if not ok then
 		print("shardpilot shutdown not complete: " .. tostring(err))

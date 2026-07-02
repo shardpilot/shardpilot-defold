@@ -1,5 +1,95 @@
 # Changelog
 
+## v0.5.0 — unreleased — early alpha
+
+- **Durable offline event spool with resend on next launch.** The analytics
+  event queue was memory-only: an app kill lost the unflushed tail, and offline
+  play silently dropped events. Undeliverable event envelopes are now persisted
+  to a per-app spool and re-sent on a later launch. Envelopes are spooled and
+  re-sent **verbatim** — the `event_id`/`event_ts` stamped at `track()` time are
+  never rebuilt — so the ingest service de-duplicates a re-send that raced an
+  original delivery, and re-sends are safe.
+  - **What gets spooled:** a batch whose publish failed for a transient reason
+    (network unreachable, timeout, `429`, `5xx` — the same classification that
+    already retains a batch for in-process retry, including a Mode B `401`,
+    which is retried with a fresh token; a Mode A `401` is terminal and is
+    never spooled); the undelivered remnant (queue + in-flight batch) at
+    `shutdown()`; and an explicit `persist()` snapshot (see below). Permanent
+    `4xx` rejects are **never** spooled — they would fail forever.
+  - **Resend:** on init the spool is loaded and re-sent through the normal
+    publish machinery — chunked to `batch_size`, before fresh events, honoring
+    the same token/consent/`Retry-After`/backoff gates. Entries leave the
+    record only after the server acknowledged their batch (2xx) — ack-based
+    removal keyed by `event_id`. A permanent `4xx` on a spooled batch also
+    removes it (surfaced via the `diagnostics` hook, scope `"spool"`); a
+    transient failure keeps it for the next launch. A failed removal rewrite
+    keeps the entries marked settled and retries on the flush cadence until
+    storage recovers. A `429` `Retry-After` received while a batch is spooled
+    is stored with the record (`retry_after_until_ms`): a relaunch inside the
+    window waits out the remainder before re-sending, bounded by the same
+    24-hour clamp as the in-process deferral. The caps are re-applied to a
+    previously persisted record at load, so lowered budgets trim an old
+    record (oldest first).
+  - **`shutdown()` semantics:** when the final flush cannot deliver and the
+    remnant is durably spooled, `shutdown()` now completes the teardown and
+    returns `true` (the events are safe on disk; a host retry loop is no
+    longer needed for them). Durable capture is strict: on a runtime without
+    the save-file API (memory-only fallback), or when the caps evicted part of
+    the remnant being captured itself, `shutdown()` keeps the old contract and
+    returns `false, err` — and so does a **permanent** rejection during the
+    final flush, which drops the batch and leaves nothing to spool (the
+    failure surfaces instead of a vacuous clean teardown; a repeated
+    `shutdown()` call completes normally since the queue is already clean).
+    It still returns `false, "consent_pending"` while
+    a consent decision awaits a token — consent receipts are not spooled. With
+    `spool_enabled = false` the previous contract is unchanged.
+  - **New `persist()`** (instance + singleton): snapshots every undelivered
+    event into the spool without sending or tearing down — call it from a
+    window focus-lost/iconify listener (the SDK never installs global
+    listeners itself; see the README recipe — note the runtime keeps a single
+    window listener, so add the branch to your existing one). Later
+    acknowledged delivery removes the snapshot entries. Reports
+    `false, "spool_persist_failed"` when the snapshot was not durably and
+    fully captured (same strictness as `shutdown()`).
+  - **Consent & identity:** a persisted "denied" decision clears the spool at
+    load without sending — the purge runs unconditionally, so a record that
+    cannot even be read is still cleared; `set_consent(false)` at runtime
+    also purges it.
+    Denied actors never have events on disk. If the durable purge itself
+    fails, `set_consent(false)` returns `false, "spool_purge_failed"` and the
+    spool goes fail-closed (nothing appended, loaded, or re-sent) while the
+    purge is retried automatically at later dispatch points and at the next
+    launch; a failed init-time purge (persisted denial or disabled spool)
+    behaves the same. Revocation cleanup completes before a new grant takes
+    effect: `set_consent(true)` retries an owed purge first and is not
+    applied while it keeps failing (`false, "spool_purge_failed"`; the
+    persisted decision stays denied), so a relaunch can never replay the
+    pre-revocation record under a granted decision. Under Mode B auth, an init-time
+    `anonymous_id` override drops spooled envelopes carrying the previous
+    identity at load — the minted token binds the current identity, so
+    re-sending them would be rejected — surfaced via `diagnostics`
+    (scope `"spool"`, code `identity_changed`); Mode A re-sends
+    historic-identity envelopes unchanged.
+  - **Bounds:** new config knobs `spool_enabled` (default `true`),
+    `spool_max_events` (default `500`), and `spool_max_bytes` (default
+    `262144`, max `393216` — headroom under the documented 512 KB save-file
+    cap). Over a cap the OLDEST entries are evicted first. The byte bound uses
+    the JSON-encoded length when the runtime provides an encoder, else a
+    conservative per-field estimate. Setting `spool_enabled = false` also
+    deletes any previously persisted spool record at the next init.
+  - **Safety:** a corrupted or garbled spool record is discarded and the
+    client starts clean — the spool never errors into game code. The spool
+    stores only the envelope tables that were already bound for the wire —
+    never tokens — under the same per-app namespace as the identity record
+    (file `"spool"`), with the same in-memory fallback outside Defold. This is
+    consistent across our SDKs.
+- `snapshot()` gains `spooled`, `spool_resent`, `spool_evicted`, and
+  `spool_persist_failed` counters.
+- Mode B anonymous-ID rotation now also waits for pending spooled work
+  (`events_pending`), since spooled envelopes carry their historic
+  `anonymous_id` snapshot.
+- This is an early alpha pre-release. The API is unstable and may change before v1.
+
 ## v0.4.0 — unreleased — early alpha
 
 - Adds **crash reporting** as a separate `require "shardpilot.crash"`

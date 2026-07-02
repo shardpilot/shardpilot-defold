@@ -22,6 +22,10 @@ ShardPilot Defold SDK v0 is configured with a Lua table:
   buffer_size = 200,
   flush_interval_seconds = 1,
   publish_timeout_seconds = 2,
+  -- Offline event spool (durable, per app). See "Offline event spool" below.
+  spool_enabled = true,
+  spool_max_events = 500,
+  spool_max_bytes = 262144,
   diagnostics = function(issue)
     -- issue = { scope, event_id?, status, code?, message?, detail_codes? }
   end,
@@ -69,12 +73,77 @@ is rejected (`auth_mode_conflict`); configuring **neither** is rejected
 (`auth_required`). `anonymous_id` is sent on the wire in both modes. Mode B
 JWTs are memory-only.
 
+## Offline event spool
+
+Three knobs control the durable offline event spool (full behavior in the
+README's "Offline durability" section and [`docs/events.md`](events.md)):
+
+- **`spool_enabled`** (default `true`, boolean). When enabled, event envelopes
+  the client could not deliver — a transiently failed batch, the undelivered
+  remnant at `shutdown()`, or an explicit `persist()` snapshot — are persisted
+  per app and re-sent on a later launch. With `false`, delivery is memory-only
+  and `shutdown()` keeps its retry-loop contract (`false, err` while
+  undelivered events remain); disabling also **deletes any previously
+  persisted spool record** at the next init, so nothing lingers on disk or
+  would re-send after a later re-enable.
+- **`spool_max_events`** (default `500`, integer ≥ 1). Hard cap on spooled
+  entries; the OLDEST entries are evicted first once the cap is exceeded.
+- **`spool_max_bytes`** (default `262144`, integer `1024`–`393216`).
+  Approximate cap on the serialized size of the spool. The size estimate uses
+  the JSON-encoded envelope length when the runtime provides an encoder,
+  otherwise a conservative per-field sum, so treat it as a budget rather than
+  an exact bound. The maximum is capped at 384 KB to keep headroom under the
+  save-file API's documented 512 KB per-record limit. The OLDEST entries are
+  evicted first over budget.
+
+Both caps are re-applied to a previously persisted record at load: a
+configuration that lowered the budgets trims an over-budget old record
+(oldest first, counted in `spool_evicted`) before anything re-sends.
+
+The spool honors consent: a persisted "denied" decision clears it at load
+without sending (the purge runs even when the record cannot be read — a
+corrupt record is still cleared), and `set_consent(false)` purges it at
+runtime. If the durable
+purge itself fails, `set_consent(false)` returns `false, "spool_purge_failed"`
+and the spool goes fail-closed (nothing appended, loaded, or re-sent) while
+the purge is retried automatically at later dispatch points and at the next
+launch. Revocation cleanup completes before a new grant takes effect:
+`set_consent(true)` retries an owed purge first and is NOT applied while it
+keeps failing (same `false, "spool_purge_failed"` return; the persisted
+decision stays denied), so a relaunch can never replay the pre-revocation
+record under a granted decision. Spooled
+envelopes are re-sent verbatim (stable `event_id`/`event_ts`), so the ingest
+service de-duplicates re-sends; when a `429` `Retry-After` arrives while a
+batch is spooled, the deadline is stored with the record and a relaunch
+inside the window waits out the remainder before re-sending. Under Mode B
+auth, spooled envelopes whose
+`anonymous_id` no longer matches the client's (an init-time `anonymous_id`
+override changed the identity) are dropped from the record at load and
+surfaced via `diagnostics` (`scope = "spool"`, code `identity_changed`) — the
+minted token binds the current identity, so re-sending them would be rejected;
+Mode A re-sends historic identities unchanged.
+
+Durability is strict: on a runtime without the save-file API the spool falls
+back to process memory (in-process retries keep working), but
+`shutdown()`/`persist()` then report failure rather than claiming the events
+are safe on disk — the same applies when the caps evict part of the remnant
+being captured itself, and when a permanent rejection during the final flush
+dropped the batch (nothing is left to spool, so `shutdown()` surfaces
+`false, err`; a repeated call completes teardown since the queue is already
+clean). A failed acknowledgment-removal rewrite keeps the
+settled entries marked and retries the rewrite on the flush cadence, so the
+record converges as soon as storage recovers.
+
 The optional `diagnostics` hook is invoked with each non-accepted ingest
 outcome the server reports. Inside a `202` events-batch response the SDK parses
 the per-event status array and reports every `observed`, `duplicate`,
 `rejected`, or `suppressed_no_consent` event (with its server `code`); on a
 non-2xx it reports the parsed error envelope (`error.code` plus per-field
-detail codes). Counts are also available on `snapshot()` (`accepted`,
-`rejected`, `duplicates`, `observed`, `suppressed`, `last_event_issue`). The
+detail codes); and when a permanent reject drops entries from the offline
+spool it reports `{ scope = "spool", status = "dropped", code, count }`.
+Counts are also available on `snapshot()` (`accepted`,
+`rejected`, `duplicates`, `observed`, `suppressed`, `last_event_issue`, plus
+the spool counters `spooled`, `spool_resent`, `spool_evicted`,
+`spool_persist_failed`). The
 SDK honors a `429` `Retry-After` header by deferring the next publish, and
 falls back to exponential backoff with jitter when no header is present.
