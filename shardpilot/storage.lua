@@ -616,9 +616,19 @@ function M.save_spool(scope, events, max_events, max_bytes)
 	end
 end
 
--- Drop the whole spool (consent revoked, or a persisted denial found at load).
+-- Drop the whole spool (consent revoked, a persisted denial found at load, or
+-- the spool disabled by configuration).
 function M.clear_spool(scope)
 	return write_spool(spool_namespace(scope), {})
+end
+
+-- True when the spool has a durable backend on this runtime (the save-file
+-- API is available). The in-memory fallback keeps in-process behavior working
+-- on plain Lua hosts, but it does not survive the process — so callers that
+-- promise durability (the shutdown/persist capture) must check this instead
+-- of treating a fallback write as data safe on disk.
+function M.spool_is_durable(scope)
+	return save_path(spool_namespace(scope), "spool") ~= nil
 end
 
 -- Clears the in-memory fallback records only; intended for tests.

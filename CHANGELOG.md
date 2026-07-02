@@ -26,23 +26,35 @@
   - **`shutdown()` semantics:** when the final flush cannot deliver and the
     remnant is durably spooled, `shutdown()` now completes the teardown and
     returns `true` (the events are safe on disk; a host retry loop is no
-    longer needed for them). It still returns `false, "consent_pending"` while
+    longer needed for them). Durable capture is strict: on a runtime without
+    the save-file API (memory-only fallback), or when the caps evicted part of
+    the remnant being captured itself, `shutdown()` keeps the old contract and
+    returns `false, err`. It still returns `false, "consent_pending"` while
     a consent decision awaits a token — consent receipts are not spooled. With
     `spool_enabled = false` the previous contract is unchanged.
   - **New `persist()`** (instance + singleton): snapshots every undelivered
     event into the spool without sending or tearing down — call it from a
     window focus-lost/iconify listener (the SDK never installs global
-    listeners itself; see the README recipe). Later acknowledged delivery
-    removes the snapshot entries.
-  - **Consent:** a persisted "denied" decision clears the spool at load
-    without sending; `set_consent(false)` at runtime also purges it. Denied
-    actors never have events on disk.
+    listeners itself; see the README recipe — note the runtime keeps a single
+    window listener, so add the branch to your existing one). Later
+    acknowledged delivery removes the snapshot entries. Reports
+    `false, "spool_persist_failed"` when the snapshot was not durably and
+    fully captured (same strictness as `shutdown()`).
+  - **Consent & identity:** a persisted "denied" decision clears the spool at
+    load without sending; `set_consent(false)` at runtime also purges it.
+    Denied actors never have events on disk. Under Mode B auth, an init-time
+    `anonymous_id` override drops spooled envelopes carrying the previous
+    identity at load — the minted token binds the current identity, so
+    re-sending them would be rejected — surfaced via `diagnostics`
+    (scope `"spool"`, code `identity_changed`); Mode A re-sends
+    historic-identity envelopes unchanged.
   - **Bounds:** new config knobs `spool_enabled` (default `true`),
     `spool_max_events` (default `500`), and `spool_max_bytes` (default
     `262144`, max `393216` — headroom under the documented 512 KB save-file
     cap). Over a cap the OLDEST entries are evicted first. The byte bound uses
     the JSON-encoded length when the runtime provides an encoder, else a
-    conservative per-field estimate.
+    conservative per-field estimate. Setting `spool_enabled = false` also
+    deletes any previously persisted spool record at the next init.
   - **Safety:** a corrupted or garbled spool record is discarded and the
     client starts clean — the spool never errors into game code. The spool
     stores only the envelope tables that were already bound for the wire —

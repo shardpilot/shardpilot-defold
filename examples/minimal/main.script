@@ -28,9 +28,12 @@ function init(self)
 	-- Offline durability: snapshot undelivered events to the durable spool
 	-- when the app loses focus or is iconified — on mobile an iconified app
 	-- can be killed without final() ever running. The SDK never installs
-	-- global listeners itself, so wire persist() up in the host.
+	-- global listeners itself. NOTE: Defold keeps a single window listener
+	-- (window.set_listener replaces any previously set one), so put the
+	-- persist() branch inside your game's existing listener.
 	if window and window.set_listener then
-		window.set_listener(function(_, event)
+		window.set_listener(function(self, event, data)
+			-- ... your existing resize/focus/iconify handling ...
 			if event == window.WINDOW_EVENT_ICONFIED or event == window.WINDOW_EVENT_FOCUS_LOST then
 				shardpilot.persist()
 			end

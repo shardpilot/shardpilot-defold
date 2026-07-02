@@ -83,7 +83,9 @@ README's "Offline durability" section and [`docs/events.md`](events.md)):
   remnant at `shutdown()`, or an explicit `persist()` snapshot — are persisted
   per app and re-sent on a later launch. With `false`, delivery is memory-only
   and `shutdown()` keeps its retry-loop contract (`false, err` while
-  undelivered events remain).
+  undelivered events remain); disabling also **deletes any previously
+  persisted spool record** at the next init, so nothing lingers on disk or
+  would re-send after a later re-enable.
 - **`spool_max_events`** (default `500`, integer ≥ 1). Hard cap on spooled
   entries; the OLDEST entries are evicted first once the cap is exceeded.
 - **`spool_max_bytes`** (default `262144`, integer `1024`–`393216`).
@@ -97,7 +99,18 @@ README's "Offline durability" section and [`docs/events.md`](events.md)):
 The spool honors consent: a persisted "denied" decision clears it at load
 without sending, and `set_consent(false)` purges it at runtime. Spooled
 envelopes are re-sent verbatim (stable `event_id`/`event_ts`), so the ingest
-service de-duplicates re-sends.
+service de-duplicates re-sends. Under Mode B auth, spooled envelopes whose
+`anonymous_id` no longer matches the client's (an init-time `anonymous_id`
+override changed the identity) are dropped from the record at load and
+surfaced via `diagnostics` (`scope = "spool"`, code `identity_changed`) — the
+minted token binds the current identity, so re-sending them would be rejected;
+Mode A re-sends historic identities unchanged.
+
+Durability is strict: on a runtime without the save-file API the spool falls
+back to process memory (in-process retries keep working), but
+`shutdown()`/`persist()` then report failure rather than claiming the events
+are safe on disk — the same applies when the caps evict part of the remnant
+being captured itself.
 
 The optional `diagnostics` hook is invoked with each non-accepted ingest
 outcome the server reports. Inside a `202` events-batch response the SDK parses

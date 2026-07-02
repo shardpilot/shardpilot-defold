@@ -62,6 +62,12 @@ fail forever) and surfaces through the `diagnostics` hook. Permanent rejects
 are never spooled in the first place. The spool is bounded
 (`spool_max_events` / `spool_max_bytes`, oldest evicted first), honors the
 consent decision (a denial clears it), and is disabled with
-`spool_enabled = false`. See the README's "Offline durability" section for
-the window-listener recipe and [`docs/configuration.md`](configuration.md)
-for the knobs.
+`spool_enabled = false` (which also deletes a previously persisted record at
+init). Durable capture is strict: when the runtime has no save-file API, or
+the caps evicted part of the remnant being captured, `shutdown()`/`persist()`
+report failure instead of claiming durability. Under Mode B auth, an
+init-time `anonymous_id` override drops spooled envelopes carrying the
+previous identity at load (diagnostics code `identity_changed`); Mode A
+re-sends historic identities unchanged. See the README's "Offline
+durability" section for the window-listener recipe and
+[`docs/configuration.md`](configuration.md) for the knobs.

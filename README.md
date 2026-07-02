@@ -154,7 +154,7 @@ Most methods return `ok, err` so callers can branch on failures (e.g.
 | `flush_interval_seconds` | `1` | Time-based flush trigger (>0) |
 | `publish_timeout_seconds` | `2` | Per-request timeout (>0) |
 | `token_refresh_lead_ms` | `60000` | Refresh lead before token expiry (≥0) |
-| `spool_enabled` | `true` | Durable offline event spool ([details](#offline-durability-event-spool)) |
+| `spool_enabled` | `true` | Durable offline event spool ([details](#offline-durability-event-spool)); `false` also clears a previously persisted record at init |
 | `spool_max_events` | `500` | Max spooled entries (≥1); oldest evicted first |
 | `spool_max_bytes` | `262144` | Approx. spool size budget (1024–393216); oldest evicted first |
 
@@ -206,11 +206,17 @@ per-app spool and re-sends them on a later launch. Enabled by default
 - The **undelivered remnant at `shutdown()`** (queue + in-flight batch). When
   that remnant is durably saved, `shutdown()` completes the teardown and
   returns `true` — the events are safe on disk, so a host retry loop is no
-  longer needed for events. A pending consent decision still returns
-  `false, "consent_pending"` (consent receipts are not spooled).
+  longer needed for events. "Durably" is strict: on a runtime without the
+  save-file API (where the spool falls back to process memory), or when part
+  of the remnant itself was evicted by the caps, `shutdown()` keeps the old
+  contract and returns `false, err` so the host can retry. A pending consent
+  decision still returns `false, "consent_pending"` (consent receipts are not
+  spooled).
 - An explicit **`persist()`** snapshot (instance + singleton): writes every
   undelivered event to the spool without sending or tearing down, while the
-  client keeps running.
+  client keeps running. It reports `false, "spool_persist_failed"` when the
+  snapshot could not be durably and fully captured (same strictness as
+  `shutdown()`).
 - Permanent `4xx` rejects are **never** spooled — they would fail forever.
 
 **Resend.** On the next `init`/`new`, spooled envelopes are re-sent through
@@ -227,20 +233,34 @@ keeps the entry for the launch after that.
 **Caps.** The spool is bounded by `spool_max_events` (default 500) and
 `spool_max_bytes` (default 256 KB, max 384 KB to keep headroom under the
 save-file API's documented 512 KB per-record cap; the size estimate is
-approximate). Over a cap, the **oldest** entries are evicted first.
+approximate). Over a cap, the **oldest** entries are evicted first. When the
+eviction reaches into the batch being captured itself, `shutdown()` /
+`persist()` report failure (the in-memory copy is kept for in-process retry)
+rather than claiming the whole remnant is safe.
 
-**Consent.** A persisted "denied" consent decision clears the spool at load
-without sending anything; `set_consent(false)` at runtime purges it too. A
-denied player's events never linger on disk. The spool stores only the
-envelope fields that were already bound for the wire — never tokens. See
-[`docs/privacy.md`](docs/privacy.md).
+**Consent & identity.** A persisted "denied" consent decision clears the spool
+at load without sending anything; `set_consent(false)` at runtime purges it
+too. A denied player's events never linger on disk. Under Mode B auth, tokens
+are minted bound to the *current* anonymous ID — so if an init-time
+`anonymous_id` override changes the identity, spooled envelopes carrying the
+previous one are dropped from the record at load (surfaced via the
+`diagnostics` hook as `scope = "spool"`, code `identity_changed`) instead of
+being re-sent into a guaranteed rejection; Mode A has no token binding and
+re-sends historic-identity envelopes unchanged. Disabling the spool
+(`spool_enabled = false`) also deletes any previously persisted record at the
+next init. The spool stores only the envelope fields that were already bound
+for the wire — never tokens. See [`docs/privacy.md`](docs/privacy.md).
 
 **Recommended: snapshot on focus loss.** The SDK never installs global
-listeners itself, so wire `persist()` to Defold's window listener — on mobile
-an iconified app can be killed without `final()` ever running:
+listeners itself, so call `persist()` from your window listener — on mobile an
+iconified app can be killed without `final()` ever running. Note that Defold
+keeps a **single** window listener (`window.set_listener` replaces any
+previously set one), so add the `persist()` branch inside your existing
+listener rather than registering a new one:
 
 ```lua
-window.set_listener(function(_, event)
+window.set_listener(function(self, event, data)
+  -- ... your existing resize/focus/iconify handling ...
   if event == window.WINDOW_EVENT_ICONFIED or event == window.WINDOW_EVENT_FOCUS_LOST then
     shardpilot.persist() -- snapshot undelivered events; delivery continues normally
   end

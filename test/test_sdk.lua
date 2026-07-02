@@ -2273,6 +2273,7 @@ end
 local function test_shutdown_spools_undelivered_and_finalizes()
 	reset()
 	storage.reset()
+	local _, restore = install_stub_sys_storage()
 	next_status = 500
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
@@ -2289,6 +2290,7 @@ local function test_shutdown_spools_undelivered_and_finalizes()
 	end
 	assert_true(names["undelivered_at_exit"] ~= nil)
 	assert_true(names["session_end"] ~= nil)
+	restore()
 
 	reset()
 	storage.reset()
@@ -2310,6 +2312,7 @@ end
 local function test_persist_snapshots_queue_while_running()
 	reset()
 	storage.reset()
+	local _, restore = install_stub_sys_storage()
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
 	assert_true(client:track("persisted_one"))
@@ -2342,6 +2345,7 @@ local function test_persist_snapshots_queue_while_running()
 	local ok, err = disabled:persist()
 	assert_equal(ok, false)
 	assert_equal(err, "spool_disabled")
+	restore()
 	storage.reset()
 end
 
@@ -2381,6 +2385,149 @@ local function test_set_anonymous_id_rejected_while_spool_pending_mode_b()
 	local mode_a = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(#mode_a.spool_batches, 1)
 	assert_true(mode_a:set_anonymous_id("anon-a-rotated"), "Mode A allows rotation while the spool is pending")
+	storage.reset()
+end
+
+-- When the caps evict part of the remnant being captured itself (not just
+-- older entries), the capture is NOT complete — shutdown() must keep the old
+-- failure contract instead of finalizing over silently lost events.
+local function test_shutdown_fails_when_remnant_evicted_by_caps()
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	local client = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		spool_max_events = 1,
+		token_provider = function(callback)
+			-- no token: the final flush cannot deliver, forcing the spool path
+			callback(nil, nil, "token unavailable")
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("evicted_one"))
+	assert_true(client:track("evicted_two"))
+
+	-- the remnant is [evicted_one, evicted_two, session_end]; the 1-entry cap
+	-- keeps only the newest (session_end), so the capture is incomplete
+	local ok = client:shutdown("app_final")
+	assert_equal(ok, false, "an evicted remnant must not report durable capture")
+	assert_equal(client.initialized, true)
+	assert_equal(client:snapshot().spooled, 1, "only the surviving envelope counts as spooled")
+	assert_equal(client:snapshot().spool_evicted, 2)
+	local leftover = storage.load_spool(spool_scope)
+	assert_equal(#leftover, 1, "the cap holds; the newest envelope survived")
+	assert_equal(leftover[1].event_name, "session_end")
+
+	-- the in-memory copy is intact: recovery delivers everything and clears
+	client.config.token_provider = function(callback)
+		callback("late-token", nil, nil)
+	end
+	assert_true(client:shutdown("app_final"))
+	assert_equal(#storage.load_spool(spool_scope), 0)
+	restore()
+	storage.reset()
+end
+
+-- Mode B tokens bind the CURRENT anonymous ID, so an init-time anonymous_id
+-- override drops spooled envelopes carrying the previous identity (they would
+-- be rejected on every re-send); Mode A keeps and re-sends them unchanged.
+local function test_spool_identity_mismatch_dropped_mode_b_kept_mode_a()
+	reset()
+	storage.reset()
+	next_status = 500
+	local first = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(first:track("historic_anon_event"))
+	assert_equal(first:flush(), false)
+	assert_equal(#first.spool_record, 1)
+
+	reset()
+	local issues = {}
+	local second = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		anonymous_id = "anon-overridden",
+		diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end,
+	})))
+	assert_equal(#second.spool_batches, 0, "mismatched envelopes must not load for re-send")
+	assert_equal(#storage.load_spool(spool_scope), 0, "mismatched envelopes must leave the record")
+	assert_equal(#issues, 1)
+	assert_equal(issues[1].scope, "spool")
+	assert_equal(issues[1].status, "dropped")
+	assert_equal(issues[1].code, "identity_changed")
+	assert_equal(issues[1].count, 1)
+	assert_true(second:flush())
+	assert_equal(#requests, 0, "nothing re-sends after the identity change")
+
+	-- Mode A: no token binding — historic-identity envelopes re-send verbatim
+	reset()
+	storage.reset()
+	next_status = 500
+	local seeder = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_true(seeder:track("historic_mode_a_event"))
+	assert_equal(seeder:flush(), false)
+	local historic_anon = seeder.anonymous_id
+	reset()
+	local mode_a = assert(sdk.new(config_mode_a({
+		flush_interval_seconds = 9999,
+		anonymous_id = "anon-a-overridden",
+	})))
+	assert_equal(#mode_a.spool_batches, 1, "Mode A keeps historic-identity envelopes")
+	assert_true(mode_a:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"anonymous_id":"' .. historic_anon .. '"')
+	assert_contains(requests[1].body, '"event_name":"historic_mode_a_event"')
+	storage.reset()
+end
+
+-- Without the save-file API the spool falls back to process memory, which is
+-- NOT durable: shutdown()/persist() must keep the old failure contract even
+-- with the spool enabled.
+local function test_shutdown_without_durable_backend_keeps_old_contract()
+	reset()
+	storage.reset()
+	next_status = 500
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("memory_only_event"))
+	local ok = client:shutdown("app_final")
+	assert_equal(ok, false, "a memory-only spool write is not durable capture")
+	assert_equal(client.initialized, true)
+
+	local persist_ok, persist_err = client:persist()
+	assert_equal(persist_ok, false)
+	assert_equal(persist_err, "spool_persist_failed")
+
+	-- in-process recovery still works: the retained batch delivers and clears
+	next_status = 202
+	assert_true(client:shutdown("app_final"))
+	assert_equal(client.initialized, false)
+	storage.reset()
+end
+
+-- Disabling the spool clears a record persisted by an earlier configuration:
+-- nothing lingers on disk, and a later re-enable starts clean.
+local function test_disabled_spool_clears_persisted_record_at_init()
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	next_status = 500
+	local seeder = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(seeder:track("left_on_disk"))
+	assert_equal(seeder:flush(), false)
+	assert_equal(#storage.load_spool(spool_scope), 1)
+
+	reset()
+	local disabled = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_enabled = false })))
+	assert_equal(#disabled.spool_batches, 0)
+	assert_equal(#storage.load_spool(spool_scope), 0, "disabling the spool must clear the persisted record")
+
+	reset()
+	local reenabled = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(#reenabled.spool_batches, 0, "a re-enabled spool starts clean")
+	assert_true(reenabled:flush())
+	assert_equal(#requests, 0)
+	restore()
 	storage.reset()
 end
 
@@ -2462,6 +2609,10 @@ local tests = {
 	test_shutdown_spools_undelivered_and_finalizes,
 	test_persist_snapshots_queue_while_running,
 	test_set_anonymous_id_rejected_while_spool_pending_mode_b,
+	test_shutdown_fails_when_remnant_evicted_by_caps,
+	test_spool_identity_mismatch_dropped_mode_b_kept_mode_a,
+	test_shutdown_without_durable_backend_keeps_old_contract,
+	test_disabled_spool_clears_persisted_record_at_init,
 }
 
 for _, test in ipairs(tests) do

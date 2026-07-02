@@ -382,13 +382,44 @@ function M.new(config)
 	-- deliver so they re-send (chunked to batch_size) before fresh events. The
 	-- consent decision is rechecked first: a persisted denial purges the spool
 	-- without sending — even when the spool is disabled by config — so events
-	-- captured before a revocation never outlive it.
-	if consent_state == "denied" then
+	-- captured before a revocation never outlive it. A disabled spool clears
+	-- the record too: envelopes persisted by an earlier configuration must not
+	-- linger on disk, nor resend if the spool is later re-enabled.
+	if consent_state == "denied" or not normalized.spool_enabled then
 		if #storage.load_spool(normalized) > 0 then
 			storage.clear_spool(normalized)
 		end
-	elseif normalized.spool_enabled then
+	else
 		local spooled = storage.load_spool(normalized)
+		if normalized.token_provider and #spooled > 0 then
+			-- Mode B tokens are minted bound to the CURRENT anonymous ID. When a
+			-- configured anonymous_id override changed the identity at init,
+			-- spooled envelopes carrying the previous one would be rejected
+			-- server-side on every re-send. Drop them from the record at load —
+			-- deterministic, and surfaced via diagnostics — instead of replaying
+			-- them into a guaranteed rejection. Mode A has no token binding, so
+			-- historic-identity envelopes re-send unchanged there (the historic
+			-- actor is the correct one for those events).
+			local kept = {}
+			local dropped = 0
+			for i = 1, #spooled do
+				if spooled[i].anonymous_id == client.anonymous_id then
+					kept[#kept + 1] = spooled[i]
+				else
+					dropped = dropped + 1
+				end
+			end
+			if dropped > 0 then
+				spooled = kept
+				client:write_spool_record(kept)
+				client:diagnose({
+					scope = "spool",
+					status = "dropped",
+					code = "identity_changed",
+					count = dropped,
+				})
+			end
+		end
 		if #spooled > 0 then
 			client.spool_record = spooled
 			local chunk = nil
@@ -1048,8 +1079,22 @@ function Client:spool_envelopes(envelopes)
 	if not self:write_spool_record(combined) then
 		return false
 	end
-	self.stats.spooled = self.stats.spooled + #fresh
-	return true
+	-- Cap eviction may have discarded some of THESE envelopes: the caps evict
+	-- oldest-first across the whole record, and once the older entries are
+	-- gone the eviction reaches into the batch being appended. Evicting OLDER
+	-- entries to make room is the documented FIFO; but an envelope from the
+	-- CURRENT batch that did not survive into the saved record was NOT
+	-- captured — count only survivors and report failure so a
+	-- durability-dependent caller (shutdown/persist) does not claim the whole
+	-- remnant is safe on disk.
+	local survivors = 0
+	for i = 1, #fresh do
+		if self.spool_index[fresh[i].event_id] then
+			survivors = survivors + 1
+		end
+	end
+	self.stats.spooled = self.stats.spooled + survivors
+	return survivors == #fresh
 end
 
 -- Ack-based removal: once the server acknowledged a batch (2xx) — or the batch
@@ -1092,9 +1137,16 @@ end
 -- Persist every not-yet-acknowledged envelope: the retained/in-flight batch
 -- and the queued events. (Loaded spool chunks are already persisted; the
 -- append de-duplicates by event_id either way.) Returns true only when the
--- whole undelivered remnant is durably recorded.
+-- whole undelivered remnant is DURABLY recorded — a memory-only fallback
+-- write or a remnant partially evicted by the caps does not qualify.
 function Client:spool_undelivered()
 	if not self.config.spool_enabled or self.consent_state == "denied" then
+		return false
+	end
+	-- The in-memory fallback (hosts without the save-file API) keeps the
+	-- in-process spool behavior working, but it dies with the process: a
+	-- teardown or snapshot must never report those events as safe on disk.
+	if not storage.spool_is_durable(self.config) then
 		return false
 	end
 	local envelopes = {}

@@ -54,10 +54,14 @@ by the service on the stable event id). This spool:
   events never linger on disk;
 - is **cleared on acknowledgment** — entries are removed as soon as the
   server accepts their batch, or on a permanent rejection (never retried);
+- is **cleared on an identity change under Mode B auth** — envelopes whose
+  anonymous ID no longer matches the client's are dropped at load rather than
+  re-sent;
 - **discards a corrupted record** and starts clean rather than erroring into
   game code;
 - goes through Defold `sys.save` only (browser storage on HTML5); and
-- can be **disabled** with `spool_enabled = false`.
+- can be **disabled** with `spool_enabled = false` — disabling also deletes
+  any previously persisted spool record at the next init.
 
 ## Crash-retry sidecar
 
