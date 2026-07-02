@@ -50,11 +50,16 @@ by the service on the stable event id). This spool:
 - is **per-app** (namespaced like the identity record) so two games on one
   device never share a spool;
 - **honors consent**: a persisted "denied" decision clears it at load without
-  sending, and `set_consent(false)` purges it at runtime — a denied actor's
+  sending — the purge runs even when the record cannot be read, so a corrupt
+  record is still cleared — and `set_consent(false)` purges it at runtime; a
+  denied actor's
   events never linger on disk. Should the durable purge itself fail, the
   failure is reported (`spool_purge_failed`), the spool goes **fail-closed**
   (nothing appended, loaded, or re-sent), and the purge is retried at later
-  dispatch points and at the next launch until it lands;
+  dispatch points and at the next launch until it lands. Revocation cleanup
+  completes **before** a new grant takes effect: `set_consent(true)` is not
+  applied while that purge is owed (the persisted decision stays denied), so
+  pre-revocation events can never replay under a granted decision;
 - is **cleared on acknowledgment** — entries are removed as soon as the
   server accepts their batch, or on a permanent rejection (never retried); a
   failed removal rewrite keeps them marked and retries until storage

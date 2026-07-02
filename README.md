@@ -209,7 +209,12 @@ per-app spool and re-sends them on a later launch. Enabled by default
   longer needed for events. "Durably" is strict: on a runtime without the
   save-file API (where the spool falls back to process memory), or when part
   of the remnant itself was evicted by the caps, `shutdown()` keeps the old
-  contract and returns `false, err` so the host can retry. A pending consent
+  contract and returns `false, err` so the host can retry. The same holds
+  when a **permanent** rejection during the final flush dropped the batch:
+  nothing is left to spool (permanent rejects never are), so the failure
+  surfaces as `false, err` instead of a clean teardown — a repeated
+  `shutdown()` call then completes normally, since the queue is already
+  clean. A pending consent
   decision still returns `false, "consent_pending"` (consent receipts are not
   spooled).
 - An explicit **`persist()`** snapshot (instance + singleton): writes every
@@ -247,13 +252,18 @@ previously persisted record at load, so lowering the budgets trims an old
 record (oldest first) durably.
 
 **Consent & identity.** A persisted "denied" consent decision clears the spool
-at load without sending anything; `set_consent(false)` at runtime purges it
-too. A denied player's events never linger on disk. If the durable purge
-itself fails (a storage error), `set_consent(false)` returns
+at load without sending anything — the purge runs even when the record cannot
+be read (a corrupt record is still cleared); `set_consent(false)` at runtime
+purges it too. A denied player's events never linger on disk. If the durable
+purge itself fails (a storage error), `set_consent(false)` returns
 `false, "spool_purge_failed"` and the spool goes **fail-closed** — nothing is
 appended, loaded, or re-sent — while the purge is retried at later dispatch
 points (and at the next launch) until it lands; calling `set_consent(false)`
-again retries it immediately. Under Mode B auth, tokens
+again retries it immediately. Revocation cleanup completes **before** a new
+grant takes effect: `set_consent(true)` while that purge is still owed
+retries it first and, if it still fails, returns `false, "spool_purge_failed"`
+without applying the grant — the persisted decision stays denied, so a
+relaunch cannot replay the pre-revocation record. Under Mode B auth, tokens
 are minted bound to the *current* anonymous ID — so if an init-time
 `anonymous_id` override changes the identity, spooled envelopes carrying the
 previous one are dropped from the record at load (surfaced via the
@@ -326,7 +336,10 @@ via `crash.capture_previous()`. See [`docs/crash.md`](docs/crash.md).
   decision and the wire report still proceed). If the identity record persisted
   but the durable spool purge failed, it returns `false, "spool_purge_failed"`
   and the spool stays fail-closed while the purge is retried automatically at
-  later dispatch points. Call `set_consent` again to retry
+  later dispatch points; a later `set_consent(true)` retries that purge first
+  and is **not applied** (same `false, "spool_purge_failed"` return, persisted
+  decision stays denied) until the purge lands — revocation cleanup completes
+  before a new grant takes effect. Call `set_consent` again to retry
   persistence, otherwise the decision can be lost on restart.
 - Explicit consent decisions are reported to `POST {ingest_url}/v1/consent` over
   the same authenticated transport; consent never rides the event envelope. The

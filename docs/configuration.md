@@ -101,11 +101,17 @@ configuration that lowered the budgets trims an over-budget old record
 (oldest first, counted in `spool_evicted`) before anything re-sends.
 
 The spool honors consent: a persisted "denied" decision clears it at load
-without sending, and `set_consent(false)` purges it at runtime. If the durable
+without sending (the purge runs even when the record cannot be read — a
+corrupt record is still cleared), and `set_consent(false)` purges it at
+runtime. If the durable
 purge itself fails, `set_consent(false)` returns `false, "spool_purge_failed"`
 and the spool goes fail-closed (nothing appended, loaded, or re-sent) while
 the purge is retried automatically at later dispatch points and at the next
-launch. Spooled
+launch. Revocation cleanup completes before a new grant takes effect:
+`set_consent(true)` retries an owed purge first and is NOT applied while it
+keeps failing (same `false, "spool_purge_failed"` return; the persisted
+decision stays denied), so a relaunch can never replay the pre-revocation
+record under a granted decision. Spooled
 envelopes are re-sent verbatim (stable `event_id`/`event_ts`), so the ingest
 service de-duplicates re-sends; when a `429` `Retry-After` arrives while a
 batch is spooled, the deadline is stored with the record and a relaunch
@@ -121,7 +127,10 @@ Durability is strict: on a runtime without the save-file API the spool falls
 back to process memory (in-process retries keep working), but
 `shutdown()`/`persist()` then report failure rather than claiming the events
 are safe on disk — the same applies when the caps evict part of the remnant
-being captured itself. A failed acknowledgment-removal rewrite keeps the
+being captured itself, and when a permanent rejection during the final flush
+dropped the batch (nothing is left to spool, so `shutdown()` surfaces
+`false, err`; a repeated call completes teardown since the queue is already
+clean). A failed acknowledgment-removal rewrite keeps the
 settled entries marked and retries the rewrite on the flush cadence, so the
 record converges as soon as storage recovers.
 

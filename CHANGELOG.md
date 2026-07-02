@@ -36,7 +36,11 @@
     longer needed for them). Durable capture is strict: on a runtime without
     the save-file API (memory-only fallback), or when the caps evicted part of
     the remnant being captured itself, `shutdown()` keeps the old contract and
-    returns `false, err`. It still returns `false, "consent_pending"` while
+    returns `false, err` — and so does a **permanent** rejection during the
+    final flush, which drops the batch and leaves nothing to spool (the
+    failure surfaces instead of a vacuous clean teardown; a repeated
+    `shutdown()` call completes normally since the queue is already clean).
+    It still returns `false, "consent_pending"` while
     a consent decision awaits a token — consent receipts are not spooled. With
     `spool_enabled = false` the previous contract is unchanged.
   - **New `persist()`** (instance + singleton): snapshots every undelivered
@@ -48,13 +52,19 @@
     `false, "spool_persist_failed"` when the snapshot was not durably and
     fully captured (same strictness as `shutdown()`).
   - **Consent & identity:** a persisted "denied" decision clears the spool at
-    load without sending; `set_consent(false)` at runtime also purges it.
+    load without sending — the purge runs unconditionally, so a record that
+    cannot even be read is still cleared; `set_consent(false)` at runtime
+    also purges it.
     Denied actors never have events on disk. If the durable purge itself
     fails, `set_consent(false)` returns `false, "spool_purge_failed"` and the
     spool goes fail-closed (nothing appended, loaded, or re-sent) while the
     purge is retried automatically at later dispatch points and at the next
     launch; a failed init-time purge (persisted denial or disabled spool)
-    behaves the same. Under Mode B auth, an init-time
+    behaves the same. Revocation cleanup completes before a new grant takes
+    effect: `set_consent(true)` retries an owed purge first and is not
+    applied while it keeps failing (`false, "spool_purge_failed"`; the
+    persisted decision stays denied), so a relaunch can never replay the
+    pre-revocation record under a granted decision. Under Mode B auth, an init-time
     `anonymous_id` override drops spooled envelopes carrying the previous
     identity at load — the minted token binds the current identity, so
     re-sending them would be rejected — surfaced via `diagnostics`

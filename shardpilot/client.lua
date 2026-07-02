@@ -396,14 +396,16 @@ function M.new(config)
 	-- the record too: envelopes persisted by an earlier configuration must not
 	-- linger on disk, nor resend if the spool is later re-enabled.
 	if consent_state == "denied" or not normalized.spool_enabled then
-		if #storage.load_spool(normalized) > 0 then
-			if not storage.clear_spool(normalized) then
-				-- The purge itself failed. Fail closed: the record is never
-				-- loaded or re-sent while the purge is owed, and later
-				-- dispatch points keep retrying it until it lands.
-				client.stats.spool_persist_failed = client.stats.spool_persist_failed + 1
-				client.spool_purge_pending = true
-			end
+		-- Attempt the purge UNCONDITIONALLY: gating it on a successful read
+		-- would let a failed/corrupt read masquerade as "nothing to purge"
+		-- and leave the stale file to replay after a later grant/re-enable.
+		-- Clearing an absent record is an idempotent no-op.
+		if not storage.clear_spool(normalized) then
+			-- The purge itself failed. Fail closed: the record is never
+			-- loaded or re-sent while the purge is owed, and later
+			-- dispatch points keep retrying it until it lands.
+			client.stats.spool_persist_failed = client.stats.spool_persist_failed + 1
+			client.spool_purge_pending = true
 		end
 	else
 		local spooled, stored_deadline = storage.load_spool(normalized)
@@ -553,6 +555,16 @@ function Client:set_consent(analytics_granted)
 	end
 	if type(analytics_granted) ~= "boolean" then
 		return false, "invalid_consent"
+	end
+	-- Revocation cleanup completes before a new grant takes effect. The
+	-- purge-owed flag is memory-only: if a grant were applied (and persisted)
+	-- while the purge of an earlier revocation is still owed, a relaunch
+	-- would see the granted decision and replay the pre-revocation record.
+	-- Retry the purge here; while it keeps failing, the grant is NOT applied
+	-- — the persisted decision stays denied, so every relaunch re-runs the
+	-- purge at init and stays fail-closed until the stale record is gone.
+	if analytics_granted and self.spool_purge_pending and not self:retry_spool_purge() then
+		return false, "spool_purge_failed"
 	end
 	self.consent_state = analytics_granted and "granted" or "denied"
 	local purged = true
@@ -1516,7 +1528,17 @@ function Client:shutdown(reason)
 		-- host retry loop is no longer needed for events. With the spool
 		-- disabled (or the remnant not durably saved) the old contract holds:
 		-- report the failure and stay alive for a host retry.
-		if not self:spool_undelivered() then
+		--
+		-- A terminal rejection during the final flush DROPS the batch: there
+		-- is no remnant left, and a vacuously "successful" capture of nothing
+		-- must not upgrade that failure to a clean teardown. Surface the old
+		-- (false, err) contract instead; a repeated shutdown() call then
+		-- completes normally — the queue is already clean — exactly as before
+		-- the spool existed. Pending spool chunks count as a remnant: they
+		-- are already durably persisted, so finalizing over them is safe.
+		local has_remnant = self.in_flight_batch ~= nil
+			or queue.size(self.queue) > 0 or self:spool_pending()
+		if not has_remnant or not self:spool_undelivered() then
 			return false, err
 		end
 	end

@@ -2729,6 +2729,121 @@ local function test_persisted_retry_after_defers_startup_resend()
 	storage.reset()
 end
 
+-- The denied/disabled init purge must run even when the record cannot be
+-- read: a failed/corrupt read is not "nothing to purge" — the stale file
+-- would otherwise survive and replay after a later grant/re-enable.
+local function test_init_purge_runs_even_when_record_unreadable()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	next_status = 500
+	local seeder = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(seeder:track("stale_unreadable"))
+	assert_equal(seeder:flush(), false)
+	assert_equal(#stored_spool_record(stores).events, 1)
+	assert_true(storage.save(spool_scope, { anonymous_id = seeder.anonymous_id, consent_analytics = "denied" }))
+
+	-- clear the in-memory shadow and make the spool file unreadable, so a
+	-- read-gated purge would see "nothing" while the stale file persists
+	storage.reset()
+	local real_load = sys.load
+	sys.load = function(path)
+		if path:sub(-6) == "/spool" then
+			error("unreadable spool file")
+		end
+		return real_load(path)
+	end
+	reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "denied")
+	assert_equal(client.spool_purge_pending, false)
+	assert_equal(#stored_spool_record(stores).events, 0,
+		"the stale record must be purged even when it cannot be read")
+	sys.load = real_load
+	restore()
+	storage.reset()
+end
+
+-- A grant while a purge from an earlier revocation is still owed must not be
+-- applied: the pending flag is memory-only, and a persisted grant would let a
+-- relaunch replay the pre-revocation record. Revocation cleanup completes
+-- before a new grant takes effect.
+local function test_grant_blocked_until_owed_purge_lands()
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	next_status = 500
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("pre_denial_event"))
+	assert_equal(client:flush(), false)
+
+	local heal = break_spool_saves()
+	next_status = 202
+	local ok, err = client:set_consent(false)
+	assert_equal(ok, false)
+	assert_equal(err, "spool_purge_failed")
+	assert_equal(#requests, 2, "the denial receipt is still reported")
+
+	-- the grant is refused while the purge is owed; the persisted decision
+	-- stays denied and no grant receipt goes out
+	ok, err = client:set_consent(true)
+	assert_equal(ok, false)
+	assert_equal(err, "spool_purge_failed")
+	assert_equal(client.consent_state, "denied", "the grant must not be applied")
+	assert_equal(storage.load(spool_scope).consent_analytics, "denied",
+		"the persisted decision must stay denied")
+	assert_equal(#requests, 2, "no grant receipt while the purge is owed")
+
+	-- a relaunch before the purge lands stays fail-closed: the persisted
+	-- denial re-runs the purge at init and never loads the record
+	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(relaunch.consent_state, "denied")
+	assert_equal(relaunch.spool_purge_pending, true)
+	assert_equal(#relaunch.spool_batches, 0)
+
+	-- storage recovers: the grant retries the purge, lands it, and applies
+	heal()
+	ok, err = client:set_consent(true)
+	assert_true(ok, err)
+	assert_equal(client.consent_state, "granted")
+	assert_equal(client.spool_purge_pending, false)
+	assert_equal(#storage.load_spool(spool_scope), 0)
+	assert_equal(storage.load(spool_scope).consent_analytics, "granted")
+	assert_equal(#requests, 3, "the applied grant is reported")
+	restore()
+	storage.reset()
+end
+
+-- A terminal rejection during the final flush drops the batch, so there is
+-- nothing to spool: shutdown must surface the failure instead of finalizing
+-- through a vacuously successful capture of nothing. A repeated shutdown()
+-- call still completes teardown (the queue is already clean).
+local function test_shutdown_surfaces_terminal_failure_not_vacuous_spool()
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	next_status = 400
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("terminally_rejected"))
+
+	local ok = client:shutdown("app_final")
+	assert_equal(ok, false, "a terminal final-flush failure must not report a clean teardown")
+	assert_equal(client.initialized, true)
+	assert_equal(#storage.load_spool(spool_scope), 0, "a permanent reject is never spooled")
+	assert_equal(client:snapshot().dropped, 2, "the tracked event and session_end were dropped")
+	assert_equal(#requests, 1)
+
+	-- retrying shutdown completes normally, as before the spool existed
+	next_status = 202
+	assert_true(client:shutdown("app_final"))
+	assert_equal(client.initialized, false)
+	assert_equal(#requests, 1, "nothing is left to send on the retry")
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_singleton_guard,
@@ -2816,6 +2931,9 @@ local tests = {
 	test_failed_ack_removal_keeps_entries_and_retries_rewrite,
 	test_loaded_record_reapplies_current_caps,
 	test_persisted_retry_after_defers_startup_resend,
+	test_init_purge_runs_even_when_record_unreadable,
+	test_grant_blocked_until_owed_purge_lands,
+	test_shutdown_surfaces_terminal_failure_not_vacuous_spool,
 }
 
 for _, test in ipairs(tests) do
