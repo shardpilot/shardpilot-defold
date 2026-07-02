@@ -367,6 +367,16 @@ function M.new(config)
 		spool_record = {},
 		spool_index = {},
 		spool_batches = {},
+		-- Deferred durable-spool work (retried at later dispatch points):
+		-- entries acknowledged/terminally-rejected whose removal rewrite is
+		-- still owed, and a denied/disabled purge that has not landed yet.
+		spool_settled = {},
+		spool_rewrite_pending = false,
+		spool_purge_pending = false,
+		-- Server-requested backpressure deadline (epoch ms) stored with the
+		-- record; spool_disk_deadline_ms mirrors what the record carries.
+		spool_retry_after_ms = nil,
+		spool_disk_deadline_ms = nil,
 		session_id = nil,
 		session_sequence = 0,
 		session_active = false,
@@ -387,10 +397,29 @@ function M.new(config)
 	-- linger on disk, nor resend if the spool is later re-enabled.
 	if consent_state == "denied" or not normalized.spool_enabled then
 		if #storage.load_spool(normalized) > 0 then
-			storage.clear_spool(normalized)
+			if not storage.clear_spool(normalized) then
+				-- The purge itself failed. Fail closed: the record is never
+				-- loaded or re-sent while the purge is owed, and later
+				-- dispatch points keep retrying it until it lands.
+				client.stats.spool_persist_failed = client.stats.spool_persist_failed + 1
+				client.spool_purge_pending = true
+			end
 		end
 	else
-		local spooled = storage.load_spool(normalized)
+		local spooled, stored_deadline = storage.load_spool(normalized)
+		-- Server-requested backpressure survives a relaunch: when the record
+		-- carries a still-future Retry-After deadline, seed the publish
+		-- deferral so the startup resend waits out the remaining window
+		-- (defer_publish's 24h clamp bounds wall-clock skew). An expired
+		-- deadline is dropped by the rewrite below.
+		if #spooled > 0 and type(stored_deadline) == "number" then
+			local remaining_ms = stored_deadline - clock.unix_ms()
+			if remaining_ms > 0 then
+				defer_publish(client, remaining_ms / 1000)
+				client.spool_retry_after_ms = client.publish_retry_after_ms
+			end
+		end
+		local mismatched = 0
 		if normalized.token_provider and #spooled > 0 then
 			-- Mode B tokens are minted bound to the CURRENT anonymous ID. When a
 			-- configured anonymous_id override changed the identity at init,
@@ -401,23 +430,35 @@ function M.new(config)
 			-- historic-identity envelopes re-send unchanged there (the historic
 			-- actor is the correct one for those events).
 			local kept = {}
-			local dropped = 0
 			for i = 1, #spooled do
 				if spooled[i].anonymous_id == client.anonymous_id then
 					kept[#kept + 1] = spooled[i]
 				else
-					dropped = dropped + 1
+					mismatched = mismatched + 1
 				end
 			end
-			if dropped > 0 then
+			if mismatched > 0 then
 				spooled = kept
-				client:write_spool_record(kept)
 				client:diagnose({
 					scope = "spool",
 					status = "dropped",
 					code = "identity_changed",
-					count = dropped,
+					count = mismatched,
 				})
+			end
+		end
+		if #spooled > 0 or mismatched > 0 then
+			if #spooled == 0 then
+				client.spool_retry_after_ms = nil
+			end
+			-- One durable rewrite: persists the identity drop and reapplies
+			-- the CURRENT caps — a configuration that lowered the budgets
+			-- trims an over-budget old record at load, oldest first (counted
+			-- in spool_evicted) — and re-stamps or drops the stored deadline.
+			-- Should this write fail, the raw list is used for this process
+			-- and the caps apply on the next successful write.
+			if client:write_spool_record(spooled) then
+				spooled = client.spool_record
 			end
 		end
 		if #spooled > 0 then
@@ -514,6 +555,7 @@ function Client:set_consent(analytics_granted)
 		return false, "invalid_consent"
 	end
 	self.consent_state = analytics_granted and "granted" or "denied"
+	local purged = true
 	if not analytics_granted then
 		local cleared = queue.size(self.queue)
 		if cleared > 0 then
@@ -535,11 +577,24 @@ function Client:set_consent(analytics_granted)
 		-- Revoked consent also purges the durable spool: envelopes captured
 		-- before the denial must not survive it on disk or be re-sent on a
 		-- later launch. Cleared unconditionally (even with the spool disabled)
-		-- so a record left by an earlier configuration cannot linger.
+		-- so a record left by an earlier configuration cannot linger. If the
+		-- durable purge fails, the spool goes fail-closed (no appends, loads,
+		-- or resends) and the purge is retried at later dispatch points; the
+		-- failure is surfaced to the caller below so it can also retry.
 		self.spool_record = {}
 		self.spool_index = {}
-		if not storage.clear_spool(self.config) then
-			self.stats.spool_persist_failed = self.stats.spool_persist_failed + 1
+		self.spool_settled = {}
+		self.spool_rewrite_pending = false
+		self.spool_retry_after_ms = nil
+		if storage.clear_spool(self.config) then
+			self.spool_purge_pending = false
+			self.spool_disk_deadline_ms = nil
+		else
+			if not self.spool_purge_pending then
+				self.stats.spool_persist_failed = self.stats.spool_persist_failed + 1
+			end
+			self.spool_purge_pending = true
+			purged = false
 		end
 		-- Any 429/transport backoff deferral was set for the now-discarded batch,
 		-- so it is stale. Clear it (and the backoff attempt count) or a later
@@ -559,6 +614,13 @@ function Client:set_consent(analytics_granted)
 		-- the durable write failed: surface it like track does (ok, err).
 		-- Calling set_consent again retries persistence.
 		return false, "consent_persist_failed"
+	end
+	if not purged then
+		-- The denial applied (and persisted), but the durable spool purge
+		-- failed: previously spooled envelopes are still on disk. Calling
+		-- set_consent(false) again retries it, and later dispatch points
+		-- keep retrying on their own.
+		return false, "spool_purge_failed"
 	end
 	return true
 end
@@ -1029,22 +1091,73 @@ function Client:ensure_batch_payload(batch)
 end
 
 -- Replace the persisted spool with `events` and refresh the client mirror
--- from what storage actually kept after cap eviction.
+-- from what storage actually kept after cap eviction. Every write drops the
+-- entries marked settled (acknowledged/terminally rejected but whose earlier
+-- removal rewrite failed), so any successful write doubles as the deferred
+-- removal; the record also carries the current backpressure deadline.
 function Client:write_spool_record(events)
-	local saved = storage.save_spool(self.config, events, self.config.spool_max_events, self.config.spool_max_bytes)
+	local target = events
+	if next(self.spool_settled) ~= nil then
+		target = {}
+		for i = 1, #events do
+			if not self.spool_settled[events[i].event_id] then
+				target[#target + 1] = events[i]
+			end
+		end
+	end
+	local saved = storage.save_spool(self.config, target,
+		self.config.spool_max_events, self.config.spool_max_bytes, self.spool_retry_after_ms)
 	if not saved then
 		self.stats.spool_persist_failed = self.stats.spool_persist_failed + 1
+		if next(self.spool_settled) ~= nil then
+			-- The settled entries are still on disk: keep them marked and
+			-- retry the rewrite at the next dispatch point.
+			self.spool_rewrite_pending = true
+		end
 		return false
 	end
-	if #events > #saved then
-		self.stats.spool_evicted = self.stats.spool_evicted + (#events - #saved)
+	if #target > #saved then
+		self.stats.spool_evicted = self.stats.spool_evicted + (#target - #saved)
 	end
 	self.spool_record = saved
 	self.spool_index = {}
 	for i = 1, #saved do
 		self.spool_index[saved[i].event_id] = true
 	end
+	self.spool_settled = {}
+	self.spool_rewrite_pending = false
+	self.spool_disk_deadline_ms = self.spool_retry_after_ms
 	return true
+end
+
+-- Retry a denied/disabled purge that could not land. While the purge is owed
+-- the spool is fail-closed (nothing appended, loaded, or re-sent). Invoked on
+-- the flush cadence (update-driven), from persist()/shutdown(), and before
+-- any append.
+function Client:retry_spool_purge()
+	if not self.spool_purge_pending then
+		return true
+	end
+	if storage.clear_spool(self.config) then
+		self.spool_purge_pending = false
+		-- Nothing can be owed beneath a completed purge.
+		self.spool_settled = {}
+		self.spool_rewrite_pending = false
+		self.spool_disk_deadline_ms = nil
+		return true
+	end
+	return false
+end
+
+-- Retry the removal rewrite for settled entries: the mirror still holds them
+-- (a failed write never mutates it), and write_spool_record's settled filter
+-- drops them from what reaches the disk — so the record converges as soon as
+-- storage recovers instead of waiting for an unrelated write or a relaunch.
+function Client:retry_spool_rewrite()
+	if not self.spool_rewrite_pending then
+		return true
+	end
+	return self:write_spool_record(self.spool_record)
 end
 
 -- Append envelopes to the durable spool, skipping any already persisted — so
@@ -1053,6 +1166,11 @@ end
 -- new is durably recorded (vacuously true when nothing new).
 function Client:spool_envelopes(envelopes)
 	if not self.config.spool_enabled or self.consent_state == "denied" then
+		return false
+	end
+	-- Fail-closed while a purge of the record is owed: retry it first, and
+	-- never append to (or resurrect) a record that must be cleared.
+	if self.spool_purge_pending and not self:retry_spool_purge() then
 		return false
 	end
 	local fresh = {}
@@ -1123,14 +1241,18 @@ function Client:clear_spooled_batch(events)
 	if not remove then
 		return 0
 	end
-	local kept = {}
-	for i = 1, #self.spool_record do
-		local env = self.spool_record[i]
-		if not remove[env.event_id] then
-			kept[#kept + 1] = env
-		end
+	-- Mark the entries settled, then rewrite the record without them. When
+	-- the rewrite fails, the mirror keeps the entries and the removal stays
+	-- pending: it is retried at the next dispatch point (and any later
+	-- successful write settles it via write_spool_record's filter), so the
+	-- disk converges as soon as storage recovers. Should the app relaunch
+	-- first, the re-sent envelopes are de-duplicated by the ingest service on
+	-- their event_id — but convergence does not depend on that: the retried
+	-- rewrite is what removes them.
+	for event_id in pairs(remove) do
+		self.spool_settled[event_id] = true
 	end
-	self:write_spool_record(kept)
+	self:write_spool_record(self.spool_record)
 	return count
 end
 
@@ -1174,6 +1296,11 @@ function Client:persist()
 	if not self.config.spool_enabled then
 		return false, "spool_disabled"
 	end
+	-- A pending denied/disabled purge takes priority over any snapshot: retry
+	-- it, and report it while the spool stays fail-closed.
+	if self.spool_purge_pending and not self:retry_spool_purge() then
+		return false, "spool_purge_failed"
+	end
 	if self.consent_state == "denied" then
 		-- Denied consent leaves nothing spoolable: the queue is already
 		-- cleared and the spool itself stays purged.
@@ -1208,8 +1335,11 @@ function Client:start_publish_batch()
 		if ok then
 			self.stats.published = self.stats.published + batch_count
 			-- A successful publish clears any backpressure deferral/backoff.
+			-- The server accepted a batch, so any stored backpressure window
+			-- is over too: the next durable write drops it from the record.
 			self.publish_retry_after_ms = nil
 			self.publish_backoff_attempt = 0
+			self.spool_retry_after_ms = nil
 			-- A 202 is NOT full per-event success: parse the body so observed /
 			-- rejected / suppressed_no_consent outcomes are surfaced instead of
 			-- silently counted as accepted. Duplicates are terminal; the batch
@@ -1246,13 +1376,6 @@ function Client:start_publish_batch()
 		-- Mode A 401 is non-retryable, so the batch is dropped here too. Compute
 		-- this FIRST so the deferral below is only set for a batch we keep.
 		local retain = is_retryable_publish_failure(err, unauthorized, retryable, mode_b) and self.consent_state ~= "denied"
-		if retain then
-			-- Durably spool a transiently failed batch (appended once — the
-			-- event_id index de-duplicates repeats) so an app kill before the
-			-- in-process retry succeeds cannot lose it. Permanent rejects are
-			-- NEVER spooled: they would fail forever on every later launch.
-			self:spool_envelopes(events.payload.events)
-		end
 		if unauthorized then
 			self.token = nil
 			self.token_expires_at_ms = nil
@@ -1262,8 +1385,26 @@ function Client:start_publish_batch()
 		-- (up to the 24h clamp). A 401 is never deferred (handled above).
 		elseif retain and retry_after and retry_after > 0 then
 			defer_publish(self, retry_after)
+			-- A server-requested delay survives a relaunch: remember the
+			-- (clamped) deadline so the spool write below stores it and a
+			-- startup resend waits out the remaining window.
+			self.spool_retry_after_ms = self.publish_retry_after_ms
 		elseif retain and is_retryable_publish_failure(err, unauthorized, retryable, mode_b) then
 			self:defer_backoff()
+		end
+		if retain then
+			-- Durably spool a transiently failed batch (appended once — the
+			-- event_id index de-duplicates repeats) so an app kill before the
+			-- in-process retry succeeds cannot lose it. Permanent rejects are
+			-- NEVER spooled: they would fail forever on every later launch.
+			self:spool_envelopes(events.payload.events)
+			-- The append is a no-op when every envelope is already persisted
+			-- (a spooled re-send failing again); an extended server-requested
+			-- deadline must still reach the record.
+			if self.spool_retry_after_ms and #self.spool_record > 0
+				and self.spool_retry_after_ms ~= self.spool_disk_deadline_ms then
+				self:write_spool_record(self.spool_record)
+			end
 		end
 		if not retain and self.in_flight_batch == events then
 			self.stats.dropped = self.stats.dropped + batch_count
@@ -1292,6 +1433,12 @@ function Client:flush(options)
 	if type(options) ~= "table" then
 		options = {}
 	end
+	-- Retry deferred durable-spool work first — before any other spool
+	-- operation: a failed denied/disabled purge keeps the spool fail-closed
+	-- until it lands, and a failed ack-removal rewrite must settle as soon as
+	-- storage recovers. Both ride the flush cadence (update-driven).
+	self:retry_spool_purge()
+	self:retry_spool_rewrite()
 	-- A consent decision retained while no token was available rides the
 	-- same dispatch cadence as queued events; its outcome never affects the
 	-- flush result.
@@ -1347,6 +1494,10 @@ function Client:flush(options)
 end
 
 function Client:shutdown(reason)
+	-- One more chance for an owed denied/disabled purge to land before
+	-- teardown (flush below retries it too; a still-failing purge is re-run
+	-- at the next launch by the persisted denial/disabled configuration).
+	self:retry_spool_purge()
 	local denied = self.consent_state == "denied"
 	if self.session_active then
 		-- session_end completes the local teardown even while consent is

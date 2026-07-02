@@ -228,7 +228,13 @@ de-duplicates a re-send that raced an original delivery. Entries leave the
 spool only when the server acknowledges their batch (2xx) — ack-based removal
 keyed by `event_id` — or when a re-send is permanently rejected (surfaced via
 the `diagnostics` hook with `scope = "spool"`). A transient re-send failure
-keeps the entry for the launch after that.
+keeps the entry for the launch after that. If the removal rewrite itself hits
+a storage error, the entries stay marked settled and the rewrite is retried on
+the flush cadence until it lands. A server-requested delay also survives a
+relaunch: when a `429` `Retry-After` arrives while a batch is spooled, the
+deadline is stored with the record, and a launch inside that window waits out
+the remainder before re-sending (bounded by the same 24-hour clamp as the
+in-process deferral).
 
 **Caps.** The spool is bounded by `spool_max_events` (default 500) and
 `spool_max_bytes` (default 256 KB, max 384 KB to keep headroom under the
@@ -236,11 +242,18 @@ save-file API's documented 512 KB per-record cap; the size estimate is
 approximate). Over a cap, the **oldest** entries are evicted first. When the
 eviction reaches into the batch being captured itself, `shutdown()` /
 `persist()` report failure (the in-memory copy is kept for in-process retry)
-rather than claiming the whole remnant is safe.
+rather than claiming the whole remnant is safe. The caps are re-applied to a
+previously persisted record at load, so lowering the budgets trims an old
+record (oldest first) durably.
 
 **Consent & identity.** A persisted "denied" consent decision clears the spool
 at load without sending anything; `set_consent(false)` at runtime purges it
-too. A denied player's events never linger on disk. Under Mode B auth, tokens
+too. A denied player's events never linger on disk. If the durable purge
+itself fails (a storage error), `set_consent(false)` returns
+`false, "spool_purge_failed"` and the spool goes **fail-closed** — nothing is
+appended, loaded, or re-sent — while the purge is retried at later dispatch
+points (and at the next launch) until it lands; calling `set_consent(false)`
+again retries it immediately. Under Mode B auth, tokens
 are minted bound to the *current* anonymous ID — so if an init-time
 `anonymous_id` override changes the identity, spooled envelopes carrying the
 previous one are dropped from the record at load (surfaced via the
@@ -306,10 +319,14 @@ via `crash.capture_previous()`. See [`docs/crash.md`](docs/crash.md).
   token-mint time (Mode B); the SDK always sends that same anonymous ID on the wire.
 - **`set_consent(analytics_granted)`** records `unknown` (default, fully open),
   `granted`, or `denied`. `denied` drops events at enqueue, clears the pending
-  queue, and discards in-flight batches instead of retrying. The decision is
+  queue, discards in-flight batches instead of retrying, and purges the
+  offline spool. The decision is
   applied in memory and persisted to the identity record; if that durable write
   fails, `set_consent` returns `false, "consent_persist_failed"` (the in-memory
-  decision and the wire report still proceed). Call `set_consent` again to retry
+  decision and the wire report still proceed). If the identity record persisted
+  but the durable spool purge failed, it returns `false, "spool_purge_failed"`
+  and the spool stays fail-closed while the purge is retried automatically at
+  later dispatch points. Call `set_consent` again to retry
   persistence, otherwise the decision can be lost on restart.
 - Explicit consent decisions are reported to `POST {ingest_url}/v1/consent` over
   the same authenticated transport; consent never rides the event envelope. The

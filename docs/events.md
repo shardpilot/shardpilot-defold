@@ -58,12 +58,19 @@ spooled event is counted once even if both copies arrive.
 
 Spooled entries are removed only after the server acknowledges their batch
 (2xx), keyed by `event_id`; a permanent `4xx` also removes them (they would
-fail forever) and surfaces through the `diagnostics` hook. Permanent rejects
+fail forever) and surfaces through the `diagnostics` hook. A failed removal
+rewrite keeps the entries marked settled and retries on the flush cadence
+until storage recovers. Permanent rejects
 are never spooled in the first place. The spool is bounded
-(`spool_max_events` / `spool_max_bytes`, oldest evicted first), honors the
-consent decision (a denial clears it), and is disabled with
+(`spool_max_events` / `spool_max_bytes`, oldest evicted first — the caps are
+re-applied to an old record at load), honors the
+consent decision (a denial clears it; a failed purge leaves the spool
+fail-closed and is retried), and is disabled with
 `spool_enabled = false` (which also deletes a previously persisted record at
-init). Durable capture is strict: when the runtime has no save-file API, or
+init). A `429` `Retry-After` received while a batch is spooled is stored with
+the record: a relaunch inside the window waits out the remainder before
+re-sending. Durable capture is strict: when the runtime has no save-file API,
+or
 the caps evicted part of the remnant being captured, `shutdown()`/`persist()`
 report failure instead of claiming durability. Under Mode B auth, an
 init-time `anonymous_id` override drops spooled envelopes carrying the

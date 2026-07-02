@@ -22,7 +22,14 @@
     record only after the server acknowledged their batch (2xx) — ack-based
     removal keyed by `event_id`. A permanent `4xx` on a spooled batch also
     removes it (surfaced via the `diagnostics` hook, scope `"spool"`); a
-    transient failure keeps it for the next launch.
+    transient failure keeps it for the next launch. A failed removal rewrite
+    keeps the entries marked settled and retries on the flush cadence until
+    storage recovers. A `429` `Retry-After` received while a batch is spooled
+    is stored with the record (`retry_after_until_ms`): a relaunch inside the
+    window waits out the remainder before re-sending, bounded by the same
+    24-hour clamp as the in-process deferral. The caps are re-applied to a
+    previously persisted record at load, so lowered budgets trim an old
+    record (oldest first).
   - **`shutdown()` semantics:** when the final flush cannot deliver and the
     remnant is durably spooled, `shutdown()` now completes the teardown and
     returns `true` (the events are safe on disk; a host retry loop is no
@@ -42,7 +49,12 @@
     fully captured (same strictness as `shutdown()`).
   - **Consent & identity:** a persisted "denied" decision clears the spool at
     load without sending; `set_consent(false)` at runtime also purges it.
-    Denied actors never have events on disk. Under Mode B auth, an init-time
+    Denied actors never have events on disk. If the durable purge itself
+    fails, `set_consent(false)` returns `false, "spool_purge_failed"` and the
+    spool goes fail-closed (nothing appended, loaded, or re-sent) while the
+    purge is retried automatically at later dispatch points and at the next
+    launch; a failed init-time purge (persisted denial or disabled spool)
+    behaves the same. Under Mode B auth, an init-time
     `anonymous_id` override drops spooled envelopes carrying the previous
     identity at load — the minted token binds the current identity, so
     re-sending them would be rejected — surfaced via `diagnostics`

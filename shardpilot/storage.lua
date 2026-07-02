@@ -536,41 +536,60 @@ local function sanitize_spool_events(events)
 	return out
 end
 
-local function write_spool(ns, events)
+-- The record optionally carries a server-requested backpressure deadline
+-- (`retry_after_until_ms`, wall-clock epoch ms recorded from a 429
+-- Retry-After) so a relaunch inside the window can keep waiting it out.
+local function sanitize_deadline(value)
+	if type(value) == "number" and value > 0 then
+		return value
+	end
+	return nil
+end
+
+local function write_spool(ns, events, retry_after_until_ms)
+	local record = { events = events, retry_after_until_ms = sanitize_deadline(retry_after_until_ms) }
 	local path = save_path(ns, "spool")
 	if not path then
-		-- No durable backend (plain Lua host): the in-memory list is the store.
-		spool_memory[ns] = events
+		-- No durable backend (plain Lua host): the in-memory record is the store.
+		spool_memory[ns] = record
 		return true
 	end
-	local ok, saved = pcall(sys.save, path, { events = events })
+	local ok, saved = pcall(sys.save, path, record)
 	if not (ok and saved == true) then
 		return false
 	end
-	spool_memory[ns] = events
+	spool_memory[ns] = record
 	return true
 end
 
--- Load the spooled envelopes for this app (possibly empty). A failed or
--- garbled sys.load discards the record and starts clean; this never throws.
+-- Load the spooled envelopes for this app (possibly empty) plus the stored
+-- backpressure deadline, if any. A failed or garbled sys.load discards the
+-- record and starts clean; this never throws.
 function M.load_spool(scope)
 	local ns = spool_namespace(scope)
+	local record = nil
 	local path = save_path(ns, "spool")
-	if not path then
-		return sanitize_spool_events(spool_memory[ns])
+	if path then
+		local ok, loaded = pcall(sys.load, path)
+		if ok and type(loaded) == "table" then
+			record = loaded
+		end
 	end
-	local ok, record = pcall(sys.load, path)
-	if not ok or type(record) ~= "table" then
-		return sanitize_spool_events(spool_memory[ns])
+	if record == nil then
+		record = spool_memory[ns]
 	end
-	return sanitize_spool_events(record.events)
+	if type(record) ~= "table" then
+		return {}, nil
+	end
+	return sanitize_spool_events(record.events), sanitize_deadline(record.retry_after_until_ms)
 end
 
 -- Replace the persisted spool with `events` (oldest first), enforcing the
 -- count and approximate-bytes caps by evicting the OLDEST entries first.
--- Returns the list that was actually persisted (possibly shorter than the
--- input after eviction), or nil when the durable write failed outright.
-function M.save_spool(scope, events, max_events, max_bytes)
+-- `retry_after_until_ms` (optional) is stored with the record. Returns the
+-- list that was actually persisted (possibly shorter than the input after
+-- eviction), or nil when the durable write failed outright.
+function M.save_spool(scope, events, max_events, max_bytes, retry_after_until_ms)
 	local ns = spool_namespace(scope)
 	local kept = sanitize_spool_events(events)
 	local limit_events = (type(max_events) == "number" and max_events > 0) and max_events or 500
@@ -606,7 +625,7 @@ function M.save_spool(scope, events, max_events, max_bytes)
 	-- entries one at a time and retry until the write succeeds or nothing is
 	-- left to save (then the backend itself is unavailable).
 	while true do
-		if write_spool(ns, kept) then
+		if write_spool(ns, kept, retry_after_until_ms) then
 			return kept
 		end
 		if #kept == 0 then
@@ -616,10 +635,10 @@ function M.save_spool(scope, events, max_events, max_bytes)
 	end
 end
 
--- Drop the whole spool (consent revoked, a persisted denial found at load, or
--- the spool disabled by configuration).
+-- Drop the whole spool — envelopes and any stored deadline (consent revoked,
+-- a persisted denial found at load, or the spool disabled by configuration).
 function M.clear_spool(scope)
-	return write_spool(spool_namespace(scope), {})
+	return write_spool(spool_namespace(scope), {}, nil)
 end
 
 -- True when the spool has a durable backend on this runtime (the save-file

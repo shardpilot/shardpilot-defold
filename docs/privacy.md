@@ -51,9 +51,17 @@ by the service on the stable event id). This spool:
   device never share a spool;
 - **honors consent**: a persisted "denied" decision clears it at load without
   sending, and `set_consent(false)` purges it at runtime — a denied actor's
-  events never linger on disk;
+  events never linger on disk. Should the durable purge itself fail, the
+  failure is reported (`spool_purge_failed`), the spool goes **fail-closed**
+  (nothing appended, loaded, or re-sent), and the purge is retried at later
+  dispatch points and at the next launch until it lands;
 - is **cleared on acknowledgment** — entries are removed as soon as the
-  server accepts their batch, or on a permanent rejection (never retried);
+  server accepts their batch, or on a permanent rejection (never retried); a
+  failed removal rewrite keeps them marked and retries until storage
+  recovers;
+- may store a server-requested **backpressure deadline** (a `429`
+  `Retry-After` timestamp — no other metadata) so a relaunch does not hammer
+  a server that asked for space;
 - is **cleared on an identity change under Mode B auth** — envelopes whose
   anonymous ID no longer matches the client's are dropped at load rather than
   re-sent;

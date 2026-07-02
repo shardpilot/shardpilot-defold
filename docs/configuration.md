@@ -96,10 +96,21 @@ README's "Offline durability" section and [`docs/events.md`](events.md)):
   save-file API's documented 512 KB per-record limit. The OLDEST entries are
   evicted first over budget.
 
+Both caps are re-applied to a previously persisted record at load: a
+configuration that lowered the budgets trims an over-budget old record
+(oldest first, counted in `spool_evicted`) before anything re-sends.
+
 The spool honors consent: a persisted "denied" decision clears it at load
-without sending, and `set_consent(false)` purges it at runtime. Spooled
+without sending, and `set_consent(false)` purges it at runtime. If the durable
+purge itself fails, `set_consent(false)` returns `false, "spool_purge_failed"`
+and the spool goes fail-closed (nothing appended, loaded, or re-sent) while
+the purge is retried automatically at later dispatch points and at the next
+launch. Spooled
 envelopes are re-sent verbatim (stable `event_id`/`event_ts`), so the ingest
-service de-duplicates re-sends. Under Mode B auth, spooled envelopes whose
+service de-duplicates re-sends; when a `429` `Retry-After` arrives while a
+batch is spooled, the deadline is stored with the record and a relaunch
+inside the window waits out the remainder before re-sending. Under Mode B
+auth, spooled envelopes whose
 `anonymous_id` no longer matches the client's (an init-time `anonymous_id`
 override changed the identity) are dropped from the record at load and
 surfaced via `diagnostics` (`scope = "spool"`, code `identity_changed`) — the
@@ -110,7 +121,9 @@ Durability is strict: on a runtime without the save-file API the spool falls
 back to process memory (in-process retries keep working), but
 `shutdown()`/`persist()` then report failure rather than claiming the events
 are safe on disk — the same applies when the caps evict part of the remnant
-being captured itself.
+being captured itself. A failed acknowledgment-removal rewrite keeps the
+settled entries marked and retries the rewrite on the flush cadence, so the
+record converges as soon as storage recovers.
 
 The optional `diagnostics` hook is invoked with each non-accepted ingest
 outcome the server reports. Inside a `202` events-batch response the SDK parses

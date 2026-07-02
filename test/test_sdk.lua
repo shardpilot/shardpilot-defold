@@ -2531,6 +2531,204 @@ local function test_disabled_spool_clears_persisted_record_at_init()
 	storage.reset()
 end
 
+-- Break sys.save for spool writes only (identity writes keep working) and
+-- return a function that heals it.
+local function break_spool_saves()
+	local real_save = sys.save
+	local broken = true
+	sys.save = function(path, record)
+		if broken and path:sub(-6) == "/spool" then
+			return false
+		end
+		return real_save(path, record)
+	end
+	return function()
+		broken = false
+	end
+end
+
+-- A failed durable purge at set_consent(false) must be reported, leave the
+-- spool fail-closed, and be retried at later dispatch points until it lands.
+local function test_set_consent_denied_reports_failed_spool_purge_and_retries()
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	next_status = 500
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("purge_me"))
+	assert_equal(client:flush(), false)
+	assert_equal(#storage.load_spool(spool_scope), 1)
+
+	local heal = break_spool_saves()
+	next_status = 202
+	local ok, err = client:set_consent(false)
+	assert_equal(ok, false)
+	assert_equal(err, "spool_purge_failed")
+	assert_equal(client.spool_purge_pending, true)
+	assert_equal(#storage.load_spool(spool_scope), 1, "the record is still on disk")
+	assert_equal(#client.spool_record, 0, "the in-memory spool is already cleared")
+	assert_equal(#client.spool_batches, 0, "nothing may be pending for re-send")
+
+	-- fail-closed: persist() reports the owed purge instead of touching the spool
+	local persist_ok, persist_err = client:persist()
+	assert_equal(persist_ok, false)
+	assert_equal(persist_err, "spool_purge_failed")
+
+	-- storage recovers: the next dispatch point (update-driven flush) lands it
+	heal()
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(client.spool_purge_pending, false)
+	assert_equal(#storage.load_spool(spool_scope), 0, "the retried purge cleared the record")
+	restore()
+	storage.reset()
+end
+
+-- A failed purge at init (persisted denial) must never load or re-send the
+-- record, and must keep retrying the purge until storage recovers.
+local function test_init_purge_failure_fails_closed_and_retries()
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	next_status = 500
+	local seeder = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(seeder:track("stale_after_denial"))
+	assert_equal(seeder:flush(), false)
+	assert_true(storage.save(spool_scope, { anonymous_id = seeder.anonymous_id, consent_analytics = "denied" }))
+
+	reset()
+	local heal = break_spool_saves()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "denied")
+	assert_equal(client.spool_purge_pending, true)
+	assert_equal(#client.spool_batches, 0, "a pending purge must never load the record")
+	assert_equal(#client.spool_record, 0)
+	client:flush()
+	assert_equal(#requests, 0, "nothing may re-send while a purge is owed")
+	assert_equal(#storage.load_spool(spool_scope), 1, "the record survives until the purge lands")
+
+	heal()
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(client.spool_purge_pending, false)
+	assert_equal(#storage.load_spool(spool_scope), 0, "the retried init purge cleared the record")
+	restore()
+	storage.reset()
+end
+
+-- A failed ack-removal rewrite keeps the settled entries pending (mirror and
+-- disk) and retries the rewrite at the next dispatch point, so the record
+-- converges as soon as storage recovers.
+local function test_failed_ack_removal_keeps_entries_and_retries_rewrite()
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	next_status = 500
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("acked_later"))
+	assert_equal(client:flush(), false)
+	assert_equal(#client.spool_record, 1)
+
+	-- the batch is acknowledged but the removal rewrite fails
+	local heal = break_spool_saves()
+	next_status = 202
+	assert_true(client:flush(), "the publish itself succeeded")
+	assert_equal(#requests, 2)
+	assert_equal(client.spool_rewrite_pending, true)
+	assert_equal(#client.spool_record, 1, "the mirror keeps the settled entry while removal is pending")
+	assert_equal(#storage.load_spool(spool_scope), 1, "the entry is still on disk")
+
+	-- storage recovers: the retried rewrite settles the entry without waiting
+	-- for an unrelated write or the next launch
+	heal()
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(client.spool_rewrite_pending, false)
+	assert_equal(#client.spool_record, 0)
+	assert_equal(#storage.load_spool(spool_scope), 0, "the retried rewrite removed the settled entry")
+	restore()
+	storage.reset()
+end
+
+-- The CURRENT caps are reapplied to a previously persisted record at load: a
+-- lowered budget trims the oldest entries, durably.
+local function test_loaded_record_reapplies_current_caps()
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	next_status = 500
+	local seeder = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(seeder:identify("user-example"))
+	assert_true(seeder:track("cap_one"))
+	assert_true(seeder:track("cap_two"))
+	assert_true(seeder:track("cap_three"))
+	assert_equal(seeder:flush(), false)
+	assert_equal(#storage.load_spool(spool_scope), 3)
+
+	reset()
+	local lowered = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_max_events = 1 })))
+	assert_equal(#lowered.spool_record, 1, "the lowered cap trims the loaded record")
+	assert_equal(lowered.spool_record[1].event_name, "cap_three", "the oldest entries are trimmed first")
+	assert_equal(lowered:snapshot().spool_evicted, 2)
+	assert_equal(#lowered.spool_batches, 1)
+	assert_equal(#lowered.spool_batches[1], 1)
+	local disk = storage.load_spool(spool_scope)
+	assert_equal(#disk, 1, "the trim is durable")
+	assert_equal(disk[1].event_name, "cap_three")
+	restore()
+	storage.reset()
+end
+
+-- A 429 Retry-After on a spooled batch stores the deadline with the record; a
+-- relaunch inside the window defers the startup resend, an expired deadline
+-- does not.
+local function test_persisted_retry_after_defers_startup_resend()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "600" }
+	local first = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(first:identify("user-example"))
+	assert_true(first:track("backpressured_event"))
+	assert_equal(first:flush(), false)
+	next_response_headers = nil
+	local record = stored_spool_record(stores)
+	assert_true(record ~= nil)
+	assert_equal(#record.events, 1)
+	assert_true(type(record.retry_after_until_ms) == "number", "the Retry-After deadline must be stored")
+	assert_true(record.retry_after_until_ms > math.floor(socket.now * 1000), "the stored deadline lies in the future")
+
+	-- relaunch inside the window: the startup resend waits it out
+	reset()
+	local second = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(#second.spool_batches, 1)
+	assert_true(second:publish_deferred(), "a still-future stored deadline must defer the resend")
+	assert_equal(second:flush(), false)
+	assert_equal(#requests, 0, "no resend inside the server-requested window")
+
+	-- once the window passes, the resend proceeds and the ack clears the record
+	second.publish_retry_after_ms = nil
+	assert_true(second:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"event_name":"backpressured_event"')
+	assert_equal(#storage.load_spool(spool_scope), 0)
+
+	-- an EXPIRED stored deadline does not delay the startup resend
+	reset()
+	storage.reset()
+	assert_true(storage.save_spool(spool_scope, {
+		{ event_id = "expired-e1", event_name = "expired_deadline_event", anonymous_id = "anon-x" },
+	}, 500, 262144, 1000) ~= nil)
+	local third = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(#third.spool_batches, 1)
+	assert_true(not third:publish_deferred(), "an expired stored deadline must not defer")
+	assert_true(third:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"event_name":"expired_deadline_event"')
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_singleton_guard,
@@ -2613,6 +2811,11 @@ local tests = {
 	test_spool_identity_mismatch_dropped_mode_b_kept_mode_a,
 	test_shutdown_without_durable_backend_keeps_old_contract,
 	test_disabled_spool_clears_persisted_record_at_init,
+	test_set_consent_denied_reports_failed_spool_purge_and_retries,
+	test_init_purge_failure_fails_closed_and_retries,
+	test_failed_ack_removal_keeps_entries_and_retries_rewrite,
+	test_loaded_record_reapplies_current_caps,
+	test_persisted_retry_after_defers_startup_resend,
 }
 
 for _, test in ipairs(tests) do
