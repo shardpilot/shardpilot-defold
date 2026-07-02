@@ -17,8 +17,8 @@ not the platform boundary.
   this repo, and the production ingest domain is **not provisioned** yet. Use
   local/develop endpoints for evaluation.
 - **Version strings are inconsistent across files** (`shardpilot/version.lua`
-  reports `0.4.0`, `game.project` declares `0.1.0`). The latest unreleased work
-  is tracked as `v0.4.0 — unreleased` in [`CHANGELOG.md`](CHANGELOG.md); treat
+  reports `0.5.0`, `game.project` declares `0.1.0`). The latest unreleased work
+  is tracked as `v0.5.0 — unreleased` in [`CHANGELOG.md`](CHANGELOG.md); treat
   that as the intent until the strings are reconciled.
 
 ## What it does
@@ -29,6 +29,11 @@ not the platform boundary.
   batches over the Defold global `http.request`. When `http.request` is absent
   (e.g. a plain Lua host) dispatch returns `http_unavailable` and events stay
   queued.
+- **Survives offline play and app kills.** Undeliverable events (a transiently
+  failed batch, the remnant at `shutdown()`, or an explicit `persist()`
+  snapshot) are written to a bounded per-app durable spool and re-sent on a
+  later launch with their original `event_id`, so the ingest service
+  de-duplicates re-sends. See [Offline durability](#offline-durability-event-spool).
 - Emits canonical helpers: `session_start()` → `app.session_started`,
   `screen_view(name)` → `app.screen_view`, plus arbitrary `track(name, props)`.
 - Generates and persists a UUIDv7 anonymous ID per configured app and supports
@@ -94,11 +99,13 @@ function update(self, dt)
 end
 
 function final(self)
-  -- shutdown() starts a flush and returns ok, err. In Defold builds where
-  -- http.request completes asynchronously it may return false, "pending"
-  -- (a batch is still in flight) or false, "consent_pending" (a consent
-  -- decision is awaiting a token). To avoid dropping the final batch, flush
-  -- earlier (e.g. on background) or retry shutdown until it returns true.
+  -- shutdown() starts a final flush. When the flush cannot deliver everything,
+  -- the undelivered events are written to the durable offline spool and
+  -- shutdown returns true — they re-send on the next launch. It still returns
+  -- false, "consent_pending" while a consent decision is awaiting a token
+  -- (consent receipts are not spooled; retry shutdown once the token lands),
+  -- and with spool_enabled = false it returns false, err whenever events
+  -- remain undelivered (retry shutdown until it returns true).
   local ok, err = shardpilot.shutdown("app_final")
   if not ok then
     print("shardpilot shutdown not complete: " .. tostring(err))
@@ -147,6 +154,9 @@ Most methods return `ok, err` so callers can branch on failures (e.g.
 | `flush_interval_seconds` | `1` | Time-based flush trigger (>0) |
 | `publish_timeout_seconds` | `2` | Per-request timeout (>0) |
 | `token_refresh_lead_ms` | `60000` | Refresh lead before token expiry (≥0) |
+| `spool_enabled` | `true` | Durable offline event spool ([details](#offline-durability-event-spool)) |
+| `spool_max_events` | `500` | Max spooled entries (≥1); oldest evicted first |
+| `spool_max_bytes` | `262144` | Approx. spool size budget (1024–393216); oldest evicted first |
 
 > `ingest.shardpilot.com` is a **planned** public domain and is not provisioned.
 > Use local/develop endpoints until a release explicitly publishes production
@@ -180,6 +190,67 @@ Legacy public-SDK fields are **never** emitted: `project_id`, `game_id`, `env`,
 [`scripts/check_library.sh`](scripts/check_library.sh). See
 [`docs/events.md`](docs/events.md).
 
+## Offline durability (event spool)
+
+Player devices go offline and games get killed mid-session. To keep those
+events, the SDK persists undeliverable event envelopes to a small durable
+per-app spool and re-sends them on a later launch. Enabled by default
+(`spool_enabled = true`).
+
+**What is spooled, and when.**
+
+- A batch whose publish failed for a **transient** reason — network
+  unreachable, timeout, `429`, or `5xx` (the same classification that already
+  retains a batch for in-process retry; a Mode B `401` is included since a
+  fresh token can be minted, a Mode A `401` is terminal and never spooled).
+- The **undelivered remnant at `shutdown()`** (queue + in-flight batch). When
+  that remnant is durably saved, `shutdown()` completes the teardown and
+  returns `true` — the events are safe on disk, so a host retry loop is no
+  longer needed for events. A pending consent decision still returns
+  `false, "consent_pending"` (consent receipts are not spooled).
+- An explicit **`persist()`** snapshot (instance + singleton): writes every
+  undelivered event to the spool without sending or tearing down, while the
+  client keeps running.
+- Permanent `4xx` rejects are **never** spooled — they would fail forever.
+
+**Resend.** On the next `init`/`new`, spooled envelopes are re-sent through
+the normal publish machinery — chunked to `batch_size`, **before** fresh
+events, honoring the same token, consent, `Retry-After`-deferral, and backoff
+gates. Envelopes are stored and re-sent **verbatim**: the `event_id` and
+`event_ts` stamped at `track()` time are never rebuilt, so the ingest service
+de-duplicates a re-send that raced an original delivery. Entries leave the
+spool only when the server acknowledges their batch (2xx) — ack-based removal
+keyed by `event_id` — or when a re-send is permanently rejected (surfaced via
+the `diagnostics` hook with `scope = "spool"`). A transient re-send failure
+keeps the entry for the launch after that.
+
+**Caps.** The spool is bounded by `spool_max_events` (default 500) and
+`spool_max_bytes` (default 256 KB, max 384 KB to keep headroom under the
+save-file API's documented 512 KB per-record cap; the size estimate is
+approximate). Over a cap, the **oldest** entries are evicted first.
+
+**Consent.** A persisted "denied" consent decision clears the spool at load
+without sending anything; `set_consent(false)` at runtime purges it too. A
+denied player's events never linger on disk. The spool stores only the
+envelope fields that were already bound for the wire — never tokens. See
+[`docs/privacy.md`](docs/privacy.md).
+
+**Recommended: snapshot on focus loss.** The SDK never installs global
+listeners itself, so wire `persist()` to Defold's window listener — on mobile
+an iconified app can be killed without `final()` ever running:
+
+```lua
+window.set_listener(function(_, event)
+  if event == window.WINDOW_EVENT_ICONFIED or event == window.WINDOW_EVENT_FOCUS_LOST then
+    shardpilot.persist() -- snapshot undelivered events; delivery continues normally
+  end
+end)
+```
+
+Events persisted this way are removed from the spool as soon as their normal
+delivery is acknowledged, so the snapshot costs nothing when the app keeps
+running.
+
 ## Crash wire contract
 
 Crashes use a **separate** module and endpoint. The crash client
@@ -195,10 +266,15 @@ via `crash.capture_previous()`. See [`docs/crash.md`](docs/crash.md).
 
 ## Privacy & consent
 
-- **Memory-only by default.** Tokens and the event queue live only in memory;
-  there is no durable local event queue in v0.
-- **Durable storage is a single identity record** (anonymous ID + consent
-  decision) per configured app — plus a bounded, per-app, TTL'd crash-retry
+- **Tokens are memory-only.** Auth material is never written to disk. The live
+  event queue is in-memory; only undeliverable event envelopes are persisted,
+  to the bounded offline spool
+  ([above](#offline-durability-event-spool)) — set `spool_enabled = false` for
+  a fully memory-only event path.
+- **Durable storage is three small bounded records** per configured app: the
+  identity record (anonymous ID + consent decision), the offline event spool
+  (only envelopes already bound for the wire; cleared on acknowledgment and on
+  consent denial), and a bounded, per-app, TTL'd crash-retry
   sidecar (see the crash note below) that holds only an already-PII-scrubbed
   previous-session crash report, resent then cleared on success. The identity
   record is written through
@@ -265,11 +341,12 @@ via `crash.capture_previous()`. See [`docs/crash.md`](docs/crash.md).
   SDK source. The guard greps file *contents* (`grep -RInE`) for these patterns,
   so it flags native references inside tracked files but does not catch a native
   source file added solely by filename — keep the boundary by convention.
-- **No durable I/O beyond the identity record and the crash-retry sidecar.**
+- **No durable I/O beyond the identity record, the event spool, and the
+  crash-retry sidecar.**
   `io.*`, `os.execute`, and browser/local storage are forbidden in source;
   `sys.save`/`sys.load`/`sys.get_save_file` are confined to
-  `shardpilot/storage.lua`, which writes only the identity record and the
-  bounded, TTL'd crash-retry sidecar.
+  `shardpilot/storage.lua`, which writes only the identity record, the bounded
+  offline event spool, and the bounded, TTL'd crash-retry sidecar.
 - **No raw/provider/token/billing surface.** Terms like `raw_payload`, `prompt`,
   `access_token`, `github_token`, `billing` must not appear in SDK or example
   source.
@@ -302,7 +379,9 @@ Planned / deferred (not yet implemented):
 - Publish a release (tag / GitHub Release / ZIP). `scripts/package_release.sh`
   only *prepares* a reviewable ZIP and explicitly does not publish tags, GitHub
   Releases, registry artifacts, websites, DNS, TLS, or production infra.
-- Durable persistence for tokens/queue is intentionally out of scope for v0.
+- Durable persistence for tokens is intentionally out of scope (tokens stay
+  memory-only by design); undeliverable events are covered by the offline
+  event spool.
 
 See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/release.md`](docs/release.md).
 

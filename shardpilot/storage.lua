@@ -1,4 +1,5 @@
--- Durable persistence for the identity record (anonymous ID + consent state).
+-- Durable persistence for the identity record (anonymous ID + consent state),
+-- the pending-crash sidecar, and the offline event spool.
 -- This is the only SDK module allowed to call Defold sys persistence. Every
 -- call is pcall-guarded so plain Lua hosts without the Defold `sys` API
 -- degrade gracefully to in-memory state for the process lifetime.
@@ -60,14 +61,14 @@ local function short_hash(value)
 	return string.format("%08x", hash)
 end
 
-local function save_path(ns)
+local function save_path(ns, file_name)
 	if type(sys) ~= "table" then
 		return nil
 	end
 	if type(sys.get_save_file) ~= "function" or type(sys.save) ~= "function" or type(sys.load) ~= "function" then
 		return nil
 	end
-	local ok, path = pcall(sys.get_save_file, ns, "identity")
+	local ok, path = pcall(sys.get_save_file, ns, file_name or "identity")
 	if not ok or type(path) ~= "string" or path == "" then
 		return nil
 	end
@@ -443,10 +444,188 @@ function M.load_pending_entries(scope)
 	return out
 end
 
+-- ── offline event spool ──────────────────────────────────────────────────────
+--
+-- Durable storage for analytics event envelopes the client could not deliver
+-- (offline play, an app kill with a batch still in flight, a transient server
+-- failure at shutdown). The client re-sends the spooled envelopes verbatim on a
+-- later launch; each envelope carries the stable event_id stamped when the
+-- event was tracked, so the ingest service de-duplicates a re-send that raced
+-- an original delivery. The record is a flat FIFO list of envelope tables —
+-- oldest first — bounded by both a count and an approximate serialized-bytes
+-- budget supplied by the caller.
+
+local spool_memory = {}
+
+-- Defold documents that sys.save caps a saved table at 512 KB. The byte budget
+-- passed by the caller is clamped to 384 KB so the approximate size estimate
+-- plus table/serialization overhead always stays clear of that hard limit.
+local max_spool_file_bytes = 393216
+
+-- Approximate the serialized size of one envelope. When the runtime provides a
+-- JSON encoder (real Defold does), the encoded length is used. Otherwise a
+-- conservative fallback sums the bytes of every string key/value and charges a
+-- fixed allowance per non-string scalar and per table for punctuation. The
+-- estimate only steers FIFO eviction against the byte budget; it does not need
+-- to be exact, which is why the budget is clamped well under the save-file cap.
+local function approx_envelope_bytes(envelope)
+	if json and type(json.encode) == "function" then
+		local ok, encoded = pcall(json.encode, envelope)
+		if ok and type(encoded) == "string" then
+			return #encoded + 1
+		end
+	end
+	local total = 2
+	local function walk(value, depth)
+		if depth > 16 then
+			return
+		end
+		local value_type = type(value)
+		if value_type == "string" then
+			total = total + #value + 3
+		elseif value_type == "number" or value_type == "boolean" then
+			total = total + 12
+		elseif value_type == "table" then
+			total = total + 2
+			for key, child in pairs(value) do
+				if type(key) == "string" then
+					total = total + #key + 3
+				else
+					total = total + 12
+				end
+				walk(child, depth + 1)
+			end
+		end
+	end
+	walk(envelope, 0)
+	return total
+end
+
+-- The spool is keyed by the same per-app namespace scheme as the identity
+-- record, plus the short raw-scope hash (as the pending-crash sidecar does) so
+-- two raw app ids that sanitize to the same slug still get distinct spools.
+local function spool_namespace(scope)
+	local base = namespace(scope)
+	local raw_workspace = type(scope) == "table" and scope.workspace_id or nil
+	local raw_app = type(scope) == "table" and scope.app_id or nil
+	if type(raw_app) == "string" and raw_app ~= "" then
+		local fingerprint = raw_app
+		if type(raw_workspace) == "string" and raw_workspace ~= "" then
+			fingerprint = raw_workspace .. "\0" .. raw_app
+		end
+		base = base .. "." .. short_hash(fingerprint)
+	end
+	return base
+end
+
+-- Keep only entries that look like event envelopes (a table carrying a
+-- non-empty string event_id). A corrupted or partially garbled record thus
+-- degrades to the salvageable subset — or a clean empty spool — instead of
+-- erroring into game code.
+local function sanitize_spool_events(events)
+	local out = {}
+	if type(events) ~= "table" then
+		return out
+	end
+	for i = 1, #events do
+		local entry = events[i]
+		if type(entry) == "table" and type(entry.event_id) == "string" and entry.event_id ~= "" then
+			out[#out + 1] = entry
+		end
+	end
+	return out
+end
+
+local function write_spool(ns, events)
+	local path = save_path(ns, "spool")
+	if not path then
+		-- No durable backend (plain Lua host): the in-memory list is the store.
+		spool_memory[ns] = events
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, { events = events })
+	if not (ok and saved == true) then
+		return false
+	end
+	spool_memory[ns] = events
+	return true
+end
+
+-- Load the spooled envelopes for this app (possibly empty). A failed or
+-- garbled sys.load discards the record and starts clean; this never throws.
+function M.load_spool(scope)
+	local ns = spool_namespace(scope)
+	local path = save_path(ns, "spool")
+	if not path then
+		return sanitize_spool_events(spool_memory[ns])
+	end
+	local ok, record = pcall(sys.load, path)
+	if not ok or type(record) ~= "table" then
+		return sanitize_spool_events(spool_memory[ns])
+	end
+	return sanitize_spool_events(record.events)
+end
+
+-- Replace the persisted spool with `events` (oldest first), enforcing the
+-- count and approximate-bytes caps by evicting the OLDEST entries first.
+-- Returns the list that was actually persisted (possibly shorter than the
+-- input after eviction), or nil when the durable write failed outright.
+function M.save_spool(scope, events, max_events, max_bytes)
+	local ns = spool_namespace(scope)
+	local kept = sanitize_spool_events(events)
+	local limit_events = (type(max_events) == "number" and max_events > 0) and max_events or 500
+	local limit_bytes = (type(max_bytes) == "number" and max_bytes > 0) and max_bytes or 262144
+	if limit_bytes > max_spool_file_bytes then
+		limit_bytes = max_spool_file_bytes
+	end
+	while #kept > limit_events do
+		table.remove(kept, 1)
+	end
+	-- Estimate each entry once, then evict from the front (oldest) until the
+	-- summed estimate fits the byte budget.
+	local total = 2
+	local sizes = {}
+	for i = 1, #kept do
+		sizes[i] = approx_envelope_bytes(kept[i])
+		total = total + sizes[i]
+	end
+	local drop = 0
+	while drop < #kept and total > limit_bytes do
+		drop = drop + 1
+		total = total - sizes[drop]
+	end
+	if drop > 0 then
+		local trimmed = {}
+		for i = drop + 1, #kept do
+			trimmed[#trimmed + 1] = kept[i]
+		end
+		kept = trimmed
+	end
+	-- The estimate ignores serialization overhead, so a near-budget list can
+	-- still overflow the save-file cap and fail the write. Evict the oldest
+	-- entries one at a time and retry until the write succeeds or nothing is
+	-- left to save (then the backend itself is unavailable).
+	while true do
+		if write_spool(ns, kept) then
+			return kept
+		end
+		if #kept == 0 then
+			return nil
+		end
+		table.remove(kept, 1)
+	end
+end
+
+-- Drop the whole spool (consent revoked, or a persisted denial found at load).
+function M.clear_spool(scope)
+	return write_spool(spool_namespace(scope), {})
+end
+
 -- Clears the in-memory fallback records only; intended for tests.
 function M.reset()
 	memory_records = {}
 	pending_memory = {}
+	spool_memory = {}
 end
 
 return M

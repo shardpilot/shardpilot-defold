@@ -267,6 +267,22 @@ local function validate_config(config)
 	if config.diagnostics ~= nil and type(config.diagnostics) ~= "function" then
 		return nil, "invalid_diagnostics"
 	end
+	if config.spool_enabled ~= nil and type(config.spool_enabled) ~= "boolean" then
+		return nil, "invalid_spool_enabled"
+	end
+	local spool_max_events, spool_max_events_err =
+		normalize_integer(config.spool_max_events, 500, 1, nil, "invalid_spool_max_events")
+	if not spool_max_events then
+		return nil, spool_max_events_err
+	end
+	-- The spool is persisted through the runtime save-file API, which caps a
+	-- saved table at 512 KB; the byte budget is capped at 384 KB so the
+	-- approximate size estimate plus serialization overhead stays clear of it.
+	local spool_max_bytes, spool_max_bytes_err =
+		normalize_integer(config.spool_max_bytes, 262144, 1024, 393216, "invalid_spool_max_bytes")
+	if not spool_max_bytes then
+		return nil, spool_max_bytes_err
+	end
 	local out = {
 		ingest_url = trim_slash(config.ingest_url),
 		workspace_id = config.workspace_id,
@@ -285,6 +301,9 @@ local function validate_config(config)
 		flush_interval_seconds = flush_interval_seconds,
 		publish_timeout_seconds = publish_timeout_seconds,
 		token_refresh_lead_ms = token_refresh_lead_ms,
+		spool_enabled = config.spool_enabled ~= false,
+		spool_max_events = spool_max_events,
+		spool_max_bytes = spool_max_bytes,
 	}
 	return out
 end
@@ -326,6 +345,10 @@ function M.new(config)
 			consent_recorded = 0,
 			consent_failed = 0,
 			consent_persist_failed = 0,
+			spooled = 0,
+			spool_resent = 0,
+			spool_evicted = 0,
+			spool_persist_failed = 0,
 			last_consent_error = nil,
 			last_error = nil,
 			last_event_issue = nil,
@@ -341,6 +364,9 @@ function M.new(config)
 		anonymous_id = anonymous_id,
 		consent_state = consent_state,
 		consent_decision_seq = 0,
+		spool_record = {},
+		spool_index = {},
+		spool_batches = {},
 		session_id = nil,
 		session_sequence = 0,
 		session_active = false,
@@ -351,6 +377,30 @@ function M.new(config)
 	}, Client)
 	if stored.anonymous_id ~= anonymous_id then
 		client:persist_identity()
+	end
+	-- Offline event spool: re-load the envelopes a previous launch could not
+	-- deliver so they re-send (chunked to batch_size) before fresh events. The
+	-- consent decision is rechecked first: a persisted denial purges the spool
+	-- without sending — even when the spool is disabled by config — so events
+	-- captured before a revocation never outlive it.
+	if consent_state == "denied" then
+		if #storage.load_spool(normalized) > 0 then
+			storage.clear_spool(normalized)
+		end
+	elseif normalized.spool_enabled then
+		local spooled = storage.load_spool(normalized)
+		if #spooled > 0 then
+			client.spool_record = spooled
+			local chunk = nil
+			for i = 1, #spooled do
+				client.spool_index[spooled[i].event_id] = true
+				if not chunk or #chunk >= normalized.batch_size then
+					chunk = {}
+					client.spool_batches[#client.spool_batches + 1] = chunk
+				end
+				chunk[#chunk + 1] = spooled[i]
+			end
+		end
 	end
 	return client
 end
@@ -392,10 +442,15 @@ function Client:set_anonymous_id(anonymous_id)
 	--     actor_identifier and survives even after the token request settles (e.g.
 	--     a token_provider error leaves it queued); its retry would mint for the
 	--     new anon but send the old actor.
+	--   * spooled envelopes loaded from a previous launch carry their historic
+	--     anonymous_id snapshot; re-sending them under a token minted for the
+	--     NEW anon would be rejected the same way, so rotation waits until the
+	--     spool has drained.
 	-- The host retries the rotation once the pending work clears.
 	local rotating = self.config.token_provider and anonymous_id ~= self.anonymous_id
 	if rotating and (queue.size(self.queue) > 0 or self.in_flight_batch ~= nil
-		or self.token_request_in_flight or self.pending_consent ~= nil) then
+		or self.token_request_in_flight or self.pending_consent ~= nil
+		or self:spool_pending()) then
 		return false, "events_pending"
 	end
 	self.anonymous_id = anonymous_id
@@ -437,8 +492,23 @@ function Client:set_consent(analytics_granted)
 			cleared = cleared + #self.in_flight_batch
 			self.in_flight_batch = nil
 		end
+		if #self.spool_batches > 0 then
+			for i = 1, #self.spool_batches do
+				cleared = cleared + #self.spool_batches[i]
+			end
+			self.spool_batches = {}
+		end
 		if cleared > 0 then
 			self.stats.dropped = self.stats.dropped + cleared
+		end
+		-- Revoked consent also purges the durable spool: envelopes captured
+		-- before the denial must not survive it on disk or be re-sent on a
+		-- later launch. Cleared unconditionally (even with the spool disabled)
+		-- so a record left by an earlier configuration cannot linger.
+		self.spool_record = {}
+		self.spool_index = {}
+		if not storage.clear_spool(self.config) then
+			self.stats.spool_persist_failed = self.stats.spool_persist_failed + 1
 		end
 		-- Any 429/transport backoff deferral was set for the now-discarded batch,
 		-- so it is stale. Clear it (and the backoff attempt count) or a later
@@ -898,6 +968,171 @@ function Client:publish_deferred()
 	return self.publish_retry_after_ms ~= nil and clock.unix_ms() < self.publish_retry_after_ms
 end
 
+-- ── offline event spool ───────────────────────────────────────────────────────
+--
+-- Envelopes the client could not deliver are persisted (see storage.lua) and
+-- re-sent on a later launch through the normal publish machinery. Spooled
+-- envelopes are stored and re-sent VERBATIM — the event_id and event_ts
+-- stamped at track() time are never rebuilt or re-stamped, so the ingest
+-- service can de-duplicate a re-send that raced an original delivery.
+-- `spool_record` mirrors the persisted list and `spool_index` its event_ids,
+-- so appends are de-duplicated and acknowledged batches are removed cheaply.
+
+-- True while envelopes loaded from a previous launch still await re-send.
+function Client:spool_pending()
+	return #self.spool_batches > 0
+end
+
+-- Build (once) and return the batch's wire payload. A retained batch keeps its
+-- payload so retries and the spool always carry the exact envelopes of the
+-- first attempt.
+function Client:ensure_batch_payload(batch)
+	if not batch.payload then
+		local envelopes = {}
+		for i, event in ipairs(batch) do
+			envelopes[i] = envelope.build(self.config, self, event)
+		end
+		batch.payload = { events = envelopes }
+	end
+	return batch.payload
+end
+
+-- Replace the persisted spool with `events` and refresh the client mirror
+-- from what storage actually kept after cap eviction.
+function Client:write_spool_record(events)
+	local saved = storage.save_spool(self.config, events, self.config.spool_max_events, self.config.spool_max_bytes)
+	if not saved then
+		self.stats.spool_persist_failed = self.stats.spool_persist_failed + 1
+		return false
+	end
+	if #events > #saved then
+		self.stats.spool_evicted = self.stats.spool_evicted + (#events - #saved)
+	end
+	self.spool_record = saved
+	self.spool_index = {}
+	for i = 1, #saved do
+		self.spool_index[saved[i].event_id] = true
+	end
+	return true
+end
+
+-- Append envelopes to the durable spool, skipping any already persisted — so
+-- a batch that fails transiently more than once is spooled exactly once, and a
+-- re-loaded spool batch is never appended again. Returns true when everything
+-- new is durably recorded (vacuously true when nothing new).
+function Client:spool_envelopes(envelopes)
+	if not self.config.spool_enabled or self.consent_state == "denied" then
+		return false
+	end
+	local fresh = {}
+	local seen = {}
+	for i = 1, #envelopes do
+		local env = envelopes[i]
+		local event_id = type(env) == "table" and env.event_id or nil
+		if type(event_id) == "string" and event_id ~= ""
+			and not self.spool_index[event_id] and not seen[event_id] then
+			seen[event_id] = true
+			fresh[#fresh + 1] = env
+		end
+	end
+	if #fresh == 0 then
+		return true
+	end
+	local combined = {}
+	for i = 1, #self.spool_record do
+		combined[#combined + 1] = self.spool_record[i]
+	end
+	for i = 1, #fresh do
+		combined[#combined + 1] = fresh[i]
+	end
+	if not self:write_spool_record(combined) then
+		return false
+	end
+	self.stats.spooled = self.stats.spooled + #fresh
+	return true
+end
+
+-- Ack-based removal: once the server acknowledged a batch (2xx) — or the batch
+-- was terminally rejected — its envelopes leave the persisted spool, keyed by
+-- their stable event_id. Returns how many entries the batch settled.
+function Client:clear_spooled_batch(events)
+	if next(self.spool_index) == nil then
+		return 0
+	end
+	local payload = events.payload
+	local sent = payload and payload.events or nil
+	if type(sent) ~= "table" then
+		return 0
+	end
+	local remove = nil
+	local count = 0
+	for i = 1, #sent do
+		local env = sent[i]
+		local event_id = type(env) == "table" and env.event_id or nil
+		if event_id and self.spool_index[event_id] then
+			remove = remove or {}
+			remove[event_id] = true
+			count = count + 1
+		end
+	end
+	if not remove then
+		return 0
+	end
+	local kept = {}
+	for i = 1, #self.spool_record do
+		local env = self.spool_record[i]
+		if not remove[env.event_id] then
+			kept[#kept + 1] = env
+		end
+	end
+	self:write_spool_record(kept)
+	return count
+end
+
+-- Persist every not-yet-acknowledged envelope: the retained/in-flight batch
+-- and the queued events. (Loaded spool chunks are already persisted; the
+-- append de-duplicates by event_id either way.) Returns true only when the
+-- whole undelivered remnant is durably recorded.
+function Client:spool_undelivered()
+	if not self.config.spool_enabled or self.consent_state == "denied" then
+		return false
+	end
+	local envelopes = {}
+	if self.in_flight_batch then
+		local payload = self:ensure_batch_payload(self.in_flight_batch)
+		for i = 1, #payload.events do
+			envelopes[#envelopes + 1] = payload.events[i]
+		end
+	end
+	for i = 1, #self.queue.items do
+		envelopes[#envelopes + 1] = envelope.build(self.config, self, self.queue.items[i])
+	end
+	return self:spool_envelopes(envelopes)
+end
+
+-- Snapshot every undelivered event into the durable spool while the client
+-- keeps running — intended for a host window focus-lost/iconify listener, so
+-- an app kill right after cannot lose the tail. Nothing is sent here, and the
+-- events stay queued for normal delivery; a later acknowledged publish removes
+-- its entries from the spool (ack-based, keyed by event_id).
+function Client:persist()
+	if not self.initialized then
+		return false, "shutdown"
+	end
+	if not self.config.spool_enabled then
+		return false, "spool_disabled"
+	end
+	if self.consent_state == "denied" then
+		-- Denied consent leaves nothing spoolable: the queue is already
+		-- cleared and the spool itself stays purged.
+		return true
+	end
+	if not self:spool_undelivered() then
+		return false, "spool_persist_failed"
+	end
+	return true
+end
+
 function Client:start_publish_batch()
 	if self.publish_in_flight or not self.in_flight_batch or #self.in_flight_batch == 0 then
 		return true, false, true
@@ -909,13 +1144,7 @@ function Client:start_publish_batch()
 		return false, false, false
 	end
 	local events = self.in_flight_batch
-	if not events.payload then
-		local envelopes = {}
-		for i, event in ipairs(events) do
-			envelopes[i] = envelope.build(self.config, self, event)
-		end
-		events.payload = { events = envelopes }
-	end
+	self:ensure_batch_payload(events)
 	self.publish_in_flight = true
 	local completed = false
 	local succeeded = false
@@ -935,6 +1164,13 @@ function Client:start_publish_batch()
 			-- is cleared here either way and never re-sent.
 			local body = type(response) == "table" and response.response or nil
 			self:apply_batch_response(body, batch_count)
+			if events.spool_origin then
+				self.stats.spool_resent = self.stats.spool_resent + batch_count
+			end
+			-- Ack-based spool removal: the server owns these events now, so
+			-- any persisted copies (a spooled re-send, a transiently failed
+			-- batch, or a persist() snapshot) leave the durable record.
+			self:clear_spooled_batch(events)
 			if self.in_flight_batch == events then
 				self.in_flight_batch = nil
 			end
@@ -958,6 +1194,13 @@ function Client:start_publish_batch()
 		-- Mode A 401 is non-retryable, so the batch is dropped here too. Compute
 		-- this FIRST so the deferral below is only set for a batch we keep.
 		local retain = is_retryable_publish_failure(err, unauthorized, retryable, mode_b) and self.consent_state ~= "denied"
+		if retain then
+			-- Durably spool a transiently failed batch (appended once — the
+			-- event_id index de-duplicates repeats) so an app kill before the
+			-- in-process retry succeeds cannot lose it. Permanent rejects are
+			-- NEVER spooled: they would fail forever on every later launch.
+			self:spool_envelopes(events.payload.events)
+		end
 		if unauthorized then
 			self.token = nil
 			self.token_expires_at_ms = nil
@@ -973,6 +1216,18 @@ function Client:start_publish_batch()
 		if not retain and self.in_flight_batch == events then
 			self.stats.dropped = self.stats.dropped + batch_count
 			self.in_flight_batch = nil
+			-- A terminally rejected batch also leaves the spool, or it would
+			-- be re-sent (and re-rejected) on every later launch. Surfaced via
+			-- diagnostics so the drop of durable entries is observable.
+			local removed = self:clear_spooled_batch(events)
+			if removed > 0 then
+				self:diagnose({
+					scope = "spool",
+					status = "dropped",
+					code = err,
+					count = removed,
+				})
+			end
 		end
 	end)
 	if not dispatched and self.publish_in_flight then
@@ -994,7 +1249,7 @@ function Client:flush(options)
 	end
 	self.flush_elapsed_seconds = 0
 	if self.publish_in_flight then
-		if self.in_flight_batch or queue.size(self.queue) > 0 then
+		if self.in_flight_batch or queue.size(self.queue) > 0 or self:spool_pending() then
 			return false, "pending"
 		end
 		return true
@@ -1003,14 +1258,28 @@ function Client:flush(options)
 	while true do
 		local token_ready = false
 		if not self.in_flight_batch then
-			if queue.size(self.queue) == 0 then
+			local resend_spool = self:spool_pending()
+			if not resend_spool and queue.size(self.queue) == 0 then
 				return true
 			end
 			if not self:can_publish() then
 				return false
 			end
 			token_ready = true
-			self.in_flight_batch = queue.drain(self.queue, self.config.batch_size)
+			if resend_spool then
+				-- Envelopes spooled by an earlier launch re-send BEFORE the
+				-- fresh queue drains, through the same token/consent/deferral
+				-- gates. The payload is the persisted envelopes verbatim —
+				-- never rebuilt — so event_id/event_ts survive the round trip.
+				local chunk = table.remove(self.spool_batches, 1)
+				local batch = { spool_origin = true, payload = { events = chunk } }
+				for i = 1, #chunk do
+					batch[i] = chunk[i]
+				end
+				self.in_flight_batch = batch
+			else
+				self.in_flight_batch = queue.drain(self.queue, self.config.batch_size)
+			end
 		end
 		if not token_ready and not self:can_publish() then
 			return false
@@ -1038,7 +1307,15 @@ function Client:shutdown(reason)
 	end
 	local ok, err = self:flush({ include_summaries = not denied })
 	if not ok then
-		return false, err
+		-- The final flush could not deliver everything. When the durable spool
+		-- captures the whole undelivered remnant, teardown completes anyway:
+		-- the envelopes are safe on disk and re-send on the next launch, so a
+		-- host retry loop is no longer needed for events. With the spool
+		-- disabled (or the remnant not durably saved) the old contract holds:
+		-- report the failure and stay alive for a host retry.
+		if not self:spool_undelivered() then
+			return false, err
+		end
 	end
 	if self.pending_consent then
 		-- A consent decision deferred behind an async token participates in

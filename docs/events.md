@@ -44,3 +44,24 @@ where it differs):
 
 Project Tower-specific event names should be sent through generic `track()`
 from the game integration later; they are not hardcoded SDK core behavior.
+
+## Offline durability
+
+Every event carries a stable `event_id` stamped at `track()` time. When a
+batch cannot be delivered for a transient reason (network unreachable,
+timeout, `429`, `5xx`), or undelivered events remain at `shutdown()`, or the
+host calls `persist()`, the already-built envelopes are written to a durable
+per-app spool and re-sent — verbatim, never re-stamped — on a later launch,
+before fresh events. Because the `event_id` survives the round trip, the
+ingest service de-duplicates a re-send that raced an original delivery, so a
+spooled event is counted once even if both copies arrive.
+
+Spooled entries are removed only after the server acknowledges their batch
+(2xx), keyed by `event_id`; a permanent `4xx` also removes them (they would
+fail forever) and surfaces through the `diagnostics` hook. Permanent rejects
+are never spooled in the first place. The spool is bounded
+(`spool_max_events` / `spool_max_bytes`, oldest evicted first), honors the
+consent decision (a denial clears it), and is disabled with
+`spool_enabled = false`. See the README's "Offline durability" section for
+the window-listener recipe and [`docs/configuration.md`](configuration.md)
+for the knobs.

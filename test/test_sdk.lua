@@ -299,6 +299,11 @@ local function test_config_validation()
 		{ { flush_interval_seconds = 0 }, "invalid_flush_interval_seconds" },
 		{ { publish_timeout_seconds = -1 }, "invalid_publish_timeout_seconds" },
 		{ { token_refresh_lead_ms = -1 }, "invalid_token_refresh_lead_ms" },
+		{ { spool_enabled = "yes" }, "invalid_spool_enabled" },
+		{ { spool_max_events = 0 }, "invalid_spool_max_events" },
+		{ { spool_max_events = 1.5 }, "invalid_spool_max_events" },
+		{ { spool_max_bytes = 512 }, "invalid_spool_max_bytes" },
+		{ { spool_max_bytes = 1000000 }, "invalid_spool_max_bytes" },
 	}
 	for _, entry in ipairs(invalid_cases) do
 		client, err = sdk.new(config(entry[1]))
@@ -324,6 +329,9 @@ local function test_config_validation()
 	assert_equal(client.config.buffer_size, 200)
 	assert_equal(client.config.platform, "linux")
 	assert_equal(client.config.token_refresh_lead_ms, 60000)
+	assert_equal(client.config.spool_enabled, true)
+	assert_equal(client.config.spool_max_events, 500)
+	assert_equal(client.config.spool_max_bytes, 262144)
 
 	-- Dual-mode auth: exactly one of token_provider / api_key.
 	-- Neither configured -> auth_required.
@@ -1588,7 +1596,9 @@ local function test_flush_and_shutdown_wait_for_async_publish()
 		callbacks[#callbacks + 1] = callback
 	end
 
-	local client = assert(sdk.new(config()))
+	-- spool_enabled=false: this test exercises the in-process wait contract
+	-- (shutdown must not finalize while a publish is still in flight).
+	local client = assert(sdk.new(config({ spool_enabled = false })))
 	assert_true(client:identify("user-example"))
 	assert_true(client:session_start())
 	local ok, err = client:flush()
@@ -1622,7 +1632,9 @@ end
 local function test_singleton_shutdown_keeps_client_after_retryable_failure()
 	reset()
 	next_status = 500
-	local ok, err = sdk.init(config())
+	-- spool_enabled=false: without the durable spool, a retryable final-flush
+	-- failure must keep the singleton alive for a host retry loop.
+	local ok, err = sdk.init(config({ spool_enabled = false }))
 	assert_true(ok, err)
 	assert_true(sdk.identify("user-example"))
 	assert_true(sdk.session_start())
@@ -1670,6 +1682,9 @@ local function test_singleton_guard()
 		end },
 		{ "flush", function()
 			return sdk.flush()
+		end },
+		{ "persist", function()
+			return sdk.persist()
 		end },
 		{ "shutdown", function()
 			return sdk.shutdown("app_final")
@@ -2024,6 +2039,351 @@ local function test_track_before_session_start_lazily_opens_session()
 	storage.reset()
 end
 
+-- ── offline event spool ──────────────────────────────────────────────────────
+
+-- Install an in-test durable sys persistence layer (the same technique as the
+-- identity persistence tests) backed by a `stores` table. Returns the table
+-- and a restore function.
+local function install_stub_sys_storage()
+	local stores = {}
+	sys.get_save_file = function(application_id, file_name)
+		return application_id .. "/" .. file_name
+	end
+	sys.save = function(path, record)
+		stores[path] = record
+		return true
+	end
+	sys.load = function(path)
+		return stores[path]
+	end
+	return stores, function()
+		sys.get_save_file = nil
+		sys.save = nil
+		sys.load = nil
+	end
+end
+
+local function stored_spool_record(stores)
+	for path, record in pairs(stores) do
+		if path:sub(-6) == "/spool" then
+			return record, path
+		end
+	end
+	return nil
+end
+
+local spool_scope = { workspace_id = "workspace-example", app_id = "app-example" }
+
+-- A transiently failed batch is spooled durably with its envelopes verbatim; a
+-- later launch re-sends it byte-for-byte (same event_id / event_ts) through the
+-- normal publish machinery and clears the record only after the 2xx ack.
+local function test_spool_persists_transient_failure_and_resends_next_launch()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+
+	next_status = 500
+	local first = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(first:identify("user-example"))
+	assert_true(first:track("offline_event", { level = 3 }))
+	assert_equal(first:flush(), false)
+	assert_equal(#requests, 1)
+	local failed_body = requests[1].body
+	local sent = first.in_flight_batch.payload.events
+	assert_equal(#sent, 1)
+	local original_id = sent[1].event_id
+	local original_ts = sent[1].event_ts
+
+	local record = stored_spool_record(stores)
+	assert_true(record ~= nil, "a transiently failed batch must be spooled durably")
+	assert_equal(#record.events, 1)
+	assert_equal(record.events[1].event_id, original_id, "the spool must keep the event_id verbatim")
+	assert_equal(record.events[1].event_ts, original_ts, "the spool must keep the event_ts verbatim")
+	assert_equal(first:snapshot().spooled, 1)
+
+	-- "next launch": a fresh client re-sends the spooled envelope and clears
+	-- the record after the server acknowledged it
+	reset()
+	local second = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(#second.spool_batches, 1)
+	assert_true(second:flush())
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].body, failed_body, "the re-sent payload must be the original envelopes verbatim")
+	assert_contains(requests[1].body, '"event_id":"' .. original_id .. '"')
+	assert_contains(requests[1].body, '"event_ts":"' .. original_ts .. '"')
+	assert_contains(requests[1].body, '"event_name":"offline_event"')
+	assert_equal(second:snapshot().spool_resent, 1)
+	record = stored_spool_record(stores)
+	assert_equal(#record.events, 0, "an acknowledged re-send must clear the spool record")
+
+	assert_true(second:flush())
+	assert_equal(#requests, 1, "a cleared spool must not re-send anything")
+	restore()
+	storage.reset()
+end
+
+-- Over the caps the OLDEST entries are evicted first (FIFO), for both the
+-- entry-count cap and the approximate serialized-bytes cap.
+local function test_spool_overflow_evicts_oldest_first()
+	reset()
+	storage.reset()
+	next_status = 500
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_max_events = 2 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("evict_one"))
+	assert_true(client:track("evict_two"))
+	assert_true(client:track("evict_three"))
+	assert_equal(client:flush(), false)
+	assert_equal(#client.spool_record, 2, "the count cap must hold")
+	assert_equal(client.spool_record[1].event_name, "evict_two", "the oldest entry is evicted first")
+	assert_equal(client.spool_record[2].event_name, "evict_three")
+	assert_equal(client:snapshot().spool_evicted, 1)
+
+	reset()
+	storage.reset()
+	next_status = 500
+	local padded = string.rep("x", 1200)
+	local bytes_client = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_max_bytes = 2048 })))
+	assert_true(bytes_client:identify("user-example"))
+	assert_true(bytes_client:track("bytes_one", { pad = padded }))
+	assert_true(bytes_client:track("bytes_two", { pad = padded }))
+	assert_equal(bytes_client:flush(), false)
+	assert_equal(#bytes_client.spool_record, 1, "the byte budget must evict the oldest entry")
+	assert_equal(bytes_client.spool_record[1].event_name, "bytes_two")
+	storage.reset()
+end
+
+-- A failed or garbled durable read discards the record and starts clean; the
+-- spool never errors into game code.
+local function test_spool_corrupted_record_starts_clean()
+	reset()
+	storage.reset()
+	sys.get_save_file = function(application_id, file_name)
+		return application_id .. "/" .. file_name
+	end
+	sys.save = function()
+		return true
+	end
+	sys.load = function()
+		error("corrupt save file")
+	end
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(#client.spool_batches, 0, "a throwing sys.load must start a clean spool")
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("after_corruption"))
+	assert_true(client:flush())
+
+	local garbage = {
+		"not-a-record",
+		{ events = "not-a-list" },
+		{ events = { "junk", { event_id = 42 }, { no_event_id = true } } },
+	}
+	for _, record in ipairs(garbage) do
+		storage.reset()
+		sys.load = function()
+			return record
+		end
+		local survivor = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+		assert_equal(#survivor.spool_batches, 0, "a garbled spool record must start clean")
+	end
+	sys.get_save_file = nil
+	sys.save = nil
+	sys.load = nil
+	storage.reset()
+end
+
+-- Consent recheck: a persisted denial clears the spool at load without
+-- sending; a runtime set_consent(false) purges a live spool the same way.
+local function test_spool_cleared_by_denied_consent()
+	reset()
+	storage.reset()
+	assert_true(storage.save_spool(spool_scope, {
+		{ event_id = "denied-e1", event_name = "stale_event", event_ts = "2026-01-01T00:00:00.000Z" },
+	}, 500, 262144) ~= nil)
+	assert_true(storage.save(spool_scope, { anonymous_id = "anon-denied", consent_analytics = "denied" }))
+
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "denied")
+	assert_equal(#client.spool_batches, 0, "a persisted denial must not load the spool")
+	assert_equal(#storage.load_spool(spool_scope), 0, "a persisted denial must clear the spool at load")
+	client:flush()
+	assert_equal(#requests, 0, "nothing may be sent for a denied actor")
+
+	reset()
+	storage.reset()
+	next_status = 500
+	local live = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(live:identify("user-example"))
+	assert_true(live:track("spooled_then_denied"))
+	assert_equal(live:flush(), false)
+	assert_equal(#live.spool_record, 1)
+	next_status = 202
+	assert_true(live:set_consent(false))
+	assert_equal(#live.spool_record, 0)
+	assert_equal(#storage.load_spool(spool_scope), 0, "set_consent(false) must purge the durable spool")
+	storage.reset()
+end
+
+-- A permanent reject on a spooled batch removes the entries (they would fail
+-- forever), surfaces the durable drop via diagnostics, and never retries.
+local function test_spool_permanent_reject_removes_entry_and_diagnoses()
+	reset()
+	storage.reset()
+	next_status = 500
+	local first = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(first:identify("user-example"))
+	assert_true(first:track("later_rejected"))
+	assert_equal(first:flush(), false)
+	assert_equal(#first.spool_record, 1)
+
+	reset()
+	next_status = 400
+	local issues = {}
+	local second = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end,
+	})))
+	assert_equal(#second.spool_batches, 1)
+	assert_equal(second:flush(), false)
+	assert_equal(#requests, 1)
+	assert_equal(second.in_flight_batch, nil, "a permanent reject must drop the batch")
+	assert_equal(#second.spool_record, 0, "a permanent reject must remove the spooled entry")
+	assert_equal(second:snapshot().dropped, 1)
+	local spool_issue = nil
+	for _, issue in ipairs(issues) do
+		if issue.scope == "spool" then
+			spool_issue = issue
+		end
+	end
+	assert_true(spool_issue ~= nil, "the durable drop must surface via diagnostics")
+	assert_equal(spool_issue.status, "dropped")
+	assert_equal(spool_issue.code, "http_400")
+	assert_equal(spool_issue.count, 1)
+
+	next_status = 202
+	assert_true(second:flush())
+	assert_equal(#requests, 1, "a permanently rejected spool entry must not be retried")
+	storage.reset()
+end
+
+-- shutdown() spools the undelivered remnant and completes the teardown (the
+-- data is safe on disk); with the spool disabled the old wait contract holds.
+local function test_shutdown_spools_undelivered_and_finalizes()
+	reset()
+	storage.reset()
+	next_status = 500
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:session_start())
+	assert_true(client:track("undelivered_at_exit"))
+
+	assert_true(client:shutdown("app_final"), "a durably spooled remnant must complete the teardown")
+	assert_equal(client.initialized, false)
+	local spooled = storage.load_spool(spool_scope)
+	assert_equal(#spooled, 3, "session events and the tracked event must be spooled")
+	local names = {}
+	for _, env in ipairs(spooled) do
+		names[env.event_name] = true
+	end
+	assert_true(names["undelivered_at_exit"] ~= nil)
+	assert_true(names["session_end"] ~= nil)
+
+	reset()
+	storage.reset()
+	next_status = 500
+	local manual = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_enabled = false })))
+	assert_true(manual:identify("user-example"))
+	assert_true(manual:track("kept_in_memory"))
+	local ok = manual:shutdown("app_final")
+	assert_equal(ok, false, "spool_enabled=false keeps the old failed-shutdown contract")
+	assert_equal(manual.initialized, true)
+	assert_equal(#storage.load_spool(spool_scope), 0)
+	next_status = 202
+	assert_true(manual:shutdown("app_final"))
+	storage.reset()
+end
+
+-- persist() snapshots queued events into the durable spool while the client
+-- keeps running; a later acknowledged publish removes them (ack-based).
+local function test_persist_snapshots_queue_while_running()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("persisted_one"))
+	assert_true(client:track("persisted_two"))
+	local queued_ids = {}
+	for i, event in ipairs(client.queue.items) do
+		queued_ids[i] = event.event_id
+	end
+
+	assert_true(client:persist())
+	assert_equal(#requests, 0, "persist must not publish")
+	assert_equal(#client.queue.items, 2, "persist must keep the events queued")
+	assert_equal(#client.spool_record, 2)
+	assert_equal(client.spool_record[1].event_id, queued_ids[1])
+	assert_equal(client.spool_record[2].event_id, queued_ids[2])
+	assert_equal(client:snapshot().spooled, 2)
+
+	-- a second persist appends nothing new (de-duplicated by event_id)
+	assert_true(client:persist())
+	assert_equal(#client.spool_record, 2)
+	assert_equal(client:snapshot().spooled, 2)
+
+	-- later successful delivery removes the entries (ack-based)
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_equal(#client.spool_record, 0, "an acknowledged publish must remove persisted entries")
+	assert_equal(#storage.load_spool(spool_scope), 0)
+
+	local disabled = assert(sdk.new(config({ spool_enabled = false })))
+	local ok, err = disabled:persist()
+	assert_equal(ok, false)
+	assert_equal(err, "spool_disabled")
+	storage.reset()
+end
+
+-- Mode B anon rotation waits for pending spooled work the same way it waits
+-- for queued/in-flight events: the spooled envelopes carry the historic anon.
+local function test_set_anonymous_id_rejected_while_spool_pending_mode_b()
+	reset()
+	storage.reset()
+	next_status = 500
+	local first = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(first:identify("user-example"))
+	assert_true(first:track("spooled_before_rotation"))
+	assert_equal(first:flush(), false)
+
+	reset()
+	local second = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(#second.spool_batches, 1)
+	local ok, err = second:set_anonymous_id("anon-rotated")
+	assert_equal(ok, false)
+	assert_equal(err, "events_pending")
+
+	assert_true(second:flush())
+	assert_equal(#second.spool_batches, 0)
+	assert_true(second:set_anonymous_id("anon-rotated"), "rotation allowed once the spool drained")
+	assert_equal(second:get_anonymous_id(), "anon-rotated")
+
+	-- Mode A has no token binding, so rotation stays allowed while spooled
+	-- work is pending (the guard must not over-restrict).
+	reset()
+	storage.reset()
+	next_status = 500
+	local seeder = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_true(seeder:identify("user-example"))
+	assert_true(seeder:track("spooled_mode_a"))
+	assert_equal(seeder:flush(), false)
+	reset()
+	local mode_a = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(#mode_a.spool_batches, 1)
+	assert_true(mode_a:set_anonymous_id("anon-a-rotated"), "Mode A allows rotation while the spool is pending")
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_singleton_guard,
@@ -2094,6 +2454,14 @@ local tests = {
 	test_client_source_keeps_anonymous_id_both_modes,
 	test_get_anonymous_id_matches_wire,
 	test_track_before_session_start_lazily_opens_session,
+	test_spool_persists_transient_failure_and_resends_next_launch,
+	test_spool_overflow_evicts_oldest_first,
+	test_spool_corrupted_record_starts_clean,
+	test_spool_cleared_by_denied_consent,
+	test_spool_permanent_reject_removes_entry_and_diagnoses,
+	test_shutdown_spools_undelivered_and_finalizes,
+	test_persist_snapshots_queue_while_running,
+	test_set_anonymous_id_rejected_while_spool_pending_mode_b,
 }
 
 for _, test in ipairs(tests) do
