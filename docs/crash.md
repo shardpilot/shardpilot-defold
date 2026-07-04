@@ -132,19 +132,23 @@ end
 
 `capture_previous()`:
 
-1. **Resends any still-pending reports first** (see *Durability* below):
-   undelivered crash reports get the first shot at the network, before the
-   host typically starts analytics traffic.
-2. Calls `crash.load_previous()` (one-shot — the dump is removed from disk on a
+1. Calls `crash.load_previous()` (one-shot — the dump is removed from disk on a
    successful load).
-3. Reads the backtrace (`crash.get_backtrace`), module list
+2. Reads the backtrace (`crash.get_backtrace`), module list
    (`crash.get_modules`), signal (`crash.get_signum`), and OS sys-fields, and
-   builds a **native** crash event: `instruction_addr` frames + a `modules` map.
-4. Forwards it as a **fatal** report (never sampled), then releases the dump
-   handle.
+   builds a **native** crash event: `instruction_addr` frames + a `modules`
+   map. The prepared report is persisted **write-ahead** (see *Durability*
+   below) and QUEUED as a fatal report (never sampled) behind any older
+   pending backlog.
+3. Runs **one serial resend pass** covering the older backlog and the
+   just-queued dump, oldest first — crash reports get the first shot at the
+   network, before the host typically starts analytics traffic, and one
+   report at a time so server backpressure can stop the pass. (When there is
+   no new dump, the pass still runs for the pending backlog.)
 
-Return value: `(true, true)` when a dump was found and forwarded, `(true, false)`
-when there was no dump, `(false, err)` on a forward failure.
+Return value: `(true, true)` when a dump was found and durably queued for the
+pass, `(true, false)` when there was no dump, `(false, err)` on a forward
+failure.
 
 ### Limits of native dump forwarding
 

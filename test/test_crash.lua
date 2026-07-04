@@ -4286,13 +4286,29 @@ local function test_legacy_report_table_entry_resent_and_settled()
 		  occurred_at = "2026-01-01T00:00:00Z" },
 	} }), "the legacy record is planted")
 
+	-- The FIRST resend adopts the legacy entry into the byte-identical
+	-- contract: it fails retryably here, and the stored entry must now
+	-- carry the encoded body under the same token.
 	reset()
-	next_status = 202
+	next_status = 500
 	local client = assert(crash.new(config({ app_id = "legacy-entry-app", sample_every = 1 })))
 	client:resend_pending()
-	assert_equal(#requests, 1, "the legacy entry is resent")
-	assert_contains(requests[1].body, '"LEGACY"')
-	assert_equal(#storage.load_pending_crashes(scope), 0, "the accepted legacy entry settled")
+	assert_equal(#requests, 1, "the legacy entry was attempted")
+	local first_body = requests[1].body
+	assert_contains(first_body, '"LEGACY"')
+	local adopted = storage.load_pending_entries(scope)
+	assert_equal(#adopted, 1, "the retryable failure kept the entry")
+	assert_equal(adopted[1].body, first_body,
+		"the adoption persisted the exact first-attempt bytes under the same token")
+
+	-- The next pass re-sends those SAME bytes and settles.
+	reset()
+	next_status = 202
+	local client2 = assert(crash.new(config({ app_id = "legacy-entry-app", sample_every = 1 })))
+	client2:resend_pending()
+	assert_equal(#requests, 1, "the adopted entry is resent")
+	assert_equal(requests[1].body, first_body, "byte-identical to the first attempt")
+	assert_equal(#storage.load_pending_crashes(scope), 0, "the accepted entry settled")
 
 	restore()
 	storage.reset()
@@ -4404,6 +4420,53 @@ local function test_memory_fallback_bounded_and_fatal_shielded()
 		end
 	end
 	assert_true(fatal_only, "a non-fatal newcomer never displaces a retained fatal report")
+
+	storage.reset()
+end
+
+-- The memory fallback honors the sidecar's BYTE caps too: an oversized body
+-- is refused outright and the total stays within the budget.
+local function test_memory_fallback_honors_byte_caps()
+	reset()
+	storage.reset()
+	next_status = 500
+	local client = assert(crash.new(config({ app_id = "mem-bytes-app", sample_every = 1 })))
+
+	local oversized = { body = string.rep("x", 65 * 1024), crash_id = "big", fatal = true }
+	assert_equal(client:retain_in_memory_pending(oversized), nil,
+		"a body over the per-record cap is refused by the fallback too")
+
+	for i = 1, 7 do
+		assert_true(client:retain_in_memory_pending(
+			{ body = string.rep("y", 60 * 1024), crash_id = "b" .. i, fatal = true }) ~= nil)
+	end
+	local total = 0
+	for _, held in pairs(client.in_memory_pending) do
+		total = total + #held.body
+	end
+	assert_true(total <= 384 * 1024, "the fallback total stays within the byte budget")
+
+	storage.reset()
+end
+
+-- Memory-fallback resend order is by minted sequence, not lexicographic: a
+-- pass must send the OLDEST retained report first even once token numbers
+-- pass one digit.
+local function test_memory_fallback_resends_oldest_first()
+	reset()
+	storage.reset()
+	-- No sys storage: every persist fails over to the memory fallback.
+	next_status = 500
+	local client = assert(crash.new(config({ app_id = "mem-order-app", sample_every = 1 })))
+	for i = 1, 12 do
+		assert_true(client:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "NF" .. i .. "x" } })))
+	end
+	-- Twelve mints, eight retained: the oldest survivor is NF5.
+	reset()
+	next_status = 202
+	client:resend_pending()
+	assert_true(#requests >= 1, "the pass ran over the fallback")
+	assert_contains(requests[1].body, '"NF5x"')
 
 	storage.reset()
 end
@@ -4524,6 +4587,8 @@ local tests = {
 	test_dump_forward_queues_behind_pending_pass,
 	test_non_fatal_save_never_displaces_fatal_backlog,
 	test_memory_fallback_bounded_and_fatal_shielded,
+	test_memory_fallback_honors_byte_caps,
+	test_memory_fallback_resends_oldest_first,
 }
 
 for _, test in ipairs(tests) do

@@ -273,24 +273,34 @@ function Client:pending_scope()
 end
 
 local max_in_memory_pending = 8
+local max_in_memory_body_bytes = 64 * 1024
+local max_in_memory_total_bytes = 384 * 1024
 
 -- Retain a pending entry ({ body, crash_id, fatal }) in the in-session
 -- fallback store (used only when on-disk persistence failed) and return its
 -- in-memory token, or nil when the entry was not admitted. The token is
 -- distinct from on-disk tokens so the two stores never collide. The store
--- is BOUNDED with the sidecar's own retention policy — at most 8 entries,
--- oldest non-fatal evicted first, a fatal entry never evicted to admit a
--- non-fatal one — so a session-long persist-failure loop with a chatty
--- handled-error path can never accumulate unbounded encoded bodies.
+-- is BOUNDED with the sidecar's own retention policy — at most 8 entries /
+-- 64 KB per body / 384 KB total, oldest non-fatal evicted first, a fatal
+-- entry never evicted to admit a non-fatal one — so a session-long
+-- persist-failure loop (or a few reports with very large raw text) can
+-- never accumulate unbounded encoded bodies in memory.
 function Client:retain_in_memory_pending(entry)
+	if type(entry.body) ~= "string" or #entry.body > max_in_memory_body_bytes then
+		-- An oversized body was already refused by the durable store for
+		-- the same reason; the fallback honors the same per-record cap.
+		return nil
+	end
 	local function seq_of(token)
 		return tonumber(token:match("^mem:(%d+)$")) or 0
 	end
 	local count = 0
-	for _ in pairs(self.in_memory_pending) do
+	local total_bytes = #entry.body
+	for _, held in pairs(self.in_memory_pending) do
 		count = count + 1
+		total_bytes = total_bytes + (type(held.body) == "string" and #held.body or 0)
 	end
-	while count >= max_in_memory_pending do
+	while count >= max_in_memory_pending or total_bytes > max_in_memory_total_bytes do
 		local victim, victim_seq = nil, nil
 		for held_token, held in pairs(self.in_memory_pending) do
 			if held.fatal ~= true and (victim_seq == nil or seq_of(held_token) < victim_seq) then
@@ -312,6 +322,8 @@ function Client:retain_in_memory_pending(entry)
 		if not victim then
 			break
 		end
+		local evicted = self.in_memory_pending[victim]
+		total_bytes = total_bytes - (type(evicted.body) == "string" and #evicted.body or 0)
 		self.in_memory_pending[victim] = nil
 		count = count - 1
 	end
@@ -569,8 +581,12 @@ end
 -- an earlier send) defers the pass until it expires — it survives relaunches
 -- and self-cleans when spent or absurd. One pass runs at a time.
 function Client:resend_pending()
-	if not self.initialized or self.resend_active then
-		return
+	if not self.initialized then
+		return false, "shutdown"
+	end
+	if self.resend_active then
+		-- A pass is already running; it covers the current backlog.
+		return true
 	end
 	local queue = {}
 	local entries, deadline = storage.load_pending_entries(self:pending_scope())
@@ -591,7 +607,11 @@ function Client:resend_pending()
 	for token in pairs(self.in_memory_pending) do
 		mem_tokens[#mem_tokens + 1] = token
 	end
-	table.sort(mem_tokens)
+	-- Numeric order by the minted sequence: a lexicographic sort would send
+	-- "mem:10" before "mem:3" and let a mid-pass 429 skip older reports.
+	table.sort(mem_tokens, function(left, right)
+		return (tonumber(left:match("^mem:(%d+)$")) or 0) < (tonumber(right:match("^mem:(%d+)$")) or 0)
+	end)
 	for _, token in ipairs(mem_tokens) do
 		local entry = self.in_memory_pending[token]
 		if type(entry) == "table" then
@@ -606,7 +626,7 @@ function Client:resend_pending()
 	if #queue == 0 then
 		-- Nothing pending: any surfaced deferral is over too.
 		self.stats.resend_deferred_until_ms = nil
-		return
+		return true
 	end
 	if type(deadline) == "number" then
 		-- Server backpressure from an earlier send is still in force (the
@@ -614,7 +634,7 @@ function Client:resend_pending()
 		-- surface the deadline. The reports stay durable; a later
 		-- resend_pending() — typically the next launch — retries.
 		self.stats.resend_deferred_until_ms = deadline
-		return
+		return true
 	end
 	self.stats.resend_deferred_until_ms = nil
 	self.resend_active = true
@@ -644,6 +664,7 @@ function Client:resend_pending()
 		end)
 	end
 	step()
+	return true
 end
 
 -- Dispatch one pending entry — the exact persisted wire body when present
@@ -669,6 +690,29 @@ function Client:dispatch_pending(entry, on_settled)
 		return false, "invalid_event"
 	end
 	local pending_token = entry.token
+	-- ADOPT a legacy entry (a prepared-report table persisted by an older
+	-- build) into the byte-identical contract at its FIRST resend: encode
+	-- once and refresh the stored entry in place under the same token, so a
+	-- retryable failure retries the SAME bytes on every later attempt
+	-- instead of re-encoding the table each time (table key order is not
+	-- guaranteed stable across encodes/runtimes). A failed refresh only
+	-- costs that guarantee for this entry — the dispatch below proceeds
+	-- with the just-encoded body either way.
+	if type(entry.body) ~= "string" and type(entry.report) == "table" then
+		local adopted = transport.encode(entry.report)
+		if adopted then
+			entry.body = adopted
+			local crash_id = entry.crash_id
+			if type(crash_id) ~= "string" then
+				crash_id = type(entry.report.crash_id) == "string" and entry.report.crash_id or nil
+			end
+			if type(pending_token) == "string" and pending_token:sub(1, 4) ~= "mem:" then
+				storage.save_pending_crash(self:pending_scope(),
+					{ body = adopted, crash_id = crash_id, fatal = entry.fatal == true },
+					pending_token)
+			end
+		end
+	end
 	self.stats.emitted = self.stats.emitted + 1
 	self.in_flight = self.in_flight + 1
 	local settled = false
