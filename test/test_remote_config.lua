@@ -547,6 +547,111 @@ local function test_malformed_response_serves_cache_or_fails()
 	assert_equal(result.values.a, 2)
 end
 
+local function test_permanent_http_error_fails_without_serving_cache()
+	reset()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	fetch(client)
+
+	-- A 404/410/other-4xx is authoritative, not transient: retrying cannot
+	-- help, so stale values must not masquerade as a healthy `ok = true`.
+	for _, status in ipairs({ 400, 404, 410 }) do
+		next_status = status
+		next_response_body = nil
+		local result = fetch(client)
+		assert_equal(result.ok, false, "a permanent HTTP error must fail the fetch")
+		assert_equal(result.from_cache, false)
+		assert_equal(result.error, "http_" .. tostring(status))
+		assert_nil(result.values)
+	end
+
+	-- Like the unauthorized outcome, the record and the getter snapshot are
+	-- left untouched, and a later healthy fetch revalidates as usual.
+	assert_equal(client:remote_config_number("a", 0), 1)
+	assert_true(storage.load_remote_config(client.config) ~= nil,
+		"a permanent error must not delete the cache record")
+	next_status = 304
+	local revalidated = fetch(client)
+	assert_true(revalidated.ok, revalidated.error)
+	assert_equal(revalidated.from_cache, true)
+	assert_equal(revalidated.values.a, 1)
+end
+
+local function test_out_of_order_responses_do_not_install_stale_config()
+	reset()
+	local client = assert(sdk.new(config()))
+
+	-- Hold the http callbacks so two fetches are in flight at once and the
+	-- responses can be delivered out of order.
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers }
+		held[#held + 1] = callback
+	end
+	local results = {}
+	client:fetch_remote_config(function(result)
+		results.older = result
+	end)
+	client:fetch_remote_config(function(result)
+		results.newer = result
+	end)
+	http.request = saved_request
+	assert_equal(#held, 2)
+
+	-- The NEWER request answers first...
+	held[2](nil, nil, {
+		status = 200,
+		response = values_body({ v = 2 }, 2),
+		headers = { etag = '"v2"' },
+	})
+	assert_equal(client:remote_config_number("v", 0), 2)
+
+	-- ...then the older one completes late with an older body: its caller
+	-- still receives that response, but nothing is installed over the newer
+	-- configuration.
+	held[1](nil, nil, {
+		status = 200,
+		response = values_body({ v = 1 }, 1),
+		headers = { etag = '"v1"' },
+	})
+	assert_true(results.older.ok)
+	assert_equal(results.older.values.v, 1, "the older fetch still reports its own response")
+	assert_equal(client:remote_config_number("v", 0), 2,
+		"an out-of-order response must not roll the snapshot back")
+	assert_equal(client:remote_config_version(), 2)
+
+	-- The kept cache is the newer one: the next fetch revalidates its ETag.
+	next_status = 304
+	next_response_body = nil
+	local result = fetch(client)
+	assert_equal(last_request().headers["If-None-Match"], '"v2"',
+		"the stale response must not have overwritten the cache record")
+	assert_true(result.ok, result.error)
+	assert_equal(result.values.v, 2)
+end
+
+local function test_callback_mutation_cannot_corrupt_the_snapshot()
+	reset()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ limit = 5 })
+	local seen = nil
+	client:fetch_remote_config(function(result)
+		-- Game code may normalize or strip the result it was handed...
+		result.values.limit = 99
+		result.values.injected = true
+		seen = result
+	end)
+	assert_equal(seen.values.limit, 99)
+
+	-- ...without corrupting what later getters read.
+	assert_equal(client:remote_config_number("limit", 0), 5,
+		"a callback mutation must not reach the getter snapshot")
+	assert_nil(client:remote_config_value("injected"))
+end
+
 local function test_unwrapped_payload_is_served_as_the_map()
 	reset()
 	local client = assert(sdk.new(config()))
@@ -653,23 +758,82 @@ local function test_corrupt_cache_record_reads_as_a_miss()
 	next_status = 200
 	next_response_body = values_body({ a = 1 })
 	fetch(seed)
-	storage.reset()
-	local corrupted = 0
+	local record_path = nil
 	for path in pairs(stores) do
 		if path:find("remote-config", 1, true) then
-			stores[path] = { body = "" }
-			corrupted = corrupted + 1
+			assert_nil(record_path, "the cache record must live in its own save file")
+			record_path = path
 		end
 	end
-	assert_equal(corrupted, 1, "the cache record must live in its own save file")
+	assert_true(record_path ~= nil)
 
+	-- A record missing its required fields is a miss...
+	storage.reset()
+	stores[record_path] = { body = "" }
 	local client = assert(sdk.new(config()))
 	assert_nil(client:remote_config_values(), "a corrupt record must read as a miss")
 	next_status = 0
 	local result = fetch(client)
 	assert_equal(result.ok, false, "a corrupt record must not be served offline")
 
+	-- ...and so is a well-shaped record whose body no longer decodes: it
+	-- must not contribute an If-None-Match either, or the 304 it provokes
+	-- would have no body to recover from.
+	storage.reset()
+	stores[record_path] = {
+		scope = remote_config.build_scope(
+			"workspace-test", "develop", "anon-client", "http://localhost:18081"),
+		etag = '"stale-etag"',
+		body = "garbage",
+		fetched_at_ms = 1,
+	}
+	local reborn = assert(sdk.new(config()))
+	assert_nil(reborn:remote_config_values(), "an undecodable record must read as a miss")
+	next_status = 200
+	next_response_body = values_body({ b = 2 })
+	local refreshed = fetch(reborn)
+	assert_nil(last_request().headers["If-None-Match"],
+		"an undecodable record must not contribute its ETag")
+	assert_true(refreshed.ok, refreshed.error)
+	assert_equal(refreshed.from_cache, false)
+
 	restore()
+end
+
+local function test_failed_cache_write_keeps_the_freshest_fallback()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ v = 1 }, 1)
+	next_response_headers = { etag = '"v1"' }
+	fetch(client)
+
+	-- The disk dies; a newer configuration is served but cannot persist.
+	local saved_save = sys.save
+	sys.save = function()
+		return false
+	end
+	next_response_body = values_body({ v = 2 }, 2)
+	next_response_headers = { etag = '"v2"' }
+	local fresh = fetch(client)
+	assert_true(fresh.ok, fresh.error)
+	assert_equal(fresh.from_cache, false)
+
+	-- Offline now: the fallback must be the FRESHEST served configuration —
+	-- the in-process record — not the older record still on disk.
+	next_status = 0
+	next_response_body = nil
+	next_response_headers = nil
+	local offline = fetch(client)
+	sys.save = saved_save
+	restore()
+
+	assert_true(offline.ok)
+	assert_equal(offline.from_cache, true)
+	assert_equal(offline.values.v, 2,
+		"a failed cache write must not revive the older on-disk configuration")
+	assert_equal(offline.version, 2)
 end
 
 local function test_anonymous_id_rotation_moves_the_scope()
@@ -893,11 +1057,15 @@ local tests = {
 	test_transient_failure_without_cache_fails,
 	test_unauthorized_fails_closed_and_never_serves_cache,
 	test_malformed_response_serves_cache_or_fails,
+	test_permanent_http_error_fails_without_serving_cache,
+	test_out_of_order_responses_do_not_install_stale_config,
+	test_callback_mutation_cannot_corrupt_the_snapshot,
 	test_unwrapped_payload_is_served_as_the_map,
 	test_cache_from_another_scope_is_a_miss_and_gets_overwritten,
 	test_transient_failure_never_serves_another_scopes_cache,
 	test_restart_serves_last_known_good_and_offline_fetch_uses_it,
 	test_corrupt_cache_record_reads_as_a_miss,
+	test_failed_cache_write_keeps_the_freshest_fallback,
 	test_anonymous_id_rotation_moves_the_scope,
 	test_typed_getters_serve_defaults_on_miss_and_type_mismatch,
 	test_getters_without_remote_config_serve_defaults,

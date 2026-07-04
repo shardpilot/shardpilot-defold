@@ -351,6 +351,11 @@ Fetch semantics:
   key never keeps supplying config. The cache file itself is left untouched
   (getters keep the last served snapshot; a later authorized fetch
   revalidates against the kept ETag).
+- **Any other status is a permanent failure** — a `404` for a removed
+  environment, an unexpected redirect, other `4xx`: retrying cannot help, so
+  the fetch fails (`http_<status>`) instead of reporting stale values as a
+  healthy `ok = true`. As with `401`/`403`, the record and the getter
+  snapshot are left untouched.
 
 The cache is scoped to the `(workspace_id, environment_id, client_id,
 remote_config_url)` tuple; a record written by any other scope is a miss (its
@@ -368,9 +373,11 @@ way.
   is no automatic or interval refresh, no `Cache-Control` interpretation, and
   no push; every fetch is an explicit call. There is no experiment
   assignment, no exposure events, and no client-side stats. A config body
-  large enough to approach the documented 512 KB `sys.save` cap is served but
-  not cached (best-effort: only offline serving is lost). Before the first
-  successful fetch on a fresh install, getters serve the caller's defaults.
+  large enough to approach the documented 512 KB `sys.save` cap — or any
+  body whose durable write fails — is still served and stays the in-process
+  offline fallback, but is not persisted (surfaced via `diagnostics`; only
+  offline serving across a *restart* is lost). Before the first successful
+  fetch on a fresh install, getters serve the caller's defaults.
 - The fetch is **not consent-gated**: config delivery carries no analytics
   payload — the client id in the URL only scopes which config to serve
   (consistent across our SDKs). See [`docs/privacy.md`](docs/privacy.md).

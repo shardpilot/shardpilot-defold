@@ -18,6 +18,11 @@
 --   * 401/403 — fails CLOSED: the cached snapshot is never served for this
 --     outcome (a revoked or wrong key must not keep supplying configuration),
 --     but the cache file itself is left untouched.
+--   * Any other status (a 404 for a removed environment, an unexpected 3xx,
+--     other 4xx) is a PERMANENT failure: the fetch fails rather than serving
+--     the cached snapshot as `ok = true` — retrying cannot help and stale
+--     values must not masquerade as a healthy fetch. As with 401/403, the
+--     cache record and the getter snapshot are left untouched.
 --
 -- The cache is stamped with the (workspace, environment, client, url) scope
 -- it was fetched for; a cache written by any other scope is a miss (its ETag
@@ -189,17 +194,20 @@ function M.apply(cache, response, now_ms)
 		return { ok = false, from_cache = false, error = "unauthorized" }, nil
 	end
 
-	local reason
+	-- The cache fallback is reserved for failures a retry can plausibly fix:
+	-- no connection, backpressure, or a server-side error. Any other status —
+	-- a 404 for a removed environment, an unexpected redirect, other 4xx — is
+	-- an authoritative "this configuration is not being served here", so the
+	-- fetch fails instead of reporting stale values as a healthy `ok = true`
+	-- (the cache record and the getter snapshot stay untouched).
 	if status == 0 then
-		reason = "http_0"
+		return serve_cache_or_fail(cache, "http_0")
 	elseif status == 429 then
-		reason = "transient_429"
+		return serve_cache_or_fail(cache, "transient_429")
 	elseif status >= 500 then
-		reason = "transient_" .. tostring(status)
-	else
-		reason = "http_" .. tostring(status)
+		return serve_cache_or_fail(cache, "transient_" .. tostring(status))
 	end
-	return serve_cache_or_fail(cache, reason)
+	return { ok = false, from_cache = false, error = "http_" .. tostring(status) }, nil
 end
 
 -- Depth-bounded copy of a decoded configuration value, so a table handed to
@@ -234,6 +242,17 @@ function M.new(config, identity)
 		identity = identity,
 		values = nil,
 		version = nil,
+		-- The in-process cache record (`{scope, etag, body, fetched_at_ms}`).
+		-- It is updated on every applied fetch even when the durable write
+		-- fails, so a later offline fetch falls back to the FRESHEST served
+		-- configuration rather than reviving an older on-disk record.
+		cache = nil,
+		-- Requests are numbered and only the newest may install its outcome
+		-- (snapshot + cache): with two fetches in flight, responses can
+		-- arrive out of order, and an older response must not roll the
+		-- getters or the cache back after a newer one was already applied.
+		fetch_seq = 0,
+		applied_seq = 0,
 	}, RemoteConfig)
 	-- Serve the persisted last-known-good snapshot immediately after a
 	-- restart: getters work before (and without) any fetch when a cache for
@@ -242,6 +261,7 @@ function M.new(config, identity)
 	if cache then
 		local decoded = decode_object(cache.body)
 		if decoded then
+			rc.cache = cache
 			rc.values, rc.version = extract(decoded)
 		end
 	end
@@ -264,16 +284,30 @@ function RemoteConfig:scope_for(client_id)
 		self.config.remote_config_url)
 end
 
--- Load the cache record for THIS scope. A record without an identity scope,
--- or written for any other (workspace, environment, client, url) tuple, is a
--- miss: its values are never served and its ETag is never sent. The next
--- successful fetch for this scope overwrites it.
+-- The usable cache record for THIS scope, or nil. The in-process record is
+-- preferred (it is the freshest served configuration even when a durable
+-- write failed); the durable store is read when the in-process record is
+-- absent or scoped elsewhere. A record without an identity scope, or written
+-- for any other (workspace, environment, client, url) tuple, is a miss: its
+-- values are never served and its ETag is never sent. So is a record whose
+-- body no longer decodes — it could neither be served offline nor recovered
+-- from after the 304 its ETag would provoke. The next successful fetch for
+-- this scope overwrites it.
 function RemoteConfig:load_cache(client_id)
 	if not client_id then
 		return nil
 	end
+	local scope = self:scope_for(client_id)
+	if self.cache and self.cache.scope == scope then
+		-- In-process records only ever hold a body that decoded when they
+		-- were installed, so no re-check is needed here.
+		return self.cache
+	end
 	local record = storage.load_remote_config(self.config)
-	if not record or record.scope ~= self:scope_for(client_id) then
+	if not record or record.scope ~= scope then
+		return nil
+	end
+	if not decode_object(record.body) then
 		return nil
 	end
 	return record
@@ -285,6 +319,34 @@ function RemoteConfig:diagnose(status)
 		-- The hook is integrator code; never let it break the fetch path.
 		pcall(hook, { scope = "remote_config", status = status })
 	end
+end
+
+-- Install an applied fetch outcome: the in-process cache record, the durable
+-- copy (best-effort), and the getter snapshot. Guarded by the request
+-- sequence so only the newest fetch may install — an older response arriving
+-- late must not roll a newer configuration back. The snapshot is a defensive
+-- copy: the result table is handed to game code, and a callback that mutates
+-- `result.values` must not corrupt what later getters read.
+function RemoteConfig:install(seq, result, new_cache, scope)
+	if not result.ok or seq <= self.applied_seq then
+		return
+	end
+	self.applied_seq = seq
+	if new_cache then
+		new_cache.scope = scope
+		-- The in-process record is updated even when the durable write
+		-- fails: the freshest served configuration stays the offline
+		-- fallback for this process either way.
+		self.cache = new_cache
+		if not storage.save_remote_config(self.config, new_cache) then
+			-- Best-effort: the fetched values are already being served;
+			-- only the offline last-known-good copy across a RESTART is
+			-- at risk.
+			self:diagnose("cache_persist_failed")
+		end
+	end
+	self.values = copy_value(result.values, 0)
+	self.version = result.version
 end
 
 -- Fetch the configuration. `callback(result)` receives
@@ -314,19 +376,20 @@ function RemoteConfig:fetch(callback)
 		return false
 	end
 
+	self.fetch_seq = self.fetch_seq + 1
+	local seq = self.fetch_seq
+
 	-- Capture the identity ONCE per fetch: the URL, the ETag revalidation,
 	-- and the scope stamped on the resulting cache all describe the same
 	-- client id even if the identity rotates while the request is in flight.
+	local scope = self:scope_for(client_id)
 	local cache = self:load_cache(client_id)
 
 	if not http or not http.request then
 		-- No transport on this runtime is a transient failure like any
 		-- other: serve the last-known-good snapshot when one exists.
 		local result = serve_cache_or_fail(cache, "http_unavailable")
-		if result.ok then
-			self.values = result.values
-			self.version = result.version
-		end
+		self:install(seq, result, nil, scope)
 		finish(result)
 		return false
 	end
@@ -348,18 +411,7 @@ function RemoteConfig:fetch(callback)
 
 	http.request(url, "GET", function(_, _, response)
 		local result, new_cache = M.apply(cache, response, clock.unix_ms())
-		if new_cache then
-			new_cache.scope = self:scope_for(client_id)
-			if not storage.save_remote_config(self.config, new_cache) then
-				-- Best-effort: the fetched values are already being served;
-				-- only the offline last-known-good copy is at risk.
-				self:diagnose("cache_persist_failed")
-			end
-		end
-		if result.ok then
-			self.values = result.values
-			self.version = result.version
-		end
+		self:install(seq, result, new_cache, scope)
 		finish(result)
 	end, headers, nil, options)
 	return true

@@ -15,11 +15,17 @@
     revalidate with `If-None-Match`, and a `304` — or any transient failure
     (offline, `429`, `5xx`, malformed body) — serves the cached snapshot with
     `from_cache = true`. The snapshot survives restarts, so an offline launch
-    still gets the last served configuration.
-  - **Fail-closed on `401`/`403`.** An unauthorized fetch reports
-    `unauthorized` and never serves the cached snapshot (a revoked or wrong
-    key must not keep supplying configuration); the cache record itself is
-    left untouched for a later authorized revalidation.
+    still gets the last served configuration. Responses arriving out of
+    order (two fetches in flight) can never roll a newer configuration back,
+    and a failed cache write keeps the freshest served configuration as the
+    in-process fallback rather than reviving an older on-disk record.
+  - **Fail-closed on `401`/`403`; permanent errors never serve the cache.**
+    An unauthorized fetch reports `unauthorized` and never serves the cached
+    snapshot (a revoked or wrong key must not keep supplying configuration);
+    the cache record itself is left untouched for a later authorized
+    revalidation. Any other non-transient status (`404`, an unexpected
+    redirect, other `4xx`) fails the same way instead of reporting stale
+    values as a healthy fetch.
   - **Scope-checked cache.** The record is stamped with the (workspace,
     environment, client, url) scope it was fetched for; any other scope —
     including a rotated anonymous ID — treats it as a miss and overwrites it
