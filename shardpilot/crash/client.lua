@@ -523,18 +523,26 @@ function Client:emit_internal(event, fatal, trusted_frame_functions, prepare_opt
 		-- backpressure discipline — never concurrently with it.
 		return true
 	end
-	-- Honor a stored server backpressure window for NON-fatal live reports:
-	-- the server explicitly asked us to wait, and a retained handled-error
-	-- report loses nothing by waiting the window out (it dispatches with the
+	-- NON-fatal live reports never race the serial discipline: while a
+	-- resend pass is ACTIVE (its in-flight report may yet answer 429), the
+	-- retained report queues and a follow-up pass picks it up as soon as the
+	-- current one completes cleanly; and a stored server backpressure window
+	-- defers it outright — the server explicitly asked us to wait, and a
+	-- handled-error report loses nothing by waiting (it dispatches with the
 	-- next pass). A FATAL report still fires immediately — the process may
 	-- be dying and this is its only chance at the network; the write-ahead
 	-- record above already guarantees a duplicate-safe retry either way.
 	if not fatal and pending_token then
+		if self.resend_active then
+			self.resend_followup_wanted = true
+			return true
+		end
 		local _, window = storage.load_pending_entries(self:pending_scope())
 		if type(window) == "number" then
 			self.stats.resend_deferred_until_ms = window
 			return true
 		end
+		self.stats.resend_deferred_until_ms = nil
 	end
 	return self:dispatch_pending(entry)
 end
@@ -685,6 +693,14 @@ function Client:resend_pending()
 		index = index + 1
 		if index > #queue then
 			self.resend_active = false
+			-- Reports queued by live emits WHILE this pass was running were
+			-- not in its snapshot: a clean completion runs one follow-up
+			-- pass for them (a retryable stop above does not — the
+			-- backpressure that stopped the pass covers them too).
+			if self.resend_followup_wanted then
+				self.resend_followup_wanted = nil
+				self:resend_pending()
+			end
 			return
 		end
 		local entry = queue[index]
@@ -779,12 +795,14 @@ function Client:dispatch_pending(entry, on_settled)
 			-- took traffic. The window clears even for a TOKENLESS send
 			-- (one whose write-ahead persist was rejected outright): a stale
 			-- window left behind would keep deferring resend passes the
-			-- server is ready for.
+			-- server is ready for. The surfaced deferral clears with it, so
+			-- snapshot() never keeps reporting a window that is over.
 			if pending_token then
 				self:remove_pending(pending_token, true)
 			else
 				storage.set_pending_crash_retry_after(self:pending_scope(), nil)
 			end
+			self.stats.resend_deferred_until_ms = nil
 			if on_settled then
 				on_settled(false)
 			end

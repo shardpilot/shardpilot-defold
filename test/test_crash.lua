@@ -4613,6 +4613,72 @@ local function test_live_non_fatal_defers_into_stored_window()
 	storage.reset()
 end
 
+-- A sampled-in NON-fatal live emit during an ACTIVE resend pass queues
+-- (never racing the in-flight report into potential backpressure); a clean
+-- pass completion runs one follow-up pass that delivers it.
+local function test_live_non_fatal_queues_behind_active_pass()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "pass-queue-app" }
+
+	-- Seed one older pending report.
+	next_status = 500
+	local seeder = assert(crash.new(config({ app_id = "pass-queue-app", sample_every = 1 })))
+	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "OLDpass" } })))
+	assert_equal(#storage.load_pending_crashes(scope), 1)
+
+	-- Async transport: hold each callback and release manually.
+	reset()
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		held[#held + 1] = callback
+	end
+
+	local client = assert(crash.new(config({ app_id = "pass-queue-app", sample_every = 1 })))
+	client:resend_pending()
+	assert_equal(#requests, 1, "the pass has the older report in flight")
+
+	assert_true(client:emit(presymbolicated_event({ exception = { type = "lua_error", reason = "LIVEpass" } })),
+		"the sampled-in non-fatal is accepted")
+	assert_equal(#requests, 1, "the live non-fatal queued instead of racing the in-flight resend")
+	assert_equal(#storage.load_pending_crashes(scope), 2, "it is durably queued")
+
+	-- The in-flight report settles cleanly: the follow-up pass delivers the
+	-- queued live report next.
+	held[1](nil, nil, { status = 202, response = '{"crash_id":"x"}' })
+	assert_equal(#requests, 2, "the follow-up pass dispatched the queued report")
+	assert_contains(requests[2].body, '"LIVEpass"')
+	held[2](nil, nil, { status = 202, response = '{"crash_id":"x"}' })
+	assert_equal(#storage.load_pending_crashes(scope), 0, "everything settled")
+
+	http.request = saved_request
+	restore()
+	storage.reset()
+end
+
+-- The surfaced deferral clears once the window is over (an accepted send
+-- clears the stored window and the stat with it).
+local function test_deferral_stat_clears_with_window()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "stat-clear-app" }
+
+	assert_true(storage.set_pending_crash_retry_after(scope, 3600))
+	next_status = 202
+	local client = assert(crash.new(config({ app_id = "stat-clear-app", sample_every = 1 })))
+	assert_true(client:emit(presymbolicated_event()), "the non-fatal defers into the window")
+	assert_true(type(client:snapshot().resend_deferred_until_ms) == "number", "the deferral is surfaced")
+
+	assert_true(client:emit_fatal(presymbolicated_event()), "the fatal fires and is accepted")
+	assert_equal(client:snapshot().resend_deferred_until_ms, nil,
+		"the accepted send cleared the window and the surfaced deferral with it")
+
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_source_stamped_on_every_report,
@@ -4735,6 +4801,8 @@ local tests = {
 	test_token_refresh_enforces_byte_budget,
 	test_resend_merges_memory_and_disk_by_age,
 	test_live_non_fatal_defers_into_stored_window,
+	test_live_non_fatal_queues_behind_active_pass,
+	test_deferral_stat_clears_with_window,
 }
 
 for _, test in ipairs(tests) do
