@@ -478,8 +478,13 @@ function M.save_pending_crash(scope, entry, token, created_at_ms)
 		crash_id = type(entry.crash_id) == "string" and entry.crash_id or nil,
 		fatal = entry.fatal == true,
 	}
+	local replaced = false
 	if token then
-		-- Idempotent re-persist: replace an existing entry with this token in place.
+		-- Idempotent re-persist: replace an existing entry with this token in
+		-- place. The refresh then runs through the SAME caps enforcement and
+		-- evict-and-retry write as an append — a legacy sidecar written
+		-- before the total-byte budget existed can already sit above it, and
+		-- adopting an entry must shrink toward the bound, not skip it.
 		for i = 1, #stored do
 			if stored[i].token == token then
 				-- Refresh the body in place but PRESERVE the original created-at so a
@@ -488,10 +493,8 @@ function M.save_pending_crash(scope, entry, token, created_at_ms)
 				new_entry.token = token
 				new_entry.created_at = type(stored[i].created_at) == "number" and stored[i].created_at or stamp
 				stored[i] = new_entry
-				if write_pending_list(ns, stored, deadline) then
-					return token
-				end
-				return nil
+				replaced = true
+				break
 			end
 		end
 	else
@@ -510,12 +513,14 @@ function M.save_pending_crash(scope, entry, token, created_at_ms)
 			end
 		until not clash
 	end
-	new_entry.token = token
-	new_entry.created_at = stamp
-	stored[#stored + 1] = new_entry
+	if not replaced then
+		new_entry.token = token
+		new_entry.created_at = stamp
+		stored[#stored + 1] = new_entry
+	end
 	-- Enforce the count AND total-bytes caps, never evicting the just-added
-	-- report (its durability is the whole point of the write-ahead persist)
-	-- and never a FATAL entry to admit a non-fatal one.
+	-- (or just-refreshed) report — its durability is the whole point of the
+	-- write-ahead persist — and never a FATAL entry to admit a non-fatal one.
 	while (#stored > max_pending_records or pending_total_bytes(stored) > max_pending_total_bytes) and
 		evict_one_pending(stored, token, new_entry.fatal) do
 	end

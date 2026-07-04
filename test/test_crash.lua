@@ -4471,6 +4471,91 @@ local function test_memory_fallback_resends_oldest_first()
 	storage.reset()
 end
 
+-- An accepted send clears the stored backpressure window even when the
+-- send was TOKENLESS (its write-ahead persist was rejected outright): the
+-- endpoint just took traffic, so later passes must not keep deferring.
+local function test_tokenless_accept_clears_retry_after_window()
+	reset()
+	storage.reset()
+	-- No sys storage: the durable save is refused; fill the memory fallback
+	-- with fatal entries so a non-fatal emit retains NOTHING (token nil).
+	local scope = { app_id = "tokenless-app" }
+	next_status = 202
+	local client = assert(crash.new(config({ app_id = "tokenless-app", sample_every = 1 })))
+	for i = 1, 8 do
+		assert_true(client:retain_in_memory_pending(
+			{ body = '{"crash_id":"f' .. i .. '"}', crash_id = "f" .. i, fatal = true }) ~= nil)
+	end
+	assert_true(storage.set_pending_crash_retry_after(scope, 3600))
+	local _, armed = storage.load_pending_entries(scope)
+	assert_true(type(armed) == "number", "the window is armed")
+
+	assert_true(client:emit(presymbolicated_event()), "the tokenless non-fatal emit is accepted")
+	local _, after_accept = storage.load_pending_entries(scope)
+	assert_equal(after_accept, nil, "the accepted tokenless send cleared the stale window")
+
+	storage.reset()
+end
+
+-- A token REFRESH (the legacy-entry adoption path) runs through the same
+-- total-byte budget as an append: a pre-budget sidecar shrinks toward the
+-- bound instead of skipping enforcement.
+local function test_token_refresh_enforces_byte_budget()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "refresh-budget-app" }
+
+	-- Plant SEVEN wrapped legacy TABLE entries (~60 KB of string scalars
+	-- each — over the 384 KB budget in aggregate, which predates it).
+	local ns_probe = nil
+	local saved_get = sys.get_save_file
+	sys.get_save_file = function(application_id, file_name)
+		if application_id:find("pending%-crashes") then
+			ns_probe = application_id .. "/" .. (file_name or "identity")
+		end
+		return saved_get(application_id, file_name)
+	end
+	storage.load_pending_entries(scope)
+	sys.get_save_file = saved_get
+	assert_true(ns_probe ~= nil, "the pending namespace path was resolved")
+	local items = {}
+	for i = 1, 7 do
+		items[i] = {
+			token = "legacy-" .. i,
+			report = { crash_id = "L" .. i, blob = string.rep("z", 60 * 1024) },
+			created_at = require("shardpilot.clock").unix_ms(),
+		}
+	end
+	assert_true(sys.save(ns_probe, { items = items }), "the legacy over-budget sidecar is planted")
+
+	-- Refresh the OLDEST entry with an encoded body under its own token: the
+	-- shared enforcement must evict toward the budget rather than write the
+	-- still-over list back untouched.
+	local refreshed = storage.save_pending_crash(scope,
+		{ body = '{"crash_id":"L1","blob":"' .. string.rep("z", 60 * 1024) .. '"}', crash_id = "L1", fatal = true },
+		"legacy-1")
+	assert_equal(refreshed, "legacy-1", "the refresh persisted under the same token")
+	local entries = storage.load_pending_entries(scope)
+	local total = 0
+	local has_refreshed = false
+	for i = 1, #entries do
+		if entries[i].token == "legacy-1" then
+			has_refreshed = true
+		end
+		if type(entries[i].body) == "string" then
+			total = total + #entries[i].body
+		elseif type(entries[i].report) == "table" then
+			total = total + 60 * 1024 -- the planted blob dominates
+		end
+	end
+	assert_true(has_refreshed, "the refreshed entry survived enforcement")
+	assert_true(total <= 384 * 1024, "the refresh shrank the sidecar toward the byte budget")
+	assert_true(#entries < 7, "older entries were evicted to fit")
+
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_source_stamped_on_every_report,
@@ -4589,6 +4674,8 @@ local tests = {
 	test_memory_fallback_bounded_and_fatal_shielded,
 	test_memory_fallback_honors_byte_caps,
 	test_memory_fallback_resends_oldest_first,
+	test_tokenless_accept_clears_retry_after_window,
+	test_token_refresh_enforces_byte_budget,
 }
 
 for _, test in ipairs(tests) do

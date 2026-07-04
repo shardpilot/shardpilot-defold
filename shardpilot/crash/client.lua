@@ -733,9 +733,15 @@ function Client:dispatch_pending(entry, on_settled)
 				self.stats.accepted = self.stats.accepted + 1
 			end
 			-- The send was accepted: the pending copy is no longer needed,
-			-- and any stored backpressure window is over.
+			-- and any stored backpressure window is over — the endpoint just
+			-- took traffic. The window clears even for a TOKENLESS send
+			-- (one whose write-ahead persist was rejected outright): a stale
+			-- window left behind would keep deferring resend passes the
+			-- server is ready for.
 			if pending_token then
 				self:remove_pending(pending_token, true)
+			else
+				storage.set_pending_crash_retry_after(self:pending_scope(), nil)
 			end
 			if on_settled then
 				on_settled(false)
