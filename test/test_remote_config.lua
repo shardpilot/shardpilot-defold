@@ -785,6 +785,76 @@ local function test_malformed_wrapped_values_member_is_rejected()
 		"a malformed wrapper must not overwrite the last-known-good configuration")
 end
 
+local function test_cache_discovered_at_fetch_time_is_adopted()
+	reset()
+	-- Two same-app clients exist before any configuration is cached...
+	local writer = assert(sdk.new(config()))
+	local reader = assert(sdk.new(config()))
+	assert_nil(reader:remote_config_values())
+
+	-- ...one fetches fresh and persists the record...
+	next_status = 200
+	next_response_body = values_body({ a = 5 }, 5)
+	next_response_headers = { etag = '"v5"' }
+	fetch(writer)
+
+	-- ...and the other's next fetch discovers that record: the 304 serves
+	-- it, and the getters must agree with what the callback just reported.
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = nil
+	local result = fetch(reader)
+	assert_true(result.ok, result.error)
+	assert_equal(result.from_cache, true)
+	assert_equal(last_request().headers["If-None-Match"], '"v5"')
+	assert_equal(reader:remote_config_number("a", 0), 5,
+		"a cache discovered at fetch time must reach the getter snapshot")
+	assert_equal(reader:remote_config_version(), 5)
+end
+
+local function test_empty_array_values_member_is_malformed()
+	reset()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ a = 2 }, 2)
+	fetch(client)
+
+	-- `{"values":[]}` decodes to the same Lua table as `{"values":{}}`; the
+	-- body text disambiguates, and the array form must not overwrite the
+	-- last-known-good configuration with an empty one.
+	next_status = 200
+	next_response_body = '{"version":9,"values":[]}'
+	local result = fetch(client)
+	assert_true(result.ok)
+	assert_equal(result.from_cache, true)
+	assert_equal(result.error, "malformed_response")
+	assert_equal(client:remote_config_number("a", 0), 2)
+
+	-- A string value spelled "values" must not decoy the scan.
+	next_response_body = '{"a":"values","values":[]}'
+	result = fetch(client)
+	assert_equal(result.error, "malformed_response")
+	assert_equal(client:remote_config_number("a", 0), 2)
+
+	-- The empty OBJECT form is a legitimate (cleared) configuration...
+	next_response_body = '{"version":9,"values":{}}'
+	result = fetch(client)
+	assert_true(result.ok, result.error)
+	assert_equal(result.from_cache, false)
+	assert_nil(result.error)
+	assert_equal(client:remote_config_number("a", 42), 42)
+	assert_equal(client:remote_config_version(), 9)
+
+	-- ...and a nested key named "values" inside the map is ordinary data,
+	-- untouched by the top-level scan.
+	next_response_body = '{"version":10,"values":{"ui":{"values":[1,2]}}}'
+	result = fetch(client)
+	assert_true(result.ok, result.error)
+	local ui = client:remote_config_value("ui")
+	assert_equal(ui.values[1], 1)
+	assert_equal(client:remote_config_version(), 10)
+end
+
 local function test_fetch_after_shutdown_is_rejected()
 	reset()
 	next_status = 200
@@ -1276,6 +1346,8 @@ local tests = {
 	test_identity_rotation_drops_inflight_response,
 	test_transient_cache_hit_does_not_fence_inflight_fresh,
 	test_malformed_wrapped_values_member_is_rejected,
+	test_cache_discovered_at_fetch_time_is_adopted,
+	test_empty_array_values_member_is_malformed,
 	test_fetch_after_shutdown_is_rejected,
 	test_callback_mutation_cannot_corrupt_the_snapshot,
 	test_unwrapped_payload_is_served_as_the_map,

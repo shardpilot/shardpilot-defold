@@ -100,20 +100,82 @@ local function decode_object(body)
 	return decoded
 end
 
+-- Whether the top-level `values` member in the body TEXT is an object.
+-- Needed only when the member decoded to an EMPTY table, where Lua cannot
+-- tell `{}` from `[]`. The scan is string- and depth-aware, so a nested
+-- `values` key or a string value spelled "values" cannot be mistaken for
+-- the top-level member; an unfindable member reads as not-an-object, which
+-- fails toward `malformed_response` (the safe direction). Escaped key
+-- spellings are not decoded — they also read as not-found.
+local function empty_values_member_is_object(body)
+	local depth = 0
+	local i = 1
+	local n = #body
+	while i <= n do
+		local ch = body:sub(i, i)
+		if ch == '"' then
+			local start = i + 1
+			local j = start
+			local plain = true
+			while j <= n do
+				local c = body:sub(j, j)
+				if c == "\\" then
+					plain = false
+					j = j + 2
+				elseif c == '"' then
+					break
+				else
+					j = j + 1
+				end
+			end
+			if depth == 1 and plain and body:sub(start, j - 1) == "values" then
+				local k = j + 1
+				while k <= n and body:sub(k, k):match("%s") do
+					k = k + 1
+				end
+				-- Only a KEY is followed by a colon; a string VALUE that
+				-- happens to spell "values" is followed by "," or "}".
+				if body:sub(k, k) == ":" then
+					k = k + 1
+					while k <= n and body:sub(k, k):match("%s") do
+						k = k + 1
+					end
+					return body:sub(k, k) == "{"
+				end
+			end
+			i = j + 1
+		elseif ch == "{" or ch == "[" then
+			depth = depth + 1
+			i = i + 1
+		elseif ch == "}" or ch == "]" then
+			depth = depth - 1
+			i = i + 1
+		else
+			i = i + 1
+		end
+	end
+	return false
+end
+
 -- The endpoint answers `{ "version": <number>, "values": { key: value } }`.
 -- The configuration map served to getters is the `values` object; a body that
 -- is a JSON object WITHOUT a `values` member is served as the map itself, so
 -- an unwrapped payload (fixtures, older servers) still works. A wrapper whose
 -- `values` member is present but not a keyed object (a string, number,
--- boolean, or a positional array — e.g. after a server-side schema bug) is
--- MALFORMED: falling back to serving the wrapper would expose wrapper fields
--- as configuration and overwrite the last-known-good cache. Returns
--- (values, version), or nil for a malformed wrapper.
-local function extract(decoded)
+-- boolean, or an array — e.g. after a server-side schema bug) is MALFORMED:
+-- falling back to serving the wrapper would expose wrapper fields as
+-- configuration and overwrite the last-known-good cache. An EMPTY array is
+-- caught by re-checking the body text, since it decodes to the same Lua
+-- table as an empty object. Returns (values, version), or nil for a
+-- malformed wrapper.
+local function extract(decoded, body)
 	local version = type(decoded.version) == "number" and decoded.version or nil
 	local values = decoded.values
 	if values ~= nil then
 		if type(values) ~= "table" or values[1] ~= nil then
+			return nil
+		end
+		if next(values) == nil and not empty_values_member_is_object(body) then
 			return nil
 		end
 		return values, version
@@ -129,7 +191,7 @@ local function parse_config(body)
 	if not decoded then
 		return nil
 	end
-	return extract(decoded)
+	return extract(decoded, body)
 end
 
 -- The real Defold http API lowercases response header keys; the test mock
@@ -364,10 +426,14 @@ end
 --     unauthorized, permanent error); a transient/cache fallback says
 --     nothing about the current configuration and must not fence off a
 --     fresh response still in flight;
---   * only a fresh 200 installs anything (`new_cache` exists exactly then);
---     a cache-served outcome re-serves content the snapshot already holds,
---     and installing it could roll back a fresher body installed while it
---     was in flight;
+--   * a fresh 200 (`new_cache` exists exactly then) always installs; a
+--     cache-served outcome installs only by ADOPTION — when this instance
+--     holds no current-scope record, e.g. the cache was discovered at fetch
+--     time after being written by an earlier launch or another same-app
+--     client. When a current-scope record IS held, the served content came
+--     from it and the snapshot already agrees — and adopting a captured
+--     older record could roll back a fresher body installed while the
+--     response was in flight;
 --   * the scope must still be current — an identity rotated while the
 --     response was in flight makes the response another client's
 --     configuration (a different rollout bucket), which must not be served
@@ -375,34 +441,40 @@ end
 -- The snapshot is a defensive copy: the result table is handed to game code,
 -- and a callback that mutates `result.values` must not corrupt what later
 -- getters read.
-function RemoteConfig:install(seq, result, new_cache, scope, authoritative)
+function RemoteConfig:install(seq, result, new_cache, scope, authoritative, served_cache)
 	if seq <= self.settled_seq then
 		return
 	end
 	if authoritative then
 		self.settled_seq = seq
 	end
-	if not result.ok or not new_cache then
+	if not result.ok then
 		return
 	end
 	local current_id = self:client_id()
 	if not current_id or self:scope_for(current_id) ~= scope then
 		return
 	end
-	new_cache.scope = scope
-	-- The in-process record is updated even when the durable write fails:
-	-- the freshest served configuration stays the offline fallback for this
-	-- process either way.
-	self.cache = new_cache
-	if not storage.save_remote_config(self.config, new_cache) then
-		-- An older durable record may still be on disk, and a restart would
-		-- revive it OVER the newer configuration just served. Clear it
-		-- (best-effort — with the storage backend itself down this fails too
-		-- and the stale record is at least superseded in this process): a
-		-- restart then starts from the game's defaults rather than from
-		-- rolled-back values.
-		storage.clear_remote_config(self.config)
-		self:diagnose("cache_persist_failed")
+	if new_cache then
+		new_cache.scope = scope
+		-- The in-process record is updated even when the durable write
+		-- fails: the freshest served configuration stays the offline
+		-- fallback for this process either way.
+		self.cache = new_cache
+		if not storage.save_remote_config(self.config, new_cache) then
+			-- An older durable record may still be on disk, and a restart
+			-- would revive it OVER the newer configuration just served.
+			-- Clear it (best-effort — with the storage backend itself down
+			-- this fails too and the stale record is at least superseded in
+			-- this process): a restart then starts from the game's defaults
+			-- rather than from rolled-back values.
+			storage.clear_remote_config(self.config)
+			self:diagnose("cache_persist_failed")
+		end
+	elseif served_cache and not (self.cache and self.cache.scope == scope) then
+		self.cache = served_cache
+	else
+		return
 	end
 	self.values = copy_value(result.values, 0)
 	self.version = result.version
@@ -447,7 +519,9 @@ function RemoteConfig:fetch(callback)
 	if not http or not http.request then
 		-- No transport on this runtime is a transient failure like any
 		-- other: serve the last-known-good snapshot when one exists.
-		finish(serve_cache_or_fail(cache, "http_unavailable"))
+		local result = serve_cache_or_fail(cache, "http_unavailable")
+		self:install(seq, result, nil, scope, false, cache)
+		finish(result)
 		return false
 	end
 
@@ -468,7 +542,7 @@ function RemoteConfig:fetch(callback)
 
 	http.request(url, "GET", function(_, _, response)
 		local result, new_cache, authoritative = M.apply(cache, response, clock.unix_ms())
-		self:install(seq, result, new_cache, scope, authoritative)
+		self:install(seq, result, new_cache, scope, authoritative, cache)
 		finish(result)
 	end, headers, nil, options)
 	return true
