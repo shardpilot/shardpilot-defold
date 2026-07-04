@@ -2,6 +2,37 @@
 
 ## v0.5.0 — unreleased — early alpha
 
+- **Remote config fetch with a durable last-known-good cache and typed
+  getters.** A new `remote_config_url` config field enables
+  `fetch_remote_config(callback)` — an explicit, game-triggered
+  `GET {remote_config_url}/config/v1/{workspace_id}/{environment_id}/{client_id}`
+  authenticated with the publishable `api_key` (`client_id` = the persisted
+  anonymous ID) — plus typed getters
+  (`remote_config_string/number/boolean/value/values/version`) that never
+  fail and serve the caller's default until configuration is available.
+  - **ETag revalidation and offline fallback.** A `200` serves fresh values
+    and overwrites the one bounded per-app cache record; later fetches
+    revalidate with `If-None-Match`, and a `304` — or any transient failure
+    (offline, `429`, `5xx`, malformed body) — serves the cached snapshot with
+    `from_cache = true`. The snapshot survives restarts, so an offline launch
+    still gets the last served configuration.
+  - **Fail-closed on `401`/`403`.** An unauthorized fetch reports
+    `unauthorized` and never serves the cached snapshot (a revoked or wrong
+    key must not keep supplying configuration); the cache record itself is
+    left untouched for a later authorized revalidation.
+  - **Scope-checked cache.** The record is stamped with the (workspace,
+    environment, client, url) scope it was fetched for; any other scope —
+    including a rotated anonymous ID — treats it as a miss and overwrites it
+    on the next successful fetch.
+  - **Auth carve-out.** The remote-config endpoint accepts the publishable
+    `api_key` only, so enabling remote config under Mode B requires the
+    `api_key` too (`remote_config_api_key_required`) — the one configuration
+    where both credentials are valid together (the minted token keeps the
+    ingest Bearer; the `api_key` authenticates only the config fetch).
+  - Not consent-gated (configuration delivery carries no analytics payload),
+    no automatic refresh (every fetch is an explicit call), no experiment
+    assignment or exposure events.
+
 - **Write-ahead crash-report durability with byte-identical resend.** Crash
   delivery is no longer fire-once for live reports: EVERY report that reaches
   dispatch — a live `emit_fatal`, a sampled-in `emit`, a previous-session dump

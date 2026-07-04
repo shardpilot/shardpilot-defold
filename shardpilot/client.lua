@@ -3,6 +3,7 @@ local clock = require "shardpilot.clock"
 local id = require "shardpilot.id"
 local platform = require "shardpilot.platform"
 local queue = require "shardpilot.queue"
+local remote_config_mod = require "shardpilot.remote_config"
 local sampling = require "shardpilot.sampling"
 local storage = require "shardpilot.storage"
 local transport = require "shardpilot.transport"
@@ -216,12 +217,29 @@ local function validate_config(config)
 	if not valid_ingest_url(config.ingest_url) then
 		return nil, "invalid_ingest_url"
 	end
+	-- Optional remote config: `remote_config_url` is the base URL of the
+	-- remote-config endpoint (a separate service from the ingest endpoint),
+	-- validated with the same URL shape rules. Omit the field to disable
+	-- remote config; a configured value must be a valid base URL.
+	if config.remote_config_url ~= nil and not valid_ingest_url(config.remote_config_url) then
+		return nil, "invalid_remote_config_url"
+	end
+	local has_remote_config = config.remote_config_url ~= nil
 	-- Dual-mode auth. EITHER a Mode B async `token_provider` (a
 	-- per-tenant ingest JWT minted by the host) OR a Mode A `api_key` (the
 	-- non-secret publishable `sp_ingest_...` key, safe to embed client-side)
 	-- satisfies the config. Mode is selected by presence: a configured
-	-- `token_provider` yields the Bearer (Mode B); otherwise the `api_key` is
-	-- the Bearer (Mode A). Configuring both is rejected so the auth source is
+	-- `token_provider` yields the ingest Bearer (Mode B); otherwise the
+	-- `api_key` is the ingest Bearer (Mode A).
+	--
+	-- Remote config is the one exception to "configure exactly one". The
+	-- remote-config endpoint authenticates with the publishable api_key
+	-- only — a Mode B ingest token is scoped to event ingest and the
+	-- remote-config endpoint rejects it. So with remote_config_url set, an
+	-- api_key is required even in Mode B, and configuring both credentials
+	-- becomes valid: the token_provider keeps the ingest Bearer, the
+	-- api_key authenticates only the remote-config fetch. Without remote
+	-- config, configuring both stays rejected so the ingest auth source is
 	-- never ambiguous.
 	if config.token_provider ~= nil and type(config.token_provider) ~= "function" then
 		return nil, "invalid_token_provider"
@@ -231,11 +249,14 @@ local function validate_config(config)
 	end
 	local has_token_provider = type(config.token_provider) == "function"
 	local has_api_key = type(config.api_key) == "string" and config.api_key ~= ""
-	if has_token_provider and has_api_key then
+	if has_token_provider and has_api_key and not has_remote_config then
 		return nil, "auth_mode_conflict"
 	end
 	if not has_token_provider and not has_api_key then
 		return nil, "auth_required"
+	end
+	if has_remote_config and not has_api_key then
+		return nil, "remote_config_api_key_required"
 	end
 	local source = config.source or "client"
 	if source ~= "client" and source ~= "server" and source ~= "backend" then
@@ -285,6 +306,7 @@ local function validate_config(config)
 	end
 	local out = {
 		ingest_url = trim_slash(config.ingest_url),
+		remote_config_url = has_remote_config and trim_slash(config.remote_config_url) or nil,
 		workspace_id = config.workspace_id,
 		app_id = config.app_id,
 		environment_id = config.environment_id,
@@ -387,6 +409,17 @@ function M.new(config)
 	}, Client)
 	if stored.anonymous_id ~= anonymous_id then
 		client:persist_identity()
+	end
+	-- Remote config rides the client's identity: the persisted anonymous id
+	-- is the client id every fetch is scoped by, read through the accessor at
+	-- fetch time so a later set_anonymous_id is naturally picked up (and the
+	-- old identity's cache becomes a scope miss). Constructed here — after the
+	-- anonymous id is resolved — so a cached snapshot for this exact scope is
+	-- served by the getters immediately, before any fetch.
+	if normalized.remote_config_url then
+		client.remote_config = remote_config_mod.new(normalized, function()
+			return client.anonymous_id
+		end)
 	end
 	-- Offline event spool: re-load the envelopes a previous launch could not
 	-- deliver so they re-send (chunked to batch_size) before fresh events. The
@@ -547,6 +580,74 @@ end
 -- it returns here — but it does not itself verify the bind.
 function Client:get_anonymous_id()
 	return self.anonymous_id
+end
+
+-- ── remote config ─────────────────────────────────────────────────────────────
+--
+-- Thin delegates over the remote-config client (shardpilot/remote_config.lua),
+-- present only when `remote_config_url` is configured. The fetch is always an
+-- explicit game-triggered call — the SDK never fetches configuration on its
+-- own — and it is deliberately NOT consent-gated: configuration delivery
+-- carries no analytics payload (the client id in the URL only scopes which
+-- configuration to serve), so a denied analytics consent does not block it.
+-- The typed getters never fail: without configuration (or without remote
+-- config at all) they serve the caller's default.
+
+function Client:fetch_remote_config(callback)
+	if not self.remote_config then
+		if type(callback) == "function" then
+			-- The callback is game code; never let it break the SDK.
+			pcall(callback, {
+				ok = false,
+				from_cache = false,
+				error = "remote_config_not_configured",
+			})
+		end
+		return false, "remote_config_not_configured"
+	end
+	return self.remote_config:fetch(callback)
+end
+
+function Client:remote_config_value(key)
+	if not self.remote_config then
+		return nil
+	end
+	return self.remote_config:get_value(key)
+end
+
+function Client:remote_config_string(key, default)
+	if not self.remote_config then
+		return default
+	end
+	return self.remote_config:get_string(key, default)
+end
+
+function Client:remote_config_number(key, default)
+	if not self.remote_config then
+		return default
+	end
+	return self.remote_config:get_number(key, default)
+end
+
+function Client:remote_config_boolean(key, default)
+	if not self.remote_config then
+		return default
+	end
+	return self.remote_config:get_boolean(key, default)
+end
+
+function Client:remote_config_values()
+	if not self.remote_config then
+		return nil
+	end
+	return self.remote_config:get_values()
+end
+
+function Client:remote_config_version()
+	if not self.remote_config then
+		return nil
+	end
+	return self.remote_config:get_version()
 end
 
 function Client:set_consent(analytics_granted)
@@ -865,7 +966,11 @@ function Client:refresh_token()
 	-- Bearer is the non-secret publishable `api_key`. It never expires and is
 	-- restored synchronously here (including after a 401 clears self.token), so
 	-- the publish/consent paths treat the api_key exactly like a yielded JWT.
-	if self.config.api_key then
+	-- The token_provider check keeps the precedence explicit for the one
+	-- configuration where both credentials are present (remote config in
+	-- Mode B): the ingest Bearer stays the minted token, never the api_key —
+	-- the api_key authenticates only the remote-config fetch there.
+	if self.config.api_key and not self.config.token_provider then
 		self.token = self.config.api_key
 		self.token_expires_at_ms = nil
 		return true

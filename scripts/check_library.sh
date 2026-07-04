@@ -13,6 +13,7 @@ required_files=(
   shardpilot/envelope.lua
   shardpilot/queue.lua
   shardpilot/transport.lua
+  shardpilot/remote_config.lua
   shardpilot/clock.lua
   shardpilot/id.lua
   shardpilot/platform.lua
@@ -30,6 +31,7 @@ required_files=(
   test/harness.script
   test/test_sdk.lua
   test/test_crash.lua
+  test/test_remote_config.lua
   docs/crash.md
   examples/minimal/README.md
   examples/minimal/main.script
@@ -76,6 +78,7 @@ fi
 
 grep -q 'POST {ingest_url}/v1/events:batch' README.md || { echo "README missing wire contract" >&2; exit 1; }
 grep -q 'POST {crash_ingest_url}/api/v1/crashes/ingest' README.md || { echo "README missing crash wire contract" >&2; exit 1; }
+grep -q 'GET {remote_config_url}/config/v1/{workspace_id}/{environment_id}/{client_id}' README.md || { echo "README missing remote-config wire contract" >&2; exit 1; }
 grep -q 'memory-only' docs/privacy.md || { echo "privacy doc missing memory-only boundary" >&2; exit 1; }
 grep -q 'does not publish tags, GitHub Releases' docs/release.md || { echo "release doc must state no release publication" >&2; exit 1; }
 

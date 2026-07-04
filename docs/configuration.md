@@ -5,6 +5,9 @@ ShardPilot Defold SDK v0 is configured with a Lua table:
 ```lua
 {
   ingest_url = "https://ingest.shardpilot.com",
+  -- Optional: enables remote config (a SEPARATE service from the ingest
+  -- endpoint; requires api_key — see "Remote config" below).
+  -- remote_config_url = "https://config.shardpilot.com",
   workspace_id = "workspace",
   app_id = "app",
   environment_id = "production",
@@ -72,6 +75,30 @@ otherwise the `api_key` is the standing Bearer (Mode A). Configuring **both**
 is rejected (`auth_mode_conflict`); configuring **neither** is rejected
 (`auth_required`). `anonymous_id` is sent on the wire in both modes. Mode B
 JWTs are memory-only.
+
+**Remote config is the exception to "exactly one".** The remote-config
+endpoint authenticates with the publishable `api_key` only — a Mode B ingest
+JWT is scoped to event ingest and the remote-config endpoint rejects it. With
+`remote_config_url` set, an `api_key` is therefore required even in Mode B
+(rejected with `remote_config_api_key_required` otherwise), and configuring
+both credentials becomes valid: the `token_provider` keeps the ingest Bearer,
+the `api_key` authenticates only the remote-config fetch.
+
+## Remote config
+
+- **`remote_config_url`** (default `nil` = disabled, string). The base URL of
+  the remote-config endpoint, validated with the same shape rules as
+  `ingest_url` (`https://…`, or `http://` for loopback hosts only; no
+  path/query/fragment). This is a **separate service** from the ingest
+  endpoint — pointing it at `ingest_url` is wrong. When set, the client
+  exposes `fetch_remote_config(callback)` plus the typed getters
+  (`remote_config_string/number/boolean/value/values/version`); fetching is
+  always an explicit call (the SDK never fetches configuration on its own),
+  responses are cached in one durable per-app record, and getters serve the
+  last-known-good snapshot across restarts (the caller's default until any
+  configuration is available). Full semantics — ETag revalidation, offline
+  fallback, the `401`/`403` fail-closed rule, and the cache's scope check —
+  are in the README's "Remote config" section.
 
 ## Offline event spool
 
