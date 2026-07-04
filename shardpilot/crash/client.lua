@@ -229,6 +229,21 @@ function M.new(config)
 		-- shutdown() waits (bounded, host-retried) for this to reach zero so a fatal
 		-- report in flight is not lost when the client is discarded.
 		in_flight = 0,
+		-- Pending tokens whose POST is currently on the wire: a resend pass
+		-- snapshot skips them so a manual resend_pending() during a live
+		-- send can never dispatch the same body twice concurrently.
+		tokens_in_flight = {},
+		-- Set when a send was throttled (a Retry-After window persisted)
+		-- so an ACTIVE pass stops before its next dispatch instead of
+		-- sending into the window the server just requested. Cleared when a
+		-- send is accepted and at the start of each (window-gated) pass.
+		backpressure_hit = false,
+		-- Bumped on every throttled send. An accepted send clears the
+		-- stored window ONLY when no throttle landed after it was
+		-- dispatched: two sends can be in flight concurrently (a live fatal
+		-- alongside a pass record), and the accept of the EARLIER one must
+		-- not erase the window the later 429 just requested.
+		backpressure_epoch = 0,
 		-- True while a serial resend pass over the pending sidecar is running
 		-- (one pass at a time; each pass sends strictly one report at a time).
 		resend_active = false,
@@ -627,6 +642,7 @@ function Client:resend_pending()
 	if type(entries) == "table" then
 		for i, entry in ipairs(entries) do
 			if type(entry) == "table" and type(entry.token) == "string" and
+				not self.tokens_in_flight[entry.token] and
 				(type(entry.body) == "string" or type(entry.report) == "table") then
 				queue[#queue + 1] = {
 					token = entry.token,
@@ -652,7 +668,7 @@ function Client:resend_pending()
 	end)
 	for i, token in ipairs(mem_tokens) do
 		local entry = self.in_memory_pending[token]
-		if type(entry) == "table" then
+		if type(entry) == "table" and not self.tokens_in_flight[token] then
 			queue[#queue + 1] = {
 				token = token,
 				body = entry.body,
@@ -687,6 +703,9 @@ function Client:resend_pending()
 		return true
 	end
 	self.stats.resend_deferred_until_ms = nil
+	-- The stored-window gate above just passed: any older in-session
+	-- backpressure signal is spent.
+	self.backpressure_hit = false
 	self.resend_active = true
 	local index = 0
 	local function step()
@@ -704,6 +723,15 @@ function Client:resend_pending()
 			return
 		end
 		local entry = queue[index]
+		-- A send OUTSIDE this pass (a fatal live emit bypassing the queue)
+		-- can hit a 429 while the pass is mid-record: its persisted window
+		-- raises the backpressure flag, and the pass must stop before its
+		-- next dispatch rather than send into the window the server just
+		-- requested.
+		if self.backpressure_hit then
+			self.resend_active = false
+			return
+		end
 		-- The settlement callback fires exactly once on EVERY dispatch path
 		-- — an async transport answer and a synchronous setup failure alike
 		-- — and is the ONLY thing that advances or stops the pass. Acting on
@@ -773,6 +801,12 @@ function Client:dispatch_pending(entry, on_settled)
 	end
 	self.stats.emitted = self.stats.emitted + 1
 	self.in_flight = self.in_flight + 1
+	local epoch_at_dispatch = self.backpressure_epoch
+	-- Mark the token in flight so a resend pass snapshot taken while this
+	-- POST is on the wire never dispatches the same body a second time.
+	if type(pending_token) == "string" then
+		self.tokens_in_flight[pending_token] = true
+	end
 	local settled = false
 	local function settle()
 		if settled then
@@ -782,6 +816,9 @@ function Client:dispatch_pending(entry, on_settled)
 		if self.in_flight > 0 then
 			self.in_flight = self.in_flight - 1
 		end
+		if type(pending_token) == "string" then
+			self.tokens_in_flight[pending_token] = nil
+		end
 	end
 
 	local function handle(ok, transport_err, unauthorized, retryable, response, retry_after)
@@ -790,19 +827,25 @@ function Client:dispatch_pending(entry, on_settled)
 			if not self:record_accepted_response(response) then
 				self.stats.accepted = self.stats.accepted + 1
 			end
-			-- The send was accepted: the pending copy is no longer needed,
-			-- and any stored backpressure window is over — the endpoint just
-			-- took traffic. The window clears even for a TOKENLESS send
-			-- (one whose write-ahead persist was rejected outright): a stale
-			-- window left behind would keep deferring resend passes the
-			-- server is ready for. The surfaced deferral clears with it, so
-			-- snapshot() never keeps reporting a window that is over.
+			-- The send was accepted: the pending copy is no longer needed.
+			-- A stored backpressure window clears too — the endpoint just
+			-- took traffic — including for a TOKENLESS send (one whose
+			-- write-ahead persist was rejected outright): a stale window
+			-- left behind would keep deferring resend passes the server is
+			-- ready for. The clear is EPOCH-GUARDED: when another send was
+			-- throttled AFTER this one went out (two can be in flight — a
+			-- live fatal alongside a pass record), the fresher 429's window
+			-- stands and this earlier accept must not erase it.
+			local window_stands = self.backpressure_epoch ~= epoch_at_dispatch
 			if pending_token then
-				self:remove_pending(pending_token, true)
-			else
+				self:remove_pending(pending_token, not window_stands)
+			elseif not window_stands then
 				storage.set_pending_crash_retry_after(self:pending_scope(), nil)
 			end
-			self.stats.resend_deferred_until_ms = nil
+			if not window_stands then
+				self.stats.resend_deferred_until_ms = nil
+				self.backpressure_hit = false
+			end
 			if on_settled then
 				on_settled(false)
 			end
@@ -818,11 +861,15 @@ function Client:dispatch_pending(entry, on_settled)
 		-- later launch, or in-memory for an in-session pass). A server
 		-- Retry-After is persisted with the pending record so the
 		-- backpressure window survives a relaunch (clamped to one day; only
-		-- an explicit server hint is persisted). A non-retryable reject is
-		-- terminal: remove the pending copy so it is not retried forever.
+		-- an explicit server hint is persisted) — and the in-session
+		-- backpressure flag stops any ACTIVE pass before its next dispatch.
+		-- A non-retryable reject is terminal: remove the pending copy so it
+		-- is not retried forever.
 		if retryable then
 			if type(retry_after) == "number" and retry_after > 0 then
 				storage.set_pending_crash_retry_after(self:pending_scope(), retry_after)
+				self.backpressure_hit = true
+				self.backpressure_epoch = self.backpressure_epoch + 1
 			end
 		elseif pending_token then
 			self:remove_pending(pending_token)

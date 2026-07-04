@@ -4679,6 +4679,81 @@ local function test_deferral_stat_clears_with_window()
 	storage.reset()
 end
 
+-- A manual resend_pending() during a live in-flight send must not dispatch
+-- the same pending body a second time.
+local function test_resend_skips_tokens_in_flight()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "inflight-skip-app" }
+
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		held[#held + 1] = callback
+	end
+
+	local client = assert(crash.new(config({ app_id = "inflight-skip-app", sample_every = 1 })))
+	assert_true(client:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "INFLIGHTx" } })))
+	assert_equal(#requests, 1, "the live send is on the wire")
+	assert_equal(#storage.load_pending_crashes(scope), 1, "its write-ahead copy is pending")
+
+	client:resend_pending()
+	assert_equal(#requests, 1, "the pass skipped the in-flight token — no duplicate concurrent POST")
+
+	held[1](nil, nil, { status = 202, response = '{"crash_id":"x"}' })
+	assert_equal(client:snapshot().accepted, 1, "settled exactly once")
+	assert_equal(#storage.load_pending_crashes(scope), 0, "the copy settled")
+
+	http.request = saved_request
+	restore()
+	storage.reset()
+end
+
+-- A fatal live emit throttled DURING an active pass raises backpressure the
+-- pass honors before its next dispatch: remaining reports stay durable.
+local function test_pass_stops_on_concurrent_fatal_throttle()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "concurrent-throttle-app" }
+
+	-- Seed two pending reports.
+	next_status = 500
+	local seeder = assert(crash.new(config({ app_id = "concurrent-throttle-app", sample_every = 1 })))
+	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "R1x" } })))
+	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "R2x" } })))
+	assert_equal(#storage.load_pending_crashes(scope), 2)
+
+	reset()
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		held[#held + 1] = callback
+	end
+
+	local client = assert(crash.new(config({ app_id = "concurrent-throttle-app", sample_every = 1 })))
+	client:resend_pending()
+	assert_equal(#requests, 1, "the pass has R1 in flight")
+
+	-- A fatal live emit bypasses the queue (dying-process posture) and gets
+	-- throttled while R1 is still on the wire.
+	assert_true(client:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "LIVEHOTx" } })))
+	assert_equal(#requests, 2, "the fatal fired immediately")
+	held[2](nil, nil, { status = 429, headers = { ["retry-after"] = "3600" }, response = "" })
+
+	-- R1 settles cleanly, but the pass must NOT advance to R2: the server
+	-- just requested a window.
+	held[1](nil, nil, { status = 202, response = '{"crash_id":"x"}' })
+	assert_equal(#requests, 2, "the pass stopped before R2 — no send into the fresh window")
+	local pending = storage.load_pending_crashes(scope)
+	assert_true(#pending >= 2, "R2 and the throttled fatal stay durable")
+
+	http.request = saved_request
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_source_stamped_on_every_report,
@@ -4803,6 +4878,8 @@ local tests = {
 	test_live_non_fatal_defers_into_stored_window,
 	test_live_non_fatal_queues_behind_active_pass,
 	test_deferral_stat_clears_with_window,
+	test_resend_skips_tokens_in_flight,
+	test_pass_stops_on_concurrent_fatal_throttle,
 }
 
 for _, test in ipairs(tests) do
