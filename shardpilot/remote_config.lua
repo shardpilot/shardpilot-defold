@@ -102,14 +102,34 @@ end
 
 -- The endpoint answers `{ "version": <number>, "values": { key: value } }`.
 -- The configuration map served to getters is the `values` object; a body that
--- is a JSON object without one is served as the map itself, so an unwrapped
--- payload (fixtures, older servers) still works. Returns (values, version).
+-- is a JSON object WITHOUT a `values` member is served as the map itself, so
+-- an unwrapped payload (fixtures, older servers) still works. A wrapper whose
+-- `values` member is present but not a keyed object (a string, number,
+-- boolean, or a positional array — e.g. after a server-side schema bug) is
+-- MALFORMED: falling back to serving the wrapper would expose wrapper fields
+-- as configuration and overwrite the last-known-good cache. Returns
+-- (values, version), or nil for a malformed wrapper.
 local function extract(decoded)
 	local version = type(decoded.version) == "number" and decoded.version or nil
-	if type(decoded.values) == "table" then
-		return decoded.values, version
+	local values = decoded.values
+	if values ~= nil then
+		if type(values) ~= "table" or values[1] ~= nil then
+			return nil
+		end
+		return values, version
 	end
 	return decoded, version
+end
+
+-- Parse a configuration body end-to-end: a JSON object whose configuration
+-- map is usable. Returns (values, version), or nil when the body cannot
+-- supply one. Never throws.
+local function parse_config(body)
+	local decoded = decode_object(body)
+	if not decoded then
+		return nil
+	end
+	return extract(decoded)
 end
 
 -- The real Defold http API lowercases response header keys; the test mock
@@ -131,33 +151,37 @@ end
 -- why the network could not refresh it.
 local function serve_cache_or_fail(cache, error_code)
 	if cache then
-		local decoded = decode_object(cache.body)
-		if decoded then
-			local values, version = extract(decoded)
+		local values, version = parse_config(cache.body)
+		if values then
 			return {
 				ok = true,
 				from_cache = true,
 				error = error_code,
 				values = values,
 				version = version,
-			}, nil
+			}
 		end
 	end
-	return { ok = false, from_cache = false, error = error_code }, nil
+	return { ok = false, from_cache = false, error = error_code }
 end
 
 -- Decide one fetch outcome from the transport response and the cached
 -- snapshot. Pure (no IO, no state) so tests can drive every branch. Returns
--- (result, new_cache): a non-nil new_cache means "persist this record" —
--- absent for every failure outcome, so an unauthorized or malformed response
--- never disturbs the last-known-good cache on disk.
+-- (result, new_cache, authoritative):
+--   * `new_cache` non-nil means "persist this record"; it exists only for a
+--     fresh 200, so no failure — unauthorized, permanent, malformed — and no
+--     cache-served outcome ever disturbs the last-known-good record.
+--   * `authoritative` marks the outcomes that settle the request fence: a
+--     fresh 200, an unauthorized response, and a permanent HTTP error. A
+--     transient/cache fallback is NOT authoritative — it says nothing about
+--     the current configuration, so it must not fence off a fresh response
+--     still in flight.
 function M.apply(cache, response, now_ms)
 	local status = type(response) == "table" and response.status or 0
 
 	if type(response) == "table" and status == 200 then
-		local decoded = decode_object(response.response)
-		if decoded then
-			local values, version = extract(decoded)
+		local values, version = parse_config(response.response)
+		if values then
 			return {
 				ok = true,
 				from_cache = false,
@@ -167,30 +191,25 @@ function M.apply(cache, response, now_ms)
 				etag = response_etag(response) or "",
 				body = response.response,
 				fetched_at_ms = now_ms,
-			}
+			}, true
 		end
-		return serve_cache_or_fail(cache, "malformed_response")
+		return serve_cache_or_fail(cache, "malformed_response"), nil, false
 	end
 
 	if type(response) == "table" and status == 304 and cache then
-		local decoded = decode_object(cache.body)
-		if decoded then
-			local values, version = extract(decoded)
+		local values, version = parse_config(cache.body)
+		if values then
 			return {
 				ok = true,
 				from_cache = true,
 				values = values,
 				version = version,
-			}, {
-				etag = cache.etag,
-				body = cache.body,
-				fetched_at_ms = now_ms,
-			}
+			}, nil, false
 		end
 		-- The revalidated cache turned out unreadable: there is nothing left
 		-- to serve (the 304 carries no body), so this fails rather than
 		-- re-serving the very cache that just failed to decode.
-		return serve_cache_or_fail(nil, "cache_unreadable_after_304")
+		return serve_cache_or_fail(nil, "cache_unreadable_after_304"), nil, false
 	end
 
 	-- An unauthorized response is an authoritative "this key may not read
@@ -199,7 +218,7 @@ function M.apply(cache, response, now_ms)
 	-- indefinitely. Fail closed; the cache file is kept untouched but is
 	-- never served for this outcome.
 	if type(response) == "table" and (status == 401 or status == 403) then
-		return { ok = false, from_cache = false, error = "unauthorized" }, nil
+		return { ok = false, from_cache = false, error = "unauthorized" }, nil, true
 	end
 
 	-- The cache fallback is reserved for failures a retry can plausibly fix:
@@ -209,13 +228,13 @@ function M.apply(cache, response, now_ms)
 	-- fetch fails instead of reporting stale values as a healthy `ok = true`
 	-- (the cache record and the getter snapshot stay untouched).
 	if status == 0 then
-		return serve_cache_or_fail(cache, "http_0")
+		return serve_cache_or_fail(cache, "http_0"), nil, false
 	elseif status == 429 then
-		return serve_cache_or_fail(cache, "transient_429")
+		return serve_cache_or_fail(cache, "transient_429"), nil, false
 	elseif status >= 500 then
-		return serve_cache_or_fail(cache, "transient_" .. tostring(status))
+		return serve_cache_or_fail(cache, "transient_" .. tostring(status)), nil, false
 	end
-	return { ok = false, from_cache = false, error = "http_" .. tostring(status) }, nil
+	return { ok = false, from_cache = false, error = "http_" .. tostring(status) }, nil, true
 end
 
 -- Depth-bounded copy of a decoded configuration value, so a table handed to
@@ -256,12 +275,15 @@ function M.new(config, identity)
 		-- configuration rather than reviving an older on-disk record.
 		cache = nil,
 		-- Requests are numbered, and `settled_seq` is the highest sequence
-		-- whose response has completed — success OR failure. Only a fetch
-		-- newer than every settled one may install its outcome (snapshot +
-		-- cache): with two fetches in flight, responses can arrive out of
-		-- order, and an older success must neither roll back a newer
-		-- configuration nor sneak values in after a newer response already
-		-- failed closed (unauthorized/permanent).
+		-- whose AUTHORITATIVE outcome has landed: a fresh 200, an
+		-- unauthorized response, or a permanent HTTP error. Only a fetch
+		-- newer than every settled one may install: with two fetches in
+		-- flight, responses can arrive out of order, and an older success
+		-- must neither roll back a newer configuration nor sneak values in
+		-- after a newer fail-closed outcome. Non-authoritative outcomes
+		-- (a transient failure, a cache-served fallback) do not settle —
+		-- they say nothing about the current configuration, so they must
+		-- not fence off a fresh response still in flight.
 		fetch_seq = 0,
 		settled_seq = 0,
 	}, RemoteConfig)
@@ -270,10 +292,10 @@ function M.new(config, identity)
 	-- this exact scope exists.
 	local cache = rc:load_cache(rc:client_id())
 	if cache then
-		local decoded = decode_object(cache.body)
-		if decoded then
+		local values, version = parse_config(cache.body)
+		if values then
 			rc.cache = cache
-			rc.values, rc.version = extract(decoded)
+			rc.values, rc.version = values, version
 		end
 	end
 	return rc
@@ -318,7 +340,7 @@ function RemoteConfig:load_cache(client_id)
 	if not record or record.scope ~= scope then
 		return nil
 	end
-	if not decode_object(record.body) then
+	if not parse_config(record.body) then
 		return nil
 	end
 	return record
@@ -332,15 +354,20 @@ function RemoteConfig:diagnose(status)
 	end
 end
 
--- Settle a completed fetch and, when it may, install its outcome: the
+-- Settle an authoritative fetch outcome and, when it may, install it: the
 -- in-process cache record, the durable copy (best-effort), and the getter
--- snapshot. Three gates apply, in order:
---   * the sequence fence — EVERY completed fetch (success or failure)
---     settles its sequence, and only a fetch newer than every settled one
---     may install, so an older success can neither roll back a newer
+-- snapshot. The gates, in order:
+--   * the sequence fence — an outcome older than the newest settled one is
+--     dropped, so an older success can neither roll back a newer
 --     configuration nor sneak values in after a newer fail-closed outcome;
---   * only successful results install — a failure settles the fence and
---     nothing else;
+--   * only AUTHORITATIVE outcomes settle the fence (fresh 200,
+--     unauthorized, permanent error); a transient/cache fallback says
+--     nothing about the current configuration and must not fence off a
+--     fresh response still in flight;
+--   * only a fresh 200 installs anything (`new_cache` exists exactly then);
+--     a cache-served outcome re-serves content the snapshot already holds,
+--     and installing it could roll back a fresher body installed while it
+--     was in flight;
 --   * the scope must still be current — an identity rotated while the
 --     response was in flight makes the response another client's
 --     configuration (a different rollout bucket), which must not be served
@@ -348,34 +375,34 @@ end
 -- The snapshot is a defensive copy: the result table is handed to game code,
 -- and a callback that mutates `result.values` must not corrupt what later
 -- getters read.
-function RemoteConfig:install(seq, result, new_cache, scope)
+function RemoteConfig:install(seq, result, new_cache, scope, authoritative)
 	if seq <= self.settled_seq then
 		return
 	end
-	self.settled_seq = seq
-	if not result.ok then
+	if authoritative then
+		self.settled_seq = seq
+	end
+	if not result.ok or not new_cache then
 		return
 	end
 	local current_id = self:client_id()
 	if not current_id or self:scope_for(current_id) ~= scope then
 		return
 	end
-	if new_cache then
-		new_cache.scope = scope
-		-- The in-process record is updated even when the durable write
-		-- fails: the freshest served configuration stays the offline
-		-- fallback for this process either way.
-		self.cache = new_cache
-		if not storage.save_remote_config(self.config, new_cache) then
-			-- An older durable record may still be on disk, and a restart
-			-- would revive it OVER the newer configuration just served.
-			-- Clear it (best-effort — with the storage backend itself down
-			-- this fails too and the stale record is at least superseded in
-			-- this process): a restart then starts from the game's defaults
-			-- rather than from rolled-back values.
-			storage.clear_remote_config(self.config)
-			self:diagnose("cache_persist_failed")
-		end
+	new_cache.scope = scope
+	-- The in-process record is updated even when the durable write fails:
+	-- the freshest served configuration stays the offline fallback for this
+	-- process either way.
+	self.cache = new_cache
+	if not storage.save_remote_config(self.config, new_cache) then
+		-- An older durable record may still be on disk, and a restart would
+		-- revive it OVER the newer configuration just served. Clear it
+		-- (best-effort — with the storage backend itself down this fails too
+		-- and the stale record is at least superseded in this process): a
+		-- restart then starts from the game's defaults rather than from
+		-- rolled-back values.
+		storage.clear_remote_config(self.config)
+		self:diagnose("cache_persist_failed")
 	end
 	self.values = copy_value(result.values, 0)
 	self.version = result.version
@@ -420,9 +447,7 @@ function RemoteConfig:fetch(callback)
 	if not http or not http.request then
 		-- No transport on this runtime is a transient failure like any
 		-- other: serve the last-known-good snapshot when one exists.
-		local result = serve_cache_or_fail(cache, "http_unavailable")
-		self:install(seq, result, nil, scope)
-		finish(result)
+		finish(serve_cache_or_fail(cache, "http_unavailable"))
 		return false
 	end
 
@@ -442,8 +467,8 @@ function RemoteConfig:fetch(callback)
 	}
 
 	http.request(url, "GET", function(_, _, response)
-		local result, new_cache = M.apply(cache, response, clock.unix_ms())
-		self:install(seq, result, new_cache, scope)
+		local result, new_cache, authoritative = M.apply(cache, response, clock.unix_ms())
+		self:install(seq, result, new_cache, scope, authoritative)
 		finish(result)
 	end, headers, nil, options)
 	return true

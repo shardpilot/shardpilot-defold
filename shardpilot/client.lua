@@ -594,9 +594,19 @@ end
 -- config at all) they serve the caller's default.
 
 function Client:fetch_remote_config(callback)
+	-- The callback is game code; never let it break the SDK.
+	if not self.initialized then
+		-- Like every other network-producing call on a torn-down client: no
+		-- request is dispatched, nothing is written, game code is not called
+		-- back later. The read-only getters below stay usable, like
+		-- snapshot().
+		if type(callback) == "function" then
+			pcall(callback, { ok = false, from_cache = false, error = "shutdown" })
+		end
+		return false, "shutdown"
+	end
 	if not self.remote_config then
 		if type(callback) == "function" then
-			-- The callback is game code; never let it break the SDK.
 			pcall(callback, {
 				ok = false,
 				from_cache = false,

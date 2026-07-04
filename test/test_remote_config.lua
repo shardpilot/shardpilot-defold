@@ -710,6 +710,107 @@ local function test_identity_rotation_drops_inflight_response()
 		"a response for the previous identity must not be persisted after rotation")
 end
 
+local function test_transient_cache_hit_does_not_fence_inflight_fresh()
+	reset()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ a = 1 }, 1)
+	fetch(client)
+
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		held[#held + 1] = callback
+	end
+	local results = {}
+	client:fetch_remote_config(function(result)
+		results.older = result
+	end)
+	client:fetch_remote_config(function(result)
+		results.newer = result
+	end)
+	http.request = saved_request
+
+	-- The NEWER fetch hits a transient error first and serves the cache;
+	-- that fallback is not authoritative and must not fence anything.
+	held[2](nil, nil, { status = 0 })
+	assert_true(results.newer.ok)
+	assert_equal(results.newer.from_cache, true)
+	assert_equal(results.newer.values.a, 1)
+
+	-- The OLDER fetch then lands a fresh 200: it must still install.
+	held[1](nil, nil, {
+		status = 200,
+		response = values_body({ a = 7 }, 7),
+		headers = { etag = '"v7"' },
+	})
+	assert_true(results.older.ok)
+	assert_equal(client:remote_config_number("a", 0), 7,
+		"a cache-served fallback must not block a fresh response still in flight")
+	assert_equal(client:remote_config_version(), 7)
+end
+
+local function test_malformed_wrapped_values_member_is_rejected()
+	reset()
+	local client = assert(sdk.new(config()))
+
+	-- With no cache, a wrapper whose `values` member is not a keyed object
+	-- must fail rather than serve the wrapper itself as configuration...
+	for _, body in ipairs({
+		'{"version":3,"values":"oops"}',
+		'{"version":3,"values":42}',
+		'{"version":3,"values":[1,2]}',
+	}) do
+		next_status = 200
+		next_response_body = body
+		local result = fetch(client)
+		assert_equal(result.ok, false, "a malformed wrapper must fail: " .. body)
+		assert_equal(result.error, "malformed_response")
+	end
+	assert_nil(client:remote_config_value("version"),
+		"wrapper fields must never surface as configuration values")
+
+	-- ...and with a cache it degrades to the snapshot without overwriting it.
+	next_status = 200
+	next_response_body = values_body({ a = 2 }, 2)
+	fetch(client)
+	next_status = 200
+	next_response_body = '{"version":9,"values":"oops"}'
+	local result = fetch(client)
+	assert_true(result.ok)
+	assert_equal(result.from_cache, true)
+	assert_equal(result.error, "malformed_response")
+	assert_equal(result.values.a, 2)
+	assert_equal(client:remote_config_version(), 2,
+		"a malformed wrapper must not overwrite the last-known-good configuration")
+end
+
+local function test_fetch_after_shutdown_is_rejected()
+	reset()
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	local client = assert(sdk.new(config()))
+	fetch(client)
+
+	next_status = 202
+	next_response_body = '{"accepted":0}'
+	assert_true(client:shutdown("test_teardown"))
+
+	-- Like every other network-producing call on a torn-down client.
+	local result = nil
+	local requests_before = #requests
+	local ok, err = client:fetch_remote_config(function(value)
+		result = value
+	end)
+	assert_equal(ok, false)
+	assert_equal(err, "shutdown")
+	assert_equal(result.error, "shutdown")
+	assert_equal(#requests, requests_before, "no request may be dispatched after shutdown")
+
+	-- The read-only getters stay usable, like snapshot().
+	assert_equal(client:remote_config_number("a", 0), 1)
+end
+
 local function test_callback_mutation_cannot_corrupt_the_snapshot()
 	reset()
 	local client = assert(sdk.new(config()))
@@ -1173,6 +1274,9 @@ local tests = {
 	test_out_of_order_responses_do_not_install_stale_config,
 	test_fail_closed_fences_older_inflight_success,
 	test_identity_rotation_drops_inflight_response,
+	test_transient_cache_hit_does_not_fence_inflight_fresh,
+	test_malformed_wrapped_values_member_is_rejected,
+	test_fetch_after_shutdown_is_rejected,
 	test_callback_mutation_cannot_corrupt_the_snapshot,
 	test_unwrapped_payload_is_served_as_the_map,
 	test_cache_from_another_scope_is_a_miss_and_gets_overwritten,
