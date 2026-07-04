@@ -694,9 +694,9 @@ function Client:resend_pending()
 		if index > #queue then
 			self.resend_active = false
 			-- Reports queued by live emits WHILE this pass was running were
-			-- not in its snapshot: a clean completion runs one follow-up
-			-- pass for them (a retryable stop above does not — the
-			-- backpressure that stopped the pass covers them too).
+			-- not in its snapshot: a pass that finished cleanly runs one
+			-- follow-up pass for them (a retryable stop above does not —
+			-- the backpressure that stopped the pass covers them too).
 			if self.resend_followup_wanted then
 				self.resend_followup_wanted = nil
 				self:resend_pending()
