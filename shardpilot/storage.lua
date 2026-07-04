@@ -402,16 +402,20 @@ end
 -- Evict ONE entry from `stored` toward the caps, never touching the entry
 -- carrying `protected_token` (the report being saved right now — the one the
 -- write-ahead contract must not lose). Non-fatal reports go first, oldest
--- first; only when none remain does the oldest FATAL report go — a fatal
--- crash is the most valuable diagnostics signal, so a burst of handled
--- (non-fatal) reports can never displace a pending fatal one. Returns true
--- when something was evicted.
-local function evict_one_pending(stored, protected_token)
+-- first. A FATAL report is evicted only to admit another FATAL one
+-- (`protected_is_fatal`): a fatal crash is the most valuable diagnostics
+-- signal, so a burst of handled (non-fatal) reports can never displace a
+-- pending fatal — when only fatal entries remain and the newcomer is
+-- non-fatal, this returns false and the CALLER drops the newcomer instead.
+local function evict_one_pending(stored, protected_token, protected_is_fatal)
 	for i = 1, #stored do
 		if stored[i].token ~= protected_token and stored[i].fatal ~= true then
 			table.remove(stored, i)
 			return true
 		end
+	end
+	if not protected_is_fatal then
+		return false
 	end
 	for i = 1, #stored do
 		if stored[i].token ~= protected_token then
@@ -455,6 +459,14 @@ function M.save_pending_crash(scope, entry, token, created_at_ms)
 		return nil
 	end
 	local ns = pending_namespace(scope)
+	-- Durability is this store's whole contract: without the Defold
+	-- save-file API there is nothing durable to write to, so the save FAILS
+	-- (no token) and the caller degrades to its explicitly non-durable
+	-- in-memory retention — a process-local table must never be counted as
+	-- write-ahead durability.
+	if not save_path(ns) then
+		return nil
+	end
 	local items, deadline = read_pending_record(ns)
 	-- Defensive copy so a later caller mutation cannot reach the stored snapshot.
 	local stored = {}
@@ -502,25 +514,34 @@ function M.save_pending_crash(scope, entry, token, created_at_ms)
 	new_entry.created_at = stamp
 	stored[#stored + 1] = new_entry
 	-- Enforce the count AND total-bytes caps, never evicting the just-added
-	-- report (its durability is the whole point of the write-ahead persist).
+	-- report (its durability is the whole point of the write-ahead persist)
+	-- and never a FATAL entry to admit a non-fatal one.
 	while (#stored > max_pending_records or pending_total_bytes(stored) > max_pending_total_bytes) and
-		evict_one_pending(stored, token) do
+		evict_one_pending(stored, token, new_entry.fatal) do
+	end
+	if #stored > max_pending_records or pending_total_bytes(stored) > max_pending_total_bytes then
+		-- Still over the caps with nothing evictable: the sidecar is full of
+		-- FATAL reports and the newcomer is non-fatal. The newcomer — the
+		-- lowest-value report present — is the one dropped; the durable file
+		-- is left untouched.
+		return nil
 	end
 	-- The byte budget above steers eviction but does not GUARANTEE the
 	-- serialized list fits the durable store's per-file limit (Defold's
 	-- sys.save caps a saved table at 512 KB): wrapper/serialization overhead
 	-- is not counted. A failed write would lose THIS report (no removable
-	-- token). So keep evicting — non-fatal first, the new report never — and
-	-- retry the write until it succeeds or only the just-added report
-	-- remains. This keeps a pending crash report always persistable and
-	-- therefore removable.
+	-- token). So keep evicting — under the same policy — and retry the write
+	-- until it succeeds or nothing evictable remains. This keeps a pending
+	-- FATAL report always persistable and therefore removable, while a
+	-- non-fatal newcomer never costs a fatal report its slot.
 	while true do
 		if write_pending_list(ns, stored, deadline) then
 			return token
 		end
-		if not evict_one_pending(stored, token) then
-			-- Even the single new report could not be written: the backend is
-			-- unavailable. Report a failed persist (no removable token).
+		if not evict_one_pending(stored, token, new_entry.fatal) then
+			-- Nothing more may be evicted (the backend is unavailable, or
+			-- only fatal entries shield a non-fatal newcomer). Report a
+			-- failed persist (no removable token).
 			return nil
 		end
 	end

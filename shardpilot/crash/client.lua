@@ -272,11 +272,49 @@ function Client:pending_scope()
 	return { app_id = self.config.app_id }
 end
 
+local max_in_memory_pending = 8
+
 -- Retain a pending entry ({ body, crash_id, fatal }) in the in-session
 -- fallback store (used only when on-disk persistence failed) and return its
--- in-memory token. The token is distinct from on-disk tokens so the two
--- stores never collide.
+-- in-memory token, or nil when the entry was not admitted. The token is
+-- distinct from on-disk tokens so the two stores never collide. The store
+-- is BOUNDED with the sidecar's own retention policy — at most 8 entries,
+-- oldest non-fatal evicted first, a fatal entry never evicted to admit a
+-- non-fatal one — so a session-long persist-failure loop with a chatty
+-- handled-error path can never accumulate unbounded encoded bodies.
 function Client:retain_in_memory_pending(entry)
+	local function seq_of(token)
+		return tonumber(token:match("^mem:(%d+)$")) or 0
+	end
+	local count = 0
+	for _ in pairs(self.in_memory_pending) do
+		count = count + 1
+	end
+	while count >= max_in_memory_pending do
+		local victim, victim_seq = nil, nil
+		for held_token, held in pairs(self.in_memory_pending) do
+			if held.fatal ~= true and (victim_seq == nil or seq_of(held_token) < victim_seq) then
+				victim, victim_seq = held_token, seq_of(held_token)
+			end
+		end
+		if not victim then
+			if entry.fatal ~= true then
+				-- Only fatal entries remain and the newcomer is non-fatal:
+				-- the newcomer is the lowest-value report — drop it.
+				return nil
+			end
+			for held_token in pairs(self.in_memory_pending) do
+				if victim_seq == nil or seq_of(held_token) < victim_seq then
+					victim, victim_seq = held_token, seq_of(held_token)
+				end
+			end
+		end
+		if not victim then
+			break
+		end
+		self.in_memory_pending[victim] = nil
+		count = count - 1
+	end
 	self.in_memory_pending_seq = self.in_memory_pending_seq + 1
 	local token = "mem:" .. tostring(self.in_memory_pending_seq)
 	self.in_memory_pending[token] = entry
@@ -444,13 +482,15 @@ function Client:emit_internal(event, fatal, trusted_frame_functions, prepare_opt
 		if pending_token then
 			self.stats.persisted = self.stats.persisted + 1
 		else
-			-- On-disk persistence can fail durably (storage quota / failure / an
-			-- oversized body). Dropping the report here would lose it permanently
-			-- if the send below also fails. Fall back to an in-session in-memory
-			-- pending entry so an in-session resend pass can still retry it.
+			-- On-disk persistence can fail durably (storage quota / failure /
+			-- an oversized body / no save-file API on this host). Dropping
+			-- the report here would lose it permanently if the send below
+			-- also fails. Fall back to a BOUNDED in-session in-memory pending
+			-- entry so an in-session resend pass can still retry it.
 			-- (Best-effort: the in-memory copy does NOT survive a process
-			-- restart; disk is the durable path.) The report is still
-			-- dispatched below either way.
+			-- restart, and a non-fatal newcomer may not be admitted at all;
+			-- disk is the durable path.) The report is still dispatched below
+			-- either way.
 			self.stats.persist_failed = self.stats.persist_failed + 1
 			pending_token = self:retain_in_memory_pending(entry)
 		end
@@ -459,6 +499,13 @@ function Client:emit_internal(event, fatal, trusted_frame_functions, prepare_opt
 	-- the dispatch below routes through the transport so the failure is
 	-- accounted exactly as before.)
 	entry.token = pending_token
+	if merged_options.defer_dispatch == true and pending_token then
+		-- The caller runs the serial resend pass next: the report is queued
+		-- (durably, or in the session fallback) and dispatches IN ORDER
+		-- behind any older backlog, under the same one-at-a-time
+		-- backpressure discipline — never concurrently with it.
+		return true
+	end
 	return self:dispatch_pending(entry)
 end
 
@@ -481,13 +528,10 @@ function Client:capture_previous(crash_module)
 	if not self.initialized then
 		return false, "shutdown"
 	end
-	-- First, try to resend any reports a previous launch persisted after a
-	-- temporary send failure (offline / rate-limited / server error) or an
-	-- app death mid-send. Crash reports get the first shot at the network,
-	-- before the host typically starts analytics traffic.
-	self:resend_pending()
 	local event = dump.load_previous_event(crash_module)
 	if not event then
+		-- No new dump: just resend whatever a previous launch left pending.
+		self:resend_pending()
 		return true, false
 	end
 	-- Dump frames carry no symbols (native addresses) and the modules come from
@@ -495,13 +539,21 @@ function Client:capture_previous(crash_module)
 	-- here; forward as a fatal report so it is never sampled away. The dump is from
 	-- the DEAD previous session and carries no breadcrumbs of its own — suppress
 	-- attaching the current session's breadcrumb ring, which would otherwise
-	-- misattribute this session's breadcrumbs to the previous crash. (Like every
-	-- emit, the prepared report persists write-ahead before its send — the dump
-	-- is one-shot and already consumed, so this is the only copy.)
-	local ok, err = self:emit_internal(event, true, true, { skip_breadcrumb_ring = true })
+	-- misattribute this session's breadcrumbs to the previous crash.
+	--
+	-- The prepared report persists write-ahead (the dump is one-shot and
+	-- already consumed, so this is the only copy) and defer_dispatch QUEUES
+	-- it behind any older pending backlog: the single serial pass below
+	-- sends everything oldest-first, one report at a time — the transport is
+	-- async, so dispatching the dump directly here would race the pass and
+	-- escape the one-at-a-time backpressure discipline.
+	local ok, err = self:emit_internal(event, true, true,
+		{ skip_breadcrumb_ring = true, defer_dispatch = true })
 	if not ok then
+		self:resend_pending()
 		return false, err
 	end
+	self:resend_pending()
 	return true, true
 end
 
@@ -574,20 +626,22 @@ function Client:resend_pending()
 			return
 		end
 		local entry = queue[index]
-		local dispatched = self:dispatch_pending(entry, function(stop_pass)
+		-- The settlement callback fires exactly once on EVERY dispatch path
+		-- — an async transport answer and a synchronous setup failure alike
+		-- — and is the ONLY thing that advances or stops the pass. Acting on
+		-- the return value as well would race it: a synchronous failure has
+		-- already advanced the chain (possibly starting the next async POST)
+		-- by the time dispatch_pending returns.
+		self:dispatch_pending(entry, function(stop_pass)
 			if stop_pass then
-				-- Retryable failure: keep this and every remaining report
-				-- durable for a later pass.
+				-- Retryable failure (or a client no longer able to send):
+				-- keep this and every remaining report durable for a later
+				-- pass.
 				self.resend_active = false
 				return
 			end
 			step()
 		end)
-		if not dispatched then
-			-- A synchronous setup failure (no http/json) would fail every
-			-- remaining entry the same way: stop the pass.
-			self.resend_active = false
-		end
 	end
 	step()
 end
@@ -606,6 +660,12 @@ end
 -- advance or stop.
 function Client:dispatch_pending(entry, on_settled)
 	if not self.initialized or type(entry) ~= "table" then
+		-- The settlement contract holds on every path: stop the pass (the
+		-- client cannot send anymore, or the entry is unusable) so a serial
+		-- pass never wedges with its active flag set.
+		if on_settled then
+			on_settled(true)
+		end
 		return false, "invalid_event"
 	end
 	local pending_token = entry.token

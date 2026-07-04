@@ -3330,9 +3330,20 @@ local function test_pending_persistence_safe_without_sys_api()
 		backtrace = { { address = 0x3abc } },
 	}))
 	assert_equal(ok, true, "capture_previous must not raise without sys persistence")
-	-- the in-memory fallback still retains it for this process
-	local pending = storage.load_pending_crashes({ app_id = "no-disk-app" })
-	assert_equal(#pending, 1, "without disk, the pending report is held in memory")
+	-- Without a durable backend the save must NOT claim durability: no
+	-- storage-side pending entry, an honest persist_failed count, and the
+	-- report retained in the CLIENT's session-only memory fallback (so an
+	-- in-session resend can still retry it).
+	assert_equal(#storage.load_pending_crashes({ app_id = "no-disk-app" }), 0,
+		"a process-local table is never counted as write-ahead durability")
+	local snap = client:snapshot()
+	assert_equal(snap.persisted, 0, "nothing was durably persisted")
+	assert_equal(snap.persist_failed, 1, "the failed persist is surfaced honestly")
+	local mem_count = 0
+	for _ in pairs(client.in_memory_pending) do
+		mem_count = mem_count + 1
+	end
+	assert_equal(mem_count, 1, "the report is retained in the session-only fallback")
 	storage.reset()
 end
 
@@ -4287,6 +4298,116 @@ local function test_legacy_report_table_entry_resent_and_settled()
 	storage.reset()
 end
 
+-- With Defold's ASYNC http callbacks, a fresh dump must never race the
+-- resend pass: it is queued (write-ahead) behind the older backlog and the
+-- single serial pass sends everything one at a time — a 429 on the older
+-- report stops the pass BEFORE the dump goes out, keeping it durable.
+local function test_dump_forward_queues_behind_pending_pass()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "order-app" }
+
+	-- Seed one older pending report (S1).
+	next_status = 500
+	local seeder = assert(crash.new(config({ app_id = "order-app", sample_every = 1 })))
+	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "S1" } })))
+	assert_equal(#storage.load_pending_crashes(scope), 1)
+
+	-- An ASYNC transport: callbacks are held and released by the test.
+	reset()
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		held[#held + 1] = callback
+	end
+
+	local client = assert(crash.new(config({ app_id = "order-app", sample_every = 1 })))
+	local ok, sent = client:capture_previous(fake_crash_module({
+		handle = 9,
+		signum = 11,
+		os_name = "Android",
+		modules = { { name = "libgame.so", address = 0x1000 } },
+		backtrace = { { address = 0x1abc } },
+	}))
+	assert_equal(ok, true)
+	assert_equal(sent, true, "the dump was accepted (durably queued + pass started)")
+
+	-- Strictly ONE request in flight: the older S1. The dump must NOT have
+	-- been dispatched concurrently with the pass.
+	assert_equal(#requests, 1, "one report at a time — the dump never races the pass")
+	assert_contains(requests[1].body, '"S1"')
+	assert_equal(#storage.load_pending_crashes(scope), 2, "the dump is durably queued behind S1")
+
+	-- The older report hits a 429: the pass STOPS — the dump stays durable
+	-- and is never sent into the backpressure window.
+	held[1](nil, nil, { status = 429, headers = { ["retry-after"] = "3600" }, response = "" })
+	assert_equal(#requests, 1, "the 429 stopped the pass before the dump went out")
+	local entries, deadline = storage.load_pending_entries(scope)
+	assert_equal(#entries, 2, "both reports remain durable")
+	assert_true(type(deadline) == "number", "the backpressure window persisted")
+
+	http.request = saved_request
+	restore()
+	storage.reset()
+end
+
+-- A sidecar full of FATAL reports never gives one up for a sampled-in
+-- NON-fatal newcomer: the newcomer is dropped instead (falling back to the
+-- session-only memory retention).
+local function test_non_fatal_save_never_displaces_fatal_backlog()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "fatal-shield-app" }
+
+	for i = 1, 8 do
+		assert_true(type(storage.save_pending_crash(scope, pending_body_entry("F" .. i))) == "string")
+	end
+	assert_equal(storage.save_pending_crash(scope, pending_body_entry("NF", { fatal = false })), nil,
+		"a non-fatal newcomer is dropped rather than displacing a fatal report")
+	local pending = storage.load_pending_crashes(scope)
+	assert_equal(#pending, 8, "every fatal report survived")
+	assert_not_contains(table.concat(pending, "\n"), '"NF"')
+
+	restore()
+	storage.reset()
+end
+
+-- The in-session memory fallback is BOUNDED with the same retention policy
+-- as the sidecar: a persist-failure loop with chatty handled errors cannot
+-- accumulate unbounded encoded bodies, and fatal entries are shielded.
+local function test_memory_fallback_bounded_and_fatal_shielded()
+	reset()
+	storage.reset()
+	-- No sys storage: every persist fails over to the memory fallback.
+	next_status = 500
+	local client = assert(crash.new(config({ app_id = "mem-bound-app", sample_every = 1 })))
+	for i = 1, 12 do
+		assert_true(client:emit(presymbolicated_event({ exception = { type = "lua_error", reason = "NF" .. i } })))
+	end
+	local count = 0
+	for _ in pairs(client.in_memory_pending) do
+		count = count + 1
+	end
+	assert_true(count <= 8, "the memory fallback stays within the sidecar bound")
+
+	-- Fill with fatal entries; a later non-fatal is refused rather than
+	-- displacing one.
+	for i = 1, 8 do
+		assert_true(client:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "F" .. i } })))
+	end
+	assert_true(client:emit(presymbolicated_event({ exception = { type = "lua_error", reason = "NF-LATE" } })))
+	local fatal_only = true
+	for _, held in pairs(client.in_memory_pending) do
+		if held.fatal ~= true then
+			fatal_only = false
+		end
+	end
+	assert_true(fatal_only, "a non-fatal newcomer never displaces a retained fatal report")
+
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_source_stamped_on_every_report,
@@ -4400,6 +4521,9 @@ local tests = {
 	test_pending_eviction_prefers_non_fatal,
 	test_pending_total_bytes_budget_evicts,
 	test_legacy_report_table_entry_resent_and_settled,
+	test_dump_forward_queues_behind_pending_pass,
+	test_non_fatal_save_never_displaces_fatal_backlog,
+	test_memory_fallback_bounded_and_fatal_shielded,
 }
 
 for _, test in ipairs(tests) do
