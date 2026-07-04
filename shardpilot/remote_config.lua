@@ -248,10 +248,10 @@ end
 --     fresh 200, so no failure — unauthorized, permanent, malformed — and no
 --     cache-served outcome ever disturbs the last-known-good record.
 --   * `authoritative` marks the outcomes that settle the request fence: a
---     fresh 200, an unauthorized response, and a permanent HTTP error. A
---     transient/cache fallback is NOT authoritative — it says nothing about
---     the current configuration, so it must not fence off a fresh response
---     still in flight.
+--     fresh 200, a successful 304 revalidation, an unauthorized response,
+--     and a permanent HTTP error. A transient/cache fallback is NOT
+--     authoritative — it says nothing about the current configuration, so
+--     it must not fence off a fresh response still in flight.
 function M.apply(cache, response, now_ms)
 	local status = type(response) == "table" and response.status or 0
 
@@ -275,12 +275,15 @@ function M.apply(cache, response, now_ms)
 	if type(response) == "table" and status == 304 and cache then
 		local values, version = parse_config(cache.body)
 		if values then
+			-- A successful revalidation is authoritative: the endpoint just
+			-- confirmed the cached ETag as CURRENT, so an older in-flight
+			-- response must not overwrite it afterwards.
 			return {
 				ok = true,
 				from_cache = true,
 				values = values,
 				version = version,
-			}, nil, false
+			}, nil, true
 		end
 		-- The revalidated cache turned out unreadable: there is nothing left
 		-- to serve (the 304 carries no body), so this fails rather than
@@ -350,21 +353,23 @@ function M.new(config, identity)
 		-- fails, so a later offline fetch falls back to the FRESHEST served
 		-- configuration rather than reviving an older on-disk record.
 		cache = nil,
-		-- Requests are numbered, and `settled_seq` is the highest sequence
-		-- whose AUTHORITATIVE outcome has landed — a fresh 200, an
-		-- unauthorized response, or a permanent HTTP error — for the scope
-		-- named by `settled_scope` (the fence resets when the scope
-		-- changes). Only a fetch newer than every settled one may install:
-		-- with two fetches in flight, responses can arrive out of order,
-		-- and an older success must neither roll back a newer configuration
-		-- nor sneak values in after a newer fail-closed outcome.
+		-- Requests are numbered, and `settled` maps a scope to the highest
+		-- sequence whose AUTHORITATIVE outcome has landed for it — a fresh
+		-- 200, a 304 revalidation, an unauthorized response, or a permanent
+		-- HTTP error. Only a fetch newer than every settled one for ITS
+		-- scope may install: with two fetches in flight, responses can
+		-- arrive out of order, and an older success must neither roll back
+		-- a newer configuration nor sneak values in after a newer
+		-- fail-closed outcome. The fence is kept per scope — never reset —
+		-- so rotating identities can neither leak one scope's fence into
+		-- another nor forget a scope's history on re-entry (the map stays
+		-- bounded by the identities this instance has actually used).
 		-- Non-authoritative outcomes (a transient failure, a cache-served
 		-- fallback) do not settle — they say nothing about the current
 		-- configuration, so they must not fence off a fresh response still
 		-- in flight.
 		fetch_seq = 0,
-		settled_seq = 0,
-		settled_scope = nil,
+		settled = {},
 	}, RemoteConfig)
 	-- Serve the persisted last-known-good snapshot immediately after a
 	-- restart: getters work before (and without) any fetch when a cache for
@@ -396,31 +401,34 @@ function RemoteConfig:scope_for(client_id)
 		self.config.remote_config_url)
 end
 
--- The usable cache record for THIS scope, or nil. The in-process record is
--- preferred (it is the freshest served configuration even when a durable
--- write failed); the durable store is read when the in-process record is
--- absent or scoped elsewhere. A record without an identity scope, or written
--- for any other (workspace, environment, client, url) tuple, is a miss: its
--- values are never served and its ETag is never sent. So is a record whose
--- body no longer decodes — it could neither be served offline nor recovered
--- from after the 304 its ETag would provoke. The next successful fetch for
--- this scope overwrites it.
+-- The usable cache record for THIS scope, or nil — the FRESHEST of the
+-- in-process record (which survives a failed durable write) and the durable
+-- record (which another same-app client may have refreshed since this
+-- instance last installed), compared by their fetched-at stamps; the
+-- in-process record wins ties, being known-good and already backing the
+-- getters. A record without an identity scope, or written for any other
+-- (workspace, environment, client, url) tuple, is a miss: its values are
+-- never served and its ETag is never sent. So is a record whose body no
+-- longer decodes — it could neither be served offline nor recovered from
+-- after the 304 its ETag would provoke. The next successful fetch for this
+-- scope overwrites it.
 function RemoteConfig:load_cache(client_id)
 	if not client_id then
 		return nil
 	end
 	local scope = self:scope_for(client_id)
+	local held = nil
 	if self.cache and self.cache.scope == scope then
 		-- In-process records only ever hold a body that decoded when they
-		-- were installed, so no re-check is needed here.
-		return self.cache
+		-- were installed, so no re-check is needed for this one.
+		held = self.cache
 	end
 	local record = storage.load_remote_config(self.config)
-	if not record or record.scope ~= scope then
-		return nil
+	if not record or record.scope ~= scope or not parse_config(record.body) then
+		record = nil
 	end
-	if not parse_config(record.body) then
-		return nil
+	if held and (not record or record.fetched_at_ms <= held.fetched_at_ms) then
+		return held
 	end
 	return record
 end
@@ -444,13 +452,14 @@ end
 --     nothing about the current configuration and must not fence off a
 --     fresh response still in flight;
 --   * a fresh 200 (`new_cache` exists exactly then) always installs; a
---     cache-served outcome installs only by ADOPTION — when this instance
---     holds no current-scope record, e.g. the cache was discovered at fetch
---     time after being written by an earlier launch or another same-app
---     client. When a current-scope record IS held, the served content came
---     from it and the snapshot already agrees — and adopting a captured
---     older record could roll back a fresher body installed while the
---     response was in flight;
+--     cache-served outcome installs only by ADOPTION — when the record it
+--     served is FRESHER than what this instance holds (or the instance
+--     holds nothing for the scope), e.g. it was discovered at fetch time
+--     after being written by an earlier launch or another same-app client.
+--     A served record no fresher than the held one is never adopted: its
+--     content came from (or predates) the held record, and adopting a
+--     captured older record could roll back a fresher body installed while
+--     the response was in flight;
 --   * the scope must still be current — checked BEFORE anything settles: an
 --     identity rotated while the response was in flight makes the response
 --     another client's configuration (a different rollout bucket), which
@@ -467,19 +476,14 @@ function RemoteConfig:install(seq, result, new_cache, scope, authoritative, serv
 	if not current_id or self:scope_for(current_id) ~= scope then
 		return
 	end
-	-- The fence belongs to ONE scope: entering a different scope — a
-	-- rotation, or a rotation back — resets it, so an outcome settled while
-	-- a previous identity was current can never fence off a response for
-	-- this one.
-	if self.settled_scope ~= scope then
-		self.settled_scope = scope
-		self.settled_seq = 0
-	end
-	if seq <= self.settled_seq then
+	-- The per-scope fence: an outcome settled under another identity never
+	-- fences this one, and a scope's own history survives a rotation away
+	-- and back.
+	if seq <= (self.settled[scope] or 0) then
 		return
 	end
 	if authoritative then
-		self.settled_seq = seq
+		self.settled[scope] = seq
 	end
 	if not result.ok then
 		return
@@ -500,7 +504,8 @@ function RemoteConfig:install(seq, result, new_cache, scope, authoritative, serv
 			storage.clear_remote_config(self.config)
 			self:diagnose("cache_persist_failed")
 		end
-	elseif served_cache and not (self.cache and self.cache.scope == scope) then
+	elseif served_cache and (not self.cache or self.cache.scope ~= scope
+		or served_cache.fetched_at_ms > self.cache.fetched_at_ms) then
 		self.cache = served_cache
 	else
 		return

@@ -853,7 +853,133 @@ local function test_stale_scope_response_does_not_fence_current_scope()
 	assert_equal(client:remote_config_version(), 3)
 end
 
-local function test_scope_fence_resets_after_rotation_cycle()
+local function test_304_revalidation_fences_older_inflight_response()
+	reset()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ v = 2 }, 2)
+	next_response_headers = { etag = '"v2"' }
+	fetch(client)
+
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		held[#held + 1] = callback
+	end
+	local results = {}
+	client:fetch_remote_config(function(result)
+		results.older = result
+	end)
+	client:fetch_remote_config(function(result)
+		results.newer = result
+	end)
+	http.request = saved_request
+
+	-- The NEWER fetch revalidates: the endpoint just confirmed the cached
+	-- ETag as current...
+	held[2](nil, nil, { status = 304 })
+	assert_true(results.newer.ok)
+	assert_equal(results.newer.from_cache, true)
+
+	-- ...so an older in-flight 200 carrying a different body must not
+	-- overwrite what was just confirmed.
+	held[1](nil, nil, {
+		status = 200,
+		response = values_body({ v = 1 }, 1),
+		headers = { etag = '"v1"' },
+	})
+	assert_equal(client:remote_config_number("v", 0), 2,
+		"a stale 200 must not overwrite a configuration a newer 304 just confirmed")
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = nil
+	local revalidated = fetch(client)
+	assert_true(revalidated.ok, revalidated.error)
+	assert_equal(last_request().headers["If-None-Match"], '"v2"',
+		"the cache record must still carry the confirmed ETag")
+end
+
+local function test_scope_fence_survives_rotation_cycle()
+	reset()
+	local client = assert(sdk.new(config()))
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		held[#held + 1] = callback
+	end
+
+	-- Two fetches in flight for the original identity; the newer installs.
+	local results = {}
+	client:fetch_remote_config(function(result)
+		results.stale = result
+	end)
+	client:fetch_remote_config(function(result)
+		results.fresh = result
+	end)
+	held[2](nil, nil, {
+		status = 200,
+		response = values_body({ v = 2 }, 2),
+		headers = { etag = '"v2"' },
+	})
+	assert_equal(client:remote_config_number("v", 0), 2)
+
+	-- Rotate away, settle something under the intermediate identity, and
+	-- rotate back: the original scope's own fence must survive the cycle.
+	assert_true(client:set_anonymous_id("anon-other"))
+	client:fetch_remote_config(function() end)
+	held[3](nil, nil, {
+		status = 200,
+		response = values_body({ bucket = "other" }),
+		headers = { etag = '"other"' },
+	})
+	assert_true(client:set_anonymous_id("anon-client"))
+	http.request = saved_request
+
+	-- The stale original-scope response is still OLDER than the response
+	-- already installed for that scope, so it stays dropped.
+	held[1](nil, nil, {
+		status = 200,
+		response = values_body({ v = 1 }, 1),
+		headers = { etag = '"v1"' },
+	})
+	assert_nil(client:remote_config_value("v"),
+		"a scope's fence must survive a rotation away and back")
+	assert_equal(client:remote_config_string("bucket", "?"), "other",
+		"the last served configuration stays until a newer one installs")
+end
+
+local function test_newer_durable_record_from_sibling_client_is_preferred()
+	reset()
+	local first = assert(sdk.new(config()))
+	local second = assert(sdk.new(config()))
+
+	next_status = 200
+	next_response_body = values_body({ v = 1 }, 1)
+	next_response_headers = { etag = '"v1"' }
+	fetch(first)
+	assert_equal(first:remote_config_number("v", 0), 1)
+
+	-- A sibling client for the same scope fetches and persists a newer
+	-- configuration...
+	next_response_body = values_body({ v = 2 }, 2)
+	next_response_headers = { etag = '"v2"' }
+	fetch(second)
+
+	-- ...so the first client's next offline fetch serves the per-app
+	-- FRESHEST record, not the older one it still holds in-process.
+	next_status = 0
+	next_response_body = nil
+	next_response_headers = nil
+	local offline = fetch(first)
+	assert_true(offline.ok)
+	assert_equal(offline.from_cache, true)
+	assert_equal(offline.values.v, 2,
+		"the freshest per-app record must win over an older in-process one")
+	assert_equal(first:remote_config_number("v", 0), 2,
+		"the adopted record must also reach the getters")
+end
+
+local function test_intermediate_scope_outcome_does_not_fence_original_scope()
 	reset()
 	local client = assert(sdk.new(config()))
 	local held = {}
@@ -1460,7 +1586,10 @@ local tests = {
 	test_malformed_wrapped_values_member_is_rejected,
 	test_null_values_member_is_malformed,
 	test_stale_scope_response_does_not_fence_current_scope,
-	test_scope_fence_resets_after_rotation_cycle,
+	test_304_revalidation_fences_older_inflight_response,
+	test_scope_fence_survives_rotation_cycle,
+	test_newer_durable_record_from_sibling_client_is_preferred,
+	test_intermediate_scope_outcome_does_not_fence_original_scope,
 	test_cache_discovered_at_fetch_time_is_adopted,
 	test_empty_array_values_member_is_malformed,
 	test_fetch_after_shutdown_is_rejected,
