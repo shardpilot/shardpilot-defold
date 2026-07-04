@@ -58,6 +58,15 @@ function M.capture_previous(crash_module)
 	return with_default("capture_previous", crash_module)
 end
 
+-- Manually run one serial resend pass over the pending crash reports
+-- (capture_previous already runs one; use this to retry later in the same
+-- session, e.g. after connectivity returns). One report at a time, oldest
+-- first; a retryable failure stops the pass and a stored Retry-After window
+-- defers it. See docs/crash.md.
+function M.resend_pending()
+	return with_default("resend_pending")
+end
+
 function M.snapshot()
 	return with_default("snapshot")
 end
