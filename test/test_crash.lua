@@ -4051,6 +4051,11 @@ local function test_live_fatal_emit_persisted_before_dispatch()
 	assert_equal(#in_flight, 1, "a live fatal emit must be persisted before its send completes")
 	assert_equal(in_flight[1], requests[1].body, "the persisted body is the exact dispatched wire body")
 	assert_equal(client:snapshot().persisted, 1)
+	-- Anchor the sidecar cap sizing: a real encoded report is a few hundred
+	-- bytes to low kilobytes — far under the 64 KB per-record cap, so the
+	-- 8-record / 384 KB bounds hold many launches' worth of reports.
+	assert_true(#in_flight[1] > 100 and #in_flight[1] < 16 * 1024,
+		"a real encoded report measures well under the per-record cap")
 
 	held_callback()
 	assert_equal(client:snapshot().accepted, 1)
