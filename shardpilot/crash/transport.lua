@@ -36,20 +36,44 @@ local function retry_after_seconds(response)
 	return math.floor(seconds)
 end
 
--- Send one crash report. The callback signature mirrors the analytics
--- transport: (ok, err, unauthorized, retryable, response, retry_after).
+-- Encode one crash report to its wire body. Returns the JSON string, or
+-- (nil, error_code) when no encoder is available or encoding fails. Exposed
+-- so the client can encode ONCE at capture — the same bytes are then
+-- persisted write-ahead and dispatched, and a later resend of the persisted
+-- body is byte-identical to the original attempt.
+function M.encode(event)
+	if not json or not json.encode then
+		return nil, "json_unavailable"
+	end
+	local ok, encoded = pcall(json.encode, event)
+	if not ok or type(encoded) ~= "string" then
+		return nil, "json_encode_failed"
+	end
+	return encoded
+end
+
+-- Send one crash report (a prepared table; encoded here). The callback
+-- signature mirrors the analytics transport:
+-- (ok, err, unauthorized, retryable, response, retry_after).
 function M.ingest(config, api_key, event, callback)
+	local encoded, encode_err = M.encode(event)
+	if not encoded then
+		callback(false, encode_err, false, false)
+		return false
+	end
+	return M.ingest_body(config, api_key, encoded, callback)
+end
+
+-- Send one ALREADY-ENCODED crash report body VERBATIM. The resend path uses
+-- this so a persisted report goes out byte-identical to its original
+-- attempt; the crash ingest service de-duplicates by the stable crash_id
+-- embedded in the body.
+function M.ingest_body(config, api_key, encoded, callback)
 	if not http or not http.request then
 		callback(false, "http_unavailable", false, true)
 		return false
 	end
-	if not json or not json.encode then
-		callback(false, "json_unavailable", false, false)
-		return false
-	end
-
-	local ok, encoded = pcall(json.encode, event)
-	if not ok then
+	if type(encoded) ~= "string" or encoded == "" then
 		callback(false, "json_encode_failed", false, false)
 		return false
 	end

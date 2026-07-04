@@ -46,7 +46,10 @@ not the platform boundary.
   module to a dedicated crash ingest endpoint with a `crash:write` key — never as
   an analytics event. Stamps a component-slug `source`, scrubs PII, samples
   non-fatal reports while **always** sending fatal ones, and forwards a
-  previous-session native crash dump on next launch. See [`docs/crash.md`](docs/crash.md).
+  previous-session native crash dump on next launch. Every dispatched report is
+  persisted **write-ahead** to a bounded per-app sidecar and re-sent on a later
+  launch until the server acknowledges it — byte-identical, one report at a
+  time. See [`docs/crash.md`](docs/crash.md).
 
 ## Installation
 
@@ -305,7 +308,11 @@ the `Bearer`, carrying the crash report JSON body: `crash_id`
 `breadcrumbs[]`, `fingerprint_components[]`, and `metadata`. A crash is **never**
 wrapped as a `mobile_crash` analytics event on `/v1/events:batch`. Fatal reports
 bypass sampling; a previous-session native crash dump is forwarded on next launch
-via `crash.capture_previous()`. See [`docs/crash.md`](docs/crash.md).
+via `crash.capture_previous()`, which first re-sends any reports whose earlier
+delivery was never confirmed — every dispatched report is persisted write-ahead
+to a bounded per-app sidecar (exact wire bytes, re-sent verbatim and
+de-duplicated by `crash_id`; a `429 Retry-After` window persists across
+relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.md).
 
 ## Privacy & consent
 

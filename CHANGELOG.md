@@ -2,6 +2,40 @@
 
 ## v0.5.0 — unreleased — early alpha
 
+- **Write-ahead crash-report durability with byte-identical resend.** Crash
+  delivery is no longer fire-once for live reports: EVERY report that reaches
+  dispatch — a live `emit_fatal`, a sampled-in `emit`, a previous-session dump
+  forward alike — is persisted to the bounded per-app pending sidecar
+  **before** its send attempt, holding the exact encoded wire body. An entry
+  settles (is removed) only when the server accepts it (2xx, including an
+  accepted-but-suppressed report) or rejects it terminally (non-retryable
+  4xx); a retryable failure — offline, `429`, `5xx` — keeps it durable, and a
+  later launch re-sends the SAME bytes, de-duplicated server-side by the
+  stable `crash_id` embedded in the body.
+  - **Serial resend with backpressure that survives relaunches.** The resend
+    pass (run first by `capture_previous()`, or manually via
+    `resend_pending()`) dispatches strictly one report at a time, oldest
+    first; a retryable failure stops the whole pass, and a server
+    `429 Retry-After` window is stored with the sidecar (clamped to one day,
+    spent/absurd values self-clean) so a relaunch inside the window keeps
+    waiting it out — surfaced via `snapshot().resend_deferred_until_ms`. An
+    accepted send clears the window; a kill mid-pass loses nothing and the
+    pass resumes where it left off.
+  - **Bounds with fatal-first retention.** At most 8 reports / 64 KB per
+    encoded body / 384 KB total (well under the documented 512 KB `sys.save`
+    cap). Over a bound, the oldest **non-fatal** reports are evicted before
+    any fatal one — a burst of handled errors can never displace a pending
+    fatal crash — and the report being saved is never the one evicted. An
+    oversized single body is rejected up front without evicting anything;
+    entries older than ~7 days are discarded on read.
+  - **Durability stays honest.** A failed durable write returns no token and
+    falls back to an in-session, memory-only retention (surfaced via
+    `snapshot().persist_failed`) that an in-session pass can retry but a
+    restart loses; pending entries written by an older build (prepared-report
+    tables) are still adopted, re-sent, and settled. New snapshot counters:
+    `persisted` / `persist_failed`.
+
+
 - **Durable offline event spool with resend on next launch.** The analytics
   event queue was memory-only: an app kill lost the unflushed tail, and offline
   play silently dropped events. Undeliverable event envelopes are now persisted

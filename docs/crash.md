@@ -132,12 +132,15 @@ end
 
 `capture_previous()`:
 
-1. Calls `crash.load_previous()` (one-shot — the dump is removed from disk on a
+1. **Resends any still-pending reports first** (see *Durability* below):
+   undelivered crash reports get the first shot at the network, before the
+   host typically starts analytics traffic.
+2. Calls `crash.load_previous()` (one-shot — the dump is removed from disk on a
    successful load).
-2. Reads the backtrace (`crash.get_backtrace`), module list
+3. Reads the backtrace (`crash.get_backtrace`), module list
    (`crash.get_modules`), signal (`crash.get_signum`), and OS sys-fields, and
    builds a **native** crash event: `instruction_addr` frames + a `modules` map.
-3. Forwards it as a **fatal** report (never sampled), then releases the dump
+4. Forwards it as a **fatal** report (never sampled), then releases the dump
    handle.
 
 Return value: `(true, true)` when a dump was found and forwarded, `(true, false)`
@@ -161,6 +164,55 @@ when there was no dump, `(false, err)` on a forward failure.
   available on the platform/build. Where it is not, manual `emit` / `emit_fatal`
   still work.
 
+## Durability: the pending-crash sidecar
+
+Every report that reaches dispatch — a live `emit_fatal`, a sampled-in
+`emit`, a dump forward alike — is persisted **write-ahead** to a small,
+bounded per-app sidecar (a `sys.save` file) **before** its send attempt: the
+process may die during the send, the network may be down, and a dump-sourced
+report is a consumed one-shot with no other copy. What is stored is the exact
+**encoded wire body** (already PII-scrubbed; auth material is never part of
+the body), so a later resend is **byte-identical** to the original attempt and
+the crash ingest service de-duplicates it by the stable `crash_id` embedded in
+the body.
+
+- **Settlement.** An entry is removed as soon as its send is **accepted**
+  (2xx — including an accepted-but-suppressed report) or **terminally
+  rejected** (a non-retryable 4xx that would fail forever). A retryable
+  failure — offline, `429`, `5xx` — leaves it persisted.
+- **Resend: one at a time, oldest first.** `capture_previous()` (and a manual
+  `resend_pending()`) runs a serial pass: the next report is dispatched only
+  from the previous one's settlement, so a `429`/`Retry-After` stops the whole
+  pass instead of racing every pending report into backpressure. Delivered
+  reports leave the sidecar as the pass advances — an app kill mid-pass loses
+  nothing and a partial delivery resumes on the next launch. A server
+  `Retry-After` is stored with the sidecar (clamped to one day; a spent or
+  absurd stored deadline self-cleans) so the backpressure window survives a
+  relaunch; while it holds, the pass defers and the deadline is surfaced via
+  `snapshot().resend_deferred_until_ms`. An accepted send clears the window.
+- **Bounds.** At most **8 reports**, each at most **64 KB** encoded, at most
+  **384 KB** total (Defold documents a 512 KB `sys.save` cap; the budget stays
+  well under it). When a bound is exceeded the oldest **non-fatal** reports
+  are evicted first, then the oldest fatal — a burst of handled errors can
+  never displace a pending fatal crash, and the report being saved is never
+  the one evicted. A report whose body alone exceeds the per-record cap is
+  rejected up front without evicting anything. Entries older than about seven
+  days are discarded on read (a local retention limit).
+- **Durable means durable.** `save` returns a removable token only when the
+  entry is confirmed written to the durable store. When the durable write
+  fails outright (quota, no `sys` API), the report is retained **in memory
+  only** for the session — surfaced via `snapshot().persist_failed` — and an
+  in-session resend pass can still retry it, but it does **not** survive a
+  process restart. Memory fallback is a degradation, never counted as
+  durability.
+- **Honest limits.** The write-ahead persist runs on the emitting thread at
+  emit time; a native engine crash (SIGSEGV) never reaches Lua at all, so live
+  emits cannot cover it — that path is covered by the engine's own dump plus
+  the next-launch forward above, whose prepared report is persisted before its
+  first send. A death inside the small window between `crash.load_previous()`
+  consuming the dump and the write-ahead persist landing loses that report —
+  the dump is one-shot by engine design.
+
 ## Privacy
 
 Every caller-populated string is PII-scrubbed before the wire (matching the Go
@@ -179,13 +231,12 @@ the username segment of a user-home path (`/Users/<name>/`, `/home/<name>/`,
 `C:\Users\<name>\`) replaced with `<redacted>`, keeping the rest of the file path
 useful without leaking the OS account name.
 
-Crash state is held in memory only, with one exception: if a previous-session
-native crash dump cannot be sent on the next launch because the network is
-temporarily unavailable (offline, rate-limited, or a server error), the prepared
-report is written to a small, bounded per-app sidecar so it can be resent on a
-later launch. The report stored there is already PII-scrubbed (the same scrub
-applied before any report leaves the device), the sidecar is bounded (a small
-fixed number of entries, each size-capped) and local to the device, and a pending
-report older than about seven days is discarded on read (a retention limit). A
-sidecar entry is removed as soon as the report is accepted or is terminally
-rejected, so it never accumulates.
+The only crash state that leaves memory is the pending-crash sidecar described
+under *Durability*: the exact already-scrubbed wire body of a report whose
+delivery has not been confirmed yet (the same bytes that go to the server —
+nothing rawer, no credentials), local to the device, bounded in count and
+size, discarded after about seven days, and removed as soon as the report is
+accepted or terminally rejected. Crash reports carry **no actor identity** —
+`session_id` / `anonymous_id` / `user_id` / `device_id`-style keys are
+stripped from context and metadata maps before the wire — so the persisted
+copy carries none either.

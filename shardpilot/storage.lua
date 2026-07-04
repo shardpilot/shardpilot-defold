@@ -104,17 +104,32 @@ end
 
 -- ── pending crash reports ────────────────────────────────────────────────────
 --
--- A previous-session native crash dump is one-shot: reading it consumes it from
--- disk. If the network send of the prepared report fails for a temporary reason
--- (offline / rate-limited / server error), the report would otherwise be lost
--- forever. These helpers persist such a report to a per-app sidecar so the next
--- launch can resend it. The list is bounded (count + per-record size) so a
--- persistently failing send can never grow the file without limit.
+-- Every crash report the client dispatches is persisted to this per-app
+-- sidecar BEFORE its send attempt (write-ahead): a previous-session native
+-- crash dump is one-shot (reading it consumes it from disk), and a live
+-- report whose send fails for a temporary reason (offline / rate-limited /
+-- server error) — or whose process dies mid-send — would otherwise be lost
+-- forever. The next launch resends whatever is still pending. An entry
+-- stores the exact ENCODED wire body, so a resend is byte-identical to the
+-- original attempt and the crash ingest service de-duplicates it by the
+-- stable crash_id embedded in the body. The list is bounded (count,
+-- per-record size, and total serialized bytes) so a persistently failing
+-- send can never grow the file without limit.
 
 local pending_memory = {}
 
 local max_pending_records = 8
 local max_pending_record_bytes = 64 * 1024
+-- Total budget across all pending bodies. Defold documents that sys.save
+-- caps a saved table at 512 KB; like the event spool's clamp, this stays
+-- well under that hard limit so wrapper/serialization overhead can never
+-- push a full list over the cap.
+local max_pending_total_bytes = 384 * 1024
+-- The clamp for a server-requested resend-backpressure deadline persisted
+-- with the record (one day, matching the analytics publish deferral): a
+-- corrupt or absurd stored deadline must never park crash resend
+-- effectively forever.
+local max_pending_retry_after_ms = 24 * 60 * 60 * 1000
 
 -- A pending crash report older than this is a stale retry that is discarded on
 -- read rather than resent: a report that has failed to send for a week is not
@@ -224,14 +239,30 @@ local function approx_record_bytes(record)
 	return total
 end
 
--- Normalize a stored items list to the wrapped { token, report, created_at }
--- shape and apply the retention TTL. Returns (out, changed):
---   * An entry written by an older build (a bare prepared report with no
---     wrapper, or a wrapper missing created_at) is adopted with a freshly minted
---     token (when absent) and the current created-at stamp so it is individually
+-- The byte cost one pending entry charges against the caps: the exact
+-- encoded-body length for a body entry, the string-scalar estimate for a
+-- legacy prepared-report entry.
+local function pending_entry_bytes(entry)
+	if type(entry.body) == "string" then
+		return #entry.body
+	end
+	return approx_record_bytes(entry.report)
+end
+
+-- Normalize a stored items list to the wrapped
+-- { token, body|report, crash_id?, fatal, created_at } shape and apply the
+-- retention TTL. Returns (out, changed):
+--   * The CURRENT shape stores the exact encoded wire body (`body`, a JSON
+--     string) plus its `crash_id` and a `fatal` flag. An entry written by an
+--     older build — a bare prepared report with no wrapper, or a wrapper
+--     carrying a prepared `report` table — is adopted as-is (the resend path
+--     encodes a legacy report once at dispatch) with a freshly minted token
+--     (when absent), the current created-at stamp, and fatal=true (legacy
+--     entries were dump-sourced fatal crashes), so it stays individually
 --     addressable and TTL-bounded. `changed` is set so the caller writes the
---     adopted entry back — otherwise a later read would mint a DIFFERENT token and
---     remove_pending_crash could never match it (an endless resend).
+--     adopted entry back — otherwise a later read would mint a DIFFERENT
+--     token and remove_pending_crash could never match it (an endless
+--     resend).
 --   * An entry whose created_at is older than the TTL is discarded (a stale
 --     retry); `changed` is set so the pruned list is written back.
 local function normalize_items(items, current_ms)
@@ -243,16 +274,23 @@ local function normalize_items(items, current_ms)
 	for i = 1, #items do
 		local entry = items[i]
 		if type(entry) == "table" then
-			local report, token, created_at
-			if type(entry.report) == "table" then
+			local body, crash_id, report, token, created_at, fatal
+			if type(entry.body) == "string" and entry.body ~= "" then
+				body = entry.body
+				crash_id = type(entry.crash_id) == "string" and entry.crash_id or nil
+				token = entry.token
+				created_at = entry.created_at
+				fatal = entry.fatal
+			elseif type(entry.report) == "table" then
 				report = entry.report
 				token = entry.token
 				created_at = entry.created_at
+				fatal = entry.fatal
 			else
 				-- A bare (legacy) prepared report: wrap it.
 				report = entry
 			end
-			if type(report) == "table" then
+			if body or type(report) == "table" then
 				if type(token) ~= "string" then
 					token = next_pending_token()
 					changed = true
@@ -261,11 +299,25 @@ local function normalize_items(items, current_ms)
 					created_at = current_ms
 					changed = true
 				end
+				if type(fatal) ~= "boolean" then
+					-- Legacy entries predate the flag and were dump-sourced
+					-- fatal crashes; keeping them in the fatal tier means the
+					-- adoption can never demote their eviction priority.
+					fatal = true
+					changed = true
+				end
 				-- Discard a report older than the retention TTL.
 				if (current_ms - created_at) > pending_ttl_ms then
 					changed = true
 				else
-					out[#out + 1] = { token = token, report = report, created_at = created_at }
+					out[#out + 1] = {
+						token = token,
+						body = body,
+						crash_id = crash_id,
+						report = report,
+						fatal = fatal,
+						created_at = created_at,
+					}
 				end
 			end
 		end
@@ -273,7 +325,7 @@ local function normalize_items(items, current_ms)
 	return out, changed
 end
 
-local function load_raw_items(ns)
+local function load_raw_record(ns)
 	local path = save_path(ns)
 	if not path then
 		return pending_memory[ns]
@@ -282,34 +334,59 @@ local function load_raw_items(ns)
 	if not ok or type(record) ~= "table" or type(record.items) ~= "table" then
 		return pending_memory[ns]
 	end
-	return record.items
+	return record
 end
 
--- forward declaration: read_pending_list writes back an adopted/pruned list.
+-- Normalize the stored resend-backpressure deadline: a number strictly in the
+-- future and no further out than the one-day clamp survives; anything else —
+-- expired, absurdly far ahead (wall-clock skew or a corrupt value), or not a
+-- number — reads as none, so a bad stored deadline can never park crash
+-- resend effectively forever.
+local function normalize_pending_deadline(value, current_ms)
+	if type(value) ~= "number" then
+		return nil
+	end
+	if value <= current_ms or value > current_ms + max_pending_retry_after_ms then
+		return nil
+	end
+	return value
+end
+
+-- forward declaration: read_pending_record writes back an adopted/pruned list.
 local write_pending_list
 
-local function read_pending_list(ns)
+local function read_pending_record(ns)
 	local current_ms = now_ms()
-	local items, changed = normalize_items(load_raw_items(ns), current_ms)
-	if changed then
-		-- Persist the adopted tokens / pruned TTL so a later read sees stable tokens
-		-- (a freshly minted token on every read would defeat remove_pending_crash and
-		-- cause an endless resend) and so the stale entries stay gone. A write failure
-		-- here is non-fatal: the in-memory normalized view is still returned.
-		write_pending_list(ns, items)
+	local raw = load_raw_record(ns)
+	local raw_items = type(raw) == "table" and raw.items or nil
+	local raw_deadline = type(raw) == "table" and raw.retry_after_until_ms or nil
+	local items, changed = normalize_items(raw_items, current_ms)
+	local deadline = normalize_pending_deadline(raw_deadline, current_ms)
+	if deadline ~= raw_deadline and raw_deadline ~= nil then
+		-- A spent or absurd stored deadline self-cleans with the rewrite.
+		changed = true
 	end
-	return items
+	if changed then
+		-- Persist the adopted tokens / pruned TTL / cleaned deadline so a later
+		-- read sees stable tokens (a freshly minted token on every read would
+		-- defeat remove_pending_crash and cause an endless resend) and so the
+		-- stale entries stay gone. A write failure here is non-fatal: the
+		-- in-memory normalized view is still returned.
+		write_pending_list(ns, items, deadline)
+	end
+	return items, deadline
 end
 
-function write_pending_list(ns, items)
+function write_pending_list(ns, items, retry_after_until_ms)
+	local record = { items = items, retry_after_until_ms = retry_after_until_ms }
 	local path = save_path(ns)
 	if not path then
-		-- No durable backend: the in-memory list IS the store. Update it and report
-		-- success.
-		pending_memory[ns] = items
+		-- No durable backend: the in-memory record IS the store. Update it and
+		-- report success.
+		pending_memory[ns] = record
 		return true
 	end
-	local ok, saved = pcall(sys.save, path, { items = items })
+	local ok, saved = pcall(sys.save, path, record)
 	if not (ok and saved == true) then
 		-- The durable write failed (e.g. disk quota). Do NOT update the in-memory
 		-- shadow: leaving it unchanged keeps the persisted and in-memory views in
@@ -318,44 +395,88 @@ function write_pending_list(ns, items)
 		-- failed persist (no removable token).
 		return false
 	end
-	pending_memory[ns] = items
+	pending_memory[ns] = record
 	return true
 end
 
--- Persist one prepared crash report for retry on a later launch. Returns a stable
--- token addressing the stored entry on success (so the caller can remove exactly
--- this entry once its send is accepted or terminally rejected), or nil when the
--- record is unusable or oversized. If `token` is supplied and an entry with that
--- token already exists, the stored report is refreshed in place (idempotent
--- re-persist) rather than appended a second time. The oldest entry is evicted once
--- the bound is reached so the list never grows past max_pending_records. Each entry
--- is stamped with a created-at time (from the SDK clock by default; `created_at_ms`
--- overrides it for tests) so the retention TTL can discard a stale report on read.
-function M.save_pending_crash(scope, record, token, created_at_ms)
-	if type(record) ~= "table" then
+-- Evict ONE entry from `stored` toward the caps, never touching the entry
+-- carrying `protected_token` (the report being saved right now — the one the
+-- write-ahead contract must not lose). Non-fatal reports go first, oldest
+-- first; only when none remain does the oldest FATAL report go — a fatal
+-- crash is the most valuable diagnostics signal, so a burst of handled
+-- (non-fatal) reports can never displace a pending fatal one. Returns true
+-- when something was evicted.
+local function evict_one_pending(stored, protected_token)
+	for i = 1, #stored do
+		if stored[i].token ~= protected_token and stored[i].fatal ~= true then
+			table.remove(stored, i)
+			return true
+		end
+	end
+	for i = 1, #stored do
+		if stored[i].token ~= protected_token then
+			table.remove(stored, i)
+			return true
+		end
+	end
+	return false
+end
+
+local function pending_total_bytes(stored)
+	local total = 0
+	for i = 1, #stored do
+		total = total + pending_entry_bytes(stored[i])
+	end
+	return total
+end
+
+-- Persist one crash report for retry on a later launch — write-ahead, BEFORE
+-- its first send attempt. `entry` carries the exact encoded wire body
+-- (`entry.body`, a JSON string), its `entry.crash_id`, and `entry.fatal`.
+-- Returns a stable token addressing the stored entry on success (so the
+-- caller can remove exactly this entry once its send is accepted or
+-- terminally rejected), or nil when the entry is unusable or its body alone
+-- exceeds the per-record byte cap (an oversized report is rejected up front,
+-- without evicting anything). If `token` is supplied and an entry with that
+-- token already exists, the stored body is refreshed in place (idempotent
+-- re-persist) rather than appended a second time. Once the count or
+-- total-bytes bound is exceeded, entries are evicted via evict_one_pending —
+-- oldest NON-fatal first, the just-added report never — so the list stays
+-- within max_pending_records / max_pending_total_bytes. Each entry is
+-- stamped with a created-at time (from the SDK clock by default;
+-- `created_at_ms` overrides it for tests) so the retention TTL can discard a
+-- stale report on read.
+function M.save_pending_crash(scope, entry, token, created_at_ms)
+	if type(entry) ~= "table" or type(entry.body) ~= "string" or entry.body == "" then
 		return nil
 	end
 	local stamp = type(created_at_ms) == "number" and created_at_ms or now_ms()
-	if approx_record_bytes(record) > max_pending_record_bytes then
+	if #entry.body > max_pending_record_bytes then
 		return nil
 	end
 	local ns = pending_namespace(scope)
-	local items = read_pending_list(ns)
+	local items, deadline = read_pending_record(ns)
 	-- Defensive copy so a later caller mutation cannot reach the stored snapshot.
 	local stored = {}
 	for i = 1, #items do
 		stored[i] = items[i]
 	end
+	local new_entry = {
+		body = entry.body,
+		crash_id = type(entry.crash_id) == "string" and entry.crash_id or nil,
+		fatal = entry.fatal == true,
+	}
 	if token then
 		-- Idempotent re-persist: replace an existing entry with this token in place.
 		for i = 1, #stored do
 			if stored[i].token == token then
-				-- Refresh the report in place but PRESERVE the original created-at so a
+				-- Refresh the body in place but PRESERVE the original created-at so a
 				-- re-persist cannot reset the retention TTL and keep a report alive
 				-- indefinitely.
-				local created_at = type(stored[i].created_at) == "number" and stored[i].created_at or stamp
-				stored[i] = { token = token, report = record, created_at = created_at }
-				if write_pending_list(ns, stored) then
+				new_entry.token = token
+				new_entry.created_at = type(stored[i].created_at) == "number" and stored[i].created_at or stamp
+				stored[i] = new_entry
+				if write_pending_list(ns, stored, deadline) then
 					return token
 				end
 				return nil
@@ -377,71 +498,109 @@ function M.save_pending_crash(scope, record, token, created_at_ms)
 			end
 		until not clash
 	end
-	stored[#stored + 1] = { token = token, report = record, created_at = stamp }
-	while #stored > max_pending_records do
-		table.remove(stored, 1)
+	new_entry.token = token
+	new_entry.created_at = stamp
+	stored[#stored + 1] = new_entry
+	-- Enforce the count AND total-bytes caps, never evicting the just-added
+	-- report (its durability is the whole point of the write-ahead persist).
+	while (#stored > max_pending_records or pending_total_bytes(stored) > max_pending_total_bytes) and
+		evict_one_pending(stored, token) do
 	end
-	-- The count bound alone does not guarantee the SERIALIZED list fits the durable
-	-- store's per-file limit (Defold's sys.save caps a saved table at 512 KB):
-	-- approx_record_bytes counts only string scalars and ignores table/wrapper
-	-- overhead, so a list of near-budget records can still overflow and fail the
-	-- write. A failed write would lose THIS report (no removable token). So evict
-	-- the OLDEST entries one at a time and retry the write until it succeeds or only
-	-- the just-added report remains — the new report is the one we must not lose, so
-	-- it is evicted last. This keeps a pending crash report always persistable and
+	-- The byte budget above steers eviction but does not GUARANTEE the
+	-- serialized list fits the durable store's per-file limit (Defold's
+	-- sys.save caps a saved table at 512 KB): wrapper/serialization overhead
+	-- is not counted. A failed write would lose THIS report (no removable
+	-- token). So keep evicting — non-fatal first, the new report never — and
+	-- retry the write until it succeeds or only the just-added report
+	-- remains. This keeps a pending crash report always persistable and
 	-- therefore removable.
 	while true do
-		if write_pending_list(ns, stored) then
+		if write_pending_list(ns, stored, deadline) then
 			return token
 		end
-		if #stored <= 1 then
+		if not evict_one_pending(stored, token) then
 			-- Even the single new report could not be written: the backend is
 			-- unavailable. Report a failed persist (no removable token).
 			return nil
 		end
-		table.remove(stored, 1)
 	end
 end
 
--- Remove a single persisted entry by its token (called once its send is accepted
--- or terminally rejected). A no-op when no entry carries that token.
-function M.remove_pending_crash(scope, token)
+-- Remove a single persisted entry by its token (called once its send is
+-- accepted or terminally rejected). A no-op when no entry carries that
+-- token. `clear_retry_after` drops the stored backpressure deadline in the
+-- same write — an ACCEPTED send proves the endpoint is taking traffic again,
+-- so the window is over (a terminal reject preserves it: one rejected report
+-- says nothing about rate limiting).
+function M.remove_pending_crash(scope, token, clear_retry_after)
 	if type(token) ~= "string" then
 		return false
 	end
 	local ns = pending_namespace(scope)
-	local items = read_pending_list(ns)
+	local items, deadline = read_pending_record(ns)
 	local kept = {}
 	for i = 1, #items do
 		if items[i].token ~= token then
 			kept[#kept + 1] = items[i]
 		end
 	end
-	return write_pending_list(ns, kept)
+	if clear_retry_after == true then
+		deadline = nil
+	end
+	return write_pending_list(ns, kept, deadline)
 end
 
--- Return the list of pending prepared crash reports for this app (possibly
--- empty), each the raw report ready for re-dispatch.
+-- Persist (or clear, with nil/non-positive seconds) the resend-backpressure
+-- deadline stored with the pending record, recorded when the crash ingest
+-- service answered a send with 429/Retry-After: a relaunch inside the window
+-- keeps waiting it out instead of hammering a rate-limited endpoint. The
+-- deadline is clamped to at most one day ahead. Best-effort: a failed write
+-- only costs one early retry the server can re-throttle.
+function M.set_pending_crash_retry_after(scope, seconds)
+	local ns = pending_namespace(scope)
+	local items, _ = read_pending_record(ns)
+	local deadline = nil
+	if type(seconds) == "number" and seconds > 0 then
+		local clamped_ms = math.floor(seconds * 1000)
+		if clamped_ms > max_pending_retry_after_ms then
+			clamped_ms = max_pending_retry_after_ms
+		end
+		deadline = now_ms() + clamped_ms
+	end
+	return write_pending_list(ns, items, deadline)
+end
+
+-- Return the list of pending crash report payloads for this app (possibly
+-- empty): the encoded body string for current entries, the prepared report
+-- table for legacy ones.
 function M.load_pending_crashes(scope)
 	local ns = pending_namespace(scope)
-	local items = read_pending_list(ns)
+	local items = read_pending_record(ns)
 	local out = {}
 	for i = 1, #items do
-		out[i] = items[i].report
+		out[i] = items[i].body or items[i].report
 	end
 	return out
 end
 
--- Return the pending entries as { token, report } pairs so a resend can address
--- (remove / re-persist) each entry individually.
+-- Return the pending entries as { token, body|report, crash_id?, fatal }
+-- records — oldest first — so a resend can address (remove / re-persist)
+-- each entry individually, plus the stored resend-backpressure deadline (ms
+-- epoch, or nil).
 function M.load_pending_entries(scope)
 	local ns = pending_namespace(scope)
-	local items = read_pending_list(ns)
+	local items, deadline = read_pending_record(ns)
 	local out = {}
 	for i = 1, #items do
-		out[i] = { token = items[i].token, report = items[i].report }
+		out[i] = {
+			token = items[i].token,
+			body = items[i].body,
+			report = items[i].report,
+			crash_id = items[i].crash_id,
+			fatal = items[i].fatal,
+		}
 	end
-	return out
+	return out, deadline
 end
 
 -- ── offline event spool ──────────────────────────────────────────────────────

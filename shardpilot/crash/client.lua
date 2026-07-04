@@ -218,17 +218,20 @@ function M.new(config)
 		config = normalized,
 		breadcrumbs = breadcrumbs.new(),
 		sample_counter = 0,
-		-- A best-effort, in-session-only fallback store of prepared reports that could
-		-- not be persisted to the on-disk sidecar (storage quota / failure / oversize).
-		-- Keyed by an in-memory token, it lets an in-session retryable failure resend
-		-- the report. It does NOT survive a process restart — disk persistence is the
-		-- durable path; this only avoids dropping a consumed one-shot dump outright.
+		-- A best-effort, in-session-only fallback store of encoded report bodies that
+		-- could not be persisted to the on-disk sidecar (storage quota / failure /
+		-- oversize). Keyed by an in-memory token, it lets an in-session resend pass
+		-- retry the report. It does NOT survive a process restart — disk persistence
+		-- is the durable path; this only avoids dropping a report outright.
 		in_memory_pending = {},
 		in_memory_pending_seq = 0,
 		-- Count of crash POSTs whose async transport callback has not yet fired.
 		-- shutdown() waits (bounded, host-retried) for this to reach zero so a fatal
 		-- report in flight is not lost when the client is discarded.
 		in_flight = 0,
+		-- True while a serial resend pass over the pending sidecar is running
+		-- (one pass at a time; each pass sends strictly one report at a time).
+		resend_active = false,
 		stats = {
 			emitted = 0,
 			sampled_out = 0,
@@ -239,12 +242,20 @@ function M.new(config)
 			failed = 0,
 			dropped = 0,
 			rejected = 0,
+			-- Reports persisted write-ahead to the pending sidecar / reports that
+			-- could not be persisted (memory-only fallback; ≠ durable).
+			persisted = 0,
+			persist_failed = 0,
 			last_error = nil,
 			last_issue = nil,
 			-- Last non-fatal processing notice and last server-instructed Retry-After
 			-- (whole seconds, from a 429/503), surfaced via snapshot() for observability.
 			last_warning = nil,
 			last_retry_after = nil,
+			-- When a resend pass found pending reports but a stored backpressure
+			-- deadline (ms epoch) is still in the future, the pass defers and the
+			-- deadline is surfaced here.
+			resend_deferred_until_ms = nil,
 		},
 		initialized = true,
 	}, Client)
@@ -261,13 +272,14 @@ function Client:pending_scope()
 	return { app_id = self.config.app_id }
 end
 
--- Retain a prepared report in the in-session fallback store (used only when on-disk
--- persistence failed) and return its in-memory token. The token is distinct from
--- on-disk tokens so the two stores never collide.
-function Client:retain_in_memory_pending(prepared)
+-- Retain a pending entry ({ body, crash_id, fatal }) in the in-session
+-- fallback store (used only when on-disk persistence failed) and return its
+-- in-memory token. The token is distinct from on-disk tokens so the two
+-- stores never collide.
+function Client:retain_in_memory_pending(entry)
 	self.in_memory_pending_seq = self.in_memory_pending_seq + 1
 	local token = "mem:" .. tostring(self.in_memory_pending_seq)
-	self.in_memory_pending[token] = prepared
+	self.in_memory_pending[token] = entry
 	return token
 end
 
@@ -282,15 +294,19 @@ end
 -- Remove a settled report's pending copy, routing to the in-memory fallback store
 -- for an in-memory token ("mem:" prefix) and to the on-disk sidecar otherwise. A
 -- SETTLED report (accepted or terminally rejected) is always removed so it is not
--- resent — the guarantee holds for both stores.
-function Client:remove_pending(token)
+-- resent — the guarantee holds for both stores. `clear_retry_after` additionally
+-- drops the stored backpressure deadline (used for an ACCEPTED send).
+function Client:remove_pending(token, clear_retry_after)
 	if type(token) ~= "string" then
 		return
 	end
 	if token:sub(1, 4) == "mem:" then
 		self:remove_in_memory_pending(token)
+		if clear_retry_after == true then
+			storage.set_pending_crash_retry_after(self:pending_scope(), nil)
+		end
 	else
-		storage.remove_pending_crash(self:pending_scope(), token)
+		storage.remove_pending_crash(self:pending_scope(), token, clear_retry_after == true)
 	end
 end
 
@@ -405,97 +421,45 @@ function Client:emit_internal(event, fatal, trusted_frame_functions, prepare_opt
 		self.stats.last_error = prepare_err
 		return false, prepare_err
 	end
-	-- A report sourced from a one-shot previous-session dump cannot be regenerated
-	-- if a temporary send failure drops it (the dump is already consumed). When the
-	-- caller marks it for persistence, the prepared report is persisted to the
-	-- per-app sidecar BEFORE dispatch, so a second crash / app kill during the
-	-- in-flight window cannot lose it. It is removed only once the send is accepted
-	-- or terminally rejected; a retryable failure leaves it persisted for the next
-	-- launch to resend.
-	local persist_on_retry = merged_options.persist_on_retry == true
 	if not fatal and not should_emit(self, prepared) then
 		self.stats.sampled_out = self.stats.sampled_out + 1
 		return true
 	end
+	-- Write-ahead durability for EVERY report that reached dispatch (a fatal
+	-- crash, a sampled-in non-fatal, a one-shot dump forward alike): encode
+	-- the wire body ONCE and persist it to the per-app sidecar BEFORE the
+	-- send attempt — the process may die during (or before) the send, and a
+	-- dump-sourced report is already consumed from the engine's store. The
+	-- entry is removed only once the send is accepted or terminally
+	-- rejected; a retryable failure leaves it persisted, and the next launch
+	-- resends the SAME bytes (the stable crash_id embedded in the body lets
+	-- the crash ingest service de-duplicate a report that was delivered but
+	-- not observed as acknowledged).
+	local entry = { report = prepared, fatal = fatal == true, crash_id = prepared.crash_id }
+	local body = transport.encode(prepared)
 	local pending_token = nil
-	if persist_on_retry then
-		pending_token = storage.save_pending_crash(self:pending_scope(), prepared)
-		-- On-disk persistence can fail durably (storage quota / failure / an oversized
-		-- prepared report). A DUMP-sourced report is a consumed one-shot — dropping it
-		-- here would lose it permanently. Fall back to an in-session in-memory pending
-		-- entry so an in-session retryable failure can still resend it. (Best-effort:
-		-- the in-memory copy does not survive a process restart; disk is the durable
-		-- path.) The report is still dispatched below either way.
-		if not pending_token then
-			pending_token = self:retain_in_memory_pending(prepared)
+	if body then
+		entry.body = body
+		pending_token = storage.save_pending_crash(self:pending_scope(), entry)
+		if pending_token then
+			self.stats.persisted = self.stats.persisted + 1
+		else
+			-- On-disk persistence can fail durably (storage quota / failure / an
+			-- oversized body). Dropping the report here would lose it permanently
+			-- if the send below also fails. Fall back to an in-session in-memory
+			-- pending entry so an in-session resend pass can still retry it.
+			-- (Best-effort: the in-memory copy does NOT survive a process
+			-- restart; disk is the durable path.) The report is still
+			-- dispatched below either way.
+			self.stats.persist_failed = self.stats.persist_failed + 1
+			pending_token = self:retain_in_memory_pending(entry)
 		end
 	end
-	self.stats.emitted = self.stats.emitted + 1
-
-	-- Track this send as in flight until its async callback fires. The
-	-- callback decrements exactly once whether the transport completes
-	-- synchronously (test stub) or on a later frame (real runtime); a `done` guard
-	-- protects against a transport that double-invokes the callback.
-	self.in_flight = self.in_flight + 1
-	local settled = false
-	local function settle()
-		if settled then
-			return
-		end
-		settled = true
-		if self.in_flight > 0 then
-			self.in_flight = self.in_flight - 1
-		end
-	end
-
-	local dispatched = transport.ingest(self.config, self.config.crash_api_key, prepared,
-		function(ok, transport_err, unauthorized, retryable, response, retry_after)
-			settle()
-			if ok then
-				-- A suppressed crash was accepted by the server but NOT stored (consent
-				-- withheld); count it as suppressed only, never in the accepted total.
-				if not self:record_accepted_response(response) then
-					self.stats.accepted = self.stats.accepted + 1
-				end
-				-- The send was accepted: the pre-dispatch pending copy (on-disk or the
-				-- in-memory fallback) is no longer needed.
-				if pending_token then
-					self:remove_pending(pending_token)
-				end
-				return
-			end
-			self.stats.failed = self.stats.failed + 1
-			self.stats.last_error = transport_err
-			if not unauthorized and not retryable then
-				self.stats.rejected = self.stats.rejected + 1
-			end
-			self:record_retry_after(retry_after)
-			-- A retryable failure leaves the pre-dispatch pending copy in place (on-disk
-			-- for a later launch, or in-memory for an in-session resend) so it can be
-			-- retried. A non-retryable reject (a 4xx other than rate-limit) is terminal:
-			-- remove the pending copy so it is not retried.
-			if pending_token and not retryable then
-				self:remove_pending(pending_token)
-			end
-			diagnose(self, {
-				scope = "crash",
-				status = unauthorized and "unauthorized" or "rejected",
-				code = transport_err,
-				retryable = retryable,
-				retry_after = type(retry_after) == "number" and retry_after or nil,
-				response = type(response) == "table" and response.status or nil,
-			})
-		end)
-	if not dispatched then
-		-- The transport reported a synchronous setup failure (no http/json, encode
-		-- error). Every transport path invokes the callback (which already settled
-		-- the in-flight count and recorded the error), but call settle() once more as
-		-- a guarded no-op so a missed callback can never wedge the count and block
-		-- shutdown forever. Surface the last error.
-		settle()
-		return false, self.stats.last_error or "not_dispatched"
-	end
-	return true
+	-- (When no JSON encoder is available, nothing can be persisted OR sent;
+	-- the dispatch below routes through the transport so the failure is
+	-- accounted exactly as before.)
+	entry.token = pending_token
+	return self:dispatch_pending(entry)
 end
 
 -- Emit a non-fatal crash report (subject to sampling).
@@ -518,8 +482,9 @@ function Client:capture_previous(crash_module)
 		return false, "shutdown"
 	end
 	-- First, try to resend any reports a previous launch persisted after a
-	-- temporary send failure (offline / rate-limited / server error). A dump is
-	-- one-shot, so this is the only way such a crash is not permanently lost.
+	-- temporary send failure (offline / rate-limited / server error) or an
+	-- app death mid-send. Crash reports get the first shot at the network,
+	-- before the host typically starts analytics traffic.
 	self:resend_pending()
 	local event = dump.load_previous_event(crash_module)
 	if not event then
@@ -530,59 +495,120 @@ function Client:capture_previous(crash_module)
 	-- here; forward as a fatal report so it is never sampled away. The dump is from
 	-- the DEAD previous session and carries no breadcrumbs of its own — suppress
 	-- attaching the current session's breadcrumb ring, which would otherwise
-	-- misattribute this session's breadcrumbs to the previous crash.
-	local ok, err = self:emit_internal(event, true, true,
-		{ skip_breadcrumb_ring = true, persist_on_retry = true })
+	-- misattribute this session's breadcrumbs to the previous crash. (Like every
+	-- emit, the prepared report persists write-ahead before its send — the dump
+	-- is one-shot and already consumed, so this is the only copy.)
+	local ok, err = self:emit_internal(event, true, true, { skip_breadcrumb_ring = true })
 	if not ok then
 		return false, err
 	end
 	return true, true
 end
 
--- Resend any crash reports persisted by a previous launch after a temporary send
--- failure. Each entry is already on disk (it was persisted before its first
--- dispatch), so it is dispatched in place and removed only once the resend is
--- accepted or terminally rejected; a retryable failure leaves it persisted for a
--- later launch. The entry is never cleared up front, so an app kill mid-resend
--- cannot lose a still-pending report.
+-- Resend the crash reports persisted by an earlier launch (or retained
+-- in-session after a failed persist), STRICTLY ONE AT A TIME, oldest first:
+-- the next report is dispatched only from the previous one's settlement, so
+-- a 429/Retry-After (or any retryable failure) stops the whole pass instead
+-- of racing every pending report into backpressure. Each entry is already
+-- durable (persisted before its first dispatch); it is dispatched in place
+-- and removed only once the resend is accepted or terminally rejected, so an
+-- app kill mid-pass loses nothing and a partial delivery resumes on the next
+-- launch. A stored Retry-After deadline (persisted when the server throttled
+-- an earlier send) defers the pass until it expires — it survives relaunches
+-- and self-cleans when spent or absurd. One pass runs at a time.
 function Client:resend_pending()
-	if not self.initialized then
+	if not self.initialized or self.resend_active then
 		return
 	end
-	-- First, resend any in-session in-memory fallback entries (reports that could not
-	-- be persisted to disk). Snapshot the tokens before dispatching: a synchronous
-	-- transport stub may settle and remove the entry mid-iteration.
+	local queue = {}
+	local entries, deadline = storage.load_pending_entries(self:pending_scope())
+	if type(entries) == "table" then
+		for _, entry in ipairs(entries) do
+			if type(entry) == "table" and type(entry.token) == "string" and
+				(type(entry.body) == "string" or type(entry.report) == "table") then
+				queue[#queue + 1] = entry
+			end
+		end
+	end
+	-- In-session in-memory fallback entries (reports that could not be
+	-- persisted to disk) go after the on-disk backlog: the disk entries are
+	-- from earlier launches and therefore older. Snapshot the tokens before
+	-- dispatching: a synchronous transport stub may settle and remove the
+	-- entry mid-iteration.
 	local mem_tokens = {}
 	for token in pairs(self.in_memory_pending) do
 		mem_tokens[#mem_tokens + 1] = token
 	end
+	table.sort(mem_tokens)
 	for _, token in ipairs(mem_tokens) do
-		local report = self.in_memory_pending[token]
-		if type(report) == "table" then
-			self:dispatch_prepared(report, token)
+		local entry = self.in_memory_pending[token]
+		if type(entry) == "table" then
+			queue[#queue + 1] = {
+				token = token,
+				body = entry.body,
+				report = entry.report,
+				fatal = entry.fatal,
+			}
 		end
 	end
-	local entries = storage.load_pending_entries(self:pending_scope())
-	if type(entries) ~= "table" or #entries == 0 then
+	if #queue == 0 then
+		-- Nothing pending: any surfaced deferral is over too.
+		self.stats.resend_deferred_until_ms = nil
 		return
 	end
-	for _, entry in ipairs(entries) do
-		if type(entry) == "table" and type(entry.report) == "table" and type(entry.token) == "string" then
-			self:dispatch_prepared(entry.report, entry.token)
+	if type(deadline) == "number" then
+		-- Server backpressure from an earlier send is still in force (the
+		-- stored deadline reads as nil once spent): defer the whole pass and
+		-- surface the deadline. The reports stay durable; a later
+		-- resend_pending() — typically the next launch — retries.
+		self.stats.resend_deferred_until_ms = deadline
+		return
+	end
+	self.stats.resend_deferred_until_ms = nil
+	self.resend_active = true
+	local index = 0
+	local function step()
+		index = index + 1
+		if index > #queue then
+			self.resend_active = false
+			return
+		end
+		local entry = queue[index]
+		local dispatched = self:dispatch_pending(entry, function(stop_pass)
+			if stop_pass then
+				-- Retryable failure: keep this and every remaining report
+				-- durable for a later pass.
+				self.resend_active = false
+				return
+			end
+			step()
+		end)
+		if not dispatched then
+			-- A synchronous setup failure (no http/json) would fail every
+			-- remaining entry the same way: stop the pass.
+			self.resend_active = false
 		end
 	end
+	step()
 end
 
--- Dispatch an ALREADY-PREPARED crash report (skipping prepare/sanitize/validate,
--- which already ran when it was first built). Mirrors the in-flight bookkeeping
--- and stats of emit_internal. `pending_token` (when set) addresses the on-disk
--- copy persisted for this report: it is removed once the send is accepted or
--- terminally rejected, and left in place on a retryable failure so a later launch
--- resends it.
-function Client:dispatch_prepared(prepared, pending_token)
-	if not self.initialized or type(prepared) ~= "table" then
+-- Dispatch one pending entry — the exact persisted wire body when present
+-- (byte-identical to the original attempt), or a legacy prepared-report
+-- table encoded at dispatch. Mirrors the in-flight bookkeeping and stats of
+-- a fresh emit. `entry.token` (when set) addresses the pending copy: it is
+-- removed once the send is accepted (clearing any stored backpressure
+-- deadline — the endpoint is taking traffic again) or terminally rejected,
+-- and left in place on a retryable failure so a later pass resends it; a
+-- server Retry-After on a retryable failure is persisted with the pending
+-- record so the backpressure window survives a relaunch. `on_settled`
+-- (optional) is invoked from the transport callback with stop_pass=true on a
+-- retryable failure and false otherwise — the serial resend pass uses it to
+-- advance or stop.
+function Client:dispatch_pending(entry, on_settled)
+	if not self.initialized or type(entry) ~= "table" then
 		return false, "invalid_event"
 	end
+	local pending_token = entry.token
 	self.stats.emitted = self.stats.emitted + 1
 	self.in_flight = self.in_flight + 1
 	local settled = false
@@ -596,39 +622,68 @@ function Client:dispatch_prepared(prepared, pending_token)
 		end
 	end
 
-	local dispatched = transport.ingest(self.config, self.config.crash_api_key, prepared,
-		function(ok, transport_err, unauthorized, retryable, response, retry_after)
-			settle()
-			if ok then
-				if not self:record_accepted_response(response) then
-					self.stats.accepted = self.stats.accepted + 1
-				end
-				if pending_token then
-					self:remove_pending(pending_token)
-				end
-				return
+	local function handle(ok, transport_err, unauthorized, retryable, response, retry_after)
+		settle()
+		if ok then
+			if not self:record_accepted_response(response) then
+				self.stats.accepted = self.stats.accepted + 1
 			end
-			self.stats.failed = self.stats.failed + 1
-			self.stats.last_error = transport_err
-			if not unauthorized and not retryable then
-				self.stats.rejected = self.stats.rejected + 1
+			-- The send was accepted: the pending copy is no longer needed,
+			-- and any stored backpressure window is over.
+			if pending_token then
+				self:remove_pending(pending_token, true)
 			end
-			self:record_retry_after(retry_after)
-			-- Leave a retryable failure pending (on-disk or in-memory); remove a terminal
-			-- (non-retryable) reject so it is not retried forever.
-			if pending_token and not retryable then
-				self:remove_pending(pending_token)
+			if on_settled then
+				on_settled(false)
 			end
-			diagnose(self, {
-				scope = "crash",
-				status = unauthorized and "unauthorized" or "rejected",
-				code = transport_err,
-				retryable = retryable,
-				retry_after = type(retry_after) == "number" and retry_after or nil,
-				response = type(response) == "table" and response.status or nil,
-			})
-		end)
+			return
+		end
+		self.stats.failed = self.stats.failed + 1
+		self.stats.last_error = transport_err
+		if not unauthorized and not retryable then
+			self.stats.rejected = self.stats.rejected + 1
+		end
+		self:record_retry_after(retry_after)
+		-- A retryable failure leaves the pending copy in place (on-disk for a
+		-- later launch, or in-memory for an in-session pass). A server
+		-- Retry-After is persisted with the pending record so the
+		-- backpressure window survives a relaunch (clamped to one day; only
+		-- an explicit server hint is persisted). A non-retryable reject is
+		-- terminal: remove the pending copy so it is not retried forever.
+		if retryable then
+			if type(retry_after) == "number" and retry_after > 0 then
+				storage.set_pending_crash_retry_after(self:pending_scope(), retry_after)
+			end
+		elseif pending_token then
+			self:remove_pending(pending_token)
+		end
+		diagnose(self, {
+			scope = "crash",
+			status = unauthorized and "unauthorized" or "rejected",
+			code = transport_err,
+			retryable = retryable,
+			retry_after = type(retry_after) == "number" and retry_after or nil,
+			response = type(response) == "table" and response.status or nil,
+		})
+		if on_settled then
+			on_settled(retryable == true)
+		end
+	end
+
+	local dispatched
+	if type(entry.body) == "string" and entry.body ~= "" then
+		dispatched = transport.ingest_body(self.config, self.config.crash_api_key, entry.body, handle)
+	else
+		-- A legacy pending entry (or a fresh report whose encode failed —
+		-- the transport then reports the same setup failure it always did).
+		dispatched = transport.ingest(self.config, self.config.crash_api_key, entry.report, handle)
+	end
 	if not dispatched then
+		-- The transport reported a synchronous setup failure (no http/json,
+		-- encode error). Every transport path invokes the callback (which
+		-- already settled the in-flight count and recorded the error), but
+		-- call settle() once more as a guarded no-op so a missed callback can
+		-- never wedge the count and block shutdown forever.
 		settle()
 		return false, self.stats.last_error or "not_dispatched"
 	end

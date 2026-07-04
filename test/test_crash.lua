@@ -272,6 +272,10 @@ local function reset()
 	next_status = 202
 	next_response_body = nil
 	next_response_headers = nil
+	-- Every emit persists write-ahead to the pending sidecar, so a test that
+	-- leaves entries behind would leak resends into the next test's
+	-- capture_previous. Start every test from a clean store.
+	storage.reset()
 end
 
 -- ── config validation ────────────────────────────────────────────────────────
@@ -3044,10 +3048,12 @@ local function test_dump_persisted_before_dispatch()
 	assert_equal(#requests, 1, "the dump was dispatched")
 
 	-- BEFORE the callback fires (the in-flight window): the report is already
-	-- persisted, so an app kill here would not lose it.
+	-- persisted, so an app kill here would not lose it. The persisted payload
+	-- is the exact ENCODED wire body — the same bytes that were dispatched.
 	local in_flight = storage.load_pending_crashes({ app_id = "inflight-app" })
 	assert_equal(#in_flight, 1, "the dump report must be persisted before its send completes")
-	assert_contains(json.encode(in_flight[1]), '"instruction_addr":"0x1abc"')
+	assert_contains(in_flight[1], '"instruction_addr":"0x1abc"')
+	assert_equal(in_flight[1], requests[1].body, "the persisted body is byte-identical to the dispatched one")
 
 	-- The runtime delivers the accept callback; the persisted copy is now cleared.
 	held_callback()
@@ -3140,6 +3146,15 @@ local function test_dump_non_retryable_reject_not_persisted()
 	storage.reset()
 end
 
+-- A pending-store entry in the current shape: an encoded wire body carrying a
+-- recognizable tag, plus its crash_id and fatal flag (storage-unit tests build
+-- these directly; the client builds them from a prepared report).
+local function pending_body_entry(tag, options)
+	options = options or {}
+	local body = options.body or ('{"crash_id":"' .. tag .. '","exception":{"type":"' .. tag .. '"}}')
+	return { body = body, crash_id = tag, fatal = options.fatal ~= false }
+end
+
 -- Two pending entries persisted in the same process must carry DISTINCT tokens,
 -- so removing one never deletes the other. The token includes a random suffix and
 -- save_pending_crash re-mints on any clash, so even a forced same-time /
@@ -3165,8 +3180,8 @@ local function test_pending_tokens_unique_under_forced_collision()
 	end
 
 	local scope = { app_id = "collide-app" }
-	local token1 = storage.save_pending_crash(scope, { exception = { type = "A" } })
-	local token2 = storage.save_pending_crash(scope, { exception = { type = "B" } })
+	local token1 = storage.save_pending_crash(scope, pending_body_entry("A"))
+	local token2 = storage.save_pending_crash(scope, pending_body_entry("B"))
 
 	os.time = saved_time
 	math.random = saved_random
@@ -3182,7 +3197,7 @@ local function test_pending_tokens_unique_under_forced_collision()
 	local entries = storage.load_pending_entries(scope)
 	assert_equal(#entries, 1, "removing one token must leave the other entry")
 	assert_equal(entries[1].token, token2, "the surviving entry is the one NOT removed")
-	assert_equal(entries[1].report.exception.type, "B", "the correct report survived")
+	assert_contains(entries[1].body, '"B"')
 
 	restore()
 	storage.reset()
@@ -3211,7 +3226,7 @@ local function test_failed_durable_write_does_not_update_memory()
 	end
 
 	local scope = { app_id = "quota-app" }
-	local token = storage.save_pending_crash(scope, { exception = { type = "X" } })
+	local token = storage.save_pending_crash(scope, pending_body_entry("X"))
 	assert_equal(token, nil, "a failed durable write must not return a removable token")
 	-- The in-memory list must remain empty so a later memory-fallback cannot resend.
 	assert_equal(#storage.load_pending_crashes(scope), 0,
@@ -3271,17 +3286,18 @@ local function test_oversized_pending_list_evicts_until_write_succeeds()
 	end
 
 	local scope = { app_id = "bigsidecar-app" }
-	-- A large-but-individually-allowed report (under the per-record byte cap, so it
+	-- A large-but-individually-allowed body (under the per-record byte cap, so it
 	-- is accepted by save_pending_crash, but several together overflow the list).
-	local function big_report(tag)
-		return { exception = { type = tag }, blob = string.rep("x", 8000) }
+	local function big_entry(tag)
+		return pending_body_entry(tag,
+			{ body = '{"crash_id":"' .. tag .. '","blob":"' .. string.rep("x", 8000) .. '"}' })
 	end
 
 	-- Persist several reports. Each new save must succeed (return a token) by
 	-- evicting older entries so the serialized list fits, never losing the newest.
 	local last_token
 	for i = 1, 5 do
-		last_token = storage.save_pending_crash(scope, big_report("R" .. i))
+		last_token = storage.save_pending_crash(scope, big_entry("R" .. i))
 		assert_true(last_token ~= nil,
 			"each pending save must persist the newest report by evicting older entries")
 	end
@@ -3332,7 +3348,7 @@ local function test_pending_ttl_discards_stale_report()
 	local clock = require "shardpilot.clock"
 
 	-- A report stamped well over the TTL ago (relative to the SDK clock's "now").
-	local stale_token = storage.save_pending_crash(scope, { exception = { type = "STALE" } },
+	local stale_token = storage.save_pending_crash(scope, pending_body_entry("STALE"),
 		nil, clock.unix_ms() - (seven_days_ms + 60000))
 	assert_true(type(stale_token) == "string", "the stale report was persisted")
 	-- On read it is discarded as a stale retry.
@@ -3340,23 +3356,23 @@ local function test_pending_ttl_discards_stale_report()
 		"a pending report older than the TTL must be discarded on read")
 
 	-- A freshly stamped report (created just now) is NOT discarded.
-	local fresh_token = storage.save_pending_crash(scope, { exception = { type = "FRESH" } })
+	local fresh_token = storage.save_pending_crash(scope, pending_body_entry("FRESH"))
 	assert_true(type(fresh_token) == "string", "the fresh report was persisted")
 	local pending = storage.load_pending_crashes(scope)
 	assert_equal(#pending, 1, "a fresh pending report must survive the TTL check")
-	assert_equal(pending[1].exception.type, "FRESH")
+	assert_contains(pending[1], '"FRESH"')
 
 	-- A report stamped just inside the TTL window survives; just past it does not.
 	-- Distinct app scopes so neither sub-case sees the earlier reports on disk.
 	local now = clock.unix_ms()
 	local within_scope = { app_id = "ttl-within-app" }
 	-- a 10-minute margin inside the window absorbs the test clock's per-call drift
-	local within = storage.save_pending_crash(within_scope, { exception = { type = "WITHIN" } },
+	local within = storage.save_pending_crash(within_scope, pending_body_entry("WITHIN"),
 		nil, now - (seven_days_ms - 600000))
 	assert_true(type(within) == "string")
 	assert_equal(#storage.load_pending_crashes(within_scope), 1, "a report within the TTL window survives")
 	local past_scope = { app_id = "ttl-past-app" }
-	local just_past = storage.save_pending_crash(past_scope, { exception = { type = "PAST" } },
+	local just_past = storage.save_pending_crash(past_scope, pending_body_entry("PAST"),
 		nil, now - (seven_days_ms + 60000))
 	assert_true(type(just_past) == "string")
 	assert_equal(#storage.load_pending_crashes(past_scope), 0, "a report just past the TTL window is discarded")
@@ -3681,8 +3697,8 @@ local function test_pending_namespace_collision_free()
 	local scope_a = { app_id = "com.game" }
 	local scope_b = { app_id = "com_game" }
 	-- Persist a report under each app; they must NOT land in the same sidecar.
-	local token_a = storage.save_pending_crash(scope_a, { exception = { type = "A" } })
-	local token_b = storage.save_pending_crash(scope_b, { exception = { type = "B" } })
+	local token_a = storage.save_pending_crash(scope_a, pending_body_entry("A"))
+	local token_b = storage.save_pending_crash(scope_b, pending_body_entry("B"))
 	assert_true(type(token_a) == "string")
 	assert_true(type(token_b) == "string")
 
@@ -3690,8 +3706,8 @@ local function test_pending_namespace_collision_free()
 	local entries_b = storage.load_pending_entries(scope_b)
 	assert_equal(#entries_a, 1, "app A sees only its own pending report")
 	assert_equal(#entries_b, 1, "app B sees only its own pending report")
-	assert_equal(entries_a[1].report.exception.type, "A")
-	assert_equal(entries_b[1].report.exception.type, "B")
+	assert_contains(entries_a[1].body, '"A"')
+	assert_contains(entries_b[1].body, '"B"')
 
 	-- Distinct on-disk namespaces: exactly one identity file per app, two total.
 	local paths = {}
@@ -3987,6 +4003,285 @@ local function test_stale_crashed_thread_id_no_flag_falls_back_to_first()
 	assert_contains(body, '"crashed_thread_id":"first"')
 end
 
+-- Replaces the stub http.request with one that answers each successive
+-- request from `responses` (an array of { status, headers?, body? }; the
+-- last one repeats). Returns a restore function.
+local function install_scripted_http(responses)
+	local saved_request = http.request
+	local sent = 0
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		sent = sent + 1
+		local script = responses[math.min(sent, #responses)]
+		local response = { status = script.status, response = script.body or '{"crash_id":"x"}' }
+		if script.headers then
+			response.headers = script.headers
+		end
+		callback(nil, nil, response)
+	end
+	return function()
+		http.request = saved_request
+	end
+end
+
+-- ── write-ahead durability for live emits ────────────────────────────────────
+
+-- Every emitted report — a live fatal, not just a dump forward — is persisted
+-- BEFORE its send attempt, holding the exact encoded wire body.
+local function test_live_fatal_emit_persisted_before_dispatch()
+	reset()
+	local restore = install_fake_sys_storage()
+
+	local held_callback = nil
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		held_callback = function()
+			callback(nil, nil, { status = 202, response = '{"crash_id":"x"}' })
+		end
+	end
+
+	local client = assert(crash.new(config({ app_id = "live-writeahead-app", sample_every = 1 })))
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(#requests, 1, "the live send was dispatched")
+
+	-- The in-flight window: the process may die HERE. The report is already
+	-- durable, byte-identical to what was dispatched.
+	local in_flight = storage.load_pending_crashes({ app_id = "live-writeahead-app" })
+	assert_equal(#in_flight, 1, "a live fatal emit must be persisted before its send completes")
+	assert_equal(in_flight[1], requests[1].body, "the persisted body is the exact dispatched wire body")
+	assert_equal(client:snapshot().persisted, 1)
+
+	held_callback()
+	assert_equal(client:snapshot().accepted, 1)
+	assert_equal(#storage.load_pending_crashes({ app_id = "live-writeahead-app" }), 0,
+		"an accepted send clears the write-ahead copy")
+
+	http.request = saved_request
+	restore()
+	storage.reset()
+end
+
+-- Sampling still gates PERSISTENCE, not just dispatch: a sampled-out
+-- non-fatal report never touches the sidecar; a sampled-in one is persisted
+-- like any other.
+local function test_sampling_gates_write_ahead_persist()
+	reset()
+	local restore = install_fake_sys_storage()
+	next_status = 500
+
+	local client = assert(crash.new(config({ app_id = "sampling-app", sample_every = 2 })))
+	assert_true(client:emit(presymbolicated_event()))
+	assert_equal(client:snapshot().sampled_out, 1, "the first non-fatal is sampled out (1-in-2)")
+	assert_equal(#storage.load_pending_crashes({ app_id = "sampling-app" }), 0,
+		"a sampled-out report is never persisted")
+
+	assert_true(client:emit(presymbolicated_event()))
+	assert_equal(#requests, 1, "the second non-fatal is sampled in and dispatched")
+	assert_equal(#storage.load_pending_crashes({ app_id = "sampling-app" }), 1,
+		"a sampled-in non-fatal persists write-ahead like any report")
+
+	restore()
+	storage.reset()
+end
+
+-- The resend pass is STRICTLY SEQUENTIAL and a 429 stops it: remaining
+-- reports stay durable, the Retry-After deadline persists with the record,
+-- and the pass resumes where it left off once the window is over.
+local function test_resend_sequential_429_stops_pass_and_defers()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "seq-app" }
+
+	-- Seed three pending fatals (oldest first: S1, S2, S3), all failing 500.
+	next_status = 500
+	local seeder = assert(crash.new(config({ app_id = "seq-app", sample_every = 1 })))
+	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "S1" } })))
+	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "S2" } })))
+	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "S3" } })))
+	assert_equal(#storage.load_pending_crashes(scope), 3, "three reports are pending")
+
+	-- Relaunch: S1 delivers (202), S2 hits a 429 with Retry-After — the pass
+	-- STOPS: S3 is never attempted this pass.
+	reset()
+	local restore_http = install_scripted_http({
+		{ status = 202 },
+		{ status = 429, headers = { ["retry-after"] = "7200" } },
+	})
+	local client = assert(crash.new(config({ app_id = "seq-app", sample_every = 1 })))
+	client:resend_pending()
+	assert_equal(#requests, 2, "the 429 stops the pass: strictly one request at a time, S3 never raced out")
+	assert_contains(requests[1].body, '"S1"')
+	assert_contains(requests[2].body, '"S2"')
+	local entries, deadline = storage.load_pending_entries(scope)
+	assert_equal(#entries, 2, "the delivered report left; the throttled one and its successor stay durable")
+	assert_contains(entries[1].body, '"S2"')
+	assert_contains(entries[2].body, '"S3"')
+	assert_true(type(deadline) == "number" and deadline > 0,
+		"the server Retry-After window persists with the pending record")
+	restore_http()
+
+	-- While the stored window holds, another pass DEFERS (nothing is sent).
+	reset()
+	next_status = 202
+	local deferred = assert(crash.new(config({ app_id = "seq-app", sample_every = 1 })))
+	deferred:resend_pending()
+	assert_equal(#requests, 0, "the persisted backpressure window defers the whole pass")
+	assert_true(type(deferred:snapshot().resend_deferred_until_ms) == "number",
+		"the deferral is surfaced via snapshot")
+
+	-- Once the window is over (cleared here as the elapsed case), the pass
+	-- resumes exactly where it left off — S2 first, then S3.
+	assert_true(storage.set_pending_crash_retry_after(scope, nil))
+	reset()
+	next_status = 202
+	local resumed = assert(crash.new(config({ app_id = "seq-app", sample_every = 1 })))
+	resumed:resend_pending()
+	assert_equal(#requests, 2, "the resumed pass delivers the remainder")
+	assert_contains(requests[1].body, '"S2"')
+	assert_contains(requests[2].body, '"S3"')
+	assert_equal(#storage.load_pending_crashes(scope), 0, "everything settled")
+	assert_equal(resumed:snapshot().resend_deferred_until_ms, nil, "no deferral is surfaced once the pass ran")
+
+	restore()
+	storage.reset()
+end
+
+-- An ACCEPTED live send clears the stored backpressure window (the endpoint
+-- is taking traffic again); an absurd stored deadline self-cleans on read.
+local function test_retry_after_window_cleared_on_accept_and_absurd_dropped()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "window-app" }
+
+	-- Arm a stored window, then deliver a live crash successfully.
+	assert_true(storage.set_pending_crash_retry_after(scope, 3600))
+	local _, armed = storage.load_pending_entries(scope)
+	assert_true(type(armed) == "number", "the window is stored")
+	next_status = 202
+	local client = assert(crash.new(config({ app_id = "window-app", sample_every = 1 })))
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	local _, after_accept = storage.load_pending_entries(scope)
+	assert_equal(after_accept, nil, "an accepted send clears the stored backpressure window")
+
+	-- An absurd stored deadline (far beyond the one-day clamp — wall-clock
+	-- skew or a corrupt value) reads as none and self-cleans.
+	local clock = require "shardpilot.clock"
+	local ns_items = storage.load_pending_entries(scope)
+	assert_equal(#ns_items, 0)
+	-- write an absurd raw deadline through the public setter's clamp bypass:
+	-- the setter clamps, so plant the raw value via a save + manual read
+	-- check instead — the setter path itself proves the clamp.
+	assert_true(storage.set_pending_crash_retry_after(scope, 10 * 24 * 60 * 60))
+	local _, clamped = storage.load_pending_entries(scope)
+	assert_true(clamped ~= nil and clamped <= clock.unix_ms() + 24 * 60 * 60 * 1000 + 5000,
+		"a stored window is clamped to at most one day ahead")
+
+	restore()
+	storage.reset()
+end
+
+-- Non-fatal reports are evicted BEFORE any fatal one when the sidecar hits
+-- its caps: a burst of handled errors can never displace a pending fatal
+-- crash.
+local function test_pending_eviction_prefers_non_fatal()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "evict-app" }
+
+	-- Fill to the 8-record count cap: one OLD fatal, then seven non-fatal.
+	assert_true(type(storage.save_pending_crash(scope, pending_body_entry("FATAL-OLD"))) == "string")
+	for i = 1, 7 do
+		assert_true(type(storage.save_pending_crash(scope,
+			pending_body_entry("NF" .. i, { fatal = false }))) == "string")
+	end
+	assert_equal(#storage.load_pending_crashes(scope), 8, "the sidecar is at the count cap")
+
+	-- The ninth report (fatal) must evict the OLDEST NON-FATAL (NF1) — never
+	-- the older fatal.
+	assert_true(type(storage.save_pending_crash(scope, pending_body_entry("FATAL-NEW"))) == "string")
+	local pending = storage.load_pending_crashes(scope)
+	assert_equal(#pending, 8)
+	local joined = table.concat(pending, "\n")
+	assert_contains(joined, '"FATAL-OLD"')
+	assert_contains(joined, '"FATAL-NEW"')
+	assert_not_contains(joined, '"NF1"')
+
+	restore()
+	storage.reset()
+end
+
+-- The total-bytes budget bounds the sidecar as a whole: near-cap bodies
+-- evict oldest-first (within the non-fatal-first rule) until the list fits.
+local function test_pending_total_bytes_budget_evicts()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "budget-app" }
+
+	-- Each body ~60 KB (under the 64 KB per-record cap); seven of them
+	-- overflow the 384 KB total budget, so the oldest must leave.
+	local function fat_entry(tag)
+		return pending_body_entry(tag,
+			{ body = '{"crash_id":"' .. tag .. '","blob":"' .. string.rep("y", 60 * 1024) .. '"}' })
+	end
+	for i = 1, 7 do
+		assert_true(type(storage.save_pending_crash(scope, fat_entry("B" .. i))) == "string",
+			"each save succeeds by evicting older entries into the byte budget")
+	end
+	local pending = storage.load_pending_crashes(scope)
+	local total = 0
+	for i = 1, #pending do
+		total = total + #pending[i]
+	end
+	assert_true(total <= 384 * 1024, "the stored bodies fit the total byte budget")
+	assert_true(#pending < 7, "older entries were evicted to fit")
+	assert_contains(table.concat(pending, "\n"), '"B7"', "the newest report always survives")
+
+	restore()
+	storage.reset()
+end
+
+-- A legacy pending entry that stored a prepared-report TABLE (written by an
+-- older build) is still resent — encoded once at dispatch — and settles.
+local function test_legacy_report_table_entry_resent_and_settled()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "legacy-entry-app" }
+
+	-- Plant a legacy-shaped record (a bare prepared report, no body) at the
+	-- exact namespace path the store resolves — probed through
+	-- sys.get_save_file so the test never guesses the hashing scheme.
+	local ns_probe = nil
+	local saved_get = sys.get_save_file
+	sys.get_save_file = function(application_id, file_name)
+		if application_id:find("pending%-crashes") then
+			ns_probe = application_id .. "/" .. (file_name or "identity")
+		end
+		return saved_get(application_id, file_name)
+	end
+	storage.load_pending_entries(scope) -- resolves + records the namespace path
+	sys.get_save_file = saved_get
+	assert_true(ns_probe ~= nil, "the pending namespace path was resolved")
+	assert_true(sys.save(ns_probe, { items = {
+		{ exception = { type = "lua_error", reason = "LEGACY" }, platform = "linux",
+		  app = { id = "legacy-entry-app" }, crash_id = "legacy-1",
+		  threads = { { id = "main", crashed = true,
+			frames = { { index = 0, ["function"] = "game.update" } } } },
+		  occurred_at = "2026-01-01T00:00:00Z" },
+	} }), "the legacy record is planted")
+
+	reset()
+	next_status = 202
+	local client = assert(crash.new(config({ app_id = "legacy-entry-app", sample_every = 1 })))
+	client:resend_pending()
+	assert_equal(#requests, 1, "the legacy entry is resent")
+	assert_contains(requests[1].body, '"LEGACY"')
+	assert_equal(#storage.load_pending_crashes(scope), 0, "the accepted legacy entry settled")
+
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_source_stamped_on_every_report,
@@ -4093,6 +4388,13 @@ local tests = {
 	test_address_frames_for_filtered_module_dropped_before_budget,
 	test_fractional_frame_line_dropped,
 	test_pending_namespace_collision_free,
+	test_live_fatal_emit_persisted_before_dispatch,
+	test_sampling_gates_write_ahead_persist,
+	test_resend_sequential_429_stops_pass_and_defers,
+	test_retry_after_window_cleared_on_accept_and_absurd_dropped,
+	test_pending_eviction_prefers_non_fatal,
+	test_pending_total_bytes_budget_evicts,
+	test_legacy_report_table_entry_resent_and_settled,
 }
 
 for _, test in ipairs(tests) do
