@@ -178,10 +178,12 @@ local function extract(decoded, body)
 	local version = type(decoded.version) == "number" and decoded.version or nil
 	local values = decoded.values
 	if values ~= nil then
-		if type(values) ~= "table" or values[1] ~= nil then
-			return nil
-		end
-		if next(values) == nil and top_level_values_char(body) ~= "{" then
+		-- Object-ness is decided on the body TEXT, not the decoded table: an
+		-- empty array decodes to the same table as an empty object, and a
+		-- sparse array (`[null, 1]` under a decoder that maps null to nil)
+		-- can dodge any positional-index probe. A JSON object can only carry
+		-- string keys, so the text check subsumes them all.
+		if type(values) ~= "table" or top_level_values_char(body) ~= "{" then
 			return nil
 		end
 		return values, version
@@ -349,17 +351,20 @@ function M.new(config, identity)
 		-- configuration rather than reviving an older on-disk record.
 		cache = nil,
 		-- Requests are numbered, and `settled_seq` is the highest sequence
-		-- whose AUTHORITATIVE outcome has landed: a fresh 200, an
-		-- unauthorized response, or a permanent HTTP error. Only a fetch
-		-- newer than every settled one may install: with two fetches in
-		-- flight, responses can arrive out of order, and an older success
-		-- must neither roll back a newer configuration nor sneak values in
-		-- after a newer fail-closed outcome. Non-authoritative outcomes
-		-- (a transient failure, a cache-served fallback) do not settle —
-		-- they say nothing about the current configuration, so they must
-		-- not fence off a fresh response still in flight.
+		-- whose AUTHORITATIVE outcome has landed — a fresh 200, an
+		-- unauthorized response, or a permanent HTTP error — for the scope
+		-- named by `settled_scope` (the fence resets when the scope
+		-- changes). Only a fetch newer than every settled one may install:
+		-- with two fetches in flight, responses can arrive out of order,
+		-- and an older success must neither roll back a newer configuration
+		-- nor sneak values in after a newer fail-closed outcome.
+		-- Non-authoritative outcomes (a transient failure, a cache-served
+		-- fallback) do not settle — they say nothing about the current
+		-- configuration, so they must not fence off a fresh response still
+		-- in flight.
 		fetch_seq = 0,
 		settled_seq = 0,
+		settled_scope = nil,
 	}, RemoteConfig)
 	-- Serve the persisted last-known-good snapshot immediately after a
 	-- restart: getters work before (and without) any fetch when a cache for
@@ -458,11 +463,19 @@ end
 -- and a callback that mutates `result.values` must not corrupt what later
 -- getters read.
 function RemoteConfig:install(seq, result, new_cache, scope, authoritative, served_cache)
-	if seq <= self.settled_seq then
-		return
-	end
 	local current_id = self:client_id()
 	if not current_id or self:scope_for(current_id) ~= scope then
+		return
+	end
+	-- The fence belongs to ONE scope: entering a different scope — a
+	-- rotation, or a rotation back — resets it, so an outcome settled while
+	-- a previous identity was current can never fence off a response for
+	-- this one.
+	if self.settled_scope ~= scope then
+		self.settled_scope = scope
+		self.settled_seq = 0
+	end
+	if seq <= self.settled_seq then
 		return
 	end
 	if authoritative then
@@ -501,7 +514,8 @@ end
 -- every http.request callback — fires asynchronously on the real runtime.
 -- A successful result (fresh OR cached) also updates the getter snapshot;
 -- a failed one leaves it untouched. Returns true when the request was
--- dispatched, false (with the callback already invoked) when it could not be.
+-- dispatched, or (false, error_code) — with the callback already invoked —
+-- when it could not be.
 function RemoteConfig:fetch(callback)
 	local function finish(result)
 		if type(callback) == "function" then
@@ -514,13 +528,13 @@ function RemoteConfig:fetch(callback)
 	local client_id = self:client_id()
 	if not client_id then
 		finish({ ok = false, from_cache = false, error = "client_id_unavailable" })
-		return false
+		return false, "client_id_unavailable"
 	end
 	if not json or type(json.decode) ~= "function" then
 		-- Without a decoder neither a fresh body nor the cache can produce
 		-- values, so there is nothing to serve.
 		finish({ ok = false, from_cache = false, error = "json_unavailable" })
-		return false
+		return false, "json_unavailable"
 	end
 
 	self.fetch_seq = self.fetch_seq + 1
@@ -538,7 +552,7 @@ function RemoteConfig:fetch(callback)
 		local result = serve_cache_or_fail(cache, "http_unavailable")
 		self:install(seq, result, nil, scope, false, cache)
 		finish(result)
-		return false
+		return false, "http_unavailable"
 	end
 
 	local headers = {

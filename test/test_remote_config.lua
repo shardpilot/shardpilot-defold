@@ -755,11 +755,14 @@ local function test_malformed_wrapped_values_member_is_rejected()
 	local client = assert(sdk.new(config()))
 
 	-- With no cache, a wrapper whose `values` member is not a keyed object
-	-- must fail rather than serve the wrapper itself as configuration...
+	-- must fail rather than serve the wrapper itself as configuration.
+	-- `[null,1]` is the decoder-hostile shape: a decoder that maps null to
+	-- nil leaves index 1 empty, so only the body text can call it an array.
 	for _, body in ipairs({
 		'{"version":3,"values":"oops"}',
 		'{"version":3,"values":42}',
 		'{"version":3,"values":[1,2]}',
+		'{"version":3,"values":[null,1]}',
 	}) do
 		next_status = 200
 		next_response_body = body
@@ -848,6 +851,47 @@ local function test_stale_scope_response_does_not_fence_current_scope()
 	assert_equal(client:remote_config_number("a", 0), 3,
 		"a stale-scope outcome must not fence off the current scope's fetch")
 	assert_equal(client:remote_config_version(), 3)
+end
+
+local function test_scope_fence_resets_after_rotation_cycle()
+	reset()
+	local client = assert(sdk.new(config()))
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		held[#held + 1] = callback
+	end
+
+	-- Fetch for the original identity, rotate away and fetch again; the
+	-- second response lands WHILE its scope is current, so it installs and
+	-- raises the fence.
+	local results = {}
+	client:fetch_remote_config(function(result)
+		results.original = result
+	end)
+	assert_true(client:set_anonymous_id("anon-other"))
+	client:fetch_remote_config(function(result)
+		results.other = result
+	end)
+	held[2](nil, nil, {
+		status = 200,
+		response = values_body({ bucket = "other" }, 2),
+		headers = { etag = '"other"' },
+	})
+	assert_equal(client:remote_config_string("bucket", "?"), "other")
+
+	-- Rotating back re-enters the original scope: the fence settled for the
+	-- intermediate identity must not drop the original response.
+	assert_true(client:set_anonymous_id("anon-client"))
+	http.request = saved_request
+	held[1](nil, nil, {
+		status = 200,
+		response = values_body({ bucket = "original" }, 1),
+		headers = { etag = '"original"' },
+	})
+	assert_true(results.original.ok)
+	assert_equal(client:remote_config_string("bucket", "?"), "original",
+		"an outcome settled under an intermediate identity must not fence the scope rotated back to")
 end
 
 local function test_cache_discovered_at_fetch_time_is_adopted()
@@ -1295,12 +1339,14 @@ local function test_missing_transport_serves_cache_and_reports()
 	local saved_http = http
 	http = nil
 	local result = nil
-	local dispatched = client:fetch_remote_config(function(value)
+	local dispatched, dispatch_err = client:fetch_remote_config(function(value)
 		result = value
 	end)
 	http = saved_http
 
 	assert_equal(dispatched, false)
+	assert_equal(dispatch_err, "http_unavailable",
+		"the non-dispatch reason must also come back to the caller")
 	assert_true(result.ok, "no transport degrades to the cached snapshot")
 	assert_equal(result.from_cache, true)
 	assert_equal(result.error, "http_unavailable")
@@ -1313,12 +1359,13 @@ local function test_missing_json_decoder_fails_the_fetch()
 	local saved_json = json
 	json = nil
 	local result = nil
-	local dispatched = client:fetch_remote_config(function(value)
+	local dispatched, dispatch_err = client:fetch_remote_config(function(value)
 		result = value
 	end)
 	json = saved_json
 
 	assert_equal(dispatched, false)
+	assert_equal(dispatch_err, "json_unavailable")
 	assert_equal(result.ok, false)
 	assert_equal(result.error, "json_unavailable")
 end
@@ -1413,6 +1460,7 @@ local tests = {
 	test_malformed_wrapped_values_member_is_rejected,
 	test_null_values_member_is_malformed,
 	test_stale_scope_response_does_not_fence_current_scope,
+	test_scope_fence_resets_after_rotation_cycle,
 	test_cache_discovered_at_fetch_time_is_adopted,
 	test_empty_array_values_member_is_malformed,
 	test_fetch_after_shutdown_is_rejected,
