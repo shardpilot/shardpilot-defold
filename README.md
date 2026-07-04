@@ -1,8 +1,9 @@
 # shardpilot-defold
 
 > Pure-Lua Defold source SDK for ShardPilot app-first telemetry — no native
-> extension required. Buffers app-first analytics events in a Defold game and
-> publishes them to the ShardPilot analytics ingest API.
+> extension required. Buffers app-first analytics events in a Defold game,
+> publishes them to the ShardPilot analytics ingest API, and fetches
+> ETag-cached remote config with a durable last-known-good fallback.
 
 ShardPilot is app-first: this SDK buffers analytics events and publishes them to
 the ingest API. The wire shape and identity rules follow ShardPilot's app-first
@@ -50,6 +51,12 @@ not the platform boundary.
   persisted **write-ahead** to a bounded per-app sidecar and re-sent on a later
   launch until the server acknowledges it — byte-identical, one report at a
   time. See [`docs/crash.md`](docs/crash.md).
+- Fetches **remote config** from the remote-config endpoint with an
+  ETag-revalidated durable cache and typed getters
+  (`remote_config_number("spawn_rate", 1.0)`), serving the last-known-good
+  snapshot across restarts and offline launches, and failing closed on
+  `401`/`403`. Every fetch is an explicit game-triggered call. See
+  [Remote config](#remote-config).
 
 ## Installation
 
@@ -141,6 +148,7 @@ Most methods return `ok, err` so callers can branch on failures (e.g.
 | Field | Default | Notes |
 |---|---|---|
 | `ingest_url` | — (required) | `https://…`, or `http://` only for `localhost`/`127.0.0.1`/`::1`; no query/fragment/path |
+| `remote_config_url` | `nil` (disabled) | Remote-config base URL (same shape rules as `ingest_url`); a **separate** service from the ingest endpoint. Requires `api_key` — see [Remote config](#remote-config) |
 | `workspace_id` | — (required) | Tenant key |
 | `app_id` | — (required) | Product key |
 | `environment_id` | — (required) | Environment scope (e.g. `local` / `develop` / `stage` / `prod`); any non-empty string is accepted |
@@ -178,6 +186,15 @@ Mode is selected by presence: a configured `token_provider` is used (Mode B); ot
 `api_key` is the standing `Bearer` (Mode A). Configuring both is rejected
 (`auth_mode_conflict`); configuring neither is rejected (`auth_required`). `anonymous_id`
 is always sent on the wire in both modes.
+
+> **Remote config is the exception.** The remote-config endpoint authenticates
+> with the publishable `sp_ingest_…` `api_key` only — a Mode B ingest JWT is
+> scoped to event ingest and the remote-config endpoint rejects it. So with
+> `remote_config_url` set, `api_key` is required even in Mode B
+> (`remote_config_api_key_required` otherwise), and that is the **one**
+> configuration where both credentials are valid together: the
+> `token_provider` keeps the ingest `Bearer`, the `api_key` authenticates only
+> the remote-config fetch.
 
 ## Wire contract
 
@@ -297,6 +314,75 @@ Events persisted this way are removed from the spool as soon as their normal
 delivery is acknowledged, so the snapshot costs nothing when the app keeps
 running.
 
+## Remote config
+
+```lua
+shardpilot.fetch_remote_config(function(result)
+  -- result = { ok, from_cache, error?, values?, version? }
+end)
+
+-- Typed getters read the last served snapshot; they never touch the network,
+-- never fail, and return the default until config is available.
+local spawn_rate = shardpilot.remote_config_number("spawn_rate", 1.0)
+local motd = shardpilot.remote_config_string("motd", "")
+local hard_mode = shardpilot.remote_config_boolean("hard_mode", false)
+```
+
+The fetch is `GET {remote_config_url}/config/v1/{workspace_id}/{environment_id}/{client_id}`
+with the publishable `api_key` as the `Bearer` (`client_id` = the persisted
+anonymous ID — the same identity the events carry, so per-client rollout
+bucketing is consistent with analytics). The endpoint answers
+`{ "version": <number>, "values": { key: value } }` with an `ETag`; the getters
+serve the `values` map. Responses are cached in a durable per-app record
+(`{scope, etag, body, fetched_at_ms}`) through the same `sys.save` storage
+seam as the identity record and the spools.
+
+Fetch semantics:
+
+- **200** — fresh values are served (`from_cache = false`) and the cache is
+  overwritten.
+- **304 Not Modified** — subsequent fetches revalidate with `If-None-Match`,
+  and the cached snapshot is served (`from_cache = true`).
+- **Transient failure** (offline, `429`, `5xx`, malformed body) — the cached
+  snapshot is served with `from_cache = true` and `error` carrying the reason;
+  with no usable cache the fetch fails.
+- **`401`/`403` fails closed** — the fetch reports `unauthorized` and the
+  cached snapshot is **not** served for that outcome, so a revoked or wrong
+  key never keeps supplying config. The cache file itself is left untouched
+  (getters keep the last served snapshot; a later authorized fetch
+  revalidates against the kept ETag).
+- **Any other status is a permanent failure** — a `404` for a removed
+  environment, an unexpected redirect, other `4xx`: retrying cannot help, so
+  the fetch fails (`http_<status>`) instead of reporting stale values as a
+  healthy `ok = true`. As with `401`/`403`, the record and the getter
+  snapshot are left untouched.
+
+The cache is scoped to the `(workspace_id, environment_id, client_id,
+remote_config_url)` tuple; a record written by any other scope is a miss (its
+ETag is never sent, its values never served) and is overwritten by the next
+successful fetch. Rotating the anonymous ID re-scopes the next fetch the same
+way.
+
+**Honest boundaries:**
+
+- **Guaranteed:** after one successful fetch, the last-known-good snapshot
+  survives restarts and is served offline (from the durable record; on hosts
+  without the `sys` save-file API the cache is memory-only and lasts for the
+  process lifetime, like the identity record).
+- **Not guaranteed / not provided:** the SDK never fetches on its own — there
+  is no automatic or interval refresh, no `Cache-Control` interpretation, and
+  no push; every fetch is an explicit call. There is no experiment
+  assignment, no exposure events, and no client-side stats. A config body
+  large enough to approach the documented 512 KB `sys.save` cap — or any
+  body whose durable write fails — is still served and stays the in-process
+  offline fallback, but is not persisted (surfaced via `diagnostics`), and
+  any older persisted record is cleared (best-effort) so a restart serves
+  the game's defaults rather than rolled-back values. Before the first
+  successful fetch on a fresh install, getters serve the caller's defaults.
+- The fetch is **not consent-gated**: config delivery carries no analytics
+  payload — the client id in the URL only scopes which config to serve
+  (consistent across our SDKs). See [`docs/privacy.md`](docs/privacy.md).
+
 ## Crash wire contract
 
 Crashes use a **separate** module and endpoint. The crash client
@@ -321,14 +407,16 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   to the bounded offline spool
   ([above](#offline-durability-event-spool)) — set `spool_enabled = false` for
   a fully memory-only event path.
-- **Durable storage is three small bounded records** per configured app: the
+- **Durable storage is four small bounded records** per configured app: the
   identity record (anonymous ID + consent decision), the offline event spool
   (only envelopes already bound for the wire; cleared on acknowledgment and on
-  consent denial), and a bounded, per-app, TTL'd pending-crash
+  consent denial), a bounded, per-app, TTL'd pending-crash
   sidecar (see the crash note below) that holds the already-PII-scrubbed wire
   body of EVERY dispatched crash report — a live `emit`/`emit_fatal` and a
   previous-session dump forward alike — written before its send attempt and
-  removed as soon as the server acknowledges or terminally rejects it. The identity
+  removed as soon as the server acknowledges or terminally rejects it, and the
+  remote-config cache (the last served config body + ETag, no analytics
+  payload; overwritten by the next successful fetch). The identity
   record is written through
   `sys.get_save_file("shardpilot.<workspace_id>.<app_id>", "identity")` with
   `sys.save`/`sys.load`. The per-app namespace prevents two games on one device
@@ -367,6 +455,12 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   read (a retention limit), and any entry is removed as soon as its report is
   accepted or terminally rejected. See
   [`docs/crash.md`](docs/crash.md#privacy).
+- **Remote config is not consent-gated.** The fetch delivers configuration TO
+  the device and carries no analytics payload; the anonymous client id in the
+  URL only scopes which config to serve (per-client rollout bucketing). A
+  denied analytics consent therefore does not block `fetch_remote_config` —
+  consistent across our SDKs. The cached record holds only the served config
+  body and its ETag.
 - The SDK does not log tokens or full payloads, and makes no
   provider/model/GitHub/billing/account-management write calls. See
   [`docs/privacy.md`](docs/privacy.md) and [`SECURITY.md`](SECURITY.md).
@@ -380,6 +474,7 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 | `shardpilot/envelope.lua` | App-first event envelope construction |
 | `shardpilot/queue.lua` | Bounded in-memory event queue |
 | `shardpilot/transport.lua` | Batch/consent dispatch (`/v1/events:batch`, `/v1/consent`) |
+| `shardpilot/remote_config.lua` | Remote-config fetch (`GET /config/v1/...`), ETag cache, typed getters |
 | `shardpilot/storage.lua` | The **only** module allowed to call `sys.save`/`sys.load` |
 | `shardpilot/clock.lua` · `id.lua` · `platform.lua` · `sampling.lua` | Time, UUIDv7, platform detect, runtime sampling |
 | `shardpilot/version.lua` | Version string constant |
@@ -392,7 +487,7 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 | `shardpilot/crash/dump.lua` | Previous-session native dump → crash event |
 | `game.project` | Defold library metadata (`[library] include_dirs = shardpilot`) |
 | `examples/minimal/` | Copy-pasteable usage example |
-| `test/` | Lua test harness (`test_sdk.lua`, `test_crash.lua`) + Defold collection/script |
+| `test/` | Lua test harness (`test_sdk.lua`, `test_crash.lua`, `test_remote_config.lua`) + Defold collection/script |
 | `docs/` | configuration · events · crash · privacy · release |
 | `scripts/` | `check_library.sh` (content guard), `package_release.sh` |
 
@@ -402,12 +497,13 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   SDK source. The guard greps file *contents* (`grep -RInE`) for these patterns,
   so it flags native references inside tracked files but does not catch a native
   source file added solely by filename — keep the boundary by convention.
-- **No durable I/O beyond the identity record, the event spool, and the
-  crash-retry sidecar.**
+- **No durable I/O beyond the identity record, the event spool, the
+  crash-retry sidecar, and the remote-config cache.**
   `io.*`, `os.execute`, and browser/local storage are forbidden in source;
   `sys.save`/`sys.load`/`sys.get_save_file` are confined to
   `shardpilot/storage.lua`, which writes only the identity record, the bounded
-  offline event spool, and the bounded, TTL'd crash-retry sidecar.
+  offline event spool, the bounded, TTL'd crash-retry sidecar, and the
+  single bounded remote-config cache record.
 - **No raw/provider/token/billing surface.** Terms like `raw_payload`, `prompt`,
   `access_token`, `github_token`, `billing` must not appear in SDK or example
   source.

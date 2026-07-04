@@ -44,6 +44,71 @@ function M.set_consent(analytics_granted)
 	return with_default("set_consent", analytics_granted)
 end
 
+-- Remote config. `fetch_remote_config` reports "not_initialized" through the
+-- result callback too, so a game that only reads the callback still learns
+-- why nothing was fetched. The value getters deliberately do NOT use
+-- with_default: they must return the caller's DEFAULT when the SDK is not
+-- initialized — with_default's `false, "not_initialized"` would be
+-- indistinguishable from a legitimate false flag value.
+function M.fetch_remote_config(callback)
+	local client = default()
+	if not client then
+		if type(callback) == "function" then
+			pcall(callback, { ok = false, from_cache = false, error = "not_initialized" })
+		end
+		return false, "not_initialized"
+	end
+	return client:fetch_remote_config(callback)
+end
+
+function M.remote_config_value(key)
+	local client = default()
+	if not client then
+		return nil
+	end
+	return client:remote_config_value(key)
+end
+
+function M.remote_config_string(key, default_value)
+	local client = default()
+	if not client then
+		return default_value
+	end
+	return client:remote_config_string(key, default_value)
+end
+
+function M.remote_config_number(key, default_value)
+	local client = default()
+	if not client then
+		return default_value
+	end
+	return client:remote_config_number(key, default_value)
+end
+
+function M.remote_config_boolean(key, default_value)
+	local client = default()
+	if not client then
+		return default_value
+	end
+	return client:remote_config_boolean(key, default_value)
+end
+
+function M.remote_config_values()
+	local client = default()
+	if not client then
+		return nil
+	end
+	return client:remote_config_values()
+end
+
+function M.remote_config_version()
+	local client = default()
+	if not client then
+		return nil
+	end
+	return client:remote_config_version()
+end
+
 function M.session_start(props)
 	return with_default("session_start", props)
 end

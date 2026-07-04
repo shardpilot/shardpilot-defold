@@ -10,9 +10,25 @@ function init(self)
 		token_provider = function(callback)
 			callback("client-token-placeholder", nil, nil)
 		end,
+		-- Remote config (optional). A separate endpoint from ingest_url; it
+		-- authenticates with the publishable api_key, so enabling it under
+		-- Mode B requires the api_key too. See docs/configuration.md.
+		remote_config_url = "http://localhost:8081",
+		api_key = "sp_ingest_publishable_placeholder",
 	})
 	shardpilot.identify("user-example")
 	shardpilot.session_start()
+
+	-- Remote config: fetch explicitly (the SDK never fetches on its own).
+	-- Getters serve the durable last-known-good snapshot immediately —
+	-- including offline and before this fetch completes — and the caller's
+	-- default until any configuration is available.
+	shardpilot.fetch_remote_config(function(result)
+		if not result.ok then
+			print("shardpilot remote config unavailable: " .. tostring(result.error))
+		end
+	end)
+	self.spawn_rate = shardpilot.remote_config_number("spawn_rate", 1.0)
 
 	-- Crash reporting. A separate module, endpoint, and crash:write
 	-- key — see docs/crash.md.

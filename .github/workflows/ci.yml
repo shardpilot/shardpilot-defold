@@ -35,3 +35,6 @@ jobs:
 
       - name: Lua crash tests
         run: lua5.4 test/test_crash.lua
+
+      - name: Lua remote-config tests
+        run: lua5.4 test/test_remote_config.lua

@@ -26,10 +26,11 @@ unauthorized — is retained (latest decision wins) and retried at the next
 dispatch point, and `shutdown` will not tear the client down while a decision
 is still waiting on a token.
 
-- Durable storage is limited to three small, bounded records, all written
+- Durable storage is limited to four small, bounded records, all written
   through Defold `sys.save`: the identity record described above, a bounded
-  crash-retry sidecar, and the bounded offline event spool (both described
-  below). No cookies and no other browser or tracking storage.
+  crash-retry sidecar, the bounded offline event spool (both described
+  below), and the remote-config cache (described below). No cookies and no
+  other browser or tracking storage.
 - All persistence goes through Defold `sys.save` only; on HTML5 builds Defold
   backs `sys.save` with browser storage, still limited to those records.
 
@@ -95,6 +96,30 @@ a later launch. This sidecar:
   storage on HTML5); and
 - is **cleared on success** — an entry is removed as soon as its report is
   accepted or terminally rejected, so it never accumulates.
+
+## Remote-config cache
+
+When remote config is enabled (`remote_config_url`), the last successfully
+served configuration is kept in one durable per-app record so a restart or an
+offline launch still gets the previously fetched values. This cache:
+
+- stores only the **served configuration body and its ETag** — data the server
+  sent TO the device — plus the (workspace, environment, client, url) scope
+  string it was fetched for and a fetched-at timestamp; **never tokens**, and
+  no analytics payload of any kind;
+- is **per-app** (namespaced like the identity record) and additionally
+  **scope-checked**: a record written for any other workspace, environment,
+  client id, or endpoint is never served and is overwritten by the next
+  successful fetch;
+- is **one bounded record**, overwritten in place — it cannot accumulate;
+- is **not consent-gated**: the fetch delivers configuration and carries no
+  analytics payload (the anonymous client id in the URL only scopes which
+  configuration to serve, e.g. for per-client rollout percentages), so a
+  denied analytics consent does not block it or clear the cache — consistent
+  across our SDKs; and
+- is **never served after an unauthorized fetch outcome**: a `401`/`403`
+  fails closed instead of serving the cached snapshot, so a revoked key
+  cannot keep supplying configuration.
 - No token logging.
 - No full event payload logging.
 - No anonymous stitching by default.

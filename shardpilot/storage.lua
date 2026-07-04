@@ -842,11 +842,112 @@ function M.spool_is_durable(scope)
 	return save_path(spool_namespace(scope), "spool") ~= nil
 end
 
+-- ── remote-config cache ──────────────────────────────────────────────────────
+--
+-- One durable last-known-good record per app for the remote-config client:
+-- the raw response body plus the ETag it was served with, stamped with the
+-- (workspace, environment, client, url) scope string the fetch was made for.
+-- The scope check itself lives in the remote-config client; this store only
+-- persists and validates the record shape. The cache is best-effort — a
+-- failed write costs only offline serving, never the fetched values.
+
+local remote_config_memory = {}
+
+-- Defold documents that sys.save caps a saved table at 512 KB. A body that
+-- alone approaches the cap is refused up front (matching the spool's byte
+-- clamp) so the write cannot fail at the sys layer with the record half
+-- formed; the previously cached record stays untouched.
+local max_remote_config_body_bytes = 393216
+
+local function remote_config_record(record)
+	return {
+		scope = record.scope,
+		etag = type(record.etag) == "string" and record.etag or "",
+		body = record.body,
+		fetched_at_ms = type(record.fetched_at_ms) == "number" and record.fetched_at_ms or 0,
+	}
+end
+
+-- Load the cached remote-config record for this app (the same per-app
+-- namespace scheme as the spool), or nil when absent or unusable. A record
+-- without a scope stamp cannot be attributed to any (workspace, environment,
+-- client, url) tuple, and one without a body has nothing to serve — both
+-- read as no cache. Never throws.
+function M.load_remote_config(scope)
+	local ns = spool_namespace(scope)
+	local record = nil
+	local path = save_path(ns, "remote-config")
+	if path then
+		local ok, loaded = pcall(sys.load, path)
+		if ok and type(loaded) == "table" then
+			record = loaded
+		end
+	end
+	if record == nil then
+		record = remote_config_memory[ns]
+	end
+	if type(record) ~= "table"
+		or type(record.scope) ~= "string" or record.scope == ""
+		or type(record.body) ~= "string" or record.body == "" then
+		return nil
+	end
+	return remote_config_record(record)
+end
+
+-- Drop the cached remote-config record: an empty record is written in its
+-- place (which loads as "no cache") and the in-memory fallback is cleared.
+-- Used when a newer configuration was served but could not overwrite the
+-- record — the stale copy must not be revived by a later launch. Returns
+-- true when the clear landed.
+function M.clear_remote_config(scope)
+	local ns = spool_namespace(scope)
+	local path = save_path(ns, "remote-config")
+	if not path then
+		remote_config_memory[ns] = nil
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, {})
+	if not (ok and saved == true) then
+		return false
+	end
+	remote_config_memory[ns] = nil
+	return true
+end
+
+-- Replace the cached remote-config record (`{ scope, etag, body,
+-- fetched_at_ms }`). Returns true when stored — in the durable save file, or
+-- in the in-memory fallback on hosts without the save-file API (which then
+-- lasts only for the process lifetime, like the identity record).
+function M.save_remote_config(scope, record)
+	if type(record) ~= "table"
+		or type(record.scope) ~= "string" or record.scope == ""
+		or type(record.body) ~= "string" or record.body == "" then
+		return false
+	end
+	if #record.body > max_remote_config_body_bytes then
+		return false
+	end
+	local ns = spool_namespace(scope)
+	local stored = remote_config_record(record)
+	local path = save_path(ns, "remote-config")
+	if not path then
+		remote_config_memory[ns] = stored
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, stored)
+	if not (ok and saved == true) then
+		return false
+	end
+	remote_config_memory[ns] = stored
+	return true
+end
+
 -- Clears the in-memory fallback records only; intended for tests.
 function M.reset()
 	memory_records = {}
 	pending_memory = {}
 	spool_memory = {}
+	remote_config_memory = {}
 end
 
 return M
