@@ -37,10 +37,6 @@ local M = {}
 
 local config_route_prefix = "/config/v1/"
 
--- Scope components are joined with the unit-separator control character,
--- which can survive in neither a validated base URL nor a non-empty
--- identifier segment, so two distinct (workspace, environment, client, url)
--- tuples can never collide into one scope string.
 local scope_separator = "\31"
 
 local function trim_slash(value)
@@ -49,7 +45,9 @@ end
 
 -- Percent-escape everything outside the RFC 3986 unreserved set, so an
 -- identifier containing "/", "%", or spaces cannot smuggle extra path
--- segments into the fetch URL.
+-- segments into the fetch URL. The escaping is injective (every escaped
+-- character has exactly one spelling, "%" itself included), so two distinct
+-- raw strings can never escape to the same output.
 local function escape_segment(value)
 	return (value:gsub("[^%w%-%._~]", function(ch)
 		return string.format("%%%02X", string.byte(ch))
@@ -63,30 +61,40 @@ function M.build_url(base_url, workspace_id, environment_id, client_id)
 		.. escape_segment(client_id)
 end
 
--- The base URL is re-trimmed here (client.lua already normalizes it once) so
--- equivalent spellings of the same endpoint can never produce distinct scopes.
+-- Scope components are escaped like URL segments — the identifiers are only
+-- validated as non-empty strings, so a raw join would be ambiguous when a
+-- component itself contains the separator byte — and then joined with a
+-- separator no escaped component can contain. Two distinct (workspace,
+-- environment, client, url) tuples therefore can never collide into one
+-- scope string. The base URL is re-trimmed here (client.lua already
+-- normalizes it once) so equivalent spellings of the same endpoint can never
+-- produce distinct scopes.
 function M.build_scope(workspace_id, environment_id, client_id, base_url)
-	return (workspace_id or "") .. scope_separator
-		.. (environment_id or "") .. scope_separator
-		.. (client_id or "") .. scope_separator
+	return escape_segment(workspace_id or "") .. scope_separator
+		.. escape_segment(environment_id or "") .. scope_separator
+		.. escape_segment(client_id or "") .. scope_separator
 		.. trim_slash(base_url or "")
 end
 
 -- Decode a JSON object body. Returns the decoded table, or nil for anything
--- unusable: no decoder on this runtime, unparseable text, a non-table result,
--- or a top-level array (an array decodes to a table with positional keys —
--- configuration is a keyed object, so index 1 being present marks it as not
--- an object; an empty array is indistinguishable from an empty object in Lua
--- and reads as an empty configuration, which is harmless). Never throws.
+-- unusable: no decoder on this runtime, unparseable text, or a non-object
+-- payload. Objectness is checked on the TEXT (the first significant
+-- character must be "{") because it cannot be told from the decoded value —
+-- an empty array decodes to the same Lua table as an empty object, and
+-- accepting `[]` would overwrite a good cache with an empty configuration.
+-- Never throws.
 local function decode_object(body)
 	if type(body) ~= "string" or body == "" then
+		return nil
+	end
+	if not body:match("^%s*{") then
 		return nil
 	end
 	if not json or type(json.decode) ~= "function" then
 		return nil
 	end
 	local ok, decoded = pcall(json.decode, body)
-	if not ok or type(decoded) ~= "table" or decoded[1] ~= nil then
+	if not ok or type(decoded) ~= "table" then
 		return nil
 	end
 	return decoded
@@ -247,12 +255,15 @@ function M.new(config, identity)
 		-- fails, so a later offline fetch falls back to the FRESHEST served
 		-- configuration rather than reviving an older on-disk record.
 		cache = nil,
-		-- Requests are numbered and only the newest may install its outcome
-		-- (snapshot + cache): with two fetches in flight, responses can
-		-- arrive out of order, and an older response must not roll the
-		-- getters or the cache back after a newer one was already applied.
+		-- Requests are numbered, and `settled_seq` is the highest sequence
+		-- whose response has completed — success OR failure. Only a fetch
+		-- newer than every settled one may install its outcome (snapshot +
+		-- cache): with two fetches in flight, responses can arrive out of
+		-- order, and an older success must neither roll back a newer
+		-- configuration nor sneak values in after a newer response already
+		-- failed closed (unauthorized/permanent).
 		fetch_seq = 0,
-		applied_seq = 0,
+		settled_seq = 0,
 	}, RemoteConfig)
 	-- Serve the persisted last-known-good snapshot immediately after a
 	-- restart: getters work before (and without) any fetch when a cache for
@@ -321,17 +332,34 @@ function RemoteConfig:diagnose(status)
 	end
 end
 
--- Install an applied fetch outcome: the in-process cache record, the durable
--- copy (best-effort), and the getter snapshot. Guarded by the request
--- sequence so only the newest fetch may install — an older response arriving
--- late must not roll a newer configuration back. The snapshot is a defensive
--- copy: the result table is handed to game code, and a callback that mutates
--- `result.values` must not corrupt what later getters read.
+-- Settle a completed fetch and, when it may, install its outcome: the
+-- in-process cache record, the durable copy (best-effort), and the getter
+-- snapshot. Three gates apply, in order:
+--   * the sequence fence — EVERY completed fetch (success or failure)
+--     settles its sequence, and only a fetch newer than every settled one
+--     may install, so an older success can neither roll back a newer
+--     configuration nor sneak values in after a newer fail-closed outcome;
+--   * only successful results install — a failure settles the fence and
+--     nothing else;
+--   * the scope must still be current — an identity rotated while the
+--     response was in flight makes the response another client's
+--     configuration (a different rollout bucket), which must not be served
+--     or persisted.
+-- The snapshot is a defensive copy: the result table is handed to game code,
+-- and a callback that mutates `result.values` must not corrupt what later
+-- getters read.
 function RemoteConfig:install(seq, result, new_cache, scope)
-	if not result.ok or seq <= self.applied_seq then
+	if seq <= self.settled_seq then
 		return
 	end
-	self.applied_seq = seq
+	self.settled_seq = seq
+	if not result.ok then
+		return
+	end
+	local current_id = self:client_id()
+	if not current_id or self:scope_for(current_id) ~= scope then
+		return
+	end
 	if new_cache then
 		new_cache.scope = scope
 		-- The in-process record is updated even when the durable write
@@ -339,9 +367,13 @@ function RemoteConfig:install(seq, result, new_cache, scope)
 		-- fallback for this process either way.
 		self.cache = new_cache
 		if not storage.save_remote_config(self.config, new_cache) then
-			-- Best-effort: the fetched values are already being served;
-			-- only the offline last-known-good copy across a RESTART is
-			-- at risk.
+			-- An older durable record may still be on disk, and a restart
+			-- would revive it OVER the newer configuration just served.
+			-- Clear it (best-effort — with the storage backend itself down
+			-- this fails too and the stale record is at least superseded in
+			-- this process): a restart then starts from the game's defaults
+			-- rather than from rolled-back values.
+			storage.clear_remote_config(self.config)
 			self:diagnose("cache_persist_failed")
 		end
 	end

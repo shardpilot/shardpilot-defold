@@ -307,6 +307,10 @@ local function test_build_scope_keeps_distinct_tuples_distinct()
 		remote_config.build_scope("ws", "env", "anon", "http://localhost:18081")
 			~= remote_config.build_scope("ws", "env", "anon", "http://localhost:28081"),
 		"the same identity against two endpoints must not share one scope")
+	assert_true(
+		remote_config.build_scope("ws\31env", "x", "anon", "http://localhost:18081")
+			~= remote_config.build_scope("ws", "env\31x", "anon", "http://localhost:18081"),
+		"a separator byte inside a component must not shift the tuple boundaries")
 	assert_equal(
 		remote_config.build_scope("ws", "env", "anon", "http://localhost:18081"),
 		remote_config.build_scope("ws", "env", "anon", "http://localhost:18081/"),
@@ -526,7 +530,7 @@ local function test_malformed_response_serves_cache_or_fails()
 	local client = assert(sdk.new(config()))
 
 	-- With no cache, a 200 whose body is not a JSON object fails...
-	for _, body in ipairs({ "not json", "[1,2]", "" }) do
+	for _, body in ipairs({ "not json", "[1,2]", "[]", "" }) do
 		next_status = 200
 		next_response_body = body
 		local result = fetch(client)
@@ -534,17 +538,22 @@ local function test_malformed_response_serves_cache_or_fails()
 		assert_equal(result.error, "malformed_response")
 	end
 
-	-- ...and with a cache it degrades to the snapshot, like any transient.
+	-- ...and with a cache it degrades to the snapshot, like any transient —
+	-- including `[]`, which decodes to the same Lua table as an empty object
+	-- and must not be accepted as a fresh empty configuration.
 	next_status = 200
 	next_response_body = values_body({ a = 2 })
 	fetch(client)
-	next_status = 200
-	next_response_body = "garbage"
-	local result = fetch(client)
-	assert_true(result.ok)
-	assert_equal(result.from_cache, true)
-	assert_equal(result.error, "malformed_response")
-	assert_equal(result.values.a, 2)
+	for _, body in ipairs({ "garbage", "[]" }) do
+		next_status = 200
+		next_response_body = body
+		local result = fetch(client)
+		assert_true(result.ok)
+		assert_equal(result.from_cache, true)
+		assert_equal(result.error, "malformed_response")
+		assert_equal(result.values.a, 2,
+			"a malformed body must not overwrite the last-known-good configuration")
+	end
 end
 
 local function test_permanent_http_error_fails_without_serving_cache()
@@ -630,6 +639,75 @@ local function test_out_of_order_responses_do_not_install_stale_config()
 		"the stale response must not have overwritten the cache record")
 	assert_true(result.ok, result.error)
 	assert_equal(result.values.v, 2)
+end
+
+local function test_fail_closed_fences_older_inflight_success()
+	reset()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	fetch(client)
+
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		held[#held + 1] = callback
+	end
+	local results = {}
+	client:fetch_remote_config(function(result)
+		results.older = result
+	end)
+	client:fetch_remote_config(function(result)
+		results.newer = result
+	end)
+	http.request = saved_request
+
+	-- The NEWER fetch fails closed first (a revoked key)...
+	held[2](nil, nil, { status = 401 })
+	assert_equal(results.newer.ok, false)
+	assert_equal(results.newer.error, "unauthorized")
+
+	-- ...so the older in-flight success must not install after it: the
+	-- latest outcome for this configuration was "you may not read it".
+	held[1](nil, nil, {
+		status = 200,
+		response = values_body({ a = 99 }, 9),
+		headers = { etag = '"late"' },
+	})
+	assert_true(results.older.ok, "the older fetch still reports its own response")
+	assert_equal(client:remote_config_number("a", 0), 1,
+		"values must not sneak in after a newer fail-closed outcome")
+	assert_equal(client:remote_config_version(), 1)
+end
+
+local function test_identity_rotation_drops_inflight_response()
+	reset()
+	local client = assert(sdk.new(config()))
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		held[#held + 1] = callback
+	end
+	local result = nil
+	client:fetch_remote_config(function(value)
+		result = value
+	end)
+	http.request = saved_request
+
+	-- The identity rotates while the GET for the previous client id is in
+	-- flight; that response is another client's rollout bucket.
+	assert_true(client:set_anonymous_id("anon-other"))
+	held[1](nil, nil, {
+		status = 200,
+		response = values_body({ bucket = "old" }),
+		headers = { etag = '"old"' },
+	})
+
+	assert_true(result.ok, "the caller still receives the response it asked for")
+	assert_nil(client:remote_config_values(),
+		"a response for the previous identity must not be served after rotation")
+	assert_nil(storage.load_remote_config(client.config),
+		"a response for the previous identity must not be persisted after rotation")
 end
 
 local function test_callback_mutation_cannot_corrupt_the_snapshot()
@@ -834,6 +912,40 @@ local function test_failed_cache_write_keeps_the_freshest_fallback()
 	assert_equal(offline.values.v, 2,
 		"a failed cache write must not revive the older on-disk configuration")
 	assert_equal(offline.version, 2)
+end
+
+local function test_unpersistable_fresh_config_clears_stale_durable_record()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ v = 1 }, 1)
+	fetch(client)
+
+	-- A fresh configuration too large for the save-file budget is served but
+	-- cannot persist; the OLDER durable record must not survive it, or a
+	-- restart would revive rolled-back values.
+	next_response_body = values_body({ v = 2, blob = string.rep("x", 400000) }, 2)
+	local fresh = fetch(client)
+	assert_true(fresh.ok, fresh.error)
+	assert_equal(fresh.from_cache, false)
+	assert_equal(client:remote_config_number("v", 0), 2)
+	assert_nil(storage.load_remote_config(client.config),
+		"the stale durable record must be cleared when the overwrite cannot land")
+
+	-- Same process: the freshest configuration is still the offline fallback.
+	next_status = 0
+	next_response_body = nil
+	local offline = fetch(client)
+	assert_true(offline.ok)
+	assert_equal(offline.values.v, 2)
+
+	-- After a restart there is nothing to revive: getters serve defaults (an
+	-- honest miss) rather than the rolled-back configuration.
+	local relaunched = assert(sdk.new(config()))
+	assert_nil(relaunched:remote_config_values())
+
+	restore()
 end
 
 local function test_anonymous_id_rotation_moves_the_scope()
@@ -1059,6 +1171,8 @@ local tests = {
 	test_malformed_response_serves_cache_or_fails,
 	test_permanent_http_error_fails_without_serving_cache,
 	test_out_of_order_responses_do_not_install_stale_config,
+	test_fail_closed_fences_older_inflight_success,
+	test_identity_rotation_drops_inflight_response,
 	test_callback_mutation_cannot_corrupt_the_snapshot,
 	test_unwrapped_payload_is_served_as_the_map,
 	test_cache_from_another_scope_is_a_miss_and_gets_overwritten,
@@ -1066,6 +1180,7 @@ local tests = {
 	test_restart_serves_last_known_good_and_offline_fetch_uses_it,
 	test_corrupt_cache_record_reads_as_a_miss,
 	test_failed_cache_write_keeps_the_freshest_fallback,
+	test_unpersistable_fresh_config_clears_stale_durable_record,
 	test_anonymous_id_rotation_moves_the_scope,
 	test_typed_getters_serve_defaults_on_miss_and_type_mismatch,
 	test_getters_without_remote_config_serve_defaults,

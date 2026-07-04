@@ -894,6 +894,26 @@ function M.load_remote_config(scope)
 	return remote_config_record(record)
 end
 
+-- Drop the cached remote-config record: an empty record is written in its
+-- place (which loads as "no cache") and the in-memory fallback is cleared.
+-- Used when a newer configuration was served but could not overwrite the
+-- record — the stale copy must not be revived by a later launch. Returns
+-- true when the clear landed.
+function M.clear_remote_config(scope)
+	local ns = spool_namespace(scope)
+	local path = save_path(ns, "remote-config")
+	if not path then
+		remote_config_memory[ns] = nil
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, {})
+	if not (ok and saved == true) then
+		return false
+	end
+	remote_config_memory[ns] = nil
+	return true
+end
+
 -- Replace the cached remote-config record (`{ scope, etag, body,
 -- fetched_at_ms }`). Returns true when stored — in the durable save file, or
 -- in the in-memory fallback on hosts without the save-file API (which then

@@ -16,9 +16,12 @@
     (offline, `429`, `5xx`, malformed body) — serves the cached snapshot with
     `from_cache = true`. The snapshot survives restarts, so an offline launch
     still gets the last served configuration. Responses arriving out of
-    order (two fetches in flight) can never roll a newer configuration back,
-    and a failed cache write keeps the freshest served configuration as the
-    in-process fallback rather than reviving an older on-disk record.
+    order (two fetches in flight) can never roll a newer configuration back
+    or sneak values in after a newer fail-closed outcome; a response for an
+    identity rotated away mid-flight is dropped; and a failed cache write
+    keeps the freshest served configuration as the in-process fallback while
+    clearing the superseded durable record, so neither this process nor a
+    restart can revive rolled-back values.
   - **Fail-closed on `401`/`403`; permanent errors never serve the cache.**
     An unauthorized fetch reports `unauthorized` and never serves the cached
     snapshot (a revoked or wrong key must not keep supplying configuration);

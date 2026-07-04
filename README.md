@@ -375,9 +375,10 @@ way.
   assignment, no exposure events, and no client-side stats. A config body
   large enough to approach the documented 512 KB `sys.save` cap — or any
   body whose durable write fails — is still served and stays the in-process
-  offline fallback, but is not persisted (surfaced via `diagnostics`; only
-  offline serving across a *restart* is lost). Before the first successful
-  fetch on a fresh install, getters serve the caller's defaults.
+  offline fallback, but is not persisted (surfaced via `diagnostics`), and
+  any older persisted record is cleared (best-effort) so a restart serves
+  the game's defaults rather than rolled-back values. Before the first
+  successful fetch on a fresh install, getters serve the caller's defaults.
 - The fetch is **not consent-gated**: config delivery carries no analytics
   payload — the client id in the URL only scopes which config to serve
   (consistent across our SDKs). See [`docs/privacy.md`](docs/privacy.md).
