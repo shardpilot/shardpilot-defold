@@ -785,6 +785,71 @@ local function test_malformed_wrapped_values_member_is_rejected()
 		"a malformed wrapper must not overwrite the last-known-good configuration")
 end
 
+local function test_null_values_member_is_malformed()
+	reset()
+	local client = assert(sdk.new(config()))
+
+	-- With no cache, a wrapper whose `values` member is null must fail: the
+	-- decoder maps null to nil, which looks like an absent member, and the
+	-- unwrapped fallback would otherwise serve wrapper fields as config.
+	next_status = 200
+	next_response_body = '{"version":3,"values":null}'
+	local result = fetch(client)
+	assert_equal(result.ok, false)
+	assert_equal(result.error, "malformed_response")
+	assert_nil(client:remote_config_value("version"),
+		"wrapper fields must never surface as configuration values")
+
+	-- With a cache it degrades to the snapshot without overwriting it.
+	next_response_body = values_body({ a = 2 }, 2)
+	fetch(client)
+	next_response_body = '{"version":9,"values":null}'
+	result = fetch(client)
+	assert_true(result.ok)
+	assert_equal(result.from_cache, true)
+	assert_equal(result.error, "malformed_response")
+	assert_equal(client:remote_config_number("a", 0), 2)
+end
+
+local function test_stale_scope_response_does_not_fence_current_scope()
+	reset()
+	local client = assert(sdk.new(config()))
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		held[#held + 1] = callback
+	end
+
+	-- Fetch for the original identity, rotate away, fetch again, rotate
+	-- back: two requests in flight, one per scope.
+	local results = {}
+	client:fetch_remote_config(function(result)
+		results.original = result
+	end)
+	assert_true(client:set_anonymous_id("anon-other"))
+	client:fetch_remote_config(function(result)
+		results.other = result
+	end)
+	assert_true(client:set_anonymous_id("anon-client"))
+	http.request = saved_request
+
+	-- The stale-scope request fails closed AFTER the rotation back. It is
+	-- void end-to-end: it must not settle the fence for the current scope.
+	held[2](nil, nil, { status = 401 })
+	assert_equal(results.other.ok, false)
+
+	-- The current-scope response — an older sequence — must still install.
+	held[1](nil, nil, {
+		status = 200,
+		response = values_body({ a = 3 }, 3),
+		headers = { etag = '"v3"' },
+	})
+	assert_true(results.original.ok)
+	assert_equal(client:remote_config_number("a", 0), 3,
+		"a stale-scope outcome must not fence off the current scope's fetch")
+	assert_equal(client:remote_config_version(), 3)
+end
+
 local function test_cache_discovered_at_fetch_time_is_adopted()
 	reset()
 	-- Two same-app clients exist before any configuration is cached...
@@ -1346,6 +1411,8 @@ local tests = {
 	test_identity_rotation_drops_inflight_response,
 	test_transient_cache_hit_does_not_fence_inflight_fresh,
 	test_malformed_wrapped_values_member_is_rejected,
+	test_null_values_member_is_malformed,
+	test_stale_scope_response_does_not_fence_current_scope,
 	test_cache_discovered_at_fetch_time_is_adopted,
 	test_empty_array_values_member_is_malformed,
 	test_fetch_after_shutdown_is_rejected,

@@ -100,14 +100,16 @@ local function decode_object(body)
 	return decoded
 end
 
--- Whether the top-level `values` member in the body TEXT is an object.
--- Needed only when the member decoded to an EMPTY table, where Lua cannot
--- tell `{}` from `[]`. The scan is string- and depth-aware, so a nested
+-- The first significant character of the top-level `values` member's value
+-- in the body TEXT ("{" for an object, "[" for an array, "n" for null, and
+-- so on), or nil when the body has no such member. The decoded Lua value
+-- cannot answer this alone: an empty array decodes to the same table as an
+-- empty object, and a JSON null is commonly decoded to nil — identical to
+-- the member being absent. The scan is string- and depth-aware, so a nested
 -- `values` key or a string value spelled "values" cannot be mistaken for
--- the top-level member; an unfindable member reads as not-an-object, which
--- fails toward `malformed_response` (the safe direction). Escaped key
--- spellings are not decoded — they also read as not-found.
-local function empty_values_member_is_object(body)
+-- the top-level member; escaped key spellings are not decoded and read as
+-- not-found, which fails toward `malformed_response` (the safe direction).
+local function top_level_values_char(body)
 	local depth = 0
 	local i = 1
 	local n = #body
@@ -140,7 +142,10 @@ local function empty_values_member_is_object(body)
 					while k <= n and body:sub(k, k):match("%s") do
 						k = k + 1
 					end
-					return body:sub(k, k) == "{"
+					if k <= n then
+						return body:sub(k, k)
+					end
+					return nil
 				end
 			end
 			i = j + 1
@@ -154,7 +159,7 @@ local function empty_values_member_is_object(body)
 			i = i + 1
 		end
 	end
-	return false
+	return nil
 end
 
 -- The endpoint answers `{ "version": <number>, "values": { key: value } }`.
@@ -162,12 +167,13 @@ end
 -- is a JSON object WITHOUT a `values` member is served as the map itself, so
 -- an unwrapped payload (fixtures, older servers) still works. A wrapper whose
 -- `values` member is present but not a keyed object (a string, number,
--- boolean, or an array — e.g. after a server-side schema bug) is MALFORMED:
--- falling back to serving the wrapper would expose wrapper fields as
--- configuration and overwrite the last-known-good cache. An EMPTY array is
--- caught by re-checking the body text, since it decodes to the same Lua
--- table as an empty object. Returns (values, version), or nil for a
--- malformed wrapper.
+-- boolean, null, or an array — e.g. after a server-side schema bug) is
+-- MALFORMED: falling back to serving the wrapper would expose wrapper fields
+-- as configuration and overwrite the last-known-good cache. The two shapes
+-- the decoded value cannot settle on its own are re-checked on the body
+-- text: an empty array (it decodes to the same Lua table as an empty
+-- object) and a JSON null (commonly decoded to nil, identical to an absent
+-- member). Returns (values, version), or nil for a malformed wrapper.
 local function extract(decoded, body)
 	local version = type(decoded.version) == "number" and decoded.version or nil
 	local values = decoded.values
@@ -175,10 +181,16 @@ local function extract(decoded, body)
 		if type(values) ~= "table" or values[1] ~= nil then
 			return nil
 		end
-		if next(values) == nil and not empty_values_member_is_object(body) then
+		if next(values) == nil and top_level_values_char(body) ~= "{" then
 			return nil
 		end
 		return values, version
+	end
+	if top_level_values_char(body) ~= nil then
+		-- The body HAS a `values` member the decoder could not deliver as a
+		-- table (a JSON null, or a value the runtime maps to nil): malformed,
+		-- not an unwrapped payload.
+		return nil
 	end
 	return decoded, version
 end
@@ -434,10 +446,14 @@ end
 --     from it and the snapshot already agrees — and adopting a captured
 --     older record could roll back a fresher body installed while the
 --     response was in flight;
---   * the scope must still be current — an identity rotated while the
---     response was in flight makes the response another client's
---     configuration (a different rollout bucket), which must not be served
---     or persisted.
+--   * the scope must still be current — checked BEFORE anything settles: an
+--     identity rotated while the response was in flight makes the response
+--     another client's configuration (a different rollout bucket), which
+--     must not be served or persisted — and it says nothing about the
+--     CURRENT scope's configuration either, so it must not settle the fence
+--     (after a rotation there and back, a stale-scope outcome would
+--     otherwise fence off a still-in-flight response for the scope rotated
+--     back to).
 -- The snapshot is a defensive copy: the result table is handed to game code,
 -- and a callback that mutates `result.values` must not corrupt what later
 -- getters read.
@@ -445,14 +461,14 @@ function RemoteConfig:install(seq, result, new_cache, scope, authoritative, serv
 	if seq <= self.settled_seq then
 		return
 	end
+	local current_id = self:client_id()
+	if not current_id or self:scope_for(current_id) ~= scope then
+		return
+	end
 	if authoritative then
 		self.settled_seq = seq
 	end
 	if not result.ok then
-		return
-	end
-	local current_id = self:client_id()
-	if not current_id or self:scope_for(current_id) ~= scope then
 		return
 	end
 	if new_cache then
