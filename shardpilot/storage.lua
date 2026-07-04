@@ -454,7 +454,6 @@ function M.save_pending_crash(scope, entry, token, created_at_ms)
 	if type(entry) ~= "table" or type(entry.body) ~= "string" or entry.body == "" then
 		return nil
 	end
-	local stamp = type(created_at_ms) == "number" and created_at_ms or now_ms()
 	if #entry.body > max_pending_record_bytes then
 		return nil
 	end
@@ -467,7 +466,13 @@ function M.save_pending_crash(scope, entry, token, created_at_ms)
 	if not save_path(ns) then
 		return nil
 	end
+	-- Read (and thereby ADOPT any legacy, un-stamped entries) BEFORE taking
+	-- the new report's timestamp: adoption stamps legacy entries with the
+	-- read-time clock, and the resend pass orders by created_at — a new
+	-- report stamped earlier than the older backlog it queues behind would
+	-- jump the line (and a 429 on it would strand the true oldest).
 	local items, deadline = read_pending_record(ns)
+	local stamp = type(created_at_ms) == "number" and created_at_ms or now_ms()
 	-- Defensive copy so a later caller mutation cannot reach the stored snapshot.
 	local stored = {}
 	for i = 1, #items do

@@ -197,11 +197,13 @@ the body.
 - **Bounds.** At most **8 reports**, each at most **64 KB** encoded, at most
   **384 KB** total (Defold documents a 512 KB `sys.save` cap; the budget stays
   well under it). When a bound is exceeded the oldest **non-fatal** reports
-  are evicted first, then the oldest fatal — a burst of handled errors can
-  never displace a pending fatal crash, and the report being saved is never
-  the one evicted. A report whose body alone exceeds the per-record cap is
-  rejected up front without evicting anything. Entries older than about seven
-  days are discarded on read (a local retention limit).
+  are evicted first; the oldest **fatal** report is evicted only to admit
+  another FATAL one — a sidecar full of fatal reports REJECTS a non-fatal
+  newcomer outright (it falls to the session-only memory retention) rather
+  than displacing a fatal crash, and the report being saved is never the one
+  evicted. A report whose body alone exceeds the per-record cap is rejected
+  up front without evicting anything. Entries older than about seven days
+  are discarded on read (a local retention limit).
 - **Durable means durable.** `save` returns a removable token only when the
   entry is confirmed written to the durable store. When the durable write
   fails outright (quota, no `sys` API), the report is retained **in memory
