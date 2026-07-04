@@ -609,10 +609,11 @@ function M.load_pending_crashes(scope)
 	return out
 end
 
--- Return the pending entries as { token, body|report, crash_id?, fatal }
--- records — oldest first — so a resend can address (remove / re-persist)
--- each entry individually, plus the stored resend-backpressure deadline (ms
--- epoch, or nil).
+-- Return the pending entries as
+-- { token, body|report, crash_id?, fatal, created_at } records — oldest
+-- first — so a resend can address (remove / re-persist) each entry
+-- individually and merge them by age with any session-only retained
+-- reports, plus the stored resend-backpressure deadline (ms epoch, or nil).
 function M.load_pending_entries(scope)
 	local ns = pending_namespace(scope)
 	local items, deadline = read_pending_record(ns)
@@ -624,6 +625,7 @@ function M.load_pending_entries(scope)
 			report = items[i].report,
 			crash_id = items[i].crash_id,
 			fatal = items[i].fatal,
+			created_at = items[i].created_at,
 		}
 	end
 	return out, deadline

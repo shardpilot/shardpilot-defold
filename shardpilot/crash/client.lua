@@ -329,6 +329,11 @@ function Client:retain_in_memory_pending(entry)
 	end
 	self.in_memory_pending_seq = self.in_memory_pending_seq + 1
 	local token = "mem:" .. tostring(self.in_memory_pending_seq)
+	-- Stamp the retention time so the resend pass can merge memory-retained
+	-- reports with the on-disk backlog by ACTUAL age (a memory entry can be
+	-- older than a later report whose durable save succeeded).
+	local ok_ms, ms = pcall(require("shardpilot.clock").unix_ms)
+	entry.created_at = (ok_ms and type(ms) == "number") and ms or 0
 	self.in_memory_pending[token] = entry
 	return token
 end
@@ -518,6 +523,19 @@ function Client:emit_internal(event, fatal, trusted_frame_functions, prepare_opt
 		-- backpressure discipline — never concurrently with it.
 		return true
 	end
+	-- Honor a stored server backpressure window for NON-fatal live reports:
+	-- the server explicitly asked us to wait, and a retained handled-error
+	-- report loses nothing by waiting the window out (it dispatches with the
+	-- next pass). A FATAL report still fires immediately — the process may
+	-- be dying and this is its only chance at the network; the write-ahead
+	-- record above already guarantees a duplicate-safe retry either way.
+	if not fatal and pending_token then
+		local _, window = storage.load_pending_entries(self:pending_scope())
+		if type(window) == "number" then
+			self.stats.resend_deferred_until_ms = window
+			return true
+		end
+	end
 	return self:dispatch_pending(entry)
 end
 
@@ -588,31 +606,43 @@ function Client:resend_pending()
 		-- A pass is already running; it covers the current backlog.
 		return true
 	end
+	-- Merge the on-disk backlog and the session-only memory retention by
+	-- ACTUAL age: a memory-retained report (one whose durable save failed)
+	-- can be OLDER than a later report whose save succeeded, and the pass
+	-- must send oldest first so a mid-pass 429 never strands the oldest
+	-- reports behind newer ones. Ties (and entries without a stamp) keep
+	-- disk before memory, each store in its own stable order. Snapshot the
+	-- memory tokens before dispatching: a synchronous transport stub may
+	-- settle and remove an entry mid-iteration.
 	local queue = {}
 	local entries, deadline = storage.load_pending_entries(self:pending_scope())
 	if type(entries) == "table" then
-		for _, entry in ipairs(entries) do
+		for i, entry in ipairs(entries) do
 			if type(entry) == "table" and type(entry.token) == "string" and
 				(type(entry.body) == "string" or type(entry.report) == "table") then
-				queue[#queue + 1] = entry
+				queue[#queue + 1] = {
+					token = entry.token,
+					body = entry.body,
+					report = entry.report,
+					crash_id = entry.crash_id,
+					fatal = entry.fatal,
+					created_at = type(entry.created_at) == "number" and entry.created_at or 0,
+					store_rank = 0,
+					stable_rank = i,
+				}
 			end
 		end
 	end
-	-- In-session in-memory fallback entries (reports that could not be
-	-- persisted to disk) go after the on-disk backlog: the disk entries are
-	-- from earlier launches and therefore older. Snapshot the tokens before
-	-- dispatching: a synchronous transport stub may settle and remove the
-	-- entry mid-iteration.
 	local mem_tokens = {}
 	for token in pairs(self.in_memory_pending) do
 		mem_tokens[#mem_tokens + 1] = token
 	end
-	-- Numeric order by the minted sequence: a lexicographic sort would send
-	-- "mem:10" before "mem:3" and let a mid-pass 429 skip older reports.
+	-- Numeric order by the minted sequence: a lexicographic sort would put
+	-- "mem:10" before "mem:3".
 	table.sort(mem_tokens, function(left, right)
 		return (tonumber(left:match("^mem:(%d+)$")) or 0) < (tonumber(right:match("^mem:(%d+)$")) or 0)
 	end)
-	for _, token in ipairs(mem_tokens) do
+	for i, token in ipairs(mem_tokens) do
 		local entry = self.in_memory_pending[token]
 		if type(entry) == "table" then
 			queue[#queue + 1] = {
@@ -620,9 +650,21 @@ function Client:resend_pending()
 				body = entry.body,
 				report = entry.report,
 				fatal = entry.fatal,
+				created_at = type(entry.created_at) == "number" and entry.created_at or 0,
+				store_rank = 1,
+				stable_rank = i,
 			}
 		end
 	end
+	table.sort(queue, function(left, right)
+		if left.created_at ~= right.created_at then
+			return left.created_at < right.created_at
+		end
+		if left.store_rank ~= right.store_rank then
+			return left.store_rank < right.store_rank
+		end
+		return left.stable_rank < right.stable_rank
+	end)
 	if #queue == 0 then
 		-- Nothing pending: any surfaced deferral is over too.
 		self.stats.resend_deferred_until_ms = nil

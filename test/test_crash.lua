@@ -4556,6 +4556,63 @@ local function test_token_refresh_enforces_byte_budget()
 	storage.reset()
 end
 
+-- The resend pass merges memory-retained and on-disk reports by ACTUAL age:
+-- an older report whose durable save failed must go out before a newer one
+-- that persisted, so a mid-pass 429 never strands the oldest.
+local function test_resend_merges_memory_and_disk_by_age()
+	reset()
+	local restore = install_fake_sys_storage()
+
+	next_status = 500
+	local client = assert(crash.new(config({ app_id = "age-merge-app", sample_every = 1 })))
+	-- OLDER report: force its durable save to fail (memory retention).
+	local saved_save = sys.save
+	sys.save = function()
+		return false
+	end
+	assert_true(client:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "OLDERx" } })))
+	sys.save = saved_save
+	-- NEWER report: persists durably.
+	assert_true(client:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "NEWERx" } })))
+	assert_equal(client:snapshot().persist_failed, 1, "the older report fell to memory retention")
+	assert_equal(client:snapshot().persisted, 1, "the newer report persisted durably")
+
+	reset()
+	next_status = 202
+	client:resend_pending()
+	assert_true(#requests >= 2, "both reports resent")
+	assert_contains(requests[1].body, '"OLDERx"')
+	assert_contains(requests[2].body, '"NEWERx"')
+
+	restore()
+	storage.reset()
+end
+
+-- A stored server backpressure window defers NON-fatal live dispatches (the
+-- report stays queued for the pass); a FATAL live report still fires — the
+-- process may be dying and this is its only chance at the network.
+local function test_live_non_fatal_defers_into_stored_window()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "window-defer-app" }
+
+	assert_true(storage.set_pending_crash_retry_after(scope, 3600))
+	next_status = 202
+	local client = assert(crash.new(config({ app_id = "window-defer-app", sample_every = 1 })))
+
+	assert_true(client:emit(presymbolicated_event({ exception = { type = "lua_error", reason = "HELDx" } })))
+	assert_equal(#requests, 0, "a non-fatal live report defers into the stored window")
+	assert_equal(#storage.load_pending_crashes(scope), 1, "the deferred report stays durably queued")
+	assert_true(type(client:snapshot().resend_deferred_until_ms) == "number", "the deferral is surfaced")
+
+	assert_true(client:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "URGENTx" } })))
+	assert_equal(#requests, 1, "a fatal live report fires regardless of the window")
+	assert_contains(requests[1].body, '"URGENTx"')
+
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_source_stamped_on_every_report,
@@ -4676,6 +4733,8 @@ local tests = {
 	test_memory_fallback_resends_oldest_first,
 	test_tokenless_accept_clears_retry_after_window,
 	test_token_refresh_enforces_byte_budget,
+	test_resend_merges_memory_and_disk_by_age,
+	test_live_non_fatal_defers_into_stored_window,
 }
 
 for _, test in ipairs(tests) do
