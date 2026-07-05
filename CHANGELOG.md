@@ -10,18 +10,29 @@
   anonymous ID) — plus typed getters
   (`remote_config_string/number/boolean/value/values/version`) that never
   fail and serve the caller's default until configuration is available.
+  `remote_config_version()` reads the `version` from the response wrapper
+  only — it is response metadata, never taken from the configuration map.
   - **ETag revalidation and offline fallback.** A `200` serves fresh values
     and overwrites the one bounded per-app cache record; later fetches
     revalidate with `If-None-Match`, and a `304` — or any transient failure
-    (offline, `429`, `5xx`, malformed body) — serves the cached snapshot with
-    `from_cache = true`. The snapshot survives restarts, so an offline launch
-    still gets the last served configuration. Responses arriving out of
-    order (two fetches in flight) can never roll a newer configuration back
-    or sneak values in after a newer fail-closed outcome; a response for an
-    identity rotated away mid-flight is dropped; and a failed cache write
-    keeps the freshest served configuration as the in-process fallback while
-    clearing the superseded durable record, so neither this process nor a
-    restart can revive rolled-back values.
+    (offline, `408`, `429`, `5xx`, malformed body) — serves the cached
+    snapshot with `from_cache = true`. A `304` also renews the record's
+    freshness stamp, in memory and (best-effort) in the durable record: the
+    endpoint just confirmed the body as current, so the record outranks
+    same-scope records stamped while the request was in flight — though it
+    never displaces a fresher record carrying a different body (a `304`
+    validates at server handling time, not delivery time). The snapshot
+    survives restarts, so an offline launch still gets the last served
+    configuration. Responses arriving out of order (two fetches in flight)
+    can never roll a newer configuration back or sneak values in after a
+    newer fail-closed outcome; a response for an identity rotated away
+    mid-flight is dropped; freshness stamps stay monotonic across backward
+    wall-clock jumps, so a record being installed can never rank below the
+    records it supersedes; and a failed cache write keeps the freshest
+    served configuration as the in-process fallback while clearing the
+    durable record it superseded (never a fresher one another same-app
+    client persisted meanwhile), so neither this process nor a restart can
+    revive rolled-back values.
   - **Fail-closed on `401`/`403`; permanent errors never serve the cache.**
     An unauthorized fetch reports `unauthorized` and never serves the cached
     snapshot (a revoked or wrong key must not keep supplying configuration);

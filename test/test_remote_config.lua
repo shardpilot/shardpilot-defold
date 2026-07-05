@@ -470,6 +470,7 @@ local function test_transient_failure_serves_cache_with_error()
 
 	local transient_cases = {
 		{ 0, "http_0" },
+		{ 408, "transient_408" },
 		{ 429, "transient_429" },
 		{ 503, "transient_503" },
 	}
@@ -495,6 +496,31 @@ local function test_transient_failure_without_cache_fails()
 	assert_equal(result.error, "http_0")
 	assert_nil(result.values)
 	assert_nil(client:remote_config_values(), "no snapshot may appear out of a failed fetch")
+end
+
+local function test_timeout_408_is_transient()
+	reset()
+	local client = assert(sdk.new(config()))
+
+	-- With no cache, a request timeout fails like any other transient...
+	next_status = 408
+	local result = fetch(client)
+	assert_equal(result.ok, false)
+	assert_equal(result.error, "transient_408")
+
+	-- ...and with one it serves the last-known-good snapshot: a timed-out
+	-- refresh is exactly the moment the cached configuration is needed, and
+	-- retrying can plausibly fix it — it must not fail like a permanent 4xx.
+	next_status = 200
+	next_response_body = values_body({ a = 1 }, 1)
+	fetch(client)
+	next_status = 408
+	next_response_body = nil
+	result = fetch(client)
+	assert_true(result.ok, "a request timeout with a cache must serve the snapshot")
+	assert_equal(result.from_cache, true)
+	assert_equal(result.error, "transient_408")
+	assert_equal(result.values.a, 1)
 end
 
 local function test_unauthorized_fails_closed_and_never_serves_cache()
@@ -1047,6 +1073,259 @@ local function test_cache_discovered_at_fetch_time_is_adopted()
 	assert_equal(reader:remote_config_version(), 5)
 end
 
+local function test_304_revalidation_renews_the_records_freshness()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ v = 1 }, 1)
+	next_response_headers = { etag = '"v1"' }
+	fetch(client)
+	local before = storage.load_remote_config(client.config)
+
+	-- A revalidation confirms the cached body as current NOW: the renewed
+	-- stamp is persisted (best-effort), so restarts and same-app clients
+	-- rank the record by its latest confirmation, not by its first fetch.
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = nil
+	local result = fetch(client)
+
+	assert_true(result.ok, result.error)
+	assert_equal(result.from_cache, true)
+	local after = storage.load_remote_config(client.config)
+	assert_equal(after.etag, '"v1"')
+	assert_equal(after.body, before.body,
+		"a revalidation renews the stamp; the body is unchanged")
+	assert_true(after.fetched_at_ms > before.fetched_at_ms,
+		"a 304 must renew the durable record's freshness stamp")
+
+	restore()
+end
+
+local function test_delayed_304_does_not_restamp_over_a_newer_body()
+	reset()
+	local restore = install_fake_sys_storage()
+	local first = assert(sdk.new(config()))
+	local second = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ v = 1 }, 1)
+	next_response_headers = { etag = '"v1"' }
+	fetch(first)
+
+	-- Hold a revalidation in flight on the first client...
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers }
+		held[#held + 1] = callback
+	end
+	local result = nil
+	first:fetch_remote_config(function(value)
+		result = value
+	end)
+	http.request = saved_request
+	assert_equal(last_request().headers["If-None-Match"], '"v1"')
+
+	-- ...while a sibling client fetches and persists a DIFFERENT body...
+	next_response_body = values_body({ v = 2 }, 2)
+	next_response_headers = { etag = '"v2"' }
+	fetch(second)
+
+	-- ...and the held 304 then arrives late. It validated the OLD body at
+	-- server handling time — possibly BEFORE the sibling's fetch was served
+	-- — and delivery order cannot order the two. The revalidated values are
+	-- still served to this fetch's caller, but the fresher different-body
+	-- record keeps the durable slot: restamping the old body over it could
+	-- roll the configuration back for restarts and siblings.
+	held[1](nil, nil, { status = 304 })
+	assert_true(result.ok, result.error)
+	assert_equal(result.from_cache, true)
+	assert_equal(result.values.v, 1, "the caller still receives its own fetch's outcome")
+	local durable = storage.load_remote_config(first.config)
+	assert_equal(durable.etag, '"v2"',
+		"a delayed revalidation must not displace a fresher different-body record")
+	local relaunched = assert(sdk.new(config()))
+	assert_equal(relaunched:remote_config_number("v", 0), 2,
+		"a restart keeps the freshest different-body configuration")
+
+	restore()
+end
+
+local function test_failed_304_restamp_keeps_the_same_body_durable()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ v = 1 }, 1)
+	next_response_headers = { etag = '"v1"' }
+	fetch(client)
+
+	-- The disk still accepts a tiny tombstone write but refuses the record
+	-- write, so the revalidation serves and renews the stamp in memory only.
+	-- The durable record carries the SAME body the endpoint just confirmed —
+	-- only its stamp is stale — so it must survive: trading the confirmed
+	-- body for a tombstone would be worse.
+	local fake_save = sys.save
+	sys.save = function(path, record)
+		if record ~= nil and record.body ~= nil then
+			return false
+		end
+		return fake_save(path, record)
+	end
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = nil
+	local result = fetch(client)
+	sys.save = fake_save
+
+	assert_true(result.ok, result.error)
+	assert_equal(result.from_cache, true)
+	assert_true(storage.load_remote_config(client.config) ~= nil,
+		"a failed restamp must not delete the record whose body was just confirmed")
+	local relaunched = assert(sdk.new(config()))
+	assert_equal(relaunched:remote_config_number("v", 0), 1)
+
+	restore()
+end
+
+local function test_failed_304_restamp_clears_a_lingering_stale_body()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ v = 1 }, 1)
+	next_response_headers = { etag = '"v1"' }
+	fetch(client)
+
+	-- The disk dies entirely: a fresh configuration is served but neither
+	-- persists nor clears the older durable record, which lingers.
+	local fake_save = sys.save
+	sys.save = function()
+		return false
+	end
+	next_response_body = values_body({ v = 2 }, 2)
+	next_response_headers = { etag = '"v2"' }
+	fetch(client)
+
+	-- The disk now accepts the tiny tombstone write but still refuses the
+	-- record write; a revalidation confirms the SECOND body as current. The
+	-- lingering record carries a DIFFERENT, no-fresher body than the one
+	-- just confirmed: a restart would revive it over the confirmed
+	-- configuration, so it must be cleared.
+	sys.save = function(path, record)
+		if record ~= nil and record.body ~= nil then
+			return false
+		end
+		return fake_save(path, record)
+	end
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = nil
+	local result = fetch(client)
+	sys.save = fake_save
+
+	assert_true(result.ok, result.error)
+	assert_equal(result.from_cache, true)
+	assert_nil(storage.load_remote_config(client.config),
+		"a lingering stale body must not survive the revalidation that outdated it")
+	local relaunched = assert(sdk.new(config()))
+	assert_nil(relaunched:remote_config_values(),
+		"a restart starts from the game's defaults, not the rolled-back configuration")
+
+	restore()
+end
+
+local function test_backward_clock_jump_cannot_rank_fresh_config_below_stale()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ v = 1 }, 1)
+	next_response_headers = { etag = '"v1"' }
+	fetch(client)
+
+	-- The wall clock jumps backward (an NTP correction, a user time change)
+	-- and the disk dies, so the fresher configuration can neither carry a
+	-- naturally newer stamp nor displace the durable record.
+	socket.now = socket.now - 600
+	local saved_save = sys.save
+	sys.save = function()
+		return false
+	end
+	next_response_body = values_body({ v = 2 }, 2)
+	next_response_headers = { etag = '"v2"' }
+	local fresh = fetch(client)
+	assert_true(fresh.ok, fresh.error)
+	assert_equal(client:remote_config_number("v", 0), 2)
+
+	-- Offline now: the fallback must be the configuration just served — its
+	-- stamp was raised above the records it superseded — not the older
+	-- durable record the clock jump left with a higher wall-clock stamp.
+	next_status = 0
+	next_response_body = nil
+	next_response_headers = nil
+	local offline = fetch(client)
+	sys.save = saved_save
+	restore()
+
+	assert_true(offline.ok)
+	assert_equal(offline.from_cache, true)
+	assert_equal(offline.values.v, 2,
+		"a backward clock jump must not rank the fresh configuration below the stale one")
+end
+
+local function test_failed_write_tombstone_spares_a_fresher_sibling_record()
+	reset()
+	local restore = install_fake_sys_storage()
+	local first = assert(sdk.new(config()))
+	local second = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ v = 1 }, 1)
+	next_response_headers = { etag = '"v1"' }
+	fetch(first)
+
+	-- Hold a fetch in flight on the first client...
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		held[#held + 1] = callback
+	end
+	local result = nil
+	first:fetch_remote_config(function(value)
+		result = value
+	end)
+	http.request = saved_request
+
+	-- ...while a sibling client persists a FRESHER configuration...
+	next_response_body = values_body({ v = 2 }, 2)
+	next_response_headers = { etag = '"v2"' }
+	fetch(second)
+
+	-- ...and the held fetch then lands fresh values too large for the
+	-- save-file budget: served, but they cannot persist.
+	held[1](nil, nil, {
+		status = 200,
+		response = values_body({ v = 3, blob = string.rep("x", 400000) }, 3),
+		headers = { etag = '"v3"' },
+	})
+	assert_true(result.ok, result.error)
+	assert_equal(first:remote_config_number("v", 0), 3,
+		"the served configuration still backs the getters in this process")
+
+	-- The tombstone must spare the sibling's record: it is FRESHER than the
+	-- record this fetch captured, and clearing it would lose the freshest
+	-- successfully persisted configuration.
+	local durable = storage.load_remote_config(first.config)
+	assert_true(durable ~= nil, "the sibling's fresher record must survive the failed write")
+	assert_equal(durable.etag, '"v2"')
+	local relaunched = assert(sdk.new(config()))
+	assert_equal(relaunched:remote_config_number("v", 0), 2,
+		"a restart falls back to the freshest persisted record, not to defaults")
+
+	restore()
+end
+
 local function test_empty_array_values_member_is_malformed()
 	reset()
 	local client = assert(sdk.new(config()))
@@ -1147,6 +1426,25 @@ local function test_unwrapped_payload_is_served_as_the_map()
 	assert_equal(result.values.flag_x, true)
 	assert_nil(result.version, "an unwrapped payload carries no version")
 	assert_equal(client:remote_config_number("limit", 0), 5)
+end
+
+local function test_unwrapped_version_key_is_configuration_not_metadata()
+	reset()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = '{"version":42,"flag_x":true}'
+	local result = fetch(client)
+
+	-- The published version is metadata of the `{version, values}` wrapper;
+	-- in an unwrapped payload a config key named "version" is ordinary
+	-- configuration and must not masquerade as a revision marker.
+	assert_true(result.ok, result.error)
+	assert_nil(result.version,
+		"an unwrapped payload's version key must not be read as wrapper metadata")
+	assert_nil(client:remote_config_version())
+	assert_equal(client:remote_config_number("version", 0), 42,
+		"an unwrapped config key named version is served as configuration")
+	assert_equal(client:remote_config_boolean("flag_x", false), true)
 end
 
 -- ── cache scope ───────────────────────────────────────────────────────────────
@@ -1576,6 +1874,7 @@ local tests = {
 	test_revalidation_304_serves_cached_snapshot,
 	test_transient_failure_serves_cache_with_error,
 	test_transient_failure_without_cache_fails,
+	test_timeout_408_is_transient,
 	test_unauthorized_fails_closed_and_never_serves_cache,
 	test_malformed_response_serves_cache_or_fails,
 	test_permanent_http_error_fails_without_serving_cache,
@@ -1591,10 +1890,17 @@ local tests = {
 	test_newer_durable_record_from_sibling_client_is_preferred,
 	test_intermediate_scope_outcome_does_not_fence_original_scope,
 	test_cache_discovered_at_fetch_time_is_adopted,
+	test_304_revalidation_renews_the_records_freshness,
+	test_delayed_304_does_not_restamp_over_a_newer_body,
+	test_failed_304_restamp_keeps_the_same_body_durable,
+	test_failed_304_restamp_clears_a_lingering_stale_body,
+	test_backward_clock_jump_cannot_rank_fresh_config_below_stale,
+	test_failed_write_tombstone_spares_a_fresher_sibling_record,
 	test_empty_array_values_member_is_malformed,
 	test_fetch_after_shutdown_is_rejected,
 	test_callback_mutation_cannot_corrupt_the_snapshot,
 	test_unwrapped_payload_is_served_as_the_map,
+	test_unwrapped_version_key_is_configuration_not_metadata,
 	test_cache_from_another_scope_is_a_miss_and_gets_overwritten,
 	test_transient_failure_never_serves_another_scopes_cache,
 	test_restart_serves_last_known_good_and_offline_fetch_uses_it,
