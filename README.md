@@ -333,7 +333,9 @@ with the publishable `api_key` as the `Bearer` (`client_id` = the persisted
 anonymous ID — the same identity the events carry, so per-client rollout
 bucketing is consistent with analytics). The endpoint answers
 `{ "version": <number>, "values": { key: value } }` with an `ETag`; the getters
-serve the `values` map. Responses are cached in a durable per-app record
+serve the `values` map, and `remote_config_version()` reads the wrapper's
+`version` only — it is response metadata, never a configuration value.
+Responses are cached in a durable per-app record
 (`{scope, etag, body, fetched_at_ms}`) through the same `sys.save` storage
 seam as the identity record and the spools.
 
@@ -342,10 +344,12 @@ Fetch semantics:
 - **200** — fresh values are served (`from_cache = false`) and the cache is
   overwritten.
 - **304 Not Modified** — subsequent fetches revalidate with `If-None-Match`,
-  and the cached snapshot is served (`from_cache = true`).
-- **Transient failure** (offline, `429`, `5xx`, malformed body) — the cached
-  snapshot is served with `from_cache = true` and `error` carrying the reason;
-  with no usable cache the fetch fails.
+  and the cached snapshot is served (`from_cache = true`); the record's
+  freshness stamp is renewed (best-effort in the durable record too), since
+  the endpoint just confirmed the body as current.
+- **Transient failure** (offline, a request timeout (`408`), `429`, `5xx`,
+  malformed body) — the cached snapshot is served with `from_cache = true`
+  and `error` carrying the reason; with no usable cache the fetch fails.
 - **`401`/`403` fails closed** — the fetch reports `unauthorized` and the
   cached snapshot is **not** served for that outcome, so a revoked or wrong
   key never keeps supplying config. The cache file itself is left untouched
@@ -376,9 +380,11 @@ way.
   large enough to approach the documented 512 KB `sys.save` cap — or any
   body whose durable write fails — is still served and stays the in-process
   offline fallback, but is not persisted (surfaced via `diagnostics`), and
-  any older persisted record is cleared (best-effort) so a restart serves
-  the game's defaults rather than rolled-back values. Before the first
-  successful fetch on a fresh install, getters serve the caller's defaults.
+  the older persisted record it superseded is cleared (best-effort; a
+  fresher record persisted meanwhile by another client of the same app is
+  left in place) so a restart serves the game's defaults rather than
+  rolled-back values. Before the first successful fetch on a fresh install,
+  getters serve the caller's defaults.
 - The fetch is **not consent-gated**: config delivery carries no analytics
   payload — the client id in the URL only scopes which config to serve
   (consistent across our SDKs). See [`docs/privacy.md`](docs/privacy.md).

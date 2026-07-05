@@ -11,10 +11,15 @@
 -- Fetch semantics (one fetch = one HTTP GET, decided by M.apply):
 --   * 200 with a JSON object body — fresh values are served and the cache is
 --     overwritten (body + response ETag).
---   * 304 Not Modified — the cached snapshot is served (`from_cache = true`).
---   * A transient failure (offline, 429, 5xx, malformed body) — the cached
---     snapshot is served with `from_cache = true` and `error` carrying the
---     reason; with no usable cache the fetch fails.
+--   * 304 Not Modified — the cached snapshot is served (`from_cache = true`)
+--     and the record's freshness stamp is renewed, in memory and
+--     (best-effort) in the durable record: the endpoint confirmed the body
+--     as current, so the record outranks same-scope records stamped while
+--     the request was in flight.
+--   * A transient failure (offline, a request timeout (408), 429, 5xx,
+--     malformed body) — the cached snapshot is served with
+--     `from_cache = true` and `error` carrying the reason; with no usable
+--     cache the fetch fails.
 --   * 401/403 — fails CLOSED: the cached snapshot is never served for this
 --     outcome (a revoked or wrong key must not keep supplying configuration),
 --     but the cache file itself is left untouched.
@@ -173,9 +178,9 @@ end
 -- the decoded value cannot settle on its own are re-checked on the body
 -- text: an empty array (it decodes to the same Lua table as an empty
 -- object) and a JSON null (commonly decoded to nil, identical to an absent
--- member). Returns (values, version), or nil for a malformed wrapper.
+-- member). Returns (values, version) — the version read from the wrapper
+-- only — or nil for a malformed wrapper.
 local function extract(decoded, body)
-	local version = type(decoded.version) == "number" and decoded.version or nil
 	local values = decoded.values
 	if values ~= nil then
 		-- Object-ness is decided on the body TEXT, not the decoded table: an
@@ -186,6 +191,10 @@ local function extract(decoded, body)
 		if type(values) ~= "table" or top_level_values_char(body) ~= "{" then
 			return nil
 		end
+		-- The published version is wrapper metadata, so it is read only
+		-- here: in an unwrapped payload a config key named "version" is
+		-- configuration, not a revision marker.
+		local version = type(decoded.version) == "number" and decoded.version or nil
 		return values, version
 	end
 	if top_level_values_char(body) ~= nil then
@@ -194,7 +203,7 @@ local function extract(decoded, body)
 		-- not an unwrapped payload.
 		return nil
 	end
-	return decoded, version
+	return decoded, nil
 end
 
 -- Parse a configuration body end-to-end: a JSON object whose configuration
@@ -243,7 +252,7 @@ end
 
 -- Decide one fetch outcome from the transport response and the cached
 -- snapshot. Pure (no IO, no state) so tests can drive every branch. Returns
--- (result, new_cache, authoritative):
+-- (result, new_cache, authoritative, revalidated_cache):
 --   * `new_cache` non-nil means "persist this record"; it exists only for a
 --     fresh 200, so no failure — unauthorized, permanent, malformed — and no
 --     cache-served outcome ever disturbs the last-known-good record.
@@ -252,6 +261,12 @@ end
 --     and a permanent HTTP error. A transient/cache fallback is NOT
 --     authoritative — it says nothing about the current configuration, so
 --     it must not fence off a fresh response still in flight.
+--   * `revalidated_cache` non-nil exists exactly for a successful 304
+--     revalidation: the cached record with its freshness stamp renewed to
+--     the revalidation time. The body is unchanged (a 304 carries none);
+--     only the stamp says something new — the endpoint just confirmed this
+--     body as current, so the record must outrank same-scope records
+--     stamped while the request was in flight.
 function M.apply(cache, response, now_ms)
 	local status = type(response) == "table" and response.status or 0
 
@@ -277,13 +292,20 @@ function M.apply(cache, response, now_ms)
 		if values then
 			-- A successful revalidation is authoritative: the endpoint just
 			-- confirmed the cached ETag as CURRENT, so an older in-flight
-			-- response must not overwrite it afterwards.
+			-- response must not overwrite it afterwards. The body is
+			-- unchanged (a 304 carries none), but the record's freshness
+			-- stamp is renewed — the confirmation is NEW information about
+			-- how current this body is.
 			return {
 				ok = true,
 				from_cache = true,
 				values = values,
 				version = version,
-			}, nil, true
+			}, nil, true, {
+				etag = cache.etag,
+				body = cache.body,
+				fetched_at_ms = now_ms,
+			}
 		end
 		-- The revalidated cache turned out unreadable: there is nothing left
 		-- to serve (the 304 carries no body), so this fails rather than
@@ -301,13 +323,16 @@ function M.apply(cache, response, now_ms)
 	end
 
 	-- The cache fallback is reserved for failures a retry can plausibly fix:
-	-- no connection, backpressure, or a server-side error. Any other status —
-	-- a 404 for a removed environment, an unexpected redirect, other 4xx — is
-	-- an authoritative "this configuration is not being served here", so the
-	-- fetch fails instead of reporting stale values as a healthy `ok = true`
-	-- (the cache record and the getter snapshot stay untouched).
+	-- no connection, a request timeout, backpressure, or a server-side
+	-- error. Any other status — a 404 for a removed environment, an
+	-- unexpected redirect, other 4xx — is an authoritative "this
+	-- configuration is not being served here", so the fetch fails instead of
+	-- reporting stale values as a healthy `ok = true` (the cache record and
+	-- the getter snapshot stay untouched).
 	if status == 0 then
 		return serve_cache_or_fail(cache, "http_0"), nil, false
+	elseif status == 408 then
+		return serve_cache_or_fail(cache, "transient_408"), nil, false
 	elseif status == 429 then
 		return serve_cache_or_fail(cache, "transient_429"), nil, false
 	elseif status >= 500 then
@@ -401,17 +426,26 @@ function RemoteConfig:scope_for(client_id)
 		self.config.remote_config_url)
 end
 
+-- The usable durable record for the given scope, or nil. A record without
+-- an identity scope, or written for any other (workspace, environment,
+-- client, url) tuple, is a miss: its values are never served and its ETag is
+-- never sent. So is a record whose body no longer decodes — it could neither
+-- be served offline nor recovered from after the 304 its ETag would provoke.
+-- The next successful fetch for this scope overwrites it.
+function RemoteConfig:durable_record(scope)
+	local record = storage.load_remote_config(self.config)
+	if not record or record.scope ~= scope or not parse_config(record.body) then
+		return nil
+	end
+	return record
+end
+
 -- The usable cache record for THIS scope, or nil — the FRESHEST of the
 -- in-process record (which survives a failed durable write) and the durable
 -- record (which another same-app client may have refreshed since this
 -- instance last installed), compared by their fetched-at stamps; the
 -- in-process record wins ties, being known-good and already backing the
--- getters. A record without an identity scope, or written for any other
--- (workspace, environment, client, url) tuple, is a miss: its values are
--- never served and its ETag is never sent. So is a record whose body no
--- longer decodes — it could neither be served offline nor recovered from
--- after the 304 its ETag would provoke. The next successful fetch for this
--- scope overwrites it.
+-- getters.
 function RemoteConfig:load_cache(client_id)
 	if not client_id then
 		return nil
@@ -423,14 +457,36 @@ function RemoteConfig:load_cache(client_id)
 		-- were installed, so no re-check is needed for this one.
 		held = self.cache
 	end
-	local record = storage.load_remote_config(self.config)
-	if not record or record.scope ~= scope or not parse_config(record.body) then
-		record = nil
-	end
+	local record = self:durable_record(scope)
 	if held and (not record or record.fetched_at_ms <= held.fetched_at_ms) then
 		return held
 	end
 	return record
+end
+
+-- Freshness stamps order the records for a scope, and the wall clock can
+-- move backward (an NTP correction, a user time change): stamped naively, a
+-- record being installed could rank BELOW the stale records it supersedes,
+-- and a later offline fetch would roll back to them. So the stamp is raised
+-- to one millisecond above every record this install supersedes — the
+-- record captured at fetch time, the held record, and the durable record for
+-- the scope. Only the relative order of stamps matters, so comparisons stay
+-- meaningful across restarts.
+function RemoteConfig:raise_stamp_above_superseded(record, scope, served_cache)
+	local floor = 0
+	if served_cache and served_cache.fetched_at_ms > floor then
+		floor = served_cache.fetched_at_ms
+	end
+	if self.cache and self.cache.scope == scope and self.cache.fetched_at_ms > floor then
+		floor = self.cache.fetched_at_ms
+	end
+	local durable = self:durable_record(scope)
+	if durable and durable.fetched_at_ms > floor then
+		floor = durable.fetched_at_ms
+	end
+	if record.fetched_at_ms <= floor then
+		record.fetched_at_ms = floor + 1
+	end
 end
 
 function RemoteConfig:diagnose(status)
@@ -447,11 +503,13 @@ end
 --   * the sequence fence — an outcome older than the newest settled one is
 --     dropped, so an older success can neither roll back a newer
 --     configuration nor sneak values in after a newer fail-closed outcome;
---   * only AUTHORITATIVE outcomes settle the fence (fresh 200,
---     unauthorized, permanent error); a transient/cache fallback says
---     nothing about the current configuration and must not fence off a
---     fresh response still in flight;
---   * a fresh 200 (`new_cache` exists exactly then) always installs; a
+--   * only AUTHORITATIVE outcomes settle the fence (fresh 200, 304
+--     revalidation, unauthorized, permanent error); a transient/cache
+--     fallback says nothing about the current configuration and must not
+--     fence off a fresh response still in flight;
+--   * a fresh 200 (`new_cache` exists exactly then) always installs, and so
+--     does a successful 304 revalidation (`revalidated_cache` exists exactly
+--     then) — the captured record with its freshness stamp renewed; a
 --     cache-served outcome installs only by ADOPTION — when the record it
 --     served is FRESHER than what this instance holds (or the instance
 --     holds nothing for the scope), e.g. it was discovered at fetch time
@@ -471,7 +529,7 @@ end
 -- The snapshot is a defensive copy: the result table is handed to game code,
 -- and a callback that mutates `result.values` must not corrupt what later
 -- getters read.
-function RemoteConfig:install(seq, result, new_cache, scope, authoritative, served_cache)
+function RemoteConfig:install(seq, result, new_cache, scope, authoritative, served_cache, revalidated_cache)
 	local current_id = self:client_id()
 	if not current_id or self:scope_for(current_id) ~= scope then
 		return
@@ -488,20 +546,39 @@ function RemoteConfig:install(seq, result, new_cache, scope, authoritative, serv
 	if not result.ok then
 		return
 	end
-	if new_cache then
-		new_cache.scope = scope
+	local record = new_cache or revalidated_cache
+	if record then
+		record.scope = scope
+		-- Stamped with the wall clock alone, a backward clock jump could
+		-- rank this record below the very records it supersedes; raise the
+		-- stamp above them first.
+		self:raise_stamp_above_superseded(record, scope, served_cache)
 		-- The in-process record is updated even when the durable write
 		-- fails: the freshest served configuration stays the offline
 		-- fallback for this process either way.
-		self.cache = new_cache
-		if not storage.save_remote_config(self.config, new_cache) then
-			-- An older durable record may still be on disk, and a restart
-			-- would revive it OVER the newer configuration just served.
-			-- Clear it (best-effort — with the storage backend itself down
-			-- this fails too and the stale record is at least superseded in
-			-- this process): a restart then starts from the game's defaults
-			-- rather than from rolled-back values.
-			storage.clear_remote_config(self.config)
+		self.cache = record
+		if not storage.save_remote_config(self.config, record) then
+			-- The stale durable record this fetch captured may still be on
+			-- disk, and a restart would revive it OVER the configuration
+			-- just served. Clear it (best-effort — with the storage backend
+			-- itself down this fails too and the stale record is at least
+			-- superseded in this process): a restart then starts from the
+			-- game's defaults rather than from rolled-back values. Only a
+			-- record no fresher than the one this fetch captured is cleared
+			-- — another same-app client may have persisted a FRESHER record
+			-- while this response was in flight, and deleting that would
+			-- lose the freshest successfully persisted configuration (with
+			-- nothing captured at fetch time there is nothing stale to
+			-- clear: any record on disk now is such a newer write). After a
+			-- revalidation, a durable record carrying the SAME body needs
+			-- no clearing either — only its stamp is stale, and trading the
+			-- just-confirmed body for a tombstone would be worse.
+			local durable = self:durable_record(scope)
+			if durable and served_cache
+				and durable.fetched_at_ms <= served_cache.fetched_at_ms
+				and (new_cache ~= nil or durable.body ~= record.body) then
+				storage.clear_remote_config(self.config)
+			end
 			self:diagnose("cache_persist_failed")
 		end
 	elseif served_cache and (not self.cache or self.cache.scope ~= scope
@@ -576,8 +653,8 @@ function RemoteConfig:fetch(callback)
 	}
 
 	http.request(url, "GET", function(_, _, response)
-		local result, new_cache, authoritative = M.apply(cache, response, clock.unix_ms())
-		self:install(seq, result, new_cache, scope, authoritative, cache)
+		local result, new_cache, authoritative, revalidated_cache = M.apply(cache, response, clock.unix_ms())
+		self:install(seq, result, new_cache, scope, authoritative, cache, revalidated_cache)
 		finish(result)
 	end, headers, nil, options)
 	return true
@@ -644,7 +721,8 @@ function RemoteConfig:get_values()
 end
 
 -- The published configuration version from the last served payload, or nil
--- when unknown (no configuration yet, or an unwrapped payload without one).
+-- when unknown (no configuration yet, or an unwrapped payload — the version
+-- is wrapper metadata, so an unwrapped payload never carries one).
 function RemoteConfig:get_version()
 	return self.version
 end
