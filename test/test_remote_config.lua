@@ -1076,6 +1076,36 @@ end
 local function test_304_revalidation_renews_the_records_freshness()
 	reset()
 	local restore = install_fake_sys_storage()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ v = 1 }, 1)
+	next_response_headers = { etag = '"v1"' }
+	fetch(client)
+	local before = storage.load_remote_config(client.config)
+
+	-- A revalidation confirms the cached body as current NOW: the renewed
+	-- stamp is persisted (best-effort), so restarts and same-app clients
+	-- rank the record by its latest confirmation, not by its first fetch.
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = nil
+	local result = fetch(client)
+
+	assert_true(result.ok, result.error)
+	assert_equal(result.from_cache, true)
+	local after = storage.load_remote_config(client.config)
+	assert_equal(after.etag, '"v1"')
+	assert_equal(after.body, before.body,
+		"a revalidation renews the stamp; the body is unchanged")
+	assert_true(after.fetched_at_ms > before.fetched_at_ms,
+		"a 304 must renew the durable record's freshness stamp")
+
+	restore()
+end
+
+local function test_delayed_304_does_not_restamp_over_a_newer_body()
+	reset()
+	local restore = install_fake_sys_storage()
 	local first = assert(sdk.new(config()))
 	local second = assert(sdk.new(config()))
 	next_status = 200
@@ -1097,25 +1127,27 @@ local function test_304_revalidation_renews_the_records_freshness()
 	http.request = saved_request
 	assert_equal(last_request().headers["If-None-Match"], '"v1"')
 
-	-- ...while a sibling client fetches and persists a different
-	-- configuration...
+	-- ...while a sibling client fetches and persists a DIFFERENT body...
 	next_response_body = values_body({ v = 2 }, 2)
 	next_response_headers = { etag = '"v2"' }
 	fetch(second)
 
-	-- ...and the held revalidation then confirms the FIRST body as current.
-	-- The confirmation is the NEWEST statement about this scope's
-	-- configuration, so the revalidated record must outrank the sibling's —
-	-- in memory and in the durable record.
+	-- ...and the held 304 then arrives late. It validated the OLD body at
+	-- server handling time — possibly BEFORE the sibling's fetch was served
+	-- — and delivery order cannot order the two. The revalidated values are
+	-- still served to this fetch's caller, but the fresher different-body
+	-- record keeps the durable slot: restamping the old body over it could
+	-- roll the configuration back for restarts and siblings.
 	held[1](nil, nil, { status = 304 })
 	assert_true(result.ok, result.error)
 	assert_equal(result.from_cache, true)
+	assert_equal(result.values.v, 1, "the caller still receives its own fetch's outcome")
 	local durable = storage.load_remote_config(first.config)
-	assert_equal(durable.etag, '"v1"',
-		"the revalidated record must be persisted with its renewed stamp")
+	assert_equal(durable.etag, '"v2"',
+		"a delayed revalidation must not displace a fresher different-body record")
 	local relaunched = assert(sdk.new(config()))
-	assert_equal(relaunched:remote_config_number("v", 0), 1,
-		"a restart must rank the revalidated record above the one it outdated")
+	assert_equal(relaunched:remote_config_number("v", 0), 2,
+		"a restart keeps the freshest different-body configuration")
 
 	restore()
 end
@@ -1859,6 +1891,7 @@ local tests = {
 	test_intermediate_scope_outcome_does_not_fence_original_scope,
 	test_cache_discovered_at_fetch_time_is_adopted,
 	test_304_revalidation_renews_the_records_freshness,
+	test_delayed_304_does_not_restamp_over_a_newer_body,
 	test_failed_304_restamp_keeps_the_same_body_durable,
 	test_failed_304_restamp_clears_a_lingering_stale_body,
 	test_backward_clock_jump_cannot_rank_fresh_config_below_stale,

@@ -15,7 +15,10 @@
 --     and the record's freshness stamp is renewed, in memory and
 --     (best-effort) in the durable record: the endpoint confirmed the body
 --     as current, so the record outranks same-scope records stamped while
---     the request was in flight.
+--     the request was in flight. The one exception is a FRESHER record
+--     carrying a DIFFERENT body — a 304 validates at server handling time,
+--     not delivery time, so it never displaces content it cannot be
+--     ordered against (see install).
 --   * A transient failure (offline, a request timeout (408), 429, 5xx,
 --     malformed body) — the cached snapshot is served with
 --     `from_cache = true` and `error` carrying the reason; with no usable
@@ -265,8 +268,10 @@ end
 --     revalidation: the cached record with its freshness stamp renewed to
 --     the revalidation time. The body is unchanged (a 304 carries none);
 --     only the stamp says something new — the endpoint just confirmed this
---     body as current, so the record must outrank same-scope records
---     stamped while the request was in flight.
+--     body as current, so the record outranks same-scope records stamped
+--     while the request was in flight. Whether the renewal may land is
+--     decided at install time: it never displaces a fresher record carrying
+--     a different body.
 function M.apply(cache, response, now_ms)
 	local status = type(response) == "table" and response.status or 0
 
@@ -469,10 +474,10 @@ end
 -- record being installed could rank BELOW the stale records it supersedes,
 -- and a later offline fetch would roll back to them. So the stamp is raised
 -- to one millisecond above every record this install supersedes — the
--- record captured at fetch time, the held record, and the durable record for
--- the scope. Only the relative order of stamps matters, so comparisons stay
--- meaningful across restarts.
-function RemoteConfig:raise_stamp_above_superseded(record, scope, served_cache)
+-- record captured at fetch time, the held record, and the durable record
+-- for the scope (pre-read by the caller). Only the relative order of stamps
+-- matters, so comparisons stay meaningful across restarts.
+function RemoteConfig:raise_stamp_above_superseded(record, scope, served_cache, durable)
 	local floor = 0
 	if served_cache and served_cache.fetched_at_ms > floor then
 		floor = served_cache.fetched_at_ms
@@ -480,7 +485,6 @@ function RemoteConfig:raise_stamp_above_superseded(record, scope, served_cache)
 	if self.cache and self.cache.scope == scope and self.cache.fetched_at_ms > floor then
 		floor = self.cache.fetched_at_ms
 	end
-	local durable = self:durable_record(scope)
 	if durable and durable.fetched_at_ms > floor then
 		floor = durable.fetched_at_ms
 	end
@@ -547,12 +551,29 @@ function RemoteConfig:install(seq, result, new_cache, scope, authoritative, serv
 		return
 	end
 	local record = new_cache or revalidated_cache
+	local durable = record and self:durable_record(scope) or nil
+	if revalidated_cache and durable and served_cache
+		and durable.body ~= revalidated_cache.body
+		and durable.fetched_at_ms > served_cache.fetched_at_ms then
+		-- A 304 validates the captured body at SERVER handling time, and
+		-- responses arrive in no particular order: a DIFFERENT body,
+		-- persisted by another same-app client after this fetch captured
+		-- its record, may reflect a newer server state than this
+		-- revalidation — the two cannot be ordered from here. Renewing the
+		-- stamp over it could roll the durable configuration back to the
+		-- old body for restarts and siblings, so the renewal is skipped
+		-- (the revalidated values are still served to this fetch's caller).
+		-- A different-body record NO fresher than the captured one is
+		-- outranked as usual — that is the lingering leftover of a failed
+		-- overwrite, healed by this revalidation.
+		record = nil
+	end
 	if record then
 		record.scope = scope
 		-- Stamped with the wall clock alone, a backward clock jump could
 		-- rank this record below the very records it supersedes; raise the
 		-- stamp above them first.
-		self:raise_stamp_above_superseded(record, scope, served_cache)
+		self:raise_stamp_above_superseded(record, scope, served_cache, durable)
 		-- The in-process record is updated even when the durable write
 		-- fails: the freshest served configuration stays the offline
 		-- fallback for this process either way.
@@ -572,8 +593,10 @@ function RemoteConfig:install(seq, result, new_cache, scope, authoritative, serv
 			-- clear: any record on disk now is such a newer write). After a
 			-- revalidation, a durable record carrying the SAME body needs
 			-- no clearing either — only its stamp is stale, and trading the
-			-- just-confirmed body for a tombstone would be worse.
-			local durable = self:durable_record(scope)
+			-- just-confirmed body for a tombstone would be worse. The
+			-- record is re-read here: the failed write may have disturbed
+			-- what the pre-save read saw.
+			durable = self:durable_record(scope)
 			if durable and served_cache
 				and durable.fetched_at_ms <= served_cache.fetched_at_ms
 				and (new_cache ~= nil or durable.body ~= record.body) then

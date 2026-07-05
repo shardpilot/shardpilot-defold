@@ -19,7 +19,9 @@
     snapshot with `from_cache = true`. A `304` also renews the record's
     freshness stamp, in memory and (best-effort) in the durable record: the
     endpoint just confirmed the body as current, so the record outranks
-    same-scope records stamped while the request was in flight. The snapshot
+    same-scope records stamped while the request was in flight — though it
+    never displaces a fresher record carrying a different body (a `304`
+    validates at server handling time, not delivery time). The snapshot
     survives restarts, so an offline launch still gets the last served
     configuration. Responses arriving out of order (two fetches in flight)
     can never roll a newer configuration back or sneak values in after a

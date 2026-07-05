@@ -346,7 +346,10 @@ Fetch semantics:
 - **304 Not Modified** — subsequent fetches revalidate with `If-None-Match`,
   and the cached snapshot is served (`from_cache = true`); the record's
   freshness stamp is renewed (best-effort in the durable record too), since
-  the endpoint just confirmed the body as current.
+  the endpoint just confirmed the body as current. A fresher record with a
+  **different** body persisted while the request was in flight is never
+  displaced by the renewal — a 304 validates at server handling time, not
+  delivery time.
 - **Transient failure** (offline, a request timeout (`408`), `429`, `5xx`,
   malformed body) — the cached snapshot is served with `from_cache = true`
   and `error` carrying the reason; with no usable cache the fetch fails.
