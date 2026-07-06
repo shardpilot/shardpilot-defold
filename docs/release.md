@@ -1,13 +1,13 @@
 # Release
 
-This repository currently contains public-preview source only. No GitHub
-Release, tag, package registry artifact, or release ZIP is published in this
-wave.
+The ShardPilot Defold SDK is published as the `v0.5.0` git tag and a GitHub
+Release. This is an early alpha pre-release: the API is unstable and may change
+before v1.
 
-`scripts/package_release.sh` prepares a future reviewable ZIP containing the
-Defold library project files when a later explicit release prompt authorizes a
-release. It does not publish tags, GitHub Releases, package registry artifacts,
-websites, DNS, TLS, or production infrastructure.
+`scripts/package_release.sh` prepares the reviewable ZIP of the Defold library
+project files for a tagged release. Pin the Defold library dependency to the
+release archive for the tag — see the README for the exact `game.project`
+dependency URL.
 
 Manual Defold/Bob release check:
 

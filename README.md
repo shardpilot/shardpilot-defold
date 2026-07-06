@@ -14,13 +14,11 @@ not the platform boundary.
 
 - **v0 alpha, pre-1.0, API unstable.** This is public-preview source only. The
   surface may change before v1 with no backward-compatibility guarantee.
-- **Pre-launch.** No GitHub Release, tag, or package artifact is published from
-  this repo, and the production ingest domain is **not provisioned** yet. Use
+- **Pre-launch.** The production ingest domain is **not provisioned** yet — use
   local/develop endpoints for evaluation.
-- **Version strings are inconsistent across files** (`shardpilot/version.lua`
-  reports `0.5.0`, `game.project` declares `0.1.0`). The latest unreleased work
-  is tracked as `v0.5.0 — unreleased` in [`CHANGELOG.md`](CHANGELOG.md); treat
-  that as the intent until the strings are reconciled.
+- **Version `0.5.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.5.0`, published as the
+  `v0.5.0` git tag.
 
 ## What it does
 
@@ -540,11 +538,6 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 Planned / deferred (not yet implemented):
 
 - Provision the public ingest domain and publish a hosted Defold dependency URL.
-- Reconcile the inconsistent version strings across `version.lua`,
-  `game.project`, and the changelog.
-- Publish a release (tag / GitHub Release / ZIP). `scripts/package_release.sh`
-  only *prepares* a reviewable ZIP and explicitly does not publish tags, GitHub
-  Releases, registry artifacts, websites, DNS, TLS, or production infra.
 - Durable persistence for tokens is intentionally out of scope (tokens stay
   memory-only by design); undeliverable events are covered by the offline
   event spool.

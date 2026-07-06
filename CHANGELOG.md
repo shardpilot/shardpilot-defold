@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.0 — unreleased — early alpha
+## v0.5.0 — 2026-07-06 — early alpha
 
 - **Remote config fetch with a durable last-known-good cache and typed
   getters.** A new `remote_config_url` config field enables
@@ -175,7 +175,7 @@
   `anonymous_id` snapshot.
 - This is an early alpha pre-release. The API is unstable and may change before v1.
 
-## v0.4.0 — unreleased — early alpha
+## v0.4.0 — 2026-07-06 — early alpha
 
 - Adds **crash reporting** as a separate `require "shardpilot.crash"`
   module. Crash reports
@@ -249,7 +249,7 @@
   later report would be dropped.
 - This is an early alpha pre-release. The API is unstable and may change before v1.
 
-## v0.3.0 — unreleased — early alpha
+## v0.3.0 — 2026-07-06 — early alpha
 
 - Dual-mode ingest auth. The SDK now supports BOTH:
   - Mode B (existing): an async `token_provider` that yields a per-tenant
@@ -272,7 +272,7 @@
   returns — but does not itself verify the backend's `bind_anon`.
 - This is an early alpha pre-release. The API is unstable and may change before v1.
 
-## v0.2.0 — unreleased — early alpha
+## v0.2.0 — 2026-07-06 — early alpha
 
 - BREAKING: built-in helpers emit canonical wire event names. `session_start()`
   emits `app.session_started` and `screen_view(...)` emits `app.screen_view`.
@@ -325,7 +325,3 @@
 - Sends app-first batched event payloads to `{ingest_url}/v1/events:batch` without legacy public SDK fields.
 - Keeps token and queue state in memory only, with Lua tests and static library checks.
 - This is an early alpha pre-release. The API is unstable and may change before v1.
-
-## Unreleased
-
-- See v0.2.0 above.
