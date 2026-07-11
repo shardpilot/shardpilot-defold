@@ -3,6 +3,30 @@ local client_mod = require "shardpilot.client"
 local M = {}
 local default_client = nil
 
+-- Capability discovery. Lets an integration feature-detect SDK abilities that
+-- are not new functions (and so cannot be detected by their presence, the way
+-- `crash.set_enabled` can) — usable BEFORE init() and without version
+-- parsing. Unknown capability names return false on older and newer SDKs
+-- alike, so a game can gate new call shapes safely:
+--
+--   if shardpilot.supports("consent_state_denied_forced_minor") then
+--     shardpilot.set_consent("denied_forced_minor")
+--   else
+--     shardpilot.set_consent(false)
+--   end
+local capabilities = {
+	-- Consent receipts are retained in a durable per-app outbox, survive
+	-- process death, and retry until the server acknowledges them.
+	consent_receipt_outbox = true,
+	-- set_consent accepts the "denied_forced_minor" decision (an age-gate-
+	-- forced denial whose receipt records reason = "denied_forced_minor").
+	consent_state_denied_forced_minor = true,
+}
+
+function M.supports(capability)
+	return capabilities[capability] == true
+end
+
 function M.new(config)
 	return client_mod.new(config)
 end
@@ -40,8 +64,12 @@ function M.get_anonymous_id()
 	return with_default("get_anonymous_id")
 end
 
-function M.set_consent(analytics_granted)
-	return with_default("set_consent", analytics_granted)
+-- Record an explicit analytics consent decision: true (granted), false
+-- (denied), or the string "denied_forced_minor" — a band-forced denial that
+-- gates analytics exactly like denied and differs only in the reason its
+-- receipt records. See docs/privacy.md.
+function M.set_consent(decision)
+	return with_default("set_consent", decision)
 end
 
 -- Remote config. `fetch_remote_config` reports "not_initialized" through the

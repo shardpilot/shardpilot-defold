@@ -49,11 +49,16 @@ All of the above is **consent-first**: no event — helper-emitted or
 `track()`-ed — is enqueued, spooled, or sent until an explicit
 `set_consent(true)`. While the decision is still `unknown` the call returns
 `false, "consent_unknown"` and the event is dropped, not held; after a denial
-it returns `false, "consent_denied"`. Runtime samples feeding `perf_summary`
-and `network_summary` follow the same rule: `observe_ping_ms` /
-`observe_disconnect` / frame sampling are dropped at the source while the
+— `set_consent(false)` or the band-forced
+`set_consent("denied_forced_minor")`, which every analytics gate treats
+identically — it returns `false, "consent_denied"`. Runtime samples feeding
+`perf_summary` and `network_summary` follow the same rule: `observe_ping_ms`
+/ `observe_disconnect` / frame sampling are dropped at the source while the
 pipeline is closed, and a denial resets the samplers — a summary emitted
-after a grant carries granted-period activity only.
+after a grant carries granted-period activity only. Consent receipts are not
+events: they post to their own `/v1/consent` endpoint from a durable outbox
+(see `docs/privacy.md`) and are the one permitted wire transmission while
+the pipeline is closed by an explicit decision.
 
 ## Offline durability
 

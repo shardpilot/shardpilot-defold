@@ -801,7 +801,15 @@ local function test_consent_send_failure_is_quiet()
 	assert_equal(client:snapshot().consent_failed, 1)
 	assert_equal(client:snapshot().last_consent_error, "transient_500")
 	assert_contains(requests[1].body, '"actor_identifier":"' .. client.anonymous_id .. '"')
+	-- The transiently failed receipt is RETAINED in the outbox (previously it
+	-- was dropped): the next dispatch point retries it until acknowledged.
+	assert_equal(#client.consent_outbox, 1, "a transient receipt failure must retain the receipt")
 	next_status = 202
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(#requests, 2)
+	assert_equal(requests[2].url, "http://localhost:8080/v1/consent")
+	assert_equal(#client.consent_outbox, 0, "the acknowledged receipt must leave the outbox")
+	assert_equal(client:snapshot().consent_recorded, 1)
 	storage.reset()
 end
 
@@ -869,13 +877,13 @@ local function test_consent_decision_defers_until_token_arrives()
 	-- it must be retained, not lost
 	assert_true(client:set_consent(true))
 	assert_equal(#requests, 0, "no consent request can go out before the token arrives")
-	assert_true(client.pending_consent ~= nil, "the decision must be retained")
+	assert_equal(#client.consent_outbox, 1, "the receipt must be retained in the outbox")
 	assert_equal(client:snapshot().consent_failed, 1)
 	assert_equal(client:snapshot().consent_recorded, 0)
 
 	token_callback("deferred-token", nil, nil)
 	assert_equal(client.token, "deferred-token")
-	assert_true(client.pending_consent ~= nil, "still pending until the next dispatch point")
+	assert_equal(#client.consent_outbox, 1, "still pending until the next dispatch point")
 
 	-- the next dispatch point (the update-driven flush) transmits it
 	-- without a second set_consent call
@@ -884,7 +892,7 @@ local function test_consent_decision_defers_until_token_arrives()
 	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
 	assert_equal(requests[1].headers["Authorization"], "Bearer deferred-token")
 	assert_contains(requests[1].body, '"categories":{"analytics":true}')
-	assert_equal(client.pending_consent, nil)
+	assert_equal(#client.consent_outbox, 0)
 	assert_equal(client:snapshot().consent_recorded, 1)
 	storage.reset()
 end
@@ -928,7 +936,7 @@ local function test_consent_retained_after_unauthorized_and_resent_with_fresh_to
 	assert_equal(#requests, 1)
 	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
 	assert_equal(client.token, nil, "401 must clear the token")
-	assert_true(client.pending_consent ~= nil, "an auth failure must not lose the decision")
+	assert_equal(#client.consent_outbox, 1, "an auth failure must not lose the decision")
 	assert_equal(client:snapshot().consent_failed, 1)
 	assert_equal(client:snapshot().last_consent_error, "unauthorized")
 
@@ -939,7 +947,7 @@ local function test_consent_retained_after_unauthorized_and_resent_with_fresh_to
 	assert_equal(requests[2].url, "http://localhost:8080/v1/consent")
 	assert_equal(requests[2].headers["Authorization"], "Bearer token-2")
 	assert_contains(requests[2].body, '"categories":{"analytics":true}')
-	assert_equal(client.pending_consent, nil)
+	assert_equal(#client.consent_outbox, 0)
 	assert_equal(client:snapshot().consent_recorded, 1)
 	storage.reset()
 end
@@ -996,8 +1004,9 @@ local function test_mode_a_401_drops_pending_consent()
 	assert_true(client:set_consent(true))
 	assert_equal(#requests, 1)
 	-- Unlike Mode B (which retains for a fresh-token retry), a Mode A consent
-	-- 401 is terminal: the decision is dropped rather than replayed forever.
-	assert_equal(client.pending_consent, nil, "Mode A 401 must drop the decision")
+	-- 401 is terminal: the receipt is dropped from the outbox rather than
+	-- replayed forever against the same static key.
+	assert_equal(#client.consent_outbox, 0, "Mode A 401 must drop the receipt")
 	assert_equal(client:snapshot().consent_failed, 1)
 	next_status = 202
 	client:update(client.config.flush_interval_seconds)
@@ -1183,14 +1192,14 @@ local function test_set_anonymous_id_rejected_while_consent_pending_mode_b()
 	storage.reset()
 	local client = assert(sdk.new(config({
 		token_provider = function(callback)
-			-- Settle the request with an error: pending_consent stays queued but
-			-- token_request_in_flight returns to false.
+			-- Settle the request with an error: the receipt stays retained in
+			-- the outbox but token_request_in_flight returns to false.
 			callback(nil, nil, "no token")
 		end,
 	})))
 	assert_true(client:identify("user-example"))
 	assert_true(client:set_consent(true))
-	assert_true(client.pending_consent ~= nil, "consent stays pending after a token error")
+	assert_equal(#client.consent_outbox, 1, "consent stays pending after a token error")
 	assert_equal(client.token_request_in_flight, false)
 	-- A consent receipt bound to the OLD anon is still pending, so rotation must
 	-- be blocked even though no token request is in flight.
@@ -1200,11 +1209,17 @@ local function test_set_anonymous_id_rejected_while_consent_pending_mode_b()
 	storage.reset()
 end
 
-local function test_stale_unauthorized_consent_does_not_resurrect_old_decision()
+-- Receipts are an audit trail: EVERY explicit decision delivers exactly one
+-- receipt, serially and strictly in decision order — one receipt in flight at
+-- a time, so a grant made right after a denial can never settle on the server
+-- as deny-after-grant, and a Mode B 401 on the older receipt retries IT first
+-- (with a fresh token) before the newer decision goes out.
+local function test_consent_receipts_deliver_serially_in_decision_order()
 	reset()
 	storage.reset()
 	local original_request = http.request
 	local callbacks = {}
+	local token_calls = 0
 	http.request = function(url, method, callback, headers, body, options)
 		requests[#requests + 1] = {
 			url = url,
@@ -1216,30 +1231,49 @@ local function test_stale_unauthorized_consent_does_not_resurrect_old_decision()
 		callbacks[#callbacks + 1] = callback
 	end
 
-	local client = assert(sdk.new(config()))
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			token_calls = token_calls + 1
+			callback("token-" .. tostring(token_calls), nil, nil)
+		end,
+	})))
 	assert_true(client:identify("user-example"))
 	assert_true(client:set_consent(false))
 	assert_true(client:set_consent(true))
-	assert_equal(#requests, 2)
-	assert_equal(#callbacks, 2)
+	-- Serial delivery: the denied receipt is in flight, the granted receipt
+	-- queues behind it instead of dispatching concurrently.
+	assert_equal(#requests, 1, "one receipt in flight at a time")
+	assert_contains(requests[1].body, '"categories":{"analytics":false}')
+	assert_equal(#client.consent_outbox, 2)
 
-	-- the newer (granted) decision completes first
-	callbacks[2](nil, nil, { status = 202, response = "" })
-	assert_equal(client:snapshot().consent_recorded, 1)
-
-	-- the stale (denied) dispatch comes back unauthorized: the token is
-	-- invalidated but the stale decision must NOT be resurrected over the
-	-- newer one
+	-- the in-flight (older, denied) receipt comes back unauthorized: the
+	-- token is invalidated, the receipt stays at the HEAD of the outbox
 	callbacks[1](nil, nil, { status = 401, response = "" })
 	assert_equal(client.token, nil)
-	assert_equal(client.pending_consent, nil, "a stale decision must not be resurrected")
+	assert_equal(#client.consent_outbox, 2, "a Mode B 401 must not lose the receipt")
+
+	-- the next dispatch point re-mints and retries the denied receipt FIRST;
+	-- its ack then chains the granted receipt in the same dispatch pass
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(#requests, 2)
+	assert_equal(requests[2].headers["Authorization"], "Bearer token-2")
+	assert_contains(requests[2].body, '"categories":{"analytics":false}')
+	callbacks[2](nil, nil, { status = 202, response = "" })
+	assert_equal(#requests, 3, "the ack must chain the next retained receipt")
+	assert_contains(requests[3].body, '"categories":{"analytics":true}')
+	callbacks[3](nil, nil, { status = 202, response = "" })
+	assert_equal(#client.consent_outbox, 0)
+	assert_equal(client:snapshot().consent_recorded, 2)
 
 	client:update(client.config.flush_interval_seconds)
-	assert_equal(#requests, 2, "the stale decision must not be replayed")
+	assert_equal(#requests, 3, "an empty outbox must not replay anything")
 	http.request = original_request
 	storage.reset()
 end
 
+-- On a host WITHOUT a durable save-file backend the outbox cannot outlive the
+-- process, so the old contract holds: shutdown() refuses to tear down while a
+-- receipt is still awaiting a token, and the host retries once it lands.
 local function test_shutdown_waits_for_deferred_consent()
 	reset()
 	storage.reset()
@@ -1251,7 +1285,7 @@ local function test_shutdown_waits_for_deferred_consent()
 	})))
 	assert_true(client:identify("user-example"))
 	assert_true(client:set_consent(true))
-	assert_true(client.pending_consent ~= nil)
+	assert_equal(#client.consent_outbox, 1)
 	assert_equal(#requests, 0)
 
 	-- no queued events, but the deferred decision must keep the client
@@ -1264,7 +1298,7 @@ local function test_shutdown_waits_for_deferred_consent()
 	token_callback("late-token", nil, nil)
 	assert_true(client:shutdown("app_final"))
 	assert_equal(client.initialized, false)
-	assert_equal(client.pending_consent, nil)
+	assert_equal(#client.consent_outbox, 0)
 	assert_equal(#requests, 1)
 	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
 	assert_equal(requests[1].headers["Authorization"], "Bearer late-token")
@@ -3153,6 +3187,328 @@ local function test_shutdown_surfaces_terminal_failure_not_vacuous_spool()
 	storage.reset()
 end
 
+-- ── consent-receipt outbox + denied_forced_minor ─────────────────────────────
+
+local function stored_consent_outbox_record(stores)
+	for path, record in pairs(stores) do
+		if path:sub(-15) == "/consent-outbox" then
+			return record, path
+		end
+	end
+	return nil
+end
+
+-- AC-8 (consent & age-gate UX spec §7/§10): in a forced-minor session the
+-- ONLY analytics-plane request permitted on the wire is the
+-- denied_forced_minor receipt POST to /v1/consent — asserted as EXACTLY one
+-- captured request across init, the decision, gameplay-shaped SDK usage,
+-- update ticks, flush, session teardown, and shutdown; zero batch requests.
+local function test_ac8_forced_minor_sole_request_is_the_receipt()
+	reset()
+	storage.reset()
+	-- init dark: no persisted decision — a consent-first client transmits
+	-- nothing at construction
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-minor"))
+	assert_equal(#requests, 0, "a dark init must produce zero requests")
+
+	assert_true(client:set_consent("denied_forced_minor"))
+	assert_equal(client.consent_state, "denied_forced_minor")
+
+	-- the rest of the forced-minor session: everything analytics stays closed
+	local ok, err = client:track("match_started")
+	assert_equal(ok, false)
+	assert_equal(err, "consent_denied", "forced minor gates exactly like denied")
+	ok, err = client:session_start()
+	assert_equal(ok, false)
+	assert_equal(err, "consent_denied")
+	client:observe_ping_ms(42)
+	client:observe_disconnect("net_drop")
+	client:update(client.config.flush_interval_seconds)
+	client:update(client.config.flush_interval_seconds)
+	assert_true(client:flush())
+	assert_true(client:session_end("minor_session_end"))
+	assert_true(client:shutdown("app_final"))
+
+	-- exactly ONE request left the device: the consent receipt
+	assert_equal(#requests, 1, "the sole permitted analytics-plane request is the receipt POST")
+	local receipt = requests[1]
+	assert_equal(receipt.url, "http://localhost:8080/v1/consent")
+	assert_equal(receipt.method, "POST")
+	assert_contains(receipt.body, '"categories":{"analytics":false}')
+	assert_contains(receipt.body, '"reason":"denied_forced_minor"')
+	assert_contains(receipt.body, '"actor_identifier":"user-minor"')
+	assert_contains(receipt.body, '"idempotency_key":"')
+	assert_contains(receipt.body, '"decided_at":"')
+	for _, request in ipairs(requests) do
+		assert_not_contains(request.url, "/v1/events:batch")
+	end
+	assert_equal(client:snapshot().consent_recorded, 1)
+	storage.reset()
+end
+
+-- denied_forced_minor is persisted, reloads as the same state, discards a
+-- retained batch when it lands mid-flight, purges the durable spool exactly
+-- like a denial, and a later explicit choice (the spec §6 band-correction
+-- path) supersedes it with a fresh, reason-less receipt.
+local function test_forced_minor_persists_and_gates_like_denied()
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local _, restore = install_stub_sys_storage()
+
+	next_status = 500
+	local first = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(first:identify("user-example"))
+	assert_true(first:track("pre_minor_event"))
+	assert_equal(first:flush(), false)
+	assert_true(first.in_flight_batch ~= nil, "the transient failure retains the batch")
+	assert_equal(#first.spool_record, 1, "the transient failure spools the batch")
+
+	next_status = 202
+	assert_true(first:set_consent("denied_forced_minor"))
+	assert_equal(first.in_flight_batch, nil, "a forced-minor denial discards the retained batch")
+	assert_equal(#storage.load_spool(spool_scope), 0, "a forced-minor denial purges the durable spool")
+	assert_equal(requests[#requests].url, "http://localhost:8080/v1/consent")
+	assert_contains(requests[#requests].body, '"reason":"denied_forced_minor"')
+
+	-- "next launch": the persisted forced-minor state reloads and keeps gating
+	reset()
+	local second = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(second.consent_state, "denied_forced_minor")
+	local ok, err = second:track("still_blocked")
+	assert_equal(ok, false)
+	assert_equal(err, "consent_denied")
+	assert_equal(#second.spool_batches, 0, "no spool may load under a forced-minor init")
+	assert_equal(#requests, 0, "a forced-minor launch with an empty outbox transmits nothing")
+
+	-- only the exact forced-minor string is a valid decision
+	ok, err = second:set_consent("denied")
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_consent")
+
+	-- the band-correction path: a later explicit grant supersedes the forced
+	-- state; its receipt carries no reason
+	assert_true(second:set_consent(true))
+	assert_equal(second.consent_state, "granted")
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"categories":{"analytics":true}')
+	assert_not_contains(requests[1].body, '"reason"')
+	restore()
+	storage.reset()
+end
+
+-- The outbox's core durability contract: a receipt that could not be
+-- delivered (500s / network errors) survives process death, re-sends at the
+-- next init VERBATIM (same idempotency_key), keeps retrying with backoff, is
+-- delivered even while the persisted consent state is DENIED (a receipt
+-- documents the decision itself — consent-plane egress, not analytics), and
+-- leaves the durable record the moment the server acknowledges it.
+local function test_consent_receipt_survives_restart_and_retries_until_acked()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+
+	next_status = 500
+	local first = assert(sdk.new(config()))
+	assert_true(first:identify("user-example"))
+	assert_true(first:set_consent(false))
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
+	local record = stored_consent_outbox_record(stores)
+	assert_true(record ~= nil, "an undelivered receipt must be durably retained")
+	assert_equal(#record.receipts, 1)
+	local original_key = record.receipts[1].idempotency_key
+	assert_equal(record.receipts[1].categories.analytics, false)
+
+	-- "next launch": init re-attempts delivery immediately — while the
+	-- persisted state is denied
+	reset()
+	next_status = 500
+	local second = assert(sdk.new(config()))
+	assert_equal(second.consent_state, "denied")
+	assert_equal(#requests, 1, "init must re-attempt the retained receipt")
+	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
+	assert_contains(requests[1].body, '"idempotency_key":"' .. original_key .. '"',
+		"the receipt re-sends verbatim")
+	assert_equal(#second.consent_outbox, 1, "a failed re-send stays retained")
+	assert_equal(second.consent_backoff_attempt, 1)
+	assert_true(not second:consent_send_deferred(), "the first failure retries without a wait")
+
+	-- a second consecutive failure (network error this time) backs off
+	next_status = 0
+	second:update(second.config.flush_interval_seconds)
+	assert_equal(#requests, 2)
+	assert_equal(second:snapshot().last_consent_error, "http_0")
+	assert_equal(second.consent_backoff_attempt, 2)
+	assert_true(second:consent_send_deferred(), "sustained receipt failures back off")
+	second:update(second.config.flush_interval_seconds)
+	assert_equal(#requests, 2, "an open backoff window must hold the retry")
+
+	-- recovery: the acknowledged receipt is pruned from the durable record
+	second.consent_retry_after_ms = nil
+	next_status = 202
+	second:update(second.config.flush_interval_seconds)
+	assert_equal(#requests, 3)
+	assert_equal(second:snapshot().consent_recorded, 1)
+	assert_equal(second.consent_backoff_attempt, 0)
+	assert_equal(#second.consent_outbox, 0)
+	record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 0, "an acknowledged receipt must leave the durable record")
+
+	second:update(second.config.flush_interval_seconds)
+	assert_equal(#requests, 3, "nothing replays after the prune")
+	restore()
+	storage.reset()
+end
+
+-- With a durable backend, an undelivered receipt no longer blocks teardown:
+-- it is safe on disk (that durability is the outbox's point), so shutdown()
+-- completes and the next launch delivers it. Hosts without durable storage
+-- keep the consent_pending contract (test_shutdown_waits_for_deferred_consent).
+local function test_shutdown_completes_with_durable_outbox_and_next_launch_delivers()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			callback(nil, nil, "token backend down")
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 0, "no token — nothing dispatched")
+	assert_equal(#client.consent_outbox, 1)
+
+	assert_true(client:shutdown("app_final"), "a durably retained receipt must not block teardown")
+	assert_equal(client.initialized, false)
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1, "the receipt survives teardown on disk")
+
+	-- next launch (working token backend) delivers it at init
+	reset()
+	local second = assert(sdk.new(config()))
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
+	assert_contains(requests[1].body, '"categories":{"analytics":true}')
+	assert_equal(second:snapshot().consent_recorded, 1)
+	record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 0)
+	restore()
+	storage.reset()
+end
+
+-- The outbox is bounded: storage evicts the OLDEST receipts beyond the fixed
+-- cap (32 — the newest decisions are the operative ones), and the client
+-- surfaces the eviction of a still-undelivered receipt via stats/diagnostics.
+local function test_consent_outbox_bounded_evicts_oldest()
+	reset()
+	storage.reset()
+	local function receipt(i)
+		return {
+			workspace_id = "workspace-example",
+			app_id = "app-example",
+			environment_id = "develop",
+			actor_identifier = "user-example",
+			categories = { analytics = (i % 2) == 0 },
+			decided_at = "2026-07-11T00:00:00Z",
+			idempotency_key = "receipt-" .. tostring(i),
+		}
+	end
+	local entries = {}
+	for i = 1, 40 do
+		entries[i] = receipt(i)
+	end
+	local saved = storage.save_consent_outbox(identity_scope, entries)
+	assert_equal(#saved, 32, "the outbox must hold at most 32 receipts")
+	assert_equal(saved[1].idempotency_key, "receipt-9", "the oldest receipts are evicted first")
+	assert_equal(saved[32].idempotency_key, "receipt-40")
+
+	-- the client mirror adopts the trim and counts the eviction
+	reset()
+	storage.reset()
+	local issues = {}
+	local client = assert(sdk.new(config({
+		diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end,
+	})))
+	for i = 1, 33 do
+		client.consent_outbox[i] = receipt(100 + i)
+	end
+	assert_true(client:persist_consent_outbox())
+	assert_equal(#client.consent_outbox, 32)
+	assert_equal(client:snapshot().consent_outbox_evicted, 1)
+	assert_equal(issues[#issues].scope, "consent")
+	assert_equal(issues[#issues].code, "outbox_overflow")
+	storage.reset()
+end
+
+-- A malformed outbox record on disk is fail-safe: garbled entries are dropped
+-- at load — never sent, never a crash into game code — and they never block
+-- the deliverable receipts stored around them.
+local function test_malformed_consent_outbox_dropped_failsafe()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+
+	-- persist one real receipt (a transient failure keeps it retained)
+	next_status = 500
+	local first = assert(sdk.new(config()))
+	assert_true(first:identify("user-example"))
+	assert_true(first:set_consent(false))
+	local record, path = stored_consent_outbox_record(stores)
+	assert_true(record ~= nil and path ~= nil)
+	local valid = record.receipts[1]
+
+	-- corrupt the record around the one valid entry
+	stores[path] = { receipts = {
+		"not-a-table",
+		42,
+		{ idempotency_key = "" },
+		{ idempotency_key = "half-a-receipt" },
+		{
+			idempotency_key = "bad-categories",
+			workspace_id = "w",
+			app_id = "a",
+			environment_id = "e",
+			actor_identifier = "u",
+			decided_at = "2026-07-11T00:00:00Z",
+			categories = { analytics = "yes" },
+		},
+		valid,
+	} }
+	storage.reset() -- drop the in-memory shadow so the corrupt FILE is what loads
+
+	reset()
+	next_status = 202
+	local second = assert(sdk.new(config()))
+	assert_equal(#requests, 1, "only the well-formed receipt may send")
+	assert_contains(requests[1].body, '"idempotency_key":"' .. valid.idempotency_key .. '"')
+	assert_equal(second:snapshot().consent_recorded, 1)
+	assert_equal(#second.consent_outbox, 0)
+
+	-- a wholly garbled record (not even a table) starts clean, never throws
+	stores[path] = "garbage"
+	storage.reset()
+	reset()
+	local third = assert(sdk.new(config()))
+	assert_equal(#requests, 0, "a garbled outbox record must load as empty")
+	assert_equal(#third.consent_outbox, 0)
+	restore()
+	storage.reset()
+end
+
+-- Capability discovery: a game feature-detects the new consent surface before
+-- init() and without version parsing; unknown names are false everywhere.
+local function test_supports_capability_discovery()
+	assert_equal(sdk.supports("consent_receipt_outbox"), true)
+	assert_equal(sdk.supports("consent_state_denied_forced_minor"), true)
+	assert_equal(sdk.supports("time_travel"), false)
+	assert_equal(sdk.supports(nil), false)
+	assert_equal(sdk.supports(42), false)
+end
+
 local tests = {
 	test_config_validation,
 	test_singleton_guard,
@@ -3189,7 +3545,7 @@ local tests = {
 	test_consent_denial_clears_stale_publish_deferral,
 	test_denied_in_flight_429_sets_no_stale_deferral,
 	test_set_anonymous_id_rejected_while_consent_pending_mode_b,
-	test_stale_unauthorized_consent_does_not_resurrect_old_decision,
+	test_consent_receipts_deliver_serially_in_decision_order,
 	test_shutdown_waits_for_deferred_consent,
 	test_set_consent_reports_persist_failure,
 	test_storage_namespace_varies_with_app_config,
@@ -3247,6 +3603,13 @@ local tests = {
 	test_init_purge_runs_even_when_record_unreadable,
 	test_grant_blocked_until_owed_purge_lands,
 	test_shutdown_surfaces_terminal_failure_not_vacuous_spool,
+	test_ac8_forced_minor_sole_request_is_the_receipt,
+	test_forced_minor_persists_and_gates_like_denied,
+	test_consent_receipt_survives_restart_and_retries_until_acked,
+	test_shutdown_completes_with_durable_outbox_and_next_launch_delivers,
+	test_consent_outbox_bounded_evicts_oldest,
+	test_malformed_consent_outbox_dropped_failsafe,
+	test_supports_capability_discovery,
 }
 
 for _, test in ipairs(tests) do
