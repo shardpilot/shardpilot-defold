@@ -130,8 +130,11 @@ configuration that lowered the budgets trims an over-budget old record
 The spool honors consent — it is written, loaded, and re-sent only under a
 **granted** decision (consent-first). While consent is "unknown" nothing
 transmits: an existing record is neither loaded nor purged, waiting on disk
-for a launch that starts granted. A persisted "denied" decision clears it at
-load
+for a launch that starts granted — unless the identity record itself FAILED
+to read (as opposed to being absent), in which case the spool is purged like
+a denial: the unreadable record may have carried a denial, and its envelopes
+must not re-send under a later grant. A persisted "denied" decision clears it
+at load
 without sending (the purge runs even when the record cannot be read — a
 corrupt record is still cleared), and `set_consent(false)` purges it at
 runtime. If the durable

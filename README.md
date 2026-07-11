@@ -451,7 +451,10 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   granted launch is neither loaded nor re-sent (it waits, untouched, for a
   granted launch; a denial purges it). A grant opens the pipeline for FUTURE
   events only. An unreadable identity record resolves to `unknown`, so a
-  consent-state read failure fails **closed**. `denied` drops events at
+  consent-state read failure fails **closed** — and because the lost record
+  may have carried a denial, a FAILED identity read (unlike a cleanly absent
+  record) also purges the spool rather than letting possibly pre-revocation
+  envelopes re-send under a later grant. `denied` drops events at
   enqueue (`consent_denied`), clears the pending
   queue, discards in-flight batches instead of retrying, and purges the
   offline spool. The decision is
@@ -477,11 +480,15 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   reports ride their own plane, independent of analytics consent:
   `crash.set_enabled(false)` persists a per-app opt-out that stops
   COLLECTION — `emit`/`emit_fatal`/`capture_previous`/`resend_pending` return
-  `false, "crash_disabled"`, no sidecar entry is written, and the
+  `false, "crash_disabled"`, no sidecar entry is written, the breadcrumb ring
+  is emptied and refuses new entries, and the
   previous-session native dump stays unread. `crash.is_enabled()` reports the
-  state. If the persisted opt-out record cannot be READ (storage error — not
+  state. If the persisted opt-out record cannot be READ (storage error or a
+  malformed record — not
   merely absent on a fresh install), the crash client **fails closed** and
-  sends nothing until a new `set_enabled` decision is persisted. See
+  sends nothing until a new `set_enabled` decision is persisted. A disabled
+  client still runs the pending sidecar's ~7-day TTL maintenance at init, so
+  already-captured reports age out on schedule while the opt-out holds. See
   [`docs/crash.md`](docs/crash.md#opting-out).
 - **Pending-crash sidecar.** Every dispatched crash report — a live
   `emit`/`emit_fatal` and a previous-session dump forward alike — has its

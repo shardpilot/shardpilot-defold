@@ -29,7 +29,11 @@ an explicit **granted** decision opens the event pipeline.
   launch is neither loaded nor re-sent (it stays on disk untouched until a
   launch that starts granted re-sends it, or a denial purges it). There is
   **zero analytics wire traffic** and **no pre-consent data at rest**; a
-  storage failure that loses the consent record therefore **fails closed**.
+  storage failure that loses the consent record therefore **fails closed** —
+  and because the unreadable record may have carried a denial, an identity
+  record that FAILED to read (unlike a cleanly absent one) also **purges the
+  spool**, so possibly pre-revocation envelopes never outlive the lost
+  decision.
 - **Granted** opens the pipeline for FUTURE events only — events dropped
   while consent was unknown are gone by design.
 - **Denied** drops events at enqueue (`false, "consent_denied"`), clears the
@@ -125,9 +129,12 @@ a later launch. This sidecar:
 - is **cleared on success** — an entry is removed as soon as its report is
   accepted or terminally rejected, so it never accumulates; and
 - **honors the opt-out**: while crash reporting is disabled, no entry is
-  written (reports are not collected at all, not merely unsent) and the
+  written (reports are not collected at all, not merely unsent — breadcrumbs
+  included) and the
   existing backlog is neither loaded nor re-sent — it stays where it is,
-  bounded by the ~7-day TTL. Entries captured earlier under an enabled state
+  bounded by the ~7-day TTL, which a disabled client still enforces with a
+  maintenance read at init (expired entries are pruned from disk even while
+  the opt-out holds). Entries captured earlier under an enabled state
   re-send only if crash reporting is re-enabled while they are still within
   the TTL.
 
@@ -142,7 +149,8 @@ Crash reporting is ON by default and needs no first-run decision; an explicit
   one device never share an opt-out;
 - is **fail-closed on read failure**: an absent record on a fresh install
   applies the default (enabled), but a record that cannot be READ (a storage
-  error or corruption) disables crash reporting entirely — nothing is
+  error or corruption) — or that loads with a malformed, non-boolean
+  decision — disables crash reporting entirely — nothing is
   collected or sent — until a later `set_enabled` call persists a readable
   decision again; and
 - goes through Defold `sys.save` only (browser storage on HTML5), degrading

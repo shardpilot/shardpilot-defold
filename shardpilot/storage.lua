@@ -76,17 +76,34 @@ local function save_path(ns, file_name)
 	return path
 end
 
+-- Load the identity record. Returns (record, err): the stored record when one
+-- is readable (an empty table — Defold's sys.load result for an absent file —
+-- reads as a fresh install); nil, nil when no record exists at all; and
+-- nil, "identity_read_failed" when the durable read itself failed (sys.load
+-- threw, or produced a non-table) and no in-process shadow — written by a
+-- save this session — can answer instead. Callers that only want the legacy
+-- record-or-nil shape ignore the second return; the consent-first client uses
+-- the error to fail closed for data at rest (an unreadable record may have
+-- carried a denial).
 function M.load(scope)
 	local ns = namespace(scope)
 	local path = save_path(ns)
 	if not path then
-		return clone(memory_records[ns])
+		return clone(memory_records[ns]), nil
 	end
 	local ok, record = pcall(sys.load, path)
-	if not ok or type(record) ~= "table" then
-		return clone(memory_records[ns])
+	if ok and type(record) == "table" then
+		return record, nil
 	end
-	return record
+	local fallback = clone(memory_records[ns])
+	if fallback ~= nil then
+		return fallback, nil
+	end
+	if ok and record == nil then
+		-- The backend answered cleanly with nothing: no record exists.
+		return nil, nil
+	end
+	return nil, "identity_read_failed"
 end
 
 function M.save(scope, record)
@@ -698,13 +715,24 @@ function M.save_crash_settings(scope, record)
 		return false
 	end
 	local ns = crash_settings_namespace(scope)
-	crash_settings_memory[ns] = clone(record)
 	local path = save_path(ns)
 	if not path then
+		-- No durable backend: the in-memory record IS the store.
+		crash_settings_memory[ns] = clone(record)
 		return true
 	end
 	local ok, saved = pcall(sys.save, path, record)
-	return ok and saved == true
+	if not (ok and saved == true) then
+		-- The durable write failed. Do NOT seed the in-process shadow: the
+		-- shadow answers load_crash_settings when the durable READ fails, so
+		-- it must only ever reflect a decision that actually persisted —
+		-- otherwise a failed set_enabled(true) could reopen a fail-closed
+		-- client at the next same-process init without any readable decision
+		-- on disk.
+		return false
+	end
+	crash_settings_memory[ns] = clone(record)
+	return true
 end
 
 -- ── offline event spool ──────────────────────────────────────────────────────

@@ -17,14 +17,23 @@
   `set_consent(true)` (wired to their consent UX) before any events flow — the
   quick start, example, and docs show the sequence.
   - A spool record persisted under an earlier granted decision is neither
-    loaded nor re-sent while consent reads `unknown` (it also is not purged —
-    it waits on disk untouched): a later launch that starts granted re-sends
-    it, and a denial purges it, exactly as before. `session_end()` and
+    loaded nor re-sent while consent reads `unknown` because no decision was
+    ever persisted (a cleanly absent identity record); it also is not purged
+    then — it waits on disk untouched for a later launch that starts granted
+    to re-send it, and a denial purges it, exactly as before. (A FAILED
+    identity read is the exception — see the fail-closed bullet below.)
+    `session_end()` and
     `shutdown()` complete their local teardown while consent is unknown with
     the same suppressed-wire posture the denied state already had.
   - A consent-state read failure now **fails closed**: an unreadable identity
     record resolves to `unknown`, which transmits nothing (previously it
-    resolved to `unknown` and transmitted everything).
+    resolved to `unknown` and transmitted everything). And because the lost
+    record may have carried a denial whose spool purge was still owed, an
+    identity record that FAILED to read (as opposed to cleanly absent) also
+    **purges the offline spool** at init — possibly pre-revocation envelopes
+    must not outlive the lost decision and re-send under a later grant.
+    `storage.load` now reports that read failure as a second return value
+    (`"identity_read_failed"`) instead of swallowing it into "absent".
   - `denied` semantics are unchanged: events drop at enqueue with
     `consent_denied`, the queue clears, in-flight batches are discarded on
     completion, the spool purges fail-closed, and explicit decisions are
@@ -44,9 +53,15 @@
     `capture_previous`, and `resend_pending` all return
     `false, "crash_disabled"`, no report is prepared or written to the
     pending sidecar, the pending backlog is neither loaded nor re-sent (it
-    ages out under its ~7-day TTL), and the previous-session native dump is
+    ages out under its ~7-day TTL — enforced by a maintenance read at every
+    `init`/`new` even while disabled, so an opted-out install cannot keep
+    already-scrubbed crash bodies on disk past the TTL), and the
+    previous-session native dump is
     left **unread** — the engine's one-shot store is not consumed, so the
-    dump survives for a later enabled launch. The gate also holds mid-pass:
+    dump survives for a later enabled launch. The breadcrumb ring is emptied
+    at the flip and `record_breadcrumb` refuses new entries while disabled,
+    so a report emitted after a re-enable can never carry opt-out-period
+    activity. The gate also holds mid-pass:
     a disable landing while a serial resend pass is in flight stops the pass
     before its next dispatch.
   - `crash.is_enabled()` returns the state plus a reason
@@ -54,11 +69,14 @@
     disabled.
   - **Fail closed on read failure:** an ABSENT settings record (fresh
     install) applies the default — enabled; a record that cannot be READ (a
-    thrown `sys.load`, a corrupt file) starts the client **disabled** and
+    thrown `sys.load`, a corrupt file) — or that loads carrying a malformed,
+    non-boolean `crash_enabled` — starts the client **disabled** and
     nothing is collected or sent until an explicit `set_enabled(...)`
     persists a readable decision again. `storage.lua` now distinguishes
     absent from failed reads for this record instead of swallowing both into
-    "absent".
+    "absent", and the in-process settings fallback is seeded only by writes
+    that actually persisted — a failed `set_enabled(true)` can never reopen
+    a fail-closed client at a later same-process init.
   - A failed durable write at `set_enabled` returns
     `false, "crash_persist_failed"` while the in-memory decision still
     applies for the session (call again to retry), mirroring

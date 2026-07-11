@@ -225,12 +225,32 @@ function M.new(config)
 	local settings, settings_err = storage.load_crash_settings({ app_id = normalized.app_id })
 	local enabled = true
 	local enabled_reason = nil
+	local decision = nil
+	if type(settings) == "table" then
+		decision = settings.crash_enabled
+	end
 	if settings_err then
 		enabled = false
 		enabled_reason = "settings_read_failed"
-	elseif type(settings) == "table" and settings.crash_enabled == false then
+	elseif decision ~= nil and type(decision) ~= "boolean" then
+		-- The record loaded but carries a malformed decision (a non-boolean
+		-- crash_enabled): that is a corrupt record, not an absent one — fail
+		-- closed exactly like an unreadable record instead of silently
+		-- reopening crash collection on the default.
+		enabled = false
+		enabled_reason = "settings_read_failed"
+	elseif decision == false then
 		enabled = false
 		enabled_reason = "opt_out"
+	end
+	if not enabled then
+		-- A disabled client still honors the pending sidecar's retention TTL:
+		-- this maintenance read runs the read-side normalization, which prunes
+		-- entries older than the TTL and rewrites the record — so an opted-out
+		-- (or fail-closed) install cannot keep already-scrubbed crash bodies
+		-- on disk past the documented ~7 days. Nothing is dispatched or
+		-- retained; the result is discarded.
+		storage.load_pending_entries({ app_id = normalized.app_id })
 	end
 	return setmetatable({
 		config = normalized,
@@ -299,7 +319,14 @@ function M.new(config)
 end
 
 -- Record a breadcrumb. Names are scrubbed; an invalid name is dropped.
+-- Refused while crash reporting is disabled: the ring is attached to the next
+-- report, so retaining entries recorded during an opt-out would ship
+-- opt-out-period activity after a later re-enable — disabling stops
+-- collection, breadcrumbs included.
 function Client:record_breadcrumb(name)
+	if not self.enabled then
+		return false, "crash_disabled"
+	end
 	return self.breadcrumbs:record(name)
 end
 
@@ -321,8 +348,10 @@ end
 -- Enable or disable crash reporting. Disabling stops COLLECTION, not just
 -- sending: no report is prepared, persisted, or dispatched while disabled —
 -- emit / emit_fatal / capture_previous / resend_pending all return
--- (false, "crash_disabled"), nothing is written to the pending sidecar, and
--- the previous-session native dump is left unread. The decision persists
+-- (false, "crash_disabled"), nothing is written to the pending sidecar, the
+-- previous-session native dump is left unread, and the breadcrumb ring is
+-- emptied and refuses new entries (retained breadcrumbs would otherwise
+-- attach to the first report after a re-enable). The decision persists
 -- across launches; when the durable write fails, the decision still applies
 -- in memory for this session and (false, "crash_persist_failed") is returned
 -- — call set_enabled again to retry persistence, otherwise the decision can
@@ -337,6 +366,13 @@ function Client:set_enabled(enabled)
 	end
 	self.enabled = enabled
 	self.enabled_reason = (not enabled) and "opt_out" or nil
+	if not enabled then
+		-- Opting out empties the breadcrumb ring: retained entries would
+		-- otherwise attach to the first report after a later re-enable, and a
+		-- disabled client must retain nothing new — record_breadcrumb refuses
+		-- while disabled, and what was recorded before the flip is dropped.
+		self.breadcrumbs = breadcrumbs.new()
+	end
 	if not storage.save_crash_settings(self:pending_scope(), { crash_enabled = enabled }) then
 		return false, "crash_persist_failed"
 	end

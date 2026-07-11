@@ -338,7 +338,8 @@ function M.new(config)
 	if not normalized then
 		return nil, err
 	end
-	local stored = storage.load(normalized) or {}
+	local stored, stored_err = storage.load(normalized)
+	stored = stored or {}
 	local anonymous_id
 	if valid_identity(config.anonymous_id) then
 		anonymous_id = config.anonymous_id
@@ -429,12 +430,17 @@ function M.new(config)
 	-- the record too: envelopes persisted by an earlier configuration must not
 	-- linger on disk, nor resend if the spool is later re-enabled. Only a
 	-- persisted GRANT loads the record for re-send: while consent reads as
-	-- "unknown" (a fresh install, or an identity record that could not be
-	-- read) the client is consent-first and transmits nothing, so the record —
-	-- which can only have been written under an earlier granted decision — is
-	-- left on disk untouched. A later launch that starts granted re-sends it;
-	-- a denial purges it.
-	if consent_state == "denied" or not normalized.spool_enabled then
+	-- "unknown" — no decision was ever persisted — the client is
+	-- consent-first and transmits nothing, so the record (which can only have
+	-- been written under an earlier granted decision) is left on disk
+	-- untouched. A later launch that starts granted re-sends it; a denial
+	-- purges it. An identity record that FAILED to read is different from an
+	-- absent one: the unreadable record may have carried a denial whose purge
+	-- is still owed, and init below re-writes the identity record without it —
+	-- so the spool is purged like a denial rather than letting possibly
+	-- pre-revocation envelopes outlive the lost decision and re-send under a
+	-- later grant.
+	if consent_state == "denied" or stored_err ~= nil or not normalized.spool_enabled then
 		-- Attempt the purge UNCONDITIONALLY: gating it on a successful read
 		-- would let a failed/corrupt read masquerade as "nothing to purge"
 		-- and leave the stale file to replay after a later grant/re-enable.

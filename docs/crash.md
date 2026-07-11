@@ -128,18 +128,28 @@ crash.set_enabled(true)         -- back to the default
   `false, "crash_disabled"`; no report is prepared, nothing is written to the
   pending sidecar, and the previous-session native dump is left **unread**
   (reading it would consume the engine's one-shot store — it stays available
-  for a later enabled launch). The already-persisted pending backlog is
-  neither loaded nor re-sent; it stays on disk under its ~7-day TTL and
+  for a later enabled launch). The breadcrumb ring is emptied at the flip and
+  `record_breadcrumb` refuses new entries while disabled — retained
+  breadcrumbs would otherwise attach to the first report after a re-enable.
+  The already-persisted pending backlog is
+  neither loaded nor re-sent; it stays on disk under its ~7-day TTL — which a
+  disabled client still enforces with a maintenance read at every
+  `init`/`new` (expired entries are pruned from disk while the opt-out
+  holds) — and
   re-sends only if crash reporting is re-enabled within that window.
 - **The decision persists across launches** in a small per-app settings
   record (`crash_enabled`), stored alongside the pending sidecar. A new
   client for the same app honors it at `init`/`new` time.
 - **A read failure fails closed.** An ABSENT record (a fresh install) applies
   the default — enabled. A record that cannot be READ (a thrown `sys.load`, a
-  corrupt file) is a different thing: the player may have opted out, so the
+  corrupt file) — or that loads carrying a malformed, non-boolean
+  `crash_enabled` — is a different thing: the player may have opted out, so
+  the
   client starts **disabled** and sends nothing; `is_enabled()` then returns
   `false, "settings_read_failed"`. A later explicit `set_enabled(...)`
-  rewrites the record and recovers the client.
+  rewrites the record and recovers the client (a `set_enabled` whose durable
+  write FAILED never seeds the in-process fallback, so a fail-closed state
+  cannot be reopened by an unpersisted decision).
 - **A failed persist is surfaced.** `set_enabled` applies the decision in
   memory for this session either way; when the durable write fails it returns
   `false, "crash_persist_failed"` — call it again to retry, otherwise the

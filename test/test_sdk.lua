@@ -2366,9 +2366,11 @@ local function test_consent_unknown_blocks_all_analytics_egress()
 end
 
 -- A spool record written under an earlier granted decision is neither loaded
--- nor purged while consent reads "unknown" (e.g. the identity record was
--- lost): nothing re-sends, and the record waits on disk for a launch that
--- starts granted — a denial still purges it.
+-- nor purged while consent reads "unknown" because no identity record exists
+-- (cleanly absent — no decision was ever persisted): nothing re-sends, and
+-- the record waits on disk for a launch that starts granted — a denial still
+-- purges it, and an identity record that FAILED to read purges it too (see
+-- the next test).
 local function test_consent_unknown_leaves_spool_unloaded_and_unsent()
 	reset()
 	storage.reset()
@@ -2399,6 +2401,52 @@ local function test_consent_unknown_leaves_spool_unloaded_and_unsent()
 	assert_equal(#requests, 1)
 	assert_contains(requests[1].body, '"event_name":"granted_era_event"')
 	assert_equal(#stored_spool_record(stores).events, 0, "the acknowledged re-send clears the record")
+	restore()
+	storage.reset()
+end
+
+-- An identity record that FAILS to read is different from an absent one: the
+-- unreadable record may have carried a denial whose spool purge is still
+-- owed, and init re-writes the identity record without it — so the spool is
+-- purged like a denial instead of letting possibly pre-revocation envelopes
+-- outlive the lost decision and re-send under a later grant.
+local function test_identity_read_failure_purges_spool()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save_spool(spool_scope, {
+		{
+			event_id = "lost-denial-e1",
+			event_name = "pre_revocation_event",
+			event_ts = "2026-01-01T00:00:00.000Z",
+			anonymous_id = "anon-lost",
+		},
+	}, 500, 262144) ~= nil)
+	assert_equal(#stored_spool_record(stores).events, 1)
+
+	-- The identity record throws on read (the spool file reads fine); no
+	-- in-process shadow exists to answer for it.
+	local real_load = sys.load
+	sys.load = function(path)
+		if path:sub(-9) == "/identity" then
+			error("unreadable identity record")
+		end
+		return real_load(path)
+	end
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "unknown", "an unreadable identity record reads as unknown")
+	assert_equal(#client.spool_batches, 0, "nothing may load for re-send")
+	assert_equal(client.spool_purge_pending, false)
+	assert_equal(#stored_spool_record(stores).events, 0,
+		"an unreadable consent decision must not leave event data at rest")
+	assert_true(client:flush())
+	assert_equal(#requests, 0)
+
+	-- Even after a later grant, the pre-revocation envelopes are gone.
+	sys.load = real_load
+	assert_true(client:set_consent(true))
+	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(#relaunch.spool_batches, 0, "nothing survives to re-send under the new grant")
 	restore()
 	storage.reset()
 end
@@ -3118,6 +3166,7 @@ local tests = {
 	test_spool_cleared_by_denied_consent,
 	test_consent_unknown_blocks_all_analytics_egress,
 	test_consent_unknown_leaves_spool_unloaded_and_unsent,
+	test_identity_read_failure_purges_spool,
 	test_spool_permanent_reject_removes_entry_and_diagnoses,
 	test_shutdown_spools_undelivered_and_finalizes,
 	test_persist_snapshots_queue_while_running,
