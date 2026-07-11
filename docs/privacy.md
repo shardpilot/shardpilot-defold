@@ -17,20 +17,48 @@ When the Defold `sys` API is unavailable, the record degrades to in-memory
 state for the process lifetime.
 
 `set_consent(analytics_granted)` records a tri-state consent decision
-{unknown, granted, denied}. Unknown leaves tracking fully open. Denied drops
-events at enqueue, clears the pending queue, and discards in-flight batches
-on completion instead of retrying them. Explicit decisions are reported
+{unknown, granted, denied}. The analytics client is **consent-first**: only
+an explicit **granted** decision opens the event pipeline.
+
+- **Unknown** (the initial state on a fresh install — and what an unreadable
+  identity record resolves to) transmits **nothing**: `track`, `screen_view`,
+  and `session_start` return `false, "consent_unknown"` and the event is
+  **dropped, not held** — nothing is queued, nothing is written to the
+  offline event spool, `flush`/`update`/`persist` are clean no-ops, no
+  consent receipt is sent, and a spool record left by an earlier granted
+  launch is neither loaded nor re-sent (it stays on disk untouched until a
+  launch that starts granted re-sends it, or a denial purges it). There is
+  **zero analytics wire traffic** and **no pre-consent data at rest**; a
+  storage failure that loses the consent record therefore **fails closed**.
+- **Granted** opens the pipeline for FUTURE events only — events dropped
+  while consent was unknown are gone by design.
+- **Denied** drops events at enqueue (`false, "consent_denied"`), clears the
+  pending queue, discards in-flight batches on completion instead of retrying
+  them, and purges the offline spool (see below).
+
+Explicit decisions are reported
 fire-and-forget to `POST {ingest_url}/v1/consent` and never ride the event
 envelope; a decision made before an auth token is available — or rejected as
 unauthorized — is retained (latest decision wins) and retried at the next
 dispatch point, and `shutdown` will not tear the client down while a decision
-is still waiting on a token.
+is still waiting on a token. While consent is unknown no receipt exists to
+send: the receipt reports an explicit player decision, never the absence of
+one.
 
-- Durable storage is limited to four small, bounded records, all written
+**Crash reporting is separate from analytics consent.** It is ON by default
+(no first-run decision needed) with a persisted per-app opt-out:
+`crash.set_enabled(false)` stops collection — not just sending — and is
+honored on every later launch (see the crash sidecar section below). If the
+persisted opt-out record cannot be **read** (a storage error — as opposed to
+cleanly absent on a fresh install), the crash client **fails closed** and
+sends nothing until an explicit `set_enabled` decision is persisted again.
+
+- Durable storage is limited to five small, bounded records, all written
   through Defold `sys.save`: the identity record described above, a bounded
-  crash-retry sidecar, the bounded offline event spool (both described
-  below), and the remote-config cache (described below). No cookies and no
-  other browser or tracking storage.
+  crash-retry sidecar, the crash-reporting settings record (both described
+  below), the bounded offline event spool (described below), and the
+  remote-config cache (described below). No cookies and no other browser or
+  tracking storage.
 - All persistence goes through Defold `sys.save` only; on HTML5 builds Defold
   backs `sys.save` with browser storage, still limited to those records.
 
@@ -93,9 +121,32 @@ a later launch. This sidecar:
 - is **TTL-bounded**: a pending report older than about seven days is discarded
   on read rather than resent;
 - is **local to the device** and goes through Defold `sys.save` only (browser
-  storage on HTML5); and
+  storage on HTML5);
 - is **cleared on success** — an entry is removed as soon as its report is
-  accepted or terminally rejected, so it never accumulates.
+  accepted or terminally rejected, so it never accumulates; and
+- **honors the opt-out**: while crash reporting is disabled, no entry is
+  written (reports are not collected at all, not merely unsent) and the
+  existing backlog is neither loaded nor re-sent — it stays where it is,
+  bounded by the ~7-day TTL. Entries captured earlier under an enabled state
+  re-send only if crash reporting is re-enabled while they are still within
+  the TTL.
+
+## Crash-reporting settings record
+
+Crash reporting is ON by default and needs no first-run decision; an explicit
+`crash.set_enabled(false)` persists the opt-out. This record:
+
+- stores only the **boolean opt-out decision** (`crash_enabled`) — no
+  identifiers, no payloads, no tokens;
+- is **per-app** (namespaced like the pending-crash sidecar) so two games on
+  one device never share an opt-out;
+- is **fail-closed on read failure**: an absent record on a fresh install
+  applies the default (enabled), but a record that cannot be READ (a storage
+  error or corruption) disables crash reporting entirely — nothing is
+  collected or sent — until a later `set_enabled` call persists a readable
+  decision again; and
+- goes through Defold `sys.save` only (browser storage on HTML5), degrading
+  to in-memory state for the process lifetime outside Defold.
 
 ## Remote-config cache
 

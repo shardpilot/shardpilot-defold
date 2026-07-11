@@ -373,6 +373,9 @@ end
 
 local function test_mode_b_with_remote_config_splits_credentials()
 	reset()
+	-- Consent-first: the event publish below only flows under a persisted
+	-- grant (the fetch itself is not consent-gated).
+	storage.save({ workspace_id = "workspace-test", app_id = "app-test" }, { consent_analytics = "granted" })
 	local client = assert(sdk.new(config({
 		token_provider = function(callback)
 			callback("minted-ingest-token", nil, nil)

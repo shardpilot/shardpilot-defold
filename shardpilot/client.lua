@@ -427,7 +427,13 @@ function M.new(config)
 	-- without sending — even when the spool is disabled by config — so events
 	-- captured before a revocation never outlive it. A disabled spool clears
 	-- the record too: envelopes persisted by an earlier configuration must not
-	-- linger on disk, nor resend if the spool is later re-enabled.
+	-- linger on disk, nor resend if the spool is later re-enabled. Only a
+	-- persisted GRANT loads the record for re-send: while consent reads as
+	-- "unknown" (a fresh install, or an identity record that could not be
+	-- read) the client is consent-first and transmits nothing, so the record —
+	-- which can only have been written under an earlier granted decision — is
+	-- left on disk untouched. A later launch that starts granted re-sends it;
+	-- a denial purges it.
 	if consent_state == "denied" or not normalized.spool_enabled then
 		-- Attempt the purge UNCONDITIONALLY: gating it on a successful read
 		-- would let a failed/corrupt read masquerade as "nothing to purge"
@@ -440,7 +446,7 @@ function M.new(config)
 			client.stats.spool_persist_failed = client.stats.spool_persist_failed + 1
 			client.spool_purge_pending = true
 		end
-	else
+	elseif consent_state == "granted" then
 		local spooled, stored_deadline = storage.load_spool(normalized)
 		-- Server-requested backpressure survives a relaunch: when the record
 		-- carries a still-future Retry-After deadline, seed the publish
@@ -829,10 +835,11 @@ function Client:session_end(reason)
 	if not self.initialized then
 		return false, "shutdown"
 	end
-	if self.consent_state == "denied" then
-		-- Consent denied: suppress the wire event but still complete the
-		-- local session teardown (the same posture as shutdown) so session
-		-- state never stays stuck active for a denied user.
+	if self.consent_state ~= "granted" then
+		-- Consent denied — or still unknown, which transmits nothing —
+		-- suppress the wire event but still complete the local session
+		-- teardown (the same posture as shutdown) so session state never
+		-- stays stuck active for a consent-blocked user.
 		self.session_active = false
 		return true
 	end
@@ -879,6 +886,16 @@ function Client:track(event_name, props, context)
 	if self.consent_state == "denied" then
 		self.stats.dropped = self.stats.dropped + 1
 		return false, "consent_denied"
+	end
+	-- Consent-first: while the decision is still "unknown" (no persisted
+	-- grant — a fresh install, or an identity record that could not be read)
+	-- the client transmits nothing. The event is DROPPED, not held: nothing
+	-- is queued, nothing reaches the durable spool, so no pre-consent data
+	-- exists at rest. set_consent(true) opens the pipeline for FUTURE events
+	-- only.
+	if self.consent_state ~= "granted" then
+		self.stats.dropped = self.stats.dropped + 1
+		return false, "consent_unknown"
 	end
 	if not valid_identity(self.user_id) and not valid_identity(self.anonymous_id) then
 		self.stats.dropped = self.stats.dropped + 1
@@ -961,6 +978,12 @@ function Client:observe_disconnect(reason)
 end
 
 function Client:enqueue_summaries()
+	-- Summary events ride the same consent gate as track(); skip the enqueue
+	-- attempts entirely while the pipeline is closed so every consent-blocked
+	-- flush cadence does not inflate the dropped counter.
+	if self.consent_state ~= "granted" then
+		return
+	end
 	local perf = sampling.perf_summary(self.perf)
 	if perf then
 		self:track("perf_summary", perf)
@@ -1292,7 +1315,10 @@ end
 -- re-loaded spool batch is never appended again. Returns true when everything
 -- new is durably recorded (vacuously true when nothing new).
 function Client:spool_envelopes(envelopes)
-	if not self.config.spool_enabled or self.consent_state == "denied" then
+	-- Only a granted actor's envelopes are ever written to disk: denied purges
+	-- the record, and a consent-first "unknown" client never captured anything
+	-- to spool in the first place.
+	if not self.config.spool_enabled or self.consent_state ~= "granted" then
 		return false
 	end
 	-- Fail-closed while a purge of the record is owed: retry it first, and
@@ -1389,7 +1415,7 @@ end
 -- whole undelivered remnant is DURABLY recorded — a memory-only fallback
 -- write or a remnant partially evicted by the caps does not qualify.
 function Client:spool_undelivered()
-	if not self.config.spool_enabled or self.consent_state == "denied" then
+	if not self.config.spool_enabled or self.consent_state ~= "granted" then
 		return false
 	end
 	-- The in-memory fallback (hosts without the save-file API) keeps the
@@ -1428,9 +1454,10 @@ function Client:persist()
 	if self.spool_purge_pending and not self:retry_spool_purge() then
 		return false, "spool_purge_failed"
 	end
-	if self.consent_state == "denied" then
-		-- Denied consent leaves nothing spoolable: the queue is already
-		-- cleared and the spool itself stays purged.
+	if self.consent_state ~= "granted" then
+		-- A consent-blocked client leaves nothing spoolable: denied already
+		-- cleared the queue (and the spool stays purged), and a consent-first
+		-- "unknown" client never queued anything to capture.
 		return true
 	end
 	if not self:spool_undelivered() then
@@ -1625,17 +1652,17 @@ function Client:shutdown(reason)
 	-- teardown (flush below retries it too; a still-failing purge is re-run
 	-- at the next launch by the persisted denial/disabled configuration).
 	self:retry_spool_purge()
-	local denied = self.consent_state == "denied"
+	local suppress_wire = self.consent_state ~= "granted"
 	if self.session_active then
 		-- session_end completes the local teardown even while consent is
-		-- denied (the wire event is suppressed inside session_end); summary
-		-- events are suppressed below via include_summaries.
+		-- denied or unknown (the wire event is suppressed inside session_end);
+		-- summary events are suppressed below via include_summaries.
 		local session_ok, session_err = self:session_end(reason or "app_final")
 		if not session_ok then
 			return false, session_err
 		end
 	end
-	local ok, err = self:flush({ include_summaries = not denied })
+	local ok, err = self:flush({ include_summaries = not suppress_wire })
 	if not ok then
 		-- The final flush could not deliver everything. When the durable spool
 		-- captures the whole undelivered remnant, teardown completes anyway:

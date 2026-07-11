@@ -4754,6 +4754,213 @@ local function test_pass_stops_on_concurrent_fatal_throttle()
 	storage.reset()
 end
 
+-- ── crash-reporting opt-out ──────────────────────────────────────────────────
+
+-- Crash reporting is ON by default (no first-run decision needed); an
+-- explicit opt-out stops COLLECTION, not just sending: zero wire traffic, no
+-- pending sidecar write, and the previous-session dump stays unread.
+local function test_crash_enabled_by_default_and_opt_out_blocks_collection()
+	reset()
+	local restore = install_fake_sys_storage()
+
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	local enabled, reason = client:is_enabled()
+	assert_equal(enabled, true, "crash reporting must default ON")
+	assert_equal(reason, nil)
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(#requests, 1, "the default-on client sends")
+
+	reset()
+	local bad_ok, bad_err = client:set_enabled("nope")
+	assert_equal(bad_ok, false)
+	assert_equal(bad_err, "invalid_enabled")
+	assert_true(client:set_enabled(false))
+	local disabled, disabled_reason = client:is_enabled()
+	assert_equal(disabled, false)
+	assert_equal(disabled_reason, "opt_out")
+
+	-- every egress path refuses with the same distinct error
+	local ok, err = client:emit(presymbolicated_event())
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	ok, err = client:emit_fatal(presymbolicated_event())
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	ok, err = client:resend_pending()
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+
+	-- capture_previous leaves the one-shot dump UNREAD and unconsumed
+	local module, released = fake_crash_module({
+		handle = 7,
+		signum = 11,
+		os_name = "Android",
+		modules = { { name = "libgame.so", address = 0x1000 } },
+		backtrace = { { address = 0x1abc } },
+	})
+	local loaded = false
+	local original_load_previous = module.load_previous
+	module.load_previous = function()
+		loaded = true
+		return original_load_previous()
+	end
+	ok, err = client:capture_previous(module)
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	assert_equal(loaded, false, "the dump must stay unread while disabled")
+	assert_equal(released.value, false, "the dump must not be consumed while disabled")
+
+	assert_equal(#requests, 0, "zero crash wire traffic while disabled")
+	assert_equal(#storage.load_pending_entries({ app_id = "app-example" }), 0,
+		"no pending sidecar entry may be written while disabled")
+	assert_equal(client:snapshot().dropped, 2)
+
+	-- re-enable: reports flow again, including the previously unread dump
+	assert_true(client:set_enabled(true))
+	assert_equal(client:is_enabled(), true)
+	local captured, sent = client:capture_previous(module)
+	assert_equal(captured, true)
+	assert_equal(sent, true, "the preserved dump forwards once re-enabled")
+	assert_equal(#requests, 1)
+	restore()
+end
+
+-- Defold's sys.load answers an ABSENT file with an empty table: that is a
+-- fresh install, not a failure — the legitimate-interest default (ON) applies.
+local function test_crash_settings_absent_record_defaults_on()
+	reset()
+	local saved_get, saved_save, saved_load = sys.get_save_file, sys.save, sys.load
+	sys.get_save_file = function(application_id, file_name)
+		return application_id .. "/" .. file_name
+	end
+	sys.save = function()
+		return true
+	end
+	sys.load = function()
+		return {}
+	end
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_equal(client:is_enabled(), true, "an absent record must apply the default, not fail closed")
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(#requests, 1)
+	sys.get_save_file, sys.save, sys.load = saved_get, saved_save, saved_load
+end
+
+-- The persisted opt-out state failing to READ (a thrown sys.load — storage
+-- corruption) is NOT "absent": the player may have opted out, so the client
+-- fails CLOSED — nothing is sent and nothing is persisted.
+local function test_crash_settings_read_error_fails_closed()
+	reset()
+	local saved_get, saved_save, saved_load = sys.get_save_file, sys.save, sys.load
+	local pending_writes = 0
+	sys.get_save_file = function(application_id, file_name)
+		return application_id .. "/" .. file_name
+	end
+	sys.save = function(path)
+		if path:find("pending-crashes", 1, true) then
+			pending_writes = pending_writes + 1
+		end
+		return true
+	end
+	sys.load = function()
+		error("disk corruption")
+	end
+
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	local enabled, reason = client:is_enabled()
+	assert_equal(enabled, false, "an unreadable opt-out state must fail closed")
+	assert_equal(reason, "settings_read_failed")
+
+	local ok, err = client:emit_fatal(presymbolicated_event())
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	ok, err = client:resend_pending()
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	assert_equal(#requests, 0, "a fail-closed client sends nothing")
+	assert_equal(pending_writes, 0, "a fail-closed client persists nothing")
+
+	-- an explicit fresh decision recovers the client: set_enabled rewrites
+	-- the record and re-opens the pipeline
+	assert_true(client:set_enabled(true))
+	assert_equal(client:is_enabled(), true)
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(#requests, 1)
+	sys.get_save_file, sys.save, sys.load = saved_get, saved_save, saved_load
+end
+
+-- The opt-out persists across re-init: a new client for the same app honors
+-- it, and a later re-enable persists the same way.
+local function test_crash_opt_out_persists_across_reinit()
+	reset()
+	local restore = install_fake_sys_storage()
+	local first = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(first:set_enabled(false))
+
+	local second = assert(crash.new(config({ sample_every = 1 })))
+	local enabled, reason = second:is_enabled()
+	assert_equal(enabled, false, "the persisted opt-out must survive re-init")
+	assert_equal(reason, "opt_out")
+	local ok, err = second:emit_fatal(presymbolicated_event())
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	assert_equal(#requests, 0)
+
+	assert_true(second:set_enabled(true))
+	local third = assert(crash.new(config({ sample_every = 1 })))
+	assert_equal(third:is_enabled(), true)
+	assert_true(third:emit_fatal(presymbolicated_event()))
+	assert_equal(#requests, 1)
+	restore()
+end
+
+-- A failed durable write at set_enabled is surfaced while the in-memory
+-- decision still applies for this session (call again to retry persistence).
+local function test_set_enabled_persist_failure_reported()
+	reset()
+	local saved_get, saved_save, saved_load = sys.get_save_file, sys.save, sys.load
+	sys.get_save_file = function(application_id, file_name)
+		return application_id .. "/" .. file_name
+	end
+	sys.save = function()
+		return false
+	end
+	sys.load = function()
+		return nil
+	end
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	local ok, err = client:set_enabled(false)
+	assert_equal(ok, false)
+	assert_equal(err, "crash_persist_failed")
+	assert_equal(client:is_enabled(), false, "the in-memory decision still applies")
+	local emit_ok, emit_err = client:emit_fatal(presymbolicated_event())
+	assert_equal(emit_ok, false)
+	assert_equal(emit_err, "crash_disabled")
+	assert_equal(#requests, 0)
+	sys.get_save_file, sys.save, sys.load = saved_get, saved_save, saved_load
+end
+
+-- The singleton facade mirrors the instance opt-out API.
+local function test_singleton_set_enabled_flow()
+	reset()
+	local off, off_reason = crash.is_enabled()
+	assert_equal(off, false)
+	assert_equal(off_reason, "not_initialized")
+	assert_true(crash.init(config({ sample_every = 1 })))
+	assert_equal(crash.is_enabled(), true)
+	assert_true(crash.set_enabled(false))
+	local enabled, reason = crash.is_enabled()
+	assert_equal(enabled, false)
+	assert_equal(reason, "opt_out")
+	local ok, err = crash.emit_fatal(presymbolicated_event())
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	assert_equal(#requests, 0)
+	assert_true(crash.set_enabled(true))
+	assert_equal(crash.is_enabled(), true)
+	assert_true(crash.shutdown())
+end
+
 local tests = {
 	test_config_validation,
 	test_source_stamped_on_every_report,
@@ -4880,6 +5087,12 @@ local tests = {
 	test_deferral_stat_clears_with_window,
 	test_resend_skips_tokens_in_flight,
 	test_pass_stops_on_concurrent_fatal_throttle,
+	test_crash_enabled_by_default_and_opt_out_blocks_collection,
+	test_crash_settings_absent_record_defaults_on,
+	test_crash_settings_read_error_fails_closed,
+	test_crash_opt_out_persists_across_reinit,
+	test_set_enabled_persist_failure_reported,
+	test_singleton_set_enabled_flow,
 }
 
 for _, test in ipairs(tests) do
