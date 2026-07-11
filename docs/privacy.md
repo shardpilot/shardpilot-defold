@@ -25,17 +25,21 @@ an explicit **granted** decision opens the event pipeline.
   and `session_start` return `false, "consent_unknown"` and the event is
   **dropped, not held** — nothing is queued, nothing is written to the
   offline event spool, `flush`/`update`/`persist` are clean no-ops, no
-  consent receipt is sent, and a spool record left by an earlier granted
-  launch is neither loaded nor re-sent (it stays on disk untouched until a
-  launch that starts granted re-sends it, or a denial purges it). There is
+  consent receipt is sent, and runtime samples (`observe_ping_ms`,
+  `observe_disconnect`, frame sampling) are dropped at the source so no later
+  summary can carry pre-consent activity. There is
   **zero analytics wire traffic** and **no pre-consent data at rest**; a
-  storage failure that loses the consent record therefore **fails closed** —
-  and because the unreadable record may have carried a denial, an identity
-  record that FAILED to read (unlike a cleanly absent one) also **purges the
-  spool**, so possibly pre-revocation envelopes never outlive the lost
-  decision.
-- **Granted** opens the pipeline for FUTURE events only — events dropped
-  while consent was unknown are gone by design.
+  storage failure that loses the consent record therefore **fails closed**.
+- **Only a launch that starts with a persisted grant loads the offline
+  spool.** Any init in a non-granted state — denied, unknown, or an
+  unreadable identity record — **purges** the spool record instead: a record
+  found without an affirmative grant behind it cannot be proven to have been
+  written under one (a pre-consent-first install spooled while "unknown" was
+  still open, and an unreadable record may have carried a denial whose purge
+  is still owed), so its envelopes are dropped rather than held for a later
+  grant.
+- **Granted** opens the pipeline for FUTURE events only — events and samples
+  dropped while consent was unknown are gone by design.
 - **Denied** drops events at enqueue (`false, "consent_denied"`), clears the
   pending queue, discards in-flight batches on completion instead of retrying
   them, and purges the offline spool (see below).
@@ -82,11 +86,14 @@ by the service on the stable event id). This spool:
   entries first, so it can never grow without limit;
 - is **per-app** (namespaced like the identity record) so two games on one
   device never share a spool;
-- **honors consent**: a persisted "denied" decision clears it at load without
+- **honors consent**: only a launch that starts with a persisted grant loads
+  it — ANY non-granted init (denied, unknown, or an unreadable identity
+  record) clears it at load without
   sending — the purge runs even when the record cannot be read, so a corrupt
   record is still cleared — and `set_consent(false)` purges it at runtime; a
   denied actor's
-  events never linger on disk. Should the durable purge itself fail, the
+  events never linger on disk, and neither do envelopes that cannot be
+  proven to have been captured under a grant. Should the durable purge itself fail, the
   failure is reported (`spool_purge_failed`), the spool goes **fail-closed**
   (nothing appended, loaded, or re-sent), and the purge is retried at later
   dispatch points and at the next launch until it lands. Revocation cleanup

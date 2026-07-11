@@ -16,9 +16,9 @@ not the platform boundary.
   surface may change before v1 with no backward-compatibility guarantee.
 - **Pre-launch.** The production ingest domain is **not provisioned** yet — use
   local/develop endpoints for evaluation.
-- **Version `0.5.0`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.5.0`, published as the
-  `v0.5.0` git tag.
+- **Version `0.6.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.6.0` (not yet tagged;
+  the latest published tag is `v0.5.0`).
 
 ## What it does
 
@@ -138,6 +138,7 @@ local sdk = require "shardpilot.sdk"
 local client = sdk.new(config)
 
 client:identify("user-123")
+client:set_consent(true) -- consent-first: required before any event flows
 client:track("play_cta_click", { cta_source = "main_menu" })
 client:flush()
 client:shutdown("app_final")
@@ -447,14 +448,17 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   `granted` transmits. While consent is `unknown`, `track`/`screen_view`/
   `session_start` return `false, "consent_unknown"` and the event is
   **dropped, not held** — nothing is queued or spooled, `flush`/`persist` are
-  no-ops, no consent receipt goes out, and a spool record from an earlier
-  granted launch is neither loaded nor re-sent (it waits, untouched, for a
-  granted launch; a denial purges it). A grant opens the pipeline for FUTURE
+  no-ops, no consent receipt goes out, and runtime samples
+  (`observe_ping_ms` / `observe_disconnect` / frame sampling) are dropped at
+  the source — a later summary can never carry pre-consent (or
+  denied-period) activity. Only a launch that starts with a persisted grant
+  loads the offline spool; any non-granted init (denied, unknown, or an
+  unreadable identity record) **purges** it instead — a record without an
+  affirmative grant behind it cannot be proven to have been written under
+  one. A grant opens the pipeline for FUTURE
   events only. An unreadable identity record resolves to `unknown`, so a
-  consent-state read failure fails **closed** — and because the lost record
-  may have carried a denial, a FAILED identity read (unlike a cleanly absent
-  record) also purges the spool rather than letting possibly pre-revocation
-  envelopes re-send under a later grant. `denied` drops events at
+  consent-state read failure fails **closed**, for the wire and for data at
+  rest alike. `denied` drops events at
   enqueue (`consent_denied`), clears the pending
   queue, discards in-flight batches instead of retrying, and purges the
   offline spool. The decision is

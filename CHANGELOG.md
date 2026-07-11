@@ -11,29 +11,34 @@
   and the event is **dropped, not held**: nothing is queued, nothing is
   written to the durable offline spool, `flush()`/`update()`/`persist()` are
   clean no-ops, summary events are not enqueued, no consent receipt is sent,
-  and there is **zero analytics wire traffic**. Because dropped means dropped,
+  and there is **zero analytics wire traffic**. Runtime samples follow the
+  same rule: `observe_ping_ms` / `observe_disconnect` / frame sampling are
+  dropped at the source while the pipeline is closed, and a denial resets the
+  samplers — a `perf_summary`/`network_summary` emitted after a grant can
+  never carry pre-consent or denied-period activity. Because dropped means
+  dropped,
   no pre-consent data ever exists at rest; `set_consent(true)` opens the
   pipeline for FUTURE events only. Integrations must now call
   `set_consent(true)` (wired to their consent UX) before any events flow — the
-  quick start, example, and docs show the sequence.
-  - A spool record persisted under an earlier granted decision is neither
-    loaded nor re-sent while consent reads `unknown` because no decision was
-    ever persisted (a cleanly absent identity record); it also is not purged
-    then — it waits on disk untouched for a later launch that starts granted
-    to re-send it, and a denial purges it, exactly as before. (A FAILED
-    identity read is the exception — see the fail-closed bullet below.)
-    `session_end()` and
+  quick start, both README examples, and docs show the sequence.
+  - **Only a launch that starts with a persisted grant loads the offline
+    spool.** Any init in a non-granted state — denied, unknown, or an
+    unreadable identity record — purges the record instead of holding it: a
+    spool without an affirmative grant behind it cannot be proven to have
+    been written under one (a v0.5 install spooled while `unknown` was still
+    open, and an unreadable identity record may have carried a denial whose
+    purge is still owed), so its envelopes are dropped rather than re-sent
+    under a later grant. The purge fails closed (`spool_purge_pending`) and
+    is retried at later dispatch points and at every later non-granted
+    launch. `session_end()` and
     `shutdown()` complete their local teardown while consent is unknown with
     the same suppressed-wire posture the denied state already had.
-  - A consent-state read failure now **fails closed**: an unreadable identity
-    record resolves to `unknown`, which transmits nothing (previously it
-    resolved to `unknown` and transmitted everything). And because the lost
-    record may have carried a denial whose spool purge was still owed, an
-    identity record that FAILED to read (as opposed to cleanly absent) also
-    **purges the offline spool** at init — possibly pre-revocation envelopes
-    must not outlive the lost decision and re-send under a later grant.
-    `storage.load` now reports that read failure as a second return value
-    (`"identity_read_failed"`) instead of swallowing it into "absent".
+  - A consent-state read failure now **fails closed**, for the wire and for
+    data at rest alike: an unreadable identity record resolves to `unknown`,
+    which transmits nothing (previously it resolved to `unknown` and
+    transmitted everything) and — via the purge rule above — clears the
+    offline spool, so possibly pre-revocation envelopes never outlive a lost
+    denial.
   - `denied` semantics are unchanged: events drop at enqueue with
     `consent_denied`, the queue clears, in-flight batches are discarded on
     completion, the spool purges fail-closed, and explicit decisions are
@@ -86,6 +91,9 @@
     no actor identity and are PII-scrubbed before anything touches disk or
     the wire).
 
+- README release references updated for the bump (version `0.6.0`, latest
+  published tag `v0.5.0`), and the instance-API example gained the required
+  `set_consent(true)` call alongside the quick start.
 - Durable storage grows from four to **five** small bounded per-app records:
   the new crash-reporting settings record joins the identity record, offline
   event spool, pending-crash sidecar, and remote-config cache. Documented in

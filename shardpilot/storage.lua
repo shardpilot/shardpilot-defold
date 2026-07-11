@@ -76,34 +76,22 @@ local function save_path(ns, file_name)
 	return path
 end
 
--- Load the identity record. Returns (record, err): the stored record when one
--- is readable (an empty table — Defold's sys.load result for an absent file —
--- reads as a fresh install); nil, nil when no record exists at all; and
--- nil, "identity_read_failed" when the durable read itself failed (sys.load
--- threw, or produced a non-table) and no in-process shadow — written by a
--- save this session — can answer instead. Callers that only want the legacy
--- record-or-nil shape ignore the second return; the consent-first client uses
--- the error to fail closed for data at rest (an unreadable record may have
--- carried a denial).
+-- Load the identity record, or nil when absent/unreadable (the in-process
+-- shadow answers when the durable read fails). An identity record that cannot
+-- be read resolves to a consent-first "unknown" in the client, which
+-- transmits nothing and purges the offline spool — so a swallowed read
+-- failure here still fails closed end to end.
 function M.load(scope)
 	local ns = namespace(scope)
 	local path = save_path(ns)
 	if not path then
-		return clone(memory_records[ns]), nil
+		return clone(memory_records[ns])
 	end
 	local ok, record = pcall(sys.load, path)
-	if ok and type(record) == "table" then
-		return record, nil
+	if not ok or type(record) ~= "table" then
+		return clone(memory_records[ns])
 	end
-	local fallback = clone(memory_records[ns])
-	if fallback ~= nil then
-		return fallback, nil
-	end
-	if ok and record == nil then
-		-- The backend answered cleanly with nothing: no record exists.
-		return nil, nil
-	end
-	return nil, "identity_read_failed"
+	return record
 end
 
 function M.save(scope, record)

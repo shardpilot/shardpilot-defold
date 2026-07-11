@@ -338,8 +338,7 @@ function M.new(config)
 	if not normalized then
 		return nil, err
 	end
-	local stored, stored_err = storage.load(normalized)
-	stored = stored or {}
+	local stored = storage.load(normalized) or {}
 	local anonymous_id
 	if valid_identity(config.anonymous_id) then
 		anonymous_id = config.anonymous_id
@@ -424,23 +423,27 @@ function M.new(config)
 	end
 	-- Offline event spool: re-load the envelopes a previous launch could not
 	-- deliver so they re-send (chunked to batch_size) before fresh events. The
-	-- consent decision is rechecked first: a persisted denial purges the spool
-	-- without sending — even when the spool is disabled by config — so events
-	-- captured before a revocation never outlive it. A disabled spool clears
-	-- the record too: envelopes persisted by an earlier configuration must not
-	-- linger on disk, nor resend if the spool is later re-enabled. Only a
-	-- persisted GRANT loads the record for re-send: while consent reads as
-	-- "unknown" — no decision was ever persisted — the client is
-	-- consent-first and transmits nothing, so the record (which can only have
-	-- been written under an earlier granted decision) is left on disk
-	-- untouched. A later launch that starts granted re-sends it; a denial
-	-- purges it. An identity record that FAILED to read is different from an
-	-- absent one: the unreadable record may have carried a denial whose purge
-	-- is still owed, and init below re-writes the identity record without it —
-	-- so the spool is purged like a denial rather than letting possibly
-	-- pre-revocation envelopes outlive the lost decision and re-send under a
-	-- later grant.
-	if consent_state == "denied" or stored_err ~= nil or not normalized.spool_enabled then
+	-- consent decision is rechecked first, and ONLY a launch that starts with
+	-- a persisted GRANT loads the record for re-send. In every other state the
+	-- record is purged at init, without sending:
+	--   * a persisted denial — events captured before a revocation never
+	--     outlive it (the documented denied semantics);
+	--   * a disabled spool — envelopes persisted by an earlier configuration
+	--     must not linger on disk, nor resend if the spool is later
+	--     re-enabled;
+	--   * an "unknown" consent state — the record cannot be PROVEN to have
+	--     been written under a grant: a v0.5 install spooled while "unknown"
+	--     was still open, an identity record that failed to read may have
+	--     carried a denial whose purge is still owed (and init above already
+	--     re-wrote the identity record without it), and a lost identity file
+	--     leaves the same ambiguity. Without an affirmative persisted grant
+	--     NOW, the envelopes are dropped rather than held for a later grant —
+	--     the consent-first contract is that a grant opens the pipeline for
+	--     FUTURE events only.
+	-- The purge is attempted unconditionally and fails closed
+	-- (spool_purge_pending) until it lands, so a failed purge is retried at
+	-- every later dispatch point and at every later non-granted launch.
+	if consent_state ~= "granted" or not normalized.spool_enabled then
 		-- Attempt the purge UNCONDITIONALLY: gating it on a successful read
 		-- would let a failed/corrupt read masquerade as "nothing to purge"
 		-- and leave the stale file to replay after a later grant/re-enable.
@@ -452,7 +455,7 @@ function M.new(config)
 			client.stats.spool_persist_failed = client.stats.spool_persist_failed + 1
 			client.spool_purge_pending = true
 		end
-	elseif consent_state == "granted" then
+	else
 		local spooled, stored_deadline = storage.load_spool(normalized)
 		-- Server-requested backpressure survives a relaunch: when the record
 		-- carries a still-future Retry-After deadline, seed the publish
@@ -737,6 +740,11 @@ function Client:set_consent(analytics_granted)
 		-- expires — up to a 24h Retry-After — even though that batch is gone.
 		self.publish_retry_after_ms = nil
 		self.publish_backoff_attempt = 0
+		-- Sampled-but-not-yet-summarized runtime signals are in-memory
+		-- analytics data too: drop them with the queue, or the first flush
+		-- after a re-grant would summarize pre-denial activity.
+		self.perf = sampling.new_perf()
+		self.network = sampling.new_network()
 	end
 	local persisted = self:persist_identity()
 	if not persisted then
@@ -966,7 +974,9 @@ function Client:update(dt)
 	if type(dt) == "number" and dt > 0 then
 		self.flush_elapsed_seconds = self.flush_elapsed_seconds + dt
 	end
-	if self.session_active and type(dt) == "number" then
+	if self.session_active and self.consent_state == "granted" and type(dt) == "number" then
+		-- Frame samples are analytics data: a session kept active through a
+		-- denial must not keep feeding the perf sampler.
 		sampling.sample_frame(self.perf, dt)
 	end
 	if queue.size(self.queue) >= self.config.batch_size or self.flush_elapsed_seconds >= self.config.flush_interval_seconds then
@@ -976,18 +986,31 @@ function Client:update(dt)
 end
 
 function Client:observe_ping_ms(ms)
+	-- Consent-first: runtime samples are analytics data, dropped at the
+	-- source while the pipeline is closed — they would otherwise surface in
+	-- the first summary emitted after a later grant.
+	if self.consent_state ~= "granted" then
+		return
+	end
 	sampling.sample_ping(self.network, ms)
 end
 
 function Client:observe_disconnect(reason)
+	if self.consent_state ~= "granted" then
+		return
+	end
 	sampling.disconnect(self.network, reason)
 end
 
 function Client:enqueue_summaries()
-	-- Summary events ride the same consent gate as track(); skip the enqueue
-	-- attempts entirely while the pipeline is closed so every consent-blocked
-	-- flush cadence does not inflate the dropped counter.
+	-- Summary events ride the same consent gate as track(). While the
+	-- pipeline is closed the accumulated samples are DROPPED, not held — the
+	-- samplers are reset so runtime signals observed before a grant (or
+	-- through a denial) can never surface in a summary emitted after a later
+	-- grant.
 	if self.consent_state ~= "granted" then
+		self.perf = sampling.new_perf()
+		self.network = sampling.new_network()
 		return
 	end
 	local perf = sampling.perf_summary(self.perf)

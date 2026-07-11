@@ -2338,7 +2338,11 @@ local function test_consent_unknown_blocks_all_analytics_egress()
 	client:update(9999)
 	assert_true(client:persist())
 	assert_equal(#requests, 0, "zero analytics wire traffic while consent is unknown")
-	assert_equal(stored_spool_record(stores), nil, "nothing may be written to the offline spool")
+	-- The init-time purge writes an empty clear record; no EVENT may ever
+	-- reach the offline spool while consent is unknown.
+	local spool_record = stored_spool_record(stores)
+	assert_true(spool_record == nil or #spool_record.events == 0,
+		"nothing may be written to the offline spool")
 	assert_equal(client:snapshot().dropped, 3, "the blocked cadence must not keep dropping summaries")
 
 	-- an explicit grant opens the pipeline for FUTURE events only
@@ -2365,20 +2369,63 @@ local function test_consent_unknown_blocks_all_analytics_egress()
 	storage.reset()
 end
 
--- A spool record written under an earlier granted decision is neither loaded
--- nor purged while consent reads "unknown" because no identity record exists
--- (cleanly absent — no decision was ever persisted): nothing re-sends, and
--- the record waits on disk for a launch that starts granted — a denial still
--- purges it, and an identity record that FAILED to read purges it too (see
--- the next test).
-local function test_consent_unknown_leaves_spool_unloaded_and_unsent()
+-- Runtime samples are analytics data: signals observed while the pipeline is
+-- closed (unknown or denied) are dropped, not held — the first summary after
+-- a later grant must not carry pre-consent or denied-period activity.
+local function test_blocked_period_samples_never_summarized()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_equal(client.consent_state, "unknown")
+
+	-- observed before any grant: dropped at the source
+	client:observe_ping_ms(50)
+	client:observe_ping_ms(70)
+	client:observe_disconnect("pre_consent_drop")
+	assert_true(client:set_consent(true))
+	assert_true(client:flush())
+	for _, request in ipairs(requests) do
+		assert_not_contains(request.body, '"event_name":"network_summary"')
+	end
+
+	-- observed under the grant: summarized normally
+	client:observe_ping_ms(60)
+	assert_true(client:flush())
+	local summarized = false
+	for _, request in ipairs(requests) do
+		if request.body:find('"event_name":"network_summary"', 1, true) then
+			summarized = true
+			assert_contains(request.body, '"ping_sample_count":1')
+		end
+	end
+	assert_true(summarized, "post-grant samples must still summarize")
+
+	-- samples gathered under a grant are dropped by a denial: a re-grant must
+	-- not summarize pre-denial activity
+	client:observe_ping_ms(80)
+	assert_true(client:set_consent(false))
+	assert_true(client:set_consent(true))
+	reset()
+	assert_true(client:flush())
+	assert_equal(#requests, 0, "no summary may survive the denial")
+	storage.reset()
+end
+
+-- Only a launch that starts with a persisted GRANT loads the spool. A spool
+-- record found while consent reads "unknown" (no identity record — no
+-- decision was ever persisted) cannot be proven to have been written under a
+-- grant (a v0.5 install spooled while "unknown" was still open), so it is
+-- purged at init instead of being held for a later grant: the grant opens
+-- the pipeline for FUTURE events only.
+local function test_consent_unknown_purges_unproven_spool_at_init()
 	reset()
 	storage.reset()
 	local stores, restore = install_stub_sys_storage()
 	assert_true(storage.save_spool(spool_scope, {
 		{
 			event_id = "unknown-e1",
-			event_name = "granted_era_event",
+			event_name = "unproven_era_event",
 			event_ts = "2026-01-01T00:00:00.000Z",
 			anonymous_id = "anon-spool",
 		},
@@ -2387,17 +2434,33 @@ local function test_consent_unknown_leaves_spool_unloaded_and_unsent()
 	local unknown_client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_equal(unknown_client.consent_state, "unknown")
 	assert_equal(#unknown_client.spool_batches, 0, "an unknown consent must not load the spool")
+	assert_equal(unknown_client.spool_purge_pending, false)
+	assert_equal(#stored_spool_record(stores).events, 0,
+		"a spool with no provable grant behind it must be purged at init")
 	assert_true(unknown_client:flush())
 	assert_equal(#requests, 0, "nothing may re-send while consent is unknown")
-	assert_equal(#stored_spool_record(stores).events, 1, "the record stays on disk for a later granted launch")
 
-	-- a launch that starts granted loads and re-sends it
-	assert_true(storage.save(spool_scope, { anonymous_id = "anon-spool", consent_analytics = "granted" }))
+	-- even after an explicit grant and a relaunch, the unproven envelopes are
+	-- gone: the grant opened the pipeline for future events only
+	assert_true(unknown_client:set_consent(true))
 	reset()
 	local granted_client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_equal(granted_client.consent_state, "granted")
-	assert_equal(#granted_client.spool_batches, 1, "a granted launch loads the spool for re-send")
+	assert_equal(#granted_client.spool_batches, 0, "nothing unproven survives to re-send under the grant")
 	assert_true(granted_client:flush())
+	assert_equal(#requests, 0)
+
+	-- a spool written UNDER the grant still round-trips as before
+	next_status = 500
+	assert_true(granted_client:identify("user-example"))
+	assert_true(granted_client:track("granted_era_event"))
+	assert_equal(granted_client:flush(), false)
+	next_status = 202
+	reset()
+	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(relaunch.consent_state, "granted")
+	assert_equal(#relaunch.spool_batches, 1, "a granted launch loads the granted-era spool for re-send")
+	assert_true(relaunch:flush())
 	assert_equal(#requests, 1)
 	assert_contains(requests[1].body, '"event_name":"granted_era_event"')
 	assert_equal(#stored_spool_record(stores).events, 0, "the acknowledged re-send clears the record")
@@ -2405,11 +2468,11 @@ local function test_consent_unknown_leaves_spool_unloaded_and_unsent()
 	storage.reset()
 end
 
--- An identity record that FAILS to read is different from an absent one: the
--- unreadable record may have carried a denial whose spool purge is still
--- owed, and init re-writes the identity record without it — so the spool is
--- purged like a denial instead of letting possibly pre-revocation envelopes
--- outlive the lost decision and re-send under a later grant.
+-- An identity record that FAILS to read resolves to "unknown", and unknown
+-- purges at init like every non-granted state: the unreadable record may
+-- have carried a denial whose spool purge is still owed, and init re-writes
+-- the identity record without it — possibly pre-revocation envelopes must
+-- not outlive the lost decision and re-send under a later grant.
 local function test_identity_read_failure_purges_spool()
 	reset()
 	storage.reset()
@@ -3165,7 +3228,8 @@ local tests = {
 	test_spool_corrupted_record_starts_clean,
 	test_spool_cleared_by_denied_consent,
 	test_consent_unknown_blocks_all_analytics_egress,
-	test_consent_unknown_leaves_spool_unloaded_and_unsent,
+	test_blocked_period_samples_never_summarized,
+	test_consent_unknown_purges_unproven_spool_at_init,
 	test_identity_read_failure_purges_spool,
 	test_spool_permanent_reject_removes_entry_and_diagnoses,
 	test_shutdown_spools_undelivered_and_finalizes,
