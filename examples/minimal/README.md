@@ -17,6 +17,7 @@ shardpilot.init({
 })
 
 shardpilot.identify("user-example")
+shardpilot.set_consent(true) -- consent-first: nothing transmits until a grant
 shardpilot.session_start()
 shardpilot.track("play_cta_click", { cta_source = "main_menu" })
 shardpilot.flush()

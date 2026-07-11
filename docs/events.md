@@ -45,6 +45,16 @@ where it differs):
 Project Tower-specific event names should be sent through generic `track()`
 from the game integration later; they are not hardcoded SDK core behavior.
 
+All of the above is **consent-first**: no event — helper-emitted or
+`track()`-ed — is enqueued, spooled, or sent until an explicit
+`set_consent(true)`. While the decision is still `unknown` the call returns
+`false, "consent_unknown"` and the event is dropped, not held; after a denial
+it returns `false, "consent_denied"`. Runtime samples feeding `perf_summary`
+and `network_summary` follow the same rule: `observe_ping_ms` /
+`observe_disconnect` / frame sampling are dropped at the source while the
+pipeline is closed, and a denial resets the samplers — a summary emitted
+after a grant carries granted-period activity only.
+
 ## Offline durability
 
 Every event carries a stable `event_id` stamped at `track()` time. When a

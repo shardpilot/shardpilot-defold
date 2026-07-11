@@ -1,5 +1,107 @@
 # Changelog
 
+## v0.6.0 — 2026-07-11 — early alpha
+
+- **BREAKING: consent-first analytics — "unknown" no longer transmits.** The
+  analytics pipeline now opens only under an explicit granted decision.
+  Previously the default `unknown` consent state was fully open (only an
+  explicit denial blocked); now, while consent is `unknown` — a fresh install,
+  or an identity record that cannot be read — `track()`, `screen_view()`, and
+  `session_start()` return the new distinct error `false, "consent_unknown"`
+  and the event is **dropped, not held**: nothing is queued, nothing is
+  written to the durable offline spool, `flush()`/`update()`/`persist()` are
+  clean no-ops, summary events are not enqueued, no consent receipt is sent,
+  and there is **zero analytics wire traffic**. Runtime samples follow the
+  same rule: `observe_ping_ms` / `observe_disconnect` / frame sampling are
+  dropped at the source while the pipeline is closed, and a denial resets the
+  samplers — a `perf_summary`/`network_summary` emitted after a grant can
+  never carry pre-consent or denied-period activity. Because dropped means
+  dropped,
+  no pre-consent data ever exists at rest; `set_consent(true)` opens the
+  pipeline for FUTURE events only. Integrations must now call
+  `set_consent(true)` (wired to their consent UX) before any events flow — the
+  quick start, both README examples, and docs show the sequence.
+  - **Only a launch that starts with a persisted grant loads the offline
+    spool.** Any init in a non-granted state — denied, unknown, or an
+    unreadable identity record — purges the record instead of holding it: a
+    spool without an affirmative grant behind it cannot be proven to have
+    been written under one (a v0.5 install spooled while `unknown` was still
+    open, and an unreadable identity record may have carried a denial whose
+    purge is still owed), so its envelopes are dropped rather than re-sent
+    under a later grant. The purge fails closed (`spool_purge_pending`) and
+    is retried at later dispatch points and at every later non-granted
+    launch. `session_end()` and
+    `shutdown()` complete their local teardown while consent is unknown with
+    the same suppressed-wire posture the denied state already had.
+  - A consent-state read failure now **fails closed**, for the wire and for
+    data at rest alike: an unreadable identity record resolves to `unknown`,
+    which transmits nothing (previously it resolved to `unknown` and
+    transmitted everything) and — via the purge rule above — clears the
+    offline spool, so possibly pre-revocation envelopes never outlive a lost
+    denial.
+  - `denied` semantics are unchanged: events drop at enqueue with
+    `consent_denied`, the queue clears, in-flight batches are discarded on
+    completion, the spool purges fail-closed, and explicit decisions are
+    still reported to `POST {ingest_url}/v1/consent` (no receipt is ever sent
+    for the undecided state).
+  - Remote config remains deliberately **not** consent-gated (configuration
+    delivery carries no analytics payload) — unchanged.
+
+- **BREAKING(-ish): crash reporting gains a persisted client-side opt-out and
+  fails closed on an unreadable state.** Crash reporting stays **ON by
+  default** — it needs no first-run decision — but the crash plane previously
+  had no client-side gate at all (suppression was server-side only). New
+  facade + instance API:
+  - `crash.set_enabled(false)` persists a per-app opt-out (a new one-boolean
+    `crash_enabled` settings record stored alongside the pending sidecar) and
+    stops **collection**, not just sending: `emit`, `emit_fatal`,
+    `capture_previous`, and `resend_pending` all return
+    `false, "crash_disabled"`, no report is prepared or written to the
+    pending sidecar, the pending backlog is neither loaded nor re-sent (it
+    ages out under its ~7-day TTL — enforced by a maintenance read at every
+    `init`/`new` even while disabled, so an opted-out install cannot keep
+    already-scrubbed crash bodies on disk past the TTL), and the
+    previous-session native dump is
+    left **unread** — the engine's one-shot store is not consumed, so the
+    dump survives for a later enabled launch. The breadcrumb ring is emptied
+    at the flip and `record_breadcrumb` refuses new entries while disabled,
+    so a report emitted after a re-enable can never carry opt-out-period
+    activity. The gate also holds mid-pass:
+    a disable landing while a serial resend pass is in flight stops the pass
+    before its next dispatch.
+  - `crash.is_enabled()` returns the state plus a reason
+    (`"opt_out"` / `"settings_read_failed"` / `"not_initialized"`) while
+    disabled.
+  - **Fail closed on read failure:** an ABSENT settings record (fresh
+    install) applies the default — enabled; a record that cannot be READ (a
+    thrown `sys.load`, a corrupt file) — or that loads carrying a malformed,
+    non-boolean `crash_enabled` — starts the client **disabled** and
+    nothing is collected or sent until an explicit `set_enabled(...)`
+    persists a readable decision again. `storage.lua` now distinguishes
+    absent from failed reads for this record instead of swallowing both into
+    "absent", and the in-process settings fallback is seeded only by writes
+    that actually persisted — a failed `set_enabled(true)` can never reopen
+    a fail-closed client at a later same-process init.
+  - A failed durable write at `set_enabled` returns
+    `false, "crash_persist_failed"` while the in-memory decision still
+    applies for the session (call again to retry), mirroring
+    `consent_persist_failed`.
+  - The crash opt-out is independent of the analytics consent state: the two
+    planes are configured, stored, and gated separately (crash reports carry
+    no actor identity and are PII-scrubbed before anything touches disk or
+    the wire).
+
+- README release references updated for the bump (version `0.6.0`, latest
+  published tag `v0.5.0`), and the instance-API example gained the required
+  `set_consent(true)` call alongside the quick start.
+- Durable storage grows from four to **five** small bounded per-app records:
+  the new crash-reporting settings record joins the identity record, offline
+  event spool, pending-crash sidecar, and remote-config cache. Documented in
+  `docs/privacy.md` / `docs/crash.md` (new "Opting out" section), and the
+  consent-first contract in the README, `docs/events.md`, and
+  `docs/configuration.md`.
+- This is an early alpha pre-release. The API is unstable and may change before v1.
+
 ## v0.5.0 — 2026-07-06 — early alpha
 
 - **Remote config fetch with a durable last-known-good cache and typed

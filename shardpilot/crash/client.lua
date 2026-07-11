@@ -214,8 +214,50 @@ function M.new(config)
 	if not normalized then
 		return nil, err
 	end
+	-- Crash reporting is ON by default — it needs no first-run decision — with
+	-- a persisted opt-out: an explicit set_enabled(false) is stored durably
+	-- (per-app, alongside the pending sidecar) and honored on every later
+	-- launch. The load distinguishes "no record" (a fresh install: the default
+	-- applies) from a FAILED read (storage error / corruption): an unreadable
+	-- opt-out state fails CLOSED — the player may have opted out, so the
+	-- client collects and sends nothing until a readable decision exists again
+	-- (a later successful set_enabled rewrites the record).
+	local settings, settings_err = storage.load_crash_settings({ app_id = normalized.app_id })
+	local enabled = true
+	local enabled_reason = nil
+	local decision = nil
+	if type(settings) == "table" then
+		decision = settings.crash_enabled
+	end
+	if settings_err then
+		enabled = false
+		enabled_reason = "settings_read_failed"
+	elseif decision ~= nil and type(decision) ~= "boolean" then
+		-- The record loaded but carries a malformed decision (a non-boolean
+		-- crash_enabled): that is a corrupt record, not an absent one — fail
+		-- closed exactly like an unreadable record instead of silently
+		-- reopening crash collection on the default.
+		enabled = false
+		enabled_reason = "settings_read_failed"
+	elseif decision == false then
+		enabled = false
+		enabled_reason = "opt_out"
+	end
+	if not enabled then
+		-- A disabled client still honors the pending sidecar's retention TTL:
+		-- this maintenance read runs the read-side normalization, which prunes
+		-- entries older than the TTL and rewrites the record — so an opted-out
+		-- (or fail-closed) install cannot keep already-scrubbed crash bodies
+		-- on disk past the documented ~7 days. Nothing is dispatched or
+		-- retained; the result is discarded.
+		storage.load_pending_entries({ app_id = normalized.app_id })
+	end
 	return setmetatable({
 		config = normalized,
+		enabled = enabled,
+		-- Why the client is disabled ("opt_out" | "settings_read_failed"),
+		-- nil while enabled. Surfaced for host diagnostics via is_enabled().
+		enabled_reason = enabled_reason,
 		breadcrumbs = breadcrumbs.new(),
 		sample_counter = 0,
 		-- A best-effort, in-session-only fallback store of encoded report bodies that
@@ -277,14 +319,64 @@ function M.new(config)
 end
 
 -- Record a breadcrumb. Names are scrubbed; an invalid name is dropped.
+-- Refused while crash reporting is disabled: the ring is attached to the next
+-- report, so retaining entries recorded during an opt-out would ship
+-- opt-out-period activity after a later re-enable — disabling stops
+-- collection, breadcrumbs included.
 function Client:record_breadcrumb(name)
+	if not self.enabled then
+		return false, "crash_disabled"
+	end
 	return self.breadcrumbs:record(name)
 end
 
--- The persistence scope for this client's pending crash reports — namespaced per
--- configured app so two games on the same device never share a pending file.
+-- The persistence scope for this client's pending crash reports and settings —
+-- namespaced per configured app so two games on the same device never share a
+-- pending file or an opt-out decision.
 function Client:pending_scope()
 	return { app_id = self.config.app_id }
+end
+
+-- True while crash reporting is enabled for this client. False after an
+-- explicit opt-out — and when the persisted opt-out state could not be READ
+-- (fail closed; see M.new). The second return says why the client is
+-- disabled ("opt_out" | "settings_read_failed"), nil while enabled.
+function Client:is_enabled()
+	return self.enabled == true, self.enabled_reason
+end
+
+-- Enable or disable crash reporting. Disabling stops COLLECTION, not just
+-- sending: no report is prepared, persisted, or dispatched while disabled —
+-- emit / emit_fatal / capture_previous / resend_pending all return
+-- (false, "crash_disabled"), nothing is written to the pending sidecar, the
+-- previous-session native dump is left unread, and the breadcrumb ring is
+-- emptied and refuses new entries (retained breadcrumbs would otherwise
+-- attach to the first report after a re-enable). The decision persists
+-- across launches; when the durable write fails, the decision still applies
+-- in memory for this session and (false, "crash_persist_failed") is returned
+-- — call set_enabled again to retry persistence, otherwise the decision can
+-- be lost on restart (an UNREADABLE record still fails closed at the next
+-- launch; only a cleanly absent one re-enables the default).
+function Client:set_enabled(enabled)
+	if not self.initialized then
+		return false, "shutdown"
+	end
+	if type(enabled) ~= "boolean" then
+		return false, "invalid_enabled"
+	end
+	self.enabled = enabled
+	self.enabled_reason = (not enabled) and "opt_out" or nil
+	if not enabled then
+		-- Opting out empties the breadcrumb ring: retained entries would
+		-- otherwise attach to the first report after a later re-enable, and a
+		-- disabled client must retain nothing new — record_breadcrumb refuses
+		-- while disabled, and what was recorded before the flip is dropped.
+		self.breadcrumbs = breadcrumbs.new()
+	end
+	if not storage.save_crash_settings(self:pending_scope(), { crash_enabled = enabled }) then
+		return false, "crash_persist_failed"
+	end
+	return true
 end
 
 local max_in_memory_pending = 8
@@ -473,6 +565,14 @@ function Client:emit_internal(event, fatal, trusted_frame_functions, prepare_opt
 	if not self.initialized then
 		return false, "shutdown"
 	end
+	-- Opted out (or the persisted opt-out state was unreadable — fail
+	-- closed): collect nothing. The report — fatal included — is neither
+	-- prepared, nor persisted to the pending sidecar, nor dispatched.
+	if not self.enabled then
+		self.stats.dropped = self.stats.dropped + 1
+		self.stats.last_error = "crash_disabled"
+		return false, "crash_disabled"
+	end
 	if type(event) ~= "table" then
 		return false, "invalid_event"
 	end
@@ -581,6 +681,13 @@ function Client:capture_previous(crash_module)
 	if not self.initialized then
 		return false, "shutdown"
 	end
+	-- Disabled: leave the previous-session dump UNREAD — reading it consumes
+	-- the engine's one-shot store — and resend nothing. Should crash
+	-- reporting be re-enabled later, the dump is still there for the next
+	-- capture_previous(), and it is forwarded under an enabled state.
+	if not self.enabled then
+		return false, "crash_disabled"
+	end
 	local event = dump.load_previous_event(crash_module)
 	if not event then
 		-- No new dump: just resend whatever a previous launch left pending.
@@ -624,6 +731,11 @@ end
 function Client:resend_pending()
 	if not self.initialized then
 		return false, "shutdown"
+	end
+	-- No egress while disabled: the pending backlog stays untouched (it is
+	-- TTL-bounded on disk) and nothing is dispatched.
+	if not self.enabled then
+		return false, "crash_disabled"
 	end
 	if self.resend_active then
 		-- A pass is already running; it covers the current backlog.
@@ -774,6 +886,15 @@ function Client:dispatch_pending(entry, on_settled)
 			on_settled(true)
 		end
 		return false, "invalid_event"
+	end
+	-- A disable landing while a serial pass is mid-flight (the transport is
+	-- async in the real runtime) must stop the pass before its next dispatch:
+	-- the egress gate holds at every dispatch point, not only at pass start.
+	if not self.enabled then
+		if on_settled then
+			on_settled(true)
+		end
+		return false, "crash_disabled"
 	end
 	local pending_token = entry.token
 	-- ADOPT a legacy entry (a prepared-report table persisted by an older

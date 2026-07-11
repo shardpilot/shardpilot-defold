@@ -112,6 +112,51 @@ A fatal crash is reported **every time**, regardless of `sample_every` or a
 custom `sampler` — `emit_fatal` (and the dump-forward path) bypass the sampler
 entirely. Only `emit` (non-fatal) is sampled.
 
+## Opting out
+
+Crash reporting is **on by default** — it exists to keep the game working and
+needs no first-run decision — with a persisted, per-app opt-out:
+
+```lua
+crash.set_enabled(false)        -- persists the opt-out (per app)
+local on, reason = crash.is_enabled()
+crash.set_enabled(true)         -- back to the default
+```
+
+- **Disabling stops collection, not just sending.** While disabled, `emit`,
+  `emit_fatal`, `capture_previous`, and `resend_pending` all return
+  `false, "crash_disabled"`; no report is prepared, nothing is written to the
+  pending sidecar, and the previous-session native dump is left **unread**
+  (reading it would consume the engine's one-shot store — it stays available
+  for a later enabled launch). The breadcrumb ring is emptied at the flip and
+  `record_breadcrumb` refuses new entries while disabled — retained
+  breadcrumbs would otherwise attach to the first report after a re-enable.
+  The already-persisted pending backlog is
+  neither loaded nor re-sent; it stays on disk under its ~7-day TTL — which a
+  disabled client still enforces with a maintenance read at every
+  `init`/`new` (expired entries are pruned from disk while the opt-out
+  holds) — and
+  re-sends only if crash reporting is re-enabled within that window.
+- **The decision persists across launches** in a small per-app settings
+  record (`crash_enabled`), stored alongside the pending sidecar. A new
+  client for the same app honors it at `init`/`new` time.
+- **A read failure fails closed.** An ABSENT record (a fresh install) applies
+  the default — enabled. A record that cannot be READ (a thrown `sys.load`, a
+  corrupt file) — or that loads carrying a malformed, non-boolean
+  `crash_enabled` — is a different thing: the player may have opted out, so
+  the
+  client starts **disabled** and sends nothing; `is_enabled()` then returns
+  `false, "settings_read_failed"`. A later explicit `set_enabled(...)`
+  rewrites the record and recovers the client (a `set_enabled` whose durable
+  write FAILED never seeds the in-process fallback, so a fail-closed state
+  cannot be reopened by an unpersisted decision).
+- **A failed persist is surfaced.** `set_enabled` applies the decision in
+  memory for this session either way; when the durable write fails it returns
+  `false, "crash_persist_failed"` — call it again to retry, otherwise the
+  decision can be lost on restart.
+- The opt-out is independent of the analytics consent state: the two planes
+  are configured, stored, and gated separately.
+
 ## Auto-capture: previous-session native crash dump
 
 **A native engine crash in Defold (SIGSEGV/SIGABRT) is not recoverable in
@@ -238,11 +283,14 @@ the username segment of a user-home path (`/Users/<name>/`, `/home/<name>/`,
 useful without leaking the OS account name.
 
 The only crash state that leaves memory is the pending-crash sidecar described
-under *Durability*: the exact already-scrubbed wire body of a report whose
+under *Durability* — the exact already-scrubbed wire body of a report whose
 delivery has not been confirmed yet (the same bytes that go to the server —
 nothing rawer, no credentials), local to the device, bounded in count and
 size, discarded after about seven days, and removed as soon as the report is
-accepted or terminally rejected. Crash reports carry **no actor identity** —
+accepted or terminally rejected — plus the one-boolean settings record
+described under *Opting out* (the persisted `crash_enabled` decision, nothing
+else). Crash reports carry **no actor identity** —
 `session_id` / `anonymous_id` / `user_id` / `device_id`-style keys are
 stripped from context and metadata maps before the wire — so the persisted
-copy carries none either.
+copy carries none either. While crash reporting is disabled no report is
+collected at all, and an unreadable opt-out record disables it fail-closed.

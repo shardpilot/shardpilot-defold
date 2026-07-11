@@ -41,6 +41,28 @@ function M.record_breadcrumb(name)
 	return with_default("record_breadcrumb", name)
 end
 
+-- Enable or disable crash reporting (a persisted per-app opt-out; crash
+-- reporting is ON by default). While disabled, nothing is collected: emit /
+-- emit_fatal / capture_previous / resend_pending return
+-- (false, "crash_disabled") and no pending sidecar entry is written. See
+-- docs/crash.md.
+function M.set_enabled(enabled)
+	return with_default("set_enabled", enabled)
+end
+
+-- True while crash reporting is enabled on the singleton client. False after
+-- an explicit opt-out, when the persisted opt-out state could not be read
+-- (fail closed), and while the module is not initialized alike; the second
+-- return carries the reason ("opt_out" | "settings_read_failed" |
+-- "not_initialized"), nil while enabled.
+function M.is_enabled()
+	local client = default()
+	if not client then
+		return false, "not_initialized"
+	end
+	return client:is_enabled()
+end
+
 -- Emit a non-fatal crash report (subject to sampling).
 function M.emit(event)
 	return with_default("emit", event)

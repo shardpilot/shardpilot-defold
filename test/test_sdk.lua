@@ -277,6 +277,21 @@ local function reset()
 	next_response_headers = nil
 end
 
+local identity_scope = { workspace_id = "workspace-example", app_id = "app-example" }
+
+-- Consent-first: a client whose consent is still "unknown" transmits nothing,
+-- so tests that exercise the event pipeline persist a grant BEFORE building
+-- their client. Seeding the record directly (instead of calling set_consent)
+-- keeps request-order assertions stable — no /v1/consent receipt is sent for
+-- a pre-seeded decision. The read-modify-write preserves any anonymous_id a
+-- previous client persisted.
+local function seed_granted_consent(scope)
+	scope = scope or identity_scope
+	local record = storage.load(scope) or {}
+	record.consent_analytics = "granted"
+	assert_true(storage.save(scope, record), "seeding the consent grant must succeed")
+end
+
 local function test_config_validation()
 	local client, err = sdk.new({})
 	assert_equal(client, nil)
@@ -376,6 +391,7 @@ end
 
 local function test_app_first_payload()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	client:identify("user-example")
 	client:session_start()
@@ -410,6 +426,7 @@ end
 
 local function test_screen_view_does_not_mutate_caller_props()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	assert_true(client:identify("user-example"))
 	local props = { origin = "menu" }
@@ -438,6 +455,7 @@ end
 
 local function test_session_start_renews_session_and_resets_sequence()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	client:identify("user-example")
 
@@ -467,6 +485,7 @@ end
 
 local function test_session_start_rolls_back_on_enqueue_failure()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config({ buffer_size = 1 })))
 	assert_true(client:identify("user-example"))
 	assert_true(client:session_start())
@@ -484,6 +503,7 @@ end
 
 local function test_session_start_rolls_back_on_invalid_props()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	assert_true(client:identify("user-example"))
 	assert_true(client:session_start())
@@ -504,6 +524,7 @@ end
 
 local function test_track_snapshots_identity_session_and_time()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	assert_true(client:identify("user-a"))
 	assert_true(client:session_start())
@@ -530,6 +551,7 @@ end
 
 local function test_track_snapshots_timestamp_props_context_and_sequence_order()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	assert_true(client:identify("user-example"))
 	local props = { surface = "before", loadout = { weapon = "sword" } }
@@ -566,6 +588,7 @@ end
 
 local function test_track_rejects_cyclic_or_too_deep_snapshots()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	assert_true(client:identify("user-example"))
 	local cyclic = {}
@@ -588,6 +611,7 @@ end
 
 local function test_bounded_queue_drop()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config({ buffer_size = 1 })))
 	assert_true(client:identify("user-example"))
 	local ok, err = client:track("one")
@@ -600,6 +624,7 @@ end
 
 local function test_token_provider_failure()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config({
 		token_provider = function(callback)
 			callback(nil, nil, "no token")
@@ -614,6 +639,7 @@ end
 
 local function test_identity_validation()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	local ok, err = client:identify("")
 	assert_equal(ok, false)
@@ -681,18 +707,24 @@ local function test_consent_tri_state_gating_and_queue_clear()
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
 	assert_equal(client.consent_state, "unknown")
-	assert_true(client:track("open_while_unknown"))
-	assert_equal(#client.queue.items, 1)
+	-- Consent-first: "unknown" transmits nothing — the event is dropped at
+	-- enqueue with its own distinct error, so the caller can tell the
+	-- undecided state from an explicit denial.
+	local ok, err = client:track("blocked_while_unknown")
+	assert_equal(ok, false)
+	assert_equal(err, "consent_unknown")
+	assert_equal(#client.queue.items, 0, "nothing may be queued while consent is unknown")
+	assert_equal(client:snapshot().dropped, 1)
 
-	local ok, err = client:set_consent("yes")
+	ok, err = client:set_consent("yes")
 	assert_equal(ok, false)
 	assert_equal(err, "invalid_consent")
 	assert_equal(client.consent_state, "unknown")
 
 	assert_true(client:set_consent(false))
 	assert_equal(client.consent_state, "denied")
-	assert_equal(#client.queue.items, 0, "denied must clear the pending queue")
-	assert_equal(client:snapshot().dropped, 1)
+	assert_equal(#client.queue.items, 0)
+	assert_equal(client:snapshot().dropped, 1, "the empty queue leaves nothing more to drop")
 	assert_equal(#requests, 1)
 	local consent_request = requests[1]
 	assert_equal(consent_request.url, "http://localhost:8080/v1/consent")
@@ -707,9 +739,9 @@ local function test_consent_tri_state_gating_and_queue_clear()
 	assert_contains(consent_request.body, '"idempotency_key":"')
 	assert_not_contains(consent_request.body, '"event_name"')
 
-	ok, err = client:track("denied_event")
-	assert_equal(ok, false)
-	assert_equal(err, "consent_denied")
+	local denied_ok, denied_err = client:track("denied_event")
+	assert_equal(denied_ok, false)
+	assert_equal(denied_err, "consent_denied")
 	assert_equal(client:snapshot().dropped, 2)
 	assert_equal(#requests, 1)
 
@@ -741,6 +773,7 @@ end
 local function test_consent_denied_clears_retained_batch()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	next_status = 500
 	local client = assert(sdk.new(config()))
 	assert_true(client:identify("user-example"))
@@ -775,6 +808,7 @@ end
 local function test_consent_denied_drops_in_flight_batch_on_retryable_failure()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local original_request = http.request
 	local callbacks = {}
 	http.request = function(url, method, callback, headers, body, options)
@@ -858,6 +892,7 @@ end
 local function test_session_end_while_denied_completes_locally()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	assert_true(client:identify("user-example"))
 	assert_true(client:session_start())
@@ -912,6 +947,7 @@ end
 local function test_lazy_session_rolls_back_on_enqueue_failure()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config_mode_a({ buffer_size = 1 })))
 	assert_true(client:identify("user-example"))
 	-- Saturate the single-slot queue directly so the FIRST real track() both
@@ -933,6 +969,7 @@ end
 local function test_mode_a_401_drops_batch_without_retry()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config_mode_a()))
 	assert_true(client:identify("user-example"))
 	assert_true(client:track("e1"))
@@ -971,6 +1008,7 @@ end
 local function test_set_anonymous_id_rejected_while_events_pending_mode_b()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	assert_true(client:identify("user-example"))
 	assert_true(client:track("queued"))
@@ -991,6 +1029,7 @@ end
 local function test_set_anonymous_id_allowed_while_pending_mode_a()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	-- Mode A has no bind_anon enforcement, so the guard must NOT over-restrict:
 	-- rotating the anon while an event is queued stays allowed.
 	local client = assert(sdk.new(config_mode_a()))
@@ -1004,6 +1043,7 @@ end
 local function test_set_anonymous_id_remints_token_after_rotation_mode_b()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local token_calls = 0
 	local client = assert(sdk.new(config({
 		token_provider = function(callback)
@@ -1085,6 +1125,7 @@ end
 local function test_consent_denial_clears_stale_publish_deferral()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config_mode_a()))
 	assert_true(client:identify("user-example"))
 	assert_true(client:track("e1"))
@@ -1107,6 +1148,7 @@ end
 local function test_denied_in_flight_429_sets_no_stale_deferral()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local original_request = http.request
 	local callbacks = {}
 	http.request = function(url, method, callback, headers, body, options)
@@ -1334,6 +1376,7 @@ end
 local function test_shutdown_completes_when_consent_denied()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	assert_true(client:identify("user-example"))
 	assert_true(client:session_start())
@@ -1358,6 +1401,7 @@ end
 
 local function test_async_token_provider_retains_queued_events()
 	reset()
+	seed_granted_consent()
 	local token_callback = nil
 	local token_requests = 0
 	local client = assert(sdk.new(config({
@@ -1388,6 +1432,7 @@ end
 
 local function test_unauthorized_invalidates_token_and_retains_batch()
 	reset()
+	seed_granted_consent()
 	next_status = 401
 	local client = assert(sdk.new(config()))
 	client:identify("user-example")
@@ -1436,6 +1481,7 @@ end
 
 local function test_non_retryable_failure_drops_batch()
 	reset()
+	seed_granted_consent()
 	next_status = 400
 	local client = assert(sdk.new(config()))
 	client:identify("user-example")
@@ -1454,6 +1500,7 @@ end
 
 local function test_token_expiry_refresh()
 	reset()
+	seed_granted_consent()
 	local token_calls = 0
 	local client = assert(sdk.new(config({
 		token_provider = function(callback)
@@ -1473,6 +1520,7 @@ end
 
 local function test_token_provider_rejects_non_numeric_expiry()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config({
 		token_provider = function(callback)
 			callback("client-token-placeholder", "not-a-number", nil)
@@ -1491,6 +1539,7 @@ end
 
 local function test_update_honors_flush_interval()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config({ flush_interval_seconds = 0.5 })))
 	client:identify("user-example")
 	assert_true(client:session_start())
@@ -1504,6 +1553,7 @@ end
 
 local function test_perf_and_ping_samples_are_bounded()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
 	assert_true(client:session_start())
@@ -1521,6 +1571,7 @@ end
 
 local function test_perf_and_network_summaries()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config({ transport = "websocket" })))
 	client:identify("user-example")
 	client:session_start()
@@ -1542,6 +1593,7 @@ end
 
 local function test_shutdown_emits_session_end()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	client:identify("user-example")
 	client:session_start()
@@ -1552,6 +1604,7 @@ end
 
 local function test_session_end_queue_full_keeps_session_active()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config({ buffer_size = 1 })))
 	assert_true(client:identify("user-example"))
 	assert_true(client:session_start())
@@ -1566,6 +1619,7 @@ end
 
 local function test_shutdown_queue_full_does_not_finalize_and_can_retry()
 	reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config({ buffer_size = 1 })))
 	assert_true(client:identify("user-example"))
 	assert_true(client:session_start())
@@ -1583,6 +1637,7 @@ end
 
 local function test_flush_and_shutdown_wait_for_async_publish()
 	reset()
+	seed_granted_consent()
 	local original_request = http.request
 	local callbacks = {}
 	http.request = function(url, method, callback, headers, body, options)
@@ -1631,6 +1686,7 @@ end
 
 local function test_singleton_shutdown_keeps_client_after_retryable_failure()
 	reset()
+	seed_granted_consent()
 	next_status = 500
 	-- spool_enabled=false: without the durable spool, a retryable final-flush
 	-- failure must keep the singleton alive for a host retry loop.
@@ -1652,6 +1708,7 @@ end
 
 local function test_singleton_guard()
 	reset()
+	seed_granted_consent()
 	local calls = {
 		{ "identify", function()
 			return sdk.identify("user-example")
@@ -1715,6 +1772,7 @@ end
 local function test_batch_response_surfaces_per_event_outcomes()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local issues = {}
 	local client = assert(sdk.new(config({
 		flush_interval_seconds = 9999,
@@ -1761,6 +1819,7 @@ end
 local function test_batch_response_surfaces_suppressed_no_consent()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
 	assert_true(client:track("suppressed_event"))
@@ -1781,6 +1840,7 @@ end
 local function test_batch_response_without_events_array_keeps_accepted()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
 	assert_true(client:track("only_aggregate"))
@@ -1796,6 +1856,7 @@ end
 local function test_retry_after_defers_next_publish()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	next_status = 429
 	next_response_headers = { ["retry-after"] = "120" }
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
@@ -1827,6 +1888,7 @@ end
 local function test_successful_publish_clears_deferral()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
 	client.publish_retry_after_ms = 1 -- a deadline in the distant past
@@ -1845,6 +1907,7 @@ end
 local function test_backoff_on_sustained_transient_failures()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	next_status = 500
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
@@ -1873,6 +1936,7 @@ end
 local function test_error_envelope_is_surfaced()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local issues = {}
 	next_status = 400
 	next_response_body = '{"error":{"code":"validation_failed","message":"bad batch","details":['
@@ -1906,6 +1970,7 @@ end
 local function test_diagnostics_hook_errors_are_swallowed()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config({
 		flush_interval_seconds = 9999,
 		diagnostics = function()
@@ -1933,6 +1998,7 @@ end
 local function test_mode_a_api_key_is_bearer()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config_mode_a({ api_key = "sp_ingest_abc123" })))
 	assert_true(client:identify("user-example"))
 	assert_true(client:track("mode_a_event"))
@@ -1965,6 +2031,7 @@ local function test_client_source_keeps_anonymous_id_both_modes()
 	-- Mode B (token_provider).
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local mode_b = assert(sdk.new(config()))
 	assert_equal(mode_b.config.source, "client")
 	assert_true(mode_b:set_anonymous_id("anon-mode-b"))
@@ -1977,6 +2044,7 @@ local function test_client_source_keeps_anonymous_id_both_modes()
 	-- Mode A (publishable api_key).
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local mode_a = assert(sdk.new(config_mode_a()))
 	assert_equal(mode_a.config.source, "client")
 	assert_true(mode_a:set_anonymous_id("anon-mode-a"))
@@ -1989,6 +2057,7 @@ local function test_client_source_keeps_anonymous_id_both_modes()
 	-- Non-client (service) source also keeps anonymous_id on the wire.
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local server_client = assert(sdk.new(config({ source = "server" })))
 	assert_true(server_client:set_anonymous_id("anon-server"))
 	assert_true(server_client:track("server_event"))
@@ -2003,6 +2072,7 @@ end
 local function test_get_anonymous_id_matches_wire()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	assert_true(client:set_anonymous_id("anon-exposed"))
 	assert_equal(client:get_anonymous_id(), "anon-exposed")
@@ -2017,6 +2087,7 @@ end
 local function test_track_before_session_start_lazily_opens_session()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local client = assert(sdk.new(config()))
 	assert_true(client:identify("user-example"))
 	assert_true(client:track("early_event"))
@@ -2029,6 +2100,7 @@ local function test_track_before_session_start_lazily_opens_session()
 	-- Backend sources do not require a session and must not synthesize one.
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local backend = assert(sdk.new(config({ source = "backend" })))
 	assert_true(backend:identify("user-example"))
 	assert_true(backend:track("backend_event"))
@@ -2080,6 +2152,7 @@ local spool_scope = { workspace_id = "workspace-example", app_id = "app-example"
 local function test_spool_persists_transient_failure_and_resends_next_launch()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local stores, restore = install_stub_sys_storage()
 
 	next_status = 500
@@ -2127,6 +2200,7 @@ end
 local function test_spool_overflow_evicts_oldest_first()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	next_status = 500
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_max_events = 2 })))
 	assert_true(client:identify("user-example"))
@@ -2141,6 +2215,7 @@ local function test_spool_overflow_evicts_oldest_first()
 
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	next_status = 500
 	local padded = string.rep("x", 1200)
 	local bytes_client = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_max_bytes = 2048 })))
@@ -2167,19 +2242,26 @@ local function test_spool_corrupted_record_starts_clean()
 	sys.load = function()
 		error("corrupt save file")
 	end
+	-- Seeded through the in-memory shadow: the throwing sys.load falls back to
+	-- it, so the client still starts granted and the spool path is exercised.
+	seed_granted_consent()
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_equal(#client.spool_batches, 0, "a throwing sys.load must start a clean spool")
 	assert_true(client:identify("user-example"))
 	assert_true(client:track("after_corruption"))
 	assert_true(client:flush())
 
+	-- The table-shaped garbage doubles as the identity record read (the same
+	-- sys.load answers both paths), so it carries a granted consent — the
+	-- spool payload itself stays garbled.
 	local garbage = {
 		"not-a-record",
-		{ events = "not-a-list" },
-		{ events = { "junk", { event_id = 42 }, { no_event_id = true } } },
+		{ events = "not-a-list", consent_analytics = "granted" },
+		{ events = { "junk", { event_id = 42 }, { no_event_id = true } }, consent_analytics = "granted" },
 	}
 	for _, record in ipairs(garbage) do
 		storage.reset()
+		seed_granted_consent()
 		sys.load = function()
 			return record
 		end
@@ -2211,6 +2293,7 @@ local function test_spool_cleared_by_denied_consent()
 
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	next_status = 500
 	local live = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(live:identify("user-example"))
@@ -2224,11 +2307,219 @@ local function test_spool_cleared_by_denied_consent()
 	storage.reset()
 end
 
+-- Consent-first: a fresh client (consent "unknown") transmits NOTHING — no
+-- event enqueue, no publish, no spool write, no consent receipt — until an
+-- explicit grant. Pre-consent events are dropped with a distinct error, not
+-- held: no pre-consent data exists at rest.
+local function test_consent_unknown_blocks_all_analytics_egress()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "unknown")
+	assert_true(client:identify("user-example"))
+
+	local ok, err = client:track("pre_consent_event")
+	assert_equal(ok, false)
+	assert_equal(err, "consent_unknown")
+	ok, err = client:screen_view("menu")
+	assert_equal(ok, false)
+	assert_equal(err, "consent_unknown")
+	ok, err = client:session_start()
+	assert_equal(ok, false)
+	assert_equal(err, "consent_unknown")
+	assert_equal(#client.queue.items, 0, "nothing may be queued while consent is unknown")
+	assert_equal(client.session_active, false, "the blocked session_start must roll back")
+	assert_equal(client:snapshot().dropped, 3)
+
+	-- flush / the update cadence / persist are clean no-ops: no publish, no
+	-- consent receipt, no summary enqueue, no spool write.
+	assert_true(client:flush())
+	client:update(9999)
+	assert_true(client:persist())
+	assert_equal(#requests, 0, "zero analytics wire traffic while consent is unknown")
+	-- The init-time purge writes an empty clear record; no EVENT may ever
+	-- reach the offline spool while consent is unknown.
+	local spool_record = stored_spool_record(stores)
+	assert_true(spool_record == nil or #spool_record.events == 0,
+		"nothing may be written to the offline spool")
+	assert_equal(client:snapshot().dropped, 3, "the blocked cadence must not keep dropping summaries")
+
+	-- an explicit grant opens the pipeline for FUTURE events only
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
+	assert_contains(requests[1].body, '"categories":{"analytics":true}')
+	assert_true(client:track("post_grant_event"))
+	assert_true(client:flush())
+	assert_equal(#requests, 2)
+	assert_equal(requests[2].url, "http://localhost:8080/v1/events:batch")
+	assert_contains(requests[2].body, '"event_name":"post_grant_event"')
+	assert_not_contains(requests[2].body, "pre_consent_event")
+	restore()
+
+	-- an unknown-state client also tears down cleanly, with zero traffic
+	reset()
+	storage.reset()
+	local silent = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(silent:identify("user-example"))
+	silent:track("dropped_at_teardown")
+	assert_true(silent:shutdown("app_final"), "an unknown-state shutdown completes with nothing to deliver")
+	assert_equal(#requests, 0, "shutdown while unknown must not transmit")
+	storage.reset()
+end
+
+-- Runtime samples are analytics data: signals observed while the pipeline is
+-- closed (unknown or denied) are dropped, not held — the first summary after
+-- a later grant must not carry pre-consent or denied-period activity.
+local function test_blocked_period_samples_never_summarized()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_equal(client.consent_state, "unknown")
+
+	-- observed before any grant: dropped at the source
+	client:observe_ping_ms(50)
+	client:observe_ping_ms(70)
+	client:observe_disconnect("pre_consent_drop")
+	assert_true(client:set_consent(true))
+	assert_true(client:flush())
+	for _, request in ipairs(requests) do
+		assert_not_contains(request.body, '"event_name":"network_summary"')
+	end
+
+	-- observed under the grant: summarized normally
+	client:observe_ping_ms(60)
+	assert_true(client:flush())
+	local summarized = false
+	for _, request in ipairs(requests) do
+		if request.body:find('"event_name":"network_summary"', 1, true) then
+			summarized = true
+			assert_contains(request.body, '"ping_sample_count":1')
+		end
+	end
+	assert_true(summarized, "post-grant samples must still summarize")
+
+	-- samples gathered under a grant are dropped by a denial: a re-grant must
+	-- not summarize pre-denial activity
+	client:observe_ping_ms(80)
+	assert_true(client:set_consent(false))
+	assert_true(client:set_consent(true))
+	reset()
+	assert_true(client:flush())
+	assert_equal(#requests, 0, "no summary may survive the denial")
+	storage.reset()
+end
+
+-- Only a launch that starts with a persisted GRANT loads the spool. A spool
+-- record found while consent reads "unknown" (no identity record — no
+-- decision was ever persisted) cannot be proven to have been written under a
+-- grant (a v0.5 install spooled while "unknown" was still open), so it is
+-- purged at init instead of being held for a later grant: the grant opens
+-- the pipeline for FUTURE events only.
+local function test_consent_unknown_purges_unproven_spool_at_init()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save_spool(spool_scope, {
+		{
+			event_id = "unknown-e1",
+			event_name = "unproven_era_event",
+			event_ts = "2026-01-01T00:00:00.000Z",
+			anonymous_id = "anon-spool",
+		},
+	}, 500, 262144) ~= nil)
+
+	local unknown_client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(unknown_client.consent_state, "unknown")
+	assert_equal(#unknown_client.spool_batches, 0, "an unknown consent must not load the spool")
+	assert_equal(unknown_client.spool_purge_pending, false)
+	assert_equal(#stored_spool_record(stores).events, 0,
+		"a spool with no provable grant behind it must be purged at init")
+	assert_true(unknown_client:flush())
+	assert_equal(#requests, 0, "nothing may re-send while consent is unknown")
+
+	-- even after an explicit grant and a relaunch, the unproven envelopes are
+	-- gone: the grant opened the pipeline for future events only
+	assert_true(unknown_client:set_consent(true))
+	reset()
+	local granted_client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(granted_client.consent_state, "granted")
+	assert_equal(#granted_client.spool_batches, 0, "nothing unproven survives to re-send under the grant")
+	assert_true(granted_client:flush())
+	assert_equal(#requests, 0)
+
+	-- a spool written UNDER the grant still round-trips as before
+	next_status = 500
+	assert_true(granted_client:identify("user-example"))
+	assert_true(granted_client:track("granted_era_event"))
+	assert_equal(granted_client:flush(), false)
+	next_status = 202
+	reset()
+	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(relaunch.consent_state, "granted")
+	assert_equal(#relaunch.spool_batches, 1, "a granted launch loads the granted-era spool for re-send")
+	assert_true(relaunch:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"event_name":"granted_era_event"')
+	assert_equal(#stored_spool_record(stores).events, 0, "the acknowledged re-send clears the record")
+	restore()
+	storage.reset()
+end
+
+-- An identity record that FAILS to read resolves to "unknown", and unknown
+-- purges at init like every non-granted state: the unreadable record may
+-- have carried a denial whose spool purge is still owed, and init re-writes
+-- the identity record without it — possibly pre-revocation envelopes must
+-- not outlive the lost decision and re-send under a later grant.
+local function test_identity_read_failure_purges_spool()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save_spool(spool_scope, {
+		{
+			event_id = "lost-denial-e1",
+			event_name = "pre_revocation_event",
+			event_ts = "2026-01-01T00:00:00.000Z",
+			anonymous_id = "anon-lost",
+		},
+	}, 500, 262144) ~= nil)
+	assert_equal(#stored_spool_record(stores).events, 1)
+
+	-- The identity record throws on read (the spool file reads fine); no
+	-- in-process shadow exists to answer for it.
+	local real_load = sys.load
+	sys.load = function(path)
+		if path:sub(-9) == "/identity" then
+			error("unreadable identity record")
+		end
+		return real_load(path)
+	end
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "unknown", "an unreadable identity record reads as unknown")
+	assert_equal(#client.spool_batches, 0, "nothing may load for re-send")
+	assert_equal(client.spool_purge_pending, false)
+	assert_equal(#stored_spool_record(stores).events, 0,
+		"an unreadable consent decision must not leave event data at rest")
+	assert_true(client:flush())
+	assert_equal(#requests, 0)
+
+	-- Even after a later grant, the pre-revocation envelopes are gone.
+	sys.load = real_load
+	assert_true(client:set_consent(true))
+	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(#relaunch.spool_batches, 0, "nothing survives to re-send under the new grant")
+	restore()
+	storage.reset()
+end
+
 -- A permanent reject on a spooled batch removes the entries (they would fail
 -- forever), surfaces the durable drop via diagnostics, and never retries.
 local function test_spool_permanent_reject_removes_entry_and_diagnoses()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	next_status = 500
 	local first = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(first:identify("user-example"))
@@ -2273,6 +2564,7 @@ end
 local function test_shutdown_spools_undelivered_and_finalizes()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local _, restore = install_stub_sys_storage()
 	next_status = 500
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
@@ -2294,6 +2586,7 @@ local function test_shutdown_spools_undelivered_and_finalizes()
 
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	next_status = 500
 	local manual = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_enabled = false })))
 	assert_true(manual:identify("user-example"))
@@ -2312,6 +2605,7 @@ end
 local function test_persist_snapshots_queue_while_running()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local _, restore = install_stub_sys_storage()
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
@@ -2354,6 +2648,7 @@ end
 local function test_set_anonymous_id_rejected_while_spool_pending_mode_b()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	next_status = 500
 	local first = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(first:identify("user-example"))
@@ -2376,6 +2671,7 @@ local function test_set_anonymous_id_rejected_while_spool_pending_mode_b()
 	-- work is pending (the guard must not over-restrict).
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	next_status = 500
 	local seeder = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_true(seeder:identify("user-example"))
@@ -2394,6 +2690,7 @@ end
 local function test_shutdown_fails_when_remnant_evicted_by_caps()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	local _, restore = install_stub_sys_storage()
 	local client = assert(sdk.new(config({
 		flush_interval_seconds = 9999,
@@ -2434,6 +2731,7 @@ end
 local function test_spool_identity_mismatch_dropped_mode_b_kept_mode_a()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	next_status = 500
 	local first = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(first:track("historic_anon_event"))
@@ -2462,6 +2760,7 @@ local function test_spool_identity_mismatch_dropped_mode_b_kept_mode_a()
 	-- Mode A: no token binding — historic-identity envelopes re-send verbatim
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	next_status = 500
 	local seeder = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_true(seeder:track("historic_mode_a_event"))
@@ -2486,6 +2785,7 @@ end
 local function test_shutdown_without_durable_backend_keeps_old_contract()
 	reset()
 	storage.reset()
+	seed_granted_consent()
 	next_status = 500
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
@@ -2511,6 +2811,7 @@ local function test_disabled_spool_clears_persisted_record_at_init()
 	reset()
 	storage.reset()
 	local _, restore = install_stub_sys_storage()
+	seed_granted_consent()
 	next_status = 500
 	local seeder = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(seeder:track("left_on_disk"))
@@ -2553,6 +2854,7 @@ local function test_set_consent_denied_reports_failed_spool_purge_and_retries()
 	reset()
 	storage.reset()
 	local _, restore = install_stub_sys_storage()
+	seed_granted_consent()
 	next_status = 500
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
@@ -2590,6 +2892,7 @@ local function test_init_purge_failure_fails_closed_and_retries()
 	reset()
 	storage.reset()
 	local _, restore = install_stub_sys_storage()
+	seed_granted_consent()
 	next_status = 500
 	local seeder = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(seeder:track("stale_after_denial"))
@@ -2622,6 +2925,7 @@ local function test_failed_ack_removal_keeps_entries_and_retries_rewrite()
 	reset()
 	storage.reset()
 	local _, restore = install_stub_sys_storage()
+	seed_granted_consent()
 	next_status = 500
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
@@ -2655,6 +2959,7 @@ local function test_loaded_record_reapplies_current_caps()
 	reset()
 	storage.reset()
 	local _, restore = install_stub_sys_storage()
+	seed_granted_consent()
 	next_status = 500
 	local seeder = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(seeder:identify("user-example"))
@@ -2685,6 +2990,7 @@ local function test_persisted_retry_after_defers_startup_resend()
 	reset()
 	storage.reset()
 	local stores, restore = install_stub_sys_storage()
+	seed_granted_consent()
 	next_status = 429
 	next_response_headers = { ["retry-after"] = "600" }
 	local first = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
@@ -2736,6 +3042,7 @@ local function test_init_purge_runs_even_when_record_unreadable()
 	reset()
 	storage.reset()
 	local stores, restore = install_stub_sys_storage()
+	seed_granted_consent()
 	next_status = 500
 	local seeder = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(seeder:track("stale_unreadable"))
@@ -2772,6 +3079,7 @@ local function test_grant_blocked_until_owed_purge_lands()
 	reset()
 	storage.reset()
 	local _, restore = install_stub_sys_storage()
+	seed_granted_consent()
 	next_status = 500
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
@@ -2823,6 +3131,7 @@ local function test_shutdown_surfaces_terminal_failure_not_vacuous_spool()
 	reset()
 	storage.reset()
 	local _, restore = install_stub_sys_storage()
+	seed_granted_consent()
 	next_status = 400
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
@@ -2918,6 +3227,10 @@ local tests = {
 	test_spool_overflow_evicts_oldest_first,
 	test_spool_corrupted_record_starts_clean,
 	test_spool_cleared_by_denied_consent,
+	test_consent_unknown_blocks_all_analytics_egress,
+	test_blocked_period_samples_never_summarized,
+	test_consent_unknown_purges_unproven_spool_at_init,
+	test_identity_read_failure_purges_spool,
 	test_spool_permanent_reject_removes_entry_and_diagnoses,
 	test_shutdown_spools_undelivered_and_finalizes,
 	test_persist_snapshots_queue_while_running,

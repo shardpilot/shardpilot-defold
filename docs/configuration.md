@@ -127,7 +127,15 @@ Both caps are re-applied to a previously persisted record at load: a
 configuration that lowered the budgets trims an over-budget old record
 (oldest first, counted in `spool_evicted`) before anything re-sends.
 
-The spool honors consent: a persisted "denied" decision clears it at load
+The spool honors consent — it is written, loaded, and re-sent only under a
+**granted** decision (consent-first). Any init in a non-granted state
+(denied, unknown, or an unreadable identity record) purges an existing
+record instead of holding it: without an affirmative persisted grant NOW the
+record cannot be proven to have been written under one (a pre-consent-first
+install spooled while "unknown" was still open, and an unreadable identity
+record may have carried a denial), so its envelopes must not re-send under a
+later grant. A persisted "denied" decision clears it
+at load
 without sending (the purge runs even when the record cannot be read — a
 corrupt record is still cleared), and `set_consent(false)` purges it at
 runtime. If the durable

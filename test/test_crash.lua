@@ -4754,6 +4754,339 @@ local function test_pass_stops_on_concurrent_fatal_throttle()
 	storage.reset()
 end
 
+-- ── crash-reporting opt-out ──────────────────────────────────────────────────
+
+-- Crash reporting is ON by default (no first-run decision needed); an
+-- explicit opt-out stops COLLECTION, not just sending: zero wire traffic, no
+-- pending sidecar write, and the previous-session dump stays unread.
+local function test_crash_enabled_by_default_and_opt_out_blocks_collection()
+	reset()
+	local restore = install_fake_sys_storage()
+
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	local enabled, reason = client:is_enabled()
+	assert_equal(enabled, true, "crash reporting must default ON")
+	assert_equal(reason, nil)
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(#requests, 1, "the default-on client sends")
+
+	reset()
+	local bad_ok, bad_err = client:set_enabled("nope")
+	assert_equal(bad_ok, false)
+	assert_equal(bad_err, "invalid_enabled")
+	assert_true(client:set_enabled(false))
+	local disabled, disabled_reason = client:is_enabled()
+	assert_equal(disabled, false)
+	assert_equal(disabled_reason, "opt_out")
+
+	-- every egress path refuses with the same distinct error
+	local ok, err = client:emit(presymbolicated_event())
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	ok, err = client:emit_fatal(presymbolicated_event())
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	ok, err = client:resend_pending()
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+
+	-- capture_previous leaves the one-shot dump UNREAD and unconsumed
+	local module, released = fake_crash_module({
+		handle = 7,
+		signum = 11,
+		os_name = "Android",
+		modules = { { name = "libgame.so", address = 0x1000 } },
+		backtrace = { { address = 0x1abc } },
+	})
+	local loaded = false
+	local original_load_previous = module.load_previous
+	module.load_previous = function()
+		loaded = true
+		return original_load_previous()
+	end
+	ok, err = client:capture_previous(module)
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	assert_equal(loaded, false, "the dump must stay unread while disabled")
+	assert_equal(released.value, false, "the dump must not be consumed while disabled")
+
+	assert_equal(#requests, 0, "zero crash wire traffic while disabled")
+	assert_equal(#storage.load_pending_entries({ app_id = "app-example" }), 0,
+		"no pending sidecar entry may be written while disabled")
+	assert_equal(client:snapshot().dropped, 2)
+
+	-- re-enable: reports flow again, including the previously unread dump
+	assert_true(client:set_enabled(true))
+	assert_equal(client:is_enabled(), true)
+	local captured, sent = client:capture_previous(module)
+	assert_equal(captured, true)
+	assert_equal(sent, true, "the preserved dump forwards once re-enabled")
+	assert_equal(#requests, 1)
+	restore()
+end
+
+-- Defold's sys.load answers an ABSENT file with an empty table: that is a
+-- fresh install, not a failure — the legitimate-interest default (ON) applies.
+local function test_crash_settings_absent_record_defaults_on()
+	reset()
+	local saved_get, saved_save, saved_load = sys.get_save_file, sys.save, sys.load
+	sys.get_save_file = function(application_id, file_name)
+		return application_id .. "/" .. file_name
+	end
+	sys.save = function()
+		return true
+	end
+	sys.load = function()
+		return {}
+	end
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_equal(client:is_enabled(), true, "an absent record must apply the default, not fail closed")
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(#requests, 1)
+	sys.get_save_file, sys.save, sys.load = saved_get, saved_save, saved_load
+end
+
+-- The persisted opt-out state failing to READ (a thrown sys.load — storage
+-- corruption) is NOT "absent": the player may have opted out, so the client
+-- fails CLOSED — nothing is sent and nothing is persisted.
+local function test_crash_settings_read_error_fails_closed()
+	reset()
+	local saved_get, saved_save, saved_load = sys.get_save_file, sys.save, sys.load
+	local pending_writes = 0
+	sys.get_save_file = function(application_id, file_name)
+		return application_id .. "/" .. file_name
+	end
+	sys.save = function(path)
+		if path:find("pending-crashes", 1, true) then
+			pending_writes = pending_writes + 1
+		end
+		return true
+	end
+	sys.load = function()
+		error("disk corruption")
+	end
+
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	local enabled, reason = client:is_enabled()
+	assert_equal(enabled, false, "an unreadable opt-out state must fail closed")
+	assert_equal(reason, "settings_read_failed")
+
+	local ok, err = client:emit_fatal(presymbolicated_event())
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	ok, err = client:resend_pending()
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	assert_equal(#requests, 0, "a fail-closed client sends nothing")
+	assert_equal(pending_writes, 0, "a fail-closed client persists nothing")
+
+	-- an explicit fresh decision recovers the client: set_enabled rewrites
+	-- the record and re-opens the pipeline
+	assert_true(client:set_enabled(true))
+	assert_equal(client:is_enabled(), true)
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(#requests, 1)
+	sys.get_save_file, sys.save, sys.load = saved_get, saved_save, saved_load
+end
+
+-- The opt-out persists across re-init: a new client for the same app honors
+-- it, and a later re-enable persists the same way.
+local function test_crash_opt_out_persists_across_reinit()
+	reset()
+	local restore = install_fake_sys_storage()
+	local first = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(first:set_enabled(false))
+
+	local second = assert(crash.new(config({ sample_every = 1 })))
+	local enabled, reason = second:is_enabled()
+	assert_equal(enabled, false, "the persisted opt-out must survive re-init")
+	assert_equal(reason, "opt_out")
+	local ok, err = second:emit_fatal(presymbolicated_event())
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	assert_equal(#requests, 0)
+
+	assert_true(second:set_enabled(true))
+	local third = assert(crash.new(config({ sample_every = 1 })))
+	assert_equal(third:is_enabled(), true)
+	assert_true(third:emit_fatal(presymbolicated_event()))
+	assert_equal(#requests, 1)
+	restore()
+end
+
+-- A failed durable write at set_enabled is surfaced while the in-memory
+-- decision still applies for this session (call again to retry persistence).
+local function test_set_enabled_persist_failure_reported()
+	reset()
+	local saved_get, saved_save, saved_load = sys.get_save_file, sys.save, sys.load
+	sys.get_save_file = function(application_id, file_name)
+		return application_id .. "/" .. file_name
+	end
+	sys.save = function()
+		return false
+	end
+	sys.load = function()
+		return nil
+	end
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	local ok, err = client:set_enabled(false)
+	assert_equal(ok, false)
+	assert_equal(err, "crash_persist_failed")
+	assert_equal(client:is_enabled(), false, "the in-memory decision still applies")
+	local emit_ok, emit_err = client:emit_fatal(presymbolicated_event())
+	assert_equal(emit_ok, false)
+	assert_equal(emit_err, "crash_disabled")
+	assert_equal(#requests, 0)
+	sys.get_save_file, sys.save, sys.load = saved_get, saved_save, saved_load
+end
+
+-- Disabling stops breadcrumb collection too: the ring is emptied at the flip
+-- and refuses new entries, so a report emitted after a re-enable can never
+-- carry opt-out-period (or pre-opt-out) activity.
+local function test_opt_out_clears_and_refuses_breadcrumbs()
+	reset()
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:record_breadcrumb("pre.optout.crumb"))
+	assert_true(client:set_enabled(false))
+
+	local ok, err = client:record_breadcrumb("hidden.optout.crumb")
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+
+	assert_true(client:set_enabled(true))
+	assert_true(client:record_breadcrumb("post.reenable.crumb"))
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, "post.reenable.crumb")
+	assert_not_contains(requests[1].body, "pre.optout.crumb",
+		"breadcrumbs recorded before the opt-out must not survive it")
+	assert_not_contains(requests[1].body, "hidden.optout.crumb",
+		"breadcrumbs recorded during the opt-out must never be retained")
+end
+
+-- The in-process settings shadow must only ever reflect a decision that
+-- actually persisted: a failed set_enabled(true) must not seed it, or a
+-- same-process re-init with the durable read still failing would reopen a
+-- fail-closed client without any readable decision on disk.
+local function test_failed_enable_persist_does_not_seed_shadow()
+	reset()
+	local saved_get, saved_save, saved_load = sys.get_save_file, sys.save, sys.load
+	sys.get_save_file = function(application_id, file_name)
+		return application_id .. "/" .. file_name
+	end
+	sys.save = function()
+		return false
+	end
+	sys.load = function()
+		error("disk corruption")
+	end
+
+	local first = assert(crash.new(config({ sample_every = 1 })))
+	assert_equal(first:is_enabled(), false, "the unreadable record must fail closed")
+	local ok, err = first:set_enabled(true)
+	assert_equal(ok, false)
+	assert_equal(err, "crash_persist_failed")
+	assert_equal(first:is_enabled(), true, "the in-memory decision applies for this session")
+
+	local second = assert(crash.new(config({ sample_every = 1 })))
+	local enabled, reason = second:is_enabled()
+	assert_equal(enabled, false,
+		"a re-init with the durable read still failing must stay fail-closed")
+	assert_equal(reason, "settings_read_failed")
+	local emit_ok, emit_err = second:emit_fatal(presymbolicated_event())
+	assert_equal(emit_ok, false)
+	assert_equal(emit_err, "crash_disabled")
+	assert_equal(#requests, 0)
+	sys.get_save_file, sys.save, sys.load = saved_get, saved_save, saved_load
+end
+
+-- A settings record that loads but carries a malformed decision (a
+-- non-boolean crash_enabled) is corrupt, not absent: it must fail closed
+-- exactly like an unreadable record.
+local function test_malformed_crash_settings_fail_closed()
+	reset()
+	local saved_get, saved_save, saved_load = sys.get_save_file, sys.save, sys.load
+	sys.get_save_file = function(application_id, file_name)
+		return application_id .. "/" .. file_name
+	end
+	sys.save = function()
+		return true
+	end
+	sys.load = function(path)
+		if path:find("crash-settings", 1, true) then
+			return { crash_enabled = "false" }
+		end
+		return nil
+	end
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	local enabled, reason = client:is_enabled()
+	assert_equal(enabled, false, "a malformed decision must not reopen collection on the default")
+	assert_equal(reason, "settings_read_failed")
+	local ok, err = client:emit_fatal(presymbolicated_event())
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	assert_equal(#requests, 0)
+	sys.get_save_file, sys.save, sys.load = saved_get, saved_save, saved_load
+end
+
+-- A disabled client still honors the pending sidecar's retention TTL: init
+-- runs the read-side normalization, so entries older than ~7 days are pruned
+-- from disk even while the opt-out (or a fail-closed state) holds.
+local function test_disabled_client_prunes_expired_pending_on_init()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	local scope = { app_id = "app-example" }
+
+	-- Seed one fresh and one stale pending entry, then persist the opt-out.
+	local now_ms = math.floor(socket.now * 1000)
+	local eight_days_ms = 8 * 24 * 60 * 60 * 1000
+	assert_true(storage.save_pending_crash(scope,
+		{ body = '{"crash_id":"stale-one"}', crash_id = "stale-one", fatal = true },
+		nil, now_ms - eight_days_ms) ~= nil)
+	assert_true(storage.save_pending_crash(scope,
+		{ body = '{"crash_id":"fresh-one"}', crash_id = "fresh-one", fatal = true },
+		nil, now_ms) ~= nil)
+	assert_true(storage.save_crash_settings(scope, { crash_enabled = false }))
+
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_equal(client:is_enabled(), false)
+	assert_equal(#requests, 0, "the maintenance read must not dispatch anything")
+
+	-- Inspect the durable record directly (another load_pending_entries call
+	-- would itself prune, masking whether init did).
+	local pending_record = nil
+	for path, record in pairs(stores) do
+		if path:find("pending-crashes", 1, true) then
+			pending_record = record
+		end
+	end
+	assert_true(pending_record ~= nil)
+	assert_equal(#pending_record.items, 1, "the expired entry must be pruned at init while disabled")
+	assert_equal(pending_record.items[1].crash_id, "fresh-one")
+	restore()
+end
+
+-- The singleton facade mirrors the instance opt-out API.
+local function test_singleton_set_enabled_flow()
+	reset()
+	local off, off_reason = crash.is_enabled()
+	assert_equal(off, false)
+	assert_equal(off_reason, "not_initialized")
+	assert_true(crash.init(config({ sample_every = 1 })))
+	assert_equal(crash.is_enabled(), true)
+	assert_true(crash.set_enabled(false))
+	local enabled, reason = crash.is_enabled()
+	assert_equal(enabled, false)
+	assert_equal(reason, "opt_out")
+	local ok, err = crash.emit_fatal(presymbolicated_event())
+	assert_equal(ok, false)
+	assert_equal(err, "crash_disabled")
+	assert_equal(#requests, 0)
+	assert_true(crash.set_enabled(true))
+	assert_equal(crash.is_enabled(), true)
+	assert_true(crash.shutdown())
+end
+
 local tests = {
 	test_config_validation,
 	test_source_stamped_on_every_report,
@@ -4880,6 +5213,16 @@ local tests = {
 	test_deferral_stat_clears_with_window,
 	test_resend_skips_tokens_in_flight,
 	test_pass_stops_on_concurrent_fatal_throttle,
+	test_crash_enabled_by_default_and_opt_out_blocks_collection,
+	test_crash_settings_absent_record_defaults_on,
+	test_crash_settings_read_error_fails_closed,
+	test_crash_opt_out_persists_across_reinit,
+	test_set_enabled_persist_failure_reported,
+	test_opt_out_clears_and_refuses_breadcrumbs,
+	test_failed_enable_persist_does_not_seed_shadow,
+	test_malformed_crash_settings_fail_closed,
+	test_disabled_client_prunes_expired_pending_on_init,
+	test_singleton_set_enabled_flow,
 }
 
 for _, test in ipairs(tests) do

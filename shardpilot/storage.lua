@@ -1,5 +1,6 @@
 -- Durable persistence for the identity record (anonymous ID + consent state),
--- the pending-crash sidecar, and the offline event spool.
+-- the pending-crash sidecar, the crash-reporting settings record (the
+-- persisted opt-out), and the offline event spool.
 -- This is the only SDK module allowed to call Defold sys persistence. Every
 -- call is pcall-guarded so plain Lua hosts without the Defold `sys` API
 -- degrade gracefully to in-memory state for the process lifetime.
@@ -75,6 +76,11 @@ local function save_path(ns, file_name)
 	return path
 end
 
+-- Load the identity record, or nil when absent/unreadable (the in-process
+-- shadow answers when the durable read fails). An identity record that cannot
+-- be read resolves to a consent-first "unknown" in the client, which
+-- transmits nothing and purges the offline spool — so a swallowed read
+-- failure here still fails closed end to end.
 function M.load(scope)
 	local ns = namespace(scope)
 	local path = save_path(ns)
@@ -187,11 +193,12 @@ local function next_pending_token()
 		.. "-" .. suffix
 end
 
-local function pending_namespace(scope)
-	-- The pending-crash sidecar is keyed per app so two games on the same device
-	-- never share a queue, even when no workspace scope is configured (the crash
-	-- client carries only an app id). Fall back to the shared namespace only when
-	-- no app id is available at all.
+-- The per-app base namespace for the crash-plane records (the pending-crash
+-- sidecar and the crash-reporting settings), keyed per app so two games on the
+-- same device never share a queue or an opt-out decision, even when no
+-- workspace scope is configured (the crash client carries only an app id).
+-- Fall back to the shared namespace only when no app id is available at all.
+local function crash_scope_base(scope)
 	local app = sanitize(type(scope) == "table" and scope.app_id or nil)
 	local base = namespace(scope)
 	if app and base == "shardpilot" then
@@ -199,8 +206,9 @@ local function pending_namespace(scope)
 	end
 	-- The sanitized slug above collapses any disallowed character to "_", so two raw
 	-- app ids that differ only in such characters ("com.game" vs "com_game") would map
-	-- to the SAME pending-crash namespace and let one app resend/remove another app's
-	-- report. Append a short hash of the RAW (un-sanitized) scope so those two ids get
+	-- to the SAME crash namespace and let one app resend/remove another app's
+	-- report (or flip its opt-out). Append a short hash of the RAW (un-sanitized)
+	-- scope so those two ids get
 	-- distinct namespaces and per-app isolation holds. The hash is omitted only when no
 	-- app id is available at all (the shared fallback has nothing to disambiguate).
 	local raw_app = type(scope) == "table" and scope.app_id or nil
@@ -212,7 +220,11 @@ local function pending_namespace(scope)
 		end
 		base = base .. "." .. short_hash(fingerprint)
 	end
-	return base .. ".pending-crashes"
+	return base
+end
+
+local function pending_namespace(scope)
+	return crash_scope_base(scope) .. ".pending-crashes"
 end
 
 local function approx_record_bytes(record)
@@ -636,6 +648,81 @@ function M.load_pending_entries(scope)
 	return out, deadline
 end
 
+-- ── crash-reporting settings ─────────────────────────────────────────────────
+--
+-- One small per-app record holding the crash-reporting opt-out decision
+-- (`crash_enabled`). Crash reporting is ON by default (no record needed); an
+-- explicit `set_enabled(false)` persists `crash_enabled = false` here so the
+-- opt-out is honored on every later launch. The load DISTINGUISHES an absent
+-- record from a failed read: absent (a fresh install) means the default
+-- applies, while a read failure means the player may have opted out and the
+-- crash client must fail CLOSED — so unlike the other loaders, this one
+-- reports the failure instead of swallowing it into "absent".
+
+local crash_settings_memory = {}
+
+local function crash_settings_namespace(scope)
+	return crash_scope_base(scope) .. ".crash-settings"
+end
+
+-- Load the crash-reporting settings record. Returns (record, err):
+--   * a table when a record is stored (an empty table — Defold's sys.load
+--     result for a file that does not exist — reads as "no decision", so the
+--     caller's default applies);
+--   * nil, nil when no record exists at all (fresh install, or a plain-Lua
+--     host whose in-memory fallback holds nothing);
+--   * nil, "crash_settings_read_failed" when the durable read itself failed
+--     (sys.load threw, or produced a non-table) and no in-process shadow —
+--     written by a successful save this session — can answer instead.
+function M.load_crash_settings(scope)
+	local ns = crash_settings_namespace(scope)
+	local path = save_path(ns)
+	if not path then
+		return clone(crash_settings_memory[ns]), nil
+	end
+	local ok, record = pcall(sys.load, path)
+	if ok and type(record) == "table" then
+		return record, nil
+	end
+	local fallback = clone(crash_settings_memory[ns])
+	if fallback ~= nil then
+		return fallback, nil
+	end
+	if ok and record == nil then
+		-- The backend answered cleanly with nothing: no record exists.
+		return nil, nil
+	end
+	return nil, "crash_settings_read_failed"
+end
+
+-- Replace the crash-reporting settings record. Returns true when the record
+-- was durably stored (or stored in the in-memory fallback on hosts without
+-- the save-file API, which then lasts only for the process lifetime).
+function M.save_crash_settings(scope, record)
+	if type(record) ~= "table" then
+		return false
+	end
+	local ns = crash_settings_namespace(scope)
+	local path = save_path(ns)
+	if not path then
+		-- No durable backend: the in-memory record IS the store.
+		crash_settings_memory[ns] = clone(record)
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, record)
+	if not (ok and saved == true) then
+		-- The durable write failed. Do NOT seed the in-process shadow: the
+		-- shadow answers load_crash_settings when the durable READ fails, so
+		-- it must only ever reflect a decision that actually persisted —
+		-- otherwise a failed set_enabled(true) could reopen a fail-closed
+		-- client at the next same-process init without any readable decision
+		-- on disk.
+		return false
+	end
+	crash_settings_memory[ns] = clone(record)
+	return true
+end
+
 -- ── offline event spool ──────────────────────────────────────────────────────
 --
 -- Durable storage for analytics event envelopes the client could not deliver
@@ -946,6 +1033,7 @@ end
 function M.reset()
 	memory_records = {}
 	pending_memory = {}
+	crash_settings_memory = {}
 	spool_memory = {}
 	remote_config_memory = {}
 end

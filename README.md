@@ -16,9 +16,9 @@ not the platform boundary.
   surface may change before v1 with no backward-compatibility guarantee.
 - **Pre-launch.** The production ingest domain is **not provisioned** yet — use
   local/develop endpoints for evaluation.
-- **Version `0.5.0`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.5.0`, published as the
-  `v0.5.0` git tag.
+- **Version `0.6.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.6.0` (not yet tagged;
+  the latest published tag is `v0.5.0`).
 
 ## What it does
 
@@ -37,8 +37,11 @@ not the platform boundary.
   `screen_view(name)` → `app.screen_view`, plus arbitrary `track(name, props)`.
 - Generates and persists a UUIDv7 anonymous ID per configured app and supports
   `identify(user_id)` to upgrade attribution to a known user.
-- Records a tri-state analytics consent decision (`unknown` / `granted` /
-  `denied`) and enforces it at enqueue and dispatch time.
+- **Consent-first analytics.** Records a tri-state consent decision
+  (`unknown` / `granted` / `denied`) and transmits **only under an explicit
+  grant**: while consent is `unknown` (the default) events are dropped at
+  enqueue with `consent_unknown` — nothing queued, nothing spooled, zero wire
+  traffic. See [Privacy & consent](#privacy--consent).
 - Samples basic runtime signals via `update(dt)`, `observe_ping_ms(ms)`, and
   `observe_disconnect(reason)`.
 - Reports **crashes** through a separate `require "shardpilot.crash"`
@@ -48,7 +51,10 @@ not the platform boundary.
   previous-session native crash dump on next launch. Every dispatched report is
   persisted **write-ahead** to a bounded per-app sidecar and re-sent on a later
   launch until the server acknowledges it — byte-identical, one report at a
-  time. See [`docs/crash.md`](docs/crash.md).
+  time. Crash reporting is **on by default** with a persisted per-app opt-out
+  (`crash.set_enabled(false)`) that stops collection entirely and **fails
+  closed** when the persisted state cannot be read. See
+  [`docs/crash.md`](docs/crash.md).
 - Fetches **remote config** from the remote-config endpoint with an
   ETag-revalidated durable cache and typed getters
   (`remote_config_number("spawn_rate", 1.0)`), serving the last-known-good
@@ -96,6 +102,9 @@ function init(self)
     -- api_key = "sp_ingest_...", -- Mode A alternative (publishable key)
   })
   shardpilot.identify("user-example")
+  -- Consent-first: NOTHING transmits until an explicit grant. Wire this to
+  -- your consent UX; while consent is undecided every track/session call
+  -- returns false, "consent_unknown" and the event is dropped, not held.
   shardpilot.set_consent(true)   -- analytics consent: granted
   shardpilot.session_start()     -- emits app.session_started
   shardpilot.screen_view("menu") -- emits app.screen_view
@@ -129,6 +138,7 @@ local sdk = require "shardpilot.sdk"
 local client = sdk.new(config)
 
 client:identify("user-123")
+client:set_consent(true) -- consent-first: required before any event flows
 client:track("play_cta_click", { cta_source = "main_menu" })
 client:flush()
 client:shutdown("app_final")
@@ -414,14 +424,16 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   to the bounded offline spool
   ([above](#offline-durability-event-spool)) — set `spool_enabled = false` for
   a fully memory-only event path.
-- **Durable storage is four small bounded records** per configured app: the
+- **Durable storage is five small bounded records** per configured app: the
   identity record (anonymous ID + consent decision), the offline event spool
   (only envelopes already bound for the wire; cleared on acknowledgment and on
   consent denial), a bounded, per-app, TTL'd pending-crash
   sidecar (see the crash note below) that holds the already-PII-scrubbed wire
   body of EVERY dispatched crash report — a live `emit`/`emit_fatal` and a
   previous-session dump forward alike — written before its send attempt and
-  removed as soon as the server acknowledges or terminally rejects it, and the
+  removed as soon as the server acknowledges or terminally rejects it, the
+  crash-reporting settings record (the persisted `crash.set_enabled` opt-out
+  boolean, nothing else), and the
   remote-config cache (the last served config body + ETag, no analytics
   payload; overwritten by the next successful fetch). The identity
   record is written through
@@ -431,8 +443,23 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   Lua test host) it degrades gracefully to in-memory state. `get_anonymous_id()`
   returns the persisted anonymous ID so a host can hand it to its own backend at
   token-mint time (Mode B); the SDK always sends that same anonymous ID on the wire.
-- **`set_consent(analytics_granted)`** records `unknown` (default, fully open),
-  `granted`, or `denied`. `denied` drops events at enqueue, clears the pending
+- **`set_consent(analytics_granted)`** records `unknown` (the default),
+  `granted`, or `denied` — and the pipeline is **consent-first**: only
+  `granted` transmits. While consent is `unknown`, `track`/`screen_view`/
+  `session_start` return `false, "consent_unknown"` and the event is
+  **dropped, not held** — nothing is queued or spooled, `flush`/`persist` are
+  no-ops, no consent receipt goes out, and runtime samples
+  (`observe_ping_ms` / `observe_disconnect` / frame sampling) are dropped at
+  the source — a later summary can never carry pre-consent (or
+  denied-period) activity. Only a launch that starts with a persisted grant
+  loads the offline spool; any non-granted init (denied, unknown, or an
+  unreadable identity record) **purges** it instead — a record without an
+  affirmative grant behind it cannot be proven to have been written under
+  one. A grant opens the pipeline for FUTURE
+  events only. An unreadable identity record resolves to `unknown`, so a
+  consent-state read failure fails **closed**, for the wire and for data at
+  rest alike. `denied` drops events at
+  enqueue (`consent_denied`), clears the pending
   queue, discards in-flight batches instead of retrying, and purges the
   offline spool. The decision is
   applied in memory and persisted to the identity record; if that durable write
@@ -453,6 +480,20 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   point (`update`/`flush`/`shutdown`). While a pending consent is outstanding,
   `shutdown()` returns `false, "consent_pending"` instead of tearing down — call
   it again once a token is available so the decision is not dropped at exit.
+- **Crash reporting is on by default, with a persisted opt-out.** Crash
+  reports ride their own plane, independent of analytics consent:
+  `crash.set_enabled(false)` persists a per-app opt-out that stops
+  COLLECTION — `emit`/`emit_fatal`/`capture_previous`/`resend_pending` return
+  `false, "crash_disabled"`, no sidecar entry is written, the breadcrumb ring
+  is emptied and refuses new entries, and the
+  previous-session native dump stays unread. `crash.is_enabled()` reports the
+  state. If the persisted opt-out record cannot be READ (storage error or a
+  malformed record — not
+  merely absent on a fresh install), the crash client **fails closed** and
+  sends nothing until a new `set_enabled` decision is persisted. A disabled
+  client still runs the pending sidecar's ~7-day TTL maintenance at init, so
+  already-captured reports age out on schedule while the opt-out holds. See
+  [`docs/crash.md`](docs/crash.md#opting-out).
 - **Pending-crash sidecar.** Every dispatched crash report — a live
   `emit`/`emit_fatal` and a previous-session dump forward alike — has its
   already-PII-scrubbed wire body written to a small, bounded, per-app sidecar
