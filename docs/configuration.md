@@ -169,16 +169,31 @@ clean). A failed acknowledgment-removal rewrite keeps the
 settled entries marked and retries the rewrite on the flush cadence, so the
 record converges as soon as storage recovers.
 
+The **consent-receipt outbox** is separate from the spool and has no
+configuration knobs: undelivered `POST /v1/consent` receipts are always
+retained durably (fixed cap of 32, oldest evicted first, no TTL) and retried
+until acknowledged. `spool_enabled = false` does not affect it, and — unlike
+the spool — it is never consent-purged: receipts deliver under denied and
+unknown states alike, because a receipt documents the decision itself. See
+`docs/privacy.md`.
+
 The optional `diagnostics` hook is invoked with each non-accepted ingest
 outcome the server reports. Inside a `202` events-batch response the SDK parses
 the per-event status array and reports every `observed`, `duplicate`,
 `rejected`, or `suppressed_no_consent` event (with its server `code`); on a
 non-2xx it reports the parsed error envelope (`error.code` plus per-field
-detail codes); and when a permanent reject drops entries from the offline
-spool it reports `{ scope = "spool", status = "dropped", code, count }`.
+detail codes); when a permanent reject drops entries from the offline
+spool it reports `{ scope = "spool", status = "dropped", code, count }`; and
+when a consent receipt is dropped (a permanent rejection, an overflow of
+the outbox cap, or a Mode B identity change at load) it reports
+`{ scope = "consent", status = "dropped", code }` (codes `outbox_overflow`
+and `identity_changed` carry a `count`).
 Counts are also available on `snapshot()` (`accepted`,
 `rejected`, `duplicates`, `observed`, `suppressed`, `last_event_issue`, plus
 the spool counters `spooled`, `spool_resent`, `spool_evicted`,
-`spool_persist_failed`). The
+`spool_persist_failed` and the consent-outbox counters
+`consent_outbox_evicted`, `consent_outbox_persist_failed`). The
 SDK honors a `429` `Retry-After` header by deferring the next publish, and
-falls back to exponential backoff with jitter when no header is present.
+falls back to exponential backoff with jitter when no header is present —
+consent-receipt retries pace themselves the same way, on their own
+consent-plane deferral.

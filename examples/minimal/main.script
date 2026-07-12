@@ -20,7 +20,13 @@ function init(self)
 	-- Consent-first: the analytics pipeline transmits NOTHING until an
 	-- explicit grant — while consent is undecided, track/session calls return
 	-- false, "consent_unknown" and the event is dropped, not held. Wire this
-	-- to your consent UX and call set_consent(false) on decline.
+	-- to your consent UX and call set_consent(false) on decline — or
+	-- set_consent("denied_forced_minor") when your age gate forces the denial
+	-- (feature-detect it with
+	-- shardpilot.supports("consent_state_denied_forced_minor")). Each explicit
+	-- decision posts a consent receipt kept in a durable outbox until the
+	-- server acknowledges it, so a decision made offline still reaches the
+	-- backend on a later launch.
 	shardpilot.set_consent(true)
 	shardpilot.session_start()
 
@@ -71,9 +77,11 @@ end
 function final(self)
 	-- shutdown() starts a final flush. Events it cannot deliver are written to
 	-- the durable offline spool and re-sent on the next launch, so shutdown
-	-- returns true even when the network is down. It still returns
-	-- false, "consent_pending" while a consent decision is awaiting a token
-	-- (retry shutdown once the token lands); with spool_enabled = false it
+	-- returns true even when the network is down. An undelivered consent
+	-- receipt is handled the same way — durably retained in the consent
+	-- outbox, it re-sends next launch — so shutdown returns
+	-- false, "consent_pending" only when the receipt could NOT be durably
+	-- captured (retry shutdown then); with spool_enabled = false it
 	-- returns false, err whenever events remain undelivered.
 	local ok, err = shardpilot.shutdown("app_final")
 	if not ok then

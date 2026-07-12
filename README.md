@@ -16,9 +16,9 @@ not the platform boundary.
   surface may change before v1 with no backward-compatibility guarantee.
 - **Pre-launch.** The production ingest domain is **not provisioned** yet — use
   local/develop endpoints for evaluation.
-- **Version `0.6.0`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.6.0` (not yet tagged;
-  the latest published tag is `v0.5.0`).
+- **Version `0.7.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.7.0` (not yet tagged;
+  the latest published tag is `v0.6.0`).
 
 ## What it does
 
@@ -37,11 +37,20 @@ not the platform boundary.
   `screen_view(name)` → `app.screen_view`, plus arbitrary `track(name, props)`.
 - Generates and persists a UUIDv7 anonymous ID per configured app and supports
   `identify(user_id)` to upgrade attribution to a known user.
-- **Consent-first analytics.** Records a tri-state consent decision
-  (`unknown` / `granted` / `denied`) and transmits **only under an explicit
-  grant**: while consent is `unknown` (the default) events are dropped at
-  enqueue with `consent_unknown` — nothing queued, nothing spooled, zero wire
-  traffic. See [Privacy & consent](#privacy--consent).
+- **Consent-first analytics.** Records an explicit consent decision over the
+  states `unknown` / `granted` / `denied` / `denied_forced_minor` (the
+  age-gate-forced denial, which gates exactly like `denied`) and transmits
+  **only under an explicit grant**: while consent is `unknown` (the default)
+  events are dropped at enqueue with `consent_unknown` — nothing queued,
+  nothing spooled, zero wire traffic. Explicit decisions post a consent
+  receipt retained in a **durable outbox** until the server acknowledges it,
+  so a receipt survives process death and offline commits. See
+  [Privacy & consent](#privacy--consent).
+- **Capability discovery.** `shardpilot.supports(capability)` feature-detects
+  SDK abilities before `init()` — `"consent_receipt_outbox"` and
+  `"consent_state_denied_forced_minor"` today; unknown names return `false`
+  on older and newer SDKs alike, so integrations can gate new call shapes
+  safely.
 - Samples basic runtime signals via `update(dt)`, `observe_ping_ms(ms)`, and
   `observe_disconnect(reason)`.
 - Reports **crashes** through a separate `require "shardpilot.crash"`
@@ -118,11 +127,13 @@ end
 function final(self)
   -- shutdown() starts a final flush. When the flush cannot deliver everything,
   -- the undelivered events are written to the durable offline spool and
-  -- shutdown returns true — they re-send on the next launch. It still returns
-  -- false, "consent_pending" while a consent decision is awaiting a token
-  -- (consent receipts are not spooled; retry shutdown once the token lands),
-  -- and with spool_enabled = false it returns false, err whenever events
-  -- remain undelivered (retry shutdown until it returns true).
+  -- shutdown returns true — they re-send on the next launch. An undelivered
+  -- consent receipt behaves the same way: durably retained in the consent
+  -- outbox, it re-sends next launch and shutdown completes. It returns
+  -- false, "consent_pending" only when the receipt could NOT be durably
+  -- captured (no save-file backend, or the write keeps failing) — retry
+  -- shutdown then — and with spool_enabled = false it returns false, err
+  -- whenever events remain undelivered (retry shutdown until it returns true).
   local ok, err = shardpilot.shutdown("app_final")
   if not ok then
     print("shardpilot shutdown not complete: " .. tostring(err))
@@ -242,9 +253,11 @@ per-app spool and re-sends them on a later launch. Enabled by default
   nothing is left to spool (permanent rejects never are), so the failure
   surfaces as `false, err` instead of a clean teardown — a repeated
   `shutdown()` call then completes normally, since the queue is already
-  clean. A pending consent
-  decision still returns `false, "consent_pending"` (consent receipts are not
-  spooled).
+  clean. An undelivered consent receipt holds teardown
+  (`false, "consent_pending"`) only when it is NOT durably retained — a
+  receipt safe in the durable consent outbox re-sends next launch, so
+  `shutdown()` completes over it exactly like it does over spooled events
+  (see [Privacy & consent](#privacy--consent)).
 - An explicit **`persist()`** snapshot (instance + singleton): writes every
   undelivered event to the spool without sending or tearing down, while the
   client keeps running. It reports `false, "spool_persist_failed"` when the
@@ -424,10 +437,13 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   to the bounded offline spool
   ([above](#offline-durability-event-spool)) — set `spool_enabled = false` for
   a fully memory-only event path.
-- **Durable storage is five small bounded records** per configured app: the
+- **Durable storage is six small bounded records** per configured app: the
   identity record (anonymous ID + consent decision), the offline event spool
   (only envelopes already bound for the wire; cleared on acknowledgment and on
-  consent denial), a bounded, per-app, TTL'd pending-crash
+  consent denial), the consent-receipt outbox (undelivered `/v1/consent`
+  receipts only — at most 32, oldest evicted first, pruned the moment the
+  server acknowledges one; never event payloads, never purged by a denial —
+  see the consent bullet below), a bounded, per-app, TTL'd pending-crash
   sidecar (see the crash note below) that holds the already-PII-scrubbed wire
   body of EVERY dispatched crash report — a live `emit`/`emit_fatal` and a
   previous-session dump forward alike — written before its send attempt and
@@ -443,8 +459,10 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   Lua test host) it degrades gracefully to in-memory state. `get_anonymous_id()`
   returns the persisted anonymous ID so a host can hand it to its own backend at
   token-mint time (Mode B); the SDK always sends that same anonymous ID on the wire.
-- **`set_consent(analytics_granted)`** records `unknown` (the default),
-  `granted`, or `denied` — and the pipeline is **consent-first**: only
+- **`set_consent(decision)`** records an explicit decision — `true`
+  (granted), `false` (denied), or the string `"denied_forced_minor"` — over
+  the states `unknown` (the default), `granted`, `denied`, and
+  `denied_forced_minor`; the pipeline is **consent-first**: only
   `granted` transmits. While consent is `unknown`, `track`/`screen_view`/
   `session_start` return `false, "consent_unknown"` and the event is
   **dropped, not held** — nothing is queued or spooled, `flush`/`persist` are
@@ -461,7 +479,15 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   rest alike. `denied` drops events at
   enqueue (`consent_denied`), clears the pending
   queue, discards in-flight batches instead of retrying, and purges the
-  offline spool. The decision is
+  offline spool. `"denied_forced_minor"` — the persisted decision for
+  age-gate under-threshold players — is treated by every analytics gate
+  exactly like `denied` (same refusals, same cleanup, same
+  purge-at-every-launch); the one difference is its receipt, which carries
+  `reason = "denied_forced_minor"` so the backend per-actor gate can tell a
+  band-forced denial from a chosen one. In a forced-minor session the sole
+  analytics-plane request on the wire is that receipt POST; a later explicit
+  `set_consent` (the band-correction path) supersedes the state normally.
+  The decision is
   applied in memory and persisted to the identity record; if that durable write
   fails, `set_consent` returns `false, "consent_persist_failed"` (the in-memory
   decision and the wire report still proceed). If the identity record persisted
@@ -473,13 +499,33 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   before a new grant takes effect. Call `set_consent` again to retry
   persistence, otherwise the decision can be lost on restart.
 - Explicit consent decisions are reported to `POST {ingest_url}/v1/consent` over
-  the same authenticated transport; consent never rides the event envelope. The
-  report is **not** strictly fire-and-forget: if no token is available yet (e.g.
-  an async Mode B `token_provider` still in flight) or the POST returns 401, the
-  decision is retained as a pending consent and retried at the next dispatch
-  point (`update`/`flush`/`shutdown`). While a pending consent is outstanding,
-  `shutdown()` returns `false, "consent_pending"` instead of tearing down — call
-  it again once a token is available so the decision is not dropped at exit.
+  the same authenticated transport; consent never rides the event envelope.
+  Every decision becomes exactly one receipt (with its own `idempotency_key`),
+  retained in the **durable consent-receipt outbox** until the server
+  acknowledges it and delivered serially, in decision order. Transient
+  failures — no token yet (e.g. an async Mode B `token_provider` still in
+  flight), a Mode B 401, offline, timeout, `429`, `5xx` — keep the receipt
+  and retry at every dispatch point (init/`update`/`flush`/`shutdown`) with
+  `Retry-After`/backoff pacing, across launches, until delivered; permanent
+  rejections (including a Mode A 401) are dropped and surfaced through the
+  `diagnostics` hook (`scope = "consent"`). Under Mode B auth, receipts
+  retained under a previous anonymous id are dropped at load like the event
+  spool's `identity_changed` rule (each entry keeps a decision-time anon
+  snapshot as retention metadata, never sent on the wire) — a minted token
+  binds the current identity, so replaying them could only wedge the trail;
+  Mode A re-sends historic actors unchanged. Receipt delivery is
+  **consent-plane traffic**: it stays permitted while analytics consent is
+  denied or unknown — the receipt documents the decision itself — and the
+  outbox never carries analytics events. If the receipt's durable append
+  fails while it is still undelivered, `set_consent` returns
+  `false, "consent_outbox_persist_failed"` (the decision applied; delivery
+  still proceeds and the write retries automatically — including from
+  `persist()` even with the event spool disabled). `shutdown()` completes
+  over a durably retained receipt (it re-sends next launch — a receipt still
+  in flight at teardown never chains further requests) and returns
+  `false, "consent_pending"` only when the receipt could not be durably
+  captured — call it again once a token is available or storage recovers so
+  the decision is not dropped at exit.
 - **Crash reporting is on by default, with a persisted opt-out.** Crash
   reports ride their own plane, independent of analytics consent:
   `crash.set_enabled(false)` persists a per-app opt-out that stops
@@ -545,13 +591,15 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   SDK source. The guard greps file *contents* (`grep -RInE`) for these patterns,
   so it flags native references inside tracked files but does not catch a native
   source file added solely by filename — keep the boundary by convention.
-- **No durable I/O beyond the identity record, the event spool, the
-  crash-retry sidecar, and the remote-config cache.**
+- **No durable I/O beyond the six records** (identity, event spool,
+  consent-receipt outbox, crash-retry sidecar, crash-reporting settings,
+  remote-config cache).
   `io.*`, `os.execute`, and browser/local storage are forbidden in source;
   `sys.save`/`sys.load`/`sys.get_save_file` are confined to
   `shardpilot/storage.lua`, which writes only the identity record, the bounded
-  offline event spool, the bounded, TTL'd crash-retry sidecar, and the
-  single bounded remote-config cache record.
+  offline event spool, the bounded consent-receipt outbox, the bounded, TTL'd
+  crash-retry sidecar, the one-boolean crash-reporting settings record, and
+  the single bounded remote-config cache record.
 - **No raw/provider/token/billing surface.** Terms like `raw_payload`, `prompt`,
   `access_token`, `github_token`, `billing` must not appear in SDK or example
   source.

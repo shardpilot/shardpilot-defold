@@ -1,6 +1,7 @@
 -- Durable persistence for the identity record (anonymous ID + consent state),
 -- the pending-crash sidecar, the crash-reporting settings record (the
--- persisted opt-out), and the offline event spool.
+-- persisted opt-out), the offline event spool, and the consent-receipt
+-- outbox.
 -- This is the only SDK module allowed to call Defold sys persistence. Every
 -- call is pcall-guarded so plain Lua hosts without the Defold `sys` API
 -- degrade gracefully to in-memory state for the process lifetime.
@@ -929,6 +930,141 @@ function M.spool_is_durable(scope)
 	return save_path(spool_namespace(scope), "spool") ~= nil
 end
 
+-- ── consent-receipt outbox ───────────────────────────────────────────────────
+--
+-- Durable retention for consent receipts — the exact `POST /v1/consent`
+-- payload built for every explicit set_consent decision — until the server
+-- acknowledges them, so a receipt survives process death and offline play.
+-- CONSENT-PLANE ONLY: the record never carries event envelopes or any other
+-- analytics payload, and — unlike the offline event spool — it is never
+-- consent-purged: a receipt documents the decision itself, so it is retained
+-- and delivered under denied/unknown states alike. The list is bounded by a
+-- fixed entry count (receipts are small, fixed-shape, and rare — one per
+-- explicit player decision), evicting the OLDEST first when it overflows
+-- (the newest decisions are the operative ones). There is deliberately NO
+-- TTL: an undelivered receipt is retried until acknowledged.
+
+local consent_outbox_memory = {}
+
+local max_consent_outbox_entries = 32
+
+local function valid_receipt_field(value)
+	return type(value) == "string" and value ~= ""
+end
+
+-- Keep only entries that are complete, well-formed receipts, copied down to
+-- the known fields — the wire fields plus one piece of retention metadata,
+-- `anonymous_id` (the decision-time anon snapshot the client's Mode B
+-- identity check reads at load; the client strips it from the wire payload).
+-- Anything else — a corrupt file, a truncated entry, a garbled field — is
+-- dropped rather than sent or crashed on: one bad record on disk must never
+-- block (or ride along with) the deliverable rest.
+local function sanitize_outbox_entries(entries)
+	local out = {}
+	if type(entries) ~= "table" then
+		return out
+	end
+	for i = 1, #entries do
+		local entry = entries[i]
+		if type(entry) == "table"
+			and valid_receipt_field(entry.idempotency_key)
+			and valid_receipt_field(entry.workspace_id)
+			and valid_receipt_field(entry.app_id)
+			and valid_receipt_field(entry.environment_id)
+			and valid_receipt_field(entry.actor_identifier)
+			and valid_receipt_field(entry.decided_at)
+			and type(entry.categories) == "table"
+			and type(entry.categories.analytics) == "boolean"
+			and (entry.reason == nil or valid_receipt_field(entry.reason))
+			and (entry.anonymous_id == nil or valid_receipt_field(entry.anonymous_id)) then
+			out[#out + 1] = {
+				idempotency_key = entry.idempotency_key,
+				workspace_id = entry.workspace_id,
+				app_id = entry.app_id,
+				environment_id = entry.environment_id,
+				actor_identifier = entry.actor_identifier,
+				decided_at = entry.decided_at,
+				categories = { analytics = entry.categories.analytics },
+				reason = entry.reason,
+				anonymous_id = entry.anonymous_id,
+			}
+		end
+	end
+	return out
+end
+
+local function write_consent_outbox(ns, receipts)
+	local record = { receipts = receipts }
+	local path = save_path(ns, "consent-outbox")
+	if not path then
+		-- No durable backend (plain Lua host): the in-memory record is the store.
+		consent_outbox_memory[ns] = record
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, record)
+	if not (ok and saved == true) then
+		return false
+	end
+	consent_outbox_memory[ns] = record
+	return true
+end
+
+-- Load the retained consent receipts for this app (oldest first, possibly
+-- empty). The outbox shares the identity record's per-app namespace scheme
+-- (plus the raw-scope hash, like the spool and the pending-crash sidecar).
+-- A failed or garbled read degrades to the salvageable subset — or a clean
+-- empty outbox — instead of erroring into game code; this never throws.
+function M.load_consent_outbox(scope)
+	local ns = spool_namespace(scope)
+	local record = nil
+	local path = save_path(ns, "consent-outbox")
+	if path then
+		local ok, loaded = pcall(sys.load, path)
+		if ok and type(loaded) == "table" then
+			record = loaded
+		end
+	end
+	if record == nil then
+		record = consent_outbox_memory[ns]
+	end
+	if type(record) ~= "table" then
+		return {}
+	end
+	return sanitize_outbox_entries(record.receipts)
+end
+
+-- Replace the persisted outbox with `receipts` (oldest first), enforcing the
+-- fixed entry cap by evicting the OLDEST entries first. Returns the list that
+-- was actually persisted — possibly shorter than the input after the cap
+-- eviction — or nil when the durable write failed. Unlike the event spool,
+-- a FAILED WRITE never evicts: receipts are consent records whose retention
+-- the caller must be able to trust, and at 32 small fixed-shape entries the
+-- record sits far under the save-file size limit — so a failing write means
+-- the backend is (transiently) unavailable, not that the record is too big.
+-- Evict-and-retry here could turn a transient fail-then-succeed into a
+-- successfully written EMPTY record, silently dropping a receipt while
+-- reporting success; failing the save keeps the receipt in the caller's
+-- mirror, marked owed and retried at every dispatch point.
+function M.save_consent_outbox(scope, receipts)
+	local ns = spool_namespace(scope)
+	local kept = sanitize_outbox_entries(receipts)
+	while #kept > max_consent_outbox_entries do
+		table.remove(kept, 1)
+	end
+	if not write_consent_outbox(ns, kept) then
+		return nil
+	end
+	return kept
+end
+
+-- True when the outbox has a durable backend on this runtime (the save-file
+-- API is available). The in-memory fallback keeps in-process retries working
+-- on plain Lua hosts, but it does not survive the process — so shutdown()
+-- must not count a fallback write as delivery-safe retention.
+function M.consent_outbox_is_durable(scope)
+	return save_path(spool_namespace(scope), "consent-outbox") ~= nil
+end
+
 -- ── remote-config cache ──────────────────────────────────────────────────────
 --
 -- One durable last-known-good record per app for the remote-config client:
@@ -1035,6 +1171,7 @@ function M.reset()
 	pending_memory = {}
 	crash_settings_memory = {}
 	spool_memory = {}
+	consent_outbox_memory = {}
 	remote_config_memory = {}
 end
 

@@ -1,5 +1,106 @@
 # Changelog
 
+## v0.7.0 — 2026-07-11 — early alpha
+
+- **Durable consent-receipt outbox: receipts now survive process death and
+  retry until acknowledged.** Every explicit `set_consent` decision becomes
+  exactly one receipt (the `POST {ingest_url}/v1/consent` payload snapshotted
+  at decision time, with its own `idempotency_key`), appended to a new small
+  per-app durable record (`consent-outbox`) and delivered **serially, in
+  decision order** — so a grant made right after a denial can never settle on
+  the server as deny-after-grant. Previously the receipt was retained
+  in memory only (lost with the process), only for the no-token-yet and
+  Mode B 401 cases, and only the LATEST undelivered decision was kept; any
+  other transport failure — a 500, a network error, an offline commit —
+  silently lost the receipt. Now:
+  - **Delivery failures never throw into game code and never give up on
+    transient errors**: a retryable outcome (offline, timeout, `429`, `5xx`,
+    a Mode B 401) keeps the receipt at the head of the outbox and retries at
+    every dispatch point — init, the update-driven flush cadence, explicit
+    `flush()`, and `shutdown()` — honoring a `Retry-After` and otherwise
+    backing off exponentially with jitter, on a **consent-plane deferral
+    independent of the events plane's** (a denial clears the publish deferral
+    but must not unthrottle receipt retries). A successful delivery prunes
+    the receipt from the durable record immediately; a failed prune rewrite
+    is retried and, if the app dies first, the next launch's re-send is
+    de-duplicated server-side on the receipt's `idempotency_key`.
+  - **Terminal outcomes are pruned, not replayed forever**: a permanent `4xx`
+    — including a Mode A 401, whose static publishable key cannot change —
+    drops the receipt (surfaced through the `diagnostics` hook, scope
+    `consent`) so the receipts queued behind it still deliver. Under Mode B
+    auth, receipts retained under a previous anonymous id are likewise
+    dropped at load (`identity_changed`, mirroring the event spool's rule):
+    each entry stores its decision-time anon snapshot as retention metadata
+    (never sent on the wire), and a token minted for the new identity could
+    only replay them into a guaranteed rejection that wedges the trail.
+    Mode A re-sends historic actors unchanged.
+  - **A failed durable append is surfaced, not silent**: while the receipt is
+    still undelivered without a durable copy, `set_consent` returns
+    `false, "consent_outbox_persist_failed"` — the decision itself applied
+    and delivery still proceeds; the write retries at every dispatch point,
+    including `persist()` even when the event spool is disabled
+    (`spool_enabled = false`), since the outbox is independent of event
+    spooling. A receipt already acknowledged by a synchronous delivery needs
+    no durability and reports success.
+  - **The outbox is consent-plane ONLY**: it never carries event envelopes,
+    and it is **never consent-purged** — unlike the offline event spool, it
+    loads and delivers on denied and unknown launches alike, because a
+    receipt documents the decision itself (that is its legal purpose; see
+    `docs/privacy.md`). An empty outbox still costs a fresh consent-first
+    install nothing: no token is minted and zero requests leave the device.
+  - **Bounded, no TTL**: at most 32 receipts, oldest evicted first (the
+    newest decisions are the operative ones; evictions of undelivered
+    receipts are counted in `consent_outbox_evicted` and diagnosed as
+    `outbox_overflow`). Only the cap evicts — a FAILED durable write never
+    does: it fails the save, the receipts stay in the in-memory mirror
+    (still delivering), and the write is retried at every dispatch point, so
+    a transient storage failure can never silently drop a receipt while
+    reporting success. There is deliberately no age limit — an undelivered
+    receipt is retried until acknowledged. A malformed record on disk is
+    fail-safe: garbled entries are dropped at load, never sent, never a
+    crash, and never a blocker for the well-formed receipts around them.
+  - **`shutdown()` no longer waits on a durably retained receipt**: like the
+    event spool, a receipt that is safely on disk re-sends on the next
+    launch, so teardown completes — and a receipt still in flight at
+    teardown settles its own bookkeeping without chaining further requests
+    (a torn-down client dispatches nothing). The
+    `false, "consent_pending"` contract remains when the receipt could NOT
+    be durably captured (no save-file API on the host, or the durable write
+    itself failing — tracked and retried via
+    `consent_outbox_persist_failed`), and an owed post-delivery prune
+    rewrite counts as pending too: a Mode B `set_anonymous_id` rotation
+    waits for it (`events_pending`), or the stale on-disk receipt would
+    reload at the next launch and replay an old actor under a token minted
+    for the new one.
+  - New snapshot counters: `consent_outbox_evicted`,
+    `consent_outbox_persist_failed`. Durable storage grows from five to
+    **six** small bounded per-app records.
+- **New consent decision `set_consent("denied_forced_minor")`** — the
+  age-gate-forced denial state the consent & age-gate UX spec's minor mode
+  requires (its AC-8). Analytics-wise it is IDENTICAL to `denied`: events
+  drop at enqueue with `consent_denied`, the queue clears, in-flight batches
+  are discarded, the durable spool purges fail-closed, samplers reset, and a
+  launch that starts with the persisted state purges the spool and transmits
+  nothing. The one difference is the receipt: it carries
+  `reason = "denied_forced_minor"`, so the backend per-actor gate can tell a
+  band-forced denial from a chosen one. In a forced-minor session the sole
+  analytics-plane request on the wire is that receipt POST (covered by a
+  dedicated AC-8 test). The state is superseded like any other: a later
+  `set_consent(true)`/`set_consent(false)` (the spec's band-correction path)
+  applies normally and posts a fresh, reason-less receipt. Any other string
+  is still rejected with `invalid_consent`; the `set_consent` parameter is
+  now documented as `decision` (`true` | `false` | `"denied_forced_minor"`).
+- **New capability discovery: `shardpilot.supports(capability)`** — usable
+  before `init()`, returns `true` for `"consent_receipt_outbox"` and
+  `"consent_state_denied_forced_minor"`, and `false` for anything unknown on
+  older and newer SDKs alike, so a game can feature-detect call shapes that
+  are not new functions (the way `crash.set_enabled` presence can be
+  checked).
+- README/docs updated for the receipt-outbox semantics (`README.md`,
+  `docs/privacy.md` — new "Consent-receipt outbox" record section — and
+  `docs/events.md`), and release references bumped (version `0.7.0`; latest
+  published tag `v0.6.0`).
+
 ## v0.6.0 — 2026-07-11 — early alpha
 
 - **BREAKING: consent-first analytics — "unknown" no longer transmits.** The

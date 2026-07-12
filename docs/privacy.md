@@ -16,9 +16,11 @@ two games on the same device from sharing an anonymous ID or consent record.
 When the Defold `sys` API is unavailable, the record degrades to in-memory
 state for the process lifetime.
 
-`set_consent(analytics_granted)` records a tri-state consent decision
-{unknown, granted, denied}. The analytics client is **consent-first**: only
-an explicit **granted** decision opens the event pipeline.
+`set_consent(decision)` records an explicit consent decision — `true`
+(granted), `false` (denied), or the string `"denied_forced_minor"` (an
+age-gate-forced denial) — over the consent states {unknown, granted, denied,
+denied_forced_minor}. The analytics client is **consent-first**: only an
+explicit **granted** decision opens the event pipeline.
 
 - **Unknown** (the initial state on a fresh install — and what an unreadable
   identity record resolves to) transmits **nothing**: `track`, `screen_view`,
@@ -43,15 +45,39 @@ an explicit **granted** decision opens the event pipeline.
 - **Denied** drops events at enqueue (`false, "consent_denied"`), clears the
   pending queue, discards in-flight batches on completion instead of retrying
   them, and purges the offline spool (see below).
+- **`denied_forced_minor`** is the band-forced denial the age-gate flow
+  persists for under-threshold players. Every analytics gate treats it
+  exactly like **denied** — same `consent_denied` refusals, same queue/
+  in-flight/spool cleanup, same zero analytics egress on every later launch.
+  The one difference is its consent receipt, which carries
+  `reason = "denied_forced_minor"` so the server-side per-actor gate can tell
+  a band-forced denial from one the player chose. In a forced-minor session
+  the **only** analytics-plane request that leaves the device is that receipt
+  POST. A later explicit `set_consent` (the age-band-correction path)
+  supersedes the state normally. Feature-detect with
+  `shardpilot.supports("consent_state_denied_forced_minor")`.
 
-Explicit decisions are reported
-fire-and-forget to `POST {ingest_url}/v1/consent` and never ride the event
-envelope; a decision made before an auth token is available — or rejected as
-unauthorized — is retained (latest decision wins) and retried at the next
-dispatch point, and `shutdown` will not tear the client down while a decision
-is still waiting on a token. While consent is unknown no receipt exists to
-send: the receipt reports an explicit player decision, never the absence of
-one.
+Explicit decisions are reported to `POST {ingest_url}/v1/consent` and never
+ride the event envelope. Each decision becomes exactly one receipt —
+workspace/app/environment, the actor identifier, `categories{analytics}`, a
+`decided_at` stamp, an `idempotency_key`, and (forced-minor only) the
+`reason` — retained in the **durable consent-receipt outbox** (see below)
+until the server acknowledges it: receipts survive process death, re-send on
+later launches, and retry with backoff until delivered, in decision order.
+`shutdown` tears the client down while receipts are still pending only when
+they are safely on disk; otherwise it returns `false, "consent_pending"` so
+the host can retry. While consent is unknown no receipt exists to send: the
+receipt reports an explicit player decision, never the absence of one.
+
+**Receipt delivery is consent-plane traffic, not analytics.** A receipt is
+sent — and a retained receipt keeps retrying — even while analytics consent
+is denied (either flavor) or unknown: the receipt documents the decision
+itself, which is its legal purpose — it is what drives server-side
+per-actor suppression and erasure consent rows, so a denial that never
+reached the server would be a denial the backend could not honor. This is
+the one deliberate exception to "a non-granted state produces zero wire
+traffic", it carries no event payload, and an install with no explicit
+decision (an empty outbox) still transmits nothing.
 
 **Crash reporting is separate from analytics consent.** It is ON by default
 (no first-run decision needed) with a persisted per-app opt-out:
@@ -61,12 +87,12 @@ persisted opt-out record cannot be **read** (a storage error — as opposed to
 cleanly absent on a fresh install), the crash client **fails closed** and
 sends nothing until an explicit `set_enabled` decision is persisted again.
 
-- Durable storage is limited to five small, bounded records, all written
+- Durable storage is limited to six small, bounded records, all written
   through Defold `sys.save`: the identity record described above, a bounded
   crash-retry sidecar, the crash-reporting settings record (both described
-  below), the bounded offline event spool (described below), and the
-  remote-config cache (described below). No cookies and no other browser or
-  tracking storage.
+  below), the bounded offline event spool, the bounded consent-receipt
+  outbox (both described below), and the remote-config cache (described
+  below). No cookies and no other browser or tracking storage.
 - All persistence goes through Defold `sys.save` only; on HTML5 builds Defold
   backs `sys.save` with browser storage, still limited to those records.
 
@@ -115,6 +141,61 @@ by the service on the stable event id). This spool:
 - goes through Defold `sys.save` only (browser storage on HTML5); and
 - can be **disabled** with `spool_enabled = false` — disabling also deletes
   any previously persisted spool record at the next init.
+
+## Consent-receipt outbox
+
+Every explicit `set_consent` decision produces one consent receipt for
+`POST {ingest_url}/v1/consent`. Until the server acknowledges it, the receipt
+is retained in a small per-app durable outbox so an offline or crashed commit
+still produces a server-side consent record once connectivity returns. This
+outbox:
+
+- stores only **consent receipts** — the decision's category flags, the actor
+  identifier the decision was made under, the workspace/app/environment
+  scope, a `decided_at` timestamp, an `idempotency_key`, (for the
+  forced-minor state) the `reason`, and one piece of retention metadata that
+  never reaches the wire: the decision-time anonymous id snapshot; **never
+  event payloads and never tokens**;
+- is **consent-plane only, in both directions**: no analytics data ever
+  enters it, and — unlike the event spool — it is **never consent-purged**
+  and its delivery is permitted while analytics consent is denied or
+  unknown, because the receipt documents the decision itself (that is the
+  record's legal purpose: server-side per-actor suppression and erasure rows
+  act on it). An empty outbox produces zero traffic — an undecided install
+  stays fully dark;
+- delivers **serially, in decision order**, so the server applies the
+  decision trail exactly as the player produced it;
+- is **retried until acknowledged**: transient failures (offline, timeout,
+  `429`, `5xx`) keep the receipt and retry at init, on the update/flush
+  cadence, and at shutdown, honoring `Retry-After` and otherwise backing off
+  exponentially — deliberately **no TTL**. Permanent rejections are dropped
+  (surfaced through the `diagnostics` hook) so they cannot wedge the trail;
+- is **pruned on success** — an acknowledged receipt leaves the record
+  immediately; a re-send that raced an acknowledgment is de-duplicated
+  server-side on the receipt's `idempotency_key`;
+- is **bounded** (32 receipts, oldest evicted first — the newest decisions
+  are the operative ones) so it can never grow without limit;
+- is **fail-safe against corruption**: a malformed entry on disk is dropped
+  at load — never sent, never a crash, never a blocker for well-formed
+  receipts;
+- is **cleared on an identity change under Mode B auth** — like the event
+  spool, receipts whose decision-time anonymous id no longer matches the
+  client's are dropped at load (diagnosed as `identity_changed`) rather than
+  replayed into a guaranteed auth rejection that would wedge the trail;
+  Mode A re-sends historic-identity receipts unchanged;
+- **surfaces a failed durable append**: when the write fails while the
+  receipt is still undelivered, `set_consent` returns
+  `false, "consent_outbox_persist_failed"` (the decision itself applied and
+  delivery still proceeds and retries) — the write is retried at every
+  dispatch point, including `persist()` even with the event spool disabled;
+- is **per-app** (namespaced like the identity record) and goes through
+  Defold `sys.save` only (browser storage on HTML5), degrading to in-memory
+  retention for the process lifetime outside Defold — in that degraded mode
+  `shutdown()` keeps refusing to tear down (`consent_pending`) while a
+  receipt is undelivered, because nothing durable would survive the exit.
+  After teardown the client dispatches nothing: a receipt still in flight
+  settles its local bookkeeping, and the remaining durable receipts re-send
+  on the next launch instead of chaining more requests.
 
 ## Crash-retry sidecar
 
