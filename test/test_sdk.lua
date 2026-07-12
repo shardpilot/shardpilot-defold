@@ -3653,6 +3653,64 @@ local function test_set_consent_surfaces_receipt_persist_failure()
 	storage.reset()
 end
 
+-- A transient storage failure must never evict a receipt: a failed write
+-- FAILS the save (the caller keeps the receipt in its mirror, marked owed)
+-- instead of evicting toward an empty record whose write then "succeeds" —
+-- which would silently drop the receipt while reporting success. And when
+-- the dispatch path's immediate retry lands the owed write, set_consent
+-- reports success on the CURRENT durability state, not the first attempt.
+local function test_transient_outbox_save_failure_never_evicts()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local fail_next_outbox_write = true
+	local plain_save = sys.save
+	sys.save = function(path, record)
+		if fail_next_outbox_write and path:sub(-15) == "/consent-outbox" then
+			fail_next_outbox_write = false
+			return false
+		end
+		return plain_save(path, record)
+	end
+
+	-- storage level: the fail-then-succeed sequence must fail the save and
+	-- leave nothing evicted, not write an empty record and report the list
+	local entry = {
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "user-example",
+		categories = { analytics = false },
+		decided_at = "2026-07-12T00:00:00Z",
+		idempotency_key = "receipt-transient",
+	}
+	local saved = storage.save_consent_outbox(identity_scope, { entry })
+	assert_equal(saved, nil, "a failed write must fail the save, never evict toward success")
+	local record = stored_consent_outbox_record(stores)
+	assert_true(record == nil, "the failed write must not have produced an emptied record")
+	saved = storage.save_consent_outbox(identity_scope, { entry })
+	assert_equal(#saved, 1, "the retried save keeps the receipt")
+	assert_equal(saved[1].idempotency_key, "receipt-transient")
+
+	-- client level: a first-write failure healed by the dispatch path's
+	-- immediate retry is durable by the time set_consent returns — success,
+	-- with the receipt retained on disk for the 500-failed delivery
+	reset()
+	storage.reset()
+	fail_next_outbox_write = true
+	next_status = 500
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:set_consent(false),
+		"an append made durable by the in-call retry must not be reported as a failure")
+	assert_equal(client.consent_outbox_dirty, false)
+	assert_equal(#client.consent_outbox, 1, "the transiently failed delivery stays retained")
+	record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1, "the receipt is durable despite the first failed write")
+	restore()
+	storage.reset()
+end
+
 -- A receipt in flight when shutdown() tears the client down settles its own
 -- bookkeeping, but must NOT chain the next retained receipt onto the wire —
 -- the SDK is torn down; the remaining durable receipts re-send next launch.
@@ -3819,6 +3877,7 @@ local tests = {
 	test_rotation_blocked_while_prune_rewrite_owed,
 	test_outbox_identity_mismatch_dropped_mode_b_kept_mode_a,
 	test_set_consent_surfaces_receipt_persist_failure,
+	test_transient_outbox_save_failure_never_evicts,
 	test_no_receipt_chaining_after_shutdown,
 	test_supports_capability_discovery,
 }

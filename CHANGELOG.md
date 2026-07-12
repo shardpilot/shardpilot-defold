@@ -51,7 +51,11 @@
   - **Bounded, no TTL**: at most 32 receipts, oldest evicted first (the
     newest decisions are the operative ones; evictions of undelivered
     receipts are counted in `consent_outbox_evicted` and diagnosed as
-    `outbox_overflow`). There is deliberately no age limit — an undelivered
+    `outbox_overflow`). Only the cap evicts — a FAILED durable write never
+    does: it fails the save, the receipts stay in the in-memory mirror
+    (still delivering), and the write is retried at every dispatch point, so
+    a transient storage failure can never silently drop a receipt while
+    reporting success. There is deliberately no age limit — an undelivered
     receipt is retried until acknowledged. A malformed record on disk is
     fail-safe: garbled entries are dropped at load, never sent, never a
     crash, and never a blocker for the well-formed receipts around them.

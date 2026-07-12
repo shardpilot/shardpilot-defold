@@ -1035,28 +1035,26 @@ end
 
 -- Replace the persisted outbox with `receipts` (oldest first), enforcing the
 -- fixed entry cap by evicting the OLDEST entries first. Returns the list that
--- was actually persisted — possibly shorter than the input after eviction —
--- or nil when the durable write failed outright.
+-- was actually persisted — possibly shorter than the input after the cap
+-- eviction — or nil when the durable write failed. Unlike the event spool,
+-- a FAILED WRITE never evicts: receipts are consent records whose retention
+-- the caller must be able to trust, and at 32 small fixed-shape entries the
+-- record sits far under the save-file size limit — so a failing write means
+-- the backend is (transiently) unavailable, not that the record is too big.
+-- Evict-and-retry here could turn a transient fail-then-succeed into a
+-- successfully written EMPTY record, silently dropping a receipt while
+-- reporting success; failing the save keeps the receipt in the caller's
+-- mirror, marked owed and retried at every dispatch point.
 function M.save_consent_outbox(scope, receipts)
 	local ns = spool_namespace(scope)
 	local kept = sanitize_outbox_entries(receipts)
 	while #kept > max_consent_outbox_entries do
 		table.remove(kept, 1)
 	end
-	-- Receipts are small and fixed-shape, so the count cap alone keeps the
-	-- record far under the save-file size limit; should a write still fail,
-	-- evict oldest-first and retry — exactly like the event spool — until it
-	-- lands or nothing is left to save (then the backend itself is
-	-- unavailable).
-	while true do
-		if write_consent_outbox(ns, kept) then
-			return kept
-		end
-		if #kept == 0 then
-			return nil
-		end
-		table.remove(kept, 1)
+	if not write_consent_outbox(ns, kept) then
+		return nil
 	end
+	return kept
 end
 
 -- True when the outbox has a durable backend on this runtime (the save-file

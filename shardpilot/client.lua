@@ -1421,7 +1421,7 @@ function Client:send_consent_decision()
 	end
 	appended[#appended + 1] = payload
 	self.consent_outbox = appended
-	local durable = self:persist_consent_outbox()
+	self:persist_consent_outbox()
 	local attempted = self:try_send_consent_outbox()
 	if not attempted and not self.consent_send_in_flight then
 		-- Never dispatched: no usable token yet (e.g. an async Mode B mint
@@ -1431,13 +1431,17 @@ function Client:send_consent_decision()
 		self.stats.consent_failed = self.stats.consent_failed + 1
 		self.stats.last_consent_error = self.stats.last_error or "token_unavailable"
 	end
-	if durable then
+	-- Report on the CURRENT durability state, not the first write attempt:
+	-- the dispatch path retries an owed write, so an append whose first write
+	-- failed may already be durable by now. A failure is surfaced only when
+	-- the record is still owed (dirty) AND this receipt is still awaiting
+	-- delivery — a receipt the synchronous ack path already delivered and
+	-- pruned has nothing left to lose (delivery is always attempted: the
+	-- server-side record is the receipt's purpose; durability is the
+	-- backstop for process death).
+	if not self.consent_outbox_dirty then
 		return true
 	end
-	-- The durable append failed. Delivery was still attempted (the server-
-	-- side record is the receipt's purpose; durability is the backstop for
-	-- process death), so when the synchronous ack path already delivered and
-	-- pruned this receipt, nothing can be lost and no failure is surfaced.
 	for i = 1, #self.consent_outbox do
 		if self.consent_outbox[i].idempotency_key == payload.idempotency_key then
 			return false
