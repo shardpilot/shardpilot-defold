@@ -508,11 +508,21 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   and retry at every dispatch point (init/`update`/`flush`/`shutdown`) with
   `Retry-After`/backoff pacing, across launches, until delivered; permanent
   rejections (including a Mode A 401) are dropped and surfaced through the
-  `diagnostics` hook (`scope = "consent"`). Receipt delivery is
+  `diagnostics` hook (`scope = "consent"`). Under Mode B auth, receipts
+  retained under a previous anonymous id are dropped at load like the event
+  spool's `identity_changed` rule (each entry keeps a decision-time anon
+  snapshot as retention metadata, never sent on the wire) — a minted token
+  binds the current identity, so replaying them could only wedge the trail;
+  Mode A re-sends historic actors unchanged. Receipt delivery is
   **consent-plane traffic**: it stays permitted while analytics consent is
   denied or unknown — the receipt documents the decision itself — and the
-  outbox never carries analytics events. `shutdown()` completes over a
-  durably retained receipt (it re-sends next launch) and returns
+  outbox never carries analytics events. If the receipt's durable append
+  fails while it is still undelivered, `set_consent` returns
+  `false, "consent_outbox_persist_failed"` (the decision applied; delivery
+  still proceeds and the write retries automatically — including from
+  `persist()` even with the event spool disabled). `shutdown()` completes
+  over a durably retained receipt (it re-sends next launch — a receipt still
+  in flight at teardown never chains further requests) and returns
   `false, "consent_pending"` only when the receipt could not be durably
   captured — call it again once a token is available or storage recovers so
   the decision is not dropped at exit.

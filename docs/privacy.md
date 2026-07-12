@@ -152,9 +152,10 @@ outbox:
 
 - stores only **consent receipts** — the decision's category flags, the actor
   identifier the decision was made under, the workspace/app/environment
-  scope, a `decided_at` timestamp, an `idempotency_key`, and (for the
-  forced-minor state) the `reason`; **never event payloads and never
-  tokens**;
+  scope, a `decided_at` timestamp, an `idempotency_key`, (for the
+  forced-minor state) the `reason`, and one piece of retention metadata that
+  never reaches the wire: the decision-time anonymous id snapshot; **never
+  event payloads and never tokens**;
 - is **consent-plane only, in both directions**: no analytics data ever
   enters it, and — unlike the event spool — it is **never consent-purged**
   and its delivery is permitted while analytics consent is denied or
@@ -177,11 +178,24 @@ outbox:
 - is **fail-safe against corruption**: a malformed entry on disk is dropped
   at load — never sent, never a crash, never a blocker for well-formed
   receipts;
+- is **cleared on an identity change under Mode B auth** — like the event
+  spool, receipts whose decision-time anonymous id no longer matches the
+  client's are dropped at load (diagnosed as `identity_changed`) rather than
+  replayed into a guaranteed auth rejection that would wedge the trail;
+  Mode A re-sends historic-identity receipts unchanged;
+- **surfaces a failed durable append**: when the write fails while the
+  receipt is still undelivered, `set_consent` returns
+  `false, "consent_outbox_persist_failed"` (the decision itself applied and
+  delivery still proceeds and retries) — the write is retried at every
+  dispatch point, including `persist()` even with the event spool disabled;
 - is **per-app** (namespaced like the identity record) and goes through
   Defold `sys.save` only (browser storage on HTML5), degrading to in-memory
   retention for the process lifetime outside Defold — in that degraded mode
   `shutdown()` keeps refusing to tear down (`consent_pending`) while a
   receipt is undelivered, because nothing durable would survive the exit.
+  After teardown the client dispatches nothing: a receipt still in flight
+  settles its local bookkeeping, and the remaining durable receipts re-send
+  on the next launch instead of chaining more requests.
 
 ## Crash-retry sidecar
 

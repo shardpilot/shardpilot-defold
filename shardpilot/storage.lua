@@ -953,9 +953,12 @@ local function valid_receipt_field(value)
 end
 
 -- Keep only entries that are complete, well-formed receipts, copied down to
--- the known wire fields. Anything else — a corrupt file, a truncated entry, a
--- garbled field — is dropped rather than sent or crashed on: one bad record
--- on disk must never block (or ride along with) the deliverable rest.
+-- the known fields — the wire fields plus one piece of retention metadata,
+-- `anonymous_id` (the decision-time anon snapshot the client's Mode B
+-- identity check reads at load; the client strips it from the wire payload).
+-- Anything else — a corrupt file, a truncated entry, a garbled field — is
+-- dropped rather than sent or crashed on: one bad record on disk must never
+-- block (or ride along with) the deliverable rest.
 local function sanitize_outbox_entries(entries)
 	local out = {}
 	if type(entries) ~= "table" then
@@ -972,7 +975,8 @@ local function sanitize_outbox_entries(entries)
 			and valid_receipt_field(entry.decided_at)
 			and type(entry.categories) == "table"
 			and type(entry.categories.analytics) == "boolean"
-			and (entry.reason == nil or valid_receipt_field(entry.reason)) then
+			and (entry.reason == nil or valid_receipt_field(entry.reason))
+			and (entry.anonymous_id == nil or valid_receipt_field(entry.anonymous_id)) then
 			out[#out + 1] = {
 				idempotency_key = entry.idempotency_key,
 				workspace_id = entry.workspace_id,
@@ -982,6 +986,7 @@ local function sanitize_outbox_entries(entries)
 				decided_at = entry.decided_at,
 				categories = { analytics = entry.categories.analytics },
 				reason = entry.reason,
+				anonymous_id = entry.anonymous_id,
 			}
 		end
 	end

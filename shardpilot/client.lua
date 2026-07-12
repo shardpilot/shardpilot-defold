@@ -553,6 +553,37 @@ function M.new(config)
 	-- install nothing: an empty outbox returns before any token is minted, so
 	-- an undecided client stays fully dark.
 	client.consent_outbox = storage.load_consent_outbox(normalized)
+	if normalized.token_provider and #client.consent_outbox > 0 then
+		-- Mode B tokens are minted bound to the CURRENT anonymous ID.
+		-- Retained receipts carry their decision-time anon snapshot; after an
+		-- init-time anonymous_id override changed the identity, re-sending
+		-- one would pair the old actor with a token bound to the new anon and
+		-- be rejected on every retry — a wedged head that blocks the rest of
+		-- the trail forever. Drop them at load — deterministic, surfaced via
+		-- diagnostics — exactly like the event spool's identity_changed rule
+		-- above. Mode A has no token binding, so historic-identity receipts
+		-- re-send unchanged there (the historic actor is the correct subject
+		-- of those decisions).
+		local kept_receipts = {}
+		local mismatched_receipts = 0
+		for i = 1, #client.consent_outbox do
+			if client.consent_outbox[i].anonymous_id == client.anonymous_id then
+				kept_receipts[#kept_receipts + 1] = client.consent_outbox[i]
+			else
+				mismatched_receipts = mismatched_receipts + 1
+			end
+		end
+		if mismatched_receipts > 0 then
+			client.consent_outbox = kept_receipts
+			client:persist_consent_outbox()
+			client:diagnose({
+				scope = "consent",
+				status = "dropped",
+				code = "identity_changed",
+				count = mismatched_receipts,
+			})
+		end
+	end
 	client:try_send_consent_outbox()
 	return client
 end
@@ -796,7 +827,7 @@ function Client:set_consent(decision)
 		self.stats.consent_persist_failed = self.stats.consent_persist_failed + 1
 		self.stats.last_consent_error = "consent_persist_failed"
 	end
-	self:send_consent_decision()
+	local receipt_safe = self:send_consent_decision()
 	if not persisted then
 		-- The decision is applied in memory and reported to the wire, but
 		-- the durable write failed: surface it like track does (ok, err).
@@ -809,6 +840,16 @@ function Client:set_consent(decision)
 		-- set_consent(false) again retries it, and later dispatch points
 		-- keep retrying on their own.
 		return false, "spool_purge_failed"
+	end
+	if not receipt_safe then
+		-- The decision applied and persisted, and its receipt is queued and
+		-- delivering — but the receipt's durable append failed and delivery
+		-- has not yet acknowledged it: until the retried write (or the
+		-- delivery) lands, the receipt exists only in memory and a process
+		-- death would lose it. Surfaced so the host knows the offline-commit
+		-- durability guarantee is not yet in effect; the write itself is
+		-- retried automatically at every dispatch point.
+		return false, "consent_outbox_persist_failed"
 	end
 	return true
 end
@@ -1248,10 +1289,15 @@ end
 -- Receipts deliver serially, strictly in decision order (FIFO), so the
 -- server applies the decision trail exactly as the player produced it.
 
--- True while any consent receipt still awaits server acknowledgment
--- (including receipts reloaded from a previous launch).
+-- True while any consent-receipt state is still unsettled: a receipt awaiting
+-- server acknowledgment (including receipts reloaded from a previous launch),
+-- OR an owed durable rewrite. The dirty case matters even with an empty
+-- mirror — a failed post-delivery prune leaves the acknowledged receipt on
+-- disk, where the next launch reloads and re-sends it; a Mode B anon rotation
+-- must wait for that rewrite too, or the stale receipt would replay an old
+-- actor under a token minted for the new one.
 function Client:consent_outbox_pending()
-	return #self.consent_outbox > 0
+	return #self.consent_outbox > 0 or self.consent_outbox_dirty
 end
 
 -- Consent-receipt delivery paces its retries independently of the events
@@ -1341,7 +1387,11 @@ end
 
 -- Snapshot the decision into a receipt and enqueue it for durable, ordered
 -- delivery. Called from set_consent only — receipts exist for explicit
--- decisions, never for the undecided state.
+-- decisions, never for the undecided state. Returns true when this receipt
+-- needs no further durability guarantee — durably appended, or already
+-- acknowledged by a synchronous delivery — and false when it is still
+-- undelivered with the durable append owed (a process death would lose it);
+-- set_consent surfaces that as consent_outbox_persist_failed.
 function Client:send_consent_decision()
 	local payload = {
 		workspace_id = self.config.workspace_id,
@@ -1351,6 +1401,10 @@ function Client:send_consent_decision()
 		categories = { analytics = self.consent_state == "granted" },
 		decided_at = clock.iso_utc(),
 		idempotency_key = id.uuid_v7(),
+		-- Retention metadata, never sent on the wire: the decision-time
+		-- anonymous id, so a later Mode B launch whose identity changed can
+		-- recognize (and drop) a receipt its minted token could never send.
+		anonymous_id = self.anonymous_id,
 	}
 	if self.consent_state == "denied_forced_minor" then
 		-- AC-8: the receipt itself records that this denial was band-forced,
@@ -1367,7 +1421,7 @@ function Client:send_consent_decision()
 	end
 	appended[#appended + 1] = payload
 	self.consent_outbox = appended
-	self:persist_consent_outbox()
+	local durable = self:persist_consent_outbox()
 	local attempted = self:try_send_consent_outbox()
 	if not attempted and not self.consent_send_in_flight then
 		-- Never dispatched: no usable token yet (e.g. an async Mode B mint
@@ -1377,7 +1431,19 @@ function Client:send_consent_decision()
 		self.stats.consent_failed = self.stats.consent_failed + 1
 		self.stats.last_consent_error = self.stats.last_error or "token_unavailable"
 	end
-	return attempted
+	if durable then
+		return true
+	end
+	-- The durable append failed. Delivery was still attempted (the server-
+	-- side record is the receipt's purpose; durability is the backstop for
+	-- process death), so when the synchronous ack path already delivered and
+	-- pruned this receipt, nothing can be lost and no failure is surfaced.
+	for i = 1, #self.consent_outbox do
+		if self.consent_outbox[i].idempotency_key == payload.idempotency_key then
+			return false
+		end
+	end
+	return true
 end
 
 -- Deliver the outbox serially, oldest receipt first — one receipt in flight
@@ -1392,6 +1458,13 @@ end
 -- 401, whose static key cannot change — drop the receipt (surfaced through
 -- diagnostics) rather than wedging every receipt queued behind it.
 function Client:try_send_consent_outbox()
+	-- A torn-down client dispatches nothing: a late async ack from a receipt
+	-- that was in flight at shutdown() must not chain further /v1/consent
+	-- traffic after the host tore the SDK down — the remaining durable
+	-- receipts re-send at the next launch instead.
+	if not self.initialized then
+		return false
+	end
 	-- An owed durable write is retried on the same cadence as delivery.
 	self:retry_consent_outbox_persist()
 	local payload = self.consent_outbox[1]
@@ -1404,8 +1477,21 @@ function Client:try_send_consent_outbox()
 	if not self:can_publish() then
 		return false
 	end
+	-- The stored entry carries retention metadata (the decision-time
+	-- anonymous_id snapshot read by the Mode B identity check at load); the
+	-- wire payload is the receipt's contract fields only.
+	local wire = {
+		workspace_id = payload.workspace_id,
+		app_id = payload.app_id,
+		environment_id = payload.environment_id,
+		actor_identifier = payload.actor_identifier,
+		categories = payload.categories,
+		decided_at = payload.decided_at,
+		idempotency_key = payload.idempotency_key,
+		reason = payload.reason,
+	}
 	self.consent_send_in_flight = true
-	local dispatched = transport.send_consent(self.config, self.token, payload,
+	local dispatched = transport.send_consent(self.config, self.token, wire,
 		function(ok, err, unauthorized, retryable, _, retry_after)
 			self.consent_send_in_flight = false
 			if ok then
@@ -1697,14 +1783,16 @@ function Client:persist()
 	if not self.initialized then
 		return false, "shutdown"
 	end
+	-- An owed durable consent-outbox write shares the snapshot moment: persist
+	-- is the host's "the app may die now" signal, and the consent outbox is
+	-- independent of event spooling — so this retry runs BEFORE the
+	-- spool-disabled return below, or a spool-less configuration could never
+	-- recover a failed receipt write from its focus-loss listener.
+	-- Best-effort — the persist result stays about the EVENT snapshot.
+	self:retry_consent_outbox_persist()
 	if not self.config.spool_enabled then
 		return false, "spool_disabled"
 	end
-	-- An owed durable consent-outbox write shares the snapshot moment: persist
-	-- is the host's "the app may die now" signal, and the receipt record
-	-- should be as current as the event spool it sits beside. Best-effort —
-	-- the persist result stays about the EVENT snapshot.
-	self:retry_consent_outbox_persist()
 	-- A pending denied/disabled purge takes priority over any snapshot: retry
 	-- it, and report it while the spool stays fail-closed.
 	if self.spool_purge_pending and not self:retry_spool_purge() then

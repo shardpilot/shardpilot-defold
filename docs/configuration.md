@@ -184,9 +184,10 @@ the per-event status array and reports every `observed`, `duplicate`,
 non-2xx it reports the parsed error envelope (`error.code` plus per-field
 detail codes); when a permanent reject drops entries from the offline
 spool it reports `{ scope = "spool", status = "dropped", code, count }`; and
-when a consent receipt is dropped (a permanent rejection, or an overflow of
-the outbox cap) it reports `{ scope = "consent", status = "dropped", code }`
-(code `outbox_overflow` carries a `count`).
+when a consent receipt is dropped (a permanent rejection, an overflow of
+the outbox cap, or a Mode B identity change at load) it reports
+`{ scope = "consent", status = "dropped", code }` (codes `outbox_overflow`
+and `identity_changed` carry a `count`).
 Counts are also available on `snapshot()` (`accepted`,
 `rejected`, `duplicates`, `observed`, `suppressed`, `last_event_issue`, plus
 the spool counters `spooled`, `spool_resent`, `spool_evicted`,

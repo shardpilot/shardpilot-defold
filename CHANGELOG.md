@@ -27,7 +27,21 @@
   - **Terminal outcomes are pruned, not replayed forever**: a permanent `4xx`
     — including a Mode A 401, whose static publishable key cannot change —
     drops the receipt (surfaced through the `diagnostics` hook, scope
-    `consent`) so the receipts queued behind it still deliver.
+    `consent`) so the receipts queued behind it still deliver. Under Mode B
+    auth, receipts retained under a previous anonymous id are likewise
+    dropped at load (`identity_changed`, mirroring the event spool's rule):
+    each entry stores its decision-time anon snapshot as retention metadata
+    (never sent on the wire), and a token minted for the new identity could
+    only replay them into a guaranteed rejection that wedges the trail.
+    Mode A re-sends historic actors unchanged.
+  - **A failed durable append is surfaced, not silent**: while the receipt is
+    still undelivered without a durable copy, `set_consent` returns
+    `false, "consent_outbox_persist_failed"` — the decision itself applied
+    and delivery still proceeds; the write retries at every dispatch point,
+    including `persist()` even when the event spool is disabled
+    (`spool_enabled = false`), since the outbox is independent of event
+    spooling. A receipt already acknowledged by a synchronous delivery needs
+    no durability and reports success.
   - **The outbox is consent-plane ONLY**: it never carries event envelopes,
     and it is **never consent-purged** — unlike the offline event spool, it
     loads and delivers on denied and unknown launches alike, because a
@@ -43,10 +57,17 @@
     crash, and never a blocker for the well-formed receipts around them.
   - **`shutdown()` no longer waits on a durably retained receipt**: like the
     event spool, a receipt that is safely on disk re-sends on the next
-    launch, so teardown completes. The `false, "consent_pending"` contract
-    remains when the receipt could NOT be durably captured (no save-file API
-    on the host, or the durable write itself failing — tracked and retried
-    via `consent_outbox_persist_failed`).
+    launch, so teardown completes — and a receipt still in flight at
+    teardown settles its own bookkeeping without chaining further requests
+    (a torn-down client dispatches nothing). The
+    `false, "consent_pending"` contract remains when the receipt could NOT
+    be durably captured (no save-file API on the host, or the durable write
+    itself failing — tracked and retried via
+    `consent_outbox_persist_failed`), and an owed post-delivery prune
+    rewrite counts as pending too: a Mode B `set_anonymous_id` rotation
+    waits for it (`events_pending`), or the stale on-disk receipt would
+    reload at the next launch and replay an old actor under a token minted
+    for the new one.
   - New snapshot counters: `consent_outbox_evicted`,
     `consent_outbox_persist_failed`. Durable storage grows from five to
     **six** small bounded per-app records.

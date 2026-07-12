@@ -3240,6 +3240,9 @@ local function test_ac8_forced_minor_sole_request_is_the_receipt()
 	assert_contains(receipt.body, '"actor_identifier":"user-minor"')
 	assert_contains(receipt.body, '"idempotency_key":"')
 	assert_contains(receipt.body, '"decided_at":"')
+	-- the retention-metadata anon snapshot stored on the outbox entry never
+	-- reaches the wire
+	assert_not_contains(receipt.body, '"anonymous_id"')
 	for _, request in ipairs(requests) do
 		assert_not_contains(request.url, "/v1/events:batch")
 	end
@@ -3499,6 +3502,210 @@ local function test_malformed_consent_outbox_dropped_failsafe()
 	storage.reset()
 end
 
+-- A failed post-delivery prune keeps the acknowledged receipt on disk; until
+-- the retried rewrite lands, a Mode B anon rotation stays refused — a later
+-- launch would reload the stale receipt and replay the OLD actor under a
+-- token minted for the new anon.
+local function test_rotation_blocked_while_prune_rewrite_owed()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local outbox_writes = 0
+	local fail_from_second_write = true
+	local plain_save = sys.save
+	sys.save = function(path, record)
+		if path:sub(-15) == "/consent-outbox" then
+			outbox_writes = outbox_writes + 1
+			if fail_from_second_write and outbox_writes >= 2 then
+				return false
+			end
+		end
+		return plain_save(path, record)
+	end
+
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	-- enqueue write (1) succeeds; the delivery acks; the prune rewrite (2) fails
+	assert_true(client:set_consent(true), "a delivered receipt needs no durability error")
+	assert_equal(#client.consent_outbox, 0, "the ack removed the receipt from the mirror")
+	assert_equal(client.consent_outbox_dirty, true, "the failed prune stays owed")
+	assert_true(client:consent_outbox_pending(), "an owed prune rewrite counts as pending")
+
+	local ok, err = client:set_anonymous_id("anon-new")
+	assert_equal(ok, false)
+	assert_equal(err, "events_pending", "rotation must wait for the owed prune rewrite")
+
+	-- storage recovers: the next dispatch point lands the rewrite and
+	-- rotation proceeds
+	fail_from_second_write = false
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(client.consent_outbox_dirty, false)
+	assert_true(client:set_anonymous_id("anon-new"))
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 0, "the prune rewrite must land once storage recovers")
+	restore()
+	storage.reset()
+end
+
+-- Mode B tokens bind the CURRENT anonymous id, so receipts retained under a
+-- previous identity are dropped at load (diagnosed as identity_changed, like
+-- the event spool) instead of wedging the trail behind a guaranteed 401;
+-- Mode A has no token binding and re-sends the historic actor unchanged.
+local function test_outbox_identity_mismatch_dropped_mode_b_kept_mode_a()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+
+	-- Mode B: retain a receipt under the original anon, then relaunch with an
+	-- identity override
+	next_status = 500
+	local first = assert(sdk.new(config()))
+	assert_true(first:set_consent(false))
+	assert_equal(#first.consent_outbox, 1)
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(record.receipts[1].anonymous_id, first.anonymous_id,
+		"the entry must carry its decision-time anon snapshot")
+
+	reset()
+	next_status = 202
+	local issues = {}
+	local second = assert(sdk.new(config({
+		anonymous_id = "anon-override",
+		diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end,
+	})))
+	assert_equal(#second.consent_outbox, 0, "a mismatched receipt must be dropped at load")
+	assert_equal(#requests, 0, "a dropped receipt must not be dispatched")
+	assert_equal(issues[#issues].scope, "consent")
+	assert_equal(issues[#issues].code, "identity_changed")
+	record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 0, "the drop must be persisted")
+
+	-- Mode A: same retained-receipt situation re-sends the historic actor
+	reset()
+	storage.reset()
+	next_status = 500
+	local third = assert(sdk.new(config_mode_a()))
+	local historic_anon = third.anonymous_id
+	assert_true(third:set_consent(false))
+	assert_equal(#third.consent_outbox, 1)
+
+	reset()
+	next_status = 202
+	local fourth = assert(sdk.new(config_mode_a({ anonymous_id = "anon-override" })))
+	assert_equal(#requests, 1, "Mode A must re-send the retained receipt")
+	assert_contains(requests[1].body, '"actor_identifier":"' .. historic_anon .. '"')
+	assert_not_contains(requests[1].body, '"anonymous_id"')
+	assert_equal(fourth:snapshot().consent_recorded, 1)
+	restore()
+	storage.reset()
+end
+
+-- A failed durable append is SURFACED, not silent: set_consent returns
+-- false, "consent_outbox_persist_failed" while the undelivered receipt exists
+-- only in memory (delivery is still attempted — the server-side record is the
+-- point; durability is the process-death backstop). persist() retries the
+-- owed write even with the event spool disabled — the outbox is independent
+-- of event spooling.
+local function test_set_consent_surfaces_receipt_persist_failure()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local outbox_writes_fail = true
+	local plain_save = sys.save
+	sys.save = function(path, record)
+		if outbox_writes_fail and path:sub(-15) == "/consent-outbox" then
+			return false
+		end
+		return plain_save(path, record)
+	end
+
+	next_status = 500
+	local client = assert(sdk.new(config({ spool_enabled = false })))
+	assert_true(client:identify("user-example"))
+	local ok, err = client:set_consent(false)
+	assert_equal(ok, false)
+	assert_equal(err, "consent_outbox_persist_failed",
+		"an undelivered receipt without a durable copy must be surfaced")
+	assert_equal(client:snapshot().consent_outbox_persist_failed >= 1, true)
+	assert_equal(#client.consent_outbox, 1, "the receipt still delivers from memory")
+	assert_equal(client.consent_state, "denied", "the decision itself applied")
+
+	-- storage recovers; the focus-loss persist() retries the owed write even
+	-- though the event spool is disabled
+	outbox_writes_fail = false
+	local persist_ok, persist_err = client:persist()
+	assert_equal(persist_ok, false)
+	assert_equal(persist_err, "spool_disabled", "the persist result stays about the event snapshot")
+	assert_equal(client.consent_outbox_dirty, false, "persist() must retry the owed outbox write")
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1, "the retained receipt is durable after the retry")
+
+	-- and a delivery that acks synchronously needs no durability error even
+	-- while outbox writes fail
+	reset()
+	outbox_writes_fail = true
+	next_status = 202
+	assert_true(client:set_consent(true),
+		"a synchronously acknowledged receipt has nothing left to lose")
+	restore()
+	storage.reset()
+end
+
+-- A receipt in flight when shutdown() tears the client down settles its own
+-- bookkeeping, but must NOT chain the next retained receipt onto the wire —
+-- the SDK is torn down; the remaining durable receipts re-send next launch.
+local function test_no_receipt_chaining_after_shutdown()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local original_request = http.request
+	local callbacks = {}
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = {
+			url = url,
+			method = method,
+			headers = headers,
+			body = body,
+			options = options,
+		}
+		callbacks[#callbacks + 1] = callback
+	end
+
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:set_consent(false))
+	local ok = client:set_consent(true)
+	assert_true(ok, "the queued second receipt is durably retained")
+	assert_equal(#requests, 1, "the second receipt queues behind the in-flight first")
+	assert_equal(#client.consent_outbox, 2)
+
+	-- both receipts are safely on disk, so teardown completes over the
+	-- in-flight send
+	assert_true(client:shutdown("app_final"))
+	assert_equal(client.initialized, false)
+
+	-- the late ack settles the first receipt but must not dispatch the second
+	callbacks[1](nil, nil, { status = 202, response = "" })
+	assert_equal(#requests, 1, "no receipt may be dispatched after teardown")
+	assert_equal(client:snapshot().consent_recorded, 1)
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1, "the remaining receipt stays durably retained")
+
+	-- the next launch delivers it
+	reset()
+	callbacks = {}
+	http.request = original_request
+	next_status = 202
+	local second = assert(sdk.new(config()))
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"categories":{"analytics":true}')
+	assert_equal(second:snapshot().consent_recorded, 1)
+	restore()
+	storage.reset()
+end
+
 -- Capability discovery: a game feature-detects the new consent surface before
 -- init() and without version parsing; unknown names are false everywhere.
 local function test_supports_capability_discovery()
@@ -3609,6 +3816,10 @@ local tests = {
 	test_shutdown_completes_with_durable_outbox_and_next_launch_delivers,
 	test_consent_outbox_bounded_evicts_oldest,
 	test_malformed_consent_outbox_dropped_failsafe,
+	test_rotation_blocked_while_prune_rewrite_owed,
+	test_outbox_identity_mismatch_dropped_mode_b_kept_mode_a,
+	test_set_consent_surfaces_receipt_persist_failure,
+	test_no_receipt_chaining_after_shutdown,
 	test_supports_capability_discovery,
 }
 
