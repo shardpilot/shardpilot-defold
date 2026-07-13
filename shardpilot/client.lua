@@ -274,7 +274,9 @@ local function validate_config(config)
 	if not batch_size then
 		return nil, batch_size_err
 	end
-	local buffer_size, buffer_size_err = normalize_integer(config.buffer_size, 200, 1, nil, "invalid_buffer_size")
+	-- 1000 is the cross-SDK canonical default (SP-059): the Go, Unity, and
+	-- Unreal SDKs and the platform docs all use a 1000-event in-memory queue.
+	local buffer_size, buffer_size_err = normalize_integer(config.buffer_size, 1000, 1, nil, "invalid_buffer_size")
 	if not buffer_size then
 		return nil, buffer_size_err
 	end
