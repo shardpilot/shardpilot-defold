@@ -16,8 +16,8 @@ not the platform boundary.
   surface may change before v1 with no backward-compatibility guarantee.
 - **Pre-launch.** The production ingest domain is **not provisioned** yet — use
   local/develop endpoints for evaluation.
-- **Version `0.7.0`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.7.0` (not yet tagged;
+- **Version `0.8.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.8.0` (not yet tagged;
   the latest published tag is `v0.6.0`).
 
 ## What it does
@@ -180,7 +180,7 @@ Most methods return `ok, err` so callers can branch on failures (e.g.
 | `anonymous_id` | generated | UUIDv7 generated on first init if not provided |
 | `user_id` | `nil` | Initial known-user attribution |
 | `batch_size` | `25` | Flush trigger, 1–100 |
-| `buffer_size` | `200` | Max queued events (≥1) |
+| `buffer_size` | `1000` | Max queued events (≥1); cross-SDK canonical default |
 | `flush_interval_seconds` | `1` | Time-based flush trigger (>0) |
 | `publish_timeout_seconds` | `2` | Per-request timeout (>0) |
 | `token_refresh_lead_ms` | `60000` | Refresh lead before token expiry (≥0) |

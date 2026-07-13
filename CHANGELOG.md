@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.8.0 — 2026-07-13 — early alpha
+
+- **`buffer_size` default raised from `200` to `1000`** — the cross-SDK
+  canonical in-memory queue capacity (architecture-audit finding SP-059).
+  The Go, Unity, and Unreal SDKs and the platform docs all default the
+  bounded event queue to 1000; the Defold SDK now matches, so a burst that
+  used to drop at 200 queued events is retained like on every other
+  ShardPilot SDK. Explicitly configured `buffer_size` values are unaffected,
+  and the queue stays memory-only. The offline spool caps
+  (`spool_max_events = 500`, `spool_max_bytes = 262144`) are deliberately
+  NOT raised to the Unity/Unreal 2000/1 MiB values: Defold's save-file API
+  caps a persisted record at 512 KB, so the spool budget stays clamped at
+  384 KB max with the same ~524-bytes-per-event ratio the other SDKs use —
+  a documented per-platform adaptation, not drift. As before, a shutdown
+  remnant larger than the spool caps surfaces honestly (`spool_evicted`,
+  `shutdown()` returning `false` while undelivered events remain).
+
 ## v0.7.0 — 2026-07-11 — early alpha
 
 - **Durable consent-receipt outbox: receipts now survive process death and
