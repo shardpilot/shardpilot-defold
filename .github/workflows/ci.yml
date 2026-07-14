@@ -25,6 +25,9 @@ jobs:
       - name: Static library checks
         run: ./scripts/check_library.sh
 
+      - name: Version consistency
+        run: ./scripts/check_versions.sh
+
       - name: Install Lua 5.4
         run: |
           sudo apt-get update
