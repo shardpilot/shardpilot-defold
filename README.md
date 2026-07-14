@@ -17,8 +17,8 @@ not the platform boundary.
 - **Pre-launch.** The production ingest domain is **not provisioned** yet — use
   local/develop endpoints for evaluation.
 - **Version `0.8.0`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.8.0` (not yet tagged;
-  the latest published tag is `v0.6.0`).
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.8.0`, matching the
+  latest published tag, `v0.8.0`.
 
 ## What it does
 
@@ -80,10 +80,17 @@ not the platform boundary.
 include_dirs = shardpilot
 ```
 
-Because no release ZIP or tag is published yet, the supported path today is to
-vendor the `shardpilot/` directory into your project (or add this repo as a
-Defold dependency from a local archive). A hosted dependency URL will be
-documented once a release is published.
+The recommended path today is to vendor the `shardpilot/` directory into your
+project. Alternatively, pin the repo as a Defold library dependency to a
+published tag's source archive — the latest tag is `v0.8.0`:
+
+```ini
+[project]
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.8.0.zip
+```
+
+Note that no packaged release ZIP asset is attached to any GitHub Release yet —
+the tag source archive above is the only hosted dependency URL.
 
 Then require the module:
 
