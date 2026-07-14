@@ -79,6 +79,22 @@ the one deliberate exception to "a non-granted state produces zero wire
 traffic", it carries no event payload, and an install with no explicit
 decision (an empty outbox) still transmits nothing.
 
+**What the server accepts from a publishable key (Mode A).** The ingest
+service records **denial** receipts — `set_consent(false)` and the
+forced-minor `reason`-bearing denial alike — for the key's own
+workspace/app/environment scope. A **grant** receipt (`set_consent(true)`)
+posted with the publishable `api_key` is rejected `403` with the distinct
+detail code `consent_grant_requires_verified_credential` and, like every
+non-transient rejection, is terminally dropped from the outbox: a public
+key can safely deny its own actor's analytics but cannot vouch for a
+grant, so grants are recorded server-side only through a trusted backend
+credential. Consequence to plan for: once a denial is recorded
+server-side, a later SDK grant re-opens the **local** pipeline, but the
+server keeps suppressing that actor's events (`suppressed_no_consent`)
+until a trusted-path grant lands. Client-key consent writes also consume
+ingest budget whether accepted or rejected (deliberate anti-flood on a
+public credential).
+
 **Crash reporting is separate from analytics consent.** It is ON by default
 (no first-run decision needed) with a persisted per-app opt-out:
 `crash.set_enabled(false)` stops collection — not just sending — and is

@@ -26,7 +26,7 @@ crash.init({
   app_version      = "1.4.2",
   app_build        = "4201",
   crash_source     = "game-client",                  -- component slug (optional)
-  -- sample_every      = 10,  -- 1-in-N sampling for NON-fatal reports (fatal always sent)
+  -- sample_every      = 10,  -- every-Nth NON-fatal is sent (deterministic counter; fatal always sent)
   -- publish_timeout_seconds = 30,
   -- sampler = function(event) return true end,       -- custom NON-fatal sampler
   -- diagnostics = function(issue) ... end,            -- per-report failure hook
@@ -41,7 +41,7 @@ crash.init({
 | `app_version`, `app_build` | no | Defaulted onto every report. |
 | `platform` | no | Auto-detected from `sys.get_sys_info` (`ios`/`android`/`windows`/`macos`/`linux`/`web`). Set it explicitly when running outside Defold or on an unrecognized system; if it is neither configured nor auto-detectable, `crash.init` fails with `platform_required` rather than returning a client that can never send a report. |
 | `crash_source` | no | The component slug (see below). |
-| `sample_every` | no | 1-in-N sampling for **non-fatal** reports (default 10). Fatal reports are **never** sampled. |
+| `sample_every` | no | Every-Nth sampling for **non-fatal** reports (default 10): a deterministic per-process counter transmits calls N, 2N, 3N, … — the first N−1 non-fatals of a process are always dropped, so a process emitting fewer than N non-fatals in its lifetime reports none (set `1` to send every one). Fatal reports are **never** sampled. |
 | `publish_timeout_seconds` | no | Per-request timeout (default 30). |
 | `sampler` | no | A custom `function(event) -> boolean` for non-fatal reports. A fatal report bypasses it. |
 | `diagnostics` | no | A hook invoked with `{ scope, status, code, retryable, response }` when a report is rejected or unauthorized. |
@@ -110,7 +110,12 @@ dropped.
 
 A fatal crash is reported **every time**, regardless of `sample_every` or a
 custom `sampler` — `emit_fatal` (and the dump-forward path) bypass the sampler
-entirely. Only `emit` (non-fatal) is sampled.
+entirely. Only `emit` (non-fatal) is sampled, and the default sampler is
+**deterministic, not probabilistic**: a per-process counter transmits every
+Nth call (10th, 20th, … at the default), so the first N−1 non-fatals of any
+process are always dropped. A sampled-out `emit` looks exactly like a sent
+one at the call site; supply a custom `sampler` (e.g. `function() return
+true end`) to transmit every non-fatal.
 
 ## Opting out
 
