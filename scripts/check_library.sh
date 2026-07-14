@@ -40,6 +40,7 @@ required_files=(
   docs/privacy.md
   docs/release.md
   scripts/check_library.sh
+  scripts/check_versions.sh
   scripts/package_release.sh
   .github/workflows/ci.yml
 )
