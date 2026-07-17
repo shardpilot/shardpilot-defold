@@ -614,7 +614,7 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   requires the wire-contract line above). Run the guard after editing docs:
   ```bash
   ./scripts/check_library.sh
-  lua5.4 test/test_sdk.lua
+  lua5.1 test/test_sdk.lua
   ```
 
 ## Compatibility
@@ -624,9 +624,10 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   when `http.request` is absent.
 - **Lua runtime:** Defold's embedded runtime is LuaJIT / Lua 5.1-compatible;
   write SDK source against Lua 5.1 language features so it runs in-game.
-- **Test runner:** CI installs `lua5.4` only as the host interpreter for
-  `test/test_sdk.lua`; it is not the in-Defold runtime target, so avoid relying
-  on Lua 5.4-only syntax or APIs that would fail inside the engine.
+- **Test runner:** CI runs the test suite under `lua5.1` and `luajit` as the
+  gating interpreters (matching Defold's embedded runtime), plus `lua5.4` as an
+  extra host-only leg; when validating locally, run the tests under Lua 5.1 or
+  LuaJIT and avoid Lua 5.2+ syntax or APIs that would fail inside the engine.
 - **License:** Apache-2.0.
 
 ## Roadmap

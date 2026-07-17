@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Shell syntax
         run: bash -n scripts/*.sh
@@ -28,16 +28,37 @@ jobs:
       - name: Version consistency
         run: ./scripts/check_versions.sh
 
-      - name: Install Lua 5.4
+  # Defold embeds Lua 5.1 / LuaJIT, so those interpreters are the gating
+  # legs. Lua 5.4 stays as an extra host leg only to catch accidental
+  # reliance on 5.1-only quirks — it is NOT a runtime the SDK targets.
+  lua-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - interpreter: lua5.1
+            package: lua5.1
+          - interpreter: luajit
+            package: luajit
+          - interpreter: lua5.4
+            package: lua5.4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install ${{ matrix.interpreter }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y lua5.4
+          sudo apt-get install -y ${{ matrix.package }}
 
       - name: Lua tests
-        run: lua5.4 test/test_sdk.lua
+        run: ${{ matrix.interpreter }} test/test_sdk.lua
 
       - name: Lua crash tests
-        run: lua5.4 test/test_crash.lua
+        run: ${{ matrix.interpreter }} test/test_crash.lua
 
       - name: Lua remote-config tests
-        run: lua5.4 test/test_remote_config.lua
+        run: ${{ matrix.interpreter }} test/test_remote_config.lua
