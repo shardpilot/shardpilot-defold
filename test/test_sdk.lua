@@ -1955,6 +1955,35 @@ local function test_503_retry_after_defers_next_publish()
 	storage.reset()
 end
 
+-- Strict-consent receipt-lag hardening (audit 2026-07-18, item 3a): within one
+-- flush cycle the consent-receipt outbox is handed to the transport BEFORE the
+-- event batch, so a retained grant receipt is on the wire ahead of the first
+-- post-grant events. Sequencing only — the batch must not wait on the
+-- receipt's acknowledgment.
+local function test_flush_sends_consent_receipt_before_event_batch()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	-- The initial receipt dispatch fails retryably, so the receipt stays
+	-- retained at the outbox head while the local grant opens the pipeline.
+	next_status = 500
+	client:set_consent(true)
+	assert_equal(#requests, 1)
+	assert_true(requests[1].url:find("/v1/consent", 1, true) ~= nil, "the grant posts a receipt")
+	assert_true(client:track("post_grant_event"))
+
+	-- One flush drives both planes: the retained receipt re-sends first, the
+	-- event batch second — and the batch is dispatched in the SAME cycle (no
+	-- ack-gating deferral to a later flush).
+	next_status = 202
+	assert_true(client:flush())
+	assert_equal(#requests, 3)
+	assert_true(requests[2].url:find("/v1/consent", 1, true) ~= nil, "the retained receipt is dispatched first")
+	assert_true(requests[3].url:find("/v1/events:batch", 1, true) ~= nil, "the event batch follows in the same cycle")
+	storage.reset()
+end
+
 -- L1 §6: a successful publish clears any active backpressure deferral. A
 -- deferral whose deadline has already elapsed does not block the publish.
 local function test_successful_publish_clears_deferral()
@@ -3873,6 +3902,7 @@ local tests = {
 	test_batch_response_without_events_array_keeps_accepted,
 	test_retry_after_defers_next_publish,
 	test_503_retry_after_defers_next_publish,
+	test_flush_sends_consent_receipt_before_event_batch,
 	test_successful_publish_clears_deferral,
 	test_backoff_on_sustained_transient_failures,
 	test_error_envelope_is_surfaced,

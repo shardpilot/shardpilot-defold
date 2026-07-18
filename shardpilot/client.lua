@@ -1945,7 +1945,14 @@ function Client:flush(options)
 	self:retry_spool_purge()
 	self:retry_spool_rewrite()
 	-- Retained consent receipts (the durable outbox) ride the same dispatch
-	-- cadence as queued events; their outcome never affects the flush result.
+	-- cadence as queued events and are handed to the transport strictly
+	-- BEFORE this cycle's event batch; their outcome never affects the flush
+	-- result. The order is load-bearing on strict-enforce workspaces
+	-- (GAP-041): dispatching the receipt first shrinks the window in which a
+	-- post-grant batch reaches the server before the grant's /v1/consent row
+	-- exists and is terminally suppressed (per-event suppressed_no_consent).
+	-- Sequencing only — the batch never waits on the receipt's
+	-- acknowledgment.
 	self:try_send_consent_outbox()
 	if options.include_summaries ~= false then
 		self:enqueue_summaries()

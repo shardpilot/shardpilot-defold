@@ -13,6 +13,15 @@
   clamp) works exactly as it already did for 429, on both the events plane
   and the consent-receipt outbox. No behavior change for responses without
   the header.
+- **Receipt-before-batch flush ordering pinned** (audit item 3a). Within one
+  flush cycle the consent-receipt outbox was already handed to the transport
+  strictly before the event batch at every dispatch point
+  (init/update/flush/shutdown); this ordering is now documented as
+  load-bearing and pinned by a regression test. On a strict-enforce
+  workspace (GAP-041) it shrinks the window in which a post-grant batch
+  reaches the server before the grant's `/v1/consent` row exists and is
+  terminally suppressed. Sequencing only — the batch never waits on the
+  receipt's acknowledgment.
 
 - **`buffer_size` default raised from `200` to `1000`** — the cross-SDK
   canonical in-memory queue capacity (architecture-audit finding SP-059).
