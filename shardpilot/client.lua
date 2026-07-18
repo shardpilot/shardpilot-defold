@@ -1347,12 +1347,13 @@ function Client:grant_receipt_pending_dispatch()
 	for i = 1, #self.consent_outbox do
 		local receipt = self.consent_outbox[i]
 		if type(receipt.categories) == "table" and receipt.categories.analytics == true then
-			if i == 1 and self.consent_send_in_flight then
-				-- The grant itself is the receipt being handed over right
-				-- now: receipt-before-batch ordering is already secured.
-				return false
+			-- The head being handed over right now releases the gate only
+			-- for ITSELF: skip it and keep scanning, so a later grant queued
+			-- behind it (grant→deny→grant toggling before the first receipt
+			-- settles) still holds events until its own handoff.
+			if not (i == 1 and self.consent_send_in_flight) then
+				return true
 			end
-			return true
 		end
 	end
 	return false

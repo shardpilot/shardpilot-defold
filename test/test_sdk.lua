@@ -3642,6 +3642,60 @@ local function test_shutdown_completes_with_only_deferred_grant_receipt()
 	storage.reset()
 end
 
+-- Audit 3a follow-up (toggling): an in-flight head grant releases the gate
+-- only for itself. With grant→deny→grant queued before the first receipt
+-- settles, the LATER grant is still undispatched — events tracked under the
+-- second grant must wait until that receipt's own handoff, or they would
+-- overtake the deny+grant pair on the wire.
+local function test_toggled_grant_behind_in_flight_head_still_holds_events()
+	reset()
+	storage.reset()
+	local original_request = http.request
+	local callbacks = {}
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		callbacks[#callbacks + 1] = callback
+	end
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	client:set_consent(true) -- dispatched, in flight
+	assert_equal(#requests, 1)
+	client:set_consent(false) -- queued behind the in-flight head
+	client:set_consent(true) -- queued behind the deny
+	assert_equal(#requests, 1)
+	assert_true(client:track("post_toggle_event"))
+
+	-- The head grant is in flight, but the SECOND grant is undispatched:
+	-- the batch stays held.
+	local flushed, reason = client:flush()
+	assert_equal(flushed, false)
+	assert_equal(reason, "consent_receipt_pending")
+	assert_equal(#requests, 1, "no batch while the toggled grant awaits dispatch")
+
+	-- Head settles; the chained drain hands over the deny, then the grant.
+	callbacks[1](nil, nil, { status = 202, response = "{}" })
+	assert_equal(#requests, 2)
+	assert_contains(requests[2].body, '"analytics":false')
+	local mid_flushed, mid_reason = client:flush()
+	assert_equal(mid_flushed, false)
+	assert_equal(mid_reason, "consent_receipt_pending")
+	assert_equal(#requests, 2, "still held while the deny is in flight and the grant queued")
+	callbacks[2](nil, nil, { status = 202, response = "{}" })
+	assert_equal(#requests, 3)
+	assert_contains(requests[3].body, '"analytics":true')
+
+	-- The second grant is now in flight (unacknowledged): the batch follows.
+	local publish_flushed, publish_reason = client:flush()
+	assert_equal(publish_flushed, false)
+	assert_equal(publish_reason, "pending")
+	assert_equal(#requests, 4)
+	assert_true(requests[4].url:find("/v1/events:batch", 1, true) ~= nil, "the batch follows the dispatched second grant")
+	callbacks[3](nil, nil, { status = 202, response = "{}" })
+	callbacks[4](nil, nil, { status = 202, response = '{"accepted":1}' })
+	http.request = original_request
+	storage.reset()
+end
+
 -- Audit 3a follow-up (restart): a relaunch mid-window reloads the durable
 -- outbox but no deferral state — the gate needs none: the retained grant is
 -- handed to the transport at init, ahead of anything the fresh process can
@@ -4129,6 +4183,7 @@ local tests = {
 	test_shutdown_completes_with_only_deferred_grant_receipt,
 	test_grant_behind_deferred_head_receipt_holds_events,
 	test_grant_behind_head_holds_events_until_dispatched,
+	test_toggled_grant_behind_in_flight_head_still_holds_events,
 	test_restart_dispatches_retained_grant_before_first_batch,
 	test_successful_publish_clears_deferral,
 	test_backoff_on_sustained_transient_failures,
