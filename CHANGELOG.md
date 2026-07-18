@@ -27,10 +27,12 @@
   plane too, a `/v1/consent` 503 + `Retry-After` opens a receipt deferral
   window; publishing events inside it would invert the receipt-before-batch
   ordering for the whole window. The event-batch leg of flush now waits out
-  that window (only that window: the gate requires a retained analytics
-  GRANT at the outbox head AND a deferral whose provenance is the server's
-  explicit hint — the client's own jittered receipt backoff never holds
-  events, and the batch still never waits on a receipt acknowledgment).
+  that window (only that window: the gate requires an undelivered analytics
+  GRANT anywhere in the outbox AND a deferral whose provenance is the
+  server's explicit hint — the client's own jittered receipt backoff never
+  holds events, the batch still never waits on a receipt acknowledgment,
+  and an empty event pipeline is never gated, so a durably retained
+  deferred receipt alone cannot block shutdown teardown).
 
 ## v0.8.0 — 2026-07-13 — early alpha
 

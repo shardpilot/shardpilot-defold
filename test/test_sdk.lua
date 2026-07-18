@@ -2038,6 +2038,43 @@ local function test_grant_receipt_retry_after_defers_event_publish()
 	storage.reset()
 end
 
+-- Gate scoping: a grant queued BEHIND a server-deferred head receipt still
+-- holds events — the serial outbox cannot deliver the grant until the head's
+-- window elapses, so post-grant events would overtake it on a strict-enforce
+-- workspace.
+local function test_grant_behind_deferred_head_receipt_holds_events()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	-- The deny receipt fails retryably with a server hint: head deferred.
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "30" }
+	client:set_consent(false)
+	assert_equal(#requests, 1)
+	assert_true(client:consent_send_deferred(), "the head receipt is parked in the server window")
+	-- The user grants during the window: the grant queues behind the head.
+	client:set_consent(true)
+	assert_equal(#requests, 1, "the serial outbox cannot deliver the grant yet")
+	assert_true(client:track("post_grant_event"))
+
+	next_status = 202
+	next_response_headers = nil
+	local flushed, reason = client:flush()
+	assert_equal(flushed, false)
+	assert_equal(reason, "consent_receipt_deferred")
+	assert_equal(#requests, 1, "no event publish while the grant waits behind the deferred head")
+
+	-- After the window: deny, then grant, then the batch — in order.
+	client.consent_retry_after_ms = nil
+	assert_true(client:flush())
+	assert_equal(#requests, 4)
+	assert_true(requests[2].url:find("/v1/consent", 1, true) ~= nil, "the deny receipt goes first")
+	assert_true(requests[3].url:find("/v1/consent", 1, true) ~= nil, "the grant receipt follows")
+	assert_true(requests[4].url:find("/v1/events:batch", 1, true) ~= nil, "the batch goes last")
+	storage.reset()
+end
+
 -- L1 §6: a successful publish clears any active backpressure deferral. A
 -- deferral whose deadline has already elapsed does not block the publish.
 local function test_successful_publish_clears_deferral()
@@ -3522,6 +3559,33 @@ local function test_shutdown_completes_with_durable_outbox_and_next_launch_deliv
 	storage.reset()
 end
 
+-- Gate scoping (audit 3a follow-up): a durably retained grant receipt parked
+-- in a server-requested Retry-After window must NOT block teardown when there
+-- is nothing to publish — the receipt is safe on disk and re-sends at the
+-- next launch, exactly like any other durably retained receipt.
+local function test_shutdown_completes_with_only_deferred_grant_receipt()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "30" }
+	client:set_consent(true)
+	assert_equal(#requests, 1)
+	assert_true(client:consent_send_deferred(), "the receipt is parked in the server window")
+	-- No events queued: the deferred durable receipt alone must not hold
+	-- shutdown hostage for the window.
+	next_status = 202
+	next_response_headers = nil
+	assert_true(client:shutdown(), "a durably retained deferred receipt must not block teardown")
+	assert_equal(client.initialized, false)
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1, "the receipt survives teardown on disk")
+	restore()
+	storage.reset()
+end
+
 -- The outbox is bounded: storage evicts the OLDEST receipts beyond the fixed
 -- cap (32 — the newest decisions are the operative ones), and the client
 -- surfaces the eviction of a still-undelivered receipt via stats/diagnostics.
@@ -3958,6 +4022,8 @@ local tests = {
 	test_503_retry_after_defers_next_publish,
 	test_flush_sends_consent_receipt_before_event_batch,
 	test_grant_receipt_retry_after_defers_event_publish,
+	test_shutdown_completes_with_only_deferred_grant_receipt,
+	test_grant_behind_deferred_head_receipt_holds_events,
 	test_successful_publish_clears_deferral,
 	test_backoff_on_sustained_transient_failures,
 	test_error_envelope_is_surfaced,
