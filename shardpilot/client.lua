@@ -407,6 +407,7 @@ function M.new(config)
 		consent_outbox_dirty = false,
 		consent_send_in_flight = false,
 		consent_retry_after_ms = nil,
+		consent_deferred_by_server = false,
 		consent_backoff_attempt = 0,
 		spool_record = {},
 		spool_index = {},
@@ -1331,6 +1332,21 @@ function Client:consent_send_deferred()
 	return self.consent_retry_after_ms ~= nil and clock.unix_ms() < self.consent_retry_after_ms
 end
 
+-- True while the head of the durable outbox is a GRANT receipt sitting inside
+-- a SERVER-requested Retry-After window (/v1/consent answered 429/5xx with
+-- the header). Both scope limits matter: only an analytics grant inverts the
+-- receipt-before-batch ordering when events overtake it on a strict-enforce
+-- workspace, and only the server's explicit pacing hint — never the client's
+-- own jittered receipt backoff — may hold the events plane (see the gate in
+-- flush).
+function Client:grant_receipt_deferred()
+	if not self.consent_deferred_by_server or not self:consent_send_deferred() then
+		return false
+	end
+	local head = self.consent_outbox[1]
+	return head ~= nil and type(head.categories) == "table" and head.categories.analytics == true
+end
+
 -- Rewrite the durable outbox record from the in-memory mirror. On a failed
 -- write the mirror keeps ruling this process (retained receipts still
 -- deliver), the write is marked owed (consent_outbox_dirty) and retried at
@@ -1503,6 +1519,7 @@ function Client:try_send_consent_outbox()
 			if ok then
 				self.stats.consent_recorded = self.stats.consent_recorded + 1
 				self.consent_retry_after_ms = nil
+				self.consent_deferred_by_server = false
 				self.consent_backoff_attempt = 0
 				self:remove_consent_receipt(payload.idempotency_key)
 				-- Chain the next retained receipt immediately (bounded by the
@@ -1527,8 +1544,17 @@ function Client:try_send_consent_outbox()
 				if not unauthorized then
 					if retry_after and retry_after > 0 then
 						self:defer_consent(retry_after)
+						-- The active window is the SERVER's explicit pacing
+						-- hint: while it covers a retained grant receipt, the
+						-- events plane is held too (see
+						-- grant_receipt_deferred).
+						self.consent_deferred_by_server = true
 					else
 						self:defer_consent_backoff()
+						-- Provenance of the current window is now the
+						-- client's own jittered backoff, which never holds
+						-- the events plane.
+						self.consent_deferred_by_server = false
 					end
 				end
 				return
@@ -1963,6 +1989,20 @@ function Client:flush(options)
 			return false, "pending"
 		end
 		return true
+	end
+
+	-- Strict-enforce hardening (audit 3a follow-up): while the head of the
+	-- durable outbox is a retained GRANT receipt held inside a
+	-- server-requested Retry-After window, the event-batch leg of this flush
+	-- is held for the same window. Publishing meanwhile would invert the
+	-- receipt-before-batch ordering for the whole window and hand a
+	-- strict-enforce workspace post-grant events with no consent row to admit
+	-- them (terminal suppressed_no_consent). This honors the server's
+	-- explicit backpressure hint — it is NOT the rejected ack-gating variant:
+	-- the batch never waits on a receipt acknowledgment, and the client's own
+	-- jittered receipt backoff never holds events.
+	if self:grant_receipt_deferred() then
+		return false, "consent_receipt_deferred"
 	end
 
 	while true do

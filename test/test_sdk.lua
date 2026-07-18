@@ -1984,6 +1984,60 @@ local function test_flush_sends_consent_receipt_before_event_batch()
 	storage.reset()
 end
 
+-- Audit 3a follow-up: a GRANT receipt held inside a SERVER-requested
+-- Retry-After window (/v1/consent answered 5xx + Retry-After) holds the
+-- event-batch leg of flush for the same window — otherwise events would
+-- overtake the grant for the whole window and reach a strict-enforce
+-- workspace with no consent row to admit them. Scope limit: the client's own
+-- jittered receipt backoff never holds events.
+local function test_grant_receipt_retry_after_defers_event_publish()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "30" }
+	client:set_consent(true)
+	assert_equal(#requests, 1)
+	assert_true(client:consent_send_deferred(), "the consent plane honors the 5xx Retry-After")
+	assert_true(client:track("post_grant_event"))
+
+	-- The batch leg is held while the grant receipt sits in the window.
+	next_status = 202
+	next_response_headers = nil
+	local flushed, reason = client:flush()
+	assert_equal(flushed, false)
+	assert_equal(reason, "consent_receipt_deferred")
+	assert_equal(#requests, 1, "no event publish while the grant receipt is deferred")
+
+	-- Once the window passes, ONE flush cycle sends receipt then batch.
+	client.consent_retry_after_ms = nil
+	assert_true(client:flush())
+	assert_equal(#requests, 3)
+	assert_true(requests[2].url:find("/v1/consent", 1, true) ~= nil, "the retained receipt goes first")
+	assert_true(requests[3].url:find("/v1/events:batch", 1, true) ~= nil, "the batch follows in the same cycle")
+
+	-- Scoping: a grant receipt deferred by the client's own jittered backoff
+	-- (no server hint) does NOT hold events.
+	reset()
+	storage.reset()
+	local scoped = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(scoped:identify("user-example"))
+	next_status = 500
+	scoped:set_consent(true) -- first failure: receipt retained, no deferral
+	assert_equal(#requests, 1)
+	assert_true(scoped:track("backoff_scoped_event"))
+	-- Later consecutive failures open a jittered window; simulate directly.
+	scoped:defer_consent_backoff()
+	scoped:defer_consent_backoff()
+	assert_true(scoped:consent_send_deferred(), "a jittered receipt window is open")
+	next_status = 202
+	assert_true(scoped:flush())
+	assert_equal(#requests, 2, "events still flow during client-side receipt backoff")
+	assert_true(requests[2].url:find("/v1/events:batch", 1, true) ~= nil)
+	storage.reset()
+end
+
 -- L1 §6: a successful publish clears any active backpressure deferral. A
 -- deferral whose deadline has already elapsed does not block the publish.
 local function test_successful_publish_clears_deferral()
@@ -3903,6 +3957,7 @@ local tests = {
 	test_retry_after_defers_next_publish,
 	test_503_retry_after_defers_next_publish,
 	test_flush_sends_consent_receipt_before_event_batch,
+	test_grant_receipt_retry_after_defers_event_publish,
 	test_successful_publish_clears_deferral,
 	test_backoff_on_sustained_transient_failures,
 	test_error_envelope_is_surfaced,
