@@ -21,6 +21,12 @@ local capabilities = {
 	-- set_consent accepts the "denied_forced_minor" decision (an age-gate-
 	-- forced denial whose receipt records reason = "denied_forced_minor").
 	consent_state_denied_forced_minor = true,
+	-- Every events:batch request declares the SDK's schema-set revision in
+	-- the X-ShardPilot-Schema-Revision request header, and the config knob
+	-- `schema_revision` exists (a string overrides the declared value;
+	-- `false` or `""` stops declaring). Detectable here because a config
+	-- field unknown to an older SDK would be silently ignored.
+	schema_revision_declaration = true,
 }
 
 function M.supports(capability)

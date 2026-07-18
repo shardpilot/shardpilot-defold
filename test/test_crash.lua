@@ -409,6 +409,10 @@ local function test_routes_to_dedicated_crash_endpoint()
 	assert_equal(request.method, "POST")
 	assert_equal(request.headers["Authorization"], "Bearer sp_crash_write_key")
 	assert_equal(request.headers["Content-Type"], "application/json")
+	-- The schema-revision declaration (GAP-036) belongs to events:batch
+	-- ingest only; the crash route must never carry it.
+	assert_equal(request.headers["X-ShardPilot-Schema-Revision"], nil,
+		"the crash route must not carry the schema-revision header")
 	assert_equal(request.options.timeout, 5)
 	-- Crash report JSON body, NOT a mobile_crash analytics event.
 	assert_contains(request.body, '"crash_id":')

@@ -195,6 +195,7 @@ json = {
 local sdk = require "shardpilot.sdk"
 local sampling = require "shardpilot.sampling"
 local platform = require "shardpilot.platform"
+local schema_revision = require "shardpilot.schema_revision"
 local storage = require "shardpilot.storage"
 
 local function assert_true(value, message)
@@ -319,6 +320,9 @@ local function test_config_validation()
 		{ { spool_max_events = 1.5 }, "invalid_spool_max_events" },
 		{ { spool_max_bytes = 512 }, "invalid_spool_max_bytes" },
 		{ { spool_max_bytes = 1000000 }, "invalid_spool_max_bytes" },
+		{ { schema_revision = 42 }, "invalid_schema_revision" },
+		{ { schema_revision = true }, "invalid_schema_revision" },
+		{ { schema_revision = {} }, "invalid_schema_revision" },
 	}
 	for _, entry in ipairs(invalid_cases) do
 		client, err = sdk.new(config(entry[1]))
@@ -348,6 +352,8 @@ local function test_config_validation()
 	assert_equal(client.config.spool_enabled, true)
 	assert_equal(client.config.spool_max_events, 500)
 	assert_equal(client.config.spool_max_bytes, 262144)
+	-- Default: declare the SDK's built-in schema-set revision on batch ingest.
+	assert_equal(client.config.schema_revision, schema_revision.REVISION)
 
 	-- Dual-mode auth: exactly one of token_provider / api_key.
 	-- Neither configured -> auth_required.
@@ -4109,9 +4115,175 @@ end
 
 -- Capability discovery: a game feature-detects the new consent surface before
 -- init() and without version parsing; unknown names are false everywhere.
+-- GAP-036 schema-revision handshake, emission side: every events:batch
+-- request declares the SDK's schema-set revision in the
+-- X-ShardPilot-Schema-Revision request header — and ONLY the batch route.
+-- The consent route shares the same transport dispatch and must stay
+-- header-free (the crash and remote-config routes use their own transports,
+-- pinned header-free in their own suites). The declaration is a header,
+-- never a body field: the ingest body is strict-decoded server-side and an
+-- unknown field would 400 the whole batch.
+local function test_schema_revision_header_on_batch_only()
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config()))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("play_cta_click"))
+	assert_true(client:flush({ include_summaries = false }))
+	assert_equal(#requests, 1)
+	local batch = requests[1]
+	assert_equal(batch.url, "http://localhost:8080/v1/events:batch")
+	-- The exact provisioned value: "sha256:" + the 64-hex digest of the
+	-- analytics-service schema set this SDK build was provisioned against
+	-- (a public content identity, re-synced when the schema set changes).
+	assert_equal(batch.headers["X-ShardPilot-Schema-Revision"], schema_revision.REVISION)
+	assert_equal(schema_revision.REVISION,
+		"sha256:e1ba01d4b76b9e73444e2edd5639281929fd89496cadc1dcc79eb68208c6a0a0")
+	assert_true(schema_revision.REVISION:match("^sha256:[0-9a-f]+$") ~= nil,
+		"the built-in revision must be sha256: plus lowercase hex")
+	assert_equal(#schema_revision.REVISION, 71)
+	assert_not_contains(batch.body, "schema_revision")
+	assert_not_contains(batch.body, "X-ShardPilot-Schema-Revision")
+
+	-- The consent route rides the same dispatch and must NOT declare.
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 2)
+	local consent = requests[2]
+	assert_contains(consent.url, "/v1/consent")
+	assert_equal(consent.headers["X-ShardPilot-Schema-Revision"], nil,
+		"the consent route must not carry the schema-revision header")
+	assert_equal(consent.headers["Authorization"], "Bearer client-token-placeholder")
+	storage.reset()
+end
+
+-- Config knob: a non-empty string overrides the declared value; false or ""
+-- stops declaring entirely (the server treats an undeclared batch as
+-- always-passing, so disabling is the no-rebuild escape hatch).
+local function test_schema_revision_override_and_disable()
+	reset()
+	storage.reset()
+	seed_granted_consent()
+
+	-- Override: a custom declared value (assembled, not a real digest).
+	local override = "sha256:" .. string.rep("ab", 32)
+	local client = assert(sdk.new(config({ schema_revision = override })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("boot"))
+	assert_true(client:flush({ include_summaries = false }))
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].headers["X-ShardPilot-Schema-Revision"], override)
+
+	-- Disable via false: no header on the batch at all.
+	reset()
+	local silent = assert(sdk.new(config({ schema_revision = false })))
+	assert_equal(silent.config.schema_revision, nil)
+	assert_true(silent:identify("user-example"))
+	assert_true(silent:track("boot"))
+	assert_true(silent:flush({ include_summaries = false }))
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].headers["X-ShardPilot-Schema-Revision"], nil,
+		"schema_revision = false must stop declaring")
+
+	-- Disable via empty string: the same escape hatch.
+	reset()
+	local empty = assert(sdk.new(config({ schema_revision = "" })))
+	assert_equal(empty.config.schema_revision, nil)
+	assert_true(empty:identify("user-example"))
+	assert_true(empty:track("boot"))
+	assert_true(empty:flush({ include_summaries = false }))
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].headers["X-ShardPilot-Schema-Revision"], nil,
+		'schema_revision = "" must stop declaring')
+	storage.reset()
+end
+
+-- GAP-036, response side: a 409 whose error.code is
+-- "schema_revision_mismatch" is TERMINAL for the batch — the server sends no
+-- Retry-After and a retry from the same build can never succeed. The batch
+-- must ride the existing terminal-failure path (dropped; never retained,
+-- deferred, or spooled) with a clear log line naming the declared and served
+-- revisions. Discrimination is by error.code, never the bare 409 status:
+-- another 409 code takes the same terminal transport path without the
+-- schema-revision log line.
+local function test_schema_revision_mismatch_409_is_terminal()
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local served = "sha256:" .. string.rep("cd", 32)
+	local issues = {}
+	next_status = 409
+	next_response_body = '{"error":{"code":"schema_revision_mismatch",'
+		.. '"message":"the declared schema revision does not match the schema revision this ingest-api serves",'
+		.. '"details":[{"field":"X-ShardPilot-Schema-Revision","code":"schema_revision_mismatch"}]}}'
+	next_response_headers = { ["x-shardpilot-schema-revision"] = served }
+	local client = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("boot"))
+	local logged = {}
+	local function capture_print(...)
+		local parts = {}
+		for i = 1, select("#", ...) do
+			parts[#parts + 1] = tostring((select(i, ...)))
+		end
+		logged[#logged + 1] = table.concat(parts, "\t")
+	end
+	local real_print = print
+	print = capture_print
+	local ok = client:flush({ include_summaries = false })
+	print = real_print
+	assert_equal(ok, false)
+	assert_equal(#requests, 1, "a schema-revision 409 must never trigger an immediate retry")
+	assert_equal(client:snapshot().last_error, "http_409:schema_revision_mismatch")
+	-- Terminal: dropped, not retained for retry, no deferral or backoff.
+	assert_equal(client.in_flight_batch, nil)
+	assert_equal(client.publish_retry_after_ms, nil)
+	assert_equal(client.publish_backoff_attempt, 0)
+	assert_equal(client:snapshot().dropped, 1)
+	-- Never spooled: a terminal reject must not re-send on a later launch.
+	assert_equal(#client.spool_record, 0)
+	-- Surfaced through diagnostics like every batch-level rejection.
+	assert_equal(#issues, 1)
+	assert_equal(issues[1].scope, "batch")
+	assert_equal(issues[1].code, "schema_revision_mismatch")
+	-- The log line names both revisions and the fix.
+	assert_equal(#logged, 1)
+	assert_contains(logged[1], "schema revision mismatch")
+	assert_contains(logged[1], schema_revision.REVISION)
+	assert_contains(logged[1], served)
+	assert_contains(logged[1], "schema_revision = false")
+	-- The pipeline is not wedged: a fresh batch publishes immediately.
+	reset()
+	assert_true(client:track("after"))
+	assert_true(client:flush({ include_summaries = false }))
+	assert_equal(#requests, 1)
+
+	-- A DIFFERENT 409 code: same terminal transport handling, no
+	-- schema-revision log line.
+	reset()
+	next_status = 409
+	next_response_body = '{"error":{"code":"workspace_override_conflict","message":"conflict"}}'
+	assert_true(client:track("other"))
+	logged = {}
+	print = capture_print
+	local other_ok = client:flush({ include_summaries = false })
+	print = real_print
+	assert_equal(other_ok, false)
+	assert_equal(client:snapshot().last_error, "http_409:workspace_override_conflict")
+	assert_equal(client.in_flight_batch, nil)
+	assert_equal(#logged, 0, "only schema_revision_mismatch produces the schema log line")
+	storage.reset()
+end
+
 local function test_supports_capability_discovery()
 	assert_equal(sdk.supports("consent_receipt_outbox"), true)
 	assert_equal(sdk.supports("consent_state_denied_forced_minor"), true)
+	assert_equal(sdk.supports("schema_revision_declaration"), true)
 	assert_equal(sdk.supports("time_travel"), false)
 	assert_equal(sdk.supports(nil), false)
 	assert_equal(sdk.supports(42), false)
@@ -4230,6 +4402,9 @@ local tests = {
 	test_set_consent_surfaces_receipt_persist_failure,
 	test_transient_outbox_save_failure_never_evicts,
 	test_no_receipt_chaining_after_shutdown,
+	test_schema_revision_header_on_batch_only,
+	test_schema_revision_override_and_disable,
+	test_schema_revision_mismatch_409_is_terminal,
 	test_supports_capability_discovery,
 }
 

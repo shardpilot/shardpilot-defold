@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.9.0 — 2026-07-18 — early alpha
+
+- **Batch ingest now declares the SDK's schema-set revision** (GAP-036,
+  client half of the analytics-service schema-revision handshake). Every
+  `POST {ingest_url}/v1/events:batch` request carries an
+  `X-ShardPilot-Schema-Revision` request header with the revision of the
+  analytics-service envelope-schema set this SDK build was provisioned
+  against (new module `shardpilot/schema_revision.lua`; the value is a
+  public content digest of the service's embedded schema files — not a
+  secret — and is re-synced whenever the service's schema set changes).
+  The header rides ONLY the events-batch route: the consent, crash, and
+  remote-config requests never carry it, and it rides only on batches that
+  already passed the consent gate (consent-first semantics unchanged).
+  While the server-side handshake mode is `off` (today's default in every
+  environment) the header is provably ignored, so emission is inert until
+  the service arms `log`/`enforce`. New config knob `schema_revision`:
+  default (nil) declares the built-in revision, a non-empty string
+  overrides the declared value, `false` or `""` stops declaring — an
+  undeclared batch always passes the server's check, in every mode.
+  Feature-detect with `shardpilot.supports("schema_revision_declaration")`.
+- **`schema_revision_mismatch` 409s are terminal for the batch.** When an
+  armed (`enforce`) ingest service rejects a batch with a `409` whose
+  `error.code` is `"schema_revision_mismatch"`, the batch takes the
+  existing terminal-failure path — dropped, never retried (the server
+  sends no `Retry-After`; a retry from the same build can never succeed),
+  never retained or spooled for a later launch — and a clear log line
+  names the declared revision, the revision the service serves (read from
+  the response header when present), and the fix (re-sync the constant or
+  set `schema_revision = false`). Discrimination is by `error.code`, never
+  by the bare `409` status: the other ingest 409 codes keep their existing
+  handling.
+
 ## v0.8.1 — 2026-07-18 — early alpha
 
 - **`Retry-After` is now honored on 5xx responses, not only 429** (SDK

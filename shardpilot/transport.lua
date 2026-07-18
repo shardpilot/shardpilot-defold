@@ -1,3 +1,5 @@
+local schema_revision = require "shardpilot.schema_revision"
+
 local M = {}
 
 local function trim_slash(value)
@@ -53,6 +55,19 @@ local function dispatch(config, token, route, payload, callback)
 		["Content-Type"] = "application/json",
 		["Authorization"] = "Bearer " .. token,
 	}
+	-- Schema-revision handshake (GAP-036): declare the schema-set revision
+	-- the SDK was built against, on the events-batch route ONLY. `dispatch`
+	-- is shared with the consent route, and the handshake is defined for
+	-- batch ingest alone — /v1/consent (and the separate crash and
+	-- remote-config transports) must never carry the header. The value is
+	-- resolved by the client config: the built-in constant by default, an
+	-- override string, or nil when declaring is disabled. Always a request
+	-- HEADER, never a body field — the ingest body is strict-decoded
+	-- server-side and an unknown field would fail the whole batch.
+	if route == "/v1/events:batch" and type(config.schema_revision) == "string"
+		and config.schema_revision ~= "" then
+		headers[schema_revision.HEADER] = config.schema_revision
+	end
 	local options = {
 		timeout = config.publish_timeout_seconds,
 	}
