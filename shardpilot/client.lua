@@ -407,7 +407,6 @@ function M.new(config)
 		consent_outbox_dirty = false,
 		consent_send_in_flight = false,
 		consent_retry_after_ms = nil,
-		consent_deferred_by_server = false,
 		consent_backoff_attempt = 0,
 		spool_record = {},
 		spool_index = {},
@@ -1332,22 +1331,27 @@ function Client:consent_send_deferred()
 	return self.consent_retry_after_ms ~= nil and clock.unix_ms() < self.consent_retry_after_ms
 end
 
--- True while the durable outbox holds an undelivered GRANT receipt and the
--- (serial, in-order) delivery is parked inside a SERVER-requested Retry-After
--- window (/v1/consent answered 429/5xx with the header). The grant may sit
--- ANYWHERE in the outbox, not only at the head: a grant made during a window
--- opened by an earlier receipt queues behind it, and events published
--- meanwhile would still overtake that grant on a strict-enforce workspace.
--- The other scope limit stays: only the server's explicit pacing hint —
--- never the client's own jittered receipt backoff — may hold the events
--- plane (see the gate in flush).
-function Client:grant_receipt_deferred()
-	if not self.consent_deferred_by_server or not self:consent_send_deferred() then
-		return false
-	end
+-- True while the durable outbox retains an analytics GRANT receipt that has
+-- NOT yet been handed to the transport. Delivery is serial and in decision
+-- order, so the only receipt that can have been handed over is the head
+-- currently in flight — a grant anywhere else (parked behind a deferral or
+-- backoff window, queued behind another receipt, or simply not yet
+-- dispatched, e.g. right after a relaunch that reloaded the durable outbox)
+-- is still awaiting its handoff, and an event batch dispatched meanwhile
+-- would overtake it on the wire: on a strict-enforce workspace those
+-- post-grant events reach the server before the grant row exists and are
+-- terminally suppressed. The condition is DISPATCH, never acknowledgment: a
+-- grant in flight (handed to the transport, response pending) does not hold
+-- events — its request already precedes any batch dispatched after it.
+function Client:grant_receipt_pending_dispatch()
 	for i = 1, #self.consent_outbox do
 		local receipt = self.consent_outbox[i]
 		if type(receipt.categories) == "table" and receipt.categories.analytics == true then
+			if i == 1 and self.consent_send_in_flight then
+				-- The grant itself is the receipt being handed over right
+				-- now: receipt-before-batch ordering is already secured.
+				return false
+			end
 			return true
 		end
 	end
@@ -1526,7 +1530,6 @@ function Client:try_send_consent_outbox()
 			if ok then
 				self.stats.consent_recorded = self.stats.consent_recorded + 1
 				self.consent_retry_after_ms = nil
-				self.consent_deferred_by_server = false
 				self.consent_backoff_attempt = 0
 				self:remove_consent_receipt(payload.idempotency_key)
 				-- Chain the next retained receipt immediately (bounded by the
@@ -1551,17 +1554,8 @@ function Client:try_send_consent_outbox()
 				if not unauthorized then
 					if retry_after and retry_after > 0 then
 						self:defer_consent(retry_after)
-						-- The active window is the SERVER's explicit pacing
-						-- hint: while it covers a retained grant receipt, the
-						-- events plane is held too (see
-						-- grant_receipt_deferred).
-						self.consent_deferred_by_server = true
 					else
 						self:defer_consent_backoff()
-						-- Provenance of the current window is now the
-						-- client's own jittered backoff, which never holds
-						-- the events plane.
-						self.consent_deferred_by_server = false
 					end
 				end
 				return
@@ -1998,22 +1992,24 @@ function Client:flush(options)
 		return true
 	end
 
-	-- Strict-enforce hardening (audit 3a follow-up): while the durable outbox
-	-- retains an undelivered GRANT receipt parked inside a server-requested
-	-- Retry-After window, the event-batch leg of this flush is held for the
-	-- same window. Publishing meanwhile would invert the receipt-before-batch
-	-- ordering for the whole window and hand a strict-enforce workspace
+	-- Strict-enforce hardening (audit 3a follow-up): the event-batch leg of
+	-- this flush is held while the outbox retains an analytics GRANT receipt
+	-- that has not yet been HANDED TO THE TRANSPORT (the dispatch above may
+	-- have started only the head, and http.request is asynchronous — a grant
+	-- parked behind a deferral/backoff window, queued behind another
+	-- receipt, or awaiting its first post-relaunch dispatch has not been
+	-- handed over yet). Publishing meanwhile would invert the
+	-- receipt-before-batch ordering and hand a strict-enforce workspace
 	-- post-grant events with no consent row to admit them (terminal
-	-- suppressed_no_consent). This honors the server's explicit backpressure
-	-- hint — it is NOT the rejected ack-gating variant: the batch never waits
-	-- on a receipt acknowledgment, and the client's own jittered receipt
-	-- backoff never holds events. The gate only fires when there ARE events
-	-- to hold: an empty pipeline must keep returning success so a
-	-- durably-retained deferred receipt alone never blocks teardown
+	-- suppressed_no_consent). The condition is dispatch, NOT acknowledgment
+	-- (the rejected ack-gating variant): a grant in flight releases the gate
+	-- with its response still pending. The gate only fires when there ARE
+	-- events to hold: an empty pipeline must keep returning success so a
+	-- durably-retained undispatched receipt alone never blocks teardown
 	-- (shutdown's outbox-durability contract).
-	if self:grant_receipt_deferred()
+	if self:grant_receipt_pending_dispatch()
 		and (self.in_flight_batch ~= nil or queue.size(self.queue) > 0 or self:spool_pending()) then
-		return false, "consent_receipt_deferred"
+		return false, "consent_receipt_pending"
 	end
 
 	while true do

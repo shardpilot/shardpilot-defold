@@ -22,17 +22,19 @@
   reaches the server before the grant's `/v1/consent` row exists and is
   terminally suppressed. Sequencing only — the batch never waits on the
   receipt's acknowledgment.
-- **Event batches are held while a grant receipt sits in a server-requested
-  Retry-After window.** With 5xx Retry-After now honored on the consent
-  plane too, a `/v1/consent` 503 + `Retry-After` opens a receipt deferral
-  window; publishing events inside it would invert the receipt-before-batch
-  ordering for the whole window. The event-batch leg of flush now waits out
-  that window (only that window: the gate requires an undelivered analytics
-  GRANT anywhere in the outbox AND a deferral whose provenance is the
-  server's explicit hint — the client's own jittered receipt backoff never
-  holds events, the batch still never waits on a receipt acknowledgment,
-  and an empty event pipeline is never gated, so a durably retained
-  deferred receipt alone cannot block shutdown teardown).
+- **Event batches are held until every retained analytics GRANT receipt has
+  been handed to the transport.** A grant parked in a server-requested
+  Retry-After window or the client's own jittered backoff, queued behind
+  another receipt in the serial outbox, or awaiting its first
+  post-relaunch dispatch has not been handed over yet — publishing events
+  meanwhile would invert the receipt-before-batch ordering, and on a
+  strict-enforce workspace those post-grant events reach the server before
+  the grant row exists and are terminally suppressed. The gate releases on
+  DISPATCH, never acknowledgment: a grant in flight lets the batch follow
+  with the receipt's response still pending, an empty event pipeline is
+  never gated (a durably retained receipt alone cannot block shutdown
+  teardown), and a relaunch needs no persisted window — the retained grant
+  re-dispatches at init ahead of any batch the fresh process can publish.
 
 ## v0.8.0 — 2026-07-13 — early alpha
 
