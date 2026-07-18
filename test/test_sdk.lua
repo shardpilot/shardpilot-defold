@@ -1918,6 +1918,219 @@ local function test_retry_after_defers_next_publish()
 	storage.reset()
 end
 
+-- L1 §6: a 5xx Retry-After is honored exactly like the 429 one. The server's
+-- strict-consent mode-unknown lane answers a whole-batch 503 with
+-- `Retry-After: 5`; the transport must pass the parsed header through so the
+-- deferral paces recovery on the server's hint instead of falling back to the
+-- client's own jittered backoff.
+local function test_503_retry_after_defers_next_publish()
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "5" }
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("consent_outage_event"))
+
+	assert_equal(client:flush(), false)
+	assert_equal(#requests, 1)
+	assert_equal(#client.in_flight_batch, 1, "the 503 batch is retained")
+	assert_true(client.publish_retry_after_ms ~= nil, "a 503 Retry-After sets a deferral")
+	assert_true(client:publish_deferred(), "publishing is deferred until the deadline")
+	assert_equal(client.publish_backoff_attempt, 0, "the server hint is used instead of jittered backoff")
+	assert_true(client.spool_retry_after_ms ~= nil, "the server-requested deadline reaches the spool record")
+
+	-- a flush during the deferral window must NOT re-send the batch
+	next_status = 202
+	next_response_headers = nil
+	assert_equal(client:flush(), false)
+	assert_equal(#requests, 1, "no publish during the retry-after window")
+
+	-- once the deadline passes the batch is republished
+	client.publish_retry_after_ms = nil
+	assert_true(client:flush())
+	assert_equal(#requests, 2)
+	assert_equal(client.in_flight_batch, nil)
+	storage.reset()
+end
+
+-- Strict-consent receipt-lag hardening (audit 2026-07-18, item 3a): within one
+-- flush cycle the consent-receipt outbox is handed to the transport BEFORE the
+-- event batch, so a retained grant receipt is on the wire ahead of the first
+-- post-grant events. Sequencing only — the batch must not wait on the
+-- receipt's acknowledgment.
+local function test_flush_sends_consent_receipt_before_event_batch()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	-- The initial receipt dispatch fails retryably, so the receipt stays
+	-- retained at the outbox head while the local grant opens the pipeline.
+	next_status = 500
+	client:set_consent(true)
+	assert_equal(#requests, 1)
+	assert_true(requests[1].url:find("/v1/consent", 1, true) ~= nil, "the grant posts a receipt")
+	assert_true(client:track("post_grant_event"))
+
+	-- One flush drives both planes: the retained receipt re-sends first, the
+	-- event batch second — and the batch is dispatched in the SAME cycle (no
+	-- ack-gating deferral to a later flush).
+	next_status = 202
+	assert_true(client:flush())
+	assert_equal(#requests, 3)
+	assert_true(requests[2].url:find("/v1/consent", 1, true) ~= nil, "the retained receipt is dispatched first")
+	assert_true(requests[3].url:find("/v1/events:batch", 1, true) ~= nil, "the event batch follows in the same cycle")
+	storage.reset()
+end
+
+-- Audit 3a follow-up: an undispatched GRANT receipt holds the event-batch leg
+-- of flush — a grant parked in a server Retry-After window (or the client's
+-- own jittered backoff) has not been handed to the transport, so a batch
+-- published meanwhile would overtake it and reach a strict-enforce workspace
+-- with no consent row to admit it.
+local function test_grant_receipt_retry_after_defers_event_publish()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "30" }
+	client:set_consent(true)
+	assert_equal(#requests, 1)
+	assert_true(client:consent_send_deferred(), "the consent plane honors the 5xx Retry-After")
+	assert_true(client:track("post_grant_event"))
+
+	-- The batch leg is held while the grant receipt sits in the window.
+	next_status = 202
+	next_response_headers = nil
+	local flushed, reason = client:flush()
+	assert_equal(flushed, false)
+	assert_equal(reason, "consent_receipt_pending")
+	assert_equal(#requests, 1, "no event publish while the grant awaits dispatch")
+
+	-- Once the window passes, ONE flush cycle sends receipt then batch.
+	client.consent_retry_after_ms = nil
+	assert_true(client:flush())
+	assert_equal(#requests, 3)
+	assert_true(requests[2].url:find("/v1/consent", 1, true) ~= nil, "the retained receipt goes first")
+	assert_true(requests[3].url:find("/v1/events:batch", 1, true) ~= nil, "the batch follows in the same cycle")
+
+	-- The rule is dispatch-based, not window-based: a grant parked by the
+	-- client's own jittered backoff is equally undispatched, so it holds
+	-- events just the same.
+	reset()
+	storage.reset()
+	local scoped = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(scoped:identify("user-example"))
+	next_status = 500
+	scoped:set_consent(true) -- first failure: receipt retained
+	assert_equal(#requests, 1)
+	assert_true(scoped:track("backoff_scoped_event"))
+	scoped:defer_consent_backoff()
+	scoped:defer_consent_backoff()
+	assert_true(scoped:consent_send_deferred(), "a jittered receipt window is open")
+	next_status = 202
+	local scoped_flushed, scoped_reason = scoped:flush()
+	assert_equal(scoped_flushed, false)
+	assert_equal(scoped_reason, "consent_receipt_pending")
+	assert_equal(#requests, 1, "events must not overtake a backoff-parked grant either")
+	storage.reset()
+end
+
+-- Gate scoping: a grant queued BEHIND a server-deferred head receipt still
+-- holds events — the serial outbox cannot deliver the grant until the head's
+-- window elapses, so post-grant events would overtake it on a strict-enforce
+-- workspace.
+local function test_grant_behind_deferred_head_receipt_holds_events()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	-- The deny receipt fails retryably with a server hint: head deferred.
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "30" }
+	client:set_consent(false)
+	assert_equal(#requests, 1)
+	assert_true(client:consent_send_deferred(), "the head receipt is parked in the server window")
+	-- The user grants during the window: the grant queues behind the head.
+	client:set_consent(true)
+	assert_equal(#requests, 1, "the serial outbox cannot deliver the grant yet")
+	assert_true(client:track("post_grant_event"))
+
+	next_status = 202
+	next_response_headers = nil
+	local flushed, reason = client:flush()
+	assert_equal(flushed, false)
+	assert_equal(reason, "consent_receipt_pending")
+	assert_equal(#requests, 1, "no event publish while the grant waits behind the deferred head")
+
+	-- After the window: deny, then grant, then the batch — in order.
+	client.consent_retry_after_ms = nil
+	assert_true(client:flush())
+	assert_equal(#requests, 4)
+	assert_true(requests[2].url:find("/v1/consent", 1, true) ~= nil, "the deny receipt goes first")
+	assert_true(requests[3].url:find("/v1/consent", 1, true) ~= nil, "the grant receipt follows")
+	assert_true(requests[4].url:find("/v1/events:batch", 1, true) ~= nil, "the batch goes last")
+	storage.reset()
+end
+
+-- Audit 3a follow-up (async transport): the real Defold http.request is
+-- asynchronous, so a flush after the head's window elapses only STARTS the
+-- head receipt — a grant queued behind it is still undispatched, and the
+-- batch must stay held until the chained drain hands the grant itself to the
+-- transport. Release is on DISPATCH, not acknowledgment: once the grant is
+-- in flight the batch follows with the grant's response still pending.
+local function test_grant_behind_head_holds_events_until_dispatched()
+	reset()
+	storage.reset()
+	local original_request = http.request
+	local callbacks = {}
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		callbacks[#callbacks + 1] = callback
+	end
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	-- The deny receipt dispatches, then fails with a Retry-After: head parked.
+	client:set_consent(false)
+	assert_equal(#requests, 1)
+	callbacks[1](nil, nil, { status = 503, headers = { ["retry-after"] = "30" } })
+	-- The user grants during the window; the grant queues behind the head.
+	client:set_consent(true)
+	assert_equal(#requests, 1)
+	assert_true(client:track("post_grant_event"))
+
+	-- The window elapses. This flush only STARTS the head receipt (async);
+	-- the grant behind it is still undispatched, so the batch stays held
+	-- even though the deferral window is over.
+	client.consent_retry_after_ms = nil
+	local flushed, reason = client:flush()
+	assert_equal(flushed, false)
+	assert_equal(reason, "consent_receipt_pending")
+	assert_equal(#requests, 2, "only the head receipt was dispatched")
+	assert_true(requests[2].url:find("/v1/consent", 1, true) ~= nil)
+
+	-- The head succeeds; the chained drain hands the GRANT to the transport.
+	callbacks[2](nil, nil, { status = 202, response = "{}" })
+	assert_equal(#requests, 3, "the chained drain dispatches the grant")
+	assert_true(requests[3].url:find("/v1/consent", 1, true) ~= nil)
+	assert_contains(requests[3].body, '"analytics":true')
+
+	-- The grant is in flight (unacknowledged): the batch may follow it now —
+	-- sequencing, not ack-gating.
+	local publish_flushed, publish_reason = client:flush()
+	assert_equal(publish_flushed, false)
+	assert_equal(publish_reason, "pending")
+	assert_equal(#requests, 4)
+	assert_true(requests[4].url:find("/v1/events:batch", 1, true) ~= nil, "the batch follows the dispatched grant")
+	callbacks[3](nil, nil, { status = 202, response = "{}" })
+	callbacks[4](nil, nil, { status = 202, response = '{"accepted":1}' })
+	http.request = original_request
+	storage.reset()
+end
+
+
 -- L1 §6: a successful publish clears any active backpressure deferral. A
 -- deferral whose deadline has already elapsed does not block the publish.
 local function test_successful_publish_clears_deferral()
@@ -3402,6 +3615,135 @@ local function test_shutdown_completes_with_durable_outbox_and_next_launch_deliv
 	storage.reset()
 end
 
+-- Gate scoping (audit 3a follow-up): a durably retained grant receipt parked
+-- in a server-requested Retry-After window must NOT block teardown when there
+-- is nothing to publish — the receipt is safe on disk and re-sends at the
+-- next launch, exactly like any other durably retained receipt.
+local function test_shutdown_completes_with_only_deferred_grant_receipt()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "30" }
+	client:set_consent(true)
+	assert_equal(#requests, 1)
+	assert_true(client:consent_send_deferred(), "the receipt is parked in the server window")
+	-- No events queued: the deferred durable receipt alone must not hold
+	-- shutdown hostage for the window.
+	next_status = 202
+	next_response_headers = nil
+	assert_true(client:shutdown(), "a durably retained deferred receipt must not block teardown")
+	assert_equal(client.initialized, false)
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1, "the receipt survives teardown on disk")
+	restore()
+	storage.reset()
+end
+
+-- Audit 3a follow-up (toggling): an in-flight head grant releases the gate
+-- only for itself. With grant→deny→grant queued before the first receipt
+-- settles, the LATER grant is still undispatched — events tracked under the
+-- second grant must wait until that receipt's own handoff, or they would
+-- overtake the deny+grant pair on the wire.
+local function test_toggled_grant_behind_in_flight_head_still_holds_events()
+	reset()
+	storage.reset()
+	local original_request = http.request
+	local callbacks = {}
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		callbacks[#callbacks + 1] = callback
+	end
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	client:set_consent(true) -- dispatched, in flight
+	assert_equal(#requests, 1)
+	client:set_consent(false) -- queued behind the in-flight head
+	client:set_consent(true) -- queued behind the deny
+	assert_equal(#requests, 1)
+	assert_true(client:track("post_toggle_event"))
+
+	-- The head grant is in flight, but the SECOND grant is undispatched:
+	-- the batch stays held.
+	local flushed, reason = client:flush()
+	assert_equal(flushed, false)
+	assert_equal(reason, "consent_receipt_pending")
+	assert_equal(#requests, 1, "no batch while the toggled grant awaits dispatch")
+
+	-- Head settles; the chained drain hands over the deny, then the grant.
+	callbacks[1](nil, nil, { status = 202, response = "{}" })
+	assert_equal(#requests, 2)
+	assert_contains(requests[2].body, '"analytics":false')
+	local mid_flushed, mid_reason = client:flush()
+	assert_equal(mid_flushed, false)
+	assert_equal(mid_reason, "consent_receipt_pending")
+	assert_equal(#requests, 2, "still held while the deny is in flight and the grant queued")
+	callbacks[2](nil, nil, { status = 202, response = "{}" })
+	assert_equal(#requests, 3)
+	assert_contains(requests[3].body, '"analytics":true')
+
+	-- The second grant is now in flight (unacknowledged): the batch follows.
+	local publish_flushed, publish_reason = client:flush()
+	assert_equal(publish_flushed, false)
+	assert_equal(publish_reason, "pending")
+	assert_equal(#requests, 4)
+	assert_true(requests[4].url:find("/v1/events:batch", 1, true) ~= nil, "the batch follows the dispatched second grant")
+	callbacks[3](nil, nil, { status = 202, response = "{}" })
+	callbacks[4](nil, nil, { status = 202, response = '{"accepted":1}' })
+	http.request = original_request
+	storage.reset()
+end
+
+-- Audit 3a follow-up (restart): a relaunch mid-window reloads the durable
+-- outbox but no deferral state — the gate needs none: the retained grant is
+-- handed to the transport at init, ahead of anything the fresh process can
+-- publish, so the first post-restart batch always follows the receipt on the
+-- wire (and is never ack-gated on it).
+local function test_restart_dispatches_retained_grant_before_first_batch()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- First launch: the grant receipt is parked by a server Retry-After and
+	-- the app closes with the receipt durably retained.
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "3600" }
+	client:set_consent(true)
+	assert_equal(#requests, 1)
+	next_status = 202
+	next_response_headers = nil
+	assert_true(client:shutdown())
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1, "the parked grant survives on disk")
+
+	-- Relaunch (async transport): init hands the retained grant over first.
+	reset()
+	local original_request = http.request
+	local callbacks = {}
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		callbacks[#callbacks + 1] = callback
+	end
+	local second = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(#requests, 1, "init hands the retained grant to the transport")
+	assert_true(requests[1].url:find("/v1/consent", 1, true) ~= nil)
+	assert_true(second:identify("user-example"))
+	assert_true(second:track("post_restart_event"), "the persisted grant reopens the pipeline")
+	local flushed, reason = second:flush()
+	assert_equal(flushed, false)
+	assert_equal(reason, "pending")
+	assert_equal(#requests, 2, "the first batch follows the already-dispatched receipt")
+	assert_true(requests[2].url:find("/v1/events:batch", 1, true) ~= nil)
+	callbacks[1](nil, nil, { status = 202, response = "{}" })
+	callbacks[2](nil, nil, { status = 202, response = '{"accepted":1}' })
+	http.request = original_request
+	restore()
+	storage.reset()
+end
+
 -- The outbox is bounded: storage evicts the OLDEST receipts beyond the fixed
 -- cap (32 — the newest decisions are the operative ones), and the client
 -- surfaces the eviction of a still-undelivered receipt via stats/diagnostics.
@@ -3835,6 +4177,14 @@ local tests = {
 	test_batch_response_surfaces_suppressed_no_consent,
 	test_batch_response_without_events_array_keeps_accepted,
 	test_retry_after_defers_next_publish,
+	test_503_retry_after_defers_next_publish,
+	test_flush_sends_consent_receipt_before_event_batch,
+	test_grant_receipt_retry_after_defers_event_publish,
+	test_shutdown_completes_with_only_deferred_grant_receipt,
+	test_grant_behind_deferred_head_receipt_holds_events,
+	test_grant_behind_head_holds_events_until_dispatched,
+	test_toggled_grant_behind_in_flight_head_still_holds_events,
+	test_restart_dispatches_retained_grant_before_first_batch,
 	test_successful_publish_clears_deferral,
 	test_backoff_on_sustained_transient_failures,
 	test_error_envelope_is_surfaced,

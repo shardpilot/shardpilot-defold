@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.8.1 — 2026-07-18 — early alpha
+
+- **`Retry-After` is now honored on 5xx responses, not only 429** (SDK
+  strict-consent audit follow-up). The transport parsed the `Retry-After`
+  header on every response but passed it to the client only in the 429
+  branch; a retryable 5xx fell back to the client's own full-jitter
+  exponential backoff. The analytics service's strict-consent
+  mode-unknown/consent-store-outage lane (GAP-041) answers a whole-batch
+  `503` with `Retry-After: 5`, so post-outage recovery is now paced by the
+  server's hint — the deferral (and its persisted spool deadline, 24h
+  clamp) works exactly as it already did for 429, on both the events plane
+  and the consent-receipt outbox. No behavior change for responses without
+  the header.
+- **Receipt-before-batch flush ordering pinned** (audit item 3a). Within one
+  flush cycle the consent-receipt outbox was already handed to the transport
+  strictly before the event batch at every dispatch point
+  (init/update/flush/shutdown); this ordering is now documented as
+  load-bearing and pinned by a regression test. On a strict-enforce
+  workspace (GAP-041) it shrinks the window in which a post-grant batch
+  reaches the server before the grant's `/v1/consent` row exists and is
+  terminally suppressed. Sequencing only — the batch never waits on the
+  receipt's acknowledgment.
+- **Event batches are held until every retained analytics GRANT receipt has
+  been handed to the transport.** A grant parked in a server-requested
+  Retry-After window or the client's own jittered backoff, queued behind
+  another receipt in the serial outbox, or awaiting its first
+  post-relaunch dispatch has not been handed over yet — publishing events
+  meanwhile would invert the receipt-before-batch ordering, and on a
+  strict-enforce workspace those post-grant events reach the server before
+  the grant row exists and are terminally suppressed. The gate releases on
+  DISPATCH, never acknowledgment: a grant in flight lets the batch follow
+  with the receipt's response still pending, an empty event pipeline is
+  never gated (a durably retained receipt alone cannot block shutdown
+  teardown), and a relaunch needs no persisted window — the retained grant
+  re-dispatches at init ahead of any batch the fresh process can publish.
+
 ## v0.8.0 — 2026-07-13 — early alpha
 
 - **`buffer_size` default raised from `200` to `1000`** — the cross-SDK

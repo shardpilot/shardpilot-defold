@@ -76,7 +76,12 @@ local function dispatch(config, token, route, payload, callback)
 			return
 		end
 		if status >= 500 then
-			callback(false, "transient_" .. tostring(status), false, true, response)
+			-- Pass the parsed Retry-After through exactly like the 429 branch:
+			-- the strict-consent mode-unknown lane answers a whole-batch 503
+			-- with `Retry-After: 5`, and the client's deferral must pace
+			-- recovery on the server's hint instead of its own jittered
+			-- backoff.
+			callback(false, "transient_" .. tostring(status), false, true, response, retry_after_seconds(response))
 			return
 		end
 		callback(false, "http_" .. tostring(status), false, false, response)

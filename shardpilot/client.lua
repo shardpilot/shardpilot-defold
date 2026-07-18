@@ -1331,6 +1331,34 @@ function Client:consent_send_deferred()
 	return self.consent_retry_after_ms ~= nil and clock.unix_ms() < self.consent_retry_after_ms
 end
 
+-- True while the durable outbox retains an analytics GRANT receipt that has
+-- NOT yet been handed to the transport. Delivery is serial and in decision
+-- order, so the only receipt that can have been handed over is the head
+-- currently in flight — a grant anywhere else (parked behind a deferral or
+-- backoff window, queued behind another receipt, or simply not yet
+-- dispatched, e.g. right after a relaunch that reloaded the durable outbox)
+-- is still awaiting its handoff, and an event batch dispatched meanwhile
+-- would overtake it on the wire: on a strict-enforce workspace those
+-- post-grant events reach the server before the grant row exists and are
+-- terminally suppressed. The condition is DISPATCH, never acknowledgment: a
+-- grant in flight (handed to the transport, response pending) does not hold
+-- events — its request already precedes any batch dispatched after it.
+function Client:grant_receipt_pending_dispatch()
+	for i = 1, #self.consent_outbox do
+		local receipt = self.consent_outbox[i]
+		if type(receipt.categories) == "table" and receipt.categories.analytics == true then
+			-- The head being handed over right now releases the gate only
+			-- for ITSELF: skip it and keep scanning, so a later grant queued
+			-- behind it (grant→deny→grant toggling before the first receipt
+			-- settles) still holds events until its own handoff.
+			if not (i == 1 and self.consent_send_in_flight) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 -- Rewrite the durable outbox record from the in-memory mirror. On a failed
 -- write the mirror keeps ruling this process (retained receipts still
 -- deliver), the write is marked owed (consent_outbox_dirty) and retried at
@@ -1945,7 +1973,14 @@ function Client:flush(options)
 	self:retry_spool_purge()
 	self:retry_spool_rewrite()
 	-- Retained consent receipts (the durable outbox) ride the same dispatch
-	-- cadence as queued events; their outcome never affects the flush result.
+	-- cadence as queued events and are handed to the transport strictly
+	-- BEFORE this cycle's event batch; their outcome never affects the flush
+	-- result. The order is load-bearing on strict-enforce workspaces
+	-- (GAP-041): dispatching the receipt first shrinks the window in which a
+	-- post-grant batch reaches the server before the grant's /v1/consent row
+	-- exists and is terminally suppressed (per-event suppressed_no_consent).
+	-- Sequencing only — the batch never waits on the receipt's
+	-- acknowledgment.
 	self:try_send_consent_outbox()
 	if options.include_summaries ~= false then
 		self:enqueue_summaries()
@@ -1956,6 +1991,26 @@ function Client:flush(options)
 			return false, "pending"
 		end
 		return true
+	end
+
+	-- Strict-enforce hardening (audit 3a follow-up): the event-batch leg of
+	-- this flush is held while the outbox retains an analytics GRANT receipt
+	-- that has not yet been HANDED TO THE TRANSPORT (the dispatch above may
+	-- have started only the head, and http.request is asynchronous — a grant
+	-- parked behind a deferral/backoff window, queued behind another
+	-- receipt, or awaiting its first post-relaunch dispatch has not been
+	-- handed over yet). Publishing meanwhile would invert the
+	-- receipt-before-batch ordering and hand a strict-enforce workspace
+	-- post-grant events with no consent row to admit them (terminal
+	-- suppressed_no_consent). The condition is dispatch, NOT acknowledgment
+	-- (the rejected ack-gating variant): a grant in flight releases the gate
+	-- with its response still pending. The gate only fires when there ARE
+	-- events to hold: an empty pipeline must keep returning success so a
+	-- durably-retained undispatched receipt alone never blocks teardown
+	-- (shutdown's outbox-durability contract).
+	if self:grant_receipt_pending_dispatch()
+		and (self.in_flight_batch ~= nil or queue.size(self.queue) > 0 or self:spool_pending()) then
+		return false, "consent_receipt_pending"
 	end
 
 	while true do
