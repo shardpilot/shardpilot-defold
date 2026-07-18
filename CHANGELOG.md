@@ -1,6 +1,18 @@
 # Changelog
 
-## v0.8.0 — 2026-07-13 — early alpha
+## v0.8.1 — 2026-07-18 — early alpha
+
+- **`Retry-After` is now honored on 5xx responses, not only 429** (SDK
+  strict-consent audit follow-up). The transport parsed the `Retry-After`
+  header on every response but passed it to the client only in the 429
+  branch; a retryable 5xx fell back to the client's own full-jitter
+  exponential backoff. The analytics service's strict-consent
+  mode-unknown/consent-store-outage lane (GAP-041) answers a whole-batch
+  `503` with `Retry-After: 5`, so post-outage recovery is now paced by the
+  server's hint — the deferral (and its persisted spool deadline, 24h
+  clamp) works exactly as it already did for 429, on both the events plane
+  and the consent-receipt outbox. No behavior change for responses without
+  the header.
 
 - **`buffer_size` default raised from `200` to `1000`** — the cross-SDK
   canonical in-memory queue capacity (architecture-audit finding SP-059).

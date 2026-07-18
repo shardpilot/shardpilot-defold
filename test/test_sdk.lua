@@ -1918,6 +1918,43 @@ local function test_retry_after_defers_next_publish()
 	storage.reset()
 end
 
+-- L1 §6: a 5xx Retry-After is honored exactly like the 429 one. The server's
+-- strict-consent mode-unknown lane answers a whole-batch 503 with
+-- `Retry-After: 5`; the transport must pass the parsed header through so the
+-- deferral paces recovery on the server's hint instead of falling back to the
+-- client's own jittered backoff.
+local function test_503_retry_after_defers_next_publish()
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "5" }
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("consent_outage_event"))
+
+	assert_equal(client:flush(), false)
+	assert_equal(#requests, 1)
+	assert_equal(#client.in_flight_batch, 1, "the 503 batch is retained")
+	assert_true(client.publish_retry_after_ms ~= nil, "a 503 Retry-After sets a deferral")
+	assert_true(client:publish_deferred(), "publishing is deferred until the deadline")
+	assert_equal(client.publish_backoff_attempt, 0, "the server hint is used instead of jittered backoff")
+	assert_true(client.spool_retry_after_ms ~= nil, "the server-requested deadline reaches the spool record")
+
+	-- a flush during the deferral window must NOT re-send the batch
+	next_status = 202
+	next_response_headers = nil
+	assert_equal(client:flush(), false)
+	assert_equal(#requests, 1, "no publish during the retry-after window")
+
+	-- once the deadline passes the batch is republished
+	client.publish_retry_after_ms = nil
+	assert_true(client:flush())
+	assert_equal(#requests, 2)
+	assert_equal(client.in_flight_batch, nil)
+	storage.reset()
+end
+
 -- L1 §6: a successful publish clears any active backpressure deferral. A
 -- deferral whose deadline has already elapsed does not block the publish.
 local function test_successful_publish_clears_deferral()
@@ -3835,6 +3872,7 @@ local tests = {
 	test_batch_response_surfaces_suppressed_no_consent,
 	test_batch_response_without_events_array_keeps_accepted,
 	test_retry_after_defers_next_publish,
+	test_503_retry_after_defers_next_publish,
 	test_successful_publish_clears_deferral,
 	test_backoff_on_sustained_transient_failures,
 	test_error_envelope_is_surfaced,
