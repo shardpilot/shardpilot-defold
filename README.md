@@ -194,6 +194,7 @@ Most methods return `ok, err` so callers can branch on failures (e.g.
 | `spool_enabled` | `true` | Durable offline event spool ([details](#offline-durability-event-spool)); `false` also clears a previously persisted record at init |
 | `spool_max_events` | `500` | Max spooled entries (≥1); oldest evicted first |
 | `spool_max_bytes` | `262144` | Approx. spool size budget (1024–393216); oldest evicted first |
+| `schema_revision` | built-in revision | Schema-set revision declared on batch ingest (`X-ShardPilot-Schema-Revision` request header); a string overrides the value, `false`/`""` stops declaring ([details](docs/configuration.md#schema-revision-declaration)) |
 
 > `ingest.shardpilot.com` is a **planned** public domain and is not provisioned.
 > Use local/develop endpoints until a release explicitly publishes production
@@ -235,6 +236,14 @@ Legacy public-SDK fields are **never** emitted: `project_id`, `game_id`, `env`,
 `build_version` are CI-guarded by
 [`scripts/check_library.sh`](scripts/check_library.sh). See
 [`docs/events.md`](docs/events.md).
+
+Each batch request also declares the SDK's schema-set revision in the
+`X-ShardPilot-Schema-Revision` **request header** (never a body field; only
+this route — consent, crash, and remote-config requests never carry it). A
+`schema_revision_mismatch` `409` from an ingest service with the handshake
+armed is terminal for the batch: dropped, never retried. See
+[`docs/configuration.md`](docs/configuration.md#schema-revision-declaration);
+`schema_revision = false` stops declaring.
 
 ## Offline durability (event spool)
 

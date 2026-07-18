@@ -426,6 +426,10 @@ local function test_fresh_fetch_serves_values_and_writes_cache()
 	assert_equal(request.url, "http://localhost:18081/config/v1/workspace-test/develop/anon-client")
 	assert_equal(request.headers["Authorization"], "Bearer sp_ingest_publishable_key")
 	assert_nil(request.headers["If-None-Match"], "the first fetch must not revalidate")
+	-- The schema-revision declaration (GAP-036) belongs to events:batch
+	-- ingest only; the remote-config fetch must never carry it.
+	assert_nil(request.headers["X-ShardPilot-Schema-Revision"],
+		"the remote-config fetch must not carry the schema-revision header")
 	assert_nil(request.body, "a config fetch carries no request body")
 	assert_equal(request.options.timeout, 2)
 
