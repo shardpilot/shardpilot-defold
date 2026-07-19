@@ -1,10 +1,6 @@
 # Changelog
 
-### Unreleased
-
-<!-- Folded into the next "## vX.Y.Z" heading at release time; kept at a
-     deeper heading level so scripts/check_versions.sh keeps reading the
-     topmost RELEASED version from the first "## " heading. -->
+## v0.9.1 — 2026-07-19 — early alpha
 
 - **Host-supplied identifiers are clamped to 512 bytes at acceptance**
   (GAP-075 code follow-up to the save-file-limit caveats documented in #30).

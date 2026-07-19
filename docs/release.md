@@ -1,7 +1,7 @@
 # Release
 
 The ShardPilot Defold SDK is published as the latest release git tag plus a
-GitHub Release (currently `v0.9.0` for both). This is an early alpha
+GitHub Release (currently `v0.9.1` for both). This is an early alpha
 pre-release: the API is unstable and may change before v1.
 
 Release ordering: merge the version-bump commit — it moves every in-tree
