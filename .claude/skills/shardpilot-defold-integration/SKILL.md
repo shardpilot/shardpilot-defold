@@ -235,10 +235,13 @@ shardpilot.track("play_cta_click", { cta_source = "main_menu" })
 shardpilot.observe_ping_ms(42)                  -- feeds network_summary
 ```
 
-- Every send-side call returns `ok, err`. `track` failure codes:
-  `consent_unknown`, `consent_denied`, `event_name_required`,
-  `identity_required`, `invalid_props`, `invalid_context`, `queue_full`,
-  `shutdown`.
+- The event-enqueue helpers (`track`, `screen_view`, `session_start`) return
+  `ok, err`. `track` failure codes: `consent_unknown`, `consent_denied`,
+  `event_name_required`, `identity_required`, `invalid_props`,
+  `invalid_context`, `queue_full`, `shutdown`. The observer calls
+  (`observe_ping_ms`, `observe_disconnect`) return **nothing** — they feed the
+  samplers only while consent is granted and are silent no-ops otherwise; do
+  not wrap them in `ok, err` handling.
 - Batches dispatch when the queue reaches `batch_size` or every
   `flush_interval_seconds`, driven by `update(dt)`; `flush()` forces a cycle.
   A session is opened lazily on the first `track` if you never called
@@ -297,6 +300,8 @@ crash.init({
   crash_api_key    = "<YOUR-CRASH-WRITE-KEY>",       -- crash:write scope
   app_id           = "<YOUR-APP-ID>",
   app_version      = "1.2.3",
+  -- platform = "windows", -- auto-detected in-engine; REQUIRED explicitly
+  --                       -- outside Defold, or init fails platform_required
 })
 crash.capture_previous()  -- once, early in init(): forwards last session's native dump, if any
 crash.record_breadcrumb("menu.open")
@@ -404,10 +409,16 @@ surface — no guessing from logs.
    returns `true`; then `crash.snapshot()` shows `emitted` ≥ 1 and, after the
    async callback, `accepted` ≥ 1 (`suppressed` counts reports the server
    accepted but did not store; `last_error`/`last_issue` name failures).
-9. **Offline durability**: go offline, `track` a granted event, kill the app
-   (or call `persist()` first), relaunch, come back online — `snapshot()`
-   shows `spool_resent` ≥ 1 and the event arrives with its original
-   `event_id`.
+   Outside the Defold engine, set `platform` explicitly in `crash.init` first
+   — auto-detection fails there and `crash.init` returns
+   `platform_required`.
+9. **Offline durability**: go offline, `track` a granted event, then make it
+   durable **before** killing the app — a kill right after `track` alone
+   loses the event, because `track` only queues it in memory. Either call
+   `persist()` (or run `shutdown()`), or keep pumping `update` until the
+   failed offline publish spools the batch (`snapshot().spooled` ≥ 1). Then
+   kill, relaunch, come back online — `snapshot()` shows `spool_resent` ≥ 1
+   and the event arrives with its original `event_id`.
 10. **Shutdown**: `shardpilot.shutdown("app_final")` returns `true` (or
     retry it while pumping `update`; see the shutdown notes above).
 
