@@ -28,6 +28,41 @@ jobs:
       - name: Version consistency
         run: ./scripts/check_versions.sh
 
+  # Engine-real leg: proves on every PR that the WORKING TREE still packages
+  # and builds as a real Defold library dependency — scripts/package_release.sh
+  # ZIP served over localhost, resolved and compiled by a pinned,
+  # sha256-verified bob.jar (`java -jar bob.jar resolve build` on
+  # test/bob-harness, whose main script requires the shardpilot.* modules).
+  # HONESTY: this is a build-time proof only (dependency resolution +
+  # compilation); it does NOT start the engine or exercise runtime behavior —
+  # runtime coverage stays with the interpreter-based lua-tests legs.
+  # All pins (Defold version, engine sha1, bob.jar sha256, dependency port)
+  # live in scripts/ci_bob_build.sh; the cache key hashes that script, so a
+  # pin bump automatically refreshes the cached bob.jar.
+  bob-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Defold 1.12.0 and newer require OpenJDK 25 (docs/release.md).
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Cache bob.jar
+        uses: actions/cache@v6
+        with:
+          path: .ci-cache/bob
+          key: bob-${{ runner.os }}-${{ hashFiles('scripts/ci_bob_build.sh') }}
+
+      - name: Engine-real library build (bob resolve + build)
+        run: ./scripts/ci_bob_build.sh
+
   # Defold embeds Lua 5.1 / LuaJIT, so those interpreters are the gating
   # legs. Lua 5.4 stays as an extra host leg only to catch accidental
   # reliance on 5.1-only quirks — it is NOT a runtime the SDK targets.

@@ -1,0 +1,7 @@
+[project]
+title = ShardPilot Bob Harness
+version = 0.0.1
+dependencies#0 = http://127.0.0.1:8910/shardpilot-defold-workingtree.zip
+
+[bootstrap]
+main_collection = /main/harness.collectionc

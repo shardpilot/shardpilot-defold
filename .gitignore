@@ -5,6 +5,7 @@
 build/
 dist/
 .internal/
+.ci-cache/
 
 *.zip
 *.log

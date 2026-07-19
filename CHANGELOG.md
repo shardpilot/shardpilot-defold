@@ -1,5 +1,29 @@
 # Changelog
 
+### Unreleased
+
+<!-- Folded into the next "## vX.Y.Z" heading at release time; kept at a
+     deeper heading level so scripts/check_versions.sh keeps reading the
+     topmost RELEASED version from the first "## " heading. -->
+
+- **CI gained an engine-real `bob-build` leg** (fleet-audit gap: the
+  contract core was interpreter-tested only, with no proof the tree still
+  works as an actual Defold library). On every PR and push to `main`,
+  `scripts/ci_bob_build.sh` packages the WORKING TREE with
+  `scripts/package_release.sh`, serves that ZIP over localhost as the
+  dependency URL of a minimal committed consumer project
+  (`test/bob-harness/`, whose main script requires `shardpilot.sdk`,
+  `shardpilot.crash`, and `shardpilot.remote_config`), and runs Defold's
+  command-line builder on it (`java -jar bob.jar resolve build`,
+  x86_64-linux, release variant with archive) — so packaging or
+  library-contract breakage is caught before a tag is cut, not after.
+  Bob is deterministic and supply-chain-pinned: Defold 1.13.0 by engine
+  sha1 with a sha256-verified `bob.jar` download (cached in CI, re-verified
+  on every run) on Temurin 25. Scope honesty: this leg proves dependency
+  resolution plus build-time compilation only — it does not start the
+  engine or exercise runtime behavior, which remains covered by the
+  interpreter test legs.
+
 ## v0.9.1 — 2026-07-19 — early alpha
 
 - **Host-supplied identifiers are clamped to 512 bytes at acceptance**

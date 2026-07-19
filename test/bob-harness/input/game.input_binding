@@ -1,0 +1,2 @@
+# Intentionally empty: the bob-build harness never runs, it only has to
+# compile. Defold's default [input] game_binding setting points here.
