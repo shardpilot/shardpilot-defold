@@ -140,7 +140,11 @@ end
 -- opaque backend tokens a few hundred. Oversized input is REJECTED (same
 -- surface as empty/non-string identity), never truncated — truncation could
 -- collide distinct identities and mis-attribute events or consent decisions.
-local max_identifier_bytes = 512
+-- The bound is defined once, in the storage layer next to the other
+-- persistence budgets: storage's outbox sanitizer enforces it on records
+-- written before the clamp existed (legacy oversized receipts are dropped at
+-- load), and this acceptance gate keeps new identifiers inside it.
+local max_identifier_bytes = storage.max_identifier_bytes
 
 local function valid_identity(value)
 	return type(value) == "string" and value ~= "" and #value <= max_identifier_bytes

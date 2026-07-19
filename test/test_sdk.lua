@@ -4158,9 +4158,11 @@ local function test_oversized_identifier_cannot_wedge_consent_teardown()
 		return plain_save(path, record)
 	end
 
-	-- (a) storage level: an entry with an oversized actor_identifier fails
-	-- the outbox write on EVERY attempt — a failed write never evicts, so an
-	-- unclamped acceptance path could never converge
+	-- (a) storage level: an entry with an oversized actor_identifier used to
+	-- fail the outbox write on EVERY attempt (a failed write never evicts, so
+	-- the record could never converge — the wedge). The sanitizer now drops
+	-- it fail-safe, like any malformed entry, so the write SUCCEEDS without
+	-- it and the persisted record stays byte-sane
 	local oversized_entry = {
 		workspace_id = "workspace-example",
 		app_id = "app-example",
@@ -4170,12 +4172,12 @@ local function test_oversized_identifier_cannot_wedge_consent_teardown()
 		decided_at = "2026-07-19T00:00:00Z",
 		idempotency_key = "receipt-oversized",
 	}
-	assert_equal(storage.save_consent_outbox(identity_scope, { oversized_entry }), nil,
-		"an oversized receipt must fail the durable write")
-	assert_equal(storage.save_consent_outbox(identity_scope, { oversized_entry }), nil,
-		"and keeps failing on retry — the write can never converge")
-	assert_true(stored_consent_outbox_record(stores) == nil,
-		"nothing may have been persisted for the oversized entry")
+	local saved = storage.save_consent_outbox(identity_scope, { oversized_entry })
+	assert_true(saved ~= nil, "the write must succeed once the oversized entry is dropped")
+	assert_equal(#saved, 0, "the oversized entry must be dropped at sanitize, never persisted")
+	local seeded = stored_consent_outbox_record(stores)
+	assert_true(seeded ~= nil and #seeded.receipts == 0,
+		"the durable record persists without the oversized entry")
 
 	-- (b) client level: the clamp rejects the oversized identifier at
 	-- acceptance, so no receipt can ever carry it
@@ -4204,6 +4206,45 @@ local function test_oversized_identifier_cannot_wedge_consent_teardown()
 	assert_true(client:shutdown("app_final"),
 		"shutdown must not wedge in consent_pending when identifiers are clamped")
 	assert_equal(client.initialized, false)
+
+	-- (c) the upgrade path: a LEGACY record written before the clamp existed
+	-- can already hold a near-cap receipt on disk (it fit alone when old code
+	-- wrote it). The load-time sanitizer drops it like any other malformed
+	-- entry, so the next decision's rewrite — which would exceed the save cap
+	-- with the oversized entry still aboard — stays writable and teardown
+	-- still completes: a previously wedged install self-heals on upgrade.
+	storage.reset()
+	local _, outbox_path = stored_consent_outbox_record(stores)
+	local legacy_sane = {
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "user-legacy",
+		categories = { analytics = false },
+		decided_at = "2026-07-18T00:00:00Z",
+		idempotency_key = "receipt-legacy-sane",
+	}
+	-- seed the poisoned pre-clamp file directly (old code could write it
+	-- when the oversized receipt still fit the record on its own)
+	stores[outbox_path] = { receipts = { oversized_entry, legacy_sane } }
+	local salvaged = storage.load_consent_outbox(identity_scope)
+	assert_equal(#salvaged, 1, "the oversized legacy receipt must be dropped at load")
+	assert_equal(salvaged[1].idempotency_key, "receipt-legacy-sane")
+
+	-- Mode A client over the legacy record with the consent endpoint offline:
+	-- the sane receipt is retained, a NEW decision still persists durably,
+	-- and shutdown() completes instead of staying consent_pending
+	next_status = 0
+	local upgraded = assert(sdk.new(config_mode_a()))
+	assert_equal(#upgraded.consent_outbox, 1, "the sane legacy receipt is retained")
+	assert_true(upgraded:set_consent(false), "a new decision must persist over the legacy record")
+	assert_equal(upgraded.consent_outbox_dirty, false)
+	local upgraded_record = stored_consent_outbox_record(stores)
+	assert_equal(#upgraded_record.receipts, 2, "legacy sane + new receipt are durable")
+	assert_true(#json.encode(upgraded_record) <= record_cap,
+		"the rewritten record stays under the save cap")
+	assert_true(upgraded:shutdown("app_final"),
+		"an upgraded install must not stay wedged in consent_pending")
 	restore()
 	storage.reset()
 end

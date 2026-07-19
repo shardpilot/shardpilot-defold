@@ -22,6 +22,12 @@
   ~512 KB `sys.save` cap, persistently failing the outbox write and wedging
   `shutdown()` in `consent_pending`. With the clamp the worst-case outbox
   stays around ~46 KB and identity-record writes stay far under the cap.
+  Records written before the clamp existed self-heal at load: an oversized
+  persisted anonymous ID is replaced by a fresh identity, and outbox
+  receipts carrying oversized identifiers are dropped by the load-time
+  sanitizer (fail-safe, like any other malformed entry — such a receipt can
+  never be durably rewritten alongside new decisions), so a previously
+  wedged install becomes writable again on upgrade.
 
 ## v0.9.0 — 2026-07-18 — early alpha
 

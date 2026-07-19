@@ -948,8 +948,30 @@ local consent_outbox_memory = {}
 
 local max_consent_outbox_entries = 32
 
+-- Shared byte budget for host-supplied identifiers, exported so the client's
+-- acceptance gate (valid_identity in client.lua) and this sanitizer enforce
+-- the SAME bound from one definition. Receipts persist identifiers verbatim
+-- and this record has no other byte budget, so the clamp is what keeps the
+-- 32-entry worst case far under the engine's save-record cap. Enforcing it
+-- here as well covers records written BEFORE the clamp existed: a legacy
+-- receipt carrying a near-cap identifier reloads verbatim, and the next
+-- decision's rewrite (old entries + new receipt) could exceed the save cap
+-- again — a write this store deliberately never resolves by eviction — and
+-- re-wedge shutdown() in consent_pending. Such an entry is dropped at
+-- sanitize like any other malformed one: it can never be durably rewritten
+-- alongside new decisions, and one bad record on disk must never block the
+-- deliverable rest.
+M.max_identifier_bytes = 512
+
 local function valid_receipt_field(value)
 	return type(value) == "string" and value ~= ""
+end
+
+-- Identifier fields (actor_identifier, anonymous_id) additionally honor the
+-- shared byte budget; the other receipt fields are SDK-generated or config
+-- constants and keep the plain non-empty-string rule.
+local function valid_receipt_identifier(value)
+	return valid_receipt_field(value) and #value <= M.max_identifier_bytes
 end
 
 -- Keep only entries that are complete, well-formed receipts, copied down to
@@ -971,12 +993,12 @@ local function sanitize_outbox_entries(entries)
 			and valid_receipt_field(entry.workspace_id)
 			and valid_receipt_field(entry.app_id)
 			and valid_receipt_field(entry.environment_id)
-			and valid_receipt_field(entry.actor_identifier)
+			and valid_receipt_identifier(entry.actor_identifier)
 			and valid_receipt_field(entry.decided_at)
 			and type(entry.categories) == "table"
 			and type(entry.categories.analytics) == "boolean"
 			and (entry.reason == nil or valid_receipt_field(entry.reason))
-			and (entry.anonymous_id == nil or valid_receipt_field(entry.anonymous_id)) then
+			and (entry.anonymous_id == nil or valid_receipt_identifier(entry.anonymous_id)) then
 			out[#out + 1] = {
 				idempotency_key = entry.idempotency_key,
 				workspace_id = entry.workspace_id,
