@@ -8,9 +8,14 @@ set -euo pipefail
 #   4. README.md               — the "- **Version `X.Y.Z`.**" Status line
 #   5. README.md               — the "the latest tag is `vX.Y.Z`:" mention
 #   6. README.md               — the pinned dependency URL (.../archive/refs/tags/vX.Y.Z.zip)
+#   7. docs/release.md         — the "(currently `vX.Y.Z` for both)" current-release mention
 #
-# Default mode is a per-commit CI gate and deliberately does NOT look at git
-# tags: between releases the tree is legitimately ahead of the latest tag.
+# Default mode is a per-commit CI gate for in-tree MUTUAL CONSISTENCY: every
+# declaration above must name the same version. It deliberately does NOT look
+# at git tags — whether tag v<version> has been published yet is the release
+# runbook's concern, not this gate's. The tree is legitimately ahead of the
+# latest PUBLISHED tag inside the runbook's prepare-then-tag window; what is
+# never legitimate is two in-tree files disagreeing about the version.
 #
 # Release mode (opt-in, for the release runbook — not CI):
 #   ./scripts/check_versions.sh --release
@@ -43,9 +48,12 @@ readme_latest_tag_version="$(sed -nE 's/^.*the latest tag is `v([0-9]+\.[0-9]+\.
 readme_dependency_version="$(sed -nE 's|^dependencies#0 = https://github\.com/shardpilot/shardpilot-defold/archive/refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)\.zip$|\1|p' README.md)"
 [[ -n "$readme_dependency_version" ]] || { echo "README.md dependency URL is not 'dependencies#0 = .../archive/refs/tags/vX.Y.Z.zip'" >&2; exit 1; }
 
+release_doc_version="$(sed -nE 's/^.*\(currently `v([0-9]+\.[0-9]+\.[0-9]+)` for both\).*$/\1/p' docs/release.md)"
+[[ -n "$release_doc_version" ]] || { echo "docs/release.md current-release mention is not '... (currently \`vX.Y.Z\` for both)'" >&2; exit 1; }
+
 if [[ "$lua_version" != "$project_version" || "$lua_version" != "$changelog_version" \
    || "$lua_version" != "$readme_status_version" || "$lua_version" != "$readme_latest_tag_version" \
-   || "$lua_version" != "$readme_dependency_version" ]]; then
+   || "$lua_version" != "$readme_dependency_version" || "$lua_version" != "$release_doc_version" ]]; then
   {
     echo "version mismatch:"
     echo "  shardpilot/version.lua M.VERSION = $lua_version"
@@ -54,6 +62,7 @@ if [[ "$lua_version" != "$project_version" || "$lua_version" != "$changelog_vers
     echo "  README.md Status line            = $readme_status_version"
     echo "  README.md latest-tag mention     = v$readme_latest_tag_version"
     echo "  README.md dependency URL tag     = v$readme_dependency_version"
+    echo "  docs/release.md current release  = v$release_doc_version"
   } >&2
   exit 1
 fi
