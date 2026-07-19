@@ -21,6 +21,7 @@ zip -r "$out_dir/$name" \
   NOTICE \
   CHANGELOG.md \
   SECURITY.md \
-  docs
+  docs \
+  .claude/skills/shardpilot-defold-integration/SKILL.md
 
 echo "$out_dir/$name"
