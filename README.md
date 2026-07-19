@@ -18,7 +18,7 @@ not the platform boundary.
   local/develop endpoints for evaluation.
 - **Version `0.9.0`.** `game.project`, `shardpilot/version.lua`, and the top
   [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.9.0`; the `v0.9.0` tag
-  is published from this line per [docs/release.md](docs/release.md).
+  is published per [docs/release.md](docs/release.md).
 
 ## What it does
 

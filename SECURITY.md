@@ -23,7 +23,10 @@ project channel.
 - Durable storage is limited to six small, bounded, per-app records written
   through Defold `sys.save`: the identity record (anonymous ID + consent
   decision); the offline event spool described above; a bounded outbox that
-  retains the SDK's own consent decisions until delivered; the last-known-good
+  retains the SDK's own consent decisions until delivered, subject to its
+  fixed 32-entry cap (oldest receipts are evicted first when it overflows,
+  so repeated undelivered decisions can displace older ones); the
+  last-known-good
   remote-config cache; the crash opt-out settings record; and a bounded,
   per-app, TTL'd crash-retry sidecar that holds only already-PII-scrubbed
   crash reports (resent then cleared on success). No other file or
