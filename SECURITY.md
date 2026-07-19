@@ -22,15 +22,15 @@ project channel.
   launch finds no persisted grant and purges the record.
 - Durable storage is limited to six per-app records written through Defold
   `sys.save`, each bounded as noted: the identity record (anonymous ID +
-  consent decision — the identifier is persisted verbatim with no byte
-  clamp, so a host-supplied oversized anonymous ID can hit the engine's
-  save-file limits); the offline event spool described above (entry- and
-  byte-budgeted); an outbox that retains the SDK's own consent decisions
-  until delivered, bounded to 32 entries (oldest receipts are evicted first
-  when it overflows, so repeated undelivered decisions can displace older
-  ones) though not byte-budgeted — per-entry size scales with the
-  host-supplied user identifier, so hosts passing very large identifiers can
-  hit the engine's save-file limits; the last-known-good remote-config cache
+  consent decision; host-supplied identifiers are clamped to 512 bytes at
+  acceptance, keeping the record far under the engine's save-file limits);
+  the offline event spool described above (entry- and byte-budgeted); an
+  outbox that retains the SDK's own consent decisions until delivered,
+  bounded to 32 entries (oldest receipts are evicted first when it
+  overflows, so repeated undelivered decisions can displace older ones),
+  each receipt carrying identifiers already clamped at acceptance, so
+  per-entry size no longer scales with oversized host-supplied
+  identifiers; the last-known-good remote-config cache
   (size-capped before it is persisted); the crash opt-out settings record (a
   single boolean); and a per-app, TTL'd crash-retry sidecar with fixed
   entry, per-report, and total byte caps, holding only already-PII-scrubbed

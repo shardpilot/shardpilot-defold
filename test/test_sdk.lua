@@ -4060,6 +4060,154 @@ local function test_transient_outbox_save_failure_never_evicts()
 	storage.reset()
 end
 
+-- Host-supplied identifiers are clamped to 512 bytes at acceptance: the
+-- identity record and every consent receipt persist them verbatim, so an
+-- unbounded identifier could push those sys.save records past the engine's
+-- save-file record cap (see max_identifier_bytes in client.lua). An
+-- exactly-max identifier is accepted and round-trips through the identity
+-- record and the receipt's actor_identifier/anonymous_id snapshot; max+1 is
+-- rejected with the previous identity retained — never truncated, since
+-- truncation could collide distinct identities. Out-of-bounds config
+-- identities and a legacy oversized persisted anonymous ID fall back to the
+-- stored/fresh identity the same way any other invalid value does.
+local function test_identifier_byte_clamp_boundary()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local max_user = "u" .. string.rep("x", 511)
+	local over_user = "u" .. string.rep("x", 512)
+	local max_anon = "a" .. string.rep("y", 511)
+	local over_anon = "a" .. string.rep("y", 512)
+	assert_equal(#max_user, 512)
+	assert_equal(#over_user, 513)
+
+	local client = assert(sdk.new(config()))
+	-- exactly-max anonymous_id accepted; it persists to the identity record
+	assert_true(client:set_anonymous_id(max_anon))
+	assert_equal(client.anonymous_id, max_anon)
+	assert_equal(storage.load(identity_scope).anonymous_id, max_anon)
+	-- max+1 rejected; the previous identity is retained, not truncated
+	local ok, err = client:set_anonymous_id(over_anon)
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_anonymous_id")
+	assert_equal(client.anonymous_id, max_anon, "the previous anonymous_id must be retained")
+	assert_equal(storage.load(identity_scope).anonymous_id, max_anon)
+
+	-- exactly-max user_id accepted; max+1 rejected with the previous retained
+	assert_true(client:identify(max_user))
+	assert_equal(client.user_id, max_user)
+	ok, err = client:identify(over_user)
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_user_id")
+	assert_equal(client.user_id, max_user, "the previous user_id must be retained")
+
+	-- the receipt snapshots the accepted max-length identifiers verbatim and
+	-- they round-trip through the durable outbox (500 keeps it retained)
+	next_status = 500
+	assert_true(client:set_consent(true))
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1)
+	assert_equal(record.receipts[1].actor_identifier, max_user)
+	assert_equal(record.receipts[1].anonymous_id, max_anon)
+	local loaded = storage.load_consent_outbox(identity_scope)
+	assert_equal(loaded[1].actor_identifier, max_user, "a max-length actor must round-trip the outbox")
+
+	-- config-supplied identities over the bound fall back like any other
+	-- invalid config identity: user_id unset, anonymous_id from the store
+	local follower = assert(sdk.new(config({ user_id = over_user, anonymous_id = over_anon })))
+	assert_equal(follower.user_id, nil, "an out-of-bounds config user_id must be ignored")
+	assert_equal(follower.anonymous_id, max_anon,
+		"an out-of-bounds config anonymous_id must fall back to the stored identity")
+
+	-- a legacy oversized persisted anonymous ID (written before the clamp)
+	-- is replaced by a fresh identity and the record self-heals
+	assert_true(storage.save(identity_scope, { anonymous_id = over_anon }))
+	local healed = assert(sdk.new(config()))
+	assert_not_equal(healed.anonymous_id, over_anon)
+	assert_equal(#healed.anonymous_id, 36, "a fresh UUID must replace the oversized stored id")
+	assert_equal(storage.load(identity_scope).anonymous_id, healed.anonymous_id)
+	restore()
+	storage.reset()
+end
+
+-- The wedge the identifier clamp exists to prevent (GAP-075 follow-up to
+-- #30's SECURITY caveats): Defold's sys.save caps a record at ~512 KB and a
+-- failed consent-outbox write deliberately never evicts, so ONE receipt
+-- carrying an oversized host-supplied identifier used to fail the outbox
+-- write on every retry — the record stayed owed (dirty) forever and
+-- shutdown() wedged in consent_pending. Simulated with a size-capped
+-- sys.save standing in for the engine's record cap: (a) at the storage
+-- level an entry with an out-of-bounds actor still fails persistently (the
+-- wedge vector the unclamped acceptance path used to feed); (b) at the
+-- client level the clamp keeps such an identifier from ever entering, the
+-- outbox record stays byte-sane and writable, and shutdown() completes over
+-- the durably retained receipt.
+local function test_oversized_identifier_cannot_wedge_consent_teardown()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- Scaled-down stand-in for the engine's fixed save-record cap: a record
+	-- whose encoded size exceeds it fails to save, exactly like sys.save
+	-- refusing a > 512 KB table.
+	local record_cap = 4096
+	local plain_save = sys.save
+	sys.save = function(path, record)
+		if #json.encode(record) > record_cap then
+			return false
+		end
+		return plain_save(path, record)
+	end
+
+	-- (a) storage level: an entry with an oversized actor_identifier fails
+	-- the outbox write on EVERY attempt — a failed write never evicts, so an
+	-- unclamped acceptance path could never converge
+	local oversized_entry = {
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = string.rep("x", record_cap),
+		categories = { analytics = true },
+		decided_at = "2026-07-19T00:00:00Z",
+		idempotency_key = "receipt-oversized",
+	}
+	assert_equal(storage.save_consent_outbox(identity_scope, { oversized_entry }), nil,
+		"an oversized receipt must fail the durable write")
+	assert_equal(storage.save_consent_outbox(identity_scope, { oversized_entry }), nil,
+		"and keeps failing on retry — the write can never converge")
+	assert_true(stored_consent_outbox_record(stores) == nil,
+		"nothing may have been persisted for the oversized entry")
+
+	-- (b) client level: the clamp rejects the oversized identifier at
+	-- acceptance, so no receipt can ever carry it
+	local oversized_user = string.rep("x", record_cap)
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			callback(nil, nil, "token backend down")
+		end,
+	})))
+	local ok, err = client:identify(oversized_user)
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_user_id")
+	assert_equal(client.user_id, nil, "the oversized identifier must not enter")
+
+	-- the decision's receipt snapshots the in-bounds anonymous_id instead
+	-- and is durably retained (no token: delivery waits for the next launch)
+	assert_true(client:set_consent(true), "the outbox write must succeed with clamped identifiers")
+	assert_equal(client.consent_outbox_dirty, false)
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1)
+	assert_equal(record.receipts[1].actor_identifier, client.anonymous_id)
+	assert_true(#json.encode(record) <= record_cap, "the persisted outbox record stays byte-sane")
+
+	-- and teardown COMPLETES over the durable receipt instead of wedging in
+	-- consent_pending
+	assert_true(client:shutdown("app_final"),
+		"shutdown must not wedge in consent_pending when identifiers are clamped")
+	assert_equal(client.initialized, false)
+	restore()
+	storage.reset()
+end
+
 -- A receipt in flight when shutdown() tears the client down settles its own
 -- bookkeeping, but must NOT chain the next retained receipt onto the wire —
 -- the SDK is torn down; the remaining durable receipts re-send next launch.
@@ -4401,6 +4549,8 @@ local tests = {
 	test_outbox_identity_mismatch_dropped_mode_b_kept_mode_a,
 	test_set_consent_surfaces_receipt_persist_failure,
 	test_transient_outbox_save_failure_never_evicts,
+	test_identifier_byte_clamp_boundary,
+	test_oversized_identifier_cannot_wedge_consent_teardown,
 	test_no_receipt_chaining_after_shutdown,
 	test_schema_revision_header_on_batch_only,
 	test_schema_revision_override_and_disable,
