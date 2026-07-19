@@ -76,7 +76,8 @@ Two analytics auth modes; configure **exactly one** (plus one exception below):
 - **Mode A — `api_key`**: the publishable `sp_ingest_…` ingest key. It is
   **non-secret by design** — safe to embed client-side, used directly as the
   `Bearer`, never expires. This is the normal choice for a shipped game
-  client.
+  client. One platform-side limit matters for consent: a publishable key can
+  record consent **denials** but not **grants** — see the consent section.
 - **Mode B — `token_provider`**: an async function yielding a short-lived
   per-tenant **ingest JWT minted by your backend** (your backend holds the
   signing secret and binds the token to the current anonymous ID). Use this
@@ -172,6 +173,18 @@ bugs.
   delivery is consent-plane traffic — it stays permitted while analytics
   consent is denied or unknown, because the receipt documents the decision
   itself.
+- **Grants need a trusted credential (platform rule).** The ingest service
+  records **denial** receipts — `set_consent(false)` and the forced-minor
+  denial alike — from the publishable Mode A key, but a **grant** receipt
+  posted with a publishable key is rejected `403` (detail code
+  `consent_grant_requires_verified_credential`) and, like every non-transient
+  rejection, terminally dropped from the outbox: a public key cannot vouch
+  for a grant. Grants are recorded server-side only through a trusted
+  backend credential (the Mode B path, or your backend's own service-side
+  consent write). `set_consent(true)` still opens the **local** pipeline in
+  Mode A, but on a workspace that enforces server-side consent the server
+  keeps answering that actor's events with per-event `suppressed_no_consent`
+  until a trusted-path grant lands — plan your grant recording accordingly.
 - **Receipts before batches.** On each flush cycle, retained receipts are
   handed to the transport strictly **before** that cycle's event batch —
   sequencing (handoff order) only; the batch never waits for the receipt's
@@ -201,10 +214,16 @@ else
 end
 ```
 
-`set_consent` returns `true`, or `false` with `consent_persist_failed` (the
-durable identity write failed — call again to retry), `spool_purge_failed`, or
+`set_consent` returns `true`, or `false` with a code — and whether the
+decision applied depends on the code. On `consent_persist_failed` (the durable
+identity write failed — call again to retry) and
 `consent_outbox_persist_failed` (receipt not yet durably captured; the write
-retries automatically). The in-memory decision applies either way.
+retries automatically) the in-memory decision DID apply.
+`spool_purge_failed` is two-sided: on a **denial** it means the denial applied
+but the durable spool purge is still owed (retried automatically at later
+dispatch points); on a **re-grant** it means the grant was **not** applied —
+the persisted state stays denied until the purge lands — so retry
+`set_consent(true)` and do not proceed as if granted.
 
 ## Sending analytics events
 
@@ -301,10 +320,15 @@ crash.record_breadcrumb("menu.open")
 - **Fatal is never sampled**; non-fatal `emit` is sampled deterministically
   1-in-N (`sample_every`, default 10 — the first N−1 non-fatals of a process
   are dropped; set `1` or a custom `sampler` to send every one).
-- **Write-ahead durability**: every dispatched report is persisted to a
-  bounded per-app pending sidecar (8 records / 64 KB each / 384 KB total,
-  ~7-day TTL) before its send attempt and re-sent byte-identical on a later
-  launch until acknowledged (de-duplicated by `crash_id`).
+- **Write-ahead durability (best-effort)**: before its send attempt, every
+  dispatched report is persisted to a bounded per-app pending sidecar
+  (8 records / 64 KB each / 384 KB total, ~7-day TTL) and re-sent
+  byte-identical on a later launch until acknowledged (de-duplicated by
+  `crash_id`). When that durable write fails (storage quota/failure, an
+  oversized body, or a host without the save-file API), the report is
+  retained only in a bounded in-session memory fallback — still dispatched
+  and retryable in-session, but it does **not** survive process death;
+  `crash.snapshot().persist_failed` counts these.
   `crash.capture_previous()` runs a resend pass; `crash.resend_pending()`
   retries later in-session.
 - **No automatic Lua script-error capture**: wire your own error handler (e.g.
@@ -356,7 +380,12 @@ surface — no guessing from logs.
    - `s.enqueued` ≥ 1, `s.published` ≥ 1, and **`s.accepted` ≥ 1** — the
      server 202 body is parsed per event, so `accepted` counts events the
      server actually accepted, not just batches sent.
-   - `s.consent_recorded` ≥ 1 once the grant receipt is acknowledged.
+   - In Mode B, `s.consent_recorded` ≥ 1 once the grant receipt is
+     acknowledged. In Mode A do **not** expect that for a grant: the platform
+     accepts only denial receipts from a publishable key, so the grant
+     receipt is terminally rejected (surfaced via the `diagnostics` hook,
+     `scope = "consent"`) and the grant must be recorded server-side through
+     your backend (see the consent section).
    - Nonzero `s.rejected` / `s.suppressed` / `s.duplicates` mean per-event
      problems: check `s.last_event_issue` (a `status:code` string) and the
      `diagnostics` hook (`scope = "event"`, e.g. status
