@@ -51,6 +51,24 @@ known user. `get_anonymous_id()` returns the persisted anonymous ID so a host
 can hand it to its own backend at token-mint time; the SDK always sends, on the
 wire, the same anonymous ID it returns.
 
+Identifiers (`user_id` and `anonymous_id`, however supplied) must be non-empty
+strings of at most **512 bytes**. Oversized values are rejected exactly like
+empty or non-string input — never truncated, since truncation could collide
+distinct identities: `identify` returns `false, "invalid_user_id"` and
+`set_anonymous_id` returns `false, "invalid_anonymous_id"`, each keeping the
+previous identity, while an out-of-bounds config `anonymous_id`/`user_id` is
+ignored in favor of the stored or freshly generated identity (the same
+fallback as any other invalid config identity value). The bound is a
+persistence budget: identifiers are persisted verbatim in the durable identity
+record and in every retained consent receipt (`actor_identifier` plus the
+decision-time `anonymous_id` snapshot), and the clamp keeps those records far
+under Defold's ~512 KB save-file record cap even at the consent outbox's
+32-receipt worst case — while staying generous for legitimate identifiers
+(UUIDs, emails, opaque backend tokens). Records persisted before the bound
+existed self-heal at load: an oversized stored anonymous ID is replaced by a
+fresh one, and outbox receipts carrying oversized identifiers are dropped by
+the load-time sanitizer like any other malformed entry.
+
 ## Authentication modes
 
 The ingest endpoint accepts two credential kinds, and the SDK supports both.

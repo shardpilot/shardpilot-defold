@@ -1,5 +1,34 @@
 # Changelog
 
+### Unreleased
+
+<!-- Folded into the next "## vX.Y.Z" heading at release time; kept at a
+     deeper heading level so scripts/check_versions.sh keeps reading the
+     topmost RELEASED version from the first "## " heading. -->
+
+- **Host-supplied identifiers are clamped to 512 bytes at acceptance**
+  (GAP-075 code follow-up to the save-file-limit caveats documented in #30).
+  `identify(user_id)` and `set_anonymous_id(id)` reject identifiers over 512
+  bytes exactly like empty/non-string input (`invalid_user_id` /
+  `invalid_anonymous_id`, previous identity retained), and an out-of-bounds
+  config `anonymous_id`/`user_id` — or a legacy oversized persisted anonymous
+  ID — is ignored in favor of the stored or freshly generated identity.
+  Oversized input is rejected, never truncated: truncation could collide
+  distinct identities. Identifiers are persisted verbatim in the identity
+  record and in every retained consent receipt (`actor_identifier` plus the
+  decision-time `anonymous_id` snapshot), and the 32-entry consent outbox
+  deliberately has no byte budget or failed-write eviction — so before the
+  clamp a few oversized identifiers could push those records past Defold's
+  ~512 KB `sys.save` cap, persistently failing the outbox write and wedging
+  `shutdown()` in `consent_pending`. With the clamp the worst-case outbox
+  stays around ~46 KB and identity-record writes stay far under the cap.
+  Records written before the clamp existed self-heal at load: an oversized
+  persisted anonymous ID is replaced by a fresh identity, and outbox
+  receipts carrying oversized identifiers are dropped by the load-time
+  sanitizer (fail-safe, like any other malformed entry — such a receipt can
+  never be durably rewritten alongside new decisions), so a previously
+  wedged install becomes writable again on upgrade.
+
 ## v0.9.0 — 2026-07-18 — early alpha
 
 - **Batch ingest now declares the SDK's schema-set revision** (GAP-036,

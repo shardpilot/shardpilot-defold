@@ -123,8 +123,31 @@ local function copy_table(value, error_code)
 	return copied, nil
 end
 
+-- Host-supplied identifiers (user_id / anonymous_id — and therefore every
+-- consent receipt's actor_identifier and anonymous_id snapshot, which copy
+-- them) are accepted only up to this many bytes. The bound is a persistence
+-- budget, not a format rule: identifiers land VERBATIM in durable records
+-- written through Defold's save-file API — the identity record, and up to
+-- 32 retained consent receipts whose outbox deliberately has no byte budget
+-- or failed-write eviction of its own — and the engine caps a saved record
+-- at 512 KB, so before this clamp a few oversized identifiers could
+-- persistently fail those writes and wedge shutdown() in consent_pending.
+-- At 512 bytes the worst-case outbox (32 receipts x two clamped identifiers
+-- plus the fixed receipt fields) stays around ~46 KB, far under the cap and
+-- in line with the storage layer's other working budgets
+-- (max_spool_file_bytes, max_pending_total_bytes = 384 KB), while staying
+-- generous for real identifiers: UUIDs are 36 bytes, emails at most 254,
+-- opaque backend tokens a few hundred. Oversized input is REJECTED (same
+-- surface as empty/non-string identity), never truncated — truncation could
+-- collide distinct identities and mis-attribute events or consent decisions.
+-- The bound is defined once, in the storage layer next to the other
+-- persistence budgets: storage's outbox sanitizer enforces it on records
+-- written before the clamp existed (legacy oversized receipts are dropped at
+-- load), and this acceptance gate keeps new identifiers inside it.
+local max_identifier_bytes = storage.max_identifier_bytes
+
 local function valid_identity(value)
-	return type(value) == "string" and value ~= ""
+	return type(value) == "string" and value ~= "" and #value <= max_identifier_bytes
 end
 
 -- Both explicit denial flavors close the analytics pipeline identically. The
