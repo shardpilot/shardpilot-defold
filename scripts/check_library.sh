@@ -33,6 +33,10 @@ required_files=(
   test/test_sdk.lua
   test/test_crash.lua
   test/test_remote_config.lua
+  test/bob-harness/game.project
+  test/bob-harness/main/harness.collection
+  test/bob-harness/main/harness.script
+  test/bob-harness/input/game.input_binding
   docs/crash.md
   examples/minimal/README.md
   examples/minimal/main.script
@@ -43,6 +47,7 @@ required_files=(
   scripts/check_library.sh
   scripts/check_versions.sh
   scripts/package_release.sh
+  scripts/ci_bob_build.sh
   .github/workflows/ci.yml
 )
 

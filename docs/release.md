@@ -21,7 +21,14 @@ Manual Defold/Bob release check:
 java -jar bob.jar resolve build
 ```
 
-Bob is distributed by Defold through GitHub Releases under `bob/bob.jar`.
-Defold 1.12.0 and newer require OpenJDK 25. CI does not hardcode a Bob download
-URL in this wave because no deterministic approved Bob version is being
-published here.
+Bob is distributed by Defold through GitHub Releases under `bob/bob.jar` and
+through the `d.defold.com` archive addressed by engine sha1. Defold 1.12.0 and
+newer require OpenJDK 25.
+
+CI now runs this same resolve+build proof on every PR and push to `main`: the
+`bob-build` job calls `scripts/ci_bob_build.sh`, which pins the Defold version,
+engine sha1, and `bob.jar` sha256 (bump all three together, deliberately),
+packages the working tree with `scripts/package_release.sh`, serves the ZIP
+over localhost, and builds `test/bob-harness/` against it as a real library
+dependency. That is a build-time proof only — it does not start the engine or
+check runtime behavior.

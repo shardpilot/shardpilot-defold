@@ -1,0 +1,14 @@
+-- Engine-real build harness: bob must resolve these modules from the
+-- shardpilot-defold library dependency (the packaged working tree served
+-- over localhost by scripts/ci_bob_build.sh) and compile them. CI never
+-- executes this script — the bob-build lane proves dependency resolution
+-- and build-time compilation only, not runtime-in-engine behavior.
+local shardpilot = require "shardpilot.sdk"
+local shardpilot_crash = require "shardpilot.crash"
+local shardpilot_remote_config = require "shardpilot.remote_config"
+
+function init(self)
+	self.ok = shardpilot ~= nil
+		and shardpilot_crash ~= nil
+		and shardpilot_remote_config ~= nil
+end
