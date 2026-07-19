@@ -10,6 +10,10 @@ set -euo pipefail
 #   5. README.md               — the "the latest tag is `vX.Y.Z`:" mention
 #   6. README.md               — the pinned dependency URL (.../archive/refs/tags/vX.Y.Z.zip)
 #   7. docs/release.md         — the "(currently `vX.Y.Z` for both)" current-release mention
+#   8. .claude/skills/shardpilot-defold-integration/SKILL.md
+#                              — the "Version pin (CI-checked): ... `vX.Y.Z`." labeled pin line
+#   9. .claude/skills/shardpilot-defold-integration/SKILL.md
+#                              — the pinned dependency URL (.../archive/refs/tags/vX.Y.Z.zip)
 #
 # Default mode is a per-commit CI gate for in-tree MUTUAL CONSISTENCY: every
 # declaration above must name the same version; git tags are deliberately not
@@ -61,10 +65,22 @@ readme_dependency_version="$(sed -nE 's|^dependencies#0 = https://github\.com/sh
 release_doc_version="$(sed -nE 's/^.*\(currently `v([0-9]+\.[0-9]+\.[0-9]+)` for both\).*$/\1/p' docs/release.md)"
 [[ -n "$release_doc_version" ]] || { echo "docs/release.md current-release mention is not '... (currently \`vX.Y.Z\` for both)'" >&2; exit 1; }
 
+# The integration skill's version-pin claims. Only the labeled pin line and the
+# pinned dependency URL are matched — the skill's surrounding tag-lag prose is
+# deliberately NOT part of either pattern.
+skill_md=".claude/skills/shardpilot-defold-integration/SKILL.md"
+
+skill_pin_version="$(sed -nE 's/^Version pin \(CI-checked\): this skill matches shardpilot-defold `v([0-9]+\.[0-9]+\.[0-9]+)`\.$/\1/p' "$skill_md")"
+[[ -n "$skill_pin_version" ]] || { echo "$skill_md pin line is not 'Version pin (CI-checked): this skill matches shardpilot-defold \`vX.Y.Z\`.'" >&2; exit 1; }
+
+skill_dependency_version="$(sed -nE 's|^dependencies#0 = https://github\.com/shardpilot/shardpilot-defold/archive/refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)\.zip$|\1|p' "$skill_md")"
+[[ -n "$skill_dependency_version" ]] || { echo "$skill_md dependency URL is not 'dependencies#0 = .../archive/refs/tags/vX.Y.Z.zip'" >&2; exit 1; }
+
 if [[ "$lua_version" != "$project_version" || "$lua_version" != "$changelog_version" \
    || "$lua_version" != "$readme_status_version" || "$lua_version" != "$readme_status_report_version" \
    || "$lua_version" != "$readme_status_tag_version" || "$lua_version" != "$readme_latest_tag_version" \
-   || "$lua_version" != "$readme_dependency_version" || "$lua_version" != "$release_doc_version" ]]; then
+   || "$lua_version" != "$readme_dependency_version" || "$lua_version" != "$release_doc_version" \
+   || "$lua_version" != "$skill_pin_version" || "$lua_version" != "$skill_dependency_version" ]]; then
   {
     echo "version mismatch:"
     echo "  shardpilot/version.lua M.VERSION = $lua_version"
@@ -76,6 +92,8 @@ if [[ "$lua_version" != "$project_version" || "$lua_version" != "$changelog_vers
     echo "  README.md latest-tag mention     = v$readme_latest_tag_version"
     echo "  README.md dependency URL tag     = v$readme_dependency_version"
     echo "  docs/release.md current release  = v$release_doc_version"
+    echo "  SKILL.md version pin             = v$skill_pin_version"
+    echo "  SKILL.md dependency URL tag      = v$skill_dependency_version"
   } >&2
   exit 1
 fi

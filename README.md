@@ -165,6 +165,19 @@ client:shutdown("app_final")
 Most methods return `ok, err` so callers can branch on failures (e.g.
 `not_initialized`, `consent_pending`).
 
+## AI-assisted integration
+
+Integrating with an AI coding tool (Claude Code or similar)? This repo ships a
+customer-facing integration skill at
+[`.claude/skills/shardpilot-defold-integration/SKILL.md`](.claude/skills/shardpilot-defold-integration/SKILL.md)
+— point your tool at it for the install paths, credential rules, the
+consent-first contract, and a verify-your-integration checklist, all written
+against this SDK's source. Claude Code picks it up automatically when working
+inside this repository. The ShardPilot docs site (`docs.shardpilot.com`) is
+pre-launch and not yet live; once it launches it will also publish an
+`llms.txt` family for machine consumption — until then, this repository's
+README, `docs/`, and the skill above are the reference.
+
 ## Configuration
 
 `init(config)` / `new(config)` take a Lua table. Required: `ingest_url`,
