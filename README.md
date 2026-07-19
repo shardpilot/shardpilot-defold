@@ -16,8 +16,8 @@ not the platform boundary.
   surface may change before v1 with no backward-compatibility guarantee.
 - **Pre-launch.** The production ingest domain is **not provisioned** yet — use
   local/develop endpoints for evaluation.
-- **Version `0.9.0`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.9.0`; the `v0.9.0` tag
+- **Version `0.9.1`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.9.1`; the `v0.9.1` tag
   is published per [docs/release.md](docs/release.md).
 
 ## What it does
@@ -82,11 +82,11 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — the latest tag is `v0.9.0`:
+published tag's source archive — the latest tag is `v0.9.1`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.9.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.9.1.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
