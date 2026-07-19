@@ -20,17 +20,20 @@ project channel.
   in every other state. A grant whose identity-record persistence fails can
   spool within that session, but does not survive to a reload: the next
   launch finds no persisted grant and purges the record.
-- Durable storage is limited to six small, bounded, per-app records written
-  through Defold `sys.save`: the identity record (anonymous ID + consent
-  decision); the offline event spool described above; an outbox that retains
-  the SDK's own consent decisions until delivered, bounded to 32 entries
-  (oldest receipts are evicted first when it overflows, so repeated
-  undelivered decisions can displace older ones) though not byte-budgeted —
-  per-entry size scales with the host-supplied user identifier, so hosts
-  passing very large identifiers can hit the engine's save-file limits; the
-  last-known-good
-  remote-config cache; the crash opt-out settings record; and a bounded,
-  per-app, TTL'd crash-retry sidecar that holds only already-PII-scrubbed
+- Durable storage is limited to six per-app records written through Defold
+  `sys.save`, each bounded as noted: the identity record (anonymous ID +
+  consent decision — the identifier is persisted verbatim with no byte
+  clamp, so a host-supplied oversized anonymous ID can hit the engine's
+  save-file limits); the offline event spool described above (entry- and
+  byte-budgeted); an outbox that retains the SDK's own consent decisions
+  until delivered, bounded to 32 entries (oldest receipts are evicted first
+  when it overflows, so repeated undelivered decisions can displace older
+  ones) though not byte-budgeted — per-entry size scales with the
+  host-supplied user identifier, so hosts passing very large identifiers can
+  hit the engine's save-file limits; the last-known-good remote-config cache
+  (size-capped before it is persisted); the crash opt-out settings record (a
+  single boolean); and a per-app, TTL'd crash-retry sidecar with fixed
+  entry, per-report, and total byte caps, holding only already-PII-scrubbed
   crash reports (resent then cleared on success). No other file or
   browser/local-storage writes are made.
 - The SDK must not log tokens or full event payloads.
