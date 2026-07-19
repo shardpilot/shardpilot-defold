@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Verifies that the three in-tree version declarations agree:
+# Verifies that the in-tree version declarations agree:
 #   1. shardpilot/version.lua  — M.VERSION = "X.Y.Z"
 #   2. game.project            — version = X.Y.Z
 #   3. CHANGELOG.md            — topmost "## vX.Y.Z — ..." heading
+#   4. README.md               — the "- **Version `X.Y.Z`.**" Status line
+#   5. README.md               — the pinned dependency URL (.../archive/refs/tags/vX.Y.Z.zip)
 #
 # Default mode is a per-commit CI gate and deliberately does NOT look at git
 # tags: between releases the tree is legitimately ahead of the latest tag.
@@ -31,12 +33,21 @@ project_version="$(sed -nE 's/^version = ([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' game.pr
 changelog_version="$(grep -m 1 -E '^## ' CHANGELOG.md | sed -nE 's/^## v([0-9]+\.[0-9]+\.[0-9]+)( —.*)?$/\1/p')"
 [[ -n "$changelog_version" ]] || { echo "topmost CHANGELOG.md heading is not '## vX.Y.Z — ...'" >&2; exit 1; }
 
-if [[ "$lua_version" != "$project_version" || "$lua_version" != "$changelog_version" ]]; then
+readme_status_version="$(sed -nE 's/^- \*\*Version `([0-9]+\.[0-9]+\.[0-9]+)`\.\*\*.*$/\1/p' README.md)"
+[[ -n "$readme_status_version" ]] || { echo "README.md Status line is not '- **Version \`X.Y.Z\`.**'" >&2; exit 1; }
+
+readme_dependency_version="$(sed -nE 's|^dependencies#0 = https://github\.com/shardpilot/shardpilot-defold/archive/refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)\.zip$|\1|p' README.md)"
+[[ -n "$readme_dependency_version" ]] || { echo "README.md dependency URL is not 'dependencies#0 = .../archive/refs/tags/vX.Y.Z.zip'" >&2; exit 1; }
+
+if [[ "$lua_version" != "$project_version" || "$lua_version" != "$changelog_version" \
+   || "$lua_version" != "$readme_status_version" || "$lua_version" != "$readme_dependency_version" ]]; then
   {
     echo "version mismatch:"
     echo "  shardpilot/version.lua M.VERSION = $lua_version"
     echo "  game.project version             = $project_version"
     echo "  CHANGELOG.md topmost heading     = v$changelog_version"
+    echo "  README.md Status line            = $readme_status_version"
+    echo "  README.md dependency URL tag     = v$readme_dependency_version"
   } >&2
   exit 1
 fi
