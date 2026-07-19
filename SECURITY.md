@@ -15,8 +15,11 @@ project channel.
 - Client tokens are memory-only.
 - The in-memory event queue is bounded. A bounded, per-app offline event spool
   additionally persists undeliverable event envelopes across restarts; it is
-  written only under a persisted analytics consent grant, is loaded at launch
-  only from a persisted grant, and is purged fail-closed in every other state.
+  written only while analytics consent is currently granted, is loaded at
+  launch only when a persisted grant is on record, and is purged fail-closed
+  in every other state. A grant whose identity-record persistence fails can
+  spool within that session, but does not survive to a reload: the next
+  launch finds no persisted grant and purges the record.
 - Durable storage is limited to six small, bounded, per-app records written
   through Defold `sys.save`: the identity record (anonymous ID + consent
   decision); the offline event spool described above; a bounded outbox that
