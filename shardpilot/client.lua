@@ -1143,6 +1143,7 @@ function Client:set_consent(decision)
 		return false, "invalid_consent"
 	end
 	local granted = next_state == "granted"
+	local state_changed = self.consent_state ~= next_state
 	-- Revocation cleanup completes before a new grant takes effect. The
 	-- purge-owed flag is memory-only: if a grant were applied (and persisted)
 	-- while the purge of an earlier revocation is still owed, a relaunch
@@ -1154,6 +1155,13 @@ function Client:set_consent(decision)
 		return false, "spool_purge_failed"
 	end
 	self.consent_state = next_state
+	if state_changed and self.experiments then
+		-- Every consent TRANSITION opens a new consent epoch: responses
+		-- dispatched before it must not install their constructive half
+		-- (destructive directives still land — the R22 partition). A
+		-- repeated same-state call is not a transition and fences nothing.
+		self.experiments.consent_epoch = self.experiments.consent_epoch + 1
+	end
 	if granted and self.experiments then
 		-- Purge/denied-restore re-arm intents materialize AT THE GRANT:
 		-- serving resumes this instant, so the replacement snapshots

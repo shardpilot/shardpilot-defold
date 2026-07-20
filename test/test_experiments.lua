@@ -3442,9 +3442,14 @@ local function test_rotation_cancels_owed_writes()
 	fetch(client, "exp-checkout")
 
 	-- A refresh write fails (owed), then the subject re-mints: the write's
-	-- source data dies with the rotation — the retired record must keep
-	-- its LAST durable state, never be reshaped from another subject's
-	-- memory or deleted by a decayed intent.
+	-- source data dies with the rotation — the retired record is never
+	-- RESHAPED from another subject's memory (the owed version-4 refresh
+	-- must not land), and the remint's own DECISIVE old-scope drops clean
+	-- it instead: the server rejected the subject's grammar, so a failed
+	-- identity persist must not let a relaunch under the restored old
+	-- subject serve the rejected subject's assignments. (Flipped from the
+	-- pre-R23 "keeps its last durable state" pin — the D23-7 tombstone
+	-- rule supersedes it.)
 	state.fail_save = function(path)
 		return fail_experiment_saves(path)
 	end
@@ -3475,9 +3480,8 @@ local function test_rotation_cancels_owed_writes()
 	client:update(0.016)
 	client:update(0.016)
 	local record = storage.load_experiments(client.config)
-	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
-		"the retired record keeps its last durable state")
-	assert_equal(record.entries["exp-checkout"].variant_key, "treatment")
+	assert_true(record == nil or record.entries["exp-checkout"] == nil,
+		"the remint's decisive old-scope drops clean the retired record")
 	restore()
 end
 
@@ -6810,6 +6814,395 @@ function extra_tests.test_invalid_wire_version_is_malformed()
 	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
 end
 
+function extra_tests.test_consent_epoch_fences_late_responses()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- A fetch goes out under grant; consent is revoked AND re-granted while
+	-- it is in flight. The current-state check alone reads granted again —
+	-- the dispatch-time consent epoch must fence the constructive half.
+	local held = {}
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	local late = nil
+	client:fetch_experiment_assignment("exp-checkout", function(value)
+		late = value
+	end)
+	responder = nil
+	assert_equal(#held, 1)
+	assert_true(client:set_consent(false))
+	assert_true(client:set_consent(true))
+	held[1](nil, nil, { status = 200, response = assignment_body({
+		version = 4, variant_key = "control",
+	}) })
+	assert_true(late ~= nil and late.ok == false
+		and late.error == "consent_changed",
+		"the late response answers closed across the consent transition")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the pre-revocation fetch installs nothing after deny+re-grant")
+
+	-- The destructive half still lands (the partition pin): a kill riding
+	-- the same window withdraws the assignment durably.
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	client:fetch_experiment_assignment("exp-checkout", function() end)
+	responder = nil
+	assert_equal(#held, 2)
+	assert_true(client:set_consent(false))
+	assert_true(client:set_consent(true))
+	held[2](nil, nil, { status = 200, response = not_assigned_body("kill_switch") })
+	assert_nil(client:experiment_variant("exp-checkout"),
+		"the destructive directive still lands across the transition")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_spool_shadow_never_masks_unreadable()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	assert_true(client:track("filler-host-event"))
+	-- The batch spools durably: the DISK and the in-runtime shadow both
+	-- hold it.
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	-- The sentinel lands with the RECORD store down: marker armed; no
+	-- experiment facts are spooled, so the spool keeps its (clean) state.
+	advance_seconds(2)
+	state.fail_save = fail_experiment_saves
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	state.fail_save = nil
+	next_status = 200
+	next_response_body = nil
+
+	-- A PRIOR process's leftover: the disk spool gains a pre-sentinel
+	-- withdrawn fact this runtime never saw (fresh table — the in-process
+	-- shadow keeps the old, clean object).
+	local spool_path = nil
+	for key, stored in pairs(stores) do
+		if key:match("/spool$") and type(stored) == "table"
+			and type(stored.events) == "table" then
+			spool_path = key
+		end
+	end
+	assert_true(spool_path ~= nil, "the durable spool was staged")
+	local old_spool = stores[spool_path]
+	local sample = old_spool.events[1]
+	assert_true(type(sample) == "table")
+	local planted = {}
+	for k, v in pairs(sample) do
+		planted[k] = v
+	end
+	planted.event_id = "evt-condemned-leftover"
+	planted.event_name = "experiment_exposure"
+	local new_events = { planted }
+	for i = 1, #old_spool.events do
+		new_events[#new_events + 1] = old_spool.events[i]
+	end
+	stores[spool_path] = { events = new_events,
+		retry_after_until_ms = old_spool.retry_after_until_ms }
+
+	-- The spool READ throws while the shadow exists: a same-runtime
+	-- sibling client's init must read UNPROVEN, not the shadow's clean
+	-- snapshot — or the marker retires over the unread withdrawn fact.
+	local saved_load = sys.load
+	sys.load = function(path)
+		if path:match("/spool$") then
+			error("io_error")
+		end
+		return saved_load(path)
+	end
+	local second = assert(sdk.new(config()))
+	second:update(0.016)
+	second:update(0.016)
+	local marker_path = nil
+	for key in pairs(stores) do
+		if key:match("/experiments%-clear$") then
+			marker_path = key
+		end
+	end
+	assert_true(marker_path ~= nil and type(stores[marker_path]) == "table"
+		and stores[marker_path].stamp ~= nil,
+		"an unreadable spool is unproven even with a shadow — the marker survives")
+	assert_true(second.condemned_spool_pending == true,
+		"the unproven-cleanliness debt is recorded")
+
+	-- The heal: the surviving marker condemns the leftover at the next
+	-- readable launch.
+	sys.load = saved_load
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			assert_true(not requests[i].body:find("experiment_exposure", 1, true),
+				"the surviving marker condemned the leftover fact")
+		end
+	end
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_null_not_assigned_version_is_malformed()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- On null→nil decoders a PRESENT-NULL version is indistinguishable
+	-- from absent without the raw-body scan: it must read as malformed,
+	-- never as the authoritative drop path.
+	next_response_body = '{"assigned":false,"version":null,'
+		.. '"reason":"kill_switch",'
+		.. '"boundary":{"assignment_unit":"client_id"}}'
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.from_cache,
+		"a present-null version is malformed, never a drop")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the cached assignment is retained")
+end
+
+function extra_tests.test_sentinel_preserves_owed_post_dispatch_write()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body({ experiment_key = "exp-a" })
+	fetch(client, "exp-a")
+
+	-- The sentinel's request goes out...
+	local held = {}
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	client:fetch_experiment_assignment("exp-a", function() end)
+	responder = nil
+	assert_equal(#held, 1)
+
+	-- ...and AFTER its dispatch a fresh authorized assignment lands whose
+	-- install save FAILS: the write is owed, its only source in memory.
+	advance_seconds(1)
+	state.fail_save = fail_experiment_saves
+	next_response_body = assignment_body({
+		experiment_key = "exp-b", variant_key = "treatment-b",
+	})
+	fetch(client, "exp-b")
+	assert_equal(client:experiment_variant("exp-b"), "treatment-b")
+
+	-- The sentinel arrives (record store still down: the clear is owed and
+	-- the marker persists). The post-dispatch survivor's owed write must
+	-- ride out the wipe.
+	next_response_body = nil
+	held[1](nil, nil, { status = 403,
+		response = json.encode({ error = "experiment real-subject assignment is disabled" }) })
+	state.fail_save = nil
+
+	-- The store heals: the clear lands against exp-a, and exp-b's owed
+	-- write lands from its preserved snapshot.
+	client:update(0.016)
+	client:update(0.016)
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-a"),
+		"the sentinel withdrew the pre-dispatch assignment")
+	assert_equal(relaunch:experiment_variant("exp-b"), "treatment-b",
+		"the post-dispatch survivor's owed write landed durably")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_invalid_cached_version_never_restores()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- On-disk corruption: sibling entries whose versions fail the positive-
+	-- integer wire grammar. They must drop at load; the valid one survives.
+	local record_path = nil
+	for key, stored in pairs(stores) do
+		if key:match("/experiments$") and type(stored) == "table"
+			and type(stored.entries) == "table"
+			and stored.entries["exp-checkout"] then
+			record_path = key
+		end
+	end
+	assert_true(record_path ~= nil, "the durable record was staged")
+	local old = stores[record_path]
+	local held_entry = old.entries["exp-checkout"]
+	local function corrupt_copy(version, variant)
+		local out = {}
+		for k, v in pairs(held_entry) do
+			out[k] = v
+		end
+		out.version = version
+		out.variant_key = variant
+		return out
+	end
+	stores[record_path] = {
+		scope = old.scope,
+		entries = {
+			["exp-checkout"] = held_entry,
+			["exp-neg"] = corrupt_copy(-1, "neg"),
+			["exp-frac"] = corrupt_copy(2.5, "frac"),
+		},
+	}
+
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_equal(relaunch:experiment_variant("exp-checkout"), "treatment",
+		"the valid sibling restores")
+	assert_nil(relaunch:experiment_variant("exp-neg"),
+		"a negative cached version never restores live")
+	assert_nil(relaunch:experiment_variant("exp-frac"),
+		"a fractional cached version never restores live")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_unreadable_record_keeps_whole_clear_owed()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body({ experiment_key = "exp-a" })
+	fetch(client, "exp-a")
+
+	-- The sentinel's request goes out; a post-dispatch sibling assignment
+	-- lands DURABLY (a survivor by the dispatch-bound rule).
+	local held = {}
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	client:fetch_experiment_assignment("exp-a", function() end)
+	responder = nil
+	assert_equal(#held, 1)
+	advance_seconds(1)
+	next_response_body = assignment_body({
+		experiment_key = "exp-b", variant_key = "treatment-b",
+	})
+	fetch(client, "exp-b")
+
+	-- The record READ starts throwing; the sentinel arrives. The owed
+	-- whole-record clear must NOT blind-wipe the file it cannot read — the
+	-- unreadable disk holds the post-dispatch survivor.
+	local saved_load = sys.load
+	sys.load = function(path)
+		if path:match("/experiments$") then
+			error("io_error")
+		end
+		return saved_load(path)
+	end
+	next_response_body = nil
+	held[1](nil, nil, { status = 403,
+		response = json.encode({ error = "experiment real-subject assignment is disabled" }) })
+
+	-- The read heals: the partition runs on real evidence — the covered
+	-- entry drops, the survivor stays, and the marker retires.
+	sys.load = saved_load
+	client:update(0.016)
+	client:update(0.016)
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-a"),
+		"the sentinel withdrew the pre-dispatch assignment")
+	assert_equal(relaunch:experiment_variant("exp-b"), "treatment-b",
+		"the post-dispatch survivor was never blind-cleared")
+	local marker_path = nil
+	for key in pairs(stores) do
+		if key:match("/experiments%-clear$") then
+			marker_path = key
+		end
+	end
+	assert_true(marker_path == nil or type(stores[marker_path]) ~= "table"
+		or stores[marker_path].stamp == nil,
+		"the settled clear retired the marker")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_remint_tombstones_old_scope_durably()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- The grammar sentinel forces a re-mint whose IDENTITY persist fails:
+	-- the durable identity still names the OLD subject, so the old scope's
+	-- record must be tombstoned durably or a relaunch serves the very
+	-- assignments the server just rejected. (The re-mint retry answers
+	-- transient so no new-scope record replaces the file.)
+	state.fail_save = function(path)
+		return path:match("/identity$") ~= nil
+	end
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = json.encode({
+				error = "experiment metadata must use synthetic local-safe identifiers only",
+			}) })
+		else
+			callback(nil, nil, { status = 503, response = "{}" })
+		end
+		return true
+	end
+	fetch(client, "exp-checkout")
+	responder = nil
+	state.fail_save = nil
+	client:update(0.016)
+
+	-- Process death: the relaunch restores the OLD subject (its identity
+	-- write failed) — and must find the old record tombstoned.
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-checkout"),
+		"the rejected subject's assignment never survives the re-mint")
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -6981,6 +7374,13 @@ local tests = {
 	extra_tests.test_stale_epoch_kill_still_lands_durably,
 	extra_tests.test_unreadable_demotion_keeps_clear_owed,
 	extra_tests.test_invalid_wire_version_is_malformed,
+	extra_tests.test_consent_epoch_fences_late_responses,
+	extra_tests.test_spool_shadow_never_masks_unreadable,
+	extra_tests.test_null_not_assigned_version_is_malformed,
+	extra_tests.test_sentinel_preserves_owed_post_dispatch_write,
+	extra_tests.test_invalid_cached_version_never_restores,
+	extra_tests.test_unreadable_record_keeps_whole_clear_owed,
+	extra_tests.test_remint_tombstones_old_scope_durably,
 }
 
 for _, test in ipairs(tests) do

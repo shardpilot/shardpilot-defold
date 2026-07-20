@@ -660,11 +660,16 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 			}, { authoritative = true, new_entry = new_entry }
 		end
 		if decoded.assigned == false then
-			if decoded.version ~= nil and not valid_wire_version(decoded.version) then
+			if (decoded.version ~= nil and not valid_wire_version(decoded.version))
+				or (decoded.version == nil
+					and body_field_is_null(body_scan, "version")) then
 				-- A PRESENT version failing the wire grammar (negative,
 				-- fractional, NaN, or mistyped) is a garbled answer: it
 				-- must not execute the authoritative durable drop below —
-				-- the same rule as an unknown reason. Absent stays fine
+				-- the same rule as an unknown reason. A PRESENT-NULL
+				-- version is the same class on null→nil decoders (the
+				-- raw-body top-level presence scan restores it, exactly
+				-- like the reason and scope-echo scans). Absent stays fine
 				-- (the reason-only shapes carry none).
 				return serve_entry_or_fail(entry, "malformed_response",
 					requested_attributes), { transient = true }
@@ -914,6 +919,12 @@ function M.new(config, deps)
 		-- was already in flight when the latch landed.
 		auth_blocked = false,
 		auth_epoch = 0,
+		-- Counts consent-state TRANSITIONS (the client bumps it on every
+		-- actual state change): a response whose dispatch-time epoch went
+		-- stale raced a consent change — the deny→re-grant window
+		-- included, where the plain current-state check reads granted
+		-- again — and its constructive half must not install.
+		consent_epoch = 0,
 		-- Revalidation cadence state.
 		revalidate_at_ms = nil,
 		retry_after_ms = nil,
@@ -1056,6 +1067,12 @@ end
 
 function Experiments:adopt_minted_subject_id()
 	local minted = M.mint_subject_id()
+	local old_subject = self:current_subject_id()
+	local old_scope = old_subject and self:scope_for(old_subject) or nil
+	local retired_entries = {}
+	for key, held in pairs(self.entries) do
+		retired_entries[key] = held
+	end
 	-- A new subject is a new cache scope AND a new exposure subject:
 	-- assignments fetched for the old subject must neither serve nor
 	-- expose GOING FORWARD, and the session's exposure de-dupe resets —
@@ -1081,6 +1098,34 @@ function Experiments:adopt_minted_subject_id()
 	for pending_composite, pending in pairs(self.durable_pending) do
 		if not pending.drop then
 			self.durable_pending[pending_composite] = nil
+		end
+	end
+	-- The OLD scope's durable record must not outlive the rotation as
+	-- reload truth: the server just rejected this subject's grammar, but
+	-- the identity persist below is best-effort — if it FAILS, a relaunch
+	-- restores the OLD subject and would serve the very assignments the
+	-- re-mint retired. Mint decisive per-key DROPS against the old scope
+	-- (stamped above each entry, rollback-proof) — they land through the
+	-- foreign-scope drop retries whether or not the identity write
+	-- succeeds (a healthy remint's old record is dead weight anyway),
+	-- leaving only the both-writes-failed storage-dead exit window as the
+	-- documented residual.
+	if old_scope then
+		local now_ms = clock.unix_ms()
+		for key, held in pairs(retired_entries) do
+			local held_at = type(held) == "table"
+				and type(held.fetched_at_ms) == "number"
+				and held.fetched_at_ms or 0
+			local drop_as_of = now_ms
+			if held_at >= drop_as_of then
+				drop_as_of = held_at + 1
+			end
+			self.durable_pending[old_scope .. scope_separator .. key] = {
+				key = key,
+				scope = old_scope,
+				as_of = drop_as_of,
+				drop = true,
+			}
 		end
 	end
 	if not self.deps.store_subject_id(minted) then
@@ -1278,11 +1323,19 @@ end
 -- the intent (a later ordinary fail-closed latch cancels owed WRITES but
 -- must let owed authoritative DROPS land).
 function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retry)
+	local composite = scope .. scope_separator .. experiment_key
+	local prior = self.durable_pending[composite]
 	local entry = self.entries[experiment_key]
+	if entry == nil and prior ~= nil and not prior.drop
+		and prior.entry ~= nil then
+		-- A sentinel wiped this post-dispatch survivor from memory while
+		-- its install save was still owed: the intent carries the entry
+		-- snapshot, and the write lands from it.
+		entry = prior.entry
+	end
 	local record, record_miss = self:durable_record_for(scope)
 	local stored = record.entries[experiment_key]
 	local as_of = type(as_of_ms) == "number" and as_of_ms or 0
-	local composite = scope .. scope_separator .. experiment_key
 	if entry then
 		if stored and type(stored.fetched_at_ms) == "number"
 			and stored.fetched_at_ms > entry.fetched_at_ms then
@@ -1342,7 +1395,6 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 			self.durable_pending[composite] = nil
 			return true
 		end
-		local prior = self.durable_pending[composite]
 		local deciding = not is_retry
 			or (prior ~= nil and prior.undecided == true)
 		local stored_at = type(stored.fetched_at_ms) == "number"
@@ -1440,6 +1492,10 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 		scope = scope,
 		as_of = as_of,
 		drop = entry == nil,
+		-- A snapshot-backed write (its key absent from live memory) keeps
+		-- its source data across failed retries.
+		entry = (entry ~= nil and self.entries[experiment_key] == nil)
+			and entry or nil,
 	}
 	self:diagnose("persist_failed", "cache")
 	return false
@@ -1652,7 +1708,18 @@ function Experiments:retry_owed_clear()
 	local clear_as_of = type(self.durable_clear_pending) == "number"
 		and self.durable_clear_pending or 0
 	local clear_scope = self.durable_clear_scope
-	local record = storage.load_experiments(self.config)
+	local record, record_miss = storage.load_experiments(self.config)
+	if record == nil and record_miss == "unreadable" then
+		-- The record could not be READ: nothing is proved, so nothing may
+		-- be consumed (the demotion rule, applied to the whole-record
+		-- form). The old blind whole-file clear here would delete a
+		-- POST-SENTINEL sibling assignment the dispatch-bound partition
+		-- exists to preserve — and then retire the marker over that loss.
+		-- The clear stays owed and armed; only a readable pass partitions
+		-- survivors, and a still-unreadable store keeps the state honest
+		-- (has_owed_durable_sync true, marker held).
+		return
+	end
 	if record and clear_scope and record.scope ~= clear_scope then
 		-- Another scope's write replaced the condemned record wholesale:
 		-- the clear's target no longer exists, and a sentinel for one
@@ -1678,7 +1745,18 @@ function Experiments:retry_owed_clear()
 	end
 	if not survivors then
 		if storage.clear_experiments(self.config) then
-			self.durable_pending = {}
+			-- The cleared file settles the owed DROPS (their stored
+			-- targets are gone with it) — but a SNAPSHOT-BACKED write is a
+			-- post-dispatch survivor whose landing is still owed: the
+			-- sentinel's clear never covered it, and wiping its intent
+			-- here would lose the authorized assignment the dispatch-bound
+			-- partition preserved through the memory wipe. It stays owed
+			-- and lands on this same sync pass.
+			for pending_composite, pending in pairs(self.durable_pending) do
+				if pending.drop or pending.entry == nil then
+					self.durable_pending[pending_composite] = nil
+				end
+			end
 			self:settle_owed_clear()
 		end
 		return
@@ -2198,6 +2276,26 @@ function Experiments:apply_sentinel_withdrawal(scope, resolved_at_ms, dispatched
 			withdrawn_stamp_max = held.fetched_at_ms
 		end
 	end
+	-- Owed WRITE intents partition by the same dispatch bound as
+	-- everything else. A POST-DISPATCH entry whose install save failed is
+	-- a survivor whose ONLY copy lives in memory: wiping it below would
+	-- leave the intent source-less and the durable-sync retry would decay
+	-- it into a drop — silently losing the post-sentinel authorized state
+	-- the partition exists to preserve. Snapshot the live entry INTO the
+	-- intent (the retry lands the write from it). Pre-dispatch owed
+	-- writes are withdrawn state and cancel, the ordinary latch's rule.
+	for pending_composite, pending in pairs(self.durable_pending) do
+		if not pending.drop then
+			local live = self.entries[pending.key]
+			if pending.scope == scope and pending.entry == nil
+				and live ~= nil and type(live.fetched_at_ms) == "number"
+				and live.fetched_at_ms > sentinel_dispatch_bound then
+				pending.entry = live
+			elseif pending.entry == nil then
+				self.durable_pending[pending_composite] = nil
+			end
+		end
+	end
 	self.entries = {}
 	-- The sentinel withdraws the assignments AND their subject-fact
 	-- keys outright: owed exposure snapshots carry those keys and
@@ -2637,6 +2735,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	-- at install time.
 	local scope = self:scope_for(subject)
 	local auth_epoch = self.auth_epoch
+	local consent_epoch = self.consent_epoch
 	local entry = self.entries[experiment_key]
 
 	local normalized_attributes, dropped
@@ -2707,6 +2806,15 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		-- nothing re-mints, and the caller receives the refusal — never a
 		-- healthy assignment fetched under a consent that no longer holds.
 		local refusal_now = consent_refusal(self.deps.consent())
+		if refusal_now == nil and consent_epoch ~= self.consent_epoch then
+			-- The plane LOOKS open, but the consent epoch moved while this
+			-- request was in flight: a deny→re-grant raced the response,
+			-- and the current-state check alone would install (serve,
+			-- expose, persist) an assignment fetched under a consent that
+			-- was since revoked. Same partition as the refusal below —
+			-- constructive suppressed, destructive still lands.
+			refusal_now = "consent_changed"
+		end
 		if refusal_now then
 			-- The plane is closed, but the request was DISPATCHED under
 			-- grant: a destructive directive in this answer (kill switch,

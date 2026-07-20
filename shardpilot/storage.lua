@@ -863,30 +863,30 @@ end
 function M.load_spool(scope)
 	local ns = spool_namespace(scope)
 	local record = nil
-	local read_failed = false
 	local path = save_path(ns, "spool")
 	if path then
 		local ok, loaded = pcall(sys.load, path)
 		if ok and type(loaded) == "table" then
 			record = loaded
 		elseif not ok then
-			read_failed = true
+			-- The STORE errored on the read: the spool's DURABLE content is
+			-- UNKNOWN, not proven empty — and the in-process shadow must
+			-- NOT stand in for it (the same rule as the experiments
+			-- record): the shadow is this runtime's last successful write,
+			-- while the file may hold facts it never saw, so a
+			-- shadow-backed answer would let an armed condemnation marker
+			-- retire off a process-local snapshot. The collapse to an
+			-- empty list stands for flow (nothing can be re-sent from an
+			-- unreadable file); callers that must prove spool CLEANLINESS
+			-- — the condemnation-marker retire rule — read the third value
+			-- and treat the launch as unproven instead of clean.
+			return {}, nil, "unreadable"
 		end
 	end
 	if record == nil then
 		record = spool_memory[ns]
 	end
 	if type(record) ~= "table" then
-		if read_failed then
-			-- The STORE errored on the read and no in-process shadow backs
-			-- it: the spool's content is UNKNOWN, not proven empty. The
-			-- collapse to an empty list stands for flow (nothing can be
-			-- re-sent from an unreadable file), but callers that must
-			-- prove spool CLEANLINESS — the experiments condemnation-
-			-- marker retire rule — read the third value and treat the
-			-- launch as unproven instead of clean.
-			return {}, nil, "unreadable"
-		end
 		return {}, nil
 	end
 	return sanitize_spool_events(record.events), sanitize_deadline(record.retry_after_until_ms)
@@ -1290,6 +1290,17 @@ local function valid_subject_fact_key(value)
 	return value:match("^sfk1_[0-9a-f]+$") ~= nil
 end
 
+-- The positive wire grammar for an experiment version (kept in sync with
+-- shardpilot/experiments.lua's valid_wire_version — same no-cycle rule as
+-- the fact-key grammar above): a positive, finite integer. A cached entry
+-- restored with a garbled version would go LIVE and stamp every emitted
+-- fact with an invalid experiment_version, so non-conforming entries drop
+-- at load (greenfield store: no legacy tolerance needed).
+local function valid_wire_version(value)
+	return type(value) == "number" and value > 0 and value < math.huge
+		and value % 1 == 0
+end
+
 -- Keep only entries that are complete, well-formed assignment records, copied
 -- down to the known fields. Anything else — a corrupt file, a truncated entry,
 -- a garbled field — is dropped rather than served or crashed on.
@@ -1303,7 +1314,7 @@ local function sanitize_experiment_entries(entries)
 			and type(entry) == "table"
 			and type(entry.assignment_key) == "string" and entry.assignment_key ~= ""
 			and type(entry.variant_key) == "string" and entry.variant_key ~= ""
-			and type(entry.version) == "number"
+			and valid_wire_version(entry.version)
 			and type(entry.assignment_unit) == "string" and entry.assignment_unit ~= ""
 			and (entry.assignment_unit ~= "client_id"
 				or valid_subject_fact_key(entry.subject_fact_key))
