@@ -1083,7 +1083,7 @@ local function test_exposure_auto_emit_once_with_deterministic_id()
 		"the envelope identity stays the standard anonymous id")
 	local subject = client.experiments_client_id
 	assert_equal(fact.event_id, experiments.exposure_event_id(
-		client.experiments.session_marker, subject, "exp-checkout", 3, fixture_assignment_key, 0),
+		client.experiments.session_marker, subject, "exp-checkout", 3, 0),
 		"the exposure event id is the deterministic derivation")
 
 	-- Re-fetching the same assignment does not re-emit.
@@ -1099,23 +1099,23 @@ local function test_exposure_auto_emit_once_with_deterministic_id()
 	assert_true(rearmed[2].event_id ~= rearmed[1].event_id,
 		"a re-arm derives a distinct id")
 	assert_equal(rearmed[2].event_id, experiments.exposure_event_id(
-		client.experiments.session_marker, subject, "exp-checkout", 3, fixture_assignment_key, 1))
+		client.experiments.session_marker, subject, "exp-checkout", 3, 1))
 end
 
 local function test_exposure_event_id_derivation_is_stable()
 	local subject = "spcid_" .. string.rep("f", 32)
-	local a = experiments.exposure_event_id("marker", subject, "exp", 3, fixture_assignment_key, 0)
-	local b = experiments.exposure_event_id("marker", subject, "exp", 3, fixture_assignment_key, 0)
+	local a = experiments.exposure_event_id("marker", subject, "exp", 3, 0)
+	local b = experiments.exposure_event_id("marker", subject, "exp", 3, 0)
 	assert_equal(a, b, "the same tuple derives the same id")
 	assert_match(a, "^%x+%-%x+%-%x+%-%x+%-%x+$")
-	assert_true(a ~= experiments.exposure_event_id("marker", subject, "exp", 3, fixture_assignment_key, 1),
+	assert_true(a ~= experiments.exposure_event_id("marker", subject, "exp", 3, 1),
 		"the arm counter varies the id")
-	assert_true(a ~= experiments.exposure_event_id("marker", subject, "exp", 4, fixture_assignment_key, 0),
+	assert_true(a ~= experiments.exposure_event_id("marker", subject, "exp", 4, 0),
 		"the version varies the id")
-	assert_true(a ~= experiments.exposure_event_id("other", subject, "exp", 3, fixture_assignment_key, 0),
+	assert_true(a ~= experiments.exposure_event_id("other", subject, "exp", 3, 0),
 		"the session marker varies the id")
 	assert_true(a ~= experiments.exposure_event_id("marker", "spcid_" .. string.rep("0", 32),
-		"exp", 3, fixture_assignment_key, 0),
+		"exp", 3, 0),
 		"the subject varies the id")
 end
 
@@ -1689,6 +1689,234 @@ local function test_session_renewal_rearms_exposure()
 	assert_equal(#queued_events(client, "experiment_exposure"), 2)
 end
 
+-- ── round-2 regressions ───────────────────────────────────────────────────────
+
+local function test_regenerated_assignment_key_does_not_reexpose()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+
+	-- The same (experiment, version, subject) tuple answering with a
+	-- REGENERATED assignment key is still the same exposure tuple: no
+	-- over-counting.
+	next_response_body = assignment_body({
+		assignment_key = "asgn_" .. string.rep("f", 32),
+	})
+	fetch(client, "exp-checkout")
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 1,
+		"a regenerated assignment key must not re-expose the same tuple")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the refreshed assignment still serves")
+end
+
+local function test_missing_fact_key_skips_facts_and_subject_never_egresses()
+	reset()
+	local client = granted_client()
+	-- A synthetic-unit answer (or any answer without the server-minted
+	-- subject-fact key): the assignment applies locally, but NO fact may be
+	-- emitted — the SDK-minted subject id never rides the analytics plane
+	-- and there is no server-safe key to send instead.
+	next_response_body = json.encode({
+		version = 3,
+		assigned = true,
+		assignment_key = fixture_assignment_key,
+		variant_key = "treatment",
+		variant_payload = { color = "blue" },
+		boundary = { assignment_unit = "synthetic_subject_key" },
+	})
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.assigned)
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the assignment still applies locally")
+	client:update(0.016)
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 0,
+		"no subject-fact key means no exposure fact, ever")
+
+	local ok, err = client:track_exposure("exp-checkout")
+	assert_equal(ok, false)
+	assert_equal(err, "exposure_no_subject_fact_key")
+	ok, err = client:track_outcome("exp-checkout", "score", 1)
+	assert_equal(ok, false)
+	assert_equal(err, "exposure_no_subject_fact_key")
+
+	-- The egress rule itself: the SDK-minted subject id appears in NO
+	-- queued analytics event, in any field.
+	local subject = client.experiments_client_id
+	assert_true(type(subject) == "string" and subject ~= "")
+	for i = 1, #client.queue.items do
+		local serialized = json.encode(client.queue.items[i])
+		assert_nil(serialized:find(subject, 1, true),
+			"the SDK subject id must never appear in an analytics event")
+	end
+end
+
+local function test_sibling_success_does_not_clear_retry_after()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body({ experiment_key = "exp-a" })
+	fetch(client, "exp-a")
+
+	-- The cadence meets a long server Retry-After for exp-a...
+	next_status = 429
+	next_response_body = nil
+	next_response_headers = { ["retry-after"] = "900" }
+	advance_seconds(400)
+	client:update(0.016)
+	local deferred_base = #assignment_requests()
+
+	-- ...then an UNRELATED explicit fetch succeeds. The server's wait for
+	-- the plane is not rescinded by one admitted request.
+	next_status = 200
+	next_response_headers = nil
+	next_response_body = assignment_body({ experiment_key = "exp-b", variant_key = "beta" })
+	fetch(client, "exp-b")
+	local base = #assignment_requests()
+
+	next_response_body = assignment_body()
+	advance_seconds(400)
+	client:update(0.016)
+	assert_equal(#assignment_requests(), base,
+		"an unrelated success must not clear the server-set Retry-After")
+
+	-- Past the deadline the cadence resumes for every cached entry.
+	advance_seconds(700)
+	client:update(0.016)
+	assert_equal(#assignment_requests(), base + 2,
+		"the cadence resumes after the deadline expires on its own")
+	assert_true(deferred_base >= 1)
+end
+
+local function test_transient_serve_reflects_current_fenced_entry()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- Hold one request in flight...
+	local held = {}
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	local late = nil
+	client:fetch_experiment_assignment("exp-checkout", function(result)
+		late = result
+	end)
+	responder = nil
+	assert_equal(#held, 1)
+
+	-- ...while a kill resolves and drops the entry...
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-checkout")
+	assert_nil(client:experiment_variant("exp-checkout"))
+
+	-- ...then the held request fails transiently. The serve must reflect
+	-- the CURRENT fenced state (nothing), never revive the killed variant.
+	held[1](nil, nil, { status = 503 })
+	assert_equal(late.ok, false,
+		"a transient serve must not revive a killed assignment")
+	assert_equal(late.error, "transient_503")
+	assert_nil(late.variant_key)
+end
+
+local function test_midflight_consent_revocation_fails_closed()
+	reset()
+	local client = granted_client()
+	local held = {}
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	local result = nil
+	client:fetch_experiment_assignment("exp-checkout", function(value)
+		result = value
+	end)
+	responder = nil
+	assert_equal(#held, 1)
+	local minted = client.experiments_client_id
+
+	-- Consent is revoked while the response is in flight: the late 200
+	-- must not install, expose, persist, or report a healthy assignment.
+	assert_true(client:set_consent(false))
+	held[1](nil, nil, { status = 200, response = assignment_body() })
+	assert_equal(result.ok, false)
+	assert_equal(result.error, "consent_denied")
+	local record = storage.load_experiments(client.config)
+	assert_true(record == nil or record.entries["exp-checkout"] == nil,
+		"a revoked-mid-flight response must not persist an assignment")
+	assert_true(client:set_consent(true))
+	assert_nil(client:experiment_variant("exp-checkout"),
+		"nothing was installed for the re-grant to serve")
+
+	-- The remint branch is unreachable post-revocation too: a grammar 400
+	-- landing after a revocation mints nothing.
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	client:fetch_experiment_assignment("exp-checkout", function() end)
+	responder = nil
+	assert_true(client:set_consent(false))
+	held[2](nil, nil, { status = 400, response = json.encode({
+		error = "experiment metadata must use synthetic local-safe identifiers only",
+	}) })
+	assert_equal(client.experiments_client_id, minted,
+		"no subject id is minted after a revocation")
+	assert_equal(client.experiments.reminted, false)
+end
+
+local function test_prelatch_response_fails_closed_to_caller()
+	reset()
+	local client = granted_client()
+	local held = {}
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	local results = {}
+	client:fetch_experiment_assignment("exp-a", function(result)
+		results.stale = result
+	end)
+	client:fetch_experiment_assignment("exp-b", function(result)
+		results.latch = result
+	end)
+	responder = nil
+	assert_equal(#held, 2)
+
+	-- The latch lands while the first request is still in flight...
+	held[2](nil, nil, {
+		status = 401,
+		response = json.encode({ error = "invalid runtime token" }),
+	})
+	assert_equal(results.latch.error, "unauthorized")
+
+	-- ...and the stale 200 is discarded from state AND from the caller:
+	-- the callback receives the closed result, never a healthy assignment.
+	held[1](nil, nil, { status = 200, response = assignment_body({ experiment_key = "exp-a" }) })
+	assert_equal(results.stale.ok, false,
+		"a pre-latch response must fail closed to its caller too")
+	assert_equal(results.stale.error, "unauthorized")
+	assert_nil(results.stale.variant_key)
+	assert_nil(client:experiment_variant("exp-a"))
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -1736,6 +1964,12 @@ local tests = {
 	test_revalidation_remints_rejected_subject,
 	test_queue_full_exposure_retried_by_tick,
 	test_session_renewal_rearms_exposure,
+	test_regenerated_assignment_key_does_not_reexpose,
+	test_missing_fact_key_skips_facts_and_subject_never_egresses,
+	test_sibling_success_does_not_clear_retry_after,
+	test_transient_serve_reflects_current_fenced_entry,
+	test_midflight_consent_revocation_fails_closed,
+	test_prelatch_response_fails_closed_to_caller,
 }
 
 for _, test in ipairs(tests) do

@@ -508,21 +508,22 @@ end
 
 -- Deterministic exposure event id (PROPOSED convention, see the module
 -- header): a stable digest of (session marker, subject, experiment, version,
--- assignment key, arm counter) — the Q4 per-subject-per-session tuple plus
--- the re-arm counter — formatted in the SDK's usual id shape. The same tuple
--- always derives the same id, so an accidental double emission inside one
--- session collapses server-side as a duplicate; an explicit re-arm bumps the
--- counter, and a rotated session marker or re-minted subject derives a
--- distinct id. Retries of one emitted fact are idempotent regardless — the
--- id is stamped once at enqueue and the spool re-sends it verbatim.
-function M.exposure_event_id(session_marker, subject_key, experiment_key, version, assignment_key, arm)
+-- arm counter) — exactly the de-dupe tuple plus the session marker and the
+-- re-arm counter, so the id-uniqueness domain and the de-dupe domain
+-- coincide. The same tuple always derives the same id, so an accidental
+-- double emission inside one session collapses server-side as a duplicate
+-- even if the assignment key was regenerated between the two; an explicit
+-- re-arm bumps the counter, and a rotated session marker or re-minted
+-- subject derives a distinct id. Retries of one emitted fact are idempotent
+-- regardless — the id is stamped once at enqueue and the spool re-sends it
+-- verbatim.
+function M.exposure_event_id(session_marker, subject_key, experiment_key, version, arm)
 	local text = table.concat({
 		"exposure",
 		tostring(session_marker),
 		tostring(subject_key),
 		tostring(experiment_key),
 		string.format("%.0f", version),
-		tostring(assignment_key),
 		string.format("%.0f", arm),
 	}, "\31")
 	return string.format("%08x-%04x-%04x-%04x-%08x%04x",
@@ -722,13 +723,14 @@ function Experiments:durable_drop_entry(scope, experiment_key)
 	end
 end
 
--- The Q4 de-dupe tuple: (experiment, version, SUBJECT). The subject is a
--- first-class component — the assignment key usually varies with it, but the
--- contract is per subject, so a re-minted subject re-arms even against an
--- identical assignment key.
+-- The Q4 de-dupe tuple: (experiment, version, subject) — exactly the
+-- documented contract, nothing more. The assignment key is deliberately NOT
+-- part of it: it is normally deterministic for this tuple anyway, and a
+-- regenerated key for the same tuple must not over-count exposures. The
+-- emitted fact still carries the current fact key as a PROP.
 local function exposure_tuple(experiment_key, entry)
 	return experiment_key .. "\31" .. string.format("%.0f", entry.version)
-		.. "\31" .. entry.assignment_key .. "\31" .. tostring(entry.subject_key)
+		.. "\31" .. tostring(entry.subject_key)
 end
 
 -- Emit the exposure fact for a cached assignment, once per (experiment,
@@ -752,29 +754,25 @@ function Experiments:try_expose(experiment_key, rearm)
 		self.pending_exposure[experiment_key] = nil
 		return true
 	end
-	-- The props contract is per assignment unit: a client_id-unit fact
-	-- carries the server-minted subject-fact key VERBATIM as assignment_key
-	-- (the ingest service structurally rejects anything else there); a
-	-- synthetic-unit fact carries the subject key. A unit this SDK cannot
-	-- satisfy is skipped — not retried — and surfaced through diagnostics.
-	local fact_key = nil
-	if entry.assignment_unit == "client_id" then
-		fact_key = entry.subject_fact_key
-	elseif entry.assignment_unit == "synthetic_subject_key" then
-		fact_key = entry.subject_key
-	end
+	-- Facts carry ONLY the server-minted subject-fact key as the
+	-- assignment_key prop (opaque, verbatim — the ingest service
+	-- structurally requires it for client_id-unit facts). The SDK-minted
+	-- subject id NEVER egresses on the analytics plane, so an assignment
+	-- without a subject-fact key — a synthetic-unit answer included, since
+	-- this SDK has no server-safe fact key for it — emits NO fact: skipped,
+	-- not retried, surfaced through diagnostics.
+	local fact_key = entry.subject_fact_key
 	if type(fact_key) ~= "string" or fact_key == "" then
 		self.pending_exposure[experiment_key] = nil
-		self:diagnose("exposure_skipped", "unit_unsupported")
-		return false, "exposure_unit_unsupported"
+		self:diagnose("exposure_skipped", "no_subject_fact_key")
+		return false, "exposure_no_subject_fact_key"
 	end
 	local arm = 0
 	if exposed then
 		arm = exposed.arm + 1
 	end
 	local event_id = M.exposure_event_id(
-		self.session_marker, entry.subject_key, experiment_key,
-		entry.version, entry.assignment_key, arm)
+		self.session_marker, entry.subject_key, experiment_key, entry.version, arm)
 	local ok, err = self.deps.emit("experiment_exposure", {
 		experiment_key = experiment_key,
 		experiment_version = entry.version,
@@ -843,9 +841,13 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch)
 	if outcome.transient then
 		return
 	end
-	-- A settled authoritative answer resets the transient backoff pacing.
+	-- A settled authoritative answer resets the consecutive-failure counter.
+	-- A server-set Retry-After deadline is deliberately NOT cleared here:
+	-- the pacing is shared by every cached entry, and one admitted request
+	-- for an unrelated entry does not rescind the server's wait for the
+	-- plane — the deadline simply expires on its own (clamped to a day; the
+	-- deferral setter already keeps only the LATEST deadline).
 	self.backoff_attempt = 0
-	self.retry_after_ms = nil
 	if outcome.drop_entry then
 		self.entries[experiment_key] = nil
 		self.pending_exposure[experiment_key] = nil
@@ -1003,7 +1005,28 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	}
 
 	http.request(url, "GET", function(_, _, response)
-		local result, outcome = M.apply(entry, response, clock.unix_ms())
+		-- The consent re-check comes FIRST: a revocation while the request
+		-- was in flight closes the plane. Nothing installs, nothing paces,
+		-- nothing re-mints, and the caller receives the refusal — never a
+		-- healthy assignment fetched under a consent that no longer holds.
+		local refusal_now = consent_refusal(self.deps.consent())
+		if refusal_now then
+			finish({ ok = false, from_cache = false, error = refusal_now })
+			return
+		end
+		-- Transient serves come from the CURRENT fenced entry, not the one
+		-- captured at dispatch: a kill or supersede that resolved while
+		-- this request was in flight must not be undone in the RESULT
+		-- either — a caller must never be handed a variant the fenced
+		-- state no longer serves. Stale epoch/scope reads as no entry.
+		local entry_now = nil
+		if auth_epoch == self.auth_epoch then
+			local subject_now = self:current_subject_id()
+			if subject_now and self:scope_for(subject_now) == scope then
+				entry_now = self.entries[experiment_key]
+			end
+		end
+		local result, outcome = M.apply(entry_now, response, clock.unix_ms())
 		outcome.attributes = normalized_attributes
 		if outcome.remint and not self.reminted then
 			-- The persisted subject id failed the wire grammar (storage
@@ -1012,17 +1035,29 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 			-- revalidation path too, or a rejected cached subject would
 			-- never heal until an explicit host fetch happens to run. A
 			-- second grammar reject with a freshly minted id is a bug,
-			-- never a loop.
+			-- never a loop. (Never reached under a mid-flight revocation:
+			-- the consent gate above returns first, so no id is minted
+			-- post-revocation.)
 			self.reminted = true
 			self:diagnose("reminted", "subject_id")
 			self:adopt_minted_subject_id()
 			self:fetch(experiment_key, attributes, callback, is_revalidation)
 			return
 		end
-		if outcome.transient then
+		if outcome.transient and auth_epoch == self.auth_epoch then
 			self:pace_transient(outcome.retry_after_seconds)
 		end
 		self:install(seq, scope, experiment_key, outcome, auth_epoch)
+		-- The epoch re-check guards the PUBLIC callback like the install:
+		-- a response that raced a fail-closed latch was discarded from
+		-- state above, and its caller must not receive a healthy
+		-- assignment either — it gets the closed result. (The
+		-- latch-setting response itself re-derives its own identical
+		-- closed result here.)
+		if auth_epoch ~= self.auth_epoch then
+			finish({ ok = false, from_cache = false, error = "unauthorized" })
+			return
+		end
 		finish(result)
 	end, headers, nil, options)
 	return true
@@ -1142,14 +1177,12 @@ function Experiments:track_outcome(experiment_key, outcome_key, outcome_value)
 	if not entry then
 		return false, "no_assignment"
 	end
-	local fact_key = nil
-	if entry.assignment_unit == "client_id" then
-		fact_key = entry.subject_fact_key
-	elseif entry.assignment_unit == "synthetic_subject_key" then
-		fact_key = entry.subject_key
-	end
+	-- Same egress rule as the exposure lane: the server-minted subject-fact
+	-- key or nothing — the SDK-minted subject id never rides an analytics
+	-- fact.
+	local fact_key = entry.subject_fact_key
 	if type(fact_key) ~= "string" or fact_key == "" then
-		return false, "exposure_unit_unsupported"
+		return false, "exposure_no_subject_fact_key"
 	end
 	return self.deps.emit("experiment_outcome", {
 		experiment_key = experiment_key,
