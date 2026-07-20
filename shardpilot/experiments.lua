@@ -487,6 +487,24 @@ local function echo_invalid(echoed, expected)
 		and echoed ~= expected
 end
 
+-- Defold's decoder (and the plain-Lua fallback) maps JSON null to Lua nil,
+-- which makes a present `"field": null` indistinguishable from an ABSENT
+-- field by table lookup alone — and the presence/type split treats those
+-- very differently (a PRESENT reason outside the closed vocabulary is
+-- malformed; an absent one is the deterministic traffic-gate miss). On
+-- runtimes whose decoder yields a null SENTINEL (json.null), the ordinary
+-- type checks already catch present-null as a wrong type; for null→nil
+-- decoders this raw-body scan restores field PRESENCE. Terminator-guarded;
+-- a literal '"field":null' inside a string VALUE can false-positive toward
+-- MALFORMED, which is the safe direction (serve-stale, never a directive
+-- misread).
+local function body_field_is_null(body_text, field)
+	if type(body_text) ~= "string" then
+		return false
+	end
+	return body_text:find('"' .. field .. '"%s*:%s*null%s*[,}%]]') ~= nil
+end
+
 -- `requested_attributes` is the normalized attribute set THIS request
 -- dispatched: every stale-cache serve inside is fenced on it matching the
 -- entry's stored set (see serve_entry_or_fail).
@@ -494,18 +512,25 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 	local status = type(response) == "table" and response.status or 0
 
 	if status == 200 then
+		local body_text = type(response) == "table"
+			and type(response.response) == "string" and response.response or ""
 		local decoded = decode_object(type(response) == "table" and response.response or nil)
 		if not decoded then
 			return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
 		end
 		if echo_invalid(decoded.experiment_key, experiment_key)
 			or echo_invalid(decoded.app_key, app_key)
-			or echo_invalid(decoded.environment_key, environment_key) then
+			or echo_invalid(decoded.environment_key, environment_key)
+			or (decoded.experiment_key == nil and body_field_is_null(body_text, "experiment_key"))
+			or (decoded.app_key == nil and body_field_is_null(body_text, "app_key"))
+			or (decoded.environment_key == nil and body_field_is_null(body_text, "environment_key")) then
 			-- A 200 whose body names ANOTHER experiment, app, or environment
 			-- is routing/proxy confusion, not an answer to this request:
 			-- malformed BEFORE anything installs — never cache (or drop)
 			-- under the current scope on another scope's payload or
-			-- subject-fact key.
+			-- subject-fact key. A PRESENT-NULL scope echo is the same
+			-- class: present and wrong, invisible only to null→nil
+			-- decoders — the body scan restores its presence.
 			return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
 		end
 		local boundary = type(decoded.boundary) == "table" and decoded.boundary or nil
@@ -515,6 +540,22 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 			and type(decoded.variant_key) == "string" and decoded.variant_key ~= ""
 			and type(decoded.version) == "number"
 			and type(assignment_unit) == "string" and assignment_unit ~= "" then
+			if assignment_unit == "client_id"
+				and not (type(decoded.subject_fact_key) == "string"
+					and decoded.subject_fact_key ~= "") then
+				-- A client_id-unit assignment WITHOUT a server-minted
+				-- subject-fact key would serve a treatment whose exposure
+				-- and outcome facts are all terminally skipped (the facts
+				-- contract requires the key; the SDK subject id never
+				-- egresses): users silently land in a variant with ZERO
+				-- reporting, biasing the experiment's results. The key is
+				-- REQUIRED for client_id units — absent or mistyped means
+				-- the response is malformed and nothing installs
+				-- (serve-stale transient). Synthetic units legitimately
+				-- carry none and keep the documented no-fact posture.
+				return serve_entry_or_fail(entry, "malformed_response",
+					requested_attributes), { transient = true }
+			end
 			local new_entry = {
 				assignment_key = decoded.assignment_key,
 				variant_key = decoded.variant_key,
@@ -548,9 +589,14 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 			-- (serve-stale transient), never executed as a drop directive it
 			-- does not understand.
 			local reason = decoded.reason
-			if reason ~= nil and (type(reason) ~= "string"
+			if (reason ~= nil and (type(reason) ~= "string"
 				or (reason ~= "kill_switch"
-					and reason ~= "targeting_unmatched")) then
+					and reason ~= "targeting_unmatched")))
+				or (reason == nil and body_field_is_null(body_text, "reason")) then
+				-- A PRESENT-NULL reason is the presence/type split's blind
+				-- spot on null→nil decoders: present and outside the
+				-- closed vocabulary — malformed, never the traffic-gate
+				-- miss its nil disguise would read as.
 				return serve_entry_or_fail(entry, "malformed_response",
 					requested_attributes), { transient = true }
 			end
@@ -1722,6 +1768,7 @@ function Experiments:sweep_pending(experiment_key, mode)
 	end
 	while list[1] do
 		if mode == "background" and list[1].session_id == nil
+			and self.config.source ~= "backend"
 			and (not self.deps.analytics_session
 				or self.deps.analytics_session() == nil) then
 			-- A still-unattributed PRE-SESSION snapshot (a constructor
@@ -1736,7 +1783,13 @@ function Experiments:sweep_pending(experiment_key, mode)
 			-- attribution runs — the explicit-first session_start migrates
 			-- it, a renewal stamps it with the lazy first session it lived
 			-- through — and the FIFO holds the tail behind it (order is
-			-- the contract). The partition is deliberate and narrow:
+			-- the contract). BACKEND sources are exempt from the hold
+			-- entirely: their envelopes are legitimately sessionless on
+			-- the normal enqueue path (no lazy session exists to phantom-
+			-- open and no session_start to double-arm), so holding would
+			-- park restored-assignment facts FOREVER in a long-lived
+			-- backend process — they drain sessionless in background
+			-- sweeps. The partition is deliberate and narrow:
 			-- HOST-INITIATED drains (an install's immediate sweep — the
 			-- host called fetch) keep the analytics canon that host
 			-- activity may lazily open the first session, and a background
@@ -2543,6 +2596,16 @@ function Experiments:tick(_)
 	for i = 1, #keys do
 		-- Batched per tick: one GET per cached entry, each re-sending its
 		-- last host-supplied attributes. Outcomes apply at resolution.
+		-- The latch is re-checked before EACH dispatch: a transport that
+		-- completes SYNCHRONOUSLY can land an earlier key's 401 mid-loop,
+		-- and the remaining keys must not dispatch as NEW post-latch
+		-- fetches — their authorized answers would be epoch-current and
+		-- unlatch/reinstall, defeating the halt (the epoch gate only
+		-- discards flights that were already in the air when the latch
+		-- landed).
+		if self.auth_blocked then
+			break
+		end
 		self:fetch(keys[i], nil, nil, true)
 	end
 end

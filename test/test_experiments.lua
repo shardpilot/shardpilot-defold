@@ -6001,6 +6001,136 @@ local function test_corrupt_stored_subject_never_rides_identity_writes()
 	storage.reset()
 end
 
+local function test_client_id_assignment_requires_fact_key()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	client:update(0.016)
+	assert_true(client:flush({ include_summaries = false }))
+
+	-- A client_id-unit 200 WITHOUT the server-minted subject-fact key
+	-- would serve a treatment whose facts are all terminally skipped —
+	-- users in a variant with zero exposure reporting. The key is
+	-- REQUIRED for client_id units: the response is malformed, nothing
+	-- installs, the cached assignment serves stale.
+	next_response_body = json.encode({
+		app_key = "app-test",
+		environment_key = "develop",
+		experiment_key = "exp-checkout",
+		version = 4,
+		assigned = true,
+		assignment_key = fixture_assignment_key,
+		variant_key = "keyless-variant",
+		boundary = { assignment_unit = "client_id" },
+	})
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.from_cache,
+		"the keyless client_id answer serves stale, never installs")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the cached variant stands — the keyless variant never serves")
+
+	-- With no cache to fall back on, the same answer fails closed.
+	local cold = granted_client()
+	local miss = fetch(cold, "exp-checkout")
+	assert_equal(miss.ok, false)
+	assert_equal(miss.error, "malformed_response")
+	assert_nil(cold:experiment_variant("exp-checkout"))
+end
+
+local function test_present_null_reason_is_malformed()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- JSON null decodes to Lua nil, disguising a PRESENT reason as the
+	-- absent traffic-gate miss: the raw-body presence scan must read it
+	-- as present-and-invalid — malformed serve-stale, never a drop
+	-- directive the client cannot distinguish.
+	next_response_body = '{"assigned":false,"reason":null,"version":3,'
+		.. '"boundary":{"assignment_unit":"client_id"}}'
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.from_cache,
+		"a present-null reason is malformed and serves stale")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the cached assignment survives the null-reason answer")
+
+	-- A present-null scope echo is the same class: present and wrong.
+	next_response_body = '{"assigned":true,"app_key":null,'
+		.. '"assignment_key":"' .. fixture_assignment_key .. '",'
+		.. '"variant_key":"null-echo-variant","version":5,'
+		.. '"subject_fact_key":"' .. fixture_subject_fact_key .. '",'
+		.. '"boundary":{"assignment_unit":"client_id"}}'
+	local echoed = fetch(client, "exp-checkout")
+	assert_true(echoed.ok and echoed.from_cache,
+		"a present-null scope echo is malformed")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"and installs nothing")
+end
+
+local function test_backend_restored_exposure_drains_in_background()
+	reset()
+	local restore = install_fake_sys_storage()
+	local seed_client = granted_client({ source = "backend" })
+	next_response_body = assignment_body()
+	fetch(seed_client, "exp-checkout")
+
+	-- A backend relaunch restores the assignment with a sessionless owed
+	-- snapshot. Backend envelopes are legitimately sessionless on the
+	-- normal enqueue path, so the background sweep must DRAIN it — the
+	-- pre-session hold exists to prevent phantom sessions and renewal
+	-- double-arms, neither of which exists for a source that never opens
+	-- sessions; holding would park the fact forever in a long-lived
+	-- backend process.
+	storage.reset()
+	local second = assert(sdk.new(config({ source = "backend" })))
+	assert_equal(second:experiment_variant("exp-checkout"), "treatment")
+	second:update(0.016)
+	local exposures = queued_events(second, "experiment_exposure")
+	assert_equal(#exposures, 1,
+		"the restored backend exposure drains on the background tick")
+	assert_nil(exposures[1].session_id,
+		"riding a legitimately sessionless backend envelope")
+	restore()
+	storage.reset()
+end
+
+local function test_sync_latch_halts_remaining_cadence_dispatches()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	next_response_body = assignment_body({ experiment_key = "exp-late", variant_key = "beta" })
+	fetch(client, "exp-late")
+
+	-- One cadence tick, synchronously completing transport: the FIRST
+	-- key's 401 latches mid-loop. The remaining keys must not dispatch —
+	-- they would be genuinely post-latch fetches whose authorized
+	-- answers unlatch and reinstall, defeating the halt.
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		if url:find("exp%-checkout") then
+			callback(nil, nil, { status = 401, response = "{}" })
+		else
+			callback(nil, nil, { status = 200,
+				response = assignment_body({ experiment_key = "exp-late", variant_key = "beta-2" }) })
+		end
+		return true
+	end
+	local probes_before = #assignment_requests()
+	advance_seconds(400)
+	client:update(0.016)
+	responder = nil
+	assert_equal(#assignment_requests(), probes_before + 1,
+		"the latch halts the remaining cadence dispatches")
+	assert_true(client.experiments.auth_blocked, "the plane stays latched")
+	assert_nil(client:experiment_variant("exp-late"),
+		"no post-latch reinstall through the same tick's loop")
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -6154,6 +6284,10 @@ local tests = {
 	test_same_second_fresh_fact_survives_partition,
 	test_presettle_persist_excludes_wire_batch_facts,
 	test_corrupt_stored_subject_never_rides_identity_writes,
+	test_client_id_assignment_requires_fact_key,
+	test_present_null_reason_is_malformed,
+	test_backend_restored_exposure_drains_in_background,
+	test_sync_latch_halts_remaining_cadence_dispatches,
 }
 
 for _, test in ipairs(tests) do
