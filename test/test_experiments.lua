@@ -2488,6 +2488,174 @@ local function test_shutdown_sweeps_owed_exposure_after_flush()
 	assert_equal(published[1].props.variant_key, "treatment")
 end
 
+-- ── round-6 regressions ───────────────────────────────────────────────────────
+
+local function test_shutdown_retries_owed_durable_drop()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- The kill's durable drop fails transiently, and the game shuts down
+	-- before any further update() tick runs.
+	state.fail_save = function(path)
+		return fail_experiment_saves(path)
+	end
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-checkout")
+	state.fail_save = nil
+	local record = storage.load_experiments(client.config)
+	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
+		"the failed drop is still reload truth before shutdown")
+
+	-- Shutdown retries the owed durable sync before teardown: the revoked
+	-- assignment must not survive as reload truth.
+	next_status = 202
+	next_response_body = nil
+	assert_true(client:shutdown())
+	record = storage.load_experiments(client.config)
+	assert_true(record == nil or record.entries["exp-checkout"] == nil,
+		"shutdown must land the owed durable drop")
+
+	next_status = 200
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-checkout"),
+		"a relaunch must not revive the killed assignment")
+	restore()
+end
+
+local function test_owed_clear_demoted_before_ordinary_latch()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body({ experiment_key = "exp-a" })
+	fetch(client, "exp-a")
+	next_response_body = assignment_body({ experiment_key = "exp-b", variant_key = "beta" })
+	fetch(client, "exp-b")
+
+	-- The real-subjects sentinel lands while the durable clear fails: the
+	-- whole-record clear is OWED.
+	state.fail_save = function(path)
+		return fail_experiment_saves(path)
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-a")
+	state.fail_save = nil
+
+	-- A fresh authorized assignment lands, then an ORDINARY 401 latches
+	-- BEFORE any tick could run the owed-clear retry. The stale clear must
+	-- not wipe the fresh assignment: the ordinary-latch canon retains the
+	-- durable record, and the clear's reach is only what it still covers.
+	next_status = 200
+	next_response_body = assignment_body({ experiment_key = "exp-a", variant_key = "fresh" })
+	fetch(client, "exp-a")
+	next_status = 401
+	next_response_body = json.encode({ error = "invalid runtime token" })
+	fetch(client, "exp-b")
+	client:update(0.016)
+	local record = storage.load_experiments(client.config)
+	assert_true(record ~= nil and record.entries["exp-a"] ~= nil,
+		"a stale owed clear must not wipe state written after it")
+	assert_equal(record.entries["exp-a"].variant_key, "fresh")
+	assert_nil(record.entries["exp-b"],
+		"the sibling the sentinel still covers is dropped")
+	restore()
+end
+
+local function test_clock_rollback_does_not_fence_refresh_write()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- The wall clock rolls BACK before a successful refresh: the write must
+	-- supersede the stored record it replaces — a fenced write would leave
+	-- the OLD variant as reload truth while memory serves the new one.
+	socket.now = socket.now - 100
+	next_response_body = assignment_body({ version = 4, variant_key = "control" })
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "control")
+	local record = storage.load_experiments(client.config)
+	assert_equal(record.entries["exp-checkout"].variant_key, "control",
+		"a clock rollback must not fence the refresh off the disk")
+	local relaunch = assert(sdk.new(config()))
+	assert_equal(relaunch:experiment_variant("exp-checkout"), "control",
+		"a relaunch serves the refreshed variant")
+	restore()
+end
+
+local function test_stale_grammar_reject_does_not_remint()
+	reset()
+	local client = granted_client()
+	local held = {}
+	local hold_next = false
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		if hold_next then
+			hold_next = false
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+	local grammar_reject = json.encode({
+		error = "experiment metadata must use synthetic local-safe identifiers only",
+	})
+
+	-- An older request is in flight when a NEWER same-key response settles.
+	hold_next = true
+	local stale = nil
+	client:fetch_experiment_assignment("exp-checkout", function(result)
+		stale = result
+	end)
+	assert_equal(#held, 1)
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	local subject_before = query_params(last_assignment_request().url).subject_key
+
+	-- The stale grammar reject lands late: fenced out like any other stale
+	-- outcome — no subject rotation, no entry wipe, no auto retry, and the
+	-- one-shot re-mint budget survives.
+	local requests_before = #assignment_requests()
+	held[1](nil, nil, { status = 400, response = grammar_reject })
+	assert_equal(#assignment_requests(), requests_before,
+		"a fenced-out grammar reject must not auto-retry")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the settled assignment keeps serving")
+	assert_true(stale.ok and stale.from_cache,
+		"the stale caller receives the settled state")
+	assert_equal(stale.error, "superseded")
+
+	-- The budget was not consumed: a GENUINE grammar reject still re-mints.
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = grammar_reject })
+		else
+			callback(nil, nil, { status = 200, response = assignment_body({
+				experiment_key = "exp-fresh", variant_key = "beta",
+			}) })
+		end
+		return true
+	end
+	local result = fetch(client, "exp-fresh")
+	responder = nil
+	assert_true(result.ok and result.assigned,
+		"a genuine grammar reject after the stale one still heals")
+	local subject_after = query_params(last_assignment_request().url).subject_key
+	assert_true(subject_after ~= subject_before,
+		"the genuine reject re-mints the subject (budget was not consumed)")
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -2556,6 +2724,10 @@ local tests = {
 	test_owed_drop_retry_yields_to_fresher_sibling_write,
 	test_rearm_while_auto_exposure_owed_emits_both,
 	test_shutdown_sweeps_owed_exposure_after_flush,
+	test_shutdown_retries_owed_durable_drop,
+	test_owed_clear_demoted_before_ordinary_latch,
+	test_clock_rollback_does_not_fence_refresh_write,
+	test_stale_grammar_reject_does_not_remint,
 }
 
 for _, test in ipairs(tests) do

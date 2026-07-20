@@ -768,10 +768,22 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 	if entry then
 		if stored and type(stored.fetched_at_ms) == "number"
 			and stored.fetched_at_ms > entry.fetched_at_ms then
-			-- A same-namespace sibling persisted a FRESHER entry after this
-			-- client's state formed: never roll the shared record back.
-			self.durable_pending[experiment_key] = nil
-			return true
+			if is_retry then
+				-- A same-namespace sibling persisted a FRESHER entry after
+				-- this write was decided: never roll the shared record
+				-- back.
+				self.durable_pending[experiment_key] = nil
+				return true
+			end
+			-- At DECISION time a fresh authoritative write supersedes the
+			-- stored record exactly like a drop does: the wall clock can
+			-- move backward across a refresh, and yielding on raw stamps
+			-- would leave the SUPERSEDED variant as reload truth while
+			-- memory serves the new one. Raise the entry's stamp above the
+			-- record instead — memory and disk stay consistent, and an
+			-- owed retry of this write still outranks the superseded
+			-- record while yielding to genuinely newer sibling writes.
+			entry.fetched_at_ms = stored.fetched_at_ms + 1
 		end
 		record.entries[experiment_key] = entry
 	else
@@ -819,6 +831,39 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 	return false
 end
 
+-- Demote an owed whole-record clear into per-key drops for exactly the keys
+-- the clear still covers — everything on disk that memory does not hold —
+-- each stamped by the clear decision, raised above the covered record (the
+-- sentinel is decisive over the state it withdrew), and let the per-key
+-- sync converge those. Runs from the retry tick AND at fresh-install time:
+-- a fresh authorized assignment landing after the failed clear supersedes
+-- the whole-record form immediately, so a later ordinary auth latch —
+-- which empties memory while RETAINING the durable record — can never
+-- leave the stale clear armed to wipe state written after it.
+function Experiments:demote_owed_clear()
+	if not self.durable_clear_pending then
+		return
+	end
+	local clear_as_of = type(self.durable_clear_pending) == "number"
+		and self.durable_clear_pending or 0
+	self.durable_clear_pending = false
+	local record = storage.load_experiments(self.config)
+	if not record then
+		return
+	end
+	for key, stored in pairs(record.entries) do
+		if self.entries[key] == nil then
+			local as_of = clear_as_of
+			if type(stored) == "table"
+				and type(stored.fetched_at_ms) == "number"
+				and stored.fetched_at_ms >= as_of then
+				as_of = stored.fetched_at_ms + 1
+			end
+			self.durable_pending[key] = { as_of = as_of, drop = true }
+		end
+	end
+end
+
 -- Retry every owed durable write (and an owed whole-record clear) so the
 -- disk converges as soon as storage recovers, instead of waiting for an
 -- unrelated write or a relaunch. Local disk housekeeping only: no network,
@@ -828,29 +873,9 @@ function Experiments:retry_durable_sync()
 	if self.durable_clear_pending then
 		if next(self.entries) ~= nil then
 			-- Newer authorized state was installed after the failed clear:
-			-- the epoch-scoped clear must not wipe it. Convert the owed
-			-- whole-record clear into per-key drops for exactly the keys
-			-- the clear still covers — everything on disk that memory no
-			-- longer holds — each stamped by the clear decision, raised
-			-- above the covered record (the sentinel is decisive over the
-			-- state it withdrew), and let the per-key sync converge those.
-			local clear_as_of = type(self.durable_clear_pending) == "number"
-				and self.durable_clear_pending or 0
-			self.durable_clear_pending = false
-			local record = storage.load_experiments(self.config)
-			if record then
-				for key, stored in pairs(record.entries) do
-					if self.entries[key] == nil then
-						local as_of = clear_as_of
-						if type(stored) == "table"
-							and type(stored.fetched_at_ms) == "number"
-							and stored.fetched_at_ms >= as_of then
-							as_of = stored.fetched_at_ms + 1
-						end
-						self.durable_pending[key] = { as_of = as_of, drop = true }
-					end
-				end
-			end
+			-- the epoch-scoped clear must not wipe it — demote it to the
+			-- per-key drops it still covers.
+			self:demote_owed_clear()
 		elseif storage.clear_experiments(self.config) then
 			self.durable_clear_pending = false
 			self.durable_pending = {}
@@ -1143,6 +1168,12 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 		entry.subject_key = subject
 		entry.attributes = outcome.attributes
 		self.entries[experiment_key] = entry
+		-- A fresh authorized assignment supersedes any owed whole-record
+		-- clear RIGHT NOW, not at the next tick: waiting would leave the
+		-- stale clear armed across an ordinary auth latch (which empties
+		-- memory while retaining the durable record), and the retention
+		-- canon must never let that clear delete state written after it.
+		self:demote_owed_clear()
 		self:sync_durable_entry(scope, experiment_key, entry.fetched_at_ms)
 		self:arm_revalidation(clock.unix_ms())
 		-- The variant takes effect at this resolution (a variant change on
@@ -1316,7 +1347,13 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		local resolved_at_ms = clock.unix_ms()
 		local result, outcome = M.apply(entry_now, response, resolved_at_ms)
 		outcome.attributes = normalized_attributes
-		if outcome.remint and not self.reminted then
+		-- Captured BEFORE install (which may settle this very seq): true
+		-- when a NEWER outcome for this key already settled while this
+		-- response was in flight, i.e. the install below discards it.
+		local fenced_out =
+			seq <= (self.settled[scope .. scope_separator .. experiment_key] or 0)
+		if outcome.remint and not self.reminted
+			and not fenced_out and auth_epoch == self.auth_epoch then
 			-- The persisted subject id failed the wire grammar (storage
 			-- corruption this client could not detect locally): re-mint
 			-- once per process and retry as a fresh subject — from the
@@ -1325,21 +1362,23 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 			-- second grammar reject with a freshly minted id is a bug,
 			-- never a loop. (Never reached under a mid-flight revocation:
 			-- the consent gate above returns first, so no id is minted
-			-- post-revocation.)
-			self.reminted = true
-			self:diagnose("reminted", "subject_id")
-			self:adopt_minted_subject_id()
-			self:fetch(experiment_key, attributes, callback, is_revalidation)
-			return
+			-- post-revocation.) The re-mint honors the SAME fences as any
+			-- other outcome — a grammar reject that is fenced out, stale
+			-- by epoch, or stale by scope must not rotate the persisted
+			-- subject, wipe entries, or consume the one-shot budget: it
+			-- falls through and is discarded like the stale outcome it is.
+			local subject_now = self:current_subject_id()
+			if subject_now and self:scope_for(subject_now) == scope then
+				self.reminted = true
+				self:diagnose("reminted", "subject_id")
+				self:adopt_minted_subject_id()
+				self:fetch(experiment_key, attributes, callback, is_revalidation)
+				return
+			end
 		end
 		if outcome.transient and auth_epoch == self.auth_epoch then
 			self:pace_transient(outcome.retry_after_seconds)
 		end
-		-- Captured BEFORE install (which may settle this very seq): true
-		-- when a NEWER outcome for this key already settled while this
-		-- response was in flight, i.e. the install below discards it.
-		local fenced_out =
-			seq <= (self.settled[scope .. scope_separator .. experiment_key] or 0)
 		self:install(seq, scope, experiment_key, outcome, auth_epoch, resolved_at_ms)
 		-- The epoch re-check guards the PUBLIC callback like the install:
 		-- a response that raced a fail-closed latch was discarded from

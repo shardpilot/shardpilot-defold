@@ -2345,6 +2345,12 @@ function Client:shutdown(reason)
 		end
 	end
 	if self.experiments then
+		-- Owed durable syncs get one last retry too — a kill/not-assigned
+		-- drop (or refresh write) whose cache write failed transiently must
+		-- not stay reload truth on disk just because no update() tick ran
+		-- after storage recovered. Local disk housekeeping, best-effort: a
+		-- still-failing write is not a teardown blocker.
+		self.experiments:retry_durable_sync()
 		-- The final flush freed queue room: sweep owed exposure facts one
 		-- last time so a treatment applied under a FULL queue does not exit
 		-- without its fact, then deliver-or-spool whatever the sweep
