@@ -1777,16 +1777,41 @@ function Experiments:has_owed_exposures()
 end
 
 -- True while a real-subjects condemnation is armed durably — an owed
--- whole-record clear, or its sidecar marker surviving a demotion. The
--- client's spool restore consults this at load: spooled experiment facts
--- carry withdrawn subject-fact keys under an armed condemnation (a purge's
--- failed spool rewrite followed by a process death leaves them on disk),
--- and re-sending them would defeat the kill switch across the restart.
-function Experiments:has_durable_condemnation()
+-- whole-record clear, or its sidecar marker surviving a demotion — AND it
+-- covers the CURRENT scope. The client's spool restore consults this at
+-- load: spooled experiment facts carry withdrawn subject-fact keys under
+-- an armed condemnation (a purge's failed spool rewrite followed by a
+-- process death leaves them on disk), and re-sending them would defeat
+-- the kill switch across the restart. Scope-gated like every other use of
+-- the marker: a STALE marker from a retired environment/credential/
+-- subject must not drop the current scope's valid facts at launch — it
+-- settles through the normal retire path instead. A legacy marker without
+-- a scope condemns conservatively (constructor parity). The old-scope
+-- facts corner — envelopes carry no scope, so facts spooled under the
+-- marker's own scope escape the load filter once the subject rotated —
+-- narrows to sentinel + failed rewrite + death + rotation-before-relaunch
+-- and stays in the documented storage-down-through-exit family.
+function Experiments:condemnation_covers_current_scope()
+	local armed = false
+	local condemned_scope = nil
 	if self.durable_clear_pending then
+		armed = true
+		condemned_scope = self.durable_clear_scope
+	elseif self.clear_marker then
+		armed = true
+		condemned_scope = self.clear_marker.scope
+	end
+	if not armed then
+		return false
+	end
+	if condemned_scope == nil then
 		return true
 	end
-	return self.clear_marker ~= nil
+	local subject = self:current_subject_id()
+	if not subject then
+		return false
+	end
+	return self:scope_for(subject) == condemned_scope
 end
 
 -- True while any durable cache write, drop, or whole-record clear is still
@@ -2340,7 +2365,18 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 			-- revalidation (and kill checks) for up to the day clamp.
 			local pace_subject = self:current_subject_id()
 			if pace_subject and self:scope_for(pace_subject) == scope then
-				self:pace_transient(outcome.retry_after_seconds)
+				-- And on the per-key SEQUENCE fence, completing the gate
+				-- set: an older in-flight fetch's transient that settles
+				-- AFTER a newer same-key authoritative response is stale
+				-- truth — the server has already answered newer — and its
+				-- Retry-After must not install plane-wide pacing.
+				-- Transients never settle the fence themselves, so two
+				-- out-of-order transients both pace (both are live truth;
+				-- the deferral setter keeps the furthest deadline).
+				local fence_key = scope .. scope_separator .. experiment_key
+				if seq > (self.settled[fence_key] or 0) then
+					self:pace_transient(outcome.retry_after_seconds)
+				end
 			end
 		end
 		self:install(seq, scope, experiment_key, outcome, auth_epoch,

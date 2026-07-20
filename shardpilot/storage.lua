@@ -228,9 +228,20 @@ local function pending_namespace(scope)
 	return crash_scope_base(scope) .. ".pending-crashes"
 end
 
+-- The fixed byte charge for a non-string scalar (number, boolean) and for a
+-- non-string table key: sys.save serializes them as tagged binary values
+-- (numbers as doubles plus framing), so charging a conservative fixed
+-- estimate keeps the check honest for numeric/boolean-heavy payloads — an
+-- estimator that counted only strings would declare such a record fit,
+-- and the sys-layer write would then fail on every retry with nothing to
+-- evict. Overshoot is the safe direction: evicting early costs a refetch,
+-- undershooting wedges the durable sync permanently.
+local non_string_scalar_bytes = 16
+
 local function approx_record_bytes(record)
 	-- A cheap upper-bound size estimate without pulling in a JSON encoder:
-	-- count the bytes of every string scalar in the record tree.
+	-- count the bytes of every string scalar plus a fixed conservative
+	-- charge per non-string scalar and non-string key in the record tree.
 	local total = 0
 	local function walk(value, depth)
 		if depth > 32 then
@@ -239,10 +250,14 @@ local function approx_record_bytes(record)
 		local value_type = type(value)
 		if value_type == "string" then
 			total = total + #value
+		elseif value_type == "number" or value_type == "boolean" then
+			total = total + non_string_scalar_bytes
 		elseif value_type == "table" then
 			for key, child in pairs(value) do
 				if type(key) == "string" then
 					total = total + #key
+				else
+					total = total + non_string_scalar_bytes
 				end
 				walk(child, depth + 1)
 			end

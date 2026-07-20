@@ -674,15 +674,17 @@ function M.new(config)
 		end
 		local condemned = 0
 		if client.experiments and #spooled > 0
-			and client.experiments:has_durable_condemnation() then
+			and client.experiments:condemnation_covers_current_scope() then
 			-- A real-subjects condemnation survived the exit (the sentinel's
-			-- clear or its sidecar marker is still armed): spooled experiment
-			-- facts carry the withdrawn subject-fact keys — a sentinel
-			-- purge's failed spool rewrite followed by a process death leaves
-			-- them here — and re-sending them would keep egressing what the
-			-- kill switch killed. Drop them at load; the rewrite below
-			-- persists the removal. Conservative and blanket, like the
-			-- in-memory sentinel posture.
+			-- clear or its sidecar marker is still armed) AND covers the
+			-- current scope: spooled experiment facts carry the withdrawn
+			-- subject-fact keys — a sentinel purge's failed spool rewrite
+			-- followed by a process death leaves them here — and re-sending
+			-- them would keep egressing what the kill switch killed. Drop
+			-- them at load; the rewrite below persists the removal. A stale
+			-- marker from a retired environment/credential/subject does NOT
+			-- condemn the current scope's facts — it settles through the
+			-- normal retire path while this launch's plane loads normally.
 			local kept = {}
 			for i = 1, #spooled do
 				local name = spooled[i].event_name
@@ -2255,10 +2257,28 @@ function Client:spool_envelopes(envelopes)
 	for i = 1, #envelopes do
 		local env = envelopes[i]
 		local event_id = type(env) == "table" and env.event_id or nil
-		if type(event_id) == "string" and event_id ~= ""
-			and not self.spool_index[event_id] and not seen[event_id] then
-			seen[event_id] = true
-			fresh[#fresh + 1] = env
+		if type(event_id) == "string" and event_id ~= "" then
+			if self.spool_settled[event_id] then
+				-- A replacement fact re-derived a deterministic id whose
+				-- prior copy a sentinel purge condemned while the removal
+				-- rewrite is still owed: capturing the replacement
+				-- RE-LEGITIMIZES the id. Clear the settled mark so the
+				-- on-disk copy stands as the replacement's durable form
+				-- (bit-equivalent — same deterministic id, same fact)
+				-- instead of the index masking the capture while the next
+				-- successful write deletes the only copy. Where a durable
+				-- condemnation marker survives to the next launch, the
+				-- scope-gated load filter still governs every spooled
+				-- fact equally — the sentinel mandate outranks capture.
+				-- (An acked-but-unrewritten published id re-captured the
+				-- same way just resurrects a delivered envelope; the
+				-- deterministic id collapses the re-send server-side.)
+				self.spool_settled[event_id] = nil
+			end
+			if not self.spool_index[event_id] and not seen[event_id] then
+				seen[event_id] = true
+				fresh[#fresh + 1] = env
+			end
 		end
 	end
 	if #fresh == 0 then
@@ -2782,6 +2802,19 @@ function Client:shutdown(reason)
 			if queue.size(self.queue) > before_sweep then
 				enqueued_any = true
 			end
+		end
+		if self.consent_state == "granted" and self.session_active
+			and not owed_session_end then
+			-- The final drain lazily opened a session (a pre-session owed
+			-- fact with no session ever started rides the exit-time
+			-- session): it must close like every session this shutdown
+			-- finalizes. Pick it up as an owed session_end so the next
+			-- pass enqueues and delivers it — tearing down here would
+			-- leave session_active with no session_end on the wire. Only
+			-- reachable for drain-opened sessions: a session active at
+			-- shutdown entry either ended before the loop (inactive now)
+			-- or is already carried by owed_session_end.
+			owed_session_end = true
 		end
 		-- Owed exposures count as deliverable only on the granted plane:
 		-- a non-granted state cannot enqueue them (the purge/consent canon

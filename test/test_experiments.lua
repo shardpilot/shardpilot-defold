@@ -5106,6 +5106,273 @@ local function test_unexpected_status_classification_pin()
 	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
 end
 
+local function test_shutdown_closes_session_opened_by_final_drain()
+	reset()
+	local restore = install_fake_sys_storage()
+	local seed_client = granted_client()
+	next_response_body = assignment_body()
+	fetch(seed_client, "exp-checkout")
+
+	-- Relaunch with a restored pre-session owed exposure and NO session:
+	-- the shutdown's final drain lazily opens the exit-time session for
+	-- the fact — that session must CLOSE in the same housekeeping loop,
+	-- with its session_end delivered, instead of teardown leaving an open
+	-- session with no end on the wire.
+	storage.reset()
+	local second = assert(sdk.new(config()))
+	assert_nil(second.session_id)
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(second:shutdown("app_final"))
+	local saw_exposure_session = nil
+	local saw_session_end_session = nil
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			local sid = requests[i].body:match(
+				'"event_name":"experiment_exposure".-"session_id":"(session%-[^"]+)"')
+				or requests[i].body:match(
+				'"session_id":"(session%-[^"]+)".-"event_name":"experiment_exposure"')
+			if sid then
+				saw_exposure_session = sid
+			end
+			local esid = requests[i].body:match(
+				'"event_name":"session_end".-"session_id":"(session%-[^"]+)"')
+				or requests[i].body:match(
+				'"session_id":"(session%-[^"]+)".-"event_name":"session_end"')
+			if esid then
+				saw_session_end_session = esid
+			end
+		end
+	end
+	assert_true(saw_exposure_session ~= nil,
+		"the final drain delivered the owed exposure")
+	assert_true(saw_session_end_session ~= nil,
+		"the drain-opened session got its session_end delivered at shutdown")
+	assert_equal(saw_session_end_session, saw_exposure_session,
+		"and it closes exactly the session the fact rode")
+	restore()
+	storage.reset()
+end
+
+local function test_stale_marker_does_not_condemn_new_scope_spool()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	-- Sentinel with the record store down: the sidecar marker persists,
+	-- stamped with THIS (develop) scope.
+	state.fail_save = fail_experiment_saves
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+
+	-- New launch under a DIFFERENT scope (environment rotated). The stale
+	-- develop-scope marker cannot retire (sidecar store failing) while
+	-- this scope installs, exposes, and spools its own valid facts.
+	storage.reset()
+	local second = assert(sdk.new(config({ environment_id = "prod" })))
+	state.fail_save = function(path)
+		return path:match("/experiments$") ~= nil
+			or path:match("/experiments%-clear$") ~= nil
+	end
+	assert_true(second:session_start())
+	assert_true(second:track("filler-host-event"))
+	next_status = 200
+	next_response_body = assignment_body({ environment_key = "prod" })
+	fetch(second, "exp-checkout")
+	assert_equal(#queued_events(second, "experiment_exposure"), 1)
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not second:flush({ include_summaries = false }))
+	responder = nil
+	state.fail_save = nil
+
+	-- Process death; the relaunch (same prod scope) must NOT let the
+	-- STALE develop-scope marker condemn its spooled facts: the marker
+	-- condemns only its own scope and settles via the normal retire path.
+	storage.reset()
+	local relaunch = assert(sdk.new(config({ environment_id = "prod" })))
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	local resent_exposure = false
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true)
+			and requests[i].body:find("experiment_exposure", 1, true) then
+			resent_exposure = true
+		end
+	end
+	assert_true(resent_exposure,
+		"a stale foreign-scope marker must not drop the current scope's spooled facts")
+	restore()
+	storage.reset()
+end
+
+local function test_numeric_payload_counts_toward_record_cap()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	-- Model the sys layer's real size limit for the record file: a write
+	-- whose entry still carries the huge numeric payload fails (the
+	-- estimator passed what the sys layer cannot store).
+	state.fail_save = function(path, record)
+		if path:sub(-#"/experiments") ~= "/experiments" then
+			return false
+		end
+		local entries = type(record) == "table" and record.entries or nil
+		local entry = entries and entries["exp-checkout"]
+		local blob = entry and type(entry.variant_payload) == "table"
+			and entry.variant_payload.blob
+		return type(blob) == "table" and #blob > 10000
+	end
+	local client = granted_client()
+	assert_true(client:session_start())
+	local blob = {}
+	for i = 1, 26000 do
+		blob[i] = i
+	end
+	next_response_body = assignment_body({ variant_payload = { blob = blob } })
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok)
+	-- A numeric-heavy payload must COUNT toward the size cap: the
+	-- string-only estimate declared it fit, the sys write then failed
+	-- every retry, and the owed sync wedged persist()/shutdown() forever —
+	-- the estimator gap reopened the permanent wedge the eviction path
+	-- exists to prevent.
+	local ok, err = client:persist()
+	assert_true(ok,
+		"persist() settles — the eviction path engages on the counted estimate (got "
+			.. tostring(err) .. ")")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"memory keeps serving the evicted assignment")
+	restore()
+	storage.reset()
+end
+
+local function test_stale_transient_does_not_pace_settled_key()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- Two same-key fetches in flight: the OLDER answer is held while the
+	-- NEWER 200 settles the key's sequence fence. The older fetch then
+	-- resolves as a 429 with a long Retry-After — stale truth for a key
+	-- the server already answered newer, so it must not install
+	-- plane-wide pacing.
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) then
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+	client:fetch_experiment_assignment("exp-checkout", nil, function() end)
+	client:fetch_experiment_assignment("exp-checkout", nil, function() end)
+	responder = nil
+	assert_equal(#held, 2)
+	-- The newer resolves first with a fresh 200 (settles the fence).
+	held[2](nil, nil, { status = 200, response = assignment_body() })
+	-- The older resolves after: 429 + Retry-After 600.
+	held[1](nil, nil, { status = 429, response = "{}",
+		headers = { ["retry-after"] = "600" } })
+
+	-- Past the cadence (~300s) but inside the stale 600s window: the
+	-- revalidation probe must FIRE — the stale Retry-After was fenced out.
+	next_status = 200
+	next_response_body = assignment_body()
+	local probes_before = #assignment_requests()
+	advance_seconds(400)
+	client:update(0.016)
+	assert_true(#assignment_requests() > probes_before,
+		"a fenced-out stale transient must not pace the settled key's plane")
+end
+
+local function test_replacement_fact_capture_survives_settled_purge()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	-- The batch spools durably on a transient failure.
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+
+	-- Sentinel with the SPOOL store failing: the purge marks the spooled
+	-- fact settled but the removal rewrite cannot land, so its id stays
+	-- in the capture index.
+	state.fail_save = function(path)
+		return path:match("/spool$") ~= nil
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+
+	-- The flag flips back on: the refetched tuple re-exposes with the
+	-- SAME deterministic id. persist() must not let the stale settled
+	-- mark turn the replacement's capture into a masked no-op — the
+	-- capture re-legitimizes the id, so the on-disk copy stands as the
+	-- replacement's durable form.
+	next_status = 200
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1,
+		"the re-served treatment re-exposes")
+	assert_true(client:persist(), "persist claims the fact captured")
+	state.fail_save = nil
+
+	-- The store recovers and the deferred removal rewrite lands (flush
+	-- runs it first; the publish stays failing so nothing delivers live).
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	advance_seconds(60)
+	client:flush({ include_summaries = false })
+	responder = nil
+
+	-- Process death before any live publish: the relaunch must replay the
+	-- replacement fact from the spool — the rewrite must not have deleted
+	-- the only copy of a fact whose capture was reported successful.
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	local resent_exposure = false
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true)
+			and requests[i].body:find("experiment_exposure", 1, true) then
+			resent_exposure = true
+		end
+	end
+	assert_true(resent_exposure,
+		"the captured replacement fact survives the settled-purge rewrite and replays")
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -5243,6 +5510,11 @@ local tests = {
 	test_dropped_entry_owed_exposure_replays_after_kill,
 	test_unproven_status_keeps_auth_latch,
 	test_unexpected_status_classification_pin,
+	test_shutdown_closes_session_opened_by_final_drain,
+	test_stale_marker_does_not_condemn_new_scope_spool,
+	test_numeric_payload_counts_toward_record_cap,
+	test_stale_transient_does_not_pace_settled_key,
+	test_replacement_fact_capture_survives_settled_purge,
 }
 
 for _, test in ipairs(tests) do
