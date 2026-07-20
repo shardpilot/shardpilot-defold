@@ -507,17 +507,19 @@ local function hash32(text, seed, mult)
 end
 
 -- Deterministic exposure event id (PROPOSED convention, see the module
--- header): a stable digest of (session marker, experiment, version,
--- assignment key, arm counter), formatted in the SDK's usual id shape. The
--- same tuple always derives the same id, so an accidental double emission
--- inside one session collapses server-side as a duplicate; an explicit
--- re-arm bumps the counter and derives a distinct id. Retries of one emitted
--- fact are idempotent regardless — the id is stamped once at enqueue and the
--- spool re-sends it verbatim.
-function M.exposure_event_id(session_marker, experiment_key, version, assignment_key, arm)
+-- header): a stable digest of (session marker, subject, experiment, version,
+-- assignment key, arm counter) — the Q4 per-subject-per-session tuple plus
+-- the re-arm counter — formatted in the SDK's usual id shape. The same tuple
+-- always derives the same id, so an accidental double emission inside one
+-- session collapses server-side as a duplicate; an explicit re-arm bumps the
+-- counter, and a rotated session marker or re-minted subject derives a
+-- distinct id. Retries of one emitted fact are idempotent regardless — the
+-- id is stamped once at enqueue and the spool re-sends it verbatim.
+function M.exposure_event_id(session_marker, subject_key, experiment_key, version, assignment_key, arm)
 	local text = table.concat({
 		"exposure",
 		tostring(session_marker),
+		tostring(subject_key),
 		tostring(experiment_key),
 		string.format("%.0f", version),
 		tostring(assignment_key),
@@ -566,11 +568,18 @@ function M.new(config, deps)
 		-- one for its key may install.
 		fetch_seq = 0,
 		settled = {},
-		-- Fail-closed latch: set by 401/403, cleared by re-init or any later
-		-- authoritative, authorized outcome. While set, nothing is served
-		-- and revalidation halts; an explicit host fetch stays allowed (the
-		-- user-triggered path) and its success unlatches.
+		-- Fail-closed latch: set by 401/403, cleared by re-init or a later
+		-- authoritative, authorized outcome of a fetch STARTED AFTER the
+		-- latch was set. While set, nothing is served and revalidation
+		-- halts; an explicit host fetch stays allowed (the user-triggered
+		-- path) and its success unlatches. `auth_epoch` counts latch events:
+		-- every fetch captures it at dispatch and an outcome whose captured
+		-- epoch is stale is discarded outright — with a batch of
+		-- revalidations in flight, one 401 must not be undone (and revoked
+		-- assignments must not be reinstalled) by a sibling response that
+		-- was already in flight when the latch landed.
 		auth_blocked = false,
+		auth_epoch = 0,
 		-- Revalidation cadence state.
 		revalidate_at_ms = nil,
 		retry_after_ms = nil,
@@ -626,14 +635,31 @@ end
 
 function Experiments:adopt_minted_subject_id()
 	local minted = M.mint_subject_id()
-	-- A new subject is a new cache scope: assignments fetched for the old
-	-- subject must neither serve nor expose.
+	-- A new subject is a new cache scope AND a new exposure subject:
+	-- assignments fetched for the old subject must neither serve nor
+	-- expose, and the session's exposure de-dupe resets — the Q4 tuple is
+	-- per (experiment, version, SUBJECT), so the new subject's first
+	-- application must emit even where the old subject's already did.
 	self.entries = {}
 	self.pending_exposure = {}
+	self.exposed = {}
 	if not self.deps.store_subject_id(minted) then
 		self:diagnose("persist_failed", "subject_id")
 	end
 	return minted
+end
+
+-- A renewed analytics session (an explicit session_start) re-arms the
+-- once-per-SESSION exposure contract: the session marker rotates so each
+-- session derives its own deterministic ids, the de-dupe map resets, and
+-- every still-applied assignment re-exposes on its next application sweep —
+-- exactly like a cache-restored assignment does at launch.
+function Experiments:on_session_renewed()
+	self.session_marker = id.uuid()
+	self.exposed = {}
+	for key in pairs(self.entries) do
+		self.pending_exposure[key] = true
+	end
 end
 
 function Experiments:scope_for(subject_id)
@@ -654,22 +680,55 @@ local function consent_refusal(state)
 	return "consent_unknown"
 end
 
--- Persist the in-memory entries as the durable record for `scope`.
--- Best-effort: a failed write costs offline serving only and is diagnosed.
-function Experiments:persist_entries(scope)
-	local saved = storage.save_experiments(self.config, {
-		scope = scope,
-		entries = self.entries,
-	})
-	if not saved then
-		self:diagnose("persist_failed", "cache")
+-- The durable record is maintained INCREMENTALLY, decoupled from the
+-- in-memory serving set: a fail-closed latch clears serving while the disk
+-- deliberately retains the record, so writing `self.entries` wholesale would
+-- clobber retained sibling entries (installing one experiment post-latch
+-- would erase the others) and a permanent drop landing while nothing is
+-- served in memory would never reach the disk at all. Both helpers are
+-- best-effort: a failed write costs offline serving only and is diagnosed.
+
+-- The stored record for `scope`, or a fresh empty one (a record stamped for
+-- any other scope is dead weight and is overwritten by the next write).
+function Experiments:durable_record_for(scope)
+	local record = storage.load_experiments(self.config)
+	if record and record.scope == scope then
+		return record
 	end
-	return saved
+	return { scope = scope, entries = {} }
 end
 
+function Experiments:durable_set_entry(scope, experiment_key, entry)
+	local record = self:durable_record_for(scope)
+	record.entries[experiment_key] = entry
+	if not storage.save_experiments(self.config, record) then
+		self:diagnose("persist_failed", "cache")
+	end
+end
+
+-- Drop one experiment's entry from the durable record. Keyed on the DISK
+-- state, never on the in-memory serving set: a permanent drop (404, any
+-- not-assigned shape) must reach the record even when a fail-closed latch
+-- already cleared serving — otherwise the stale assignment would revive at
+-- the next launch.
+function Experiments:durable_drop_entry(scope, experiment_key)
+	local record = storage.load_experiments(self.config)
+	if not record or record.scope ~= scope or record.entries[experiment_key] == nil then
+		return
+	end
+	record.entries[experiment_key] = nil
+	if not storage.save_experiments(self.config, record) then
+		self:diagnose("persist_failed", "cache")
+	end
+end
+
+-- The Q4 de-dupe tuple: (experiment, version, SUBJECT). The subject is a
+-- first-class component — the assignment key usually varies with it, but the
+-- contract is per subject, so a re-minted subject re-arms even against an
+-- identical assignment key.
 local function exposure_tuple(experiment_key, entry)
 	return experiment_key .. "\31" .. string.format("%.0f", entry.version)
-		.. "\31" .. entry.assignment_key
+		.. "\31" .. entry.assignment_key .. "\31" .. tostring(entry.subject_key)
 end
 
 -- Emit the exposure fact for a cached assignment, once per (experiment,
@@ -714,7 +773,8 @@ function Experiments:try_expose(experiment_key, rearm)
 		arm = exposed.arm + 1
 	end
 	local event_id = M.exposure_event_id(
-		self.session_marker, experiment_key, entry.version, entry.assignment_key, arm)
+		self.session_marker, entry.subject_key, experiment_key,
+		entry.version, entry.assignment_key, arm)
 	local ok, err = self.deps.emit("experiment_exposure", {
 		experiment_key = experiment_key,
 		experiment_version = entry.version,
@@ -734,11 +794,16 @@ function Experiments:try_expose(experiment_key, rearm)
 end
 
 -- Settle an authoritative fetch outcome and, when it may, install it. Gates,
--- in remote-config order: the scope must still be current (a subject
--- re-minted while the response was in flight makes it another subject's
--- assignment), then the per-key sequence fence, then the outcome's own
--- directives.
-function Experiments:install(seq, scope, experiment_key, outcome)
+-- in remote-config order: the auth epoch must still be current (an outcome
+-- whose fetch was already in flight when a fail-closed latch landed is
+-- discarded outright — it must neither unlatch nor reinstall revoked
+-- assignments), the scope must still be current (a subject re-minted while
+-- the response was in flight makes it another subject's assignment), then
+-- the per-key sequence fence, then the outcome's own directives.
+function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch)
+	if auth_epoch ~= self.auth_epoch then
+		return
+	end
 	local subject = self:current_subject_id()
 	if not subject or self:scope_for(subject) ~= scope then
 		return
@@ -752,10 +817,14 @@ function Experiments:install(seq, scope, experiment_key, outcome)
 	end
 	if outcome.auth_blocked then
 		-- Fail closed: stop serving every cached assignment (the getters
-		-- return nil) and halt revalidation. The durable record is retained
-		-- (a re-init may serve it and re-probe) unless the real-subjects
-		-- sentinel says the platform withdrew the assignments outright.
+		-- return nil), halt revalidation, and open a new auth epoch so
+		-- every response still in flight is discarded — only a fetch
+		-- started AFTER this moment may unlatch. The durable record is
+		-- retained (a re-init may serve it and re-probe) unless the
+		-- real-subjects sentinel says the platform withdrew the
+		-- assignments outright.
 		self.auth_blocked = true
+		self.auth_epoch = self.auth_epoch + 1
 		self.entries = {}
 		self.pending_exposure = {}
 		if outcome.drop_all then
@@ -766,7 +835,8 @@ function Experiments:install(seq, scope, experiment_key, outcome)
 		return
 	end
 	if outcome.authoritative then
-		-- Any authoritative, authorized outcome proves the credential works
+		-- An authoritative, authorized outcome of a post-latch fetch (the
+		-- epoch gate above guarantees that) proves the credential works
 		-- again: unlatch and let revalidation resume.
 		self.auth_blocked = false
 	end
@@ -777,11 +847,12 @@ function Experiments:install(seq, scope, experiment_key, outcome)
 	self.backoff_attempt = 0
 	self.retry_after_ms = nil
 	if outcome.drop_entry then
-		if self.entries[experiment_key] then
-			self.entries[experiment_key] = nil
-			self.pending_exposure[experiment_key] = nil
-			self:persist_entries(scope)
-		end
+		self.entries[experiment_key] = nil
+		self.pending_exposure[experiment_key] = nil
+		-- The durable drop is keyed on the disk state, not the in-memory
+		-- serving set: a latch may have cleared serving while the record
+		-- retains the entry, and the permanent drop must still land.
+		self:durable_drop_entry(scope, experiment_key)
 		return
 	end
 	if outcome.new_entry then
@@ -789,13 +860,16 @@ function Experiments:install(seq, scope, experiment_key, outcome)
 		entry.subject_key = subject
 		entry.attributes = outcome.attributes
 		self.entries[experiment_key] = entry
-		self.pending_exposure[experiment_key] = nil
-		self:persist_entries(scope)
+		self:durable_set_entry(scope, experiment_key, entry)
 		self:arm_revalidation(clock.unix_ms())
 		-- The variant takes effect at this resolution (a variant change on
 		-- republish applies here too — no mid-session flapping guard beyond
-		-- the fetch cadence): the application point, so the exposure fact is
-		-- emitted now, deduplicated per session tuple.
+		-- the fetch cadence): the application point, so the exposure fact
+		-- is emitted now, deduplicated per session tuple. The pending mark
+		-- is set FIRST and cleared only by a successful (or terminally
+		-- skipped) emission, so a locally failed emit — a full queue — is
+		-- retried by the tick sweep instead of being lost.
+		self.pending_exposure[experiment_key] = true
 		self:try_expose(experiment_key)
 	end
 end
@@ -878,10 +952,13 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	self.fetch_seq = self.fetch_seq + 1
 	local seq = self.fetch_seq
 
-	-- Capture the scope ONCE per fetch: the URL, the served cache, and the
-	-- installed entry all describe the same subject even if the id re-mints
-	-- while the request is in flight.
+	-- Capture the scope and the auth epoch ONCE per fetch: the URL, the
+	-- served cache, and the installed entry all describe the same subject
+	-- even if the id re-mints while the request is in flight, and an
+	-- outcome that raced a fail-closed latch is discarded by the epoch gate
+	-- at install time.
 	local scope = self:scope_for(subject)
+	local auth_epoch = self.auth_epoch
 	local entry = self.entries[experiment_key]
 
 	local normalized_attributes, dropped
@@ -890,11 +967,13 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		if dropped > 0 then
 			self:diagnose("dropped", "attributes")
 		end
-	elseif entry and entry.attributes then
+	elseif is_revalidation and entry and entry.attributes then
 		-- A revalidation re-sends the attributes of the last host-supplied
 		-- fetch for this experiment (one targeting vocabulary, one value
 		-- set), so a server-evaluated condition keeps seeing the same
-		-- subject it matched before.
+		-- subject it matched before. Only the CADENCE reuses them: a
+		-- host-triggered fetch that omits attributes means what it says —
+		-- it sends none, and none become the entry's remembered set.
 		normalized_attributes = entry.attributes
 	else
 		normalized_attributes = {}
@@ -926,21 +1005,24 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	http.request(url, "GET", function(_, _, response)
 		local result, outcome = M.apply(entry, response, clock.unix_ms())
 		outcome.attributes = normalized_attributes
-		if outcome.remint and not self.reminted and not is_revalidation then
+		if outcome.remint and not self.reminted then
 			-- The persisted subject id failed the wire grammar (storage
-			-- corruption this client could not detect locally): re-mint once
-			-- per process and retry as a fresh subject. A second grammar
-			-- reject with a freshly minted id is a bug, never a loop.
+			-- corruption this client could not detect locally): re-mint
+			-- once per process and retry as a fresh subject — from the
+			-- revalidation path too, or a rejected cached subject would
+			-- never heal until an explicit host fetch happens to run. A
+			-- second grammar reject with a freshly minted id is a bug,
+			-- never a loop.
 			self.reminted = true
 			self:diagnose("reminted", "subject_id")
 			self:adopt_minted_subject_id()
-			self:fetch(experiment_key, attributes, callback)
+			self:fetch(experiment_key, attributes, callback, is_revalidation)
 			return
 		end
 		if outcome.transient then
 			self:pace_transient(outcome.retry_after_seconds)
 		end
-		self:install(seq, scope, experiment_key, outcome)
+		self:install(seq, scope, experiment_key, outcome, auth_epoch)
 		finish(result)
 	end, headers, nil, options)
 	return true

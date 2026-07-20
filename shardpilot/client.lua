@@ -1046,6 +1046,13 @@ function Client:session_start(props)
 		self.session_active = previous_session_active
 		return false, err
 	end
+	if self.experiments then
+		-- The exposure contract is once per (experiment, version, subject)
+		-- per SESSION: an explicit session renewal re-arms it, so a
+		-- still-applied assignment emits one exposure into the new session
+		-- (with its own deterministic id) on the next application sweep.
+		self.experiments:on_session_renewed()
+	end
 	return true
 end
 

@@ -1081,8 +1081,9 @@ local function test_exposure_auto_emit_once_with_deterministic_id()
 	assert_nil(fact.user_id, "experiment facts omit user_id even when identified")
 	assert_equal(fact.anonymous_id, "anon-client",
 		"the envelope identity stays the standard anonymous id")
+	local subject = client.experiments_client_id
 	assert_equal(fact.event_id, experiments.exposure_event_id(
-		client.experiments.session_marker, "exp-checkout", 3, fixture_assignment_key, 0),
+		client.experiments.session_marker, subject, "exp-checkout", 3, fixture_assignment_key, 0),
 		"the exposure event id is the deterministic derivation")
 
 	-- Re-fetching the same assignment does not re-emit.
@@ -1098,20 +1099,24 @@ local function test_exposure_auto_emit_once_with_deterministic_id()
 	assert_true(rearmed[2].event_id ~= rearmed[1].event_id,
 		"a re-arm derives a distinct id")
 	assert_equal(rearmed[2].event_id, experiments.exposure_event_id(
-		client.experiments.session_marker, "exp-checkout", 3, fixture_assignment_key, 1))
+		client.experiments.session_marker, subject, "exp-checkout", 3, fixture_assignment_key, 1))
 end
 
 local function test_exposure_event_id_derivation_is_stable()
-	local a = experiments.exposure_event_id("marker", "exp", 3, fixture_assignment_key, 0)
-	local b = experiments.exposure_event_id("marker", "exp", 3, fixture_assignment_key, 0)
+	local subject = "spcid_" .. string.rep("f", 32)
+	local a = experiments.exposure_event_id("marker", subject, "exp", 3, fixture_assignment_key, 0)
+	local b = experiments.exposure_event_id("marker", subject, "exp", 3, fixture_assignment_key, 0)
 	assert_equal(a, b, "the same tuple derives the same id")
 	assert_match(a, "^%x+%-%x+%-%x+%-%x+%-%x+$")
-	assert_true(a ~= experiments.exposure_event_id("marker", "exp", 3, fixture_assignment_key, 1),
+	assert_true(a ~= experiments.exposure_event_id("marker", subject, "exp", 3, fixture_assignment_key, 1),
 		"the arm counter varies the id")
-	assert_true(a ~= experiments.exposure_event_id("marker", "exp", 4, fixture_assignment_key, 0),
+	assert_true(a ~= experiments.exposure_event_id("marker", subject, "exp", 4, fixture_assignment_key, 0),
 		"the version varies the id")
-	assert_true(a ~= experiments.exposure_event_id("other", "exp", 3, fixture_assignment_key, 0),
+	assert_true(a ~= experiments.exposure_event_id("other", subject, "exp", 3, fixture_assignment_key, 0),
 		"the session marker varies the id")
+	assert_true(a ~= experiments.exposure_event_id("marker", "spcid_" .. string.rep("0", 32),
+		"exp", 3, fixture_assignment_key, 0),
+		"the subject varies the id")
 end
 
 local function test_exposure_version_change_rearms()
@@ -1428,6 +1433,262 @@ local function test_facade_and_capability()
 	assert_true(sdk.shutdown())
 end
 
+-- ── round-1 regressions ───────────────────────────────────────────────────────
+
+local function test_auth_latch_survives_prelatch_inflight_success()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body({ experiment_key = "exp-a" })
+	fetch(client, "exp-a")
+	next_response_body = assignment_body({ experiment_key = "exp-b", variant_key = "beta" })
+	fetch(client, "exp-b")
+
+	-- A batched revalidation puts both requests in flight at once.
+	local held = {}
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = { url = url, callback = callback }
+		return true
+	end
+	advance_seconds(400)
+	client:update(0.016)
+	responder = nil
+	assert_equal(#held, 2, "both cached entries revalidate in one batch")
+
+	-- One sibling fails closed first...
+	held[1].callback(nil, nil, {
+		status = 401,
+		response = json.encode({ error = "invalid runtime token" }),
+	})
+	assert_nil(client:experiment_variant("exp-a"))
+	assert_nil(client:experiment_variant("exp-b"))
+
+	-- ...and the other — already in flight when the latch landed — answers
+	-- 200. It must neither unlatch nor reinstall the revoked assignment.
+	held[2].callback(nil, nil, {
+		status = 200,
+		response = assignment_body({ experiment_key = "exp-b", variant_key = "beta" }),
+	})
+	assert_nil(client:experiment_variant("exp-b"),
+		"a pre-latch in-flight success must not resume serving")
+	local before = #assignment_requests()
+	advance_seconds(400)
+	client:update(0.016)
+	assert_equal(#assignment_requests(), before,
+		"a pre-latch in-flight success must not unlatch revalidation")
+
+	-- Only a fetch STARTED AFTER the latch clears it.
+	next_status = 200
+	next_response_body = assignment_body({ experiment_key = "exp-a" })
+	local result = fetch(client, "exp-a")
+	assert_true(result.ok and result.assigned)
+	assert_equal(client:experiment_variant("exp-a"), "treatment",
+		"a post-latch authorized fetch unlatches and serves")
+end
+
+local function test_permanent_drop_reaches_disk_after_latch_wipe()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body({ experiment_key = "exp-a" })
+	fetch(client, "exp-a")
+	next_response_body = assignment_body({ experiment_key = "exp-b", variant_key = "beta" })
+	fetch(client, "exp-b")
+
+	-- The latch clears the in-memory serving set; the durable record is
+	-- deliberately retained.
+	next_status = 401
+	next_response_body = json.encode({ error = "invalid runtime token" })
+	fetch(client, "exp-a")
+	local record = storage.load_experiments(client.config)
+	assert_true(record.entries["exp-a"] ~= nil and record.entries["exp-b"] ~= nil,
+		"the latch retains the durable record")
+
+	-- A post-latch permanent drop must reach the disk even though nothing
+	-- is served in memory for the key.
+	next_status = 404
+	next_response_body = json.encode({ error = "published experiment not found" })
+	fetch(client, "exp-a")
+	record = storage.load_experiments(client.config)
+	assert_nil(record.entries["exp-a"],
+		"a permanent drop must reach the durable record after a latch wipe")
+	assert_true(record.entries["exp-b"] ~= nil,
+		"dropping one experiment must not disturb the sibling's durable entry")
+
+	-- A post-latch reinstall must not clobber retained siblings either.
+	next_status = 200
+	next_response_body = assignment_body({ experiment_key = "exp-a" })
+	fetch(client, "exp-a")
+	record = storage.load_experiments(client.config)
+	assert_true(record.entries["exp-a"] ~= nil and record.entries["exp-b"] ~= nil,
+		"installing one experiment must keep the sibling's durable entry")
+
+	-- The disk state is what a relaunch serves.
+	local relaunch = assert(sdk.new(config()))
+	assert_equal(relaunch:experiment_variant("exp-a"), "treatment")
+	assert_equal(relaunch:experiment_variant("exp-b"), "beta",
+		"the retained sibling survives to the next launch")
+	restore()
+end
+
+local function test_remint_rearms_exposure_for_new_subject()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	local first_subject = query_params(last_assignment_request().url).subject_key
+
+	-- The stored subject goes bad server-side; the re-minted subject gets
+	-- the IDENTICAL assignment answer (same assignment key, same version).
+	-- The Q4 tuple is per subject, so the new subject's first application
+	-- must emit its own exposure.
+	local grammar_reject = json.encode({
+		error = "experiment metadata must use synthetic local-safe identifiers only",
+	})
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = grammar_reject })
+		else
+			callback(nil, nil, { status = 200, response = assignment_body() })
+		end
+		return true
+	end
+	local result = fetch(client, "exp-checkout")
+	responder = nil
+	assert_true(result.ok and result.assigned)
+	local second_subject = query_params(last_assignment_request().url).subject_key
+	assert_true(second_subject ~= first_subject)
+
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 2,
+		"the re-minted subject's first application must expose again")
+	assert_true(exposures[2].event_id ~= exposures[1].event_id,
+		"the new subject derives a distinct exposure id")
+end
+
+local function test_explicit_fetch_without_attributes_sends_none()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout", { geo = "EU" })
+	assert_equal(query_params(last_assignment_request().url).geo, "EU")
+
+	-- A host-triggered fetch that omits attributes means what it says: no
+	-- attributes ride, and none become the remembered set.
+	fetch(client, "exp-checkout")
+	assert_nil(query_params(last_assignment_request().url).geo,
+		"an explicit no-attributes fetch must not reuse the saved set")
+
+	advance_seconds(400)
+	client:update(0.016)
+	assert_nil(query_params(last_assignment_request().url).geo,
+		"the cadence re-sends the LAST host-supplied set — now none")
+	assert_equal(query_params(last_assignment_request().url).experiment_key, "exp-checkout")
+end
+
+local function test_revalidation_remints_rejected_subject()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	local first_subject = query_params(last_assignment_request().url).subject_key
+	local base = #assignment_requests()
+
+	-- The server starts rejecting the stored subject's grammar; the CADENCE
+	-- must heal it (re-mint once and retry) without waiting for an explicit
+	-- host fetch.
+	local grammar_reject = json.encode({
+		error = "experiment metadata must use synthetic local-safe identifiers only",
+	})
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = grammar_reject })
+		else
+			callback(nil, nil, { status = 200, response = assignment_body() })
+		end
+		return true
+	end
+	advance_seconds(400)
+	client:update(0.016)
+	responder = nil
+
+	assert_equal(#assignment_requests(), base + 2,
+		"the revalidation grammar reject must re-mint and retry")
+	local healed_subject = query_params(last_assignment_request().url).subject_key
+	assert_match(healed_subject, subject_grammar)
+	assert_true(healed_subject ~= first_subject,
+		"the retry must carry the freshly minted subject")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the healed subject's assignment installs")
+end
+
+local function test_queue_full_exposure_retried_by_tick()
+	reset()
+	local client = granted_client({ buffer_size = 1 })
+	assert_true(client:track("filler"))
+
+	-- The fresh assignment applies while the queue is full: the exposure
+	-- emit fails locally and must stay armed instead of being lost.
+	next_response_body = assignment_body()
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.assigned)
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0,
+		"the full queue rejected the exposure emit")
+
+	-- Draining the queue and ticking retries the armed exposure.
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1,
+		"the armed exposure must emit once the queue drains")
+	assert_equal(exposures[1].props.experiment_key, "exp-checkout")
+
+	-- Still exactly once: the retry consumed the arm.
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+end
+
+local function test_session_renewal_rearms_exposure()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	local first = queued_events(client, "experiment_exposure")
+	assert_equal(#first, 1)
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 1,
+		"one exposure per session while the session lasts")
+
+	-- An explicit session renewal re-arms the once-per-SESSION contract.
+	assert_true(client:session_start())
+	client:update(0.016)
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 2,
+		"a renewed session emits its own exposure for the applied assignment")
+	assert_true(exposures[2].event_id ~= exposures[1].event_id,
+		"each session derives its own deterministic id")
+	assert_equal(exposures[2].session_id, client.session_id,
+		"the renewed session's exposure rides the new session")
+
+	-- And once only, again.
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 2)
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -1468,6 +1729,13 @@ local tests = {
 	test_fail_closed_fences_older_inflight_success,
 	test_shutdown_never_blocked_by_parked_revalidation,
 	test_facade_and_capability,
+	test_auth_latch_survives_prelatch_inflight_success,
+	test_permanent_drop_reaches_disk_after_latch_wipe,
+	test_remint_rearms_exposure_for_new_subject,
+	test_explicit_fetch_without_attributes_sends_none,
+	test_revalidation_remints_rejected_subject,
+	test_queue_full_exposure_retried_by_tick,
+	test_session_renewal_rearms_exposure,
 }
 
 for _, test in ipairs(tests) do
