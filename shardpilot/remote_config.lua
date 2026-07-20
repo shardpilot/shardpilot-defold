@@ -35,19 +35,8 @@
 -- The cache is stamped with the (workspace, environment, client, url) scope
 -- it was fetched for; a cache written by any other scope is a miss (its ETag
 -- is never sent, its values never served) and is overwritten by the next
--- successful fetch. There is no experiment assignment and no exposure event
--- here (that surface lives in shardpilot/experiments.lua), and this module
--- never schedules a fetch on its own — by default the game triggers every
--- fetch. The one exception is the OPT-IN periodic revalidation timer
--- (config `remote_config_revalidate`, default off; the timer itself lives
--- in client.lua's update tick): when enabled, the client calls fetch() on an
--- interval derived from the server's Cache-Control max-age (floored at 60s,
--- 300s when unknown — see revalidate_interval_seconds), each tick a plain
--- conditional GET riding the same If-None-Match/304 lane as a host fetch.
--- That automatic lane HALTS after any authoritative 401/403 (`auth_refused`)
--- until a new client is constructed; host-triggered fetches never consult
--- the flag and keep classifying per fetch, and no classification or cache
--- behavior changes with the timer on.
+-- successful fetch. There is no experiment assignment, no exposure events,
+-- and no automatic refresh here by design — the game triggers every fetch.
 
 local clock = require "shardpilot.clock"
 local storage = require "shardpilot.storage"
@@ -244,29 +233,6 @@ local function response_etag(response)
 	return value
 end
 
--- The Cache-Control max-age of a response (whole seconds), or nil when the
--- response carries none. Only the client `max-age` directive is read — it is
--- what the opt-in revalidation interval anchors on. The header is parsed as
--- comma-separated directives with the directive NAME matched whole, so a
--- shared-cache or lookalike directive (`s-maxage`, or any name merely ending
--- in `max-age`) can never be misread as the client freshness window.
-function M.cache_max_age_seconds(response)
-	if type(response) ~= "table" or type(response.headers) ~= "table" then
-		return nil
-	end
-	local value = response.headers["cache-control"] or response.headers["Cache-Control"]
-	if type(value) ~= "string" then
-		return nil
-	end
-	for directive in value:lower():gmatch("[^,]+") do
-		local seconds = directive:match("^%s*max%-age%s*=%s*(%d+)%s*$")
-		if seconds then
-			return tonumber(seconds)
-		end
-	end
-	return nil
-end
-
 -- Serve the cached snapshot for a transient failure, or fail when no usable
 -- cache exists. A served snapshot is still a SUCCESS (`ok = true`) — the game
 -- has usable configuration — with `from_cache = true` and `error` carrying
@@ -434,24 +400,6 @@ function M.new(config, identity)
 		-- in flight.
 		fetch_seq = 0,
 		settled = {},
-		-- The last observed Cache-Control max-age (seconds), captured from
-		-- any response carrying one; nil until then. Read only by the opt-in
-		-- revalidation interval below.
-		max_age_seconds = nil,
-		-- Automatic-lane halt (assignment-plane Extra 2 mirrored onto the
-		-- opt-in RC revalidation TIMER; pending coordinator ratification —
-		-- see client.lua): true once ANY authoritative 401/403 landed on
-		-- this plane. The update-tick timer stops scheduling fetches while
-		-- set; host-triggered fetches never consult it and keep classifying
-		-- per fetch (no latch on classification, cache, or getters). Resets
-		-- only with a new client (re-init / config change).
-		auth_refused = false,
-		-- Count of fetches whose RESPONSE has been processed (any lane, any
-		-- outcome). The opt-in revalidation timer re-arms its interval from
-		-- the latest completed fetch, so a freshly observed (e.g. shorter)
-		-- Cache-Control max-age governs the NEXT tick instead of a stale
-		-- previously-armed deadline firing first.
-		fetches_completed = 0,
 	}, RemoteConfig)
 	-- Serve the persisted last-known-good snapshot immediately after a
 	-- restart: getters work before (and without) any fetch when a cache for
@@ -729,38 +677,10 @@ function RemoteConfig:fetch(callback)
 
 	http.request(url, "GET", function(_, _, response)
 		local result, new_cache, authoritative, revalidated_cache = M.apply(cache, response, clock.unix_ms())
-		-- Revalidation bookkeeping, both deliberately outside the install
-		-- gates (they are not installs): remember the server's freshness
-		-- window when the response names one, and halt the opt-in automatic
-		-- revalidation timer on an authoritative auth refusal — per-fetch
-		-- classification and the cache are untouched either way.
-		local max_age = M.cache_max_age_seconds(response)
-		if max_age then
-			self.max_age_seconds = max_age
-		end
-		if authoritative and not result.ok and result.error == "unauthorized" then
-			self.auth_refused = true
-		end
-		self.fetches_completed = self.fetches_completed + 1
 		self:install(seq, result, new_cache, scope, authoritative, cache, revalidated_cache)
 		finish(result)
 	end, headers, nil, options)
 	return true
-end
-
--- The opt-in periodic revalidation interval (seconds): the server's last
--- observed Cache-Control max-age, floored at 60s to respect the per-scope
--- server rate limiter, 300s while no max-age has been observed. [Interval
--- anchoring pends coordinator ratification; ADR-0259 pins no numbers.]
-local default_revalidate_interval_seconds = 300
-local min_revalidate_interval_seconds = 60
-
-function RemoteConfig:revalidate_interval_seconds()
-	local interval = self.max_age_seconds or default_revalidate_interval_seconds
-	if interval < min_revalidate_interval_seconds then
-		interval = min_revalidate_interval_seconds
-	end
-	return interval
 end
 
 -- ── typed value getters ───────────────────────────────────────────────────────
