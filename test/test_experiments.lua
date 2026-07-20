@@ -2668,14 +2668,15 @@ local function test_owed_exposures_stay_session_scoped()
 	next_response_body = nil
 	assert_true(seed:shutdown())
 
-	-- A relaunch restores the assignment: its exposure for the new
-	-- process's FIRST session is owed until the first granted tick. The
-	-- host rotates the session BEFORE that tick: the renewal must queue
-	-- the second session's exposure BEHIND the first session's owed
+	-- A relaunch restores the assignment, and activity REALIZES the first
+	-- session (lazily) with the exposure still owed. The host then rotates
+	-- the session BEFORE the tick drains it: the genuine renewal must
+	-- queue the second session's exposure BEHIND the first session's owed
 	-- snapshot — each session's treatment gets its own fact and id, never
 	-- an overwrite.
 	next_status = 200
 	local client = assert(sdk.new(config()))
+	assert_true(client:track("warmup"))
 	assert_true(client:session_start())
 	client:update(0.016)
 	local exposures = queued_events(client, "experiment_exposure")
@@ -2894,6 +2895,122 @@ local function test_stale_scope_retry_after_does_not_park_revalidation()
 		"a stale-scope Retry-After must not park the current subject's revalidation")
 end
 
+-- ── round-8 regressions ───────────────────────────────────────────────────────
+
+local function test_restored_exposure_migrates_to_first_session()
+	reset()
+	local restore = install_fake_sys_storage()
+	local seed = granted_client()
+	next_response_body = assignment_body()
+	fetch(seed, "exp-checkout")
+	next_status = 202
+	next_response_body = nil
+	assert_true(seed:shutdown())
+
+	-- The common init-then-start-session launch flow: the restored
+	-- assignment's owed exposure is armed under the PRE-session
+	-- constructor marker, and the host explicitly starts the FIRST session
+	-- before any update(). No session existed for the restoration to have
+	-- run in — the owed snapshot must MIGRATE to the first real session,
+	-- never duplicate into two facts.
+	next_status = 200
+	local client = assert(sdk.new(config()))
+	assert_true(client:session_start())
+	client:update(0.016)
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1,
+		"the restored application emits exactly ONE fact into the first session")
+	assert_equal(exposures[1].session_id, client.session_id,
+		"attributed to the just-started session")
+
+	-- And stays once-only.
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	restore()
+end
+
+local function test_permanent_400_drops_cached_assignment()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout", { geo = "de" })
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- The cadence revalidation answers a NON-grammar 400: permanent for
+	-- this input set. The cached assignment fails closed — a durable drop
+	-- — instead of serving stale forever while the cadence re-sends the
+	-- same rejected input.
+	next_status = 400
+	next_response_body = json.encode({ error = "unsupported attribute value" })
+	advance_seconds(400)
+	client:update(0.016)
+	assert_nil(client:experiment_variant("exp-checkout"),
+		"a permanent 400 stops serving the cached assignment")
+	local record = storage.load_experiments(client.config)
+	assert_true(record == nil or record.entries["exp-checkout"] == nil,
+		"the drop is durable")
+
+	-- The cadence stops re-asking for the dropped experiment.
+	local before = #assignment_requests()
+	next_status = 200
+	next_response_body = nil
+	advance_seconds(400)
+	client:update(0.016)
+	assert_equal(#assignment_requests(), before)
+	restore()
+end
+
+local function test_shutdown_captures_deferred_session_end_when_flush_cannot_send()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	-- Mode B ingest (token provider) alongside the Mode A control plane:
+	-- the provider cannot supply a token, so the shutdown flush fails
+	-- BEFORE moving anything out of the queue.
+	local client = granted_client({
+		buffer_size = 2,
+		token_provider = function(callback)
+			callback(nil, nil, "token_unavailable")
+		end,
+	})
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	-- The queue is FULL and undeliverable; the spool durably captures it.
+	-- Shutdown must evict the captured remnant so the deferred session end
+	-- and the owed exposure can still enqueue — and be spooled in turn —
+	-- instead of silently finalizing with the session active and neither
+	-- fact captured anywhere.
+	next_response_body = nil
+	assert_true(client:shutdown(),
+		"a durably captured queue must not block teardown")
+	assert_equal(client.session_active, false,
+		"the deferred session end completed")
+	local names = {}
+	local function collect(value)
+		if type(value) ~= "table" then
+			return
+		end
+		if type(value.event_name) == "string" then
+			names[value.event_name] = true
+		end
+		for _, child in pairs(value) do
+			collect(child)
+		end
+	end
+	for _, record in pairs(stores) do
+		collect(record)
+	end
+	assert_true(names["session_end"],
+		"the deferred session end is durably captured in the spool")
+	assert_true(names["experiment_exposure"],
+		"the owed exposure is durably captured in the spool")
+	restore()
+end
+
 local function test_shutdown_completes_with_active_session_and_full_queue()
 	reset()
 	local client = granted_client({ buffer_size = 2 })
@@ -3005,6 +3122,9 @@ local tests = {
 	test_cadence_remint_retry_carries_attributes,
 	test_stale_scope_retry_after_does_not_park_revalidation,
 	test_shutdown_completes_with_active_session_and_full_queue,
+	test_restored_exposure_migrates_to_first_session,
+	test_permanent_400_drops_cached_assignment,
+	test_shutdown_captures_deferred_session_end_when_flush_cannot_send,
 }
 
 for _, test in ipairs(tests) do

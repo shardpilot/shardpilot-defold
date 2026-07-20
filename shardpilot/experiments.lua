@@ -374,8 +374,9 @@ end
 --     outcomes do not, so they cannot fence off a fresh response in flight;
 --   * new_entry — cache this assignment (exists exactly for 200 assigned);
 --   * drop_entry / drop_all — drop the experiment's cached assignment (every
---     not-assigned shape, 404) / drop the whole durable record (the
---     real-subjects kill sentinel);
+--     not-assigned shape, 404, and non-grammar 400s — a permanently
+--     rejected input set must not serve stale forever) / drop the whole
+--     durable record (the real-subjects kill sentinel);
 --   * auth_blocked — 401/403: stop serving and stop revalidating, fail
 --     closed;
 --   * remint — the subject-grammar 400 sentinel: the caller may re-mint the
@@ -467,13 +468,19 @@ function M.apply(entry, response, now_ms)
 	-- Bad inputs are permanent for this input set — retrying unchanged cannot
 	-- help. The one self-healing case: the subject-grammar sentinel with an
 	-- SDK-minted id means the persisted id went bad; the caller re-mints once
-	-- (fresh-install semantics) and retries.
+	-- (fresh-install semantics) and retries — deliberately NOT a drop: the
+	-- assignment itself was never rejected, the subject id was. Every OTHER
+	-- 400 fails closed for the experiment: a cached assignment whose
+	-- revalidation is permanently rejected must not keep serving stale
+	-- forever while the cadence re-sends the same invalid input set, so the
+	-- entry drops (durably, with the usual decision-time stamp raise).
 	if status == 400 then
-		local outcome = { authoritative = true }
 		if response_error_text(response) == sentinel_subject_grammar then
-			outcome.remint = true
+			return { ok = false, from_cache = false, error = "bad_request" },
+				{ authoritative = true, remint = true }
 		end
-		return { ok = false, from_cache = false, error = "bad_request" }, outcome
+		return { ok = false, from_cache = false, error = "bad_request" },
+			{ authoritative = true, drop_entry = true }
 	end
 
 	-- Transient bucket: no connection, timeout, backpressure, or any server
@@ -694,9 +701,27 @@ end
 -- session derives its own deterministic ids, the de-dupe map resets, and
 -- every still-applied assignment re-exposes on its next application sweep —
 -- exactly like a cache-restored assignment does at launch.
-function Experiments:on_session_renewed()
+-- `is_renewal` distinguishes a genuine renewal (a session existed in this
+-- process — lazily or explicitly started) from the process's FIRST explicit
+-- session_start: owed snapshots armed under the pre-session constructor
+-- marker (cache restores in the common init-then-start-session launch flow)
+-- belong to that first real session — no session existed for them to have
+-- run in — so they MIGRATE to it instead of a duplicate being queued. A
+-- genuine renewal preserves prior sessions' owed snapshots untouched: those
+-- treatments really ran in their sessions.
+function Experiments:on_session_renewed(is_renewal)
+	local previous = self.session_marker
 	self.session_marker = id.uuid()
 	self.exposed = {}
+	if not is_renewal then
+		for _, list in pairs(self.pending_exposure) do
+			for i = 1, #list do
+				if list[i].session == previous then
+					list[i].session = self.session_marker
+				end
+			end
+		end
+	end
 	for key, entry in pairs(self.entries) do
 		self:arm_exposure(key, entry)
 	end

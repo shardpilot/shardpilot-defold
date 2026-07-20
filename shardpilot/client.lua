@@ -1059,7 +1059,11 @@ function Client:session_start(props)
 		-- per SESSION: an explicit session renewal re-arms it, so a
 		-- still-applied assignment emits one exposure into the new session
 		-- (with its own deterministic id) on the next application sweep.
-		self.experiments:on_session_renewed()
+		-- Whether this start is a genuine RENEWAL (any session — lazy or
+		-- explicit — existed before it) decides what happens to owed
+		-- pre-session exposure snapshots: the first real session adopts
+		-- them; a renewal preserves them as prior sessions' facts.
+		self.experiments:on_session_renewed(previous_session_id ~= nil)
 	end
 	return true
 end
@@ -2340,6 +2344,12 @@ function Client:shutdown(reason)
 		if not has_remnant or not self:spool_undelivered() then
 			return false, err
 		end
+		-- The remnant is now durably on disk: EVICT it from the in-memory
+		-- queue so the post-flush housekeeping (the deferred session end,
+		-- owed exposure facts) has room to enqueue. The spooled envelopes
+		-- re-send at the next launch; keeping the memory copies would both
+		-- wedge that housekeeping behind a still-full queue and double-send.
+		queue.drain(self.queue, queue.size(self.queue))
 	end
 	if self:consent_outbox_pending() then
 		-- Undelivered consent receipts behave like the event spool at
@@ -2364,9 +2374,16 @@ function Client:shutdown(reason)
 	-- assignment's owed fact is lost with the process, as before).
 	local before_housekeeping = queue.size(self.queue)
 	if session_end_owed and self.session_active then
-		-- The room the full queue denied session_end() now exists:
-		-- complete the local session teardown, wire event best-effort.
-		self:session_end(reason or "app_final")
+		-- The room the full queue denied session_end() now exists (the
+		-- flush drained the queue, or its spooled remnant was evicted):
+		-- complete the session teardown. If the event STILL cannot
+		-- enqueue, do not silently finalize with the session active and
+		-- its event captured nowhere — report the failure and stay alive
+		-- for a host retry.
+		local retry_ok, retry_err = self:session_end(reason or "app_final")
+		if not retry_ok then
+			return false, retry_err
+		end
 	end
 	if self.experiments then
 		-- Owed durable syncs get one last retry too — a kill/not-assigned
