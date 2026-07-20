@@ -2656,6 +2656,276 @@ local function test_stale_grammar_reject_does_not_remint()
 		"the genuine reject re-mints the subject (budget was not consumed)")
 end
 
+-- ── round-7 regressions ───────────────────────────────────────────────────────
+
+local function test_owed_exposures_stay_session_scoped()
+	reset()
+	local restore = install_fake_sys_storage()
+	local seed = granted_client()
+	next_response_body = assignment_body()
+	fetch(seed, "exp-checkout")
+	next_status = 202
+	next_response_body = nil
+	assert_true(seed:shutdown())
+
+	-- A relaunch restores the assignment: its exposure for the new
+	-- process's FIRST session is owed until the first granted tick. The
+	-- host rotates the session BEFORE that tick: the renewal must queue
+	-- the second session's exposure BEHIND the first session's owed
+	-- snapshot — each session's treatment gets its own fact and id, never
+	-- an overwrite.
+	next_status = 200
+	local client = assert(sdk.new(config()))
+	assert_true(client:session_start())
+	client:update(0.016)
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 2,
+		"both sessions' treatments get their own exposure fact")
+	assert_true(exposures[1].event_id ~= exposures[2].event_id,
+		"each session derives its own deterministic id")
+
+	-- And exactly those two.
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 2)
+	restore()
+end
+
+local function test_ordinary_latch_preserves_owed_exposure()
+	reset()
+	local client = granted_client({ buffer_size = 2 })
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	-- An ORDINARY 401 latches: serving stops, but the treatment already
+	-- ran — its owed fact is about the past and must survive the latch,
+	-- draining once the queue has room.
+	next_status = 401
+	next_response_body = json.encode({ error = "invalid runtime token" })
+	fetch(client, "exp-checkout")
+	assert_nil(client:experiment_variant("exp-checkout"))
+
+	next_status = 200
+	next_response_body = nil
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1,
+		"the owed exposure for a treatment that ran must survive the latch")
+	assert_equal(exposures[1].props.variant_key, "treatment")
+	assert_nil(client:experiment_variant("exp-checkout"),
+		"serving stays latched")
+end
+
+local function test_remint_preserves_owed_exposure_of_past_treatment()
+	reset()
+	local client = granted_client({ buffer_size = 2 })
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	-- A grammar re-mint rotates the subject: the OLD subject's applied
+	-- treatment is a past fact — its owed exposure survives the rotation
+	-- (each fact carries its own server-minted fact key, never the subject
+	-- id).
+	local other_fact_key = "sfk1_" .. string.rep("c", 64)
+	local grammar_reject = json.encode({
+		error = "experiment metadata must use synthetic local-safe identifiers only",
+	})
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = grammar_reject })
+		else
+			callback(nil, nil, { status = 200, response = assignment_body({
+				experiment_key = "exp-other",
+				variant_key = "beta",
+				subject_fact_key = other_fact_key,
+			}) })
+		end
+		return true
+	end
+	fetch(client, "exp-other")
+	responder = nil
+
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 2,
+		"the old subject's owed exposure AND the new subject's both emit")
+	local seen = {}
+	seen[exposures[1].props.assignment_key] = true
+	seen[exposures[2].props.assignment_key] = true
+	assert_true(seen[fixture_subject_fact_key] and seen[other_fact_key],
+		"each fact carries its own server-minted fact key")
+end
+
+local function test_sentinel_discards_owed_exposures()
+	reset()
+	local client = granted_client({ buffer_size = 2 })
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	-- The real-subjects sentinel withdraws the assignments AND their
+	-- subject-fact keys: unlike an ordinary latch, it discards owed
+	-- exposure snapshots too — a withdrawn fact key must not egress after
+	-- the platform flipped real subjects off.
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+
+	next_status = 200
+	next_response_body = nil
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 0,
+		"no exposure fact may egress a sentinel-withdrawn fact key")
+end
+
+local function test_cadence_remint_retry_carries_attributes()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout", { geo = "de" })
+	local params = query_params(last_assignment_request().url)
+	assert_equal(params.geo, "de")
+	local subject_before = params.subject_key
+
+	-- The cadence revalidation hits the grammar sentinel: the self-heal
+	-- retry must carry the SAME attribute set with the new subject — the
+	-- rotation cleared the cached entry the cadence read them from, and a
+	-- targeted assignment retried un-targeted would drop as
+	-- targeting_unmatched.
+	local grammar_reject = json.encode({
+		error = "experiment metadata must use synthetic local-safe identifiers only",
+	})
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = grammar_reject })
+		else
+			callback(nil, nil, { status = 200, response = assignment_body() })
+		end
+		return true
+	end
+	advance_seconds(400)
+	client:update(0.016)
+	responder = nil
+	assert_equal(answers, 2, "the cadence fetch reminted and retried")
+	local retry = query_params(last_assignment_request().url)
+	assert_equal(retry.geo, "de",
+		"the remint retry re-sends the rejected request's attributes")
+	assert_true(retry.subject_key ~= subject_before, "with the new subject")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the self-heal reinstalls the assignment")
+end
+
+local function test_stale_scope_retry_after_does_not_park_revalidation()
+	reset()
+	local client = granted_client()
+	local held = {}
+	local hold_next = false
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		if hold_next then
+			hold_next = false
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+
+	-- An old-subject request is in flight when a grammar reject on another
+	-- experiment re-mints the subject.
+	hold_next = true
+	client:fetch_experiment_assignment("exp-slow", function() end)
+	assert_equal(#held, 1)
+	local grammar_reject = json.encode({
+		error = "experiment metadata must use synthetic local-safe identifiers only",
+	})
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = grammar_reject })
+		else
+			callback(nil, nil, { status = 200, response = assignment_body({
+				experiment_key = "exp-b",
+			}) })
+		end
+		return true
+	end
+	local result = fetch(client, "exp-b")
+	responder = nil
+	assert_true(result.ok and result.assigned)
+
+	-- The OLD subject's 429 lands late with a huge Retry-After: install
+	-- discards it on the scope check, and the PACING must be discarded
+	-- with it — not park the new subject's revalidation and kill checks.
+	held[1](nil, nil, {
+		status = 429,
+		response = "",
+		headers = { ["retry-after"] = "3600" },
+	})
+	local before = #assignment_requests()
+	advance_seconds(400)
+	client:update(0.016)
+	assert_true(#assignment_requests() > before,
+		"a stale-scope Retry-After must not park the current subject's revalidation")
+end
+
+local function test_shutdown_completes_with_active_session_and_full_queue()
+	reset()
+	local client = granted_client({ buffer_size = 2 })
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	-- Active session + FULL queue — the exact scenario that owes an
+	-- exposure. session_end()'s queue_full must not short-circuit the
+	-- shutdown housekeeping: the flush frees the room, the session end
+	-- retries, the owed exposure sweeps, and teardown completes.
+	next_status = 202
+	next_response_body = nil
+	assert_true(client:shutdown(),
+		"a full queue with an active session must not fail shutdown")
+	local names = {}
+	for i = 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			local body = json.decode(requests[i].body)
+			for j = 1, #(body.events or {}) do
+				names[body.events[j].event_name] = true
+			end
+		end
+	end
+	assert_true(names["experiment_exposure"],
+		"the owed exposure rides a shutdown batch")
+	assert_true(names["session_end"],
+		"the deferred session end rides a shutdown batch")
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -2728,6 +2998,13 @@ local tests = {
 	test_owed_clear_demoted_before_ordinary_latch,
 	test_clock_rollback_does_not_fence_refresh_write,
 	test_stale_grammar_reject_does_not_remint,
+	test_owed_exposures_stay_session_scoped,
+	test_ordinary_latch_preserves_owed_exposure,
+	test_remint_preserves_owed_exposure_of_past_treatment,
+	test_sentinel_discards_owed_exposures,
+	test_cadence_remint_retry_carries_attributes,
+	test_stale_scope_retry_after_does_not_park_revalidation,
+	test_shutdown_completes_with_active_session_and_full_queue,
 }
 
 for _, test in ipairs(tests) do

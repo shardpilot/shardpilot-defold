@@ -1658,22 +1658,29 @@ local function test_session_end_queue_full_keeps_session_active()
 	assert_equal(client.session_id, session_id)
 end
 
-local function test_shutdown_queue_full_does_not_finalize_and_can_retry()
+local function test_shutdown_queue_full_completes_after_final_flush()
 	reset()
 	seed_granted_consent()
 	local client = assert(sdk.new(config({ buffer_size = 1 })))
 	assert_true(client:identify("user-example"))
 	assert_true(client:session_start())
 
-	local ok, err = client:shutdown("app_final")
-	assert_equal(ok, false)
-	assert_equal(err, "queue_full")
-	assert_equal(client.initialized, true)
-	assert_equal(client.session_active, true)
-
-	assert_true(client:flush())
+	-- The full queue rejects session_end's event first, but shutdown's own
+	-- final flush is exactly what frees the room: the session end is
+	-- retried and delivered, and teardown completes in ONE call — a full
+	-- queue must not wedge the exit path behind a manual flush.
 	assert_true(client:shutdown("app_final"))
 	assert_equal(client.initialized, false)
+	assert_equal(client.session_active, false)
+	local seen_session_end = false
+	for i = 1, #requests do
+		if requests[i].body
+			and requests[i].body:find('"event_name":"session_end"', 1, true) then
+			seen_session_end = true
+		end
+	end
+	assert_true(seen_session_end,
+		"the deferred session end must ride a shutdown batch")
 end
 
 local function test_flush_and_shutdown_wait_for_async_publish()
@@ -4531,7 +4538,7 @@ local tests = {
 	test_perf_and_network_summaries,
 	test_shutdown_emits_session_end,
 	test_session_end_queue_full_keeps_session_active,
-	test_shutdown_queue_full_does_not_finalize_and_can_retry,
+	test_shutdown_queue_full_completes_after_final_flush,
 	test_flush_and_shutdown_wait_for_async_publish,
 	test_singleton_shutdown_keeps_client_after_retryable_failure,
 	test_batch_response_surfaces_per_event_outcomes,

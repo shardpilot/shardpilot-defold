@@ -555,12 +555,18 @@ function M.new(config, deps)
 		-- In-memory serving cache: experiment_key → entry. Only assigned
 		-- entries exist here; every not-assigned outcome drops its key.
 		entries = {},
-		-- Applications whose exposure fact is still OWED this session:
-		-- experiment_key → the applied entry snapshot. Swept on tick while
-		-- consent is granted. The snapshot — not the serving cache — is the
-		-- emission source, so an owed fact for a variant that really ran
-		-- survives a later drop of the live entry (a kill stops future
-		-- serving, not the record of an application that already happened).
+		-- Applications whose exposure fact is still OWED: experiment_key →
+		-- a bounded FIFO of { entry, session } snapshots, each carrying THE
+		-- SESSION THE APPLICATION BELONGS TO (a renewal must queue the new
+		-- session's fact behind the prior session's owed one, never
+		-- overwrite it — each session's treatment gets its own fact and
+		-- deterministic id). Swept on tick while consent is granted. The
+		-- snapshot — not the serving cache — is the emission source, so an
+		-- owed fact for a variant that really ran survives a later drop of
+		-- the live entry, an ordinary auth latch, and a subject re-mint
+		-- (exposure facts are facts about the PAST, like receipts; only the
+		-- real-subjects sentinel — whose fact keys must not outlive it —
+		-- discards them).
 		pending_exposure = {},
 		-- Durable-write convergence: experiment_key → { as_of, drop } for an
 		-- OWED sync (memory changed, disk did not), retried every tick; plus
@@ -617,7 +623,9 @@ function M.new(config, deps)
 		if record and record.scope == ex:scope_for(subject) then
 			for key, entry in pairs(record.entries) do
 				ex.entries[key] = entry
-				ex.pending_exposure[key] = { entry }
+				ex.pending_exposure[key] = {
+					{ entry = entry, session = ex.session_marker },
+				}
 			end
 		end
 	end
@@ -665,11 +673,15 @@ function Experiments:adopt_minted_subject_id()
 	local minted = M.mint_subject_id()
 	-- A new subject is a new cache scope AND a new exposure subject:
 	-- assignments fetched for the old subject must neither serve nor
-	-- expose, and the session's exposure de-dupe resets — the Q4 tuple is
-	-- per (experiment, version, SUBJECT), so the new subject's first
-	-- application must emit even where the old subject's already did.
+	-- expose GOING FORWARD, and the session's exposure de-dupe resets —
+	-- the Q4 tuple is per (experiment, version, SUBJECT), so the new
+	-- subject's first application must emit even where the old subject's
+	-- already did. Owed exposure snapshots are deliberately RETAINED: a
+	-- treatment that already ran under the old subject is a fact about the
+	-- past, its fact carries the server-minted fact key (never the subject
+	-- id), and its tuple — old subject included — stays distinct from
+	-- anything the new subject arms.
 	self.entries = {}
-	self.pending_exposure = {}
 	self.exposed = {}
 	if not self.deps.store_subject_id(minted) then
 		self:diagnose("persist_failed", "subject_id")
@@ -927,25 +939,29 @@ function Experiments:arm_exposure(experiment_key, entry)
 		self.pending_exposure[experiment_key] = list
 	end
 	local tail = list[#list]
-	if tail and exposure_tuple(experiment_key, tail) == exposure_tuple(experiment_key, entry) then
-		list[#list] = entry
+	if tail and tail.session == self.session_marker
+		and exposure_tuple(experiment_key, tail.entry) == exposure_tuple(experiment_key, entry) then
+		tail.entry = entry
 		return
 	end
-	list[#list + 1] = entry
+	list[#list + 1] = { entry = entry, session = self.session_marker }
 	if #list > max_owed_exposures then
 		table.remove(list, 1)
 		self:diagnose("exposure_skipped", "owed_overflow")
 	end
 end
 
--- True when `list` still holds an armed snapshot for `tuple`: the tuple's
--- automatic arm-0 emission is owed in the queue, not yet emitted.
-local function owed_tuple_armed(list, experiment_key, tuple)
+-- True when `list` still holds an armed CURRENT-SESSION snapshot for
+-- `tuple`: this session's automatic arm-0 emission is owed in the queue,
+-- not yet emitted. Prior sessions' owed snapshots are another session's
+-- facts and do not count against this session's arm accounting.
+local function owed_tuple_armed(list, experiment_key, tuple, session_marker)
 	if type(list) ~= "table" then
 		return false
 	end
 	for i = 1, #list do
-		if exposure_tuple(experiment_key, list[i]) == tuple then
+		if list[i].session == session_marker
+			and exposure_tuple(experiment_key, list[i].entry) == tuple then
 			return true
 		end
 	end
@@ -958,19 +974,29 @@ end
 --                               key; the SDK subject id never egresses);
 --   false, code               — retryable (consent closed, queue full):
 --                               the armed snapshot stays for a later sweep.
+-- `session_marker` is the marker of the SESSION THE APPLICATION BELONGS TO
+-- (an owed snapshot carries its own; nil means the current session): the
+-- deterministic id derives from it, so a prior session's owed fact keeps
+-- its own identity when it finally drains, and the current session's dedup
+-- bookkeeping (`exposed`) is consulted and updated ONLY for current-session
+-- emissions — a late prior-session drain must neither suppress nor be
+-- suppressed by this session's arm accounting (its once-only guarantee is
+-- the per-(session, tuple) arm-time coalescing plus FIFO removal).
 -- Arm accounting: `exposed[tuple]` records the highest arm handed out and
 -- whether the AUTOMATIC arm-0 fact has emitted. An explicit re-arm that
 -- runs while that automatic emission is still owed in the queue takes arm 1
 -- and leaves the owed snapshot its arm 0 — the re-arm buys an EXTRA fact,
 -- never the owed one's slot — and the later sweep emits the arm 0 exactly
 -- once.
-function Experiments:emit_entry_exposure(experiment_key, entry, rearm)
+function Experiments:emit_entry_exposure(experiment_key, entry, rearm, session_marker)
 	local refusal = consent_refusal(self.deps.consent())
 	if refusal then
 		return false, refusal
 	end
+	local marker = session_marker or self.session_marker
+	local current_session = marker == self.session_marker
 	local tuple = exposure_tuple(experiment_key, entry)
-	local exposed = self.exposed[tuple]
+	local exposed = current_session and self.exposed[tuple] or nil
 	if exposed and not rearm and exposed.auto then
 		return true
 	end
@@ -992,7 +1018,8 @@ function Experiments:emit_entry_exposure(experiment_key, entry, rearm)
 			arm = exposed.arm + 1
 			next_exposed = { arm = arm, auto = exposed.auto }
 		elseif owed_tuple_armed(
-			self.pending_exposure[experiment_key], experiment_key, tuple) then
+			self.pending_exposure[experiment_key], experiment_key, tuple,
+			self.session_marker) then
 			-- The automatic emission is still owed in the queue: the
 			-- explicit re-arm counts as the EXTRA fact on top of it.
 			arm = 1
@@ -1008,7 +1035,7 @@ function Experiments:emit_entry_exposure(experiment_key, entry, rearm)
 		next_exposed = { arm = exposed and exposed.arm or 0, auto = true }
 	end
 	local event_id = M.exposure_event_id(
-		self.session_marker, entry.subject_key, experiment_key, entry.version, arm)
+		marker, entry.subject_key, experiment_key, entry.version, arm)
 	local ok, err = self.deps.emit("experiment_exposure", {
 		experiment_key = experiment_key,
 		experiment_version = entry.version,
@@ -1019,7 +1046,9 @@ function Experiments:emit_entry_exposure(experiment_key, entry, rearm)
 	if not ok then
 		return false, err
 	end
-	self.exposed[tuple] = next_exposed
+	if current_session then
+		self.exposed[tuple] = next_exposed
+	end
 	return true
 end
 
@@ -1034,7 +1063,8 @@ function Experiments:sweep_pending(experiment_key)
 		return
 	end
 	while list[1] do
-		local ok, _, terminal = self:emit_entry_exposure(experiment_key, list[1])
+		local ok, _, terminal = self:emit_entry_exposure(
+			experiment_key, list[1].entry, false, list[1].session)
 		if ok or terminal then
 			table.remove(list, 1)
 		else
@@ -1099,8 +1129,11 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 		self.auth_blocked = true
 		self.auth_epoch = self.auth_epoch + 1
 		self.entries = {}
-		self.pending_exposure = {}
 		if outcome.drop_all then
+			-- The sentinel withdraws the assignments AND their subject-fact
+			-- keys outright: owed exposure snapshots carry those keys and
+			-- go with them.
+			self.pending_exposure = {}
 			if storage.clear_experiments(self.config) then
 				self.durable_pending = {}
 			else
@@ -1112,9 +1145,13 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 				self:diagnose("persist_failed", "cache_clear")
 			end
 		else
-			-- An ORDINARY 401/403 retains the durable record. An owed cache
-			-- WRITE whose entry this latch just cleared from memory must
-			-- not decay into a delete at the next retry — absence in memory
+			-- An ORDINARY 401/403 retains the durable record — and the
+			-- owed EXPOSURE snapshots: a treatment that already ran is a
+			-- fact about the past, and the latch stops future serving, not
+			-- the reporting of what happened (the tick sweep keeps
+			-- draining them while consent is granted). An owed cache WRITE
+			-- whose entry this latch just cleared from memory must not
+			-- decay into a delete at the next retry — absence in memory
 			-- here is fail-closed serving, not a drop decision — so owed
 			-- writes are cancelled (their source data is gone; the disk
 			-- keeps its last-known record). Owed DROPS were authoritative
@@ -1234,7 +1271,7 @@ end
 --   boundary?, from_cache, error? } and — like every request callback — fires
 -- exactly once, pcall-guarded. Returns true when a request was dispatched, or
 -- (false, error_code) with the callback already invoked when it could not be.
-function Experiments:fetch(experiment_key, attributes, callback, is_revalidation)
+function Experiments:fetch(experiment_key, attributes, callback, is_revalidation, preset_attributes)
 	local function finish(result)
 		if type(callback) == "function" then
 			-- The callback is game code; never let it break the SDK.
@@ -1276,7 +1313,14 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	local entry = self.entries[experiment_key]
 
 	local normalized_attributes, dropped
-	if attributes ~= nil then
+	if preset_attributes ~= nil then
+		-- Internal grammar-remint retry only: the EXACT normalized set of
+		-- the rejected request rides the retry verbatim — the subject
+		-- rotation cleared the cached entry the cadence would have re-read
+		-- them from, and a targeted assignment must be retried with the
+		-- same input set, not un-targeted.
+		normalized_attributes = preset_attributes
+	elseif attributes ~= nil then
 		normalized_attributes, dropped = M.normalize_attributes(attributes)
 		if dropped > 0 then
 			self:diagnose("dropped", "attributes")
@@ -1372,12 +1416,25 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 				self.reminted = true
 				self:diagnose("reminted", "subject_id")
 				self:adopt_minted_subject_id()
-				self:fetch(experiment_key, attributes, callback, is_revalidation)
+				-- The retry carries the SAME normalized attribute set the
+				-- rejected request sent: the adopt above cleared the cached
+				-- entry, so the cadence path could no longer recover its
+				-- saved attributes on its own.
+				self:fetch(experiment_key, attributes, callback,
+					is_revalidation, normalized_attributes)
 				return
 			end
 		end
 		if outcome.transient and auth_epoch == self.auth_epoch then
-			self:pace_transient(outcome.retry_after_seconds)
+			-- Pacing is gated on scope currency exactly like the install:
+			-- a transient answer for a RE-MINTED-AWAY subject is discarded
+			-- from state, and its Retry-After must be discarded with it —
+			-- a stale 429/5xx must not park the CURRENT subject's
+			-- revalidation (and kill checks) for up to the day clamp.
+			local pace_subject = self:current_subject_id()
+			if pace_subject and self:scope_for(pace_subject) == scope then
+				self:pace_transient(outcome.retry_after_seconds)
+			end
 		end
 		self:install(seq, scope, experiment_key, outcome, auth_epoch, resolved_at_ms)
 		-- The epoch re-check guards the PUBLIC callback like the install:

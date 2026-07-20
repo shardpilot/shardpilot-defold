@@ -2299,13 +2299,24 @@ function Client:shutdown(reason)
 	-- at the next launch by the persisted denial/disabled configuration).
 	self:retry_spool_purge()
 	local suppress_wire = self.consent_state ~= "granted"
+	local session_end_owed = false
 	if self.session_active then
 		-- session_end completes the local teardown even while consent is
 		-- denied or unknown (the wire event is suppressed inside session_end);
 		-- summary events are suppressed below via include_summaries.
 		local session_ok, session_err = self:session_end(reason or "app_final")
 		if not session_ok then
-			return false, session_err
+			if session_err == "queue_full" then
+				-- A FULL queue is exactly the scenario the flush below
+				-- exists to drain (and the one that leaves an exposure
+				-- owed): it must not short-circuit shutdown's last-chance
+				-- housekeeping. The session end is retried after the flush
+				-- frees the room, best-effort like the rest of the exit
+				-- path.
+				session_end_owed = true
+			else
+				return false, session_err
+			end
 		end
 	end
 	local ok, err = self:flush({ include_summaries = not suppress_wire })
@@ -2344,6 +2355,19 @@ function Client:shutdown(reason)
 			return false, "consent_pending"
 		end
 	end
+	-- Post-flush housekeeping: the flush freed queue room, so the deferred
+	-- session end and the owed exposure facts get their last chance to
+	-- enqueue, then everything newly queued is delivered-or-spooled in one
+	-- more pass. Best-effort by design: a still-failing enqueue or send
+	-- with no durable spool is not a teardown blocker — the durable record
+	-- re-arms live assignments at the next launch (only a since-dropped
+	-- assignment's owed fact is lost with the process, as before).
+	local before_housekeeping = queue.size(self.queue)
+	if session_end_owed and self.session_active then
+		-- The room the full queue denied session_end() now exists:
+		-- complete the local session teardown, wire event best-effort.
+		self:session_end(reason or "app_final")
+	end
 	if self.experiments then
 		-- Owed durable syncs get one last retry too — a kill/not-assigned
 		-- drop (or refresh write) whose cache write failed transiently must
@@ -2351,20 +2375,16 @@ function Client:shutdown(reason)
 		-- after storage recovered. Local disk housekeeping, best-effort: a
 		-- still-failing write is not a teardown blocker.
 		self.experiments:retry_durable_sync()
-		-- The final flush freed queue room: sweep owed exposure facts one
-		-- last time so a treatment applied under a FULL queue does not exit
-		-- without its fact, then deliver-or-spool whatever the sweep
-		-- enqueued. Best-effort by design: a still-failing send with no
-		-- durable spool is not a teardown blocker — the durable record
-		-- re-arms live assignments at the next launch (only a since-dropped
-		-- assignment's owed fact is lost with the process, as before).
-		local before_sweep = queue.size(self.queue)
+		-- Sweep owed exposure facts one last time so a treatment applied
+		-- under a FULL queue does not exit without its fact.
 		self.experiments:sweep_owed()
-		if queue.size(self.queue) > before_sweep then
-			if not self:flush({ include_summaries = false }) then
-				self:spool_undelivered()
-			end
+	end
+	if queue.size(self.queue) > before_housekeeping then
+		if not self:flush({ include_summaries = false }) then
+			self:spool_undelivered()
 		end
+	end
+	if self.experiments then
 		-- Stop the experiments consumer WITH the successful teardown (a
 		-- failed shutdown keeps the client — and the consumer — alive for
 		-- a host retry): an assignment response still in flight must not
