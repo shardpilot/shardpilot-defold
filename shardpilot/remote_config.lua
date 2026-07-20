@@ -245,8 +245,11 @@ local function response_etag(response)
 end
 
 -- The Cache-Control max-age of a response (whole seconds), or nil when the
--- response carries none. Only the max-age directive is read — it is what the
--- opt-in revalidation interval anchors on; every other directive is ignored.
+-- response carries none. Only the client `max-age` directive is read — it is
+-- what the opt-in revalidation interval anchors on. The header is parsed as
+-- comma-separated directives with the directive NAME matched whole, so a
+-- shared-cache or lookalike directive (`s-maxage`, or any name merely ending
+-- in `max-age`) can never be misread as the client freshness window.
 function M.cache_max_age_seconds(response)
 	if type(response) ~= "table" or type(response.headers) ~= "table" then
 		return nil
@@ -255,11 +258,13 @@ function M.cache_max_age_seconds(response)
 	if type(value) ~= "string" then
 		return nil
 	end
-	local seconds = tonumber(value:lower():match("max%-age%s*=%s*(%d+)"))
-	if not seconds then
-		return nil
+	for directive in value:lower():gmatch("[^,]+") do
+		local seconds = directive:match("^%s*max%-age%s*=%s*(%d+)%s*$")
+		if seconds then
+			return tonumber(seconds)
+		end
 	end
-	return seconds
+	return nil
 end
 
 -- Serve the cached snapshot for a transient failure, or fail when no usable

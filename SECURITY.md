@@ -20,10 +20,12 @@ project channel.
   in every other state. A grant whose identity-record persistence fails can
   spool within that session, but does not survive to a reload: the next
   launch finds no persisted grant and purges the record.
-- Durable storage is limited to six per-app records written through Defold
+- Durable storage is limited to seven per-app records written through Defold
   `sys.save`, each bounded as noted: the identity record (anonymous ID +
-  consent decision; host-supplied identifiers are clamped to 512 bytes at
-  acceptance, keeping the record far under the engine's save-file limits);
+  consent decision — plus the dedicated `spcid_…` experiment subject id once
+  the experiment surface is opted into; host-supplied identifiers are
+  clamped to 512 bytes at acceptance, keeping the record far under the
+  engine's save-file limits);
   the offline event spool described above (entry- and byte-budgeted); an
   outbox that retains the SDK's own consent decisions until delivered,
   bounded to 32 entries (oldest receipts are evicted first when it
@@ -31,7 +33,10 @@ project channel.
   each receipt carrying identifiers already clamped at acceptance, so
   per-entry size no longer scales with oversized host-supplied
   identifiers; the last-known-good remote-config cache
-  (size-capped before it is persisted); the crash opt-out settings record (a
+  (size-capped before it is persisted); the experiment-assignment cache
+  (served assignment bodies only, scope-stamped, at most 16 records of at
+  most 16 KB each; a scope's record is dropped on the flag-off sentinel);
+  the crash opt-out settings record (a
   single boolean); and a per-app, TTL'd crash-retry sidecar with fixed
   entry, per-report, and total byte caps, holding only already-PII-scrubbed
   crash reports (resent then cleared on success). No other file or

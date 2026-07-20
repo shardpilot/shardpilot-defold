@@ -599,8 +599,10 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   to the bounded offline spool
   ([above](#offline-durability-event-spool)) — set `spool_enabled = false` for
   a fully memory-only event path.
-- **Durable storage is six small bounded records** per configured app: the
-  identity record (anonymous ID + consent decision), the offline event spool
+- **Durable storage is seven small bounded records** per configured app: the
+  identity record (anonymous ID + consent decision, plus the `spcid_…`
+  experiment subject id once experiments are opted into), the offline event
+  spool
   (only envelopes already bound for the wire; cleared on acknowledgment and on
   consent denial), the consent-receipt outbox (undelivered `/v1/consent`
   receipts only — at most 32, oldest evicted first, pruned the moment the
@@ -611,9 +613,12 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   previous-session dump forward alike — written before its send attempt and
   removed as soon as the server acknowledges or terminally rejects it, the
   crash-reporting settings record (the persisted `crash.set_enabled` opt-out
-  boolean, nothing else), and the
+  boolean, nothing else), the
   remote-config cache (the last served config body + ETag, no analytics
-  payload; overwritten by the next successful fetch). The identity
+  payload; overwritten by the next successful fetch), and the
+  experiment-assignment cache (served assignment decisions only,
+  scope-stamped and bounded; a scope's record is dropped on the flag-off
+  sentinel). The identity
   record is written through
   `sys.get_save_file("shardpilot.<workspace_id>.<app_id>", "identity")` with
   `sys.save`/`sys.load`. The per-app namespace prevents two games on one device
@@ -754,15 +759,16 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   SDK source. The guard greps file *contents* (`grep -RInE`) for these patterns,
   so it flags native references inside tracked files but does not catch a native
   source file added solely by filename — keep the boundary by convention.
-- **No durable I/O beyond the six records** (identity, event spool,
+- **No durable I/O beyond the seven records** (identity, event spool,
   consent-receipt outbox, crash-retry sidecar, crash-reporting settings,
-  remote-config cache).
+  remote-config cache, experiment-assignment cache).
   `io.*`, `os.execute`, and browser/local storage are forbidden in source;
   `sys.save`/`sys.load`/`sys.get_save_file` are confined to
   `shardpilot/storage.lua`, which writes only the identity record, the bounded
   offline event spool, the bounded consent-receipt outbox, the bounded, TTL'd
-  crash-retry sidecar, the one-boolean crash-reporting settings record, and
-  the single bounded remote-config cache record.
+  crash-retry sidecar, the one-boolean crash-reporting settings record, the
+  single bounded remote-config cache record, and the bounded
+  experiment-assignment cache record.
 - **No raw/provider/token/billing surface.** Terms like `raw_payload`, `prompt`,
   `access_token`, `github_token`, `billing` must not appear in SDK or example
   source.

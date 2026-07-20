@@ -156,6 +156,69 @@ local function decode_object(body)
 	return decoded
 end
 
+-- The first significant character of the top-level `member`'s value in the
+-- body TEXT ("{" for an object, "[" for an array, "n" for null, and so on),
+-- or nil when the body has no such member — adapted from the remote-config
+-- client's `values`-member scan. The decoded Lua value cannot answer this
+-- alone: an empty array decodes to the same Lua table as an empty object,
+-- and a JSON null is commonly decoded to nil — identical to the member
+-- being absent. The scan is string- and depth-aware, so a nested member or
+-- a string value spelling the member name cannot be mistaken for the
+-- top-level member; escaped key spellings are not decoded and read as
+-- not-found, which fails toward malformed (the safe direction).
+local function top_level_member_char(body, member)
+	local depth = 0
+	local i = 1
+	local n = #body
+	while i <= n do
+		local ch = body:sub(i, i)
+		if ch == '"' then
+			local start = i + 1
+			local j = start
+			local plain = true
+			while j <= n do
+				local c = body:sub(j, j)
+				if c == "\\" then
+					plain = false
+					j = j + 2
+				elseif c == '"' then
+					break
+				else
+					j = j + 1
+				end
+			end
+			if depth == 1 and plain and body:sub(start, j - 1) == member then
+				local k = j + 1
+				while k <= n and body:sub(k, k):match("%s") do
+					k = k + 1
+				end
+				-- Only a KEY is followed by a colon; a string VALUE that
+				-- happens to spell the member name is followed by "," or "}".
+				if body:sub(k, k) == ":" then
+					k = k + 1
+					while k <= n and body:sub(k, k):match("%s") do
+						k = k + 1
+					end
+					if k <= n then
+						return body:sub(k, k)
+					end
+					return nil
+				end
+			end
+			i = j + 1
+		elseif ch == "{" or ch == "[" then
+			depth = depth + 1
+			i = i + 1
+		elseif ch == "}" or ch == "]" then
+			depth = depth - 1
+			i = i + 1
+		else
+			i = i + 1
+		end
+	end
+	return nil
+end
+
 -- Parse an assignment body end-to-end into the snapshot shape the SDK serves
 -- and the producers read. Strict on the fields the contract pins — a body
 -- this cannot parse is MALFORMED (a transient outcome), so a garbled payload
@@ -190,9 +253,13 @@ local function parse_assignment(body)
 	if unit ~= "synthetic_subject_key" and unit ~= "client_id" then
 		return nil
 	end
+	-- Only the two published refusal reasons exist — absence is the third
+	-- (deterministic traffic gate) shape. Any other value is a body this
+	-- build cannot interpret: malformed, so it can neither overwrite the
+	-- last-known-good cache nor feed the producers.
 	local reason = nil
 	if decoded.reason ~= nil then
-		if type(decoded.reason) ~= "string" or decoded.reason == "" then
+		if decoded.reason ~= "kill_switch" and decoded.reason ~= "targeting_unmatched" then
 			return nil
 		end
 		reason = decoded.reason
@@ -211,7 +278,26 @@ local function parse_assignment(body)
 			return nil
 		end
 		variant_key = decoded.variant_key
-		variant_payload = decoded.variant_payload
+		-- The author-defined payload must be a JSON OBJECT when present.
+		-- Object-ness is decided on the body TEXT (the remote-config
+		-- `values`-member precedent): a payload the decoder delivered as a
+		-- non-table (string/number), a non-object payload text (an array,
+		-- empty or not), or a null-bearing member all read as MALFORMED —
+		-- installing a mangled payload would hand the game a shape the
+		-- author never published, and cache it over the last-known-good
+		-- decision.
+		local payload_char = top_level_member_char(body, "variant_payload")
+		if decoded.variant_payload ~= nil then
+			if type(decoded.variant_payload) ~= "table" or payload_char ~= "{" then
+				return nil
+			end
+			variant_payload = decoded.variant_payload
+		elseif payload_char ~= nil then
+			-- The body HAS a variant_payload member the decoder could not
+			-- deliver as a table (a JSON null, or a value the runtime maps
+			-- to nil): malformed, not an absent payload.
+			return nil
+		end
 	end
 	return {
 		experiment_key = decoded.experiment_key,
@@ -272,11 +358,13 @@ end
 -- Serve the cached assignment for a transient failure, or fail when no
 -- usable cache exists. A served snapshot is still a SUCCESS (`ok = true`)
 -- with `from_cache = true` and `error` carrying why the network could not
--- refresh it.
-local function serve_cache_or_fail(cache, error_code)
+-- refresh it. A cached body naming a DIFFERENT experiment than the one
+-- fetched (a corrupted or foreign write) is a miss, never served.
+local function serve_cache_or_fail(cache, error_code, expected_experiment_key)
 	if cache then
 		local snapshot = parse_assignment(cache.body)
-		if snapshot then
+		if snapshot and (expected_experiment_key == nil
+			or snapshot.experiment_key == expected_experiment_key) then
 			return result_from_snapshot(snapshot, true, error_code)
 		end
 	end
@@ -286,8 +374,12 @@ end
 -- Decide one fetch outcome from the transport response and the cached
 -- record. Pure (no IO, no state) so tests can drive every branch — a direct
 -- port of the remote-config classifier, minus the ETag/304 lane (this
--- endpoint has neither) and plus the two Amendment-2 extras. Returns
--- (result, new_cache, authoritative, drop_cache, auth_refused):
+-- endpoint has neither) and plus the two Amendment-2 extras.
+-- `experiment_key` is the experiment the fetch ASKED for: a 200 body naming
+-- any other experiment is MALFORMED (transient) — installing it would
+-- misattribute another experiment's decision (and its exposures) to this
+-- scope. The same check guards the cached body on the serve-cache path.
+-- Returns (result, new_cache, authoritative, drop_cache, auth_refused):
 --   * `new_cache` non-nil means "persist this record"; it exists only for a
 --     parsed fresh 200, so no failure and no cache-served outcome ever
 --     disturbs the last-known-good record.
@@ -300,18 +392,19 @@ end
 --   * `auth_refused` is true for every 401/403 (sentinel or generic): the
 --     signal the automatic-lane halt (Extra 2) latches on. It has no other
 --     side effect — classification stays per fetch.
-function M.apply(cache, response, now_ms)
+function M.apply(cache, response, now_ms, experiment_key)
 	local status = type(response) == "table" and response.status or 0
 
 	if type(response) == "table" and status == 200 then
 		local snapshot = parse_assignment(response.response)
-		if snapshot then
+		if snapshot and (experiment_key == nil
+			or snapshot.experiment_key == experiment_key) then
 			return result_from_snapshot(snapshot, false, nil), {
 				body = response.response,
 				fetched_at_ms = now_ms,
 			}, true, false, false
 		end
-		return serve_cache_or_fail(cache, "malformed_response"), nil, false, false, false
+		return serve_cache_or_fail(cache, "malformed_response", experiment_key), nil, false, false, false
 	end
 
 	-- An unauthorized response is an authoritative "this key may not read
@@ -338,13 +431,13 @@ function M.apply(cache, response, now_ms)
 	-- "this assignment is not being served here": the fetch fails instead of
 	-- reporting a stale decision as a healthy `ok = true`.
 	if status == 0 then
-		return serve_cache_or_fail(cache, "http_0"), nil, false, false, false
+		return serve_cache_or_fail(cache, "http_0", experiment_key), nil, false, false, false
 	elseif status == 408 then
-		return serve_cache_or_fail(cache, "transient_408"), nil, false, false, false
+		return serve_cache_or_fail(cache, "transient_408", experiment_key), nil, false, false, false
 	elseif status == 429 then
-		return serve_cache_or_fail(cache, "transient_429"), nil, false, false, false
+		return serve_cache_or_fail(cache, "transient_429", experiment_key), nil, false, false, false
 	elseif status >= 500 then
-		return serve_cache_or_fail(cache, "transient_" .. tostring(status)), nil, false, false, false
+		return serve_cache_or_fail(cache, "transient_" .. tostring(status), experiment_key), nil, false, false, false
 	end
 	return { ok = false, from_cache = false, error = "http_" .. tostring(status) }, nil, true, false, false
 end
@@ -375,6 +468,16 @@ function M.new(config, subject)
 		-- may install, and only AUTHORITATIVE outcomes settle.
 		fetch_seq = 0,
 		settled = {},
+		-- Per-scope sentinel tombstones: set when a sentinel drop's DURABLE
+		-- clear failed (storage writes down while reads still work), so the
+		-- surviving disk record can never be reloaded and re-served by a
+		-- later transient fetch. While a scope is tombstoned, load_cache()
+		-- refuses its durable record (and retries the owed clear); only a
+		-- successful durable clear — or a newer fresh decision durably
+		-- overwriting the record — lifts it. Process-local by design: a
+		-- relaunch before the clear lands re-adopts the record until its
+		-- next sentinel (best-effort, like every failed durable write here).
+		tombstones = {},
 		-- Amendment-2 Extra 2 (assignment plane only): true once ANY
 		-- authoritative 401/403 landed. An automatic assignment lane must
 		-- consult automatic_fetch_allowed() before scheduling a fetch; this
@@ -449,6 +552,17 @@ end
 -- cache read).
 function Experiments:load_cache(experiment_key, subject_key)
 	local scope = self:scope_for(experiment_key, subject_key)
+	if self.tombstones[scope] then
+		-- A sentinel drop is still owed durably for this scope: retry the
+		-- clear, and refuse the durable record either way — only the
+		-- in-process record (nil until a newer fresh decision installs) may
+		-- serve while the disk copy is untrusted.
+		if storage.clear_experiment_assignment(self.config, scope) then
+			self.tombstones[scope] = nil
+		else
+			return self.cache[scope]
+		end
+	end
 	local held = self.cache[scope]
 	local record = self:durable_record(scope)
 	if held and (not record or record.fetched_at_ms <= held.fetched_at_ms) then
@@ -509,15 +623,20 @@ function Experiments:install(seq, experiment_key, scope, result, new_cache, auth
 		-- Amendment-2 Extra 1: the sentinel 403 drops this scope's cached
 		-- assignment record AND its subject_fact_key (the sfk lives in the
 		-- record and the snapshot; both go). Other scopes' records are
-		-- untouched. Best-effort durably — with the storage backend down the
-		-- in-process drop still rules this process, surfaced through
-		-- diagnostics.
+		-- untouched. The scope is tombstoned BEFORE the durable clear is
+		-- attempted: should the clear fail (storage writes down while reads
+		-- still work), the surviving disk record must not be reloaded and
+		-- re-served by a later transient fetch — load_cache() refuses it and
+		-- keeps retrying the owed clear while the tombstone stands.
 		self.cache[scope] = nil
 		local held = self.snapshots[experiment_key]
 		if held and held.scope == scope then
 			self.snapshots[experiment_key] = nil
 		end
-		if not storage.clear_experiment_assignment(self.config, scope) then
+		self.tombstones[scope] = true
+		if storage.clear_experiment_assignment(self.config, scope) then
+			self.tombstones[scope] = nil
+		else
 			self:diagnose("assignment_cache_drop_failed")
 		end
 		return
@@ -538,7 +657,14 @@ function Experiments:install(seq, experiment_key, scope, result, new_cache, auth
 		-- fails: the freshest served assignment stays the offline fallback
 		-- for this process either way.
 		self.cache[scope] = record
-		if not storage.save_experiment_assignment(self.config, record) then
+		if storage.save_experiment_assignment(self.config, record) then
+			-- A durably persisted fresh decision overwrites whatever record
+			-- an owed sentinel drop left on disk, so the tombstone lifts. On
+			-- a FAILED save it deliberately stands: the disk still holds the
+			-- sentinel-disabled record, and the in-process record above
+			-- serves this process meanwhile.
+			self.tombstones[scope] = nil
+		else
 			-- The stale durable record this fetch captured may still be on
 			-- disk, and a restart would revive it OVER the assignment just
 			-- served. Clear it (best-effort) when it is no fresher than the
@@ -607,7 +733,7 @@ function Experiments:fetch(experiment_key, callback)
 	if not http or not http.request then
 		-- No transport on this runtime is a transient failure like any
 		-- other: serve the last-known-good assignment when one exists.
-		local result = serve_cache_or_fail(cache, "http_unavailable")
+		local result = serve_cache_or_fail(cache, "http_unavailable", experiment_key)
 		self:install(seq, experiment_key, scope, result, nil, false, cache, false)
 		finish(result)
 		return false, "http_unavailable"
@@ -628,7 +754,7 @@ function Experiments:fetch(experiment_key, callback)
 
 	http.request(url, "GET", function(_, _, response)
 		local result, new_cache, authoritative, drop_cache, auth_refused =
-			M.apply(cache, response, clock.unix_ms())
+			M.apply(cache, response, clock.unix_ms(), experiment_key)
 		if auth_refused then
 			-- Amendment-2 Extra 2: the automatic lane halts after any
 			-- authoritative 401/403 until re-init/config change. Deliberately

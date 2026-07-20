@@ -500,8 +500,10 @@ function M.new(config)
 		anonymous_id = anonymous_id,
 		spcid = spcid,
 		-- Client-side exposure de-duplication (the server does not
-		-- de-duplicate): one experiment_exposure per assignment subject per
-		-- client lifetime (per launch, in practice).
+		-- de-duplicate): one DELIVERED experiment_exposure per assignment
+		-- subject per client lifetime (per launch, in practice). Keys commit
+		-- on enqueue and re-arm when a consent revocation purges the still-
+		-- undelivered event (see rearm_purged_exposures).
 		exposure_tracked = {},
 		-- The opt-in remote-config revalidation timer's dt accumulator
 		-- (update-driven, like the flush pacing).
@@ -918,6 +920,30 @@ function Client:experiment_assignment(experiment_key)
 	return self.experiments:get_assignment(experiment_key)
 end
 
+-- Re-arm the per-launch exposure de-duplication for exposure facts a consent
+-- revocation purged BEFORE delivery: the dedupe key is committed at enqueue,
+-- but a purged fact never left the device — leaving the key burned would
+-- make the exposure permanently unreportable this launch (duplicate_exposure
+-- after a later re-grant, with nothing ever sent). Only consent purges
+-- re-arm; a DELIVERED exposure stays deduped for the launch (re-arming it
+-- would double-count the fact). Works on queued events and on retained
+-- batch/spool envelope shapes alike (both carry event_name + props); keys
+-- from another launch's spooled envelopes are absent from this launch's map,
+-- so re-arming them is a no-op.
+local function rearm_purged_exposures(self, events)
+	if type(events) ~= "table" then
+		return
+	end
+	for i = 1, #events do
+		local event = events[i]
+		if type(event) == "table" and event.event_name == "experiment_exposure"
+			and type(event.props) == "table"
+			and event.props.assignment_key ~= nil then
+			self.exposure_tracked[event.props.assignment_key] = nil
+		end
+	end
+end
+
 function Client:set_consent(decision)
 	if not self.initialized then
 		return false, "shutdown"
@@ -954,10 +980,14 @@ function Client:set_consent(decision)
 	if not granted then
 		local cleared = queue.size(self.queue)
 		if cleared > 0 then
-			queue.drain(self.queue, cleared)
+			-- The purged events never left the device: re-arm any exposure
+			-- dedupe keys they carried, so a later re-grant can report the
+			-- exposure (see rearm_purged_exposures).
+			rearm_purged_exposures(self, queue.drain(self.queue, cleared))
 		end
 		if self.in_flight_batch and not self.publish_in_flight then
 			cleared = cleared + #self.in_flight_batch
+			rearm_purged_exposures(self, self.in_flight_batch)
 			self.in_flight_batch = nil
 		end
 		if #self.spool_batches > 0 then
@@ -1266,6 +1296,10 @@ function Client:track_experiment_exposure(experiment_key)
 	if not props then
 		return false, props_err
 	end
+	-- The check-then-mark pair below cannot race: Defold runs all script
+	-- code — game calls and http callbacks alike — on one Lua VM thread, and
+	-- nothing between the check, the synchronous enqueue, and the mark
+	-- yields, so two exposure calls can never interleave here.
 	if self.exposure_tracked[props.assignment_key] then
 		return false, "duplicate_exposure"
 	end
@@ -2309,6 +2343,13 @@ function Client:start_publish_batch()
 		if not retain and self.in_flight_batch == events then
 			self.stats.dropped = self.stats.dropped + batch_count
 			self.in_flight_batch = nil
+			-- A batch dropped because consent was revoked while it was in
+			-- flight is a consent purge like the set_consent one: its
+			-- undelivered exposures re-arm (a terminal rejection under an
+			-- unchanged grant does not — that dedupe stands for the launch).
+			if consent_denied_state(self.consent_state) then
+				rearm_purged_exposures(self, events)
+			end
 			-- A terminally rejected batch also leaves the spool, or it would
 			-- be re-sent (and re-rejected) on every later launch. Surfaced via
 			-- diagnostics so the drop of durable entries is observable.

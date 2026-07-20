@@ -1839,6 +1839,42 @@ local function count_requests()
 	return #requests
 end
 
+local function test_cache_control_max_age_directive_boundary()
+	reset()
+	local function max_age(header)
+		return remote_config.cache_max_age_seconds({ headers = { ["cache-control"] = header } })
+	end
+	assert_equal(max_age("max-age=120"), 120)
+	assert_equal(max_age("private, max-age=300"), 300)
+	assert_equal(max_age("Private, MAX-AGE=90"), 90, "directive names are case-insensitive")
+	assert_equal(max_age(" max-age = 45 "), 45)
+	assert_equal(max_age("s-maxage=3600, max-age=60"), 60,
+		"the shared-cache directive must never win over the client max-age")
+	assert_equal(max_age("max-age=60, s-maxage=3600"), 60)
+	assert_nil(max_age("s-maxage=3600"), "a shared-cache directive alone anchors nothing")
+	assert_nil(max_age("smax-age=3600"), "a lookalike directive name must not match")
+	assert_nil(max_age("x-max-age=3600"))
+	assert_nil(max_age("private"))
+	assert_nil(remote_config.cache_max_age_seconds({ headers = {} }))
+	assert_nil(remote_config.cache_max_age_seconds({}))
+
+	-- Timer integration for the exact shared-cache header: the interval
+	-- anchors on the client max-age (60), never on s-maxage (3600).
+	local client = assert(sdk.new(config({ remote_config_revalidate = true })))
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	next_response_headers = { etag = 'W/"v1"', ["cache-control"] = "s-maxage=3600, max-age=60" }
+	assert_true(fetch(client).ok)
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = nil
+	client:update(59)
+	assert_equal(count_requests(), 1)
+	client:update(2)
+	assert_equal(count_requests(), 2,
+		"the client max-age (60), not s-maxage (3600), anchors the revalidation interval")
+end
+
 local function test_revalidation_config_validation()
 	reset()
 	local client, err = sdk.new(config({ remote_config_revalidate = "yes" }))
@@ -2089,6 +2125,7 @@ local tests = {
 	test_missing_transport_serves_cache_and_reports,
 	test_missing_json_decoder_fails_the_fetch,
 	test_cache_persist_failure_is_best_effort_and_diagnosed,
+	test_cache_control_max_age_directive_boundary,
 	test_revalidation_config_validation,
 	test_revalidation_defaults_off,
 	test_revalidation_fires_conditional_get_on_the_max_age_interval,

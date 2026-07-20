@@ -103,12 +103,13 @@ persisted opt-out record cannot be **read** (a storage error — as opposed to
 cleanly absent on a fresh install), the crash client **fails closed** and
 sends nothing until an explicit `set_enabled` decision is persisted again.
 
-- Durable storage is limited to six small, bounded records, all written
+- Durable storage is limited to seven small, bounded records, all written
   through Defold `sys.save`: the identity record described above, a bounded
   crash-retry sidecar, the crash-reporting settings record (both described
   below), the bounded offline event spool, the bounded consent-receipt
-  outbox (both described below), and the remote-config cache (described
-  below). No cookies and no other browser or tracking storage.
+  outbox (both described below), the remote-config cache, and the
+  experiment-assignment cache (both described below). No cookies and no
+  other browser or tracking storage.
 - All persistence goes through Defold `sys.save` only; on HTML5 builds Defold
   backs `sys.save` with browser storage, still limited to those records.
 

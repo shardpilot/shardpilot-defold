@@ -472,7 +472,7 @@ local function test_apply_transients_serve_cache_and_permanents_fail()
 		{ { status = 503, response = '{"error":"kill switch state unavailable"}' }, "transient_503" },
 	}
 	for _, case in ipairs(transient_cases) do
-		local result, new_cache, authoritative, drop, refused = experiments.apply(cache, case[1], 2000)
+		local result, new_cache, authoritative, drop, refused = experiments.apply(cache, case[1], 2000, "exp-armor")
 		assert_true(result.ok, case[2] .. " must serve the cache")
 		assert_equal(result.from_cache, true)
 		assert_equal(result.error, case[2])
@@ -482,7 +482,7 @@ local function test_apply_transients_serve_cache_and_permanents_fail()
 		assert_equal(drop, false)
 		assert_equal(refused, false)
 
-		local missing = experiments.apply(nil, case[1], 2000)
+		local missing = experiments.apply(nil, case[1], 2000, "exp-armor")
 		assert_equal(missing.ok, false, case[2] .. " without cache must fail")
 		assert_equal(missing.error, case[2])
 	end
@@ -493,7 +493,7 @@ local function test_apply_transients_serve_cache_and_permanents_fail()
 		{ { status = 413 }, "http_413" },
 	}
 	for _, case in ipairs(permanent_cases) do
-		local result, new_cache, authoritative, drop, refused = experiments.apply(cache, case[1], 2000)
+		local result, new_cache, authoritative, drop, refused = experiments.apply(cache, case[1], 2000, "exp-armor")
 		assert_equal(result.ok, false, case[2] .. " must fail without serving the cache")
 		assert_equal(result.error, case[2])
 		assert_nil(new_cache)
@@ -505,6 +505,15 @@ end
 
 local function test_apply_malformed_bodies_are_transient()
 	reset()
+	-- Raw assigned bodies with a literal variant_payload value: the mock
+	-- json.encode cannot express null or an empty ARRAY distinctly, and
+	-- these cases are decided on the body TEXT.
+	local function assigned_raw_payload(payload_json)
+		return '{"assigned":true,"version":3,"assignment_key":"' .. test_assignment_key
+			.. '","variant_key":"v","experiment_key":"exp-armor"'
+			.. ',"boundary":{"assignment_unit":"client_id"},"subject_fact_key":"' .. test_sfk
+			.. '","variant_payload":' .. payload_json .. "}"
+	end
 	local malformed = {
 		"not json",
 		"[]",
@@ -518,10 +527,26 @@ local function test_apply_malformed_bodies_are_transient()
 		-- client_id unit without a grammar-valid subject_fact_key.
 		assigned_body({ subject_fact_key = "sfk1_short" }),
 		'{"assigned":false,"version":3,"assignment_key":"a","experiment_key":"e","boundary":{"assignment_unit":"client_id"}}',
+		-- A body naming a DIFFERENT experiment than the one fetched.
+		assigned_body({ experiment_key = "exp-other" }),
+		-- An unknown not-assigned reason (only kill_switch /
+		-- targeting_unmatched / absence are published shapes).
+		unassigned_body("kil_switch"),
+		unassigned_body("paused"),
+		-- An assigned verdict missing its assignment_key entirely.
+		'{"assigned":true,"version":3,"variant_key":"v","experiment_key":"exp-armor","boundary":{"assignment_unit":"synthetic_subject_key"}}',
+		-- variant_payload present but not a JSON object: scalar, array
+		-- (empty or not — an empty array decodes to the same Lua table as an
+		-- empty object, so the check reads the body text), or null.
+		assigned_raw_payload('"str"'),
+		assigned_raw_payload("7"),
+		assigned_raw_payload("[1,2]"),
+		assigned_raw_payload("[]"),
+		assigned_raw_payload("null"),
 	}
 	local cache = { body = assigned_body(), fetched_at_ms = 1000 }
 	for index, body in ipairs(malformed) do
-		local result, new_cache, authoritative = experiments.apply(cache, { status = 200, response = body }, 2000)
+		local result, new_cache, authoritative = experiments.apply(cache, { status = 200, response = body }, 2000, "exp-armor")
 		assert_true(result.ok, "malformed case " .. index .. " must serve the cache")
 		assert_equal(result.error, "malformed_response", "malformed case " .. index)
 		assert_nil(new_cache, "malformed case " .. index .. " must not overwrite the cache")
@@ -545,7 +570,7 @@ local function test_apply_auth_refusals_and_sentinel()
 		{ status = 403 },
 	}
 	for index, response in ipairs(generic_cases) do
-		local result, new_cache, authoritative, drop, refused = experiments.apply(cache, response, 2000)
+		local result, new_cache, authoritative, drop, refused = experiments.apply(cache, response, 2000, "exp-armor")
 		assert_equal(result.ok, false, "auth case " .. index .. " must fail closed")
 		assert_equal(result.error, "unauthorized", "auth case " .. index)
 		assert_nil(new_cache)
@@ -556,7 +581,7 @@ local function test_apply_auth_refusals_and_sentinel()
 
 	-- The exact sentinel body — and only it — additionally drops the cache.
 	local result, new_cache, authoritative, drop, refused =
-		experiments.apply(cache, { status = 403, response = '{"error":"' .. sentinel_text .. '"}' }, 2000)
+		experiments.apply(cache, { status = 403, response = '{"error":"' .. sentinel_text .. '"}' }, 2000, "exp-armor")
 	assert_equal(result.ok, false)
 	assert_equal(result.error, "unauthorized")
 	assert_nil(new_cache)
@@ -566,7 +591,7 @@ local function test_apply_auth_refusals_and_sentinel()
 
 	-- A 401 carrying the sentinel text never drops: the drop is 403-only.
 	local _, _, _, drop_401 =
-		experiments.apply(cache, { status = 401, response = '{"error":"' .. sentinel_text .. '"}' }, 2000)
+		experiments.apply(cache, { status = 401, response = '{"error":"' .. sentinel_text .. '"}' }, 2000, "exp-armor")
 	assert_equal(drop_401, false, "a 401 never drops the cache")
 end
 
@@ -699,11 +724,142 @@ local function test_scope_isolation_between_experiments_and_subjects()
 	assert_equal(other.error, "transient_500")
 	assert_nil(client:experiment_assignment("exp-shield"))
 
+	-- Fetching another experiment must never displace this one either: the
+	-- cache is keyed per scope (one record per experiment), not one shared
+	-- record.
+	next_status = 200
+	next_response_body = assigned_body({ experiment_key = "exp-shield", variant_key = "variant-s" })
+	assert_true(fetch(client, "exp-shield").ok)
+	assert_equal(client:experiment_assignment("exp-armor").variant_key, "variant-b",
+		"fetching experiment B must not evict experiment A's cached decision")
+	assert_equal(client:experiment_assignment("exp-shield").variant_key, "variant-s")
+	local reloaded = assert(sdk.new(config()))
+	assert_equal(reloaded:experiment_assignment("exp-armor").variant_key, "variant-b",
+		"both experiments' records survive a restart side by side")
+	assert_equal(reloaded:experiment_assignment("exp-shield").variant_key, "variant-s")
+
 	-- Another subject is another scope: a client whose spcid differs must
 	-- not adopt the persisted record at construction.
 	local foreign = assert(sdk.new(config({ spcid = "spcid_" .. string.rep("z", 24) })))
 	assert_nil(foreign:experiment_assignment("exp-armor"),
 		"another subject must not serve this subject's cached assignment")
+	restore()
+end
+
+local function test_mismatched_experiment_key_200_is_malformed()
+	reset()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = assigned_body()
+	assert_true(fetch(client).ok)
+
+	-- A 200 naming ANOTHER experiment must not install under this scope —
+	-- it would misattribute that experiment's decision (and its exposures)
+	-- until restart. Malformed: the last-known-good decision serves.
+	next_response_body = assigned_body({ experiment_key = "exp-other", variant_key = "variant-x" })
+	local result = fetch(client)
+	assert_true(result.ok, "the cache serves through the malformed body")
+	assert_equal(result.from_cache, true)
+	assert_equal(result.error, "malformed_response")
+	assert_equal(result.variant_key, "variant-b", "the served decision is the last-known-good one")
+	assert_equal(client:experiment_assignment("exp-armor").variant_key, "variant-b",
+		"a mismatched-key body must not overwrite the snapshot")
+	assert_nil(client:experiment_assignment("exp-other"),
+		"nothing may be installed for the foreign key either")
+
+	-- Without a cache the mismatch fails outright (still transient-shaped).
+	next_response_body = assigned_body()
+	local miss = fetch(client, "exp-shield")
+	assert_equal(miss.ok, false)
+	assert_equal(miss.error, "malformed_response")
+	assert_nil(client:experiment_assignment("exp-shield"))
+end
+
+local function test_unknown_not_assigned_reason_is_malformed()
+	reset()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = assigned_body()
+	assert_true(fetch(client).ok)
+
+	-- Only three not-assigned shapes exist (reason absent / kill_switch /
+	-- targeting_unmatched): any other reason is a body this build cannot
+	-- interpret, and it must not overwrite the last-known-good decision.
+	next_response_body = unassigned_body("kil_switch")
+	local result = fetch(client)
+	assert_true(result.ok, "the cache serves through the malformed body")
+	assert_equal(result.from_cache, true)
+	assert_equal(result.error, "malformed_response")
+	assert_equal(result.assigned, true, "the served decision is the cached assigned one")
+	assert_equal(client:experiment_assignment("exp-armor").variant_key, "variant-b",
+		"an unknown refusal reason must not displace the cached decision")
+
+	-- The intact decision keeps feeding the producers.
+	next_status = 200
+	next_response_body = nil
+	assert_true(client:set_consent(true))
+	assert_true(client:track_experiment_exposure("exp-armor"))
+end
+
+local function test_sentinel_drop_failed_durable_clear_blocks_resurrection()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = assigned_body()
+	assert_true(fetch(client).ok)
+
+	local function stored_assignment_records()
+		for path, record in pairs(stores) do
+			if path:find("experiment-assignments", 1, true) then
+				return record.records
+			end
+		end
+		return nil
+	end
+
+	-- Storage WRITES start failing while reads keep working: the sentinel's
+	-- durable clear cannot land, so the disk record survives the drop.
+	local saved_save = sys.save
+	sys.save = function()
+		return false
+	end
+	next_status = 403
+	next_response_body = '{"error":"' .. sentinel_text .. '"}'
+	fetch(client)
+	assert_nil(client:experiment_assignment("exp-armor"))
+	local kept = stored_assignment_records()
+	assert_true(kept ~= nil and #kept == 1, "the failed clear leaves the record on disk")
+
+	-- The surviving disk record must NOT resurrect through a later
+	-- transient fetch: the in-memory tombstone refuses it.
+	next_status = 500
+	next_response_body = nil
+	local result = fetch(client)
+	assert_equal(result.ok, false, "the sentinel-disabled record must never be re-served")
+	assert_equal(result.error, "transient_500")
+	assert_nil(client:experiment_assignment("exp-armor"))
+
+	-- Storage recovers: the next fetch retries the owed durable clear and
+	-- the poisoned record leaves the disk.
+	sys.save = saved_save
+	next_status = 500
+	local after = fetch(client)
+	assert_equal(after.ok, false, "still nothing to serve once the clear lands")
+	kept = stored_assignment_records()
+	assert_true(kept ~= nil and #kept == 0, "the retried durable clear must land once storage recovers")
+
+	-- A newer fresh decision lifts the drop entirely: it serves, re-caches,
+	-- and backs later transients again.
+	next_status = 200
+	next_response_body = assigned_body({ variant_key = "variant-after" })
+	assert_true(fetch(client).ok)
+	assert_equal(client:experiment_assignment("exp-armor").variant_key, "variant-after")
+	next_status = 500
+	next_response_body = nil
+	local served = fetch(client)
+	assert_true(served.ok, "the newer decision serves from cache on transients")
+	assert_equal(served.variant_key, "variant-after")
 	restore()
 end
 
@@ -1197,6 +1353,38 @@ local function test_exposure_dedupe_is_per_launch()
 	restore()
 end
 
+local function test_consent_purge_rearms_undelivered_exposure_dedupe()
+	reset()
+	local client = granted_client_with_assignment()
+
+	-- Queued but NOT yet delivered: a revocation purges the event, so the
+	-- dedupe key must re-arm — the fact never left the device, and leaving
+	-- it burned would make this assignment's exposure unreportable for the
+	-- rest of the launch.
+	assert_true(client:track_experiment_exposure("exp-armor"))
+	next_status = 200
+	next_response_body = nil
+	assert_true(client:set_consent(false))
+	assert_true(client:set_consent(true))
+	assert_true(client:track_experiment_exposure("exp-armor"),
+		"a consent purge must re-arm the undelivered exposure")
+	local events = published_events(client)
+	assert_equal(#events, 1, "the re-armed exposure is delivered exactly once")
+	assert_equal(events[1].event_name, "experiment_exposure")
+
+	-- A DELIVERED exposure stays deduped across a revoke/re-grant cycle:
+	-- re-arming it would double-count the fact.
+	next_status = 200
+	next_response_body = nil
+	assert_true(client:set_consent(false))
+	assert_true(client:set_consent(true))
+	local repeat_ok, repeat_err = client:track_experiment_exposure("exp-armor")
+	assert_equal(repeat_ok, false)
+	assert_equal(repeat_err, "duplicate_exposure",
+		"a delivered exposure must stay deduped through a consent cycle")
+	assert_equal(requests_to("/v1/events:batch"), 1)
+end
+
 -- ── singleton facade ──────────────────────────────────────────────────────────
 
 local function test_facade_reports_not_initialized()
@@ -1285,6 +1473,9 @@ local tests = {
 	test_scope_isolation_between_experiments_and_subjects,
 	test_auth_refusal_fails_closed_without_latch_or_drop,
 	test_sentinel_403_drops_cache_and_sfk_for_its_scope_only,
+	test_mismatched_experiment_key_200_is_malformed,
+	test_unknown_not_assigned_reason_is_malformed,
+	test_sentinel_drop_failed_durable_clear_blocks_resurrection,
 	test_automatic_lane_halts_after_auth_refusal_until_reinit,
 	test_out_of_order_responses_cannot_install_or_erase_fresh_state,
 	test_missing_transport_and_decoder_degrade_cleanly,
@@ -1298,6 +1489,7 @@ local tests = {
 	test_producers_refuse_without_assigned_decision,
 	test_synthetic_unit_fact_uses_response_assignment_key,
 	test_exposure_dedupe_is_per_launch,
+	test_consent_purge_rearms_undelivered_exposure_dedupe,
 	test_facade_reports_not_initialized,
 	test_facade_delegates_to_the_default_client,
 	test_fetch_after_shutdown_is_rejected,

@@ -29,7 +29,15 @@
   assignment lane halts after any authoritative `401`/`403` until re-init
   (`automatic_fetch_allowed()`; host-triggered fetches never blocked, still
   per-fetch). All three not-assigned 200 shapes (`reason` absent /
-  `kill_switch` / `targeting_unmatched`) are handled as valid decisions.
+  `kill_switch` / `targeting_unmatched`) are handled as valid decisions,
+  and verdict parsing is strict — a 200 naming another experiment, an
+  unknown refusal reason, an incomplete assigned verdict, or a
+  `variant_payload` that is not a JSON object (checked on the body text,
+  like the remote-config `values` member) classifies `malformed_response`
+  and never displaces the last-known-good decision. A sentinel drop whose
+  durable clear fails tombstones the scope in memory, so the surviving disk
+  record can never be re-served by a later transient fetch (the clear is
+  retried; a durably persisted newer decision also lifts it).
   DARK: the platform flags are off everywhere, so every call answers `403`
   today — handled cleanly; without the opt-in the SDK's wire behavior and
   identity record are byte-identical to before.
@@ -46,14 +54,18 @@
   `subject_fact_key` (`sfk1_…`), the raw spcid never rides event props, and
   the envelope always carries `anonymous_id` (erasure reachability) and
   never `user_id`. Exposures are de-duplicated client-side per assignment
-  subject per launch; outcomes are not.
+  subject per launch (a consent revocation that purges a still-undelivered
+  exposure re-arms its dedupe key, so a later re-grant can report it —
+  delivered exposures stay deduped); outcomes are not.
 - **Opt-in periodic remote-config revalidation, default OFF** (kill-switch
   reach, ADR-0259 gate 2(a)). New boolean config `remote_config_revalidate`
   (requires `remote_config_url`; capability
   `supports("remote_config_revalidation")`): the `update(dt)` tick paces a
   conditional GET (cached ETag as `If-None-Match`) so a running client
   converges on a server-side kill within one interval. Interval = the
-  server's `Cache-Control` max-age floored at 60s, 300s while unknown
+  server's `Cache-Control` client `max-age` (directive-boundary parsed —
+  `s-maxage` and lookalike names never match) floored at 60s, 300s while
+  unknown
   [pending coordinator ratification]; transient failures keep the schedule;
   the timer halts after an authoritative `401`/`403` until a new client is
   constructed [pending ratification] while explicit fetches stay available
