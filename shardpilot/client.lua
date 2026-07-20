@@ -523,18 +523,22 @@ function M.new(config)
 	if normalized.experiments_enabled then
 		client.experiments = experiments_mod.new(normalized, {
 			subject_id = function()
-				if client.experiments_client_id == nil then
-					-- Two clients constructed before the first mint both
-					-- captured nil here: a sibling client in this process
-					-- may have minted AND persisted since. Re-read the
-					-- identity record at mint-decision time and adopt the
-					-- now-persisted subject — one install converges on ONE
-					-- subject id (and one cache scope) instead of the
-					-- second client re-minting over it. A raw field copy
-					-- (the consumer validates the grammar); a sibling
-					-- whose mint could not persist stays process-local by
-					-- the documented failed-persist rule, so there is
-					-- nothing on disk to adopt in that case.
+				if not experiments_mod.valid_subject_id(client.experiments_client_id) then
+					-- No USABLE captured subject — nil, or a stored value
+					-- that fails the wire grammar. Either way a sibling
+					-- client in this process may have minted (or healed)
+					-- AND persisted a valid subject since this client
+					-- captured its copy: re-read the identity record at
+					-- mint-decision time and adopt it — one install
+					-- converges on ONE subject id (and one cache scope)
+					-- instead of the second client re-minting over the
+					-- sibling's. Gating on VALIDITY, not nilness, matters:
+					-- a captured corrupt string must not block the reload
+					-- while the consumer treats it as absent and mints. A
+					-- raw field copy (the consumer validates the grammar);
+					-- a sibling whose mint could not persist stays
+					-- process-local by the documented failed-persist rule,
+					-- so there is nothing on disk to adopt in that case.
 					local persisted = storage.load(normalized) or {}
 					if type(persisted.experiments_client_id) == "string" then
 						client.experiments_client_id = persisted.experiments_client_id
@@ -768,11 +772,18 @@ function Client:set_anonymous_id(anonymous_id)
 	--     anonymous_id snapshot; re-sending them under a token minted for the
 	--     NEW anon would be rejected the same way, so rotation waits until the
 	--     spool has drained.
+	--   * OWED experiment-exposure snapshots are pending old-anon work that
+	--     sits OUTSIDE the queue: their arm-time anonymous_id enters the
+	--     envelope only when the sweep finally enqueues them, so a flushed
+	--     queue does not mean the old anon is drained — rotating first would
+	--     send the old-anon fact under a token minted for the new anon and
+	--     the bind_anon check would reject the whole batch.
 	-- The host retries the rotation once the pending work clears.
 	local rotating = self.config.token_provider and anonymous_id ~= self.anonymous_id
 	if rotating and (queue.size(self.queue) > 0 or self.in_flight_batch ~= nil
 		or self.token_request_in_flight or self:consent_outbox_pending()
-		or self:spool_pending()) then
+		or self:spool_pending()
+		or (self.experiments and self.experiments:has_owed_exposures())) then
 		return false, "events_pending"
 	end
 	self.anonymous_id = anonymous_id

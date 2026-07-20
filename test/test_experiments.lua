@@ -3886,6 +3886,312 @@ local function test_owed_clear_demotion_preserves_fresh_disk_entry()
 	storage.reset()
 end
 
+local function test_transient_serve_requires_matching_attributes()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	local first = fetch(client, "exp-checkout", { geo = "US" })
+	assert_true(first.ok and first.assigned)
+
+	-- Targeting is server-evaluated and the cache stores the attribute set
+	-- it was evaluated under: during an outage, a request carrying a
+	-- DIFFERENT set gets the closed transient failure — never a variant
+	-- whose targeting condition the new context may not match.
+	next_status = 503
+	next_response_body = nil
+	local mismatched = fetch(client, "exp-checkout", { geo = "CA" })
+	assert_equal(mismatched.ok, false,
+		"a geo=CA request must not serve the geo=US-evaluated cache")
+	assert_true(not mismatched.from_cache)
+	assert_equal(mismatched.error, "transient_503")
+	local empty = fetch(client, "exp-checkout")
+	assert_equal(empty.ok, false,
+		"an attribute-less request is a different targeting context")
+	local matched = fetch(client, "exp-checkout", { geo = "US" })
+	assert_equal(matched.ok, true, "the SAME context still serves stale")
+	assert_equal(matched.from_cache, true)
+	assert_equal(matched.variant_key, "treatment")
+	next_status = 200
+end
+
+local function test_stale_inflight_sentinel_preserves_sibling_write()
+	reset()
+	seed_granted_consent()
+	local a = assert(sdk.new(config()))
+	next_response_body = assignment_body()
+	fetch(a, "exp-checkout")
+
+	-- The sentinel answer is held IN FLIGHT while a sibling client lands a
+	-- fresh authorized assignment: the flag flipped back on after the
+	-- sentinel was served, so the sibling's write is the newer server
+	-- truth. The clear's SUCCESS path must partition by its dispatch-bound
+	-- stamp — withdrawing only what predates the request — not wipe the
+	-- whole record.
+	local held = nil
+	responder = function(url, method, callback)
+		if held == nil
+			and url:find("/experiments/assignment", 1, true)
+			and url:find("experiment_key=exp-checkout", 1, true) then
+			held = callback
+			return true
+		end
+	end
+	a:fetch_experiment_assignment("exp-checkout", nil, function() end)
+	assert_true(held ~= nil, "the sentinel response must be held in flight")
+	responder = nil
+	advance_seconds(5)
+	local b = assert(sdk.new(config()))
+	next_response_body = assignment_body({ experiment_key = "exp-onboarding" })
+	fetch(b, "exp-onboarding")
+
+	held(nil, nil, { status = 403, response = json.encode({
+		error = "experiment real-subject assignment is disabled",
+	}) })
+	local record = storage.load_experiments(config())
+	assert_true(record ~= nil,
+		"the successful clear must not wipe the whole shared record")
+	assert_true(record.entries["exp-onboarding"] ~= nil,
+		"the sibling's post-sentinel write survives the clear")
+	assert_nil(record.entries["exp-checkout"],
+		"the state the sentinel covered is withdrawn")
+end
+
+local function test_condemned_record_refused_after_restart()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	seed_granted_consent()
+	local a = assert(sdk.new(config()))
+	next_response_body = assignment_body()
+	fetch(a, "exp-checkout")
+
+	-- The sentinel clear cannot land (the record file's writes fail); the
+	-- condemnation is persisted in the sidecar marker. A RESTART must
+	-- refuse the withdrawn record — no serving, not even stale — instead
+	-- of serving it until the first probe; the first tick after storage
+	-- recovers lands the clear and retires the marker.
+	state.fail_save = fail_experiment_saves
+	next_status = 403
+	next_response_body = json.encode({
+		error = "experiment real-subject assignment is disabled",
+	})
+	fetch(a, "exp-checkout")
+	next_status = 200
+	local b = assert(sdk.new(config()))
+	next_status = 503
+	next_response_body = nil
+	local stale = fetch(b, "exp-checkout")
+	assert_equal(stale.ok, false,
+		"a condemned record must not serve after a restart, even stale")
+	assert_true(not stale.from_cache)
+	next_status = 200
+	state.fail_save = nil
+	b:update(0.016)
+	local record = storage.load_experiments(config())
+	assert_true(record == nil or record.entries["exp-checkout"] == nil,
+		"the recovered store lands the owed clear")
+	assert_nil(storage.load_experiments_clear(config()),
+		"the landed clear retires its condemnation marker")
+	restore()
+	storage.reset()
+end
+
+local function test_condemned_survivor_restores_and_converges()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	seed_granted_consent()
+	local a = assert(sdk.new(config()))
+	next_response_body = assignment_body()
+	fetch(a, "exp-checkout")
+	state.fail_save = fail_experiment_saves
+	next_status = 403
+	next_response_body = json.encode({
+		error = "experiment real-subject assignment is disabled",
+	})
+	fetch(a, "exp-checkout")
+	next_status = 200
+	state.fail_save = nil
+	advance_seconds(5)
+
+	-- Restart under the condemnation: the covered entry must not restore,
+	-- and a fresh authorized install then supersedes the whole-record form
+	-- — the demotion retires the marker and the combined save converges
+	-- the covered key out while the fresh entry stays.
+	local b = assert(sdk.new(config()))
+	next_status = 503
+	next_response_body = nil
+	local stale = fetch(b, "exp-checkout")
+	assert_equal(stale.ok, false, "condemned entries must not restore")
+	next_status = 200
+	next_response_body = assignment_body({ experiment_key = "exp-onboarding" })
+	fetch(b, "exp-onboarding")
+	local record = storage.load_experiments(config())
+	assert_true(record ~= nil and record.entries["exp-onboarding"] ~= nil,
+		"the fresh authorized install persists")
+	assert_nil(record.entries["exp-checkout"],
+		"the covered key converges out with the demoted clear")
+	assert_nil(storage.load_experiments_clear(config()),
+		"the authorized install disproves the sentinel state and retires the marker")
+	local c = assert(sdk.new(config()))
+	next_status = 503
+	next_response_body = nil
+	local kept = fetch(c, "exp-onboarding")
+	assert_equal(kept.ok, true, "the survivor serves normally after the next restart")
+	assert_equal(kept.from_cache, true)
+	next_status = 200
+	restore()
+	storage.reset()
+end
+
+local function test_sibling_adopts_after_corrupt_subject_heals()
+	reset()
+	-- BOTH clients are constructed from an identity record whose stored
+	-- subject id fails the wire grammar. The first fetch heals it (re-mint
+	-- + persist); the second client's captured value is non-nil but
+	-- INVALID — the reload gate must fire on validity, not nilness, so it
+	-- adopts the healed subject instead of minting again over it.
+	storage.save(storage_scope, {
+		consent_analytics = "granted",
+		experiments_client_id = "not-wire-valid",
+	})
+	local a = assert(sdk.new(config()))
+	local b = assert(sdk.new(config()))
+	next_response_body = assignment_body()
+	fetch(a, "exp-checkout")
+	local healed = query_params(last_assignment_request().url).subject_key
+	assert_match(healed, subject_grammar)
+	next_response_body = assignment_body()
+	fetch(b, "exp-checkout")
+	local adopted = query_params(last_assignment_request().url).subject_key
+	assert_equal(adopted, healed,
+		"the sibling must adopt the healed subject, not re-mint over it")
+	assert_equal(storage.load(storage_scope).experiments_client_id, healed)
+end
+
+local function test_migrated_snapshot_keeps_apply_identity_through_session_start()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	local seed_client = granted_client()
+	next_response_body = assignment_body()
+	fetch(seed_client, "exp-checkout")
+
+	-- Restart: the restored assignment arms its pre-session snapshot at
+	-- construction. Time passes and the anonymous id rotates BEFORE the
+	-- first session starts: the migration must carry the snapshot into
+	-- the first real session with its RESTORE-moment identity — the
+	-- unconditional re-arm must not replace it with a session-start-
+	-- stamped one.
+	local clock_mod = require "shardpilot.clock"
+	local ts_low = clock_mod.iso_utc()
+	local client = assert(sdk.new(config()))
+	local ts_high = clock_mod.iso_utc()
+	advance_seconds(120)
+	assert_true(client:set_anonymous_id("anon-rotated"))
+	assert_true(client:session_start())
+	client:update(0.016)
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1)
+	assert_equal(exposures[1].anonymous_id, "anon-client",
+		"the migrated snapshot keeps the restore-moment anonymous id")
+	assert_true(ts_low <= exposures[1].event_ts
+		and exposures[1].event_ts <= ts_high,
+		"the migrated snapshot keeps the restore-moment timestamp")
+	assert_equal(exposures[1].session_id, client.session_id,
+		"and belongs to the first real session")
+	restore()
+	storage.reset()
+end
+
+local function test_mode_b_rotation_blocked_while_exposure_owed()
+	reset()
+	seed_granted_consent()
+	-- Mode B analytics (token_provider) + the publishable api_key for the
+	-- control plane: a valid dual-credential configuration. Owed exposure
+	-- snapshots hold the OLD anon identity outside the queue, so a flushed
+	-- queue must not admit rotation while one is owed — the later sweep
+	-- would send an old-anon fact under a token minted for the new anon.
+	local client = assert(sdk.new(config({
+		buffer_size = 4,
+		token_provider = function(callback)
+			callback("client-token-placeholder", nil, nil)
+		end,
+	})))
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+	assert_true(client:track("filler-c"))
+	assert_true(client:track("filler-d"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_true(client:flush({ include_summaries = false }))
+	assert_equal(#client.queue.items, 0, "the queue itself is drained")
+	local ok, err = client:set_anonymous_id("anon-rotated")
+	assert_equal(ok, false,
+		"owed old-anon exposures must block Mode B rotation like queued work")
+	assert_equal(err, "events_pending")
+	client:update(0.016)
+	assert_true(client:flush({ include_summaries = false }))
+	assert_true(client:set_anonymous_id("anon-rotated"),
+		"rotation proceeds once the owed fact drained")
+end
+
+local function test_purge_rearm_materializes_at_grant_identity()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	client:update(0.016)
+	assert_true(client:flush({ include_summaries = false }))
+
+	-- Consent is revoked (the purge re-arms the retained assignment as
+	-- INTENT), time passes and the anonymous id rotates during denial,
+	-- then consent returns: the re-emitted exposure must carry the
+	-- identity of the moment serving RESUMED — never a denied-period
+	-- snapshot for a treatment that was not being served.
+	local clock_mod = require "shardpilot.clock"
+	assert_true(client:set_consent(false))
+	advance_seconds(120)
+	assert_true(client:set_anonymous_id("anon-rotated"))
+	assert_true(client:set_consent(true))
+	local ts_low = clock_mod.iso_utc()
+	client:update(0.016)
+	local ts_high = clock_mod.iso_utc()
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1)
+	assert_equal(exposures[1].anonymous_id, "anon-rotated",
+		"the re-emitted exposure carries the serving-resumed identity")
+	assert_true(ts_low <= exposures[1].event_ts
+		and exposures[1].event_ts <= ts_high,
+		"and the grant-moment timestamp, never the denied period's")
+end
+
+local function test_transient_pacing_shortens_next_revalidation()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	local base = #assignment_requests()
+
+	-- The cadence fires and meets a 503 carrying a SHORT Retry-After: the
+	-- window must shorten the next attempt — the cadence deadline was
+	-- re-armed a full interval out at dispatch, and without the pull-down
+	-- the 5 s window is dead code swallowed by the 300 s cadence.
+	next_status = 503
+	next_response_body = nil
+	next_response_headers = { ["retry-after"] = "5" }
+	advance_seconds(400)
+	client:update(0.016)
+	assert_equal(#assignment_requests(), base + 1, "the cadence fired once")
+	client:update(0.016)
+	assert_equal(#assignment_requests(), base + 1,
+		"inside the server window nothing fires")
+	next_status = 200
+	next_response_body = assignment_body()
+	next_response_headers = nil
+	advance_seconds(10)
+	client:update(0.016)
+	assert_equal(#assignment_requests(), base + 2,
+		"past the SHORT window the retry fires — not after the full cadence")
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -3992,6 +4298,15 @@ local tests = {
 	test_persist_reports_uncaptured_experiment_state,
 	test_owed_clear_retry_preserves_sibling_fresh_write,
 	test_owed_clear_demotion_preserves_fresh_disk_entry,
+	test_transient_serve_requires_matching_attributes,
+	test_stale_inflight_sentinel_preserves_sibling_write,
+	test_condemned_record_refused_after_restart,
+	test_condemned_survivor_restores_and_converges,
+	test_sibling_adopts_after_corrupt_subject_heals,
+	test_migrated_snapshot_keeps_apply_identity_through_session_start,
+	test_mode_b_rotation_blocked_while_exposure_owed,
+	test_purge_rearm_materializes_at_grant_identity,
+	test_transient_pacing_shortens_next_revalidation,
 }
 
 for _, test in ipairs(tests) do

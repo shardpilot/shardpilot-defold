@@ -1335,6 +1335,70 @@ function M.save_experiments(scope, record)
 	return true
 end
 
+-- Durable condemnation marker for the experiment cache: when the
+-- real-subjects sentinel's whole-record clear cannot land, the CLEAR ITSELF
+-- is persisted — its stamp — in a sidecar file, so the intent survives the
+-- process and the next launch refuses the withdrawn record instead of
+-- serving it until the first probe. Deliberately a SEPARATE file: the
+-- record file's write is what is failing, and this marker is the cheapest
+-- possible durable mark (a per-file failure of the record must not take the
+-- condemnation down with it; if the whole store is down, both writes fail
+-- and the documented storage-down-through-exit residual applies).
+local experiments_clear_memory = {}
+
+function M.load_experiments_clear(scope)
+	local ns = spool_namespace(scope)
+	local record = nil
+	local path = save_path(ns, "experiments-clear")
+	if path then
+		local ok, loaded = pcall(sys.load, path)
+		if ok and type(loaded) == "table" then
+			record = loaded
+		end
+	end
+	if record == nil then
+		record = experiments_clear_memory[ns]
+	end
+	if type(record) ~= "table" or type(record.stamp) ~= "number" then
+		return nil
+	end
+	return record.stamp
+end
+
+function M.save_experiments_clear(scope, stamp)
+	if type(stamp) ~= "number" then
+		return false
+	end
+	local ns = spool_namespace(scope)
+	local stored = { stamp = stamp }
+	local path = save_path(ns, "experiments-clear")
+	if not path then
+		experiments_clear_memory[ns] = stored
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, stored)
+	if not (ok and saved == true) then
+		return false
+	end
+	experiments_clear_memory[ns] = stored
+	return true
+end
+
+function M.clear_experiments_clear(scope)
+	local ns = spool_namespace(scope)
+	local path = save_path(ns, "experiments-clear")
+	if not path then
+		experiments_clear_memory[ns] = nil
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, {})
+	if not (ok and saved == true) then
+		return false
+	end
+	experiments_clear_memory[ns] = nil
+	return true
+end
+
 -- Drop the cached experiment-assignment record: an empty record is written in
 -- its place (which loads as "no cache") and the in-memory fallback is cleared.
 -- Returns true when the clear landed.
@@ -1362,6 +1426,7 @@ function M.reset()
 	consent_outbox_memory = {}
 	remote_config_memory = {}
 	experiments_memory = {}
+	experiments_clear_memory = {}
 end
 
 return M

@@ -405,13 +405,42 @@ local function response_error_text(response)
 	return nil
 end
 
+-- Order-insensitive-in-effect equality of two normalized attribute sets
+-- (both are name-sorted { name, value } arrays — the dispatch normalizer
+-- sorts, the entry stores the dispatched set, and the restore sanitizer
+-- preserves stored order — so pairwise comparison suffices; nil means the
+-- empty set).
+local function attributes_match(requested, stored)
+	local a = requested or {}
+	local b = stored or {}
+	if #a ~= #b then
+		return false
+	end
+	for i = 1, #a do
+		if a[i].name ~= b[i].name or a[i].value ~= b[i].value then
+			return false
+		end
+	end
+	return true
+end
+
 -- Serve the cached entry for a transient failure, or fail when none exists. A
 -- served entry is still a SUCCESS (`ok = true`) — the game has a usable
 -- assignment — with `from_cache = true` and `error` carrying why the network
 -- could not refresh it. Only assigned entries are ever cached, so a cache
 -- serve always carries a variant.
-local function serve_entry_or_fail(entry, error_code)
-	if entry then
+--
+-- The serve is honest only for the SAME targeting context: targeting is
+-- server-evaluated, and the entry stores the normalized attribute set it was
+-- evaluated under. A request carrying a DIFFERENT set (geo=CA against a
+-- geo=US-evaluated cache) cannot be answered by this entry — a variant whose
+-- targeting condition the requested attributes may not match must not apply
+-- — so a mismatch gets the closed transient-failure result instead. The
+-- serving GETTERS are unaffected: they report the last APPLIED state, not an
+-- attribute-bearing request; the revalidation cadence re-sends the entry's
+-- own remembered set, so cadence serves always match.
+local function serve_entry_or_fail(entry, error_code, requested)
+	if entry and attributes_match(requested, entry.attributes) then
 		return {
 			ok = true,
 			from_cache = true,
@@ -458,13 +487,16 @@ local function echo_invalid(echoed, expected)
 		and echoed ~= expected
 end
 
-function M.apply(entry, response, now_ms, experiment_key, app_key, environment_key)
+-- `requested_attributes` is the normalized attribute set THIS request
+-- dispatched: every stale-cache serve inside is fenced on it matching the
+-- entry's stored set (see serve_entry_or_fail).
+function M.apply(entry, response, now_ms, experiment_key, app_key, environment_key, requested_attributes)
 	local status = type(response) == "table" and response.status or 0
 
 	if status == 200 then
 		local decoded = decode_object(type(response) == "table" and response.response or nil)
 		if not decoded then
-			return serve_entry_or_fail(entry, "malformed_response"), { transient = true }
+			return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
 		end
 		if echo_invalid(decoded.experiment_key, experiment_key)
 			or echo_invalid(decoded.app_key, app_key)
@@ -474,7 +506,7 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 			-- malformed BEFORE anything installs — never cache (or drop)
 			-- under the current scope on another scope's payload or
 			-- subject-fact key.
-			return serve_entry_or_fail(entry, "malformed_response"), { transient = true }
+			return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
 		end
 		local boundary = type(decoded.boundary) == "table" and decoded.boundary or nil
 		local assignment_unit = boundary and boundary.assignment_unit or nil
@@ -519,8 +551,8 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 			if reason ~= nil and (type(reason) ~= "string"
 				or (reason ~= "kill_switch"
 					and reason ~= "targeting_unmatched")) then
-				return serve_entry_or_fail(entry, "malformed_response"),
-					{ transient = true }
+				return serve_entry_or_fail(entry, "malformed_response",
+					requested_attributes), { transient = true }
 			end
 			return {
 				ok = true,
@@ -531,7 +563,7 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 				boundary = copy_value(boundary, 0),
 			}, { authoritative = true, drop_entry = true }
 		end
-		return serve_entry_or_fail(entry, "malformed_response"), { transient = true }
+		return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
 	end
 
 	-- Unauthorized / forbidden fail CLOSED (a dark server, a revoked or
@@ -585,11 +617,14 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 	-- fails (an explicit serve-stale-and-retry case). Retry-After is honored
 	-- on 429 and 5xx alike.
 	if status == 0 then
-		return serve_entry_or_fail(entry, "http_0"), { transient = true }
+		return serve_entry_or_fail(entry, "http_0", requested_attributes),
+			{ transient = true }
 	elseif status == 408 then
-		return serve_entry_or_fail(entry, "transient_408"), { transient = true }
+		return serve_entry_or_fail(entry, "transient_408", requested_attributes),
+			{ transient = true }
 	elseif status == 429 or status >= 500 then
-		return serve_entry_or_fail(entry, "transient_" .. tostring(status)),
+		return serve_entry_or_fail(entry, "transient_" .. tostring(status),
+				requested_attributes),
 			{ transient = true, retry_after_seconds = retry_after_seconds(response) }
 	end
 
@@ -673,6 +708,12 @@ function M.new(config, deps)
 		-- real-subjects sentinel — whose fact keys must not outlive it —
 		-- discards them).
 		pending_exposure = {},
+		-- Consent-purge re-arm INTENTS: experiment_key → true for a live
+		-- assignment whose exposure must re-arm when consent returns. The
+		-- snapshot is deliberately NOT minted at purge time (a denied
+		-- period must not stamp the future fact's identity); it
+		-- materializes at the first granted sweep.
+		pending_rearm = {},
 		-- Durable-write convergence: (scope\31key) composite →
 		-- { key, scope, as_of, drop } for an OWED sync (memory changed,
 		-- disk did not), retried every tick; plus an owed whole-record
@@ -729,20 +770,37 @@ function M.new(config, deps)
 	-- the first granted tick. No subject id is minted here.
 	local subject = ex:current_subject_id()
 	if subject then
+		-- A durable condemnation outlives the process: a real-subjects
+		-- sentinel clear that could not land before an exit left its
+		-- stamp in the sidecar marker. Re-arm the clear here and REFUSE
+		-- everything it covers — serving the withdrawn record until its
+		-- first probe would defeat the sentinel. Entries stamped strictly
+		-- after the condemnation are a sibling's post-sentinel authorized
+		-- state and restore normally (the same survivor partition the
+		-- clear itself applies); the first tick lands the clear.
+		local condemned_stamp = storage.load_experiments_clear(config)
+		if condemned_stamp then
+			ex.durable_clear_pending = condemned_stamp
+		end
 		local record = storage.load_experiments(config)
 		if record and record.scope == ex:scope_for(subject) then
 			for key, entry in pairs(record.entries) do
-				-- Restored attributes re-validate against the live fetch
-				-- vocabulary before any revalidation can send them: corrupt
-				-- or older-build records degrade to a safe targeting miss,
-				-- never a reshaped request.
-				entry.attributes = sanitize_restored_attributes(entry.attributes)
-				ex.entries[key] = entry
-				-- The restored assignment APPLIES at this restore (this
-				-- launch's serving), so the snapshot's identity is the
-				-- construction moment's — session nil until the first real
-				-- session migrates it, anonymous id and timestamp of NOW.
-				ex.pending_exposure[key] = { ex:exposure_snapshot(entry) }
+				local stored_at = type(entry.fetched_at_ms) == "number"
+					and entry.fetched_at_ms or 0
+				if not condemned_stamp or stored_at > condemned_stamp then
+					-- Restored attributes re-validate against the live
+					-- fetch vocabulary before any revalidation can send
+					-- them: corrupt or older-build records degrade to a
+					-- safe targeting miss, never a reshaped request.
+					entry.attributes = sanitize_restored_attributes(entry.attributes)
+					ex.entries[key] = entry
+					-- The restored assignment APPLIES at this restore
+					-- (this launch's serving), so the snapshot's identity
+					-- is the construction moment's — session nil until
+					-- the first real session migrates it, anonymous id
+					-- and timestamp of NOW.
+					ex.pending_exposure[key] = { ex:exposure_snapshot(entry) }
+				end
 			end
 		end
 	end
@@ -834,10 +892,11 @@ function Experiments:on_session_renewed(is_renewal)
 	local previous = self.session_marker
 	self.session_marker = id.uuid()
 	self.exposed = {}
+	local migrated = nil
 	if not is_renewal then
 		local session_id = self.deps.analytics_session
 			and self.deps.analytics_session() or nil
-		for _, list in pairs(self.pending_exposure) do
+		for key, list in pairs(self.pending_exposure) do
 			for i = 1, #list do
 				if list[i].session == previous then
 					list[i].session = self.session_marker
@@ -848,12 +907,24 @@ function Experiments:on_session_renewed(is_renewal)
 					-- session the fact belongs to, not when it happened or
 					-- which device identity it happened under.
 					list[i].session_id = session_id
+					migrated = migrated or {}
+					migrated[key] = true
 				end
 			end
 		end
 	end
 	for key, entry in pairs(self.entries) do
-		self:arm_exposure(key, entry)
+		-- Migration and re-arm are ALTERNATIVES, never both: a key whose
+		-- pre-session snapshot just migrated already owes this first
+		-- session its fact with the ARM-moment identity — re-arming would
+		-- coalesce into that migrated tail and re-stamp it with the
+		-- session-start moment's timestamp and anonymous id (the FIFO
+		-- drains in order, so anything still owed at session start
+		-- includes the latest application; keys with nothing owed re-arm
+		-- normally).
+		if not (migrated and migrated[key]) then
+			self:arm_exposure(key, entry)
+		end
 	end
 end
 
@@ -862,15 +933,25 @@ end
 -- consent contract outranks the facts-about-the-past retention that governs
 -- auth latches and subject re-mints. Snapshots for since-dropped
 -- assignments die HERE (a re-grant must never publish a treatment the
--- server already killed); still-LIVE assignments re-arm and re-emit on
--- re-grant — with the same deterministic ids, so anything that HAD already
--- published collapses server-side as a duplicate, and the session never
--- under-counts real, still-served treatment.
+-- server already killed); still-LIVE assignments re-emit on re-grant —
+-- with the same deterministic ids, so anything that HAD already published
+-- collapses server-side as a duplicate, and the session never under-counts
+-- real, still-served treatment.
+--
+-- The re-arm is recorded as INTENT only (`pending_rearm`), not as a
+-- snapshot: consent is already denied when this runs, getters serve
+-- nothing during denial, and a snapshot minted NOW would stamp the future
+-- fact with a denied-period timestamp and anonymous identity for a
+-- treatment that was not being served. The replacement snapshot
+-- materializes at the first granted sweep — the moment serving actually
+-- resumes — with THAT moment's identity; an intent whose entry died
+-- meanwhile is discarded (dead treatments never re-emit).
 function Experiments:on_analytics_purge()
 	self.pending_exposure = {}
 	self.exposed = {}
-	for key, entry in pairs(self.entries) do
-		self:arm_exposure(key, entry)
+	self.pending_rearm = {}
+	for key in pairs(self.entries) do
+		self.pending_rearm[key] = true
 	end
 end
 
@@ -1072,6 +1153,15 @@ function Experiments:demote_owed_clear()
 	local clear_as_of = type(self.durable_clear_pending) == "number"
 		and self.durable_clear_pending or 0
 	self.durable_clear_pending = false
+	-- The demotion also retires the durable condemnation marker: a fresh
+	-- AUTHORIZED install exists (that is what triggers demotion), which
+	-- disproves the sentinel state — the platform re-authorized the plane
+	-- — so a whole-record refusal at the next launch is no longer
+	-- warranted. The per-key drops the demotion mints are ordinary owed
+	-- intents from here on; a process death before they land is the
+	-- documented per-key storage-down-through-exit class, not the
+	-- sentinel-blanket one.
+	storage.clear_experiments_clear(self.config)
 	local record = storage.load_experiments(self.config)
 	if not record then
 		return
@@ -1184,6 +1274,11 @@ function Experiments:retry_owed_clear()
 		if storage.clear_experiments(self.config) then
 			self.durable_clear_pending = false
 			self.durable_pending = {}
+			-- The landed clear retires its durable condemnation marker
+			-- (best-effort: a lingering marker is harmless — the next
+			-- construction re-arms a clear whose targets are gone, which
+			-- settles here and retries this delete).
+			storage.clear_experiments_clear(self.config)
 		end
 		return
 	end
@@ -1194,6 +1289,7 @@ function Experiments:retry_owed_clear()
 		-- sibling's state. Per-key owed intents stay to converge on their
 		-- own fences.
 		self.durable_clear_pending = false
+		storage.clear_experiments_clear(self.config)
 		return
 	end
 	record.entries = survivors
@@ -1204,6 +1300,7 @@ function Experiments:retry_owed_clear()
 		-- (the stored entry is gone), and anything targeting a survivor
 		-- is protected by the usual strictly-fresher retry fences.
 		self.durable_clear_pending = false
+		storage.clear_experiments_clear(self.config)
 	end
 end
 
@@ -1444,6 +1541,18 @@ function Experiments:sweep_owed()
 	if consent_refusal(self.deps.consent()) then
 		return
 	end
+	-- Purge-deferred re-arms materialize HERE — the first granted sweep is
+	-- the moment serving resumes, so the replacement snapshot captures
+	-- THIS moment's identity (session, anonymous id, timestamp), never the
+	-- denied period's. An intent whose entry died meanwhile is discarded:
+	-- dead treatments never re-emit.
+	for key in pairs(self.pending_rearm) do
+		local entry = self.entries[key]
+		if entry then
+			self:arm_exposure(key, entry)
+		end
+		self.pending_rearm[key] = nil
+	end
 	if not next(self.pending_exposure) then
 		return
 	end
@@ -1481,7 +1590,7 @@ end
 -- assignments), the scope must still be current (a subject re-minted while
 -- the response was in flight makes it another subject's assignment), then
 -- the per-key sequence fence, then the outcome's own directives.
-function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, resolved_at_ms)
+function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, resolved_at_ms, dispatched_at_ms)
 	if auth_epoch ~= self.auth_epoch then
 		return
 	end
@@ -1512,7 +1621,12 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 			-- withdraws (the drop rule: the wall clock can move backward,
 			-- and a rollback must not let withdrawn entries outrank their
 			-- own clear). Capture the withdrawn stamps BEFORE memory is
-			-- wiped.
+			-- wiped. The DISK record is deliberately NOT folded in: an
+			-- entry there stamped after the dispatch bound is a sibling's
+			-- post-sentinel write the partition must see as a survivor,
+			-- not withdrawn state (same-clock best-effort, like every
+			-- write fence; a rollback-backdated withdrawn disk-only entry
+			-- surviving until its own next probe is the accepted corner).
 			for _, held in pairs(self.entries) do
 				if type(held) == "table"
 					and type(held.fetched_at_ms) == "number"
@@ -1525,34 +1639,41 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 		if outcome.drop_all then
 			-- The sentinel withdraws the assignments AND their subject-fact
 			-- keys outright: owed exposure snapshots carry those keys and
-			-- go with them.
+			-- go with them. (A snapshot whose entry survives the partition
+			-- below dies too — conservative toward the sentinel's privacy
+			-- mandate; the survivor re-arms from the durable record at the
+			-- next construction.)
 			self.pending_exposure = {}
-			if storage.clear_experiments(self.config) then
-				self.durable_pending = {}
-			else
-				-- The withdrawn assignments are still on disk: mark the
-				-- clear OWED and retry it every tick until it lands. Its
-				-- stamp is this resolution raised above every withdrawn
-				-- entry — memory's image and (best-effort) the disk
-				-- record's, which may hold entries a latch already cleared
-				-- from memory — so at retry time an entry stamped STRICTLY
-				-- after the clear can only be a post-sentinel authorized
-				-- write (a same-app sibling's) and survives the demotion.
-				local record = storage.load_experiments(self.config)
-				if record then
-					for _, held in pairs(record.entries) do
-						if type(held) == "table"
-							and type(held.fetched_at_ms) == "number"
-							and held.fetched_at_ms > withdrawn_stamp_max then
-							withdrawn_stamp_max = held.fetched_at_ms
-						end
-					end
+			-- The clear's authority is bounded by WHEN THIS FETCH ASKED:
+			-- the flag state this answer reports is no newer than the
+			-- request's dispatch, so an entry written while the sentinel
+			-- was in flight (a sibling's fresh 200 — the flag flipped back
+			-- on) postdates the directive and must survive. Stamp = the
+			-- dispatch bound, raised above the withdrawn memory image.
+			local stamp = type(dispatched_at_ms) == "number" and dispatched_at_ms
+				or (type(resolved_at_ms) == "number" and resolved_at_ms or 0)
+			if withdrawn_stamp_max >= stamp then
+				stamp = withdrawn_stamp_max + 1
+			end
+			self.durable_clear_pending = stamp
+			-- The SUCCESS path partitions exactly like the retry — a stale
+			-- in-flight sentinel must not erase a sibling's newer
+			-- post-sentinel write even when storage works — so the clear
+			-- goes through the one stamped implementation immediately.
+			self:retry_owed_clear()
+			if self.durable_clear_pending then
+				-- Still owed: the in-memory intent would die with the
+				-- process and the next launch would serve the withdrawn
+				-- record until its first probe. Make the condemnation
+				-- DURABLE — the sidecar tombstone carries the clear's
+				-- stamp, the constructor refuses what it covers and
+				-- re-arms the clear. Best-effort in the double-failure
+				-- corner (record AND sidecar stores down), diagnosed:
+				-- that corner is the documented storage-down-through-exit
+				-- residual.
+				if not storage.save_experiments_clear(self.config, stamp) then
+					self:diagnose("persist_failed", "cache_clear_tombstone")
 				end
-				local stamp = type(resolved_at_ms) == "number" and resolved_at_ms or 0
-				if withdrawn_stamp_max >= stamp then
-					stamp = withdrawn_stamp_max + 1
-				end
-				self.durable_clear_pending = stamp
 				self:diagnose("persist_failed", "cache_clear")
 			end
 		else
@@ -1652,6 +1773,17 @@ function Experiments:defer_revalidation(seconds)
 	if not self.retry_after_ms or deadline > self.retry_after_ms then
 		self.retry_after_ms = deadline
 	end
+	-- Pacing may SHORTEN the next attempt, never merely lengthen it: the
+	-- cadence deadline was already re-armed a full interval out when the
+	-- failing batch DISPATCHED, so without this pull-down a short
+	-- Retry-After or backoff window would be dead code — the `now <
+	-- revalidate_at_ms` gate would suppress the retry until the full
+	-- cadence anyway. The effective next attempt becomes min(cadence,
+	-- pacing window); retry_after_ms above still lower-bounds it, so a
+	-- server wait LONGER than the cadence holds exactly as before.
+	if self.revalidate_at_ms and deadline < self.revalidate_at_ms then
+		self.revalidate_at_ms = deadline
+	end
 end
 
 -- Transient-failure pacing for the revalidation cadence: a server Retry-After
@@ -1749,7 +1881,8 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	end
 
 	if not http or not http.request then
-		local result = serve_entry_or_fail(entry, "http_unavailable")
+		local result = serve_entry_or_fail(entry, "http_unavailable",
+			normalized_attributes)
 		finish(result)
 		return false, "http_unavailable"
 	end
@@ -1771,6 +1904,13 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		timeout = self.config.publish_timeout_seconds,
 	}
 
+	-- The dispatch bound: the server truth any answer to THIS request can
+	-- carry is no newer than the moment it was asked. The real-subjects
+	-- sentinel's whole-record clear stamps its authority by it (see the
+	-- drop_all install), so state written while the sentinel was in flight
+	-- — a sibling's fresh 200, meaning the flag flipped back on — postdates
+	-- the directive and survives its partition.
+	local dispatched_at_ms = clock.unix_ms()
 	http.request(url, "GET", function(_, _, response)
 		-- A torn-down consumer discards in-flight responses outright:
 		-- nothing installs, persists, or paces, and game code is not
@@ -1801,7 +1941,8 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		end
 		local resolved_at_ms = clock.unix_ms()
 		local result, outcome = M.apply(entry_now, response, resolved_at_ms,
-			experiment_key, self.config.app_id, self.config.environment_id)
+			experiment_key, self.config.app_id, self.config.environment_id,
+			normalized_attributes)
 		outcome.attributes = normalized_attributes
 		-- Captured BEFORE install (which may settle this very seq): true
 		-- when a NEWER outcome for this key already settled while this
@@ -1859,7 +2000,8 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 				self:pace_transient(outcome.retry_after_seconds)
 			end
 		end
-		self:install(seq, scope, experiment_key, outcome, auth_epoch, resolved_at_ms)
+		self:install(seq, scope, experiment_key, outcome, auth_epoch,
+			resolved_at_ms, dispatched_at_ms)
 		-- The epoch re-check guards the PUBLIC callback like the install:
 		-- a response that raced a fail-closed latch was discarded from
 		-- state above, and its caller must not receive a healthy
