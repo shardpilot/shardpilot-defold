@@ -32,11 +32,15 @@
 --     Assignment stickiness is entirely the server's deterministic hash; the
 --     cache is a latency/offline device, never an assignment authority, and
 --     this client never re-buckets locally.
---   * 200 not-assigned — three shapes distinguished only by `reason`:
---     absent (deterministic traffic-gate miss), "targeting_unmatched" (may
---     change when attributes change), "kill_switch" (operator kill). All
---     three drop the cached assignment for the experiment; a kill
---     additionally guarantees no exposure is emitted for it.
+--   * 200 not-assigned — three shapes distinguished only by `reason`, a
+--     CLOSED vocabulary: absent (deterministic traffic-gate miss),
+--     "targeting_unmatched" (may change when attributes change),
+--     "kill_switch" (operator kill). All three drop the cached assignment
+--     for the experiment; a kill additionally guarantees no exposure is
+--     emitted for it. An UNKNOWN reason — like a 200 whose body names a
+--     DIFFERENT experiment than the request — is treated as malformed
+--     (transient serve-stale), never executed as a directive this client
+--     does not understand.
 --   * 401/403 — fail CLOSED: the result never serves a cached assignment,
 --     in-memory serving stops (getters return nil) and revalidation halts
 --     until re-init or a later successful, authorized fetch. The durable
@@ -165,6 +169,28 @@ local function escape_component(value)
 	end))
 end
 
+-- Pure-arithmetic 32-bit rolling hash (shared by the credential fingerprint
+-- and the deterministic exposure event id below).
+local function hash32(text, seed, mult)
+	local hash = seed
+	for i = 1, #text do
+		hash = (hash * mult + text:byte(i)) % 4294967296
+	end
+	return hash
+end
+
+-- Non-secret fingerprint of the publishable credential: 8 lowercase hex
+-- chars of a pure-arithmetic rolling hash — NEVER the raw key, and not
+-- reversible to it. It rides the cache scope so the durable record is
+-- keyed by the credential that fetched it: the server resolves the TENANT
+-- from the Bearer key, and an in-place key swap with unchanged
+-- workspace/app/environment must make the previous tenant's cached
+-- assignments (and their subject-fact keys) a safe scope-miss, never a
+-- serve.
+function M.credential_fingerprint(credential)
+	return string.format("%08x", hash32(tostring(credential or ""), 2166136261, 131))
+end
+
 -- ── subject id ────────────────────────────────────────────────────────────────
 
 -- The wire grammar for a client subject id. Accepting the full grammar on
@@ -202,16 +228,21 @@ function M.build_url(base_url, query)
 end
 
 -- Cache-scope discipline shared with the remote-config client: components are
--- escaped and joined with a separator no escaped component can contain, so two
--- distinct (workspace, environment, subject, url) tuples can never collide
--- into one scope string. The experiment key is deliberately NOT part of the
--- base scope — entries are keyed by it inside the record, so the full cache
--- key is the (scope, experiment_key) pair.
-function M.build_scope(workspace_id, environment_id, subject_id, base_url)
+-- escaped and joined with a separator no escaped component can contain, so
+-- two distinct (workspace, environment, subject, url, credential) tuples can
+-- never collide into one scope string. The experiment key is deliberately
+-- NOT part of the base scope — entries are keyed by it inside the record, so
+-- the full cache key is the (scope, experiment_key) pair. The CREDENTIAL
+-- rides as a non-secret fingerprint (never the raw key): the tenant resolves
+-- server-side from the Bearer key, so a swapped key with unchanged
+-- workspace/app/environment is another tenant's plane and its cache must
+-- scope-miss.
+function M.build_scope(workspace_id, environment_id, subject_id, base_url, credential)
 	return escape_component(workspace_id or "") .. scope_separator
 		.. escape_component(environment_id or "") .. scope_separator
 		.. escape_component(subject_id or "") .. scope_separator
-		.. trim_slash(base_url or "")
+		.. trim_slash(base_url or "") .. scope_separator
+		.. M.credential_fingerprint(credential)
 end
 
 local function trim(value)
@@ -383,12 +414,21 @@ end
 --     subject id once and retry;
 --   * transient + retry_after_seconds — pace the revalidation backoff and
 --     honor a server Retry-After (429 and 5xx alike).
-function M.apply(entry, response, now_ms)
+function M.apply(entry, response, now_ms, experiment_key)
 	local status = type(response) == "table" and response.status or 0
 
 	if status == 200 then
 		local decoded = decode_object(type(response) == "table" and response.response or nil)
 		if not decoded then
+			return serve_entry_or_fail(entry, "malformed_response"), { transient = true }
+		end
+		if type(decoded.experiment_key) == "string" and decoded.experiment_key ~= ""
+			and type(experiment_key) == "string"
+			and decoded.experiment_key ~= experiment_key then
+			-- A 200 whose body names ANOTHER experiment is routing/proxy
+			-- confusion, not an answer to this request: malformed BEFORE
+			-- anything installs — never cache (or drop) under the requested
+			-- key on another experiment's payload.
 			return serve_entry_or_fail(entry, "malformed_response"), { transient = true }
 		end
 		local boundary = type(decoded.boundary) == "table" and decoded.boundary or nil
@@ -419,17 +459,26 @@ function M.apply(entry, response, now_ms)
 			}, { authoritative = true, new_entry = new_entry }
 		end
 		if decoded.assigned == false then
-			-- The three not-assigned shapes, distinguished only by `reason`
-			-- (absent = deterministic traffic-gate miss; unknown reason
-			-- strings pass through untouched — additive evolution). Every
-			-- shape drops the cached assignment: the server just said this
-			-- subject has no variant NOW, and a kill in particular must stop
-			-- applying at the next safe point and emit no exposure.
+			-- The three not-assigned shapes, distinguished only by `reason`,
+			-- form a CLOSED vocabulary: absent (deterministic traffic-gate
+			-- miss), "targeting_unmatched", "kill_switch". Each drops the
+			-- cached assignment: the server just said this subject has no
+			-- variant NOW, and a kill in particular must stop applying at
+			-- the next safe point and emit no exposure. An UNKNOWN reason is
+			-- semantics this client cannot honor — treated as MALFORMED
+			-- (serve-stale transient), never executed as a drop directive it
+			-- does not understand.
+			local reason = type(decoded.reason) == "string" and decoded.reason or nil
+			if reason ~= nil and reason ~= "kill_switch"
+				and reason ~= "targeting_unmatched" then
+				return serve_entry_or_fail(entry, "malformed_response"),
+					{ transient = true }
+			end
 			return {
 				ok = true,
 				from_cache = false,
 				assigned = false,
-				reason = type(decoded.reason) == "string" and decoded.reason or nil,
+				reason = reason,
 				version = type(decoded.version) == "number" and decoded.version or nil,
 				boundary = copy_value(boundary, 0),
 			}, { authoritative = true, drop_entry = true }
@@ -504,14 +553,6 @@ function M.apply(entry, response, now_ms)
 end
 
 -- ── exposure event id ─────────────────────────────────────────────────────────
-
-local function hash32(text, seed, mult)
-	local hash = seed
-	for i = 1, #text do
-		hash = (hash * mult + text:byte(i)) % 4294967296
-	end
-	return hash
-end
 
 -- Deterministic exposure event id (PROPOSED convention, see the module
 -- header): a stable digest of (session marker, subject, experiment, version,
@@ -745,7 +786,8 @@ function Experiments:scope_for(subject_id)
 		self.config.workspace_id,
 		self.config.environment_id,
 		subject_id,
-		self.config.remote_config_url)
+		self.config.remote_config_url,
+		self.config.api_key)
 end
 
 local function consent_refusal(state)
@@ -1414,7 +1456,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 			end
 		end
 		local resolved_at_ms = clock.unix_ms()
-		local result, outcome = M.apply(entry_now, response, resolved_at_ms)
+		local result, outcome = M.apply(entry_now, response, resolved_at_ms, experiment_key)
 		outcome.attributes = normalized_attributes
 		-- Captured BEFORE install (which may settle this very seq): true
 		-- when a NEWER outcome for this key already settled while this

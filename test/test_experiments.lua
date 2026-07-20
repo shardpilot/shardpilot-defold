@@ -545,7 +545,8 @@ local function test_fetch_happy_path_and_boundary_passthrough()
 	assert_true(record.entries["exp-checkout"] ~= nil)
 	assert_equal(record.entries["exp-checkout"].variant_key, "treatment")
 	assert_equal(record.scope, experiments.build_scope(
-		"workspace-test", "develop", params.subject_key, "http://localhost:18081"))
+		"workspace-test", "develop", params.subject_key,
+		"http://localhost:18081", "sp_ingest_publishable_key"))
 end
 
 local function test_optional_attributes_argument_shift()
@@ -3043,6 +3044,169 @@ local function test_shutdown_completes_with_active_session_and_full_queue()
 		"the deferred session end rides a shutdown batch")
 end
 
+-- ── round-9 regressions (post-merge audit absorption) ─────────────────────────
+
+local function test_stale_auth_refusal_does_not_latch()
+	reset()
+	local client = granted_client()
+	local held = {}
+	local hold_next = false
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		if hold_next then
+			hold_next = false
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+
+	-- An older request is in flight when a NEWER same-key success settles.
+	hold_next = true
+	local stale = nil
+	client:fetch_experiment_assignment("exp-checkout", function(result)
+		stale = result
+	end)
+	assert_equal(#held, 1)
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	responder = nil
+
+	-- The DELAYED STALE 401 lands: the per-key fence discards it BEFORE the
+	-- latch branch — a fence-losing refusal must not halt the lane. (A
+	-- fence-WINNING refusal still latches: pinned by
+	-- test_unauthorized_fails_closed_and_halts_revalidation.)
+	held[1](nil, nil, {
+		status = 401,
+		response = json.encode({ error = "invalid runtime token" }),
+	})
+	assert_true(stale.ok and stale.from_cache,
+		"the stale caller receives the settled state")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"a fence-losing 401 must not stop serving")
+
+	-- And the revalidation cadence still runs.
+	local before = #assignment_requests()
+	next_response_body = assignment_body()
+	advance_seconds(400)
+	client:update(0.016)
+	assert_true(#assignment_requests() > before,
+		"a fence-losing 401 must not halt the revalidation cadence")
+end
+
+local function test_credential_swap_scopes_the_cache()
+	reset()
+	local restore = install_fake_sys_storage()
+	local first = granted_client()
+	next_response_body = assignment_body()
+	fetch(first, "exp-checkout")
+	assert_equal(first:experiment_variant("exp-checkout"), "treatment")
+
+	-- The scope carries a credential FINGERPRINT — never the raw key.
+	local record = storage.load_experiments(first.config)
+	assert_nil(record.scope:find("sp_ingest_publishable_key", 1, true),
+		"the raw key must never appear in the scope")
+	assert_match(record.scope, "%x%x%x%x%x%x%x%x$")
+
+	-- An IN-PLACE key swap (same workspace/app/environment) is another
+	-- tenant's plane: the previous tenant's cached assignment and its
+	-- subject-fact key must be a safe scope-miss, never served.
+	local swapped = assert(sdk.new(config({ api_key = "sp_ingest_publishable_key_b" })))
+	assert_nil(swapped:experiment_variant("exp-checkout"),
+		"a swapped credential must not serve the previous tenant's cache")
+
+	-- The ORIGINAL credential still restores its own record.
+	local back = assert(sdk.new(config()))
+	assert_equal(back:experiment_variant("exp-checkout"), "treatment")
+	restore()
+end
+
+local function test_mismatched_experiment_key_is_malformed()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- A 200 whose body names ANOTHER experiment (routing/proxy confusion)
+	-- is malformed — serve-stale transient — never installed under the
+	-- requested key.
+	next_response_body = assignment_body({
+		experiment_key = "exp-other",
+		variant_key = "beta",
+		version = 9,
+	})
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.from_cache,
+		"a mismatched body serves the cached entry as a transient")
+	assert_equal(result.error, "malformed_response")
+	assert_equal(result.variant_key, "treatment")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"nothing installs from another experiment's payload")
+	assert_nil(client:experiment_variant("exp-other"))
+end
+
+local function test_unknown_not_assigned_reason_is_malformed()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- The not-assigned reason vocabulary is CLOSED. An unknown reason is
+	-- semantics this client cannot honor: malformed serve-stale — never a
+	-- drop directive executed blind.
+	next_response_body = not_assigned_body("mystery_gate")
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.from_cache)
+	assert_equal(result.error, "malformed_response")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"an unknown reason must not drop the cached assignment")
+
+	-- The known vocabulary still drops.
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-checkout")
+	assert_nil(client:experiment_variant("exp-checkout"))
+end
+
+local function test_failed_sentinel_clear_never_resurrects_serving()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- The sentinel lands while the durable clear keeps failing: the
+	-- withdrawn assignment stays on DISK for the moment, but serving must
+	-- never resurrect from the stale disk record while the clear is owed.
+	state.fail_save = function(path)
+		return fail_experiment_saves(path)
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	assert_nil(client:experiment_variant("exp-checkout"))
+	local record = storage.load_experiments(client.config)
+	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
+		"the withdrawn record is still on disk while the clear is owed")
+
+	-- Owed-clear retry ticks READ the disk: no resurrection.
+	client:update(0.016)
+	client:update(0.016)
+	assert_nil(client:experiment_variant("exp-checkout"),
+		"owed-clear retries must never resurrect serving from the stale record")
+
+	-- Storage recovers: the clear lands and a relaunch serves nothing.
+	state.fail_save = nil
+	client:update(0.016)
+	next_status = 200
+	next_response_body = nil
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-checkout"),
+		"the landed clear leaves nothing to restore")
+	restore()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -3125,6 +3289,11 @@ local tests = {
 	test_restored_exposure_migrates_to_first_session,
 	test_permanent_400_drops_cached_assignment,
 	test_shutdown_captures_deferred_session_end_when_flush_cannot_send,
+	test_stale_auth_refusal_does_not_latch,
+	test_credential_swap_scopes_the_cache,
+	test_mismatched_experiment_key_is_malformed,
+	test_unknown_not_assigned_reason_is_malformed,
+	test_failed_sentinel_clear_never_resurrects_serving,
 }
 
 for _, test in ipairs(tests) do
