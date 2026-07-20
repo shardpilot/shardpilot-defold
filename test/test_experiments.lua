@@ -1166,11 +1166,23 @@ local function test_restart_restores_cache_serves_offline_and_exposes_once()
 	assert_equal(result.variant_key, "treatment")
 
 	-- The restored application emits one exposure for the NEW session, with
-	-- a distinct deterministic id.
+	-- a distinct deterministic id — once that session EXISTS. The
+	-- background tick must not lazily open a session to drain it (a
+	-- phantom session would demote the host's first session_start to a
+	-- renewal and double-arm); the snapshot waits for the first-session
+	-- migration.
 	second:update(0.016)
+	second:update(0.016)
+	assert_equal(#queued_events(second, "experiment_exposure"), 0,
+		"the pre-session snapshot is unsweepable by the background tick")
+	assert_nil(second.session_id,
+		"and the tick opened no phantom analytics session")
+	assert_true(second:session_start())
 	second:update(0.016)
 	local exposures = queued_events(second, "experiment_exposure")
 	assert_equal(#exposures, 1, "a restored assignment exposes once per session")
+	assert_equal(exposures[1].session_id, second.session_id,
+		"attributed to the first real session by the migration")
 	assert_true(exposures[1].event_id ~= first_exposure.event_id,
 		"each session derives its own exposure id")
 	restore()
@@ -4150,10 +4162,17 @@ local function test_purge_rearm_materializes_at_grant_identity()
 	assert_true(client:set_consent(false))
 	advance_seconds(120)
 	assert_true(client:set_anonymous_id("anon-rotated"))
-	assert_true(client:set_consent(true))
+	-- The re-arm intent materializes INSIDE the grant call — serving
+	-- resumes at that exact moment, so the snapshot captures the grant
+	-- moment's identity; the window brackets set_consent(true) itself.
+	-- The clock then moves well past the window before the sweep runs, so
+	-- a lazily-at-first-sweep materialization (the pre-fix posture) would
+	-- stamp a visibly LATER timestamp and fail the bracket.
 	local ts_low = clock_mod.iso_utc()
-	client:update(0.016)
+	assert_true(client:set_consent(true))
 	local ts_high = clock_mod.iso_utc()
+	advance_seconds(5)
+	client:update(0.016)
 	local exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 1)
 	assert_equal(exposures[1].anonymous_id, "anon-rotated",
@@ -4211,14 +4230,25 @@ local function test_denied_restore_arms_intent_and_exposes_at_grant_identity()
 	local client = assert(sdk.new(config()))
 	advance_seconds(120)
 	assert_true(client:set_anonymous_id("anon-rotated"))
-	assert_true(client:set_consent(true))
+	-- The intent materializes INSIDE the grant call (the moment serving
+	-- resumes stamps the snapshot's identity), so the timestamp window
+	-- brackets set_consent(true) itself; the fact then enqueues once a
+	-- session exists to attribute it to — the first session_start migrates
+	-- it, and the background tick opens no phantom session for it.
 	local ts_low = clock_mod.iso_utc()
-	client:update(0.016)
+	assert_true(client:set_consent(true))
 	local ts_high = clock_mod.iso_utc()
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 0,
+		"the grant-moment snapshot waits for the first real session")
+	assert_true(client:session_start())
+	client:update(0.016)
 	local exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 1)
 	assert_equal(exposures[1].anonymous_id, "anon-rotated",
 		"the restored exposure carries the grant-moment identity")
+	assert_equal(exposures[1].session_id, client.session_id,
+		"attributed to the first real session")
 	assert_true(ts_low <= exposures[1].event_ts
 		and exposures[1].event_ts <= ts_high,
 		"and the grant-moment timestamp, never the denied launch's")
@@ -4483,6 +4513,599 @@ local function test_retry_after_arms_cadence_before_first_tick()
 	storage.reset()
 end
 
+local function test_fresh_install_outranks_pending_clear_marker()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- The sentinel lands while the record store is down: the clear cannot
+	-- land, so the condemnation persists as the sidecar marker.
+	state.fail_save = fail_experiment_saves
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+
+	-- The clock rolls back below the marker's stamp, storage recovers, and
+	-- a LATER authorized fetch reassigns: the install must raise the fresh
+	-- entry's stamp decisively above the pending clear — the demotion
+	-- protects it in memory, but the constructor's partition would refuse
+	-- a restored entry stamped at/below the marker and clear the fresh
+	-- assignment on the next launch.
+	socket.now = socket.now - 600
+	state.fail_save = nil
+	next_status = 200
+	next_response_body = assignment_body({ variant_key = "fresh" })
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok, "the post-sentinel authorized fetch installs")
+	assert_equal(client:experiment_variant("exp-checkout"), "fresh")
+
+	local relaunch = assert(sdk.new(config()))
+	assert_equal(relaunch:experiment_variant("exp-checkout"), "fresh",
+		"the fresh assignment restores — the rolled-back install outranks the retired clear")
+	restore()
+	storage.reset()
+end
+
+local function test_marker_survives_unreadable_record()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- Sentinel with the record store down: marker persisted, clear owed.
+	state.fail_save = fail_experiment_saves
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+
+	local marker_path = nil
+	for key in pairs(stores) do
+		if key:match("/experiments%-clear$") then
+			marker_path = key
+		end
+	end
+	assert_true(marker_path ~= nil and stores[marker_path] ~= nil,
+		"the durable condemnation marker exists")
+
+	-- PROCESS BOUNDARY: the in-process memory mirror dies with the exit
+	-- (storage.reset), the fake disk survives. The relaunch re-arms the
+	-- clear from the marker; a fresh authorized install for ANOTHER key
+	-- then demotes it — with the record UNREADABLE (the store errors on
+	-- read, distinct from a readable miss) and the demoted state still
+	-- owed, the settle check must keep the marker: retiring on ambiguity
+	-- would lose the only durable refusal, and an exit after that would
+	-- let the next launch serve the withdrawn record until its first
+	-- probe.
+	-- The durable identity record (consent + subject id) survives the
+	-- boundary in the fake store — re-seeding would REPLACE it and wipe
+	-- the persisted subject, detaching the relaunch from the marker's
+	-- scope entirely.
+	storage.reset()
+	local second = assert(sdk.new(config()))
+	state.fail_save = fail_experiment_saves
+	local saved_load = sys.load
+	sys.load = function(path)
+		if path:match("/experiments$") then
+			error("io_error")
+		end
+		return saved_load(path)
+	end
+	next_status = 200
+	next_response_body = assignment_body({ experiment_key = "exp-two" })
+	fetch(second, "exp-two")
+	second:update(0.016)
+	assert_true(type(stores[marker_path]) == "table"
+		and stores[marker_path].stamp ~= nil,
+		"an unreadable record is NOT settled — the marker survives with its stamp")
+
+	sys.load = saved_load
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-checkout"),
+		"the surviving marker still refuses the withdrawn record after a restart")
+	restore()
+	storage.reset()
+end
+
+local function test_oversized_record_write_settles_terminally()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	-- A variant payload large enough that the stored record exceeds the
+	-- deterministic size cap: the write can never fit, so it must SETTLE —
+	-- non-durable serving plus eviction from the record — never wedge
+	-- persist()/shutdown() on an owed sync that cannot land.
+	next_response_body = assignment_body({
+		variant_payload = { blob = string.rep("x", 420000) },
+	})
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok)
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"memory serves the oversized assignment")
+	local ok, err = client:persist()
+	assert_true(ok,
+		"persist() settles — a deterministic oversize is terminal, not an owed retry (got "
+			.. tostring(err) .. ")")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"serving is non-durable but intact")
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-checkout"),
+		"the evicted entry is absent durably — the next launch refetches")
+	restore()
+	storage.reset()
+end
+
+local function test_stale_sentinel_stamp_ignores_post_dispatch_install()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	next_response_body = assignment_body({ experiment_key = "exp-two", variant_key = "beta" })
+	fetch(client, "exp-two")
+
+	-- One revalidation batch: exp-checkout's answer is HELD in flight while
+	-- exp-two's fresh 200 lands first. The held answer then reports the
+	-- real-subjects sentinel — its authority is bounded by its own
+	-- DISPATCH, so the fresh post-dispatch install must not raise the
+	-- clear's stamp above itself and be deleted as covered.
+	local held = nil
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		if url:find("experiment_key=exp-checkout", 1, true)
+			or url:find("exp%-checkout") then
+			held = callback
+			return true
+		end
+		callback(nil, nil, { status = 200,
+			response = assignment_body({ experiment_key = "exp-two", variant_key = "beta-2" }) })
+		return true
+	end
+	advance_seconds(400)
+	client:update(0.016)
+	assert_true(held ~= nil, "the sentinel answer is held in flight")
+	assert_equal(client:experiment_variant("exp-two"), "beta-2",
+		"the sibling key's fresh 200 installed first")
+	held(nil, nil, { status = 403,
+		response = json.encode({ error = "experiment real-subject assignment is disabled" }) })
+	responder = nil
+
+	local record_path = nil
+	for key in pairs(stores) do
+		if key:match("/experiments$") then
+			record_path = key
+		end
+	end
+	assert_true(record_path ~= nil and type(stores[record_path]) == "table",
+		"the durable record survives the sentinel")
+	assert_true(stores[record_path].entries ~= nil
+		and stores[record_path].entries["exp-two"] ~= nil,
+		"the post-dispatch install survives the sentinel's stamped partition")
+	assert_nil(stores[record_path].entries["exp-checkout"],
+		"while the sentinel's own key is withdrawn")
+
+	local relaunch = assert(sdk.new(config()))
+	assert_equal(relaunch:experiment_variant("exp-two"), "beta-2",
+		"and restores on the next launch")
+	assert_nil(relaunch:experiment_variant("exp-checkout"))
+	restore()
+	storage.reset()
+end
+
+local function test_regrant_window_blocks_rotation_until_materialized()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({
+		token_provider = function(callback)
+			callback("client-token-placeholder", nil, nil)
+		end,
+	})))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_true(client:flush({ include_summaries = false }))
+
+	-- Deny (the purge re-arms the retained assignment as INTENT), then
+	-- re-grant: the intent must materialize AT THE GRANT — the treatment
+	-- resumes serving that instant under the OLD anon — so the Mode B
+	-- rotation gate sees the owed automatic fact immediately. The lazy
+	-- first-sweep posture left a window in which has_owed_exposures()
+	-- reported none and a rotation could slip through, stamping the fact
+	-- with the NEW anon's identity.
+	assert_true(client:set_consent(false))
+	assert_true(client:set_consent(true))
+	assert_true(client:flush({ include_summaries = false }),
+		"the consent receipts drain")
+	local ok, err = client:set_anonymous_id("anon-rotated")
+	assert_equal(ok, false,
+		"rotation is blocked while the grant-materialized exposure is owed")
+	assert_equal(err, "events_pending")
+	client:update(0.016)
+	assert_true(client:flush({ include_summaries = false }))
+	assert_true(client:set_anonymous_id("anon-rotated"),
+		"rotation proceeds once the owed fact drained")
+end
+
+local function test_sentinel_purges_queue_resident_exposure_facts()
+	reset()
+	local client = granted_client()
+	assert_true(client:session_start())
+	assert_true(client:track("filler-host-event"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1,
+		"the accepted exposure fact sits in the queue below batch size")
+
+	-- The sentinel withdraws the assignments AND their subject-fact keys:
+	-- facts already ACCEPTED into the analytics queue carry those keys
+	-- verbatim and must not ship on the next flush — the kill switch stops
+	-- egress, not just future serving.
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0,
+		"queue-resident exposure facts are purged with the sentinel")
+	assert_equal(#queued_events(client, "filler-host-event"), 1,
+		"host events are untouched — the purge is selective, not the consent nuke")
+
+	next_status = 200
+	next_response_body = nil
+	assert_true(client:flush({ include_summaries = false }))
+	for i = 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			assert_true(not requests[i].body:find("experiment_exposure", 1, true),
+				"no exposure fact egresses after the sentinel")
+		end
+	end
+end
+
+local function test_sentinel_purges_retained_backoff_batch()
+	reset()
+	local client = granted_client()
+	assert_true(client:session_start())
+	assert_true(client:track("filler-host-event"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+
+	-- The batch (host event + exposure fact) fails transiently and is
+	-- RETAINED behind the retry backoff.
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	local flushed = client:flush({ include_summaries = false })
+	assert_true(not flushed, "the 503 retains the batch for retry")
+	assert_true(client.in_flight_batch ~= nil)
+
+	-- The sentinel lands BETWEEN attempts: the retained batch must lose
+	-- the withdrawn facts (and its cached wire payload must be rebuilt) or
+	-- the next attempt re-sends them verbatim.
+	responder = nil
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 202, response = '{"accepted":1}' })
+			return true
+		end
+		return false
+	end
+	advance_seconds(60)
+	local requests_before = #requests
+	assert_true(client:flush({ include_summaries = false }))
+	responder = nil
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			assert_true(not requests[i].body:find("experiment_exposure", 1, true),
+				"the retained batch resends WITHOUT the withdrawn facts")
+			assert_true(requests[i].body:find("filler%-host%-event") ~= nil,
+				"and keeps the host's events")
+		end
+	end
+end
+
+local function test_sentinel_purges_spooled_facts_from_prior_launch()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	local first = granted_client()
+	assert_true(first:session_start())
+	assert_true(first:track("filler-host-event"))
+	next_response_body = assignment_body()
+	fetch(first, "exp-checkout")
+	assert_equal(#queued_events(first, "experiment_exposure"), 1)
+	-- A transiently failing publish durably SPOOLS the batch (exposure
+	-- fact included); the process then dies without a clean shutdown.
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not first:flush({ include_summaries = false }))
+	responder = nil
+
+	-- The next launch loads the spool for re-send — and the sentinel lands
+	-- BEFORE the re-send window. The spooled exposure fact carries the
+	-- withdrawn subject-fact key: it must leave both the loaded chunks and
+	-- the durable record, or the relaunch ships it.
+	local second = assert(sdk.new(config()))
+	assert_true(second:spool_pending(), "the spooled envelopes await re-send")
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(second, "exp-checkout")
+
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(second:flush({ include_summaries = false }))
+	local resent = 0
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			resent = resent + 1
+			assert_true(not requests[i].body:find("experiment_exposure", 1, true),
+				"the spool re-send excludes the withdrawn facts")
+			assert_true(requests[i].body:find("filler%-host%-event") ~= nil,
+				"and still delivers the host's spooled events")
+		end
+	end
+	assert_true(resent > 0, "the surviving spooled envelopes re-sent")
+	restore()
+	storage.reset()
+end
+
+local function test_presession_exposure_attributes_to_lazy_first_session()
+	reset()
+	local restore = install_fake_sys_storage()
+	local seed_client = granted_client()
+	next_response_body = assignment_body()
+	fetch(seed_client, "exp-checkout")
+
+	-- Relaunch: the restored snapshot is pre-session. Host activity lazily
+	-- opens the first real session (a pre-start track), the snapshot stays
+	-- held (no tick runs), and the explicit session_start is a RENEWAL of
+	-- that lazy session: the still-unattributed snapshot takes the LAZY
+	-- session's id — the session it lived through — while the renewal
+	-- re-arms the entry for the new session. Each real session gets
+	-- exactly one fact, correctly attributed.
+	local second = assert(sdk.new(config()))
+	assert_true(second:track("boot-event"))
+	local lazy_session = second.session_id
+	assert_true(lazy_session ~= nil, "host activity opened the lazy first session")
+	assert_true(second:session_start())
+	local started_session = second.session_id
+	assert_true(started_session ~= lazy_session)
+	second:update(0.016)
+	local exposures = queued_events(second, "experiment_exposure")
+	assert_equal(#exposures, 2,
+		"one fact per real session: the lazy first session's and the renewal's")
+	assert_equal(exposures[1].session_id, lazy_session,
+		"the pre-session application is attributed to the lazy FIRST session")
+	assert_equal(exposures[2].session_id, started_session,
+		"the renewal re-arm rides the new session")
+	restore()
+	storage.reset()
+end
+
+local function test_sentinel_purged_tuple_reexposes_on_refetch()
+	reset()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1)
+	local original_id = exposures[1].event_id
+
+	-- The sentinel purges the queued fact — it never egressed — and the
+	-- platform then flips real subjects back ON in the same session: the
+	-- refetched tuple must expose again (a retained dedupe mark would
+	-- under-count the re-served treatment), and it derives the SAME
+	-- deterministic id, so a fact that had somehow already published
+	-- collapses server-side instead of double-counting.
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	next_status = 200
+	next_response_body = assignment_body()
+	local refetched = fetch(client, "exp-checkout")
+	assert_true(refetched.ok, "the flag flipped back on — the plane recovers")
+	exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1,
+		"the purged tuple re-exposes on the same-session refetch")
+	assert_equal(exposures[1].event_id, original_id,
+		"with the same deterministic id — server-side dedupe stays the guard")
+end
+
+local function test_condemned_relaunch_filters_spooled_facts()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	assert_true(client:track("filler-host-event"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	-- The batch (filler + fact) spools durably on a transient failure.
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+
+	-- The sentinel lands with the WHOLE store down: the record clear and
+	-- the spool rewrite both fail — only the sidecar marker persists. The
+	-- process then dies. The relaunch must not re-send the spooled facts:
+	-- the armed condemnation is consulted at spool load and the withdrawn
+	-- facts are dropped there, durably.
+	state.fail_save = function(path)
+		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	state.fail_save = nil
+	storage.reset()
+
+	local relaunch = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	local resent = 0
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			resent = resent + 1
+			assert_true(not requests[i].body:find("experiment_exposure", 1, true),
+				"the condemned relaunch never re-sends withdrawn facts")
+			assert_true(requests[i].body:find("filler%-host%-event") ~= nil,
+				"while the host's spooled events still deliver")
+		end
+	end
+	assert_true(resent > 0, "the surviving spooled envelopes re-sent")
+	restore()
+	storage.reset()
+end
+
+local function test_dropped_entry_owed_exposure_replays_after_kill()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client({ buffer_size = 1 })
+	assert_true(client:session_start())
+	-- The queue is FULL (buffer_size 1 holds the session start), so the
+	-- applied assignment's exposure stays OWED in memory.
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0,
+		"the exposure is owed, not queued")
+
+	-- The kill switch drops the entry DURABLY while the exposure is still
+	-- owed only in memory: the delete removes the only persisted source
+	-- the fact could re-arm from, so the drop must durably capture it —
+	-- a process kill before the next sweep would otherwise lose the
+	-- treatment's record entirely.
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-checkout")
+
+	-- SIMULATED PROCESS DEATH: no shutdown, no persist — module memory
+	-- dies, the fake disk survives.
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-checkout"),
+		"the kill landed durably — nothing restores")
+	assert_true(relaunch:spool_pending(),
+		"the captured fact envelope survived the kill in the spool")
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	local replayed = false
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true)
+			and requests[i].body:find("experiment_exposure", 1, true) then
+			replayed = true
+		end
+	end
+	assert_true(replayed,
+		"the relaunch replays the dropped entry's owed exposure from the spool")
+	restore()
+	storage.reset()
+end
+
+local function test_unproven_status_keeps_auth_latch()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	next_status = 401
+	next_response_body = nil
+	fetch(client, "exp-checkout")
+	assert_nil(client:experiment_variant("exp-checkout"),
+		"the 401 latches fail-closed")
+
+	-- A post-latch fetch answered by an unexpected status (a captive
+	-- portal's redirect, a gateway conflict) is authoritative for the
+	-- caller but carries NO authorization proof: it must not unlatch the
+	-- fail-closed plane. The latch's memory wipe makes the getters nil
+	-- either way today, so the LATCH FLAG itself is the pinned contract —
+	-- it must not lie to any current or future serve path (the flag is
+	-- the plane's fail-closed truth, the wipe merely its consequence).
+	next_status = 302
+	next_response_body = ""
+	local result = fetch(client, "exp-checkout")
+	assert_equal(result.ok, false)
+	assert_equal(result.error, "http_302")
+	assert_nil(client:experiment_variant("exp-checkout"),
+		"an unproven status must not resume serving")
+	assert_true(client.experiments.auth_blocked,
+		"an unproven status must not unlatch the fail-closed plane")
+
+	-- A genuine authorized outcome still recovers the plane.
+	next_status = 200
+	next_response_body = assignment_body()
+	local recovered = fetch(client, "exp-checkout")
+	assert_true(recovered.ok)
+	assert_true(not client.experiments.auth_blocked,
+		"a parsed authorized outcome still unlatches")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"a parsed authorized 200 unlatches and reinstalls")
+end
+
+local function test_unexpected_status_classification_pin()
+	reset()
+	-- PIN (passes before and after this round): the classification table
+	-- for statuses outside the handled set — 302/409/422 and kin — on a
+	-- cached assignment. Contract: authoritative-no-serve for THAT call
+	-- (closed http_<status> error, no stale serve), the cached record
+	-- RETAINED and STILL SERVED by the getters, and the revalidation
+	-- cadence KEEPS PROBING — the kill-switch reach survives, so no
+	-- unclassified status can freeze a stale assignment beyond the
+	-- server's own answers. No status lands in an implicit bucket.
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	next_status = 409
+	next_response_body = "{}"
+	local result = fetch(client, "exp-checkout")
+	assert_equal(result.ok, false)
+	assert_equal(result.error, "http_409")
+	assert_equal(result.from_cache, false, "no stale serve on the failing call")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the cached record is retained and served")
+
+	local probes_before = #assignment_requests()
+	advance_seconds(400)
+	client:update(0.016)
+	assert_true(#assignment_requests() > probes_before,
+		"the cadence keeps probing after the unexpected status")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"and the assignment keeps serving between probes")
+
+	next_status = 422
+	local unproc = fetch(client, "exp-checkout")
+	assert_equal(unproc.ok, false)
+	assert_equal(unproc.error, "http_422")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -4606,6 +5229,20 @@ local tests = {
 	test_superseded_serve_requires_matching_attributes,
 	test_rearm_during_regrant_window_keeps_auto_exposure,
 	test_retry_after_arms_cadence_before_first_tick,
+	test_fresh_install_outranks_pending_clear_marker,
+	test_marker_survives_unreadable_record,
+	test_oversized_record_write_settles_terminally,
+	test_stale_sentinel_stamp_ignores_post_dispatch_install,
+	test_regrant_window_blocks_rotation_until_materialized,
+	test_sentinel_purges_queue_resident_exposure_facts,
+	test_sentinel_purges_retained_backoff_batch,
+	test_sentinel_purges_spooled_facts_from_prior_launch,
+	test_presession_exposure_attributes_to_lazy_first_session,
+	test_sentinel_purged_tuple_reexposes_on_refetch,
+	test_condemned_relaunch_filters_spooled_facts,
+	test_dropped_entry_owed_exposure_replays_after_kill,
+	test_unproven_status_keeps_auth_latch,
+	test_unexpected_status_classification_pin,
 }
 
 for _, test in ipairs(tests) do

@@ -1285,11 +1285,14 @@ end
 function M.load_experiments(scope)
 	local ns = spool_namespace(scope)
 	local record = nil
+	local read_failed = false
 	local path = save_path(ns, "experiments")
 	if path then
 		local ok, loaded = pcall(sys.load, path)
 		if ok and type(loaded) == "table" then
 			record = loaded
+		elseif not ok then
+			read_failed = true
 		end
 	end
 	if record == nil then
@@ -1297,6 +1300,16 @@ function M.load_experiments(scope)
 	end
 	if type(record) ~= "table"
 		or type(record.scope) ~= "string" or record.scope == "" then
+		if read_failed and record == nil then
+			-- The STORE errored on the read — distinct from a readable
+			-- miss (no file, or a record another scope replaced) and from
+			-- a parsed-but-corrupt record (which stays a plain miss, the
+			-- corrupt-is-a-miss canon: same bytes parse the same way
+			-- forever). Callers that must fail closed on ambiguity — the
+			-- condemnation-marker settle check — read the second value;
+			-- everyone else keeps the nil-is-a-miss contract unchanged.
+			return nil, "unreadable"
+		end
 		return nil
 	end
 	return {
@@ -1318,21 +1331,52 @@ function M.save_experiments(scope, record)
 		scope = record.scope,
 		entries = sanitize_experiment_entries(record.entries),
 	}
-	if approx_record_bytes(stored) > max_experiments_record_bytes then
-		return false
+	-- The size cap is a DETERMINISTIC bound, so an oversized record must
+	-- never surface as a retryable failure: the caller would record an owed
+	-- durable sync that can never land and persist()/shutdown() would wedge
+	-- on experiments_pending forever. Spool parity instead — evict entries
+	-- oldest-fetched-first until the record fits (including the offender
+	-- itself when a single entry alone exceeds the cap). Evicted entries
+	-- simply stop being durable: memory keeps serving them for this
+	-- process, the next launch refetches (absence is a refetch, never
+	-- wrong serving), and drops always land because removal only shrinks
+	-- the record. The evicted count returns as a second value so callers
+	-- can surface a diagnostic.
+	local evicted = 0
+	while approx_record_bytes(stored) > max_experiments_record_bytes do
+		local oldest_key = nil
+		local oldest_at = nil
+		for key, entry in pairs(stored.entries) do
+			local at = type(entry) == "table"
+				and type(entry.fetched_at_ms) == "number"
+				and entry.fetched_at_ms or 0
+			if oldest_at == nil or at < oldest_at then
+				oldest_at = at
+				oldest_key = key
+			end
+		end
+		if oldest_key == nil then
+			-- Nothing left to evict and the record still exceeds the cap:
+			-- deterministic and terminal for this input, surfaced as a
+			-- plain failure (callers treat it like any failed save; no
+			-- retry can change it, but no entry data exists to wedge on).
+			return false, evicted
+		end
+		stored.entries[oldest_key] = nil
+		evicted = evicted + 1
 	end
 	local ns = spool_namespace(scope)
 	local path = save_path(ns, "experiments")
 	if not path then
 		experiments_memory[ns] = stored
-		return true
+		return true, evicted
 	end
 	local ok, saved = pcall(sys.save, path, stored)
 	if not (ok and saved == true) then
-		return false
+		return false, evicted
 	end
 	experiments_memory[ns] = stored
-	return true
+	return true, evicted
 end
 
 -- Durable condemnation marker for the experiment cache: when the

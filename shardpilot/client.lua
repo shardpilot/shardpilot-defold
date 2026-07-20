@@ -451,6 +451,11 @@ function M.new(config)
 		token_expires_at_ms = nil,
 		token_request_in_flight = false,
 		in_flight_batch = nil,
+		-- Set when a sentinel fact purge finds a publish mid-flight: the
+		-- batch on the wire is past recall, but if it fails and is
+		-- retained, the settle path filters the withdrawn facts before any
+		-- retry or spool capture.
+		experiment_purge_awaited = false,
 		publish_in_flight = false,
 		publish_retry_after_ms = nil,
 		publish_backoff_attempt = 0,
@@ -575,6 +580,20 @@ function M.new(config)
 					retryable = overrides.retryable,
 				})
 			end,
+			purge_facts = function()
+				-- The real-subjects sentinel withdrew the assignments AND
+				-- their subject-fact keys: experiment facts already
+				-- accepted into the analytics pipeline carry those keys
+				-- verbatim and must not egress on a later flush.
+				return client:purge_experiment_facts()
+			end,
+			capture_fact = function(event_name, props, event_id, overrides)
+				-- Drop-time durable capture: a durable entry delete with
+				-- an exposure still owed must not let a process kill lose
+				-- the fact — the spool copy replays it at the next launch.
+				return client:capture_experiment_fact(
+					event_name, props, event_id, overrides)
+			end,
 		})
 	end
 	-- Offline event spool: re-load the envelopes a previous launch could not
@@ -653,7 +672,37 @@ function M.new(config)
 				})
 			end
 		end
-		if #spooled > 0 or mismatched > 0 then
+		local condemned = 0
+		if client.experiments and #spooled > 0
+			and client.experiments:has_durable_condemnation() then
+			-- A real-subjects condemnation survived the exit (the sentinel's
+			-- clear or its sidecar marker is still armed): spooled experiment
+			-- facts carry the withdrawn subject-fact keys — a sentinel
+			-- purge's failed spool rewrite followed by a process death leaves
+			-- them here — and re-sending them would keep egressing what the
+			-- kill switch killed. Drop them at load; the rewrite below
+			-- persists the removal. Conservative and blanket, like the
+			-- in-memory sentinel posture.
+			local kept = {}
+			for i = 1, #spooled do
+				local name = spooled[i].event_name
+				if name == "experiment_exposure" or name == "experiment_outcome" then
+					condemned = condemned + 1
+				else
+					kept[#kept + 1] = spooled[i]
+				end
+			end
+			if condemned > 0 then
+				spooled = kept
+				client:diagnose({
+					scope = "spool",
+					status = "dropped",
+					code = "experiments_condemned",
+					count = condemned,
+				})
+			end
+		end
+		if #spooled > 0 or mismatched > 0 or condemned > 0 then
 			if #spooled == 0 then
 				client.spool_retry_after_ms = nil
 			end
@@ -990,6 +1039,14 @@ function Client:set_consent(decision)
 		return false, "spool_purge_failed"
 	end
 	self.consent_state = next_state
+	if granted and self.experiments then
+		-- Purge/denied-restore re-arm intents materialize AT THE GRANT:
+		-- serving resumes this instant, so the replacement snapshots
+		-- capture this exact moment's identity — and has_owed_exposures()
+		-- reflects the owed automatic facts immediately, before any Mode B
+		-- rotation can be requested in the regrant window.
+		self.experiments:on_consent_granted()
+	end
 	local purged = true
 	if not granted then
 		local cleared = queue.size(self.queue)
@@ -1106,8 +1163,12 @@ function Client:session_start(props)
 		-- Whether this start is a genuine RENEWAL (any session — lazy or
 		-- explicit — existed before it) decides what happens to owed
 		-- pre-session exposure snapshots: the first real session adopts
-		-- them; a renewal preserves them as prior sessions' facts.
-		self.experiments:on_session_renewed(previous_session_id ~= nil)
+		-- them; a renewal preserves them as prior sessions' facts — and
+		-- stamps any still-unattributed pre-session snapshot with the
+		-- PREVIOUS session's id (the lazy first session it lived through),
+		-- which the renewal path needs the id itself for.
+		self.experiments:on_session_renewed(
+			previous_session_id ~= nil, previous_session_id)
 	end
 	return true
 end
@@ -1912,6 +1973,178 @@ end
 -- `spool_record` mirrors the persisted list and `spool_index` its event_ids,
 -- so appends are de-duplicated and acknowledged batches are removed cheaply.
 
+-- The experiments plane's two fact shapes on the analytics pipeline. Queue
+-- items and wire envelopes both carry event_name, so one predicate serves
+-- every surface.
+local function is_experiment_fact(event)
+	local name = type(event) == "table" and event.event_name or nil
+	return name == "experiment_exposure" or name == "experiment_outcome"
+end
+
+-- Remove experiment facts from a batch IN PLACE and rebuild its cached wire
+-- payload (the payload snapshots the envelopes at first attempt — a filtered
+-- batch resending the unfiltered capture would defeat the purge). Returns
+-- the number removed.
+local function filter_batch_facts(batch)
+	local kept = {}
+	for i = 1, #batch do
+		if not is_experiment_fact(batch[i]) then
+			kept[#kept + 1] = batch[i]
+		end
+	end
+	local removed = #batch - #kept
+	if removed == 0 then
+		return 0
+	end
+	for i = #batch, 1, -1 do
+		batch[i] = nil
+	end
+	for i = 1, #kept do
+		batch[i] = kept[i]
+	end
+	if batch.payload then
+		if batch.spool_origin then
+			-- Spool-origin batches carry the persisted envelopes verbatim
+			-- as BOTH the array part and the payload: rebuild the payload
+			-- from the filtered array (the envelopes must survive
+			-- unrebuilt — event_id/event_ts round-trip intact).
+			local envelopes = {}
+			for i = 1, #kept do
+				envelopes[i] = kept[i]
+			end
+			batch.payload = { events = envelopes }
+		else
+			-- Queue-origin batches rebuild lazily at the next dispatch
+			-- (ensure_batch_payload); envelope.build is deterministic over
+			-- the immutable event snapshots, so the kept envelopes are
+			-- bit-identical to the first attempt's.
+			batch.payload = nil
+		end
+	end
+	return removed
+end
+
+-- Purge experiment facts from every analytics pipeline surface. Invoked by
+-- the experiments consumer when the real-subjects sentinel lands: the
+-- withdrawn subject-fact keys ride these facts verbatim, and a fact that
+-- ships after the platform flipped real subjects off keeps egressing what
+-- the kill switch killed. SELECTIVE by event name — the host's events are
+-- untouched (unlike the consent purge, which closes the whole plane).
+-- Surfaces, in pipeline order: the memory queue (accepted facts below batch
+-- size); the retained in-flight batch — only between attempts; a batch
+-- actually ON THE WIRE is past recall (the consent purge's
+-- publish-in-flight carve-out), and if that publish fails and retains, the
+-- settle path filters it via experiment_purge_awaited; the in-memory spool
+-- chunks awaiting re-send; and the durable spool record, converging through
+-- the settled/rewrite machinery when the store is down. A failed rewrite
+-- followed by process death before the retry lands re-sends those spooled
+-- facts on the next launch — the documented storage-down-through-exit
+-- residual family.
+function Client:purge_experiment_facts()
+	local purged = queue.remove_matching(self.queue, is_experiment_fact)
+	if self.in_flight_batch then
+		if self.publish_in_flight then
+			self.experiment_purge_awaited = true
+		else
+			purged = purged + filter_batch_facts(self.in_flight_batch)
+			if #self.in_flight_batch == 0 then
+				self.in_flight_batch = nil
+				-- The armed backpressure deferral belonged to the batch the
+				-- purge just emptied — the consent-purge stale-deadline
+				-- rule: leaving it would block the next granted batch for a
+				-- window the server set for discarded work.
+				self.publish_retry_after_ms = nil
+				self.publish_backoff_attempt = 0
+				self.spool_retry_after_ms = nil
+			end
+		end
+	end
+	if #self.spool_batches > 0 then
+		local kept_chunks = {}
+		for i = 1, #self.spool_batches do
+			local chunk = self.spool_batches[i]
+			local kept = {}
+			for j = 1, #chunk do
+				if is_experiment_fact(chunk[j]) then
+					purged = purged + 1
+				else
+					kept[#kept + 1] = chunk[j]
+				end
+			end
+			if #kept > 0 then
+				kept_chunks[#kept_chunks + 1] = kept
+			end
+		end
+		self.spool_batches = kept_chunks
+	end
+	-- Durable spool: mark the fact envelopes settled — every successful
+	-- write drops settled entries — and attempt the rewrite immediately; a
+	-- failed write leaves spool_rewrite_pending for the normal retry
+	-- cadence (flush/persist/shutdown dispatch points). The facts marked
+	-- here are the durable shadows of copies already counted on the memory
+	-- surfaces (or of prior-launch chunks counted above), so they do not
+	-- bump the purged count again.
+	local marked = false
+	for i = 1, #self.spool_record do
+		local env = self.spool_record[i]
+		if is_experiment_fact(env) and type(env.event_id) == "string" then
+			self.spool_settled[env.event_id] = true
+			marked = true
+		end
+	end
+	if marked and not self:write_spool_record(self.spool_record) then
+		self.spool_rewrite_pending = true
+	end
+	if purged > 0 then
+		-- Terminal non-delivery by server mandate: counted like the
+		-- consent purge counts its clears, never like a retryable sweep
+		-- refusal.
+		self.stats.dropped = self.stats.dropped + purged
+	end
+	return purged
+end
+
+-- Durably capture ONE experiment fact straight into the spool, bypassing the
+-- memory queue. Invoked by the experiments consumer when a durable entry
+-- DROP lands while that entry's exposure is still owed in memory: the delete
+-- removes the only persisted source the fact could re-arm from, so a process
+-- KILL before the next sweep/persist would lose it — the spool copy makes a
+-- relaunch replay it. NARROW by contract: only drop-time capture — owed
+-- facts whose entries live on stay memory-only until the ordinary
+-- dispatch-point captures (persist/shutdown/failed publish). The snapshot
+-- stays armed in memory afterwards: the live process still emits it through
+-- the normal sweep, and the deterministic event_id makes the pair collapse —
+-- a successful publish acks the spool copy away, a replayed copy after a
+-- kill dedups server-side. Fails (false) without a durable write when the
+-- spool is disabled, consent is not granted, storage is down (the
+-- storage-down-through-exit residual), or no session identity exists to
+-- stamp — a background capture must not lazily open a session any more than
+-- the background sweep may.
+function Client:capture_experiment_fact(event_name, props, event_id, overrides)
+	if not self.initialized or self.consent_state ~= "granted" then
+		return false
+	end
+	overrides = overrides or {}
+	local session_id = overrides.session_id or self.session_id
+	if type(session_id) ~= "string" or session_id == "" then
+		return false
+	end
+	local props_snapshot = copy_table(props, "invalid_props")
+	local event = {
+		event_id = event_id,
+		event_name = event_name,
+		event_ts = overrides.event_ts or clock.iso_utc(),
+		user_id = nil,
+		anonymous_id = overrides.anonymous_id or self.anonymous_id,
+		session_id = session_id,
+		session_sequence = self.session_sequence + 1,
+		props = props_snapshot,
+		context = nil,
+	}
+	self.session_sequence = event.session_sequence
+	return self:spool_envelopes({ envelope.build(self.config, self, event) })
+end
+
 -- True while envelopes loaded from a previous launch still await re-send.
 function Client:spool_pending()
 	return #self.spool_batches > 0
@@ -2214,6 +2447,13 @@ function Client:start_publish_batch()
 		completed = true
 		succeeded = ok == true
 		self.publish_in_flight = false
+		-- A sentinel purge that ran while this batch was ON THE WIRE could
+		-- not touch it (the attempt itself is past recall); settle the
+		-- deferred recall now, whatever the outcome — a successful publish
+		-- means the facts egressed with the attempt (the accepted
+		-- carve-out), a retained failure filters them below.
+		local purge_awaited = self.experiment_purge_awaited
+		self.experiment_purge_awaited = false
 		if ok then
 			self.stats.published = self.stats.published + batch_count
 			-- A successful publish clears any backpressure deferral/backoff.
@@ -2259,6 +2499,31 @@ function Client:start_publish_batch()
 		-- this FIRST so the deferral below is only set for a batch we keep.
 		local retain = is_retryable_publish_failure(err, unauthorized, retryable, mode_b)
 			and not consent_denied_state(self.consent_state)
+		if retain and purge_awaited then
+			-- The failed batch is retained for retry, but a sentinel purge
+			-- ran mid-flight: the withdrawn facts must not ride the next
+			-- attempt or the spool capture below. Filter them now (their
+			-- spool shadows were already marked settled by the purge); an
+			-- emptied batch has nothing left to retain, defer, or spool —
+			-- and its facts were counted dropped per-item here, so the
+			-- terminal not-retained accounting below must not run for it.
+			local removed = filter_batch_facts(events)
+			if removed > 0 then
+				self.stats.dropped = self.stats.dropped + removed
+			end
+			if #events == 0 then
+				if self.in_flight_batch == events then
+					self.in_flight_batch = nil
+				end
+				retain = false
+				-- Nothing is retained, so no deferral may arm below — and
+				-- any deadline a previous attempt of this batch armed is
+				-- stale now (the consent-purge rule).
+				self.publish_retry_after_ms = nil
+				self.publish_backoff_attempt = 0
+				self.spool_retry_after_ms = nil
+			end
+		end
 		if unauthorized then
 			self.token = nil
 			self.token_expires_at_ms = nil
@@ -2280,7 +2545,10 @@ function Client:start_publish_batch()
 			-- event_id index de-duplicates repeats) so an app kill before the
 			-- in-process retry succeeds cannot lose it. Permanent rejects are
 			-- NEVER spooled: they would fail forever on every later launch.
-			self:spool_envelopes(events.payload.events)
+			-- ensure_batch_payload: a mid-flight fact purge invalidates a
+			-- queue-origin batch's cached payload; rebuild it here so the
+			-- spool captures exactly the kept envelopes.
+			self:spool_envelopes(self:ensure_batch_payload(events).events)
 			-- The append is a no-op when every envelope is already persisted
 			-- (a spooled re-send failing again); an extended server-requested
 			-- deadline must still reach the record.
@@ -2503,9 +2771,14 @@ function Client:shutdown(reason)
 			self.experiments:retry_durable_sync()
 			-- Sweep owed exposure facts — as many as the queue admits this
 			-- pass — so a treatment applied under a FULL queue does not
-			-- exit without its fact.
+			-- exit without its fact. FINAL sweep: pre-session snapshots the
+			-- tick sweep held for their first-session attribution drain
+			-- here too — no later session_start can double-arm at
+			-- teardown, and the fact must not exit unemitted (it rides the
+			-- exit-time session, lazily opened at the very end when none
+			-- ever existed).
 			local before_sweep = queue.size(self.queue)
-			self.experiments:sweep_owed()
+			self.experiments:sweep_owed(true)
 			if queue.size(self.queue) > before_sweep then
 				enqueued_any = true
 			end
