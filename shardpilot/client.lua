@@ -697,8 +697,42 @@ function M.new(config)
 			end
 		end
 		local condemned = 0
-		if client.experiments and #spooled > 0
-			and client.experiments:condemnation_covers_current_scope() then
+		local condemnation_covers = false
+		local condemnation_stamp_iso = nil
+		if #spooled > 0 then
+			if client.experiments then
+				condemnation_covers =
+					client.experiments:condemnation_covers_current_scope()
+				if condemnation_covers then
+					condemnation_stamp_iso =
+						client.experiments:condemnation_stamp_iso()
+				end
+			else
+				-- Experiments DISABLED (the dark default, or a rollback
+				-- launch after an enabled run): the consumer is not
+				-- constructed, but the SPOOL is still live — and a prior
+				-- enabled run's real-subjects condemnation may still be
+				-- armed. A sentinel + failed spool rewrite + death leaves
+				-- the sidecar marker as the ONLY guard against replaying
+				-- the withdrawn subject-fact keys, so the marker is
+				-- honored INDEPENDENTLY of the flag: the sidecar file is
+				-- read directly, and with no subject/scope machinery
+				-- constructed to disprove it, it condemns conservatively —
+				-- the same fail-closed rule the consumer applies when its
+				-- comparator goes blind. The marker is deliberately NEVER
+				-- retired here: retiring requires proving the covered
+				-- record AND spool durably clean, which only the full
+				-- machinery can do — a marker whose facts are all
+				-- post-stamp condemns nothing below and retires in the
+				-- next ENABLED launch's first tick.
+				local marker_stamp = storage.load_experiments_clear(normalized)
+				if marker_stamp then
+					condemnation_covers = true
+					condemnation_stamp_iso = clock.iso_utc(marker_stamp)
+				end
+			end
+		end
+		if condemnation_covers then
 			-- A real-subjects condemnation survived the exit (the sentinel's
 			-- clear or its sidecar marker is still armed) AND covers the
 			-- current scope: spooled experiment facts carrying the withdrawn
@@ -714,8 +748,9 @@ function M.new(config)
 			-- — the settled-but-unretired sidecar case — and retires on
 			-- the first tick instead of eating fresh facts. A stale marker
 			-- from a retired environment/credential/subject never reaches
-			-- this branch at all.
-			local stamp_iso = client.experiments:condemnation_stamp_iso()
+			-- this branch at all (fail-closed when nothing can disprove it:
+			-- a blind consumer comparator, or no consumer at all).
+			local stamp_iso = condemnation_stamp_iso
 			local kept = {}
 			for i = 1, #spooled do
 				local env = spooled[i]

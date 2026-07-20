@@ -6270,6 +6270,174 @@ function extra_tests.test_nested_null_never_reads_as_scope_echo()
 	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
 end
 
+function extra_tests.test_disabled_relaunch_filters_condemned_spool()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	assert_true(client:track("filler-host-event"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	-- The batch (filler + fact) spools durably on a transient failure.
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+
+	-- The sentinel lands with the WHOLE store down (the record clear and
+	-- the spool rewrite both fail; only the sidecar marker persists), then
+	-- the process dies — the enabled-relaunch filter test's exact staging.
+	advance_seconds(2)
+	state.fail_save = function(path)
+		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	state.fail_save = nil
+	storage.reset()
+
+	-- ...but the relaunch is a ROLLBACK: experiments_enabled = false. The
+	-- consumer is never constructed while the spool is still live, so the
+	-- sidecar marker must be honored flag-independently — otherwise the
+	-- withdrawn subject-fact keys replay on the analytics plane.
+	local relaunch = assert(sdk.new(config({ experiments_enabled = false })))
+	assert_nil(relaunch.experiments, "the consumer stays dark")
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	local resent = 0
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			resent = resent + 1
+			assert_true(not requests[i].body:find("experiment_exposure", 1, true),
+				"a DISABLED relaunch still honors the condemnation marker")
+			assert_true(requests[i].body:find("filler%-host%-event") ~= nil,
+				"while the host's spooled events still deliver")
+		end
+	end
+	assert_true(resent > 0, "the surviving spooled envelopes re-sent")
+	-- The flagless path never RETIRES the marker: proving the covered
+	-- record and spool durably clean takes the full machinery.
+	local marker_alive = false
+	for key, value in pairs(stores) do
+		if key:match("/experiments%-clear$") and type(value) == "table"
+			and value.stamp ~= nil then
+			marker_alive = true
+		end
+	end
+	assert_true(marker_alive, "the disabled launch never retires the marker")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_unreadable_record_read_keeps_kill_drop_owed()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- PROCESS BOUNDARY: the in-process memory mirror dies with the exit
+	-- (storage.reset), the fake disk survives — a failing disk read below
+	-- then has no mirror to fall back to (the unreadable-marker staging).
+	storage.reset()
+	local second = assert(sdk.new(config()))
+	assert_true(second:session_start())
+	assert_equal(second:experiment_variant("exp-checkout"), "treatment",
+		"the durable record restored")
+	second:update(0.016)
+	second:update(0.016)
+
+	-- The record READ starts throwing (an io error — distinct from a
+	-- readable miss) and the kill lands while the store is unreadable: the
+	-- absent stored entry proves nothing, so the drop must stay OWED
+	-- instead of settling over the blind read.
+	local saved_load = sys.load
+	sys.load = function(path)
+		if path:match("/experiments$") then
+			error("io_error")
+		end
+		return saved_load(path)
+	end
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(second, "exp-checkout")
+	assert_nil(second:experiment_variant("exp-checkout"),
+		"memory dropped the killed assignment")
+	local ok, err = second:persist()
+	assert_equal(ok, false)
+	assert_equal(err, "experiments_pending")
+
+	-- The store heals: the next tick's owed retry lands the drop.
+	sys.load = saved_load
+	second:update(0.016)
+	assert_true(second:persist(),
+		"the owed drop settles once the record reads again")
+
+	-- Relaunch over the healed store: the killed assignment must NOT
+	-- restore from the old record.
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-checkout"),
+		"the kill landed durably — a readable next launch restores nothing")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_restored_synthetic_fact_key_is_cleared()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	-- A synthetic-unit assignment CAN carry a server-minted fact key: it
+	-- installs, persists, and reports normally.
+	next_response_body = assignment_body({
+		boundary = { assignment_unit = "synthetic_subject_key" },
+	})
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- On-disk corruption (or a pre-grammar-build leftover): the stored
+	-- synthetic entry's fact key becomes an SDK-subject-shaped value the
+	-- live install path would have rejected.
+	local corrupted = "spcid_" .. string.rep("c", 34)
+	local tampered = false
+	for key, record in pairs(stores) do
+		if key:match("/experiments$") and type(record) == "table"
+			and type(record.entries) == "table"
+			and record.entries["exp-checkout"] then
+			record.entries["exp-checkout"].subject_fact_key = corrupted
+			tampered = true
+		end
+	end
+	assert_true(tampered, "the stored record was staged")
+
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_true(relaunch:session_start())
+	assert_equal(relaunch:experiment_variant("exp-checkout"), "treatment",
+		"the synthetic entry itself restores — fact-less posture, not a discard")
+	relaunch:update(0.016)
+	relaunch:update(0.016)
+	assert_equal(#queued_events(relaunch, "experiment_exposure"), 0,
+		"a malformed restored fact key is cleared for EVERY unit — no fact emits")
+	for i = 1, #relaunch.queue.items do
+		local serialized = json.encode(relaunch.queue.items[i])
+		assert_nil(serialized:find(corrupted, 1, true),
+			"the malformed value never egresses on the analytics plane")
+	end
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -6431,6 +6599,9 @@ local tests = {
 	extra_tests.test_sync_remint_stops_stale_cadence_keys,
 	extra_tests.test_restored_client_id_entry_requires_fact_key,
 	extra_tests.test_nested_null_never_reads_as_scope_echo,
+	extra_tests.test_disabled_relaunch_filters_condemned_spool,
+	extra_tests.test_unreadable_record_read_keeps_kill_drop_owed,
+	extra_tests.test_restored_synthetic_fact_key_is_cleared,
 }
 
 for _, test in ipairs(tests) do

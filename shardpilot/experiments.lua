@@ -1211,13 +1211,20 @@ end
 -- best-effort guard, not a distributed clock).
 
 -- The stored record for `scope`, or a fresh empty one (a record stamped for
--- any other scope is dead weight and is overwritten by the next write).
+-- any other scope is dead weight and is overwritten by the next write). The
+-- second return is "unreadable" when the store ERRORED on the read: the
+-- collapse to an empty record is then a blind guess, not a decided miss, and
+-- callers that would treat "absent" as "already converged" must be able to
+-- tell the difference. The corrupt-is-a-miss canon is untouched — a record
+-- that read but failed sanitation stays a plain miss (same bytes parse the
+-- same way forever), and so does a readable record another scope replaced.
 function Experiments:durable_record_for(scope)
-	local record = storage.load_experiments(self.config)
+	local record, miss = storage.load_experiments(self.config)
 	if record and record.scope == scope then
 		return record
 	end
-	return { scope = scope, entries = {} }
+	return { scope = scope, entries = {} },
+		record == nil and miss == "unreadable" and "unreadable" or nil
 end
 
 -- Converge one experiment's durable entry to the in-memory truth: an entry
@@ -1235,7 +1242,7 @@ end
 -- must let owed authoritative DROPS land).
 function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retry)
 	local entry = self.entries[experiment_key]
-	local record = self:durable_record_for(scope)
+	local record, record_miss = self:durable_record_for(scope)
 	local stored = record.entries[experiment_key]
 	local as_of = type(as_of_ms) == "number" and as_of_ms or 0
 	local composite = scope .. scope_separator .. experiment_key
@@ -1262,12 +1269,48 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 		record.entries[experiment_key] = entry
 	else
 		if stored == nil then
+			if record_miss == "unreadable" then
+				-- The store ERRORED on the read: the absent stored entry
+				-- proves nothing — the old on-disk record may still hold
+				-- this experiment, and settling the drop over a blind read
+				-- would let any launch that reads the file again restore
+				-- and serve the killed assignment. The drop stays OWED
+				-- instead, as an OPEN decision: the decision-time raise
+				-- over the stored record (the rollback guard below) is
+				-- part of deciding, so the first READABLE pass re-runs
+				-- decision semantics (the `undecided` mark), never the
+				-- retry fence that yields to rollback-inflated stamps. No
+				-- blind write is forced either: unlike an owed WRITE —
+				-- which converges the disk to live memory and whose worst
+				-- case (an unreadable sibling entry overwritten) is
+				-- refetch-safe absence — a drop expresses itself BY
+				-- absence, so a blind near-empty save buys nothing the
+				-- owed retry does not while wiping every sibling entry
+				-- the failed read hid. Permanently unreadable storage
+				-- keeps the key owed — persist()/shutdown() report it
+				-- honestly — and a death in that window is the documented
+				-- storage-down-through-exit residual.
+				self.durable_pending[composite] = {
+					key = experiment_key,
+					scope = scope,
+					as_of = as_of,
+					drop = true,
+					undecided = true,
+				}
+				if not is_retry then
+					self:diagnose("persist_failed", "cache_unreadable")
+				end
+				return false
+			end
 			self.durable_pending[composite] = nil
 			return true
 		end
+		local prior = self.durable_pending[composite]
+		local deciding = not is_retry
+			or (prior ~= nil and prior.undecided == true)
 		local stored_at = type(stored.fetched_at_ms) == "number"
 			and stored.fetched_at_ms or 0
-		if is_retry and stored_at > as_of then
+		if not deciding and stored_at > as_of then
 			-- The RETRY of an owed drop found an entry stamped after the
 			-- drop was decided: a sibling client persisted a newer
 			-- assignment this drop never resolved. Deleting it would lose
@@ -1275,14 +1318,18 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 			self.durable_pending[composite] = nil
 			return true
 		end
-		if not is_retry and stored_at >= as_of then
+		if deciding and stored_at >= as_of then
 			-- At DECISION time a drop always wins over the stored record it
 			-- resolves: the wall clock can move backward, and fencing the
 			-- delete on raw stamps would let a rollback revive a killed
 			-- variant at the next launch. Raise the drop's effective stamp
 			-- above the record instead — the kill lands now, and an owed
 			-- retry yields only to entries genuinely written AFTER this
-			-- decision.
+			-- decision. A drop held open by an unreadable read (`undecided`)
+			-- completes its decision HERE, on its first readable pass — the
+			-- fence was never fair while the comparator was blind. A failed
+			-- save below re-records the pending with the raised stamp and
+			-- without the mark: the decision is complete either way.
 			as_of = stored_at + 1
 		end
 		record.entries[experiment_key] = nil
@@ -1632,7 +1679,15 @@ end
 -- longer exists and the drop settles; the usual retry fence still yields to
 -- an old-scope sibling instance's strictly fresher write.
 function Experiments:retry_foreign_scope_drop(composite, pending)
-	local record = storage.load_experiments(self.config)
+	local record, miss = storage.load_experiments(self.config)
+	if record == nil and miss == "unreadable" then
+		-- The store ERRORED on the read (same rule as the in-scope sync):
+		-- "no record" is a blind guess, not proof the retired record is
+		-- gone — settling here would let a later readable launch resurrect
+		-- the killed entry under the restored old subject. The drop stays
+		-- owed for the next pass.
+		return
+	end
 	if not record or record.scope ~= pending.scope then
 		self.durable_pending[composite] = nil
 		return

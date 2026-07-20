@@ -1263,7 +1263,13 @@ end
 -- cannot require experiments without a cycle): sfk1_ + exactly 64 lowercase
 -- hex. A restored client_id entry whose key fails it would serve a variant
 -- with every fact terminally skipped — the zero-reporting bias the live
--- install path rejects — so it reads as a safe scope-miss instead.
+-- install path rejects — so it reads as a safe scope-miss instead. Every
+-- OTHER unit restores the entry but has the failing FIELD cleared (live
+-- install parity: the install path stores the key on no unit unless it
+-- passes this grammar): a corrupted or pre-grammar-build value — an
+-- SDK-subject-shaped `spcid_...` included — must not ride
+-- `props.assignment_key` onto the analytics plane at the next emit, and a
+-- key-less synthetic entry keeps the documented fact-less serving posture.
 local function valid_subject_fact_key(value)
 	if type(value) ~= "string" or #value ~= 69 then
 		return false
@@ -1286,8 +1292,6 @@ local function sanitize_experiment_entries(entries)
 			and type(entry.variant_key) == "string" and entry.variant_key ~= ""
 			and type(entry.version) == "number"
 			and type(entry.assignment_unit) == "string" and entry.assignment_unit ~= ""
-			and (entry.subject_fact_key == nil
-				or (type(entry.subject_fact_key) == "string" and entry.subject_fact_key ~= ""))
 			and (entry.assignment_unit ~= "client_id"
 				or valid_subject_fact_key(entry.subject_fact_key))
 			and (entry.subject_key == nil or type(entry.subject_key) == "string")
@@ -1298,7 +1302,8 @@ local function sanitize_experiment_entries(entries)
 				variant_payload = copy_experiment_payload(entry.variant_payload, 0),
 				version = entry.version,
 				assignment_unit = entry.assignment_unit,
-				subject_fact_key = entry.subject_fact_key,
+				subject_fact_key = valid_subject_fact_key(entry.subject_fact_key)
+					and entry.subject_fact_key or nil,
 				subject_key = entry.subject_key,
 				attributes = sanitize_experiment_attributes(entry.attributes),
 				fetched_at_ms = entry.fetched_at_ms,
