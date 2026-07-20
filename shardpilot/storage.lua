@@ -1258,6 +1258,19 @@ local function copy_experiment_payload(value, depth)
 	return out
 end
 
+-- The positive wire grammar for a server-minted subject-fact key (kept in
+-- sync with shardpilot/experiments.lua's valid_subject_fact_key — storage
+-- cannot require experiments without a cycle): sfk1_ + exactly 64 lowercase
+-- hex. A restored client_id entry whose key fails it would serve a variant
+-- with every fact terminally skipped — the zero-reporting bias the live
+-- install path rejects — so it reads as a safe scope-miss instead.
+local function valid_subject_fact_key(value)
+	if type(value) ~= "string" or #value ~= 69 then
+		return false
+	end
+	return value:match("^sfk1_[0-9a-f]+$") ~= nil
+end
+
 -- Keep only entries that are complete, well-formed assignment records, copied
 -- down to the known fields. Anything else — a corrupt file, a truncated entry,
 -- a garbled field — is dropped rather than served or crashed on.
@@ -1275,6 +1288,8 @@ local function sanitize_experiment_entries(entries)
 			and type(entry.assignment_unit) == "string" and entry.assignment_unit ~= ""
 			and (entry.subject_fact_key == nil
 				or (type(entry.subject_fact_key) == "string" and entry.subject_fact_key ~= ""))
+			and (entry.assignment_unit ~= "client_id"
+				or valid_subject_fact_key(entry.subject_fact_key))
 			and (entry.subject_key == nil or type(entry.subject_key) == "string")
 			and type(entry.fetched_at_ms) == "number" then
 			out[key] = {

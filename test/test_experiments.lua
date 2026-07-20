@@ -6131,6 +6131,145 @@ local function test_sync_latch_halts_remaining_cadence_dispatches()
 		"no post-latch reinstall through the same tick's loop")
 end
 
+-- Lua 5.4 caps a chunk at 200 locals; the suite crossed it at 160 test
+-- functions. New tests from here on are FIELDS of this one registry
+-- table, never new locals.
+local extra_tests = {}
+
+function extra_tests.test_subject_echo_never_installs_as_fact_key()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	local subject = query_params(last_assignment_request().url).subject_key
+
+	-- A buggy server echoing the DISPATCHED spcid_ subject as the fact
+	-- key must never install: it would ride props.assignment_key onto the
+	-- analytics plane — the exact no-egress breach the sfk1_ namespace
+	-- prevents. The positive grammar (sfk1_ + 64 lowercase hex, go
+	-- parity) rejects it and any other malformed key before install.
+	next_response_body = assignment_body({
+		subject_fact_key = subject,
+		variant_key = "echoed-variant",
+	})
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.from_cache,
+		"the subject-echo answer is malformed and serves stale")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	next_response_body = assignment_body({
+		subject_fact_key = "sfk1_" .. string.rep("b", 63),
+		variant_key = "short-key-variant",
+	})
+	local short = fetch(client, "exp-checkout")
+	assert_true(short.ok and short.from_cache,
+		"a key outside the positive grammar is malformed")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+end
+
+function extra_tests.test_sync_remint_stops_stale_cadence_keys()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	next_response_body = assignment_body({ experiment_key = "exp-late", variant_key = "beta" })
+	fetch(client, "exp-late")
+
+	-- One cadence tick with a SYNCHRONOUS transport: the first key's
+	-- grammar-400 re-mints (the adopt wipes the cache under a NEW subject
+	-- and retries its own key). The remaining pre-remint keys must not
+	-- dispatch — they would be revalidations for the fresh subject,
+	-- installing assignments the host never requested.
+	local grammar_reject = json.encode({
+		error = "experiment metadata must use synthetic local-safe identifiers only",
+	})
+	local checkout_answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		if url:find("exp%-checkout") then
+			checkout_answers = checkout_answers + 1
+			if checkout_answers == 1 then
+				callback(nil, nil, { status = 400, response = grammar_reject })
+			else
+				callback(nil, nil, { status = 200, response = assignment_body() })
+			end
+		else
+			callback(nil, nil, { status = 200,
+				response = assignment_body({ experiment_key = "exp-late", variant_key = "beta-2" }) })
+		end
+		return true
+	end
+	local probes_before = #assignment_requests()
+	advance_seconds(400)
+	client:update(0.016)
+	responder = nil
+	assert_equal(#assignment_requests(), probes_before + 2,
+		"only the reminting key and its retry dispatch — the batch stops")
+	assert_nil(client:experiment_variant("exp-late"),
+		"no pre-remint key installs under the fresh subject")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the reminting key's own retry still lands")
+end
+
+function extra_tests.test_restored_client_id_entry_requires_fact_key()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- A pre-fix or corrupted record restoring a client_id entry WITHOUT a
+	-- valid fact key would serve a variant whose facts are all terminally
+	-- skipped — the zero-reporting bias the live install path rejects.
+	-- The restore sanitizer discards it: a safe scope-miss, refetched
+	-- cleanly.
+	local record_path = nil
+	for key in pairs(stores) do
+		if key:match("/experiments$") then
+			record_path = key
+		end
+	end
+	assert_true(record_path ~= nil)
+	stores[record_path].entries["exp-checkout"].subject_fact_key = nil
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-checkout"),
+		"a keyless client_id restore reads as a scope-miss, never serves")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_nested_null_never_reads_as_scope_echo()
+	reset()
+	local client = granted_client()
+	-- A legitimate variant payload carrying a NESTED "app_key": null must
+	-- not trip the top-level null-presence scan: the projection strips
+	-- everything below the root object before the pattern runs.
+	next_response_body = '{"assigned":true,"experiment_key":"exp-checkout",'
+		.. '"assignment_key":"' .. fixture_assignment_key .. '",'
+		.. '"variant_key":"treatment","version":3,'
+		.. '"subject_fact_key":"' .. fixture_subject_fact_key .. '",'
+		.. '"variant_payload":{"app_key":null,"color":"blue"},'
+		.. '"boundary":{"assignment_unit":"client_id"}}'
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.assigned and not result.from_cache,
+		"a nested null inside the payload never reads as a scope echo")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- A REAL top-level present-null echo stays malformed.
+	next_response_body = '{"assigned":true,"app_key":null,'
+		.. '"assignment_key":"' .. fixture_assignment_key .. '",'
+		.. '"variant_key":"null-echo","version":4,'
+		.. '"subject_fact_key":"' .. fixture_subject_fact_key .. '",'
+		.. '"boundary":{"assignment_unit":"client_id"}}'
+	local echoed = fetch(client, "exp-checkout")
+	assert_true(echoed.ok and echoed.from_cache,
+		"a top-level present-null echo is still malformed")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -6288,6 +6427,10 @@ local tests = {
 	test_present_null_reason_is_malformed,
 	test_backend_restored_exposure_drains_in_background,
 	test_sync_latch_halts_remaining_cadence_dispatches,
+	extra_tests.test_subject_echo_never_installs_as_fact_key,
+	extra_tests.test_sync_remint_stops_stale_cadence_keys,
+	extra_tests.test_restored_client_id_entry_requires_fact_key,
+	extra_tests.test_nested_null_never_reads_as_scope_echo,
 }
 
 for _, test in ipairs(tests) do

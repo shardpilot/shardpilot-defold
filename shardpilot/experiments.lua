@@ -487,6 +487,69 @@ local function echo_invalid(echoed, expected)
 		and echoed ~= expected
 end
 
+-- The positive wire grammar for a server-minted subject-fact key (go
+-- parity: sfk1_ + exactly 64 lowercase hex). The negative rule it enforces
+-- is the no-egress contract: a fact key that is actually the dispatched
+-- SDK subject id (a buggy server echo) must never install — it would ride
+-- props.assignment_key onto the analytics plane, the exact leak the sfk1_
+-- namespace exists to prevent.
+local function valid_subject_fact_key(value)
+	if type(value) ~= "string" or #value ~= 69 then
+		return false
+	end
+	return value:match("^sfk1_[0-9a-f]+$") ~= nil
+end
+
+-- Strip everything nested below the ROOT object from a JSON body (string-
+-- aware: quotes and escapes tracked, so braces inside string values cannot
+-- skew the depth), leaving only the top-level keys and scalar values. The
+-- null-presence scan runs on this projection so a legitimate nested
+-- `"app_key": null` inside a variant payload can never read as a malformed
+-- top-level scope echo. Deterministic plain-Lua chars walk — identical on
+-- every interpreter.
+local function top_level_projection(body)
+	if type(body) ~= "string" then
+		return ""
+	end
+	local out = {}
+	local depth = 0
+	local in_string = false
+	local escaped = false
+	for i = 1, #body do
+		local ch = body:sub(i, i)
+		if in_string then
+			if depth == 1 then
+				out[#out + 1] = ch
+			end
+			if escaped then
+				escaped = false
+			elseif ch == "\\" then
+				escaped = true
+			elseif ch == '"' then
+				in_string = false
+			end
+		elseif ch == '"' then
+			in_string = true
+			if depth == 1 then
+				out[#out + 1] = ch
+			end
+		elseif ch == "{" or ch == "[" then
+			depth = depth + 1
+			if depth == 1 then
+				out[#out + 1] = ch
+			end
+		elseif ch == "}" or ch == "]" then
+			if depth == 1 then
+				out[#out + 1] = ch
+			end
+			depth = depth - 1
+		elseif depth == 1 then
+			out[#out + 1] = ch
+		end
+	end
+	return table.concat(out)
+end
+
 -- Defold's decoder (and the plain-Lua fallback) maps JSON null to Lua nil,
 -- which makes a present `"field": null` indistinguishable from an ABSENT
 -- field by table lookup alone — and the presence/type split treats those
@@ -514,6 +577,10 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 	if status == 200 then
 		local body_text = type(response) == "table"
 			and type(response.response) == "string" and response.response or ""
+		-- Null-presence scans run on the TOP-LEVEL projection only: a
+		-- nested "app_key": null inside a legitimate variant payload must
+		-- not read as a malformed scope echo.
+		local body_scan = top_level_projection(body_text)
 		local decoded = decode_object(type(response) == "table" and response.response or nil)
 		if not decoded then
 			return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
@@ -521,9 +588,9 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 		if echo_invalid(decoded.experiment_key, experiment_key)
 			or echo_invalid(decoded.app_key, app_key)
 			or echo_invalid(decoded.environment_key, environment_key)
-			or (decoded.experiment_key == nil and body_field_is_null(body_text, "experiment_key"))
-			or (decoded.app_key == nil and body_field_is_null(body_text, "app_key"))
-			or (decoded.environment_key == nil and body_field_is_null(body_text, "environment_key")) then
+			or (decoded.experiment_key == nil and body_field_is_null(body_scan, "experiment_key"))
+			or (decoded.app_key == nil and body_field_is_null(body_scan, "app_key"))
+			or (decoded.environment_key == nil and body_field_is_null(body_scan, "environment_key")) then
 			-- A 200 whose body names ANOTHER experiment, app, or environment
 			-- is routing/proxy confusion, not an answer to this request:
 			-- malformed BEFORE anything installs — never cache (or drop)
@@ -541,18 +608,23 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 			and type(decoded.version) == "number"
 			and type(assignment_unit) == "string" and assignment_unit ~= "" then
 			if assignment_unit == "client_id"
-				and not (type(decoded.subject_fact_key) == "string"
-					and decoded.subject_fact_key ~= "") then
+				and not valid_subject_fact_key(decoded.subject_fact_key) then
 				-- A client_id-unit assignment WITHOUT a server-minted
 				-- subject-fact key would serve a treatment whose exposure
 				-- and outcome facts are all terminally skipped (the facts
 				-- contract requires the key; the SDK subject id never
 				-- egresses): users silently land in a variant with ZERO
 				-- reporting, biasing the experiment's results. The key is
-				-- REQUIRED for client_id units — absent or mistyped means
-				-- the response is malformed and nothing installs
-				-- (serve-stale transient). Synthetic units legitimately
-				-- carry none and keep the documented no-fact posture.
+				-- REQUIRED for client_id units — absent, mistyped, or
+				-- OUTSIDE the positive sfk1_ grammar means the response is
+				-- malformed and nothing installs (serve-stale transient).
+				-- The grammar check also rejects a buggy server echo of
+				-- the dispatched spcid_ subject id: installing that would
+				-- ride the SDK subject onto the analytics plane as
+				-- props.assignment_key — the exact no-egress breach the
+				-- sfk1_ namespace exists to prevent. Synthetic units
+				-- legitimately carry none and keep the documented no-fact
+				-- posture.
 				return serve_entry_or_fail(entry, "malformed_response",
 					requested_attributes), { transient = true }
 			end
@@ -562,8 +634,8 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 				variant_payload = copy_value(decoded.variant_payload, 0),
 				version = decoded.version,
 				assignment_unit = assignment_unit,
-				subject_fact_key = type(decoded.subject_fact_key) == "string"
-					and decoded.subject_fact_key ~= "" and decoded.subject_fact_key or nil,
+				subject_fact_key = valid_subject_fact_key(decoded.subject_fact_key)
+					and decoded.subject_fact_key or nil,
 				fetched_at_ms = now_ms,
 			}
 			return {
@@ -592,7 +664,7 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 			if (reason ~= nil and (type(reason) ~= "string"
 				or (reason ~= "kill_switch"
 					and reason ~= "targeting_unmatched")))
-				or (reason == nil and body_field_is_null(body_text, "reason")) then
+				or (reason == nil and body_field_is_null(body_scan, "reason")) then
 				-- A PRESENT-NULL reason is the presence/type split's blind
 				-- spot on null→nil decoders: present and outside the
 				-- closed vocabulary — malformed, never the traffic-gate
@@ -828,6 +900,14 @@ function M.new(config, deps)
 		backoff_attempt = 0,
 		-- One-shot grammar re-mint guard (per process).
 		reminted = false,
+		-- Bumped whenever the serving cache is wholesale replaced under a
+		-- NEW subject (the grammar re-mint's adopt): a synchronous
+		-- transport can land that mid-way through a cadence batch, and
+		-- the remaining PRE-remint keys must not dispatch as
+		-- revalidations for the fresh subject (assignments the host never
+		-- requested, with no restored attributes). The cadence loop
+		-- captures this counter and stops when it moves.
+		cache_generation = 0,
 	}, Experiments)
 	-- Serve the persisted last-known-good assignments immediately after a
 	-- restart when a stored subject id exists and the record matches this
@@ -950,6 +1030,10 @@ function Experiments:adopt_minted_subject_id()
 	-- id), and its tuple — old subject included — stays distinct from
 	-- anything the new subject arms.
 	self.entries = {}
+	-- The serving cache was wholesale replaced under a NEW subject: any
+	-- cadence batch mid-iteration must stop dispatching its pre-remint
+	-- keys (see tick's generation check).
+	self.cache_generation = self.cache_generation + 1
 	self.exposed = {}
 	-- Owed durable WRITE intents die with the rotation: their source
 	-- entries were just cleared, and the retired subject's record must not
@@ -2593,6 +2677,7 @@ function Experiments:tick(_)
 		keys[#keys + 1] = key
 	end
 	table.sort(keys)
+	local generation = self.cache_generation
 	for i = 1, #keys do
 		-- Batched per tick: one GET per cached entry, each re-sending its
 		-- last host-supplied attributes. Outcomes apply at resolution.
@@ -2602,8 +2687,13 @@ function Experiments:tick(_)
 		-- fetches — their authorized answers would be epoch-current and
 		-- unlatch/reinstall, defeating the halt (the epoch gate only
 		-- discards flights that were already in the air when the latch
-		-- landed).
-		if self.auth_blocked then
+		-- landed). The GENERATION is re-checked for the same reason: a
+		-- synchronous grammar-400 re-mints mid-loop (adopt wipes the
+		-- cache under a NEW subject and retries its own key), and the
+		-- remaining pre-remint keys must not dispatch as revalidations
+		-- for the fresh subject — assignments the host never requested,
+		-- with no restored attributes.
+		if self.auth_blocked or self.cache_generation ~= generation then
 			break
 		end
 		self:fetch(keys[i], nil, nil, true)
