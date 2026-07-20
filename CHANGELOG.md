@@ -6,6 +6,97 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **Experiment-assignment consumer (ADR-0259 SDK leg), dark behind
+  `experiments_enabled` (default `false`).** New module
+  `shardpilot/experiments.lua`: fetches the server-evaluated assignment from
+  `GET {remote_config_url}/api/v1/runtime/experiments/assignment`
+  (control-plane host, publishable-key bearer — the same credential as the
+  remote-config fetch), serves the assigned variant through
+  `shardpilot.fetch_experiment_assignment(experiment_key, [attributes],
+  callback)` / `experiment_variant(key)` / `experiment_payload(key)`, and
+  keeps a scope-stamped durable last-known-good cache (corrupt = miss).
+  While the flag is off — the default — ZERO experiment code paths execute:
+  no subject-id mint, no fetch, no revalidation timer, no exposure emit, no
+  new persistence keys; the public calls answer
+  `experiments_not_configured` / nil. Enablement for real traffic is
+  governed by the platform's flag-flip registry preconditions; the endpoint
+  itself answers 403 until the platform flips it, which this client treats
+  fail-closed like any unauthorized answer.
+- **SDK-managed experiment subject id.** Assignment fetches identify the
+  subject with an SDK-minted id (`spcid_` + 32 lowercase hex — a UUIDv7
+  with the dashes removed) persisted in the durable identity record. There
+  is deliberately NO host override path: no config field is read for it and
+  no setter exists. It is minted lazily at first need, validated against
+  the wire grammar on load, re-minted only on storage loss/corruption
+  (fresh-install re-bucketing semantics), carried forward across
+  identity-record rewrites even while the flag is off, and egresses ONLY as
+  the assignment fetch's `subject_key` — never in analytics events, props,
+  or envelope identity. It is distinct from `anonymous_id`; the
+  remote-config fetch identity is unchanged this wave.
+- **Assignment-plane semantics.** Stickiness is entirely the server's
+  deterministic hash (the SDK never re-buckets locally; the cache is a
+  latency/offline device). The three not-assigned shapes — reason absent
+  (deterministic traffic-gate miss), `targeting_unmatched`, `kill_switch` —
+  all drop the cached assignment, a kill additionally guaranteeing no
+  exposure is emitted for it. 401/403 fail CLOSED: nothing is served for
+  the outcome, in-memory serving stops and revalidation halts until re-init
+  or a later authorized fetch; the durable record is retained (remote-config
+  parity) except under the server's real-subjects kill sentinel, which
+  drops it together with its subject-fact key. 404 is permanent per
+  experiment (treated as not-assigned, never served stale). 503 (the
+  endpoint's kill-state-unavailable answer), 429, other 5xx, offline and
+  timeouts are transient: the last-known-good assignment is served with the
+  error surfaced, `Retry-After` is honored on 429 AND 5xx, and the
+  revalidation cadence backs off exponentially otherwise. Targeting
+  attributes ride the fixed server vocabulary (`geo`, `app_version`,
+  `device_type`, `install_date`, `user_segment`) plus `custom_attribute_*`
+  (suffix 1-64 chars); values are trimmed and bounded to 512 bytes, at most
+  64 attributes ride one fetch (sorted-key order), and names outside the
+  vocabulary are never sent.
+- **Periodic revalidation (the SDK-side kill-switch reach).** Cached
+  assignments are re-fetched — batched per tick, one GET per entry, each
+  re-sending its last host-supplied attributes — every 300 s with ±10%
+  jitter while the SDK runs, consent is granted, and at least one
+  assignment is cached. Kill latency is bounded by this cadence and stated
+  honestly: an offline client keeps its last-known-good variant
+  indefinitely. A parked revalidation never blocks `shutdown()`.
+- **Consent integration (granted-only plane).** Assignment fetches, cached
+  serving, revalidation, and the subject-id mint all require analytics
+  consent `granted`: under `unknown` or either denial flavor — the
+  forced-minor state in particular — the consumer produces ZERO experiment
+  traffic on both planes, refuses fetches with the standard distinct codes
+  (`consent_unknown` / `consent_denied`), and the getters serve nil. The
+  durable cache record is retained unserved through a downgrade (the
+  remote-config fail-closed posture: never destroy the record, never serve
+  it either) and a later re-grant serves it again. Experiments therefore
+  require analytics consent by design — deliberately stricter than the
+  remote-config fetch, which stays consent-free.
+- **Exposure/outcome fact lane (ships dark with the same flag).**
+  `experiment_exposure` rides the normal analytics pipeline (queue → batch
+  → spool → consent gates) at most once per (experiment, version, subject)
+  per session, emitted when the assigned variant is first applied — a fresh
+  fetch resolution, or the first granted tick serving a cache-restored
+  assignment — with a deterministic `event_id` so at-least-once retries and
+  same-session double emissions collapse server-side as duplicates. The
+  emission timing and id derivation are a PROPOSED SDK convention pending
+  platform ratification. `shardpilot.track_exposure(key)` re-arms
+  explicitly (a distinct deterministic id per arm);
+  `shardpilot.track_outcome(key, outcome_key, outcome_value)` records
+  host-defined outcomes as distinct facts. Facts carry the server-minted
+  subject-fact key VERBATIM as the `assignment_key` prop for
+  client_id-unit assignments (the raw subject id is structurally rejected
+  there) and omit `user_id` per the facts contract, keeping the standard
+  `anonymous_id` as the envelope identity. NOTE: the analytics service
+  currently rejects these event names from game-embedded publishable keys
+  by design; until the platform's producer-lane decision lands, an emitted
+  exposure is expected to come back as a per-event reject, surfaced through
+  diagnostics and tolerated silently otherwise — that server-side block is
+  load-bearing and stays authoritative.
+- Feature-detect with `shardpilot.supports("experiments_assignment")`. New
+  behavioral suite `test/test_experiments.lua` joins the CI interpreter
+  matrix, and the engine-real bob-build harness now requires
+  `shardpilot.experiments` so the module is compiled by the library build.
+
 - **CI gained an engine-real `bob-build` leg** (fleet-audit gap: the
   contract core was interpreter-tested only, with no proof the tree still
   works as an actual Defold library). On every PR and push to `main`,

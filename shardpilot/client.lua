@@ -1,5 +1,6 @@
 local envelope = require "shardpilot.envelope"
 local clock = require "shardpilot.clock"
+local experiments_mod = require "shardpilot.experiments"
 local id = require "shardpilot.id"
 local platform = require "shardpilot.platform"
 local queue = require "shardpilot.queue"
@@ -257,6 +258,19 @@ local function validate_config(config)
 		return nil, "invalid_remote_config_url"
 	end
 	local has_remote_config = config.remote_config_url ~= nil
+	-- Experiments (dark by default): `experiments_enabled = true` opts into
+	-- the assignment consumer. The assignment endpoint lives on the same
+	-- control-plane host as the remote-config fetch and authenticates with
+	-- the same publishable api_key, so the flag requires `remote_config_url`
+	-- (which in turn requires the api_key). Default false — and while false,
+	-- zero experiment code paths execute.
+	if config.experiments_enabled ~= nil and type(config.experiments_enabled) ~= "boolean" then
+		return nil, "invalid_experiments_enabled"
+	end
+	local experiments_enabled = config.experiments_enabled == true
+	if experiments_enabled and not has_remote_config then
+		return nil, "experiments_requires_remote_config_url"
+	end
 	-- Dual-mode auth. EITHER a Mode B async `token_provider` (a
 	-- per-tenant ingest JWT minted by the host) OR a Mode A `api_key` (the
 	-- non-secret publishable `sp_ingest_...` key, safe to embed client-side)
@@ -372,6 +386,7 @@ local function validate_config(config)
 		transport = config.transport,
 		token_provider = config.token_provider,
 		api_key = has_api_key and config.api_key or nil,
+		experiments_enabled = experiments_enabled,
 		diagnostics = config.diagnostics,
 		batch_size = batch_size,
 		buffer_size = buffer_size,
@@ -474,6 +489,13 @@ function M.new(config)
 		flush_elapsed_seconds = 0,
 		initialized = true,
 	}, Client)
+	-- The experiments subject id is loaded BEFORE any identity rewrite below:
+	-- persist_identity carries it forward verbatim, so a rewrite triggered by
+	-- a changed anonymous id can never drop a previously minted id (dropping
+	-- would silently re-bucket the subject on a later re-enable). Loaded
+	-- regardless of the experiments flag — a raw field copy, no minting.
+	client.experiments_client_id = type(stored.experiments_client_id) == "string"
+		and stored.experiments_client_id or nil
 	if stored.anonymous_id ~= anonymous_id then
 		client:persist_identity()
 	end
@@ -487,6 +509,36 @@ function M.new(config)
 		client.remote_config = remote_config_mod.new(normalized, function()
 			return client.anonymous_id
 		end)
+	end
+	-- Experiment-assignment consumer (dark unless `experiments_enabled`).
+	-- Constructed only when the flag is on — while off there is no subject-id
+	-- mint, no fetch, no revalidation, no exposure and no new persistence
+	-- keys. The subject id is SDK-managed: it is loaded from the identity
+	-- record above (never from config — no host override path exists),
+	-- minted lazily by the consumer at first need, and persisted through
+	-- persist_identity. Experiment facts are enqueued through the normal
+	-- analytics pipeline with the envelope identity rules the facts contract
+	-- requires (no user_id; the standard anonymous_id — never the
+	-- experiments subject id).
+	if normalized.experiments_enabled then
+		client.experiments = experiments_mod.new(normalized, {
+			subject_id = function()
+				return client.experiments_client_id
+			end,
+			store_subject_id = function(value)
+				client.experiments_client_id = value
+				return client:persist_identity()
+			end,
+			consent = function()
+				return client.consent_state
+			end,
+			emit = function(event_name, props, event_id)
+				return client:enqueue_event(event_name, props, nil, {
+					event_id = event_id,
+					omit_user_id = true,
+				})
+			end,
+		})
 	end
 	-- Offline event spool: re-load the envelopes a previous launch could not
 	-- deliver so they re-send (chunked to batch_size) before fresh events. The
@@ -640,6 +692,13 @@ function Client:persist_identity()
 	if self.consent_state == "granted" or consent_denied_state(self.consent_state) then
 		record.consent_analytics = self.consent_state
 	end
+	-- The experiments subject id rides the identity record whenever one is
+	-- held — including when the experiments flag is currently off — so an
+	-- identity rewrite can never drop a previously minted id (dropping would
+	-- silently re-bucket the subject on a later re-enable).
+	if type(self.experiments_client_id) == "string" and self.experiments_client_id ~= "" then
+		record.experiments_client_id = self.experiments_client_id
+	end
 	return storage.save(self.config, record)
 end
 
@@ -782,6 +841,77 @@ function Client:remote_config_version()
 		return nil
 	end
 	return self.remote_config:get_version()
+end
+
+-- ── experiments ───────────────────────────────────────────────────────────────
+--
+-- Thin delegates over the experiment-assignment consumer
+-- (shardpilot/experiments.lua), present only when `experiments_enabled` is
+-- configured true. Unlike the remote-config fetch, the assignment plane IS
+-- consent-gated (granted-only, forced-minor fully off — see the module
+-- header); the getters serve nil rather than failing, so game code can ship
+-- one code path with the control experience as its default.
+
+function Client:fetch_experiment_assignment(experiment_key, attributes, callback)
+	-- `attributes` is optional: (key, callback) is accepted too.
+	if type(attributes) == "function" and callback == nil then
+		callback = attributes
+		attributes = nil
+	end
+	-- The callback is game code; never let it break the SDK.
+	if not self.initialized then
+		-- No request is dispatched on a torn-down client, nothing is
+		-- written, game code is not called back later.
+		if type(callback) == "function" then
+			pcall(callback, { ok = false, from_cache = false, error = "shutdown" })
+		end
+		return false, "shutdown"
+	end
+	if not self.experiments then
+		if type(callback) == "function" then
+			pcall(callback, {
+				ok = false,
+				from_cache = false,
+				error = "experiments_not_configured",
+			})
+		end
+		return false, "experiments_not_configured"
+	end
+	return self.experiments:fetch(experiment_key, attributes, callback)
+end
+
+function Client:experiment_variant(experiment_key)
+	if not self.experiments then
+		return nil
+	end
+	return self.experiments:variant(experiment_key)
+end
+
+function Client:experiment_payload(experiment_key)
+	if not self.experiments then
+		return nil
+	end
+	return self.experiments:payload(experiment_key)
+end
+
+function Client:track_exposure(experiment_key)
+	if not self.initialized then
+		return false, "shutdown"
+	end
+	if not self.experiments then
+		return false, "experiments_not_configured"
+	end
+	return self.experiments:track_exposure(experiment_key)
+end
+
+function Client:track_outcome(experiment_key, outcome_key, outcome_value)
+	if not self.initialized then
+		return false, "shutdown"
+	end
+	if not self.experiments then
+		return false, "experiments_not_configured"
+	end
+	return self.experiments:track_outcome(experiment_key, outcome_key, outcome_value)
 end
 
 function Client:set_consent(decision)
@@ -963,6 +1093,19 @@ function Client:tutorial_complete(tutorial_id)
 end
 
 function Client:track(event_name, props, context)
+	return self:enqueue_event(event_name, props, context, nil)
+end
+
+-- The shared enqueue path behind track() and the SDK-internal experiment
+-- facts. `fact` (internal only — never host-supplied) carries the two
+-- deviations an experiment fact needs from an ordinary event: a
+-- pre-derived `event_id` (the deterministic exposure id, so at-least-once
+-- retries and same-session double emissions collapse server-side) and
+-- `omit_user_id` (the facts contract forbids user_id on the envelope; the
+-- identity is the standard anonymous_id alone). Everything else — the
+-- consent-first gates, identity requirement, lazy session, queue caps —
+-- applies to facts exactly as to events.
+function Client:enqueue_event(event_name, props, context, fact)
 	if not self.initialized then
 		self.stats.dropped = self.stats.dropped + 1
 		return false, "shutdown"
@@ -1011,11 +1154,19 @@ function Client:track(event_name, props, context)
 		self.session_active = true
 		opened_lazy_session = true
 	end
+	local user_id = self.user_id
+	local event_id = nil
+	if fact then
+		event_id = fact.event_id
+		if fact.omit_user_id then
+			user_id = nil
+		end
+	end
 	local event = {
-		event_id = id.uuid(),
+		event_id = event_id or id.uuid(),
 		event_name = event_name,
 		event_ts = clock.iso_utc(),
-		user_id = self.user_id,
+		user_id = user_id,
 		anonymous_id = self.anonymous_id,
 		session_id = self.session_id,
 		session_sequence = self.session_sequence + 1,
@@ -1052,6 +1203,13 @@ function Client:update(dt)
 		-- Frame samples are analytics data: a session kept active through a
 		-- denial must not keep feeding the perf sampler.
 		sampling.sample_frame(self.perf, dt)
+	end
+	if self.experiments then
+		-- Revalidation cadence + the cache-restored exposure sweep. Runs
+		-- before the flush check so a fact enqueued by this tick can ride
+		-- this same update's flush; internally a no-op unless consent is
+		-- granted and an assignment is cached.
+		self.experiments:tick(dt)
 	end
 	if queue.size(self.queue) >= self.config.batch_size or self.flush_elapsed_seconds >= self.config.flush_interval_seconds then
 		self.flush_elapsed_seconds = 0

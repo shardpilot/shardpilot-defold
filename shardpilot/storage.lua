@@ -1187,6 +1187,172 @@ function M.save_remote_config(scope, record)
 	return true
 end
 
+-- ── experiment-assignment cache ──────────────────────────────────────────────
+--
+-- One durable last-known-good record per app for the experiments client: a map
+-- of experiment_key → the assignment entry served for it, stamped with the
+-- (workspace, environment, subject, url) scope string the fetches were made
+-- for. The scope check itself lives in the experiments client; this store only
+-- persists and validates the record shape. Like the remote-config cache, the
+-- record is best-effort — a failed write costs only offline serving, never the
+-- fetched assignment — and a corrupt or partially garbled record degrades to
+-- the salvageable subset (corrupt = miss, clean start).
+
+local experiments_memory = {}
+
+-- Defold documents that sys.save caps a saved table at 512 KB; refuse a record
+-- whose string-scalar estimate approaches it (parity with the remote-config
+-- body clamp) so the write cannot fail at the sys layer with the record half
+-- formed. The previously cached record stays untouched.
+local max_experiments_record_bytes = 393216
+
+-- Keep only attribute pairs that are usable for a revalidation fetch: a
+-- { name, value } table of non-empty strings.
+local function sanitize_experiment_attributes(attributes)
+	if type(attributes) ~= "table" then
+		return nil
+	end
+	local out = nil
+	for i = 1, #attributes do
+		local pair = attributes[i]
+		if type(pair) == "table"
+			and type(pair.name) == "string" and pair.name ~= ""
+			and type(pair.value) == "string" then
+			out = out or {}
+			out[#out + 1] = { name = pair.name, value = pair.value }
+		end
+	end
+	return out
+end
+
+-- Deep copy for a cached variant payload (decoded JSON: acyclic; the depth
+-- cap only bounds the walk). Non-table scalars are stored as-is.
+local function copy_experiment_payload(value, depth)
+	if type(value) ~= "table" then
+		return value
+	end
+	if depth >= 16 then
+		return nil
+	end
+	local out = {}
+	for key, child in pairs(value) do
+		if type(key) == "string" or type(key) == "number" then
+			out[key] = copy_experiment_payload(child, depth + 1)
+		end
+	end
+	return out
+end
+
+-- Keep only entries that are complete, well-formed assignment records, copied
+-- down to the known fields. Anything else — a corrupt file, a truncated entry,
+-- a garbled field — is dropped rather than served or crashed on.
+local function sanitize_experiment_entries(entries)
+	local out = {}
+	if type(entries) ~= "table" then
+		return out
+	end
+	for key, entry in pairs(entries) do
+		if type(key) == "string" and key ~= ""
+			and type(entry) == "table"
+			and type(entry.assignment_key) == "string" and entry.assignment_key ~= ""
+			and type(entry.variant_key) == "string" and entry.variant_key ~= ""
+			and type(entry.version) == "number"
+			and type(entry.assignment_unit) == "string" and entry.assignment_unit ~= ""
+			and (entry.subject_fact_key == nil
+				or (type(entry.subject_fact_key) == "string" and entry.subject_fact_key ~= ""))
+			and (entry.subject_key == nil or type(entry.subject_key) == "string")
+			and type(entry.fetched_at_ms) == "number" then
+			out[key] = {
+				assignment_key = entry.assignment_key,
+				variant_key = entry.variant_key,
+				variant_payload = copy_experiment_payload(entry.variant_payload, 0),
+				version = entry.version,
+				assignment_unit = entry.assignment_unit,
+				subject_fact_key = entry.subject_fact_key,
+				subject_key = entry.subject_key,
+				attributes = sanitize_experiment_attributes(entry.attributes),
+				fetched_at_ms = entry.fetched_at_ms,
+			}
+		end
+	end
+	return out
+end
+
+-- Load the cached experiment-assignment record for this app (the same per-app
+-- namespace scheme as the spool), or nil when absent or unusable. A record
+-- without a scope stamp cannot be attributed to any (workspace, environment,
+-- subject, url) tuple — it reads as no cache. Never throws.
+function M.load_experiments(scope)
+	local ns = spool_namespace(scope)
+	local record = nil
+	local path = save_path(ns, "experiments")
+	if path then
+		local ok, loaded = pcall(sys.load, path)
+		if ok and type(loaded) == "table" then
+			record = loaded
+		end
+	end
+	if record == nil then
+		record = experiments_memory[ns]
+	end
+	if type(record) ~= "table"
+		or type(record.scope) ~= "string" or record.scope == "" then
+		return nil
+	end
+	return {
+		scope = record.scope,
+		entries = sanitize_experiment_entries(record.entries),
+	}
+end
+
+-- Replace the cached experiment-assignment record
+-- (`{ scope, entries = { [experiment_key] = entry } }`). Returns true when
+-- stored — in the durable save file, or in the in-memory fallback on hosts
+-- without the save-file API (which then lasts only for the process lifetime).
+function M.save_experiments(scope, record)
+	if type(record) ~= "table"
+		or type(record.scope) ~= "string" or record.scope == "" then
+		return false
+	end
+	local stored = {
+		scope = record.scope,
+		entries = sanitize_experiment_entries(record.entries),
+	}
+	if approx_record_bytes(stored) > max_experiments_record_bytes then
+		return false
+	end
+	local ns = spool_namespace(scope)
+	local path = save_path(ns, "experiments")
+	if not path then
+		experiments_memory[ns] = stored
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, stored)
+	if not (ok and saved == true) then
+		return false
+	end
+	experiments_memory[ns] = stored
+	return true
+end
+
+-- Drop the cached experiment-assignment record: an empty record is written in
+-- its place (which loads as "no cache") and the in-memory fallback is cleared.
+-- Returns true when the clear landed.
+function M.clear_experiments(scope)
+	local ns = spool_namespace(scope)
+	local path = save_path(ns, "experiments")
+	if not path then
+		experiments_memory[ns] = nil
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, {})
+	if not (ok and saved == true) then
+		return false
+	end
+	experiments_memory[ns] = nil
+	return true
+end
+
 -- Clears the in-memory fallback records only; intended for tests.
 function M.reset()
 	memory_records = {}
@@ -1195,6 +1361,7 @@ function M.reset()
 	spool_memory = {}
 	consent_outbox_memory = {}
 	remote_config_memory = {}
+	experiments_memory = {}
 end
 
 return M
