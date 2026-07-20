@@ -26,9 +26,16 @@
   cached record and its `subject_fact_key` are dropped ONLY on the exact
   `403` sentinel body `experiment real-subject assignment is disabled`
   (string equality; generic flag-off bodies never drop), and the automatic
-  assignment lane halts after any authoritative `401`/`403` until re-init
-  (`automatic_fetch_allowed()`; host-triggered fetches never blocked, still
-  per-fetch). All three not-assigned 200 shapes (`reason` absent /
+  assignment lane halts after an authoritative `401`/`403` that SETTLES its
+  scope's fence, until re-init (`automatic_fetch_allowed()`; a delayed
+  stale refusal outranked by a newer settled outcome never halts;
+  host-triggered fetches never blocked, still per-fetch). The cache scope
+  additionally carries a non-secret fingerprint of the publishable key —
+  the endpoint resolves the tenant from the Bearer key, so a device whose
+  configuration swaps between two workspaces' keys can never serve one
+  tenant's cached assignment under the other's (the raw key never rides the
+  scope string, and the scope-format change simply orphans any pre-existing
+  cached record as a scope miss). All three not-assigned 200 shapes (`reason` absent /
   `kill_switch` / `targeting_unmatched`) are handled as valid decisions,
   and verdict parsing is strict — a 200 naming another experiment, an
   unknown refusal reason, an incomplete assigned verdict, or a
@@ -58,7 +65,13 @@
   (the version-stable, potentially colliding sfk must not suppress another
   assignment's exposure) — per launch; a consent revocation that purges a
   still-undelivered exposure re-arms its dedupe key, so a later re-grant
-  can report it (delivered exposures stay deduped). Outcomes are not
+  can report it — but ONLY when every wire attempt provably failed to
+  deliver: delivered exposures stay deduped, and so does any exposure whose
+  batch saw a wire-ambiguous outcome (a lost/timed-out request the server
+  may have accepted — a re-emit would carry a new event_id the server
+  cannot de-duplicate). The producers also refuse a corrupted snapshot
+  whose version violates the positive-integer bound
+  (`invalid_assignment_version`, defense in depth). Outcomes are not
   de-duplicated.
 - **Opt-in periodic remote-config revalidation, default OFF** (kill-switch
   reach, ADR-0259 gate 2(a)). New boolean config `remote_config_revalidate`
@@ -68,11 +81,15 @@
   converges on a server-side kill within one interval. Interval = the
   server's `Cache-Control` client `max-age` (directive-boundary parsed —
   `s-maxage` and lookalike names never match) floored at 60s, 300s while
-  unknown; the timer re-arms from the latest completed fetch on any lane,
-  so a freshly observed shorter max-age governs the next tick instead of a
-  stale longer deadline firing first
+  unknown; the anchor mirrors the latest USABLE outcome on any lane (a
+  fresh 200 or a 304, fence-gated): a freshly observed shorter max-age
+  governs the next tick instead of a stale longer deadline firing first, a
+  usable outcome WITHOUT a max-age restores the 300s default, and an ERROR
+  response — whatever Cache-Control it carries — can neither move the
+  anchor nor stretch the interval
   [pending coordinator ratification]; transient failures keep the schedule;
-  the timer halts after an authoritative `401`/`403` until a new client is
+  the timer halts after an authoritative `401`/`403` that settles its
+  scope's fence (a delayed stale refusal never halts) until a new client is
   constructed [pending ratification] while explicit fetches stay available
   and classify per fetch. Unset, the no-automatic-refresh stance is
   preserved byte-for-byte, and per-fetch classification/cache semantics are

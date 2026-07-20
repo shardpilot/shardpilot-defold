@@ -457,18 +457,24 @@ nothing changes: the SDK keeps its no-automatic-refresh stance exactly.
 
 - **Interval:** the server's `Cache-Control` client `max-age` (directive-
   boundary parsed; `s-maxage` never counts), floored at **60s**; **300s**
-  while no max-age has been observed. The timer re-arms from the latest
-  completed fetch on any lane, so a freshly observed shorter max-age
-  governs the next tick instead of a stale longer deadline firing first.
+  while unknown. The anchor mirrors the latest **usable** outcome on any
+  lane (a fresh `200` or a `304`, fence-gated): a freshly observed shorter
+  max-age governs the next tick instead of a stale longer deadline firing
+  first, a usable outcome **without** a max-age restores the 300s default,
+  and an **error response never moves the cadence** — whatever
+  `Cache-Control` it carries, a failed fetch can neither re-arm the timer
+  nor stretch the interval.
   *(Interval anchoring is pending coordinator ratification; ADR-0259 pins
   no numbers.)*
 - **Transient failures keep the schedule** — the durable cache serves, and no
   extra retry happens inside an interval.
-- **The timer halts after an authoritative `401`/`403`** on this plane until a
-  new client is constructed (re-init / config change) — an unattended loop
-  must not keep re-asking an endpoint that authoritatively refused it.
-  Host-triggered `fetch_remote_config` calls stay available throughout and
-  classify per fetch — no latch on classification, cache, or getters.
+- **The timer halts after an authoritative `401`/`403` that settles its
+  scope's fence** on this plane, until a new client is constructed (re-init /
+  config change) — an unattended loop must not keep re-asking an endpoint
+  that authoritatively refused it, while a delayed stale refusal outranked
+  by a newer settled outcome never halts. Host-triggered
+  `fetch_remote_config` calls stay available throughout and classify per
+  fetch — no latch on classification, cache, or getters.
   *(Mirroring the assignment plane's automatic-lane halt onto this timer is
   pending coordinator ratification.)*
 - With the timer **off** (the default), operators plan on **next-fetch
@@ -520,7 +526,11 @@ survives later identity-record rewrites.
 **Fetch semantics** (per-fetch, ported from the remote-config classifier):
 
 - **200** — served fresh and cached durably (per-scope records through the
-  same `sys.save` seam; a restart or offline launch serves last-known-good).
+  same `sys.save` seam — the scope covers the app/environment keys, the
+  experiment, the subject, the endpoint, **and a non-secret fingerprint of
+  the publishable key** (the endpoint resolves the tenant from the Bearer
+  key, so another workspace's key can never be served this key's cached
+  decision); a restart or offline launch serves last-known-good).
   All **three not-assigned shapes are valid 200s**, distinguished by
   `reason`: absent (the deterministic traffic gate), `"kill_switch"` (an
   operator kill — machine-readable), `"targeting_unmatched"`. For
@@ -540,12 +550,13 @@ survives later identity-record rewrites.
   drops this scope's cached assignment record **and its `subject_fact_key`**
   (a surface flipped back off must not keep being honored from cache).
   Equality, never substring; an unparseable 403 body is generic.
-- **Automatic-lane halt:** after any authoritative `401`/`403` the automatic
-  assignment lane halts until re-init/config change
-  (`automatic_fetch_allowed()` on the assignment client answers false). This
-  SDK schedules no automatic assignment fetch itself; every
-  `fetch_experiment_assignment` call is host-triggered, classifies per
-  fetch, and is never blocked by the halt.
+- **Automatic-lane halt:** after an authoritative `401`/`403` that settles
+  its scope's fence, the automatic assignment lane halts until
+  re-init/config change (`automatic_fetch_allowed()` on the assignment
+  client answers false); a delayed stale refusal outranked by a newer
+  settled outcome never halts. This SDK schedules no automatic assignment
+  fetch itself; every `fetch_experiment_assignment` call is host-triggered,
+  classifies per fetch, and is never blocked by the halt.
 - **Any other status is permanent** (`http_<status>`, e.g. `404` for an
   unknown experiment): the fetch fails; cache and snapshot stay untouched.
 
@@ -562,9 +573,11 @@ assignments the fact subject (`assignment_key` prop) is the derived
 `subject_fact_key` — **the raw spcid never rides event props** — and the
 envelope always carries `anonymous_id` (GDPR erasure reachability) and never
 `user_id`. Exposures are de-duplicated client-side, once per assignment
-identity (experiment + version + fact subject) per launch — a purged-before-
-delivery exposure re-arms after a consent revocation; outcomes are not
-de-duplicated.
+identity (experiment + version + fact subject) per launch — a consent
+revocation re-arms a purged exposure only when every wire attempt provably
+failed to deliver (a lost/timed-out request the server may have accepted
+keeps it deduped: a re-emit would carry a new `event_id` the server cannot
+de-duplicate); outcomes are not de-duplicated.
 
 **Dark-phase truth (today):**
 

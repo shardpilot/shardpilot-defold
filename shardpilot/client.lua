@@ -508,13 +508,15 @@ function M.new(config)
 		-- rearm_purged_exposures).
 		exposure_tracked = {},
 		-- The opt-in remote-config revalidation timer's dt accumulator
-		-- (update-driven, like the flush pacing) and the completed-fetch
-		-- count it last re-armed against: the accumulator measures time
-		-- since the LATEST completed remote-config fetch on any lane, so a
-		-- freshly observed (e.g. server-shortened) max-age governs the next
-		-- tick instead of a stale previously-armed deadline firing first.
+		-- (update-driven, like the flush pacing) and the usable-fetch count
+		-- it last re-armed against: the accumulator measures time since the
+		-- LATEST USABLE remote-config outcome on any lane (a fresh 200 or a
+		-- 304 — never an error response), so a freshly observed
+		-- server-shortened max-age governs the next tick instead of a stale
+		-- previously-armed deadline firing first, while a failed fetch can
+		-- neither defer nor stretch the cadence.
 		rc_revalidate_elapsed = 0,
-		rc_revalidate_completed = 0,
+		rc_revalidate_usable = 0,
 		consent_state = consent_state,
 		-- Durable consent-receipt outbox (mirror of the persisted record,
 		-- oldest receipt first). Receipts are delivered serially, strictly in
@@ -944,11 +946,13 @@ end
 -- but a purged fact never left the device — leaving the key burned would
 -- make the exposure permanently unreportable this launch (duplicate_exposure
 -- after a later re-grant, with nothing ever sent). Only consent purges
--- re-arm; a DELIVERED exposure stays deduped for the launch (re-arming it
--- would double-count the fact). Works on queued events and on retained
--- batch/spool envelope shapes alike (both carry event_name + props); keys
--- from another launch's spooled envelopes are absent from this launch's map,
--- so re-arming them is a no-op.
+-- re-arm, and only for facts that PROVABLY never got delivered: a DELIVERED
+-- exposure stays deduped for the launch, and so does one whose batch ever
+-- saw a wire-AMBIGUOUS outcome (`wire_ambiguous` on the batch — callers
+-- gate on it) — re-arming either would double-count the fact. Works on
+-- queued events and on retained batch/spool envelope shapes alike (both
+-- carry event_name + props); keys from another launch's spooled envelopes
+-- are absent from this launch's map, so re-arming them is a no-op.
 local function rearm_purged_exposures(self, events)
 	if type(events) ~= "table" then
 		return
@@ -1009,7 +1013,13 @@ function Client:set_consent(decision)
 		end
 		if self.in_flight_batch and not self.publish_in_flight then
 			cleared = cleared + #self.in_flight_batch
-			rearm_purged_exposures(self, self.in_flight_batch)
+			-- A retained batch is purged like the queue — but its exposures
+			-- re-arm only when no earlier attempt was wire-ambiguous: after
+			-- a lost/timed-out request the server may hold the batch, and a
+			-- re-emitted exposure (a new event_id) would double-count.
+			if not self.in_flight_batch.wire_ambiguous then
+				rearm_purged_exposures(self, self.in_flight_batch)
+			end
 			self.in_flight_batch = nil
 		end
 		if #self.spool_batches > 0 then
@@ -1277,6 +1287,15 @@ local function fact_snapshot(self, experiment_key)
 	if snapshot.assigned ~= true then
 		return nil, "not_assigned"
 	end
+	-- Defense in depth, like fact_props' sfk grammar re-check: the version
+	-- rides producer props verbatim, and every SDK-installed snapshot
+	-- already passed the parser's positive-integer bound — so a snapshot
+	-- violating it here is corrupted state that must not produce a fact the
+	-- ingest service would misattribute.
+	if type(snapshot.version) ~= "number" or snapshot.version ~= snapshot.version
+		or snapshot.version < 1 or snapshot.version ~= math.floor(snapshot.version) then
+		return nil, "invalid_assignment_version"
+	end
 	if not valid_identity(self.anonymous_id) then
 		return nil, "identity_required"
 	end
@@ -1409,14 +1428,17 @@ function Client:update_remote_config_revalidation(dt)
 	if type(dt) ~= "number" or dt <= 0 then
 		return
 	end
-	-- Re-arm from the latest COMPLETED fetch (any lane): that fetch just
-	-- revalidated the configuration — and may have observed a NEW max-age —
-	-- so the next revalidation is due one CURRENT interval after it. A
-	-- server-shortened max-age thereby takes effect at the next tick
-	-- instead of a stale longer deadline firing first, and a host fetch is
-	-- never followed by a near-immediate redundant timer fetch.
-	if self.remote_config.fetches_completed ~= self.rc_revalidate_completed then
-		self.rc_revalidate_completed = self.remote_config.fetches_completed
+	-- Re-arm from the latest USABLE outcome (any lane; a fresh 200 or a
+	-- 304, counted behind the fence — never an error response): that fetch
+	-- just revalidated the configuration — and may have observed a NEW
+	-- max-age — so the next revalidation is due one CURRENT interval after
+	-- it. A server-shortened max-age thereby takes effect at the next tick
+	-- instead of a stale longer deadline firing first, a usable host fetch
+	-- is never followed by a near-immediate redundant timer fetch, and a
+	-- FAILED fetch — whatever Cache-Control its error response carries —
+	-- neither moves the anchor nor the interval.
+	if self.remote_config.usable_fetches ~= self.rc_revalidate_usable then
+		self.rc_revalidate_usable = self.remote_config.usable_fetches
 		self.rc_revalidate_elapsed = 0
 	end
 	self.rc_revalidate_elapsed = self.rc_revalidate_elapsed + dt
@@ -2328,6 +2350,18 @@ function Client:start_publish_batch()
 		end
 		self.stats.failed_batches = self.stats.failed_batches + 1
 		self.stats.last_error = err
+		-- A failure with NO received response (the request was lost or
+		-- timed out on the wire) is wire-AMBIGUOUS: the server may have
+		-- accepted the batch even though this client saw a failure.
+		-- Remember that on the batch — its exposures must never re-arm
+		-- the dedupe (a re-emitted exposure carries a NEW event_id, so the
+		-- server's event_id de-duplication cannot protect against the
+		-- double-count the way it does for a verbatim re-send). A received
+		-- non-2xx, by the batch pipe's own retry contract, means the batch
+		-- was not admitted.
+		if err == "http_0" then
+			events.wire_ambiguous = true
+		end
 		-- Surface the server error envelope (error.code + detail codes) on a
 		-- non-2xx instead of leaving only the bare transport status.
 		self:apply_error_envelope(err, response)
@@ -2380,9 +2414,11 @@ function Client:start_publish_batch()
 			self.in_flight_batch = nil
 			-- A batch dropped because consent was revoked while it was in
 			-- flight is a consent purge like the set_consent one: its
-			-- undelivered exposures re-arm (a terminal rejection under an
-			-- unchanged grant does not — that dedupe stands for the launch).
-			if consent_denied_state(self.consent_state) then
+			-- exposures re-arm — but ONLY when every wire attempt provably
+			-- failed to deliver (never after a wire-ambiguous attempt, and
+			-- never for a terminal rejection under an unchanged grant; both
+			-- dedupes stand for the launch).
+			if consent_denied_state(self.consent_state) and not events.wire_ambiguous then
 				rearm_purged_exposures(self, events)
 			end
 			-- A terminally rejected batch also leaves the spool, or it would

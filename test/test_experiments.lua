@@ -387,22 +387,34 @@ end
 
 local function test_build_scope_keeps_distinct_tuples_distinct()
 	local subject = "spcid_" .. string.rep("a", 20)
+	local credential = experiments.credential_fingerprint("sp_ingest_publishable_key")
 	assert_true(
-		experiments.build_scope("app", "env-a", "exp", subject, "http://localhost:28090")
-			~= experiments.build_scope("app", "env", "a-exp", subject, "http://localhost:28090"),
+		experiments.build_scope("app", "env-a", "exp", subject, "http://localhost:28090", credential)
+			~= experiments.build_scope("app", "env", "a-exp", subject, "http://localhost:28090", credential),
 		"shifting one identifier boundary must not collide two scopes")
 	assert_true(
-		experiments.build_scope("app", "env", "exp-a", subject, "http://localhost:28090")
-			~= experiments.build_scope("app", "env", "exp-b", subject, "http://localhost:28090"),
+		experiments.build_scope("app", "env", "exp-a", subject, "http://localhost:28090", credential)
+			~= experiments.build_scope("app", "env", "exp-b", subject, "http://localhost:28090", credential),
 		"two experiments must never share one scope")
 	assert_true(
-		experiments.build_scope("app", "env", "exp", "spcid_" .. string.rep("a", 20), "http://localhost:28090")
-			~= experiments.build_scope("app", "env", "exp", "spcid_" .. string.rep("b", 20), "http://localhost:28090"),
+		experiments.build_scope("app", "env", "exp", "spcid_" .. string.rep("a", 20), "http://localhost:28090", credential)
+			~= experiments.build_scope("app", "env", "exp", "spcid_" .. string.rep("b", 20), "http://localhost:28090", credential),
 		"two subjects must never share one scope")
+	assert_true(
+		experiments.build_scope("app", "env", "exp", subject, "http://localhost:28090",
+			experiments.credential_fingerprint("sp_ingest_key_one"))
+			~= experiments.build_scope("app", "env", "exp", subject, "http://localhost:28090",
+				experiments.credential_fingerprint("sp_ingest_key_two")),
+		"two publishable keys must never share one scope (tenant resolution rides the key)")
 	assert_equal(
-		experiments.build_scope("app", "env", "exp", subject, "http://localhost:28090"),
-		experiments.build_scope("app", "env", "exp", subject, "http://localhost:28090/"),
+		experiments.build_scope("app", "env", "exp", subject, "http://localhost:28090", credential),
+		experiments.build_scope("app", "env", "exp", subject, "http://localhost:28090/", credential),
 		"a trailing slash must not split one endpoint into two scopes")
+	-- The fingerprint is a stable non-secret derivation: eight hex chars,
+	-- never the raw key.
+	assert_true(credential:match("^[0-9a-f]+$") ~= nil and #credential == 8)
+	assert_equal(credential, experiments.credential_fingerprint("sp_ingest_publishable_key"))
+	assert_nil(credential:find("sp_ingest", 1, true))
 end
 
 -- ── configuration validation ──────────────────────────────────────────────────
@@ -988,6 +1000,74 @@ local function test_automatic_lane_halts_after_auth_refusal_until_reinit()
 	restore()
 end
 
+local function test_stale_auth_refusal_does_not_halt_the_lane()
+	reset()
+	local client = assert(sdk.new(config()))
+
+	-- Two fetches in flight; the NEWER settles first with a usable 200.
+	local saved_request = http.request
+	local pending = {}
+	http.request = function(url, method, callback, headers, body, options)
+		pending[#pending + 1] = callback
+	end
+	client:fetch_experiment_assignment("exp-armor", function() end)
+	client:fetch_experiment_assignment("exp-armor", function() end)
+	pending[2](nil, nil, { status = 200, response = assigned_body() })
+	assert_true(client.experiments:automatic_fetch_allowed())
+
+	-- The DELAYED refusal from the older fetch lost the fence: it fails its
+	-- own caller closed (per fetch), but it must not halt the automatic
+	-- lane over the newer settled success.
+	pending[1](nil, nil, { status = 401, response = '{"error":"invalid runtime token"}' })
+	assert_true(client.experiments:automatic_fetch_allowed(),
+		"a stale refusal outranked by a newer settled outcome must not halt the lane")
+	assert_equal(client:experiment_assignment("exp-armor").variant_key, "variant-b")
+
+	-- A refusal that SETTLES the fence still halts (the ratified Extra 2).
+	pending = {}
+	client:fetch_experiment_assignment("exp-armor", function() end)
+	pending[1](nil, nil, { status = 403, response = '{"error":"experiment assignment fetch is disabled"}' })
+	assert_equal(client.experiments:automatic_fetch_allowed(), false,
+		"a fence-settling refusal must still halt the automatic lane")
+	http.request = saved_request
+end
+
+local function test_credential_dimension_scopes_the_cache()
+	reset()
+	local restore = install_fake_sys_storage()
+	local first = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = assigned_body()
+	assert_true(fetch(first).ok)
+	assert_equal(first:experiment_assignment("exp-armor").variant_key, "variant-b")
+
+	-- Same device, same save file, same app/environment KEYS and subject —
+	-- but a DIFFERENT publishable key: the assignment endpoint resolves the
+	-- tenant from the key, so the other key's cached decision must be a
+	-- scope miss, at construction and on transients alike.
+	local other = assert(sdk.new(config({ api_key = "sp_ingest_other_workspace_key" })))
+	assert_equal(other:get_spcid(), first:get_spcid(), "same persisted subject either way")
+	assert_nil(other:experiment_assignment("exp-armor"),
+		"another key's cached assignment must not be adopted at construction")
+	next_status = 500
+	next_response_body = nil
+	local result = fetch(other)
+	assert_equal(result.ok, false,
+		"a transient fetch under another key must not serve the first key's cache")
+	assert_equal(result.error, "transient_500")
+
+	-- Each key caches under its own scope; both coexist and neither
+	-- displaces the other.
+	next_status = 200
+	next_response_body = assigned_body({ variant_key = "variant-other" })
+	assert_true(fetch(other).ok)
+	assert_equal(other:experiment_assignment("exp-armor").variant_key, "variant-other")
+	local first_again = assert(sdk.new(config()))
+	assert_equal(first_again:experiment_assignment("exp-armor").variant_key, "variant-b",
+		"the original key's record survives, scoped to its own credential")
+	restore()
+end
+
 local function test_out_of_order_responses_cannot_install_or_erase_fresh_state()
 	reset()
 	local client = assert(sdk.new(config()))
@@ -1425,6 +1505,94 @@ end
 
 -- ── singleton facade ──────────────────────────────────────────────────────────
 
+local function test_producer_refuses_corrupted_snapshot_version()
+	reset()
+	local client = granted_client_with_assignment()
+	assert_true(client:track_experiment_exposure("exp-armor"))
+
+	-- Every SDK-installed snapshot passed the parser's positive-integer
+	-- bound; a snapshot violating it is corrupted state, and the producers
+	-- refuse rather than emit a misattributable fact (defense in depth —
+	-- there is no public path that installs a hand-built table).
+	client.experiments.snapshots["exp-armor"].data.version = 0
+	local ok, err = client:track_experiment_outcome("exp-armor", "k", 1)
+	assert_equal(ok, false)
+	assert_equal(err, "invalid_assignment_version")
+	client.experiments.snapshots["exp-armor"].data.version = 2.5
+	local frac_ok, frac_err = client:track_experiment_exposure("exp-armor")
+	assert_equal(frac_ok, false)
+	assert_equal(frac_err, "invalid_assignment_version")
+end
+
+local function test_wire_ambiguous_exposure_never_rearms()
+	reset()
+	local client = granted_client_with_assignment()
+	assert_true(client:track_experiment_exposure("exp-armor"))
+
+	-- Dispatch the batch but HOLD the response; revoke consent mid-flight;
+	-- then the held response lands as a received 500 — a proven
+	-- non-acceptance, so the denial drop re-arms the exposure.
+	local saved_request = http.request
+	local pending = {}
+	http.request = function(url, method, callback, headers, body, options)
+		pending[#pending + 1] = callback
+	end
+	client:flush()
+	assert_equal(#pending, 1)
+	http.request = saved_request
+	next_status = 200
+	next_response_body = nil
+	assert_true(client:set_consent(false))
+	pending[1](nil, nil, { status = 500 })
+	assert_true(client:set_consent(true))
+	assert_true(client:track_experiment_exposure("exp-armor"),
+		"a received non-2xx proves non-acceptance: the denial drop re-arms")
+
+	-- The same shape, but the held response is LOST (status 0): the server
+	-- may have accepted the batch despite the client-side failure, and a
+	-- re-emitted exposure would carry a NEW event_id the server cannot
+	-- de-duplicate — so the exposure stays deduped through the re-grant.
+	pending = {}
+	http.request = function(url, method, callback, headers, body, options)
+		pending[#pending + 1] = callback
+	end
+	client:flush()
+	assert_equal(#pending, 1)
+	http.request = saved_request
+	assert_true(client:set_consent(false))
+	pending[1](nil, nil, { status = 0 })
+	assert_true(client:set_consent(true))
+	local ok, err = client:track_experiment_exposure("exp-armor")
+	assert_equal(ok, false)
+	assert_equal(err, "duplicate_exposure",
+		"a wire-ambiguous outcome must keep the exposure deduped")
+end
+
+local function test_retained_ambiguous_batch_purge_keeps_dedupe()
+	reset()
+	local client = granted_client_with_assignment()
+	assert_true(client:track_experiment_exposure("exp-armor"))
+
+	-- The batch's only attempt is LOST on the wire (status 0): retryable
+	-- under an unchanged grant, so the batch is retained — and marked
+	-- wire-ambiguous.
+	next_status = 0
+	next_response_body = nil
+	client:flush()
+	assert_true(client.in_flight_batch ~= nil, "the ambiguous batch is retained for retry")
+
+	-- A later revocation purges the retained batch, but its exposure must
+	-- stay deduped through the re-grant: the lost request may have been
+	-- accepted server-side.
+	next_status = 200
+	assert_true(client:set_consent(false))
+	assert_true(client:set_consent(true))
+	local ok, err = client:track_experiment_exposure("exp-armor")
+	assert_equal(ok, false)
+	assert_equal(err, "duplicate_exposure",
+		"a purged batch with a wire-ambiguous attempt must not re-arm")
+end
+
 local function test_facade_reports_not_initialized()
 	reset()
 	assert_nil(sdk.experiment_assignment("exp-armor"))
@@ -1515,6 +1683,9 @@ local tests = {
 	test_unknown_not_assigned_reason_is_malformed,
 	test_sentinel_drop_failed_durable_clear_blocks_resurrection,
 	test_automatic_lane_halts_after_auth_refusal_until_reinit,
+	test_stale_auth_refusal_does_not_halt_the_lane,
+	test_credential_dimension_scopes_the_cache,
+	test_producer_refuses_corrupted_snapshot_version,
 	test_out_of_order_responses_cannot_install_or_erase_fresh_state,
 	test_missing_transport_and_decoder_degrade_cleanly,
 	test_spcid_minted_persisted_and_distinct_from_anonymous_id,
@@ -1529,6 +1700,8 @@ local tests = {
 	test_exposure_dedupe_is_per_launch,
 	test_exposure_dedupe_keys_on_full_assignment_identity,
 	test_consent_purge_rearms_undelivered_exposure_dedupe,
+	test_wire_ambiguous_exposure_never_rearms,
+	test_retained_ambiguous_batch_purge_keeps_dedupe,
 	test_facade_reports_not_initialized,
 	test_facade_delegates_to_the_default_client,
 	test_fetch_after_shutdown_is_rejected,

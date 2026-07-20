@@ -326,7 +326,11 @@ platform flags are off everywhere):
   erasure cascade reaches the fact through it) and **never** `user_id`.
 - **The assignment cache** is a bounded per-app durable record set
   (scope-stamped like the remote-config cache) storing served assignment
-  bodies only — never tokens. A `401`/`403` fetch outcome is never served
-  from it, and the exact flag-off sentinel (`403` body
+  bodies only — never tokens: the scope string carries a NON-SECRET
+  eight-hex-character fingerprint of the publishable key (a 32-bit fold
+  that cannot reconstruct the key; it only keeps one workspace's cached
+  decisions from serving under another workspace's key), never the key
+  itself. A `401`/`403` fetch outcome is never served from it, and the
+  exact flag-off sentinel (`403` body
   `experiment real-subject assignment is disabled`) drops the affected
   scope's record and its `subject_fact_key` durably.

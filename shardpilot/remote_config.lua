@@ -434,24 +434,34 @@ function M.new(config, identity)
 		-- in flight.
 		fetch_seq = 0,
 		settled = {},
-		-- The last observed Cache-Control max-age (seconds), captured from
-		-- any response carrying one; nil until then. Read only by the opt-in
-		-- revalidation interval below.
+		-- The Cache-Control max-age (seconds) of the LATEST USABLE outcome
+		-- (fresh 200 / 304), adopted inside install's gates; nil while none
+		-- has landed OR the latest usable outcome carried no max-age (the
+		-- anchor mirrors that response — a disappeared header restores the
+		-- default interval). Read only by the opt-in revalidation interval
+		-- below.
 		max_age_seconds = nil,
 		-- Automatic-lane halt (assignment-plane Extra 2 mirrored onto the
 		-- opt-in RC revalidation TIMER; pending coordinator ratification —
-		-- see client.lua): true once ANY authoritative 401/403 landed on
-		-- this plane. The update-tick timer stops scheduling fetches while
-		-- set; host-triggered fetches never consult it and keep classifying
-		-- per fetch (no latch on classification, cache, or getters). Resets
+		-- see client.lua): true once an authoritative 401/403 SETTLED this
+		-- plane's per-scope fence (set inside install, behind the same
+		-- scope-current + sequence gates as every install — a DELAYED stale
+		-- refusal that an already-settled newer outcome outranks never
+		-- halts). The update-tick timer stops scheduling fetches while set;
+		-- host-triggered fetches never consult it and keep classifying per
+		-- fetch (no latch on classification, cache, or getters). Resets
 		-- only with a new client (re-init / config change).
 		auth_refused = false,
-		-- Count of fetches whose RESPONSE has been processed (any lane, any
-		-- outcome). The opt-in revalidation timer re-arms its interval from
-		-- the latest completed fetch, so a freshly observed (e.g. shorter)
-		-- Cache-Control max-age governs the NEXT tick instead of a stale
-		-- previously-armed deadline firing first.
-		fetches_completed = 0,
+		-- Count of fetches that settled with a USABLE configuration
+		-- outcome — a fresh 200 install or a 304 revalidation, fence- and
+		-- scope-gated like the halt above. The opt-in revalidation timer
+		-- re-arms its interval from the latest usable outcome, so a freshly
+		-- observed (e.g. shorter) Cache-Control max-age governs the NEXT
+		-- tick instead of a stale previously-armed deadline firing first —
+		-- while an ERROR response (transient, unauthorized, permanent) can
+		-- neither move the anchor nor stretch the interval, however many
+		-- Cache-Control headers it carries.
+		usable_fetches = 0,
 	}, RemoteConfig)
 	-- Serve the persisted last-known-good snapshot immediately after a
 	-- restart: getters work before (and without) any fetch when a cache for
@@ -585,7 +595,7 @@ end
 -- The snapshot is a defensive copy: the result table is handed to game code,
 -- and a callback that mutates `result.values` must not corrupt what later
 -- getters read.
-function RemoteConfig:install(seq, result, new_cache, scope, authoritative, served_cache, revalidated_cache)
+function RemoteConfig:install(seq, result, new_cache, scope, authoritative, served_cache, revalidated_cache, max_age)
 	local current_id = self:client_id()
 	if not current_id or self:scope_for(current_id) ~= scope then
 		return
@@ -598,6 +608,26 @@ function RemoteConfig:install(seq, result, new_cache, scope, authoritative, serv
 	end
 	if authoritative then
 		self.settled[scope] = seq
+		-- Revalidation-timer bookkeeping, deliberately INSIDE the scope and
+		-- sequence gates so a delayed stale outcome can neither halt nor
+		-- re-arm the timer after a newer outcome already settled this scope:
+		--   * a USABLE outcome (fresh 200 install / 304 revalidation — the
+		--     authoritative successes) re-arms the timer and may adopt the
+		--     response's Cache-Control max-age as the interval anchor;
+		--   * an authoritative REFUSAL (401/403) halts the timer instead —
+		--     and an error response's Cache-Control, transient or
+		--     authoritative, is never read: only a usable configuration
+		--     response may move the cadence.
+		if result.ok then
+			-- The anchor mirrors the usable response exactly: a max-age is
+			-- adopted, and its ABSENCE restores the default interval — a
+			-- freshness window the server stopped advertising must not
+			-- linger as a stale anchor.
+			self.max_age_seconds = max_age
+			self.usable_fetches = self.usable_fetches + 1
+		elseif result.error == "unauthorized" then
+			self.auth_refused = true
+		end
 	end
 	if not result.ok then
 		return
@@ -729,29 +759,25 @@ function RemoteConfig:fetch(callback)
 
 	http.request(url, "GET", function(_, _, response)
 		local result, new_cache, authoritative, revalidated_cache = M.apply(cache, response, clock.unix_ms())
-		-- Revalidation bookkeeping, both deliberately outside the install
-		-- gates (they are not installs): remember the server's freshness
-		-- window when the response names one, and halt the opt-in automatic
-		-- revalidation timer on an authoritative auth refusal — per-fetch
-		-- classification and the cache are untouched either way.
-		local max_age = M.cache_max_age_seconds(response)
-		if max_age then
-			self.max_age_seconds = max_age
-		end
-		if authoritative and not result.ok and result.error == "unauthorized" then
-			self.auth_refused = true
-		end
-		self.fetches_completed = self.fetches_completed + 1
-		self:install(seq, result, new_cache, scope, authoritative, cache, revalidated_cache)
+		-- The response's Cache-Control is parsed here (install has no
+		-- response) but ADOPTED only inside install's scope/fence gates,
+		-- and only for a usable outcome — an error response can never move
+		-- the revalidation cadence, and a stale outcome can never halt or
+		-- re-arm the timer over a newer settled one.
+		self:install(seq, result, new_cache, scope, authoritative, cache, revalidated_cache,
+			M.cache_max_age_seconds(response))
 		finish(result)
 	end, headers, nil, options)
 	return true
 end
 
--- The opt-in periodic revalidation interval (seconds): the server's last
--- observed Cache-Control max-age, floored at 60s to respect the per-scope
--- server rate limiter, 300s while no max-age has been observed. [Interval
--- anchoring pends coordinator ratification; ADR-0259 pins no numbers.]
+-- The opt-in periodic revalidation interval (seconds): the Cache-Control
+-- max-age of the LATEST USABLE outcome, floored at 60s to respect the
+-- per-scope server rate limiter; 300s while that outcome carried none (or
+-- none has landed yet) — the anchor mirrors the latest usable response, so
+-- a window the server stopped advertising falls back to the default
+-- instead of lingering. [Interval anchoring pends coordinator ratification;
+-- ADR-0259 pins no numbers.]
 local default_revalidate_interval_seconds = 300
 local min_revalidate_interval_seconds = 60
 

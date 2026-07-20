@@ -39,13 +39,15 @@
 --     assignment for a surface flipped back off. An unparseable 403 body,
 --     or any other 403 body, is a GENERIC 403: fail-closed per fetch, no
 --     drop. Never dropped on 401, never on 404.
---   * Amendment-2 Extra 2 — after ANY authoritative 401/403 the AUTOMATIC
---     assignment lane halts (`auth_refused`; read it through
---     `automatic_fetch_allowed()`): an unattended loop must not keep
---     re-asking an endpoint that authoritatively refused it. This SDK
---     schedules no automatic assignment fetch itself today — every fetch
---     here is host-triggered, classifies per fetch, and is never blocked by
---     the halt. The flag resets only with a new client (re-init / config
+--   * Amendment-2 Extra 2 — after an authoritative 401/403 that SETTLES its
+--     scope's fence, the AUTOMATIC assignment lane halts (`auth_refused`;
+--     read it through `automatic_fetch_allowed()`): an unattended loop must
+--     not keep re-asking an endpoint that authoritatively refused it. The
+--     halt is fence-guarded like every install — a DELAYED stale refusal
+--     that a newer settled outcome outranks never halts. This SDK schedules
+--     no automatic assignment fetch itself today — every fetch here is
+--     host-triggered, classifies per fetch, and is never blocked by the
+--     halt. The flag resets only with a new client (re-init / config
 --     change).
 --   * Any other status (404 for an unknown experiment, an unexpected 3xx,
 --     other 4xx) is a PERMANENT failure (`http_<status>`): the fetch fails
@@ -122,16 +124,46 @@ function M.build_url(base_url, app_key, environment_key, experiment_key, subject
 		.. "&subject_key=" .. escape_component(subject_key)
 end
 
+-- A short, stable 32-bit hash of a string, returned as lowercase hex — the
+-- same pure-arithmetic polynomial rolling hash the storage layer uses for
+-- its namespace fingerprints (no bitwise operators, every intermediate
+-- value inside double-precision integer range). NON-SECRET by construction:
+-- eight hex characters of a 32-bit fold cannot reconstruct the input; it
+-- only discriminates cache scopes.
+local function short_hash(value)
+	local hash = 2166136261
+	for i = 1, #value do
+		hash = (hash * 131 + value:byte(i)) % 4294967296
+	end
+	return string.format("%08x", hash)
+end
+
+-- The non-secret credential fingerprint stamped into every cache scope. The
+-- assignment endpoint resolves the TENANT from the Bearer key (the token's
+-- bound app/environment), not from any identifier in the URL — so the key
+-- is a content-determining dimension the (app_key, environment_key, ...)
+-- tuple alone does not capture: two workspaces can each own an
+-- "app"/"production" key pair, and a device whose configuration swaps
+-- between their publishable keys must not serve one tenant's cached
+-- assignment under the other's. The raw key never rides the scope string —
+-- only this derivation does.
+function M.credential_fingerprint(api_key)
+	return short_hash(type(api_key) == "string" and api_key or "")
+end
+
 -- Scope components are escaped and joined with a separator no escaped
 -- component can contain, exactly like the remote-config scope: two distinct
--- (app, environment, experiment, subject, url) tuples can never collide into
--- one scope string, and equivalent spellings of the same endpoint cannot
--- split one scope into two.
-function M.build_scope(app_key, environment_key, experiment_key, subject_key, base_url)
+-- (app, environment, experiment, subject, credential, url) tuples can never
+-- collide into one scope string, and equivalent spellings of the same
+-- endpoint cannot split one scope into two. `credential` is the NON-SECRET
+-- key fingerprint from M.credential_fingerprint — see there for why the
+-- publishable key is a cache dimension on this plane.
+function M.build_scope(app_key, environment_key, experiment_key, subject_key, base_url, credential)
 	return escape_component(app_key or "") .. scope_separator
 		.. escape_component(environment_key or "") .. scope_separator
 		.. escape_component(experiment_key or "") .. scope_separator
 		.. escape_component(subject_key or "") .. scope_separator
+		.. escape_component(credential or "") .. scope_separator
 		.. trim_slash(base_url or "")
 end
 
@@ -463,6 +495,10 @@ function M.new(config, subject)
 	local ex = setmetatable({
 		config = config,
 		subject = subject,
+		-- The non-secret key fingerprint every scope carries (the tenant
+		-- dimension the Bearer key resolves server-side; see
+		-- M.credential_fingerprint).
+		credential = M.credential_fingerprint(config.api_key),
 		-- In-memory assignment snapshots served to getters and producers:
 		-- experiment_key -> { scope, data }. Installed by successful fetches
 		-- and, below, from the durable cache at construction.
@@ -487,11 +523,14 @@ function M.new(config, subject)
 		-- relaunch before the clear lands re-adopts the record until its
 		-- next sentinel (best-effort, like every failed durable write here).
 		tombstones = {},
-		-- Amendment-2 Extra 2 (assignment plane only): true once ANY
-		-- authoritative 401/403 landed. An automatic assignment lane must
-		-- consult automatic_fetch_allowed() before scheduling a fetch; this
-		-- SDK ships no such lane today, host-triggered fetches never check
-		-- it, and the flag resets only with a new client (re-init / config
+		-- Amendment-2 Extra 2 (assignment plane only): true once an
+		-- authoritative 401/403 SETTLED its scope's fence (set inside
+		-- install, behind the same scope-current + sequence gates as every
+		-- install — a delayed stale refusal that a newer settled outcome
+		-- outranks never halts). An automatic assignment lane must consult
+		-- automatic_fetch_allowed() before scheduling a fetch; this SDK
+		-- ships no such lane today, host-triggered fetches never check it,
+		-- and the flag resets only with a new client (re-init / config
 		-- change) — never on a later per-fetch success.
 		auth_refused = false,
 	}, Experiments)
@@ -530,7 +569,8 @@ function Experiments:scope_for(experiment_key, subject_key)
 		self.config.experiments_environment_key,
 		experiment_key,
 		subject_key,
-		self.config.experiments_url)
+		self.config.experiments_url,
+		self.credential)
 end
 
 -- True while no authoritative 401/403 has halted the automatic assignment
@@ -612,12 +652,14 @@ end
 -- Settle an authoritative fetch outcome and, when it may, install it —
 -- ported from the remote-config install, minus the 304/revalidation lane and
 -- plus the sentinel drop. The gates, in order: the scope must still be
--- current; the per-scope sequence fence; only authoritative outcomes settle;
--- the sentinel drop (fence-guarded like any install, so an out-of-order
--- stale sentinel cannot erase a fresher assignment installed after it); a
--- fresh 200 installs and persists; a cache-served outcome installs only by
--- ADOPTION when the served record is fresher than the held one.
-function Experiments:install(seq, experiment_key, scope, result, new_cache, authoritative, served_cache, drop_cache)
+-- current; the per-scope sequence fence; only authoritative outcomes settle
+-- (the automatic-lane halt latches here too, so a delayed stale refusal
+-- never halts over a newer settled outcome); the sentinel drop
+-- (fence-guarded like any install, so an out-of-order stale sentinel cannot
+-- erase a fresher assignment installed after it); a fresh 200 installs and
+-- persists; a cache-served outcome installs only by ADOPTION when the
+-- served record is fresher than the held one.
+function Experiments:install(seq, experiment_key, scope, result, new_cache, authoritative, served_cache, drop_cache, auth_refused)
 	local subject_key = self:subject_key()
 	if not subject_key or self:scope_for(experiment_key, subject_key) ~= scope then
 		return
@@ -627,6 +669,13 @@ function Experiments:install(seq, experiment_key, scope, result, new_cache, auth
 	end
 	if authoritative then
 		self.settled[scope] = seq
+		if auth_refused then
+			-- Amendment-2 Extra 2, fence-guarded: only a refusal that
+			-- SETTLES this scope halts the automatic lane — a stale 401/403
+			-- outranked by an already-settled newer outcome returned above
+			-- and changed nothing.
+			self.auth_refused = true
+		end
 	end
 	if drop_cache then
 		-- Amendment-2 Extra 1: the sentinel 403 drops this scope's cached
@@ -743,7 +792,7 @@ function Experiments:fetch(experiment_key, callback)
 		-- No transport on this runtime is a transient failure like any
 		-- other: serve the last-known-good assignment when one exists.
 		local result = serve_cache_or_fail(cache, "http_unavailable", experiment_key)
-		self:install(seq, experiment_key, scope, result, nil, false, cache, false)
+		self:install(seq, experiment_key, scope, result, nil, false, cache, false, false)
 		finish(result)
 		return false, "http_unavailable"
 	end
@@ -764,13 +813,10 @@ function Experiments:fetch(experiment_key, callback)
 	http.request(url, "GET", function(_, _, response)
 		local result, new_cache, authoritative, drop_cache, auth_refused =
 			M.apply(cache, response, clock.unix_ms(), experiment_key)
-		if auth_refused then
-			-- Amendment-2 Extra 2: the automatic lane halts after any
-			-- authoritative 401/403 until re-init/config change. Deliberately
-			-- NOT fence-guarded — halting is conservative, never an install.
-			self.auth_refused = true
-		end
-		self:install(seq, experiment_key, scope, result, new_cache, authoritative, cache, drop_cache)
+		-- The automatic-lane halt (Extra 2) latches inside install, behind
+		-- the same scope/fence gates as every install: a refusal that lost
+		-- the fence to a newer settled outcome must not halt the lane.
+		self:install(seq, experiment_key, scope, result, new_cache, authoritative, cache, drop_cache, auth_refused)
 		finish(result)
 	end, headers, nil, options)
 	return true

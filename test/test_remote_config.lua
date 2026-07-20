@@ -1923,10 +1923,12 @@ local function test_revalidation_fires_conditional_get_on_the_max_age_interval()
 	assert_equal(count_requests(), 1)
 
 	-- Crossing it issues exactly ONE conditional GET: the cached ETag rides
-	-- as If-None-Match, and a 304 keeps serving the cached snapshot.
+	-- as If-None-Match, and a 304 keeps serving the cached snapshot. The
+	-- 304 keeps advertising the same window (a usable outcome WITHOUT one
+	-- would restore the default interval — tested separately).
 	next_status = 304
 	next_response_body = nil
-	next_response_headers = nil
+	next_response_headers = { ["cache-control"] = "private, max-age=120" }
 	client:update(1.5)
 	assert_equal(count_requests(), 2)
 	local request = last_request()
@@ -2000,6 +2002,106 @@ local function test_revalidation_rearms_on_shorter_max_age()
 	assert_equal(count_requests(), 2, "the shortened window re-arms from the observing fetch")
 	client:update(2)
 	assert_equal(count_requests(), 3, "the next revalidation lands about one new interval later")
+end
+
+local function test_revalidation_ignores_error_response_cadence()
+	reset()
+	local client = assert(sdk.new(config({ remote_config_revalidate = true })))
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	next_response_headers = { etag = 'W/"v1"', ["cache-control"] = "max-age=60" }
+	assert_true(fetch(client).ok)
+	client:update(30)
+	assert_equal(count_requests(), 1)
+
+	-- A FAILED host fetch mid-window — even one whose error response
+	-- carries a Cache-Control — must neither re-arm the timer nor stretch
+	-- the interval: only a usable outcome (fresh 200 / 304) moves the
+	-- cadence.
+	next_status = 500
+	next_response_body = nil
+	next_response_headers = { ["cache-control"] = "max-age=3600" }
+	local failed = fetch(client)
+	assert_true(failed.from_cache, "the 500 serves the cache, as ever")
+	assert_equal(count_requests(), 2)
+
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = { ["cache-control"] = "max-age=60" }
+	client:update(31)
+	assert_equal(count_requests(), 3,
+		"the timer fires on the original anchor: the failed fetch moved nothing")
+
+	-- And the interval is still the last USABLE max-age (60), not the
+	-- error response's 3600.
+	client:update(59)
+	assert_equal(count_requests(), 3)
+	client:update(2)
+	assert_equal(count_requests(), 4,
+		"an error response's Cache-Control must never stretch the interval")
+end
+
+local function test_stale_auth_refusal_does_not_halt_the_timer()
+	reset()
+	local client = assert(sdk.new(config({ remote_config_revalidate = true })))
+
+	-- Two host fetches in flight; the NEWER settles first with a usable
+	-- 200, then the DELAYED 401 from the older fetch arrives.
+	local saved_request = http.request
+	local pending = {}
+	http.request = function(url, method, callback, headers, body, options)
+		pending[#pending + 1] = callback
+	end
+	client:fetch_remote_config(function() end)
+	client:fetch_remote_config(function() end)
+	pending[2](nil, nil, { status = 200, response = values_body({ a = 1 }),
+		headers = { etag = 'W/"v1"', ["cache-control"] = "max-age=60" } })
+	pending[1](nil, nil, { status = 401 })
+	http.request = saved_request
+
+	assert_equal(client.remote_config.auth_refused, false,
+		"a stale refusal outranked by a newer settled outcome must not halt the timer")
+	assert_equal(client:remote_config_number("a", 0), 1)
+
+	-- The timer keeps running on the settled outcome's cadence.
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = { ["cache-control"] = "max-age=60" }
+	client:update(61)
+	assert_equal(count_requests(), 1, "the timer must still fire after the stale refusal")
+
+	-- A refusal that SETTLES the fence still halts.
+	next_status = 401
+	next_response_body = nil
+	client:update(61)
+	assert_equal(count_requests(), 2)
+	assert_equal(client.remote_config.auth_refused, true)
+	client:update(200)
+	assert_equal(count_requests(), 2)
+end
+
+local function test_revalidation_restores_default_when_max_age_disappears()
+	reset()
+	local client = assert(sdk.new(config({ remote_config_revalidate = true })))
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	next_response_headers = { etag = 'W/"v1"', ["cache-control"] = "max-age=60" }
+	assert_true(fetch(client).ok)
+
+	-- The anchored 60s window governs the first tick...
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = nil
+	client:update(61)
+	assert_equal(count_requests(), 2)
+
+	-- ...but that usable 304 carried NO Cache-Control: the server stopped
+	-- advertising a freshness window, so the anchor restores the 300s
+	-- default instead of keeping the stale prior value.
+	client:update(61)
+	assert_equal(count_requests(), 2, "the stale 60s anchor must not survive a headerless success")
+	client:update(239)
+	assert_equal(count_requests(), 3, "the default interval governs once the header disappears")
 end
 
 local function test_revalidation_transient_failure_keeps_the_schedule()
@@ -2158,6 +2260,9 @@ local tests = {
 	test_revalidation_fires_conditional_get_on_the_max_age_interval,
 	test_revalidation_interval_floor_and_default,
 	test_revalidation_rearms_on_shorter_max_age,
+	test_revalidation_ignores_error_response_cadence,
+	test_stale_auth_refusal_does_not_halt_the_timer,
+	test_revalidation_restores_default_when_max_age_disappears,
 	test_revalidation_transient_failure_keeps_the_schedule,
 	test_revalidation_halts_after_auth_refusal_manual_fetch_unaffected,
 	test_facade_serves_defaults_when_not_initialized,
