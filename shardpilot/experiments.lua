@@ -789,26 +789,31 @@ function M.new(config, deps)
 	-- once a session exists to attribute them to (the first-session
 	-- migration, a host-opened lazy session, or the shutdown drain — never
 	-- a background-tick lazy open). No subject id is minted here.
+	-- A durable condemnation outlives the process: a real-subjects
+	-- sentinel clear that could not land before an exit left its stamp
+	-- AND scope in the sidecar marker. Re-arm the clear here and REFUSE
+	-- everything it covers — serving the withdrawn record until its
+	-- first probe would defeat the sentinel. Loaded WITHOUT a subject
+	-- gate: the marker file needs no subject to read, and its whole
+	-- machinery (partition, retire, spool-load condemnation) operates on
+	-- the scope string STORED IN the marker — an identity record that
+	-- lost its subject field must not make the condemnation invisible
+	-- while spooled withdrawn facts await re-send. The condemnation
+	-- applies ONLY to the scope it was decided for (a legacy marker
+	-- without one condemns conservatively): another scope's record is
+	-- untouched, and the first tick settles such a stale marker. Entries
+	-- stamped strictly after the condemnation are a sibling's
+	-- post-sentinel authorized state and restore normally (the same
+	-- survivor partition the clear itself applies); the first tick lands
+	-- the clear.
+	local condemned_stamp, condemned_scope = storage.load_experiments_clear(config)
+	if condemned_stamp then
+		ex.durable_clear_pending = condemned_stamp
+		ex.durable_clear_scope = condemned_scope
+		ex.clear_marker = { stamp = condemned_stamp, scope = condemned_scope }
+	end
 	local subject = ex:current_subject_id()
 	if subject then
-		-- A durable condemnation outlives the process: a real-subjects
-		-- sentinel clear that could not land before an exit left its
-		-- stamp AND scope in the sidecar marker. Re-arm the clear here
-		-- and REFUSE everything it covers — serving the withdrawn record
-		-- until its first probe would defeat the sentinel. The
-		-- condemnation applies ONLY to the scope it was decided for (a
-		-- legacy marker without one condemns conservatively): another
-		-- scope's record is untouched, and the first tick settles such a
-		-- stale marker. Entries stamped strictly after the condemnation
-		-- are a sibling's post-sentinel authorized state and restore
-		-- normally (the same survivor partition the clear itself
-		-- applies); the first tick lands the clear.
-		local condemned_stamp, condemned_scope = storage.load_experiments_clear(config)
-		if condemned_stamp then
-			ex.durable_clear_pending = condemned_stamp
-			ex.durable_clear_scope = condemned_scope
-			ex.clear_marker = { stamp = condemned_stamp, scope = condemned_scope }
-		end
 		local record = storage.load_experiments(config)
 		if record and record.scope == ex:scope_for(subject) then
 			local record_condemned = condemned_stamp ~= nil
@@ -1809,7 +1814,16 @@ function Experiments:condemnation_covers_current_scope()
 	end
 	local subject = self:current_subject_id()
 	if not subject then
-		return false
+		-- NO provable current scope (the identity record lost its subject
+		-- field, or none was ever minted): the SDK cannot demonstrate the
+		-- marker stale, and envelopes carry no scope of their own — fail
+		-- CLOSED and condemn conservatively, exactly like the legacy
+		-- scope-less marker. After a sentinel + failed spool rewrite +
+		-- identity loss, the withdrawn keys must not replay just because
+		-- the comparator went blind; a later mint (a fresh subject = a
+		-- fresh scope) settles the stale marker through the normal retire
+		-- path.
+		return true
 	end
 	return self:scope_for(subject) == condemned_scope
 end

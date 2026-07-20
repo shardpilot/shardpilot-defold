@@ -1983,6 +1983,31 @@ local function is_experiment_fact(event)
 	return name == "experiment_exposure" or name == "experiment_outcome"
 end
 
+-- Order-independent deep equality over envelope prop tables (scalar values,
+-- shallow nesting at most): the replacement-detection compare for a
+-- re-captured deterministic id — identity fields (timestamps, session,
+-- anon) deliberately excluded, props are the wire content whose staleness
+-- matters (a withdrawn assignment_key must never resend).
+local function props_equal(a, b)
+	if a == b then
+		return true
+	end
+	if type(a) ~= "table" or type(b) ~= "table" then
+		return a == b
+	end
+	for key, value in pairs(a) do
+		if not props_equal(value, b[key]) then
+			return false
+		end
+	end
+	for key in pairs(b) do
+		if a[key] == nil then
+			return false
+		end
+	end
+	return true
+end
+
 -- Remove experiment facts from a batch IN PLACE and rebuild its cached wire
 -- payload (the payload snapshots the envelopes at first attempt — a filtered
 -- batch resending the unfiltered capture would defeat the purge). Returns
@@ -2254,6 +2279,7 @@ function Client:spool_envelopes(envelopes)
 	end
 	local fresh = {}
 	local seen = {}
+	local replaced = false
 	for i = 1, #envelopes do
 		local env = envelopes[i]
 		local event_id = type(env) == "table" and env.event_id or nil
@@ -2262,18 +2288,37 @@ function Client:spool_envelopes(envelopes)
 				-- A replacement fact re-derived a deterministic id whose
 				-- prior copy a sentinel purge condemned while the removal
 				-- rewrite is still owed: capturing the replacement
-				-- RE-LEGITIMIZES the id. Clear the settled mark so the
+				-- RE-LEGITIMIZES the id — clear the settled mark. The
 				-- on-disk copy stands as the replacement's durable form
-				-- (bit-equivalent — same deterministic id, same fact)
-				-- instead of the index masking the capture while the next
-				-- successful write deletes the only copy. Where a durable
-				-- condemnation marker survives to the next launch, the
-				-- scope-gated load filter still governs every spooled
-				-- fact equally — the sentinel mandate outranks capture.
-				-- (An acked-but-unrewritten published id re-captured the
-				-- same way just resurrects a delivered envelope; the
-				-- deterministic id collapses the re-send server-side.)
+				-- ONLY when its content actually matches: the server may
+				-- have reissued the same tuple/version with a DIFFERENT
+				-- subject-fact key (same deterministic id, different
+				-- assignment_key prop), and the pre-sentinel envelope
+				-- carrying the withdrawn key must never resend as the
+				-- replacement. On a props mismatch the stored envelope is
+				-- OVERWRITTEN with the replacement's bytes and the write
+				-- below must land (else the deferred-rewrite machinery
+				-- converges the mirror). Where a durable condemnation
+				-- marker survives to the next launch, the scope-gated
+				-- load filter still governs every spooled fact equally —
+				-- the sentinel mandate outranks capture. (An acked-but-
+				-- unrewritten published id re-captured the same way just
+				-- resurrects a delivered envelope; the deterministic id
+				-- collapses the re-send server-side.)
 				self.spool_settled[event_id] = nil
+				if self.spool_index[event_id] then
+					for j = 1, #self.spool_record do
+						local stored = self.spool_record[j]
+						if type(stored) == "table"
+							and stored.event_id == event_id then
+							if not props_equal(stored.props, env.props) then
+								self.spool_record[j] = env
+								replaced = true
+							end
+							break
+						end
+					end
+				end
 			end
 			if not self.spool_index[event_id] and not seen[event_id] then
 				seen[event_id] = true
@@ -2281,7 +2326,7 @@ function Client:spool_envelopes(envelopes)
 			end
 		end
 	end
-	if #fresh == 0 then
+	if #fresh == 0 and not replaced then
 		return true
 	end
 	local combined = {}
@@ -2292,6 +2337,12 @@ function Client:spool_envelopes(envelopes)
 		combined[#combined + 1] = fresh[i]
 	end
 	if not self:write_spool_record(combined) then
+		if replaced then
+			-- The disk still carries the superseded (withdrawn-key) bytes
+			-- while the mirror holds the replacement: converge through the
+			-- deferred-rewrite machinery at the next dispatch point.
+			self.spool_rewrite_pending = true
+		end
 		return false
 	end
 	-- Cap eviction may have discarded some of THESE envelopes: the caps evict

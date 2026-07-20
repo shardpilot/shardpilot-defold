@@ -5373,6 +5373,132 @@ local function test_replacement_fact_capture_survives_settled_purge()
 	storage.reset()
 end
 
+local function test_reissued_fact_key_replaces_settled_spool_copy()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local new_fact_key = "sfk1_" .. string.rep("c", 64)
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+
+	-- Sentinel with the spool store failing: the purge marks the spooled
+	-- old-key fact settled but cannot rewrite it away.
+	state.fail_save = function(path)
+		return path:match("/spool$") ~= nil
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+
+	-- The platform re-enables and REISSUES the same tuple/version with a
+	-- DIFFERENT subject-fact key: the re-exposed fact derives the SAME
+	-- deterministic id but different assignment_key bytes. The stale
+	-- settled copy on disk carries the WITHDRAWN key — the capture must
+	-- REPLACE it, never let it stand as the replacement's durable form.
+	next_status = 200
+	next_response_body = assignment_body({ subject_fact_key = new_fact_key })
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	state.fail_save = nil
+	assert_true(client:persist(), "the replacement capture lands durably")
+
+	-- Process death before any live publish: the relaunch replays the
+	-- REPLACEMENT bytes — the withdrawn key never egresses.
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	local saw_new = false
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			assert_true(not requests[i].body:find(fixture_subject_fact_key, 1, true),
+				"the withdrawn subject-fact key must never resend")
+			if requests[i].body:find(new_fact_key, 1, true) then
+				saw_new = true
+			end
+		end
+	end
+	assert_true(saw_new, "the reissued key's replacement fact replays from the spool")
+	restore()
+	storage.reset()
+end
+
+local function test_condemned_marker_holds_without_subject()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	assert_true(client:track("filler-host-event"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+
+	-- Sentinel with record AND spool stores down: only the sidecar marker
+	-- lands; the withdrawn fact stays spooled.
+	state.fail_save = function(path)
+		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	state.fail_save = nil
+
+	-- Process death, and the identity record loses its SUBJECT field
+	-- (partial corruption / an older-build rewrite) while consent stays
+	-- granted. The relaunch has NO provable current scope: the surviving
+	-- marker must condemn conservatively — the SDK cannot demonstrate it
+	-- stale, and the spooled facts carry the withdrawn keys.
+	storage.reset()
+	local identity_path = nil
+	for key in pairs(stores) do
+		if key:match("/identity$") then
+			identity_path = key
+		end
+	end
+	assert_true(identity_path ~= nil and stores[identity_path] ~= nil)
+	stores[identity_path].experiments_client_id = nil
+
+	local relaunch = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	local resent = 0
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			resent = resent + 1
+			assert_true(not requests[i].body:find("experiment_exposure", 1, true),
+				"withdrawn facts must not replay when no current scope can disprove the marker")
+			assert_true(requests[i].body:find("filler%-host%-event") ~= nil,
+				"the host's spooled events still deliver")
+		end
+	end
+	assert_true(resent > 0, "the surviving envelopes re-sent")
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -5515,6 +5641,8 @@ local tests = {
 	test_numeric_payload_counts_toward_record_cap,
 	test_stale_transient_does_not_pace_settled_key,
 	test_replacement_fact_capture_survives_settled_purge,
+	test_reissued_fact_key_replaces_settled_spool_copy,
+	test_condemned_marker_holds_without_subject,
 }
 
 for _, test in ipairs(tests) do
