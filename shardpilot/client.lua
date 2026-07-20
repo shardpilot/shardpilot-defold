@@ -501,13 +501,20 @@ function M.new(config)
 		spcid = spcid,
 		-- Client-side exposure de-duplication (the server does not
 		-- de-duplicate): one DELIVERED experiment_exposure per assignment
-		-- subject per client lifetime (per launch, in practice). Keys commit
-		-- on enqueue and re-arm when a consent revocation purges the still-
-		-- undelivered event (see rearm_purged_exposures).
+		-- IDENTITY — experiment, version, and fact subject (see
+		-- exposure_dedupe_key) — per client lifetime (per launch, in
+		-- practice). Keys commit on enqueue and re-arm when a consent
+		-- revocation purges the still-undelivered event (see
+		-- rearm_purged_exposures).
 		exposure_tracked = {},
 		-- The opt-in remote-config revalidation timer's dt accumulator
-		-- (update-driven, like the flush pacing).
+		-- (update-driven, like the flush pacing) and the completed-fetch
+		-- count it last re-armed against: the accumulator measures time
+		-- since the LATEST completed remote-config fetch on any lane, so a
+		-- freshly observed (e.g. server-shortened) max-age governs the next
+		-- tick instead of a stale previously-armed deadline firing first.
 		rc_revalidate_elapsed = 0,
+		rc_revalidate_completed = 0,
 		consent_state = consent_state,
 		-- Durable consent-receipt outbox (mirror of the persisted record,
 		-- oldest receipt first). Receipts are delivered serially, strictly in
@@ -920,6 +927,18 @@ function Client:experiment_assignment(experiment_key)
 	return self.experiments:get_assignment(experiment_key)
 end
 
+-- The exposure dedupe key: the FULL assignment identity — experiment key,
+-- version, and fact subject — joined with a separator none of them carries.
+-- Keying on the fact subject alone could suppress a different assignment's
+-- exposure whose subject coincides: the client_id-unit subject_fact_key
+-- derives from the experiment salt and the subject only, so it is stable
+-- across versions of one experiment (a re-fetched bumped version is a NEW
+-- assignment that must emit its own exposure) and identical across any two
+-- experiments that happen to share a salt.
+local function exposure_dedupe_key(experiment_key, version, subject)
+	return tostring(experiment_key) .. "\31" .. tostring(version) .. "\31" .. tostring(subject)
+end
+
 -- Re-arm the per-launch exposure de-duplication for exposure facts a consent
 -- revocation purged BEFORE delivery: the dedupe key is committed at enqueue,
 -- but a purged fact never left the device — leaving the key burned would
@@ -939,7 +958,10 @@ local function rearm_purged_exposures(self, events)
 		if type(event) == "table" and event.event_name == "experiment_exposure"
 			and type(event.props) == "table"
 			and event.props.assignment_key ~= nil then
-			self.exposure_tracked[event.props.assignment_key] = nil
+			self.exposure_tracked[exposure_dedupe_key(
+				event.props.experiment_key,
+				event.props.experiment_version,
+				event.props.assignment_key)] = nil
 		end
 	end
 end
@@ -1283,9 +1305,10 @@ local function fact_props(snapshot)
 end
 
 -- Emit ONE experiment_exposure when the game first acts on this assignment.
--- De-duplicated client-side per assignment subject per launch (the server
--- does not de-duplicate); a repeat call reports `duplicate_exposure`. The
--- dedupe commits only on a successful enqueue, so an exposure dropped by the
+-- De-duplicated client-side per assignment identity (experiment, version,
+-- fact subject — see exposure_dedupe_key) per launch; the server does not
+-- de-duplicate. A repeat call reports `duplicate_exposure`. The dedupe
+-- commits only on a successful enqueue, so an exposure dropped by the
 -- consent gate is NOT burned — it emits normally after a later grant.
 function Client:track_experiment_exposure(experiment_key)
 	local snapshot, err = fact_snapshot(self, experiment_key)
@@ -1300,12 +1323,14 @@ function Client:track_experiment_exposure(experiment_key)
 	-- code — game calls and http callbacks alike — on one Lua VM thread, and
 	-- nothing between the check, the synchronous enqueue, and the mark
 	-- yields, so two exposure calls can never interleave here.
-	if self.exposure_tracked[props.assignment_key] then
+	local dedupe_key = exposure_dedupe_key(
+		snapshot.experiment_key, snapshot.version, props.assignment_key)
+	if self.exposure_tracked[dedupe_key] then
 		return false, "duplicate_exposure"
 	end
 	local ok, enqueue_err = enqueue_gated_event(self, "experiment_exposure", props, nil, true)
 	if ok then
-		self.exposure_tracked[props.assignment_key] = true
+		self.exposure_tracked[dedupe_key] = true
 	end
 	return ok, enqueue_err
 end
@@ -1383,6 +1408,16 @@ function Client:update_remote_config_revalidation(dt)
 	end
 	if type(dt) ~= "number" or dt <= 0 then
 		return
+	end
+	-- Re-arm from the latest COMPLETED fetch (any lane): that fetch just
+	-- revalidated the configuration — and may have observed a NEW max-age —
+	-- so the next revalidation is due one CURRENT interval after it. A
+	-- server-shortened max-age thereby takes effect at the next tick
+	-- instead of a stale longer deadline firing first, and a host fetch is
+	-- never followed by a near-immediate redundant timer fetch.
+	if self.remote_config.fetches_completed ~= self.rc_revalidate_completed then
+		self.rc_revalidate_completed = self.remote_config.fetches_completed
+		self.rc_revalidate_elapsed = 0
 	end
 	self.rc_revalidate_elapsed = self.rc_revalidate_elapsed + dt
 	if self.rc_revalidate_elapsed < self.remote_config:revalidate_interval_seconds() then

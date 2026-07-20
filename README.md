@@ -455,9 +455,13 @@ cheap `304` — letting an already-running client converge on a server-side kill
 or config change within one interval instead of "next explicit fetch". Unset,
 nothing changes: the SDK keeps its no-automatic-refresh stance exactly.
 
-- **Interval:** the server's `Cache-Control` max-age, floored at **60s**;
-  **300s** while no max-age has been observed. *(Interval anchoring is pending
-  coordinator ratification; ADR-0259 pins no numbers.)*
+- **Interval:** the server's `Cache-Control` client `max-age` (directive-
+  boundary parsed; `s-maxage` never counts), floored at **60s**; **300s**
+  while no max-age has been observed. The timer re-arms from the latest
+  completed fetch on any lane, so a freshly observed shorter max-age
+  governs the next tick instead of a stale longer deadline firing first.
+  *(Interval anchoring is pending coordinator ratification; ADR-0259 pins
+  no numbers.)*
 - **Transient failures keep the schedule** — the durable cache serves, and no
   extra retry happens inside an interval.
 - **The timer halts after an authoritative `401`/`403`** on this plane until a
@@ -558,7 +562,9 @@ assignments the fact subject (`assignment_key` prop) is the derived
 `subject_fact_key` — **the raw spcid never rides event props** — and the
 envelope always carries `anonymous_id` (GDPR erasure reachability) and never
 `user_id`. Exposures are de-duplicated client-side, once per assignment
-subject per launch; outcomes are not.
+identity (experiment + version + fact subject) per launch — a purged-before-
+delivery exposure re-arms after a consent revocation; outcomes are not
+de-duplicated.
 
 **Dark-phase truth (today):**
 

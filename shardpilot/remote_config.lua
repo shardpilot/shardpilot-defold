@@ -446,6 +446,12 @@ function M.new(config, identity)
 		-- per fetch (no latch on classification, cache, or getters). Resets
 		-- only with a new client (re-init / config change).
 		auth_refused = false,
+		-- Count of fetches whose RESPONSE has been processed (any lane, any
+		-- outcome). The opt-in revalidation timer re-arms its interval from
+		-- the latest completed fetch, so a freshly observed (e.g. shorter)
+		-- Cache-Control max-age governs the NEXT tick instead of a stale
+		-- previously-armed deadline firing first.
+		fetches_completed = 0,
 	}, RemoteConfig)
 	-- Serve the persisted last-known-good snapshot immediately after a
 	-- restart: getters work before (and without) any fetch when a cache for
@@ -735,6 +741,7 @@ function RemoteConfig:fetch(callback)
 		if authoritative and not result.ok and result.error == "unauthorized" then
 			self.auth_refused = true
 		end
+		self.fetches_completed = self.fetches_completed + 1
 		self:install(seq, result, new_cache, scope, authoritative, cache, revalidated_cache)
 		finish(result)
 	end, headers, nil, options)

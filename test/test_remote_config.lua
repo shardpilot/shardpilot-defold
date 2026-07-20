@@ -1975,6 +1975,33 @@ local function test_revalidation_interval_floor_and_default()
 	assert_equal(count_requests(), 2)
 end
 
+local function test_revalidation_rearms_on_shorter_max_age()
+	reset()
+	local client = assert(sdk.new(config({ remote_config_revalidate = true })))
+	-- Armed long: no max-age observed yet, so the 300s default governs and
+	-- most of it has already accumulated.
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	next_response_headers = { etag = 'W/"v1"' }
+	assert_true(fetch(client).ok)
+	client:update(250)
+	assert_equal(count_requests(), 1, "the default interval has not elapsed yet")
+
+	-- A host fetch observes a SHORTER max-age. The stale long deadline must
+	-- not fire first: the timer re-arms from the observing fetch, so the
+	-- next revalidation lands about one NEW interval (60s) after it.
+	next_response_headers = { etag = 'W/"v1"', ["cache-control"] = "max-age=60" }
+	assert_true(fetch(client).ok)
+	assert_equal(count_requests(), 2)
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = nil
+	client:update(59)
+	assert_equal(count_requests(), 2, "the shortened window re-arms from the observing fetch")
+	client:update(2)
+	assert_equal(count_requests(), 3, "the next revalidation lands about one new interval later")
+end
+
 local function test_revalidation_transient_failure_keeps_the_schedule()
 	reset()
 	local client = assert(sdk.new(config({ remote_config_revalidate = true })))
@@ -2130,6 +2157,7 @@ local tests = {
 	test_revalidation_defaults_off,
 	test_revalidation_fires_conditional_get_on_the_max_age_interval,
 	test_revalidation_interval_floor_and_default,
+	test_revalidation_rearms_on_shorter_max_age,
 	test_revalidation_transient_failure_keeps_the_schedule,
 	test_revalidation_halts_after_auth_refusal_manual_fetch_unaffected,
 	test_facade_serves_defaults_when_not_initialized,

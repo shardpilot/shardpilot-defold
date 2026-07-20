@@ -239,7 +239,16 @@ local function parse_assignment(body)
 	if type(decoded.assigned) ~= "boolean" then
 		return nil
 	end
-	if type(decoded.version) ~= "number" then
+	-- The published version is a positive integer. Anything else — a
+	-- fractional value, zero/negative, an out-of-int-range magnitude, or a
+	-- non-finite number — is a body this build cannot attribute facts to
+	-- (experiment_version rides the producer props verbatim): malformed.
+	-- The NaN self-inequality check runs before math.floor so floor is only
+	-- ever applied to a finite in-range number.
+	local version = decoded.version
+	if type(version) ~= "number" or version ~= version
+		or version < 1 or version > 2147483647
+		or version ~= math.floor(version) then
 		return nil
 	end
 	if type(decoded.experiment_key) ~= "string" or decoded.experiment_key == "" then

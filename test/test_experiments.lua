@@ -543,6 +543,11 @@ local function test_apply_malformed_bodies_are_transient()
 		assigned_raw_payload("[1,2]"),
 		assigned_raw_payload("[]"),
 		assigned_raw_payload("null"),
+		-- The version must be a positive integer in int range.
+		assigned_body({ version = 3.5 }),
+		assigned_body({ version = 0 }),
+		assigned_body({ version = -1 }),
+		assigned_body({ version = 1e300 }),
 	}
 	local cache = { body = assigned_body(), fetched_at_ms = 1000 }
 	for index, body in ipairs(malformed) do
@@ -1353,6 +1358,39 @@ local function test_exposure_dedupe_is_per_launch()
 	restore()
 end
 
+local function test_exposure_dedupe_keys_on_full_assignment_identity()
+	reset()
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = nil
+	assert_true(client:set_consent(true))
+
+	-- Two experiments whose fact subjects COINCIDE (forced here — e.g. a
+	-- shared salt makes client_id-unit sfks collide): each emits its own
+	-- exposure, because the dedupe keys on the full assignment identity
+	-- (experiment + version + subject), never on the subject alone.
+	next_status = 200
+	next_response_body = assigned_body()
+	assert_true(fetch(client, "exp-armor").ok)
+	next_response_body = assigned_body({ experiment_key = "exp-shield", variant_key = "variant-s" })
+	assert_true(fetch(client, "exp-shield").ok)
+	assert_true(client:track_experiment_exposure("exp-armor"))
+	assert_true(client:track_experiment_exposure("exp-shield"),
+		"a coinciding fact subject must not suppress another experiment's exposure")
+
+	-- A bumped VERSION of the same experiment is a NEW assignment identity
+	-- (the client_id-unit sfk is version-stable by construction): its
+	-- exposure emits too, and only the true repeat is de-duplicated.
+	next_response_body = assigned_body({ version = 4, variant_key = "variant-v4" })
+	assert_true(fetch(client, "exp-armor").ok)
+	assert_true(client:track_experiment_exposure("exp-armor"),
+		"a bumped version must emit its own exposure despite the version-stable sfk")
+	local repeat_ok, repeat_err = client:track_experiment_exposure("exp-armor")
+	assert_equal(repeat_ok, false)
+	assert_equal(repeat_err, "duplicate_exposure")
+	assert_equal(client.stats.enqueued, 3)
+end
+
 local function test_consent_purge_rearms_undelivered_exposure_dedupe()
 	reset()
 	local client = granted_client_with_assignment()
@@ -1489,6 +1527,7 @@ local tests = {
 	test_producers_refuse_without_assigned_decision,
 	test_synthetic_unit_fact_uses_response_assignment_key,
 	test_exposure_dedupe_is_per_launch,
+	test_exposure_dedupe_keys_on_full_assignment_identity,
 	test_consent_purge_rearms_undelivered_exposure_dedupe,
 	test_facade_reports_not_initialized,
 	test_facade_delegates_to_the_default_client,

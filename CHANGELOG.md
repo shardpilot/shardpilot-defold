@@ -54,9 +54,12 @@
   `subject_fact_key` (`sfk1_…`), the raw spcid never rides event props, and
   the envelope always carries `anonymous_id` (erasure reachability) and
   never `user_id`. Exposures are de-duplicated client-side per assignment
-  subject per launch (a consent revocation that purges a still-undelivered
-  exposure re-arms its dedupe key, so a later re-grant can report it —
-  delivered exposures stay deduped); outcomes are not.
+  IDENTITY — experiment + version + fact subject, never the subject alone
+  (the version-stable, potentially colliding sfk must not suppress another
+  assignment's exposure) — per launch; a consent revocation that purges a
+  still-undelivered exposure re-arms its dedupe key, so a later re-grant
+  can report it (delivered exposures stay deduped). Outcomes are not
+  de-duplicated.
 - **Opt-in periodic remote-config revalidation, default OFF** (kill-switch
   reach, ADR-0259 gate 2(a)). New boolean config `remote_config_revalidate`
   (requires `remote_config_url`; capability
@@ -65,7 +68,9 @@
   converges on a server-side kill within one interval. Interval = the
   server's `Cache-Control` client `max-age` (directive-boundary parsed —
   `s-maxage` and lookalike names never match) floored at 60s, 300s while
-  unknown
+  unknown; the timer re-arms from the latest completed fetch on any lane,
+  so a freshly observed shorter max-age governs the next tick instead of a
+  stale longer deadline firing first
   [pending coordinator ratification]; transient failures keep the schedule;
   the timer halts after an authoritative `401`/`403` until a new client is
   constructed [pending ratification] while explicit fetches stay available
