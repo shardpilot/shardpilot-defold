@@ -456,6 +456,14 @@ function M.new(config)
 		-- retained, the settle path filters the withdrawn facts before any
 		-- retry or spool capture.
 		experiment_purge_awaited = false,
+		-- Set while CONDEMNED experiment facts remain on the durable spool
+		-- because their removal write failed (the sentinel purge's rewrite,
+		-- or the relaunch condemnation filter): durable work still owed.
+		-- The condemnation marker's retire check consults this — the
+		-- marker must outlive the stale file, or the launch after next
+		-- replays the withdrawn keys. Cleared by any successful spool
+		-- write (the whole file is rewritten from the filtered state).
+		condemned_spool_pending = false,
 		publish_in_flight = false,
 		publish_retry_after_ms = nil,
 		publish_backoff_attempt = 0,
@@ -594,6 +602,12 @@ function M.new(config)
 				return client:capture_experiment_fact(
 					event_name, props, event_id, overrides)
 			end,
+			spool_condemned_pending = function()
+				-- Condemned facts still on the durable spool (a removal
+				-- write that could not land): the condemnation marker
+				-- must not retire over them.
+				return client.condemned_spool_pending == true
+			end,
 		})
 	end
 	-- Offline event spool: re-load the envelopes a previous launch could not
@@ -677,21 +691,33 @@ function M.new(config)
 			and client.experiments:condemnation_covers_current_scope() then
 			-- A real-subjects condemnation survived the exit (the sentinel's
 			-- clear or its sidecar marker is still armed) AND covers the
-			-- current scope: spooled experiment facts carry the withdrawn
+			-- current scope: spooled experiment facts carrying the withdrawn
 			-- subject-fact keys — a sentinel purge's failed spool rewrite
-			-- followed by a process death leaves them here — and re-sending
-			-- them would keep egressing what the kill switch killed. Drop
-			-- them at load; the rewrite below persists the removal. A stale
-			-- marker from a retired environment/credential/subject does NOT
-			-- condemn the current scope's facts — it settles through the
-			-- normal retire path while this launch's plane loads normally.
+			-- followed by a process death leaves them here — must not
+			-- re-send. The drop is PARTITIONED by the marker's own stamp,
+			-- the record partition's dispatch-bound rule extended to the
+			-- spool: a fact whose event_ts is STRICTLY AFTER the stamp
+			-- postdates the sentinel's authority (a flip-back re-exposure
+			-- captured before the exit) and SURVIVES; a fact at/before it
+			-- is what the sentinel withdrew and drops. A marker whose
+			-- in-scope facts are ALL post-stamp therefore condemns nothing
+			-- — the settled-but-unretired sidecar case — and retires on
+			-- the first tick instead of eating fresh facts. A stale marker
+			-- from a retired environment/credential/subject never reaches
+			-- this branch at all.
+			local stamp_iso = client.experiments:condemnation_stamp_iso()
 			local kept = {}
 			for i = 1, #spooled do
-				local name = spooled[i].event_name
-				if name == "experiment_exposure" or name == "experiment_outcome" then
+				local env = spooled[i]
+				local name = env.event_name
+				local is_fact = name == "experiment_exposure"
+					or name == "experiment_outcome"
+				if is_fact and not (stamp_iso ~= nil
+					and type(env.event_ts) == "string"
+					and env.event_ts > stamp_iso) then
 					condemned = condemned + 1
 				else
-					kept[#kept + 1] = spooled[i]
+					kept[#kept + 1] = env
 				end
 			end
 			if condemned > 0 then
@@ -716,6 +742,18 @@ function M.new(config)
 			-- and the caps apply on the next successful write.
 			if client:write_spool_record(spooled) then
 				spooled = client.spool_record
+			elseif condemned > 0 then
+				-- The CONDEMNATION could not land durably: the stale file
+				-- still carries the withdrawn facts, and with everything
+				-- condemned there may be nothing left to resend/ack that
+				-- would ever rewrite it. This is durable work — record the
+				-- debt so the rewrite retries at every dispatch point, and
+				-- so the condemnation marker stays alive (the retire check
+				-- consults it) until the file is actually clean; a retired
+				-- marker over a stale file would replay the withdrawn keys
+				-- at the launch after next.
+				client.spool_rewrite_pending = true
+				client.condemned_spool_pending = true
 			end
 		end
 		if #spooled > 0 then
@@ -2121,6 +2159,9 @@ function Client:purge_experiment_facts()
 	end
 	if marked and not self:write_spool_record(self.spool_record) then
 		self.spool_rewrite_pending = true
+		-- The withdrawn facts are still on disk: durable debt — the
+		-- condemnation marker must not retire until a write lands.
+		self.condemned_spool_pending = true
 	end
 	if purged > 0 then
 		-- Terminal non-delivery by server mandate: counted like the
@@ -2154,7 +2195,17 @@ function Client:capture_experiment_fact(event_name, props, event_id, overrides)
 	overrides = overrides or {}
 	local session_id = overrides.session_id or self.session_id
 	if type(session_id) ~= "string" or session_id == "" then
-		return false
+		session_id = nil
+		-- Mirror the enqueue path's source-conditional session rule: a
+		-- backend-source client legitimately ships sessionless envelopes
+		-- (enqueue never lazily opens a session for it), so its drop-time
+		-- capture must not refuse for lacking one — a backend owed fact
+		-- behind a full queue would otherwise die with the entry on a
+		-- kill. Every OTHER source still requires a session identity: a
+		-- background capture opens no phantom session.
+		if self.config.source ~= "backend" then
+			return false
+		end
 	end
 	local props_snapshot = copy_table(props, "invalid_props")
 	local event = {
@@ -2227,6 +2278,9 @@ function Client:write_spool_record(events)
 	end
 	self.spool_settled = {}
 	self.spool_rewrite_pending = false
+	-- The whole file was just rewritten from the filtered state: no
+	-- condemned content can remain on disk.
+	self.condemned_spool_pending = false
 	self.spool_disk_deadline_ms = self.spool_retry_after_ms
 	return true
 end
@@ -2280,6 +2334,7 @@ function Client:spool_envelopes(envelopes)
 	local fresh = {}
 	local seen = {}
 	local replaced = false
+	local replaced_ids = nil
 	for i = 1, #envelopes do
 		local env = envelopes[i]
 		local event_id = type(env) == "table" and env.event_id or nil
@@ -2314,6 +2369,8 @@ function Client:spool_envelopes(envelopes)
 							if not props_equal(stored.props, env.props) then
 								self.spool_record[j] = env
 								replaced = true
+								replaced_ids = replaced_ids or {}
+								replaced_ids[event_id] = true
 							end
 							break
 						end
@@ -2360,6 +2417,18 @@ function Client:spool_envelopes(envelopes)
 		end
 	end
 	self.stats.spooled = self.stats.spooled + survivors
+	if replaced_ids then
+		-- An in-place replacement sits at its ORIGINAL position, so the
+		-- caps' oldest-first eviction can reach it exactly like any old
+		-- entry: a replacement that did not survive into the saved record
+		-- was NOT captured, and a durability-dependent caller must not
+		-- report it safe on the strength of the overwrite alone.
+		for event_id in pairs(replaced_ids) do
+			if not self.spool_index[event_id] then
+				return false
+			end
+		end
+	end
 	return survivors == #fresh
 end
 

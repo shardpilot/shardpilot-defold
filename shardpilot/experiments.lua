@@ -1364,6 +1364,19 @@ end
 -- failed delete just means a later pass, or the next construction's first
 -- tick, retries it).
 function Experiments:retire_clear_marker()
+	if self.deps.spool_condemned_pending and self.deps.spool_condemned_pending() then
+		-- Condemned spool content is still on disk (a condemnation-filter
+		-- or purge rewrite that could not land): the marker is the only
+		-- durable refusal that survives an exit, and retiring it now —
+		-- from ANY settle path: the record clear landing, a demotion's
+		-- vanished target, the periodic settled check — would let the
+		-- launch after next replay the withdrawn facts from the stale
+		-- file. Held until the spool clear lands; a lingering marker over
+		-- settled record state condemns nothing meanwhile (the stamp
+		-- partition spares post-sentinel facts), and the settled check
+		-- retires it once the debt clears.
+		return
+	end
 	if storage.clear_experiments_clear(self.config) then
 		self.clear_marker = nil
 	end
@@ -1442,6 +1455,13 @@ end
 -- pass and after an install's combined save.
 function Experiments:retire_clear_marker_if_settled()
 	if not self.clear_marker or self.durable_clear_pending then
+		return
+	end
+	if self.deps.spool_condemned_pending and self.deps.spool_condemned_pending() then
+		-- Condemned spool content still on disk: not settled — "record
+		-- clean" is half the condition (retire_clear_marker enforces the
+		-- same rule as the chokepoint; this early-out just skips the
+		-- record read).
 		return
 	end
 	local record, miss = storage.load_experiments(self.config)
@@ -1822,10 +1842,31 @@ function Experiments:condemnation_covers_current_scope()
 		-- identity loss, the withdrawn keys must not replay just because
 		-- the comparator went blind; a later mint (a fresh subject = a
 		-- fresh scope) settles the stale marker through the normal retire
-		-- path.
+		-- path. (The spool filter still stamp-partitions what it drops —
+		-- post-sentinel facts survive even blind, the record partition's
+		-- rule.)
 		return true
 	end
 	return self:scope_for(subject) == condemned_scope
+end
+
+-- The armed condemnation's stamp, formatted for comparison against envelope
+-- event_ts values (the clock's own second-granular ISO shape, so plain
+-- string comparison is chronological). The spool filter partitions by it:
+-- the sentinel's authority is bounded by its stamp, so a fact minted
+-- strictly after it is post-sentinel state the condemnation never covered.
+-- Nil while nothing is armed.
+function Experiments:condemnation_stamp_iso()
+	local stamp = nil
+	if type(self.durable_clear_pending) == "number" then
+		stamp = self.durable_clear_pending
+	elseif self.clear_marker and type(self.clear_marker.stamp) == "number" then
+		stamp = self.clear_marker.stamp
+	end
+	if not stamp then
+		return nil
+	end
+	return clock.iso_utc(stamp)
 end
 
 -- True while any durable cache write, drop, or whole-record clear is still

@@ -5499,6 +5499,216 @@ local function test_condemned_marker_holds_without_subject()
 	storage.reset()
 end
 
+local function test_condemnation_survives_failed_spool_clear()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+	-- Sentinel with record AND spool stores down: only the marker lands;
+	-- the spool file keeps the withdrawn fact (its only content).
+	state.fail_save = function(path)
+		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+
+	-- SECOND launch with the spool store still down: the condemnation
+	-- filter drops the fact (nothing survives → nothing will ever resend
+	-- or ack) and the CLEAR WRITE FAILS. That is durable work — the
+	-- rewrite debt must be recorded and the marker must stay alive: the
+	-- record side settles on the first tick, and a retired marker over
+	-- the stale file would replay the withdrawn fact one launch later.
+	storage.reset()
+	state.fail_save = function(path)
+		return path:match("/spool$") ~= nil
+	end
+	local second = assert(sdk.new(config()))
+	second:update(0.016)
+	assert_true(second.condemned_spool_pending == true,
+		"the failed condemnation clear is recorded as durable debt")
+	local marker_path = nil
+	for key in pairs(stores) do
+		if key:match("/experiments%-clear$") then
+			marker_path = key
+		end
+	end
+	assert_true(marker_path ~= nil and type(stores[marker_path]) == "table"
+		and stores[marker_path].stamp ~= nil,
+		"the marker outlives the stale spool file")
+	state.fail_save = nil
+
+	-- THIRD launch, store healed: the surviving marker condemns again,
+	-- the clear lands this time, and nothing withdrawn replays.
+	storage.reset()
+	local third = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(third:flush({ include_summaries = false }))
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			assert_true(not requests[i].body:find("experiment_exposure", 1, true),
+				"the withdrawn fact never replays across the failed-clear launches")
+		end
+	end
+	restore()
+	storage.reset()
+end
+
+local function test_evicted_replacement_reports_capture_failure()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local new_fact_key = "sfk1_" .. string.rep("d", 64)
+	local client = granted_client({ spool_max_events = 1 })
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+	state.fail_save = function(path)
+		return path:match("/spool$") ~= nil
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	next_status = 200
+	next_response_body = assignment_body({ subject_fact_key = new_fact_key })
+	fetch(client, "exp-checkout")
+	assert_true(client:track("late-host-event"))
+	state.fail_save = nil
+
+	-- The capture replaces the settled copy IN PLACE — at the FRONT of the
+	-- record — and the one-event cap then evicts exactly that position to
+	-- admit the appended host event. A replacement that fell out of the
+	-- saved record was NOT captured: persist must not claim the fact safe.
+	local ok = client:persist()
+	assert_equal(ok, false,
+		"an evicted in-place replacement must fail the capture report")
+	restore()
+	storage.reset()
+end
+
+local function test_settled_marker_spares_fresh_facts()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	client:update(0.016)
+	assert_true(client:flush({ include_summaries = false }))
+	-- Sentinel with the record store down mints the marker...
+	state.fail_save = fail_experiment_saves
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	-- ...the record store heals but the SIDECAR delete fails: the clear
+	-- fully settles on the first tick while the stale marker file stays.
+	state.fail_save = function(path)
+		return path:match("/experiments%-clear$") ~= nil
+	end
+	client:update(0.016)
+	assert_true(client.experiments.durable_clear_pending == false,
+		"the whole-record clear settled")
+
+	-- The platform re-enables; a FRESH post-sentinel assignment applies
+	-- and its exposure spools on a transient failure.
+	advance_seconds(5)
+	next_status = 200
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+	state.fail_save = nil
+
+	-- Relaunch under the STALE settled marker: the spool partition must
+	-- spare the post-stamp fresh fact — a fully settled condemnation
+	-- condemns nothing, and eating fresh facts on its account corrupts
+	-- the new assignment's delivery.
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	local resent_exposure = false
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true)
+			and requests[i].body:find("experiment_exposure", 1, true) then
+			resent_exposure = true
+		end
+	end
+	assert_true(resent_exposure,
+		"a settled marker must not condemn post-sentinel fresh facts")
+	restore()
+	storage.reset()
+end
+
+local function test_backend_owed_fact_capture_without_session()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client({ source = "backend", buffer_size = 1 })
+	assert_true(client:track("filler-backend-event"))
+	-- Backend sources never open sessions — the queue is full, so the
+	-- applied assignment's exposure stays OWED and sessionless.
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0,
+		"the exposure is owed behind the full queue")
+
+	-- The kill switch drops the entry durably: the drop-time capture must
+	-- spool the owed fact WITHOUT a session — backend envelopes are
+	-- legitimately sessionless on the normal enqueue path too, and a
+	-- process kill would otherwise lose the fact with its entry.
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-checkout")
+
+	storage.reset()
+	local relaunch = assert(sdk.new(config({ source = "backend", buffer_size = 1 })))
+	assert_true(relaunch:spool_pending(),
+		"the sessionless backend fact was durably captured")
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	local replayed = false
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true)
+			and requests[i].body:find("experiment_exposure", 1, true) then
+			replayed = true
+		end
+	end
+	assert_true(replayed, "the backend owed fact replays after the kill")
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -5643,6 +5853,10 @@ local tests = {
 	test_replacement_fact_capture_survives_settled_purge,
 	test_reissued_fact_key_replaces_settled_spool_copy,
 	test_condemned_marker_holds_without_subject,
+	test_condemnation_survives_failed_spool_clear,
+	test_evicted_replacement_reports_capture_failure,
+	test_settled_marker_spares_fresh_facts,
+	test_backend_owed_fact_capture_without_session,
 }
 
 for _, test in ipairs(tests) do
