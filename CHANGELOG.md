@@ -6,6 +6,60 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **Opt-in experiment-assignment consumer, shipped dark** (GAP-017,
+  ADR-0259). New module `shardpilot/experiments.lua` + config
+  `experiments_url` / `experiments_app_key` / `experiments_environment_key`
+  (publishable-api_key auth, valid alongside a Mode B `token_provider` like
+  the remote-config exception) expose
+  `fetch_experiment_assignment(experiment_key, callback)` and the
+  `experiment_assignment(experiment_key)` snapshot getter:
+  `GET {experiments_url}/api/cp/v1/runtime/experiments/assignment` with a
+  durable per-scope last-known-good cache. The fetch subject is a new
+  dedicated persisted `spcid_…` installation id
+  (`^spcid_[A-Za-z0-9_-]{20,64}$`, minted as `spcid_` + UUIDv7 at the first
+  opted-in init, stored in the identity record, exposed via `get_spcid()`)
+  — never derived from and never replacing the anonymous id, which keeps its
+  value, format, and remote-config `client_id` role. Classification is the
+  remote-config per-fetch canon ported verbatim (transients serve the cache;
+  `401`/`403` fail closed for that fetch with NO cross-fetch latch; other
+  statuses permanent) plus the two ratified assignment-plane extras: the
+  cached record and its `subject_fact_key` are dropped ONLY on the exact
+  `403` sentinel body `experiment real-subject assignment is disabled`
+  (string equality; generic flag-off bodies never drop), and the automatic
+  assignment lane halts after any authoritative `401`/`403` until re-init
+  (`automatic_fetch_allowed()`; host-triggered fetches never blocked, still
+  per-fetch). All three not-assigned 200 shapes (`reason` absent /
+  `kill_switch` / `targeting_unmatched`) are handled as valid decisions.
+  DARK: the platform flags are off everywhere, so every call answers `403`
+  today — handled cleanly; without the opt-in the SDK's wire behavior and
+  identity record are byte-identical to before.
+- **Exposure/outcome producers through the existing consent-gated queue**
+  (dark; server-side client-tier admission is decision-gated and closed
+  today). `track_experiment_exposure(experiment_key)` /
+  `track_experiment_outcome(experiment_key, outcome_key, outcome_value)`
+  build `experiment_exposure` / `experiment_outcome` events from the cached
+  ASSIGNED decision (never for `assigned = false`) and enqueue them through
+  the same consent-first path as `track()` — consent unknown ⇒ dropped,
+  denied ⇒ dropped, no new unconsented network path — onto the existing
+  `/v1/events:batch` pipe. Props are the server's strict allowlist only;
+  for `client_id`-unit assignments the fact subject is the server-derived
+  `subject_fact_key` (`sfk1_…`), the raw spcid never rides event props, and
+  the envelope always carries `anonymous_id` (erasure reachability) and
+  never `user_id`. Exposures are de-duplicated client-side per assignment
+  subject per launch; outcomes are not.
+- **Opt-in periodic remote-config revalidation, default OFF** (kill-switch
+  reach, ADR-0259 gate 2(a)). New boolean config `remote_config_revalidate`
+  (requires `remote_config_url`; capability
+  `supports("remote_config_revalidation")`): the `update(dt)` tick paces a
+  conditional GET (cached ETag as `If-None-Match`) so a running client
+  converges on a server-side kill within one interval. Interval = the
+  server's `Cache-Control` max-age floored at 60s, 300s while unknown
+  [pending coordinator ratification]; transient failures keep the schedule;
+  the timer halts after an authoritative `401`/`403` until a new client is
+  constructed [pending ratification] while explicit fetches stay available
+  and classify per fetch. Unset, the no-automatic-refresh stance is
+  preserved byte-for-byte, and per-fetch classification/cache semantics are
+  unchanged with the timer on.
 - **CI gained an engine-real `bob-build` leg** (fleet-audit gap: the
   contract core was interpreter-tested only, with no proof the tree still
   works as an actual Defold library). On every PR and push to `main`,

@@ -6,9 +6,11 @@
 local shardpilot = require "shardpilot.sdk"
 local shardpilot_crash = require "shardpilot.crash"
 local shardpilot_remote_config = require "shardpilot.remote_config"
+local shardpilot_experiments = require "shardpilot.experiments"
 
 function init(self)
 	self.ok = shardpilot ~= nil
 		and shardpilot_crash ~= nil
 		and shardpilot_remote_config ~= nil
+		and shardpilot_experiments ~= nil
 end

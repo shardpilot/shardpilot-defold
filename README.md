@@ -426,10 +426,13 @@ way.
   survives restarts and is served offline (from the durable record; on hosts
   without the `sys` save-file API the cache is memory-only and lasts for the
   process lifetime, like the identity record).
-- **Not guaranteed / not provided:** the SDK never fetches on its own — there
-  is no automatic or interval refresh, no `Cache-Control` interpretation, and
-  no push; every fetch is an explicit call. There is no experiment
-  assignment, no exposure events, and no client-side stats. A config body
+- **Not guaranteed / not provided:** by default the SDK never fetches on its
+  own — every fetch is an explicit call and there is no push channel. The one
+  opt-in exception is periodic revalidation (`remote_config_revalidate =
+  true`, default **off** — see below), which paces conditional GETs of this
+  same endpoint from `update(dt)`. Experiment assignment and exposure events
+  live on their own opt-in surface (see "Experiment assignment"), not here,
+  and there are no client-side stats. A config body
   large enough to approach the documented 512 KB `sys.save` cap — or any
   body whose durable write fails — is still served and stays the in-process
   offline fallback, but is not persisted (surfaced via `diagnostics`), and
@@ -441,6 +444,136 @@ way.
 - The fetch is **not consent-gated**: config delivery carries no analytics
   payload — the client id in the URL only scopes which config to serve
   (consistent across our SDKs). See [`docs/privacy.md`](docs/privacy.md).
+
+### Opt-in periodic revalidation (default off)
+
+`remote_config_revalidate = true` (requires `remote_config_url`; feature-detect
+with `shardpilot.supports("remote_config_revalidation")`) arms a timer on the
+`update(dt)` tick that revalidates the configuration with a conditional GET —
+the cached ETag rides as `If-None-Match`, so an unchanged config answers a
+cheap `304` — letting an already-running client converge on a server-side kill
+or config change within one interval instead of "next explicit fetch". Unset,
+nothing changes: the SDK keeps its no-automatic-refresh stance exactly.
+
+- **Interval:** the server's `Cache-Control` max-age, floored at **60s**;
+  **300s** while no max-age has been observed. *(Interval anchoring is pending
+  coordinator ratification; ADR-0259 pins no numbers.)*
+- **Transient failures keep the schedule** — the durable cache serves, and no
+  extra retry happens inside an interval.
+- **The timer halts after an authoritative `401`/`403`** on this plane until a
+  new client is constructed (re-init / config change) — an unattended loop
+  must not keep re-asking an endpoint that authoritatively refused it.
+  Host-triggered `fetch_remote_config` calls stay available throughout and
+  classify per fetch — no latch on classification, cache, or getters.
+  *(Mirroring the assignment plane's automatic-lane halt onto this timer is
+  pending coordinator ratification.)*
+- With the timer **off** (the default), operators plan on **next-fetch
+  semantics**: a kill reaches a client at its next explicit fetch.
+
+## Experiment assignment (dark, opt-in)
+
+Real-subject experiment assignment (ADR-0259, GAP-017). **This surface ships
+dark**: the platform's assignment flags are off in every environment today, so
+a well-built consumer simply receives `403` on every call until enablement —
+the expected posture, handled cleanly below. Everything is opt-in via
+`experiments_url`; without it the SDK's wire behavior (and its identity
+record) is byte-identical to today.
+
+```lua
+shardpilot.fetch_experiment_assignment("exp-armor", function(result)
+  -- result = { ok, from_cache, error?, assigned?, reason?, experiment_key?,
+  --            version?, assignment_key?, variant_key?, variant_payload?,
+  --            assignment_unit?, subject_fact_key? }
+  if result.ok and result.assigned then
+    apply_variant(result.variant_key, result.variant_payload)
+    shardpilot.track_experiment_exposure("exp-armor")
+  end
+end)
+
+-- Later, on the measured outcome (finite number or boolean):
+shardpilot.track_experiment_outcome("exp-armor", "level_finished", true)
+```
+
+The fetch is `GET {experiments_url}/api/cp/v1/runtime/experiments/assignment`
+with query parameters `app_key`, `environment_key` (`experiments_app_key` /
+`experiments_environment_key` — the control-plane **keys**, never ids; a wrong
+key surfaces as `401`), `experiment_key`, and `subject_key`, authenticated with
+the publishable `api_key` as the `Bearer`. `experiments_url` is the
+control-plane **origin** (no path); the SDK targets the public-prefix route.
+No targeting-attribute parameters are sent (parity with this SDK's
+remote-config fetch, which sends none).
+
+**The subject (`spcid`).** The `subject_key` is a dedicated persisted
+installation id matching `^spcid_[A-Za-z0-9_-]{20,64}$`, minted as
+`"spcid_" .. uuid_v7()` at the first experiments-configured init and stored in
+the identity record. It is **not** the anonymous id and is never derived from
+it: the anonymous id keeps its value, format, and remote-config `client_id`
+role untouched. `get_spcid()` exposes it; there is deliberately no setter. A
+launch without the opt-in never mints one (an un-opted install's identity
+record stays byte-identical), while an already-provisioned spcid always
+survives later identity-record rewrites.
+
+**Fetch semantics** (per-fetch, ported from the remote-config classifier):
+
+- **200** — served fresh and cached durably (per-scope records through the
+  same `sys.save` seam; a restart or offline launch serves last-known-good).
+  All **three not-assigned shapes are valid 200s**, distinguished by
+  `reason`: absent (the deterministic traffic gate), `"kill_switch"` (an
+  operator kill — machine-readable), `"targeting_unmatched"`. For
+  `client_id`-unit assignments the response's `subject_fact_key`
+  (`sfk1_<64 hex>`) is retained with the cached assignment.
+- **Transient failures** (offline, `408`, `429`, `5xx` — including the
+  endpoint's `503` kill-switch-state-unavailable — malformed body) serve the
+  cached assignment with `from_cache = true`; with no usable cache the fetch
+  fails.
+- **`401`/generic `403` fail closed for that fetch** (`unauthorized`,
+  classified by HTTP status alone) — and **nothing else**: no cross-fetch
+  latch, no cache drop, no getter clearing. A later fetch classifies
+  independently. The generic flag-off bodies (`experimentation runtime is
+  disabled`, `experiment assignment fetch is disabled`) land here.
+- **The sentinel drops the cache** — the ONE exception: a `403` whose JSON
+  `error` equals exactly `experiment real-subject assignment is disabled`
+  drops this scope's cached assignment record **and its `subject_fact_key`**
+  (a surface flipped back off must not keep being honored from cache).
+  Equality, never substring; an unparseable 403 body is generic.
+- **Automatic-lane halt:** after any authoritative `401`/`403` the automatic
+  assignment lane halts until re-init/config change
+  (`automatic_fetch_allowed()` on the assignment client answers false). This
+  SDK schedules no automatic assignment fetch itself; every
+  `fetch_experiment_assignment` call is host-triggered, classifies per
+  fetch, and is never blocked by the halt.
+- **Any other status is permanent** (`http_<status>`, e.g. `404` for an
+  unknown experiment): the fetch fails; cache and snapshot stay untouched.
+
+**Exposure/outcome facts.** `track_experiment_exposure` /
+`track_experiment_outcome` build `experiment_exposure` / `experiment_outcome`
+events from the cached **assigned** decision (never for `assigned = false`)
+and enqueue them through the SAME consent-first pipeline as every tracked
+event — consent unknown ⇒ dropped, denied ⇒ dropped, never held, no new
+unconsented path — onto the existing `/v1/events:batch` pipe. Props are the
+server's strict allowlist and nothing else (`experiment_key`,
+`experiment_version`, `assignment_key`, `variant_key`, `assignment_unit`,
+plus `outcome_key`/`outcome_value` on outcomes). For `client_id`-unit
+assignments the fact subject (`assignment_key` prop) is the derived
+`subject_fact_key` — **the raw spcid never rides event props** — and the
+envelope always carries `anonymous_id` (GDPR erasure reachability) and never
+`user_id`. Exposures are de-duplicated client-side, once per assignment
+subject per launch; outcomes are not.
+
+**Dark-phase truth (today):**
+
+- The assignment endpoint is flag-gated **off** everywhere: expect the
+  generic `403` bodies above until the platform flips them.
+- A stock publishable key does not yet carry the
+  `experiment_assignment_read` scope and receives `401 invalid runtime
+  token`; the control-plane auth leg grants the scope to publishable keys,
+  after which the same `api_key` the remote-config fetch uses authenticates
+  assignments. Until then, integration testing needs an explicitly-scoped
+  token.
+- Server-side **client-tier admission for the two fact events is
+  decision-gated and closed today**: the producers are built dark end to end
+  — facts are rejected at ingest until the producer-lane decision and its
+  flag pair open the lane.
 
 ## Crash wire contract
 
@@ -597,7 +730,8 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 | `shardpilot/envelope.lua` | App-first event envelope construction |
 | `shardpilot/queue.lua` | Bounded in-memory event queue |
 | `shardpilot/transport.lua` | Batch/consent dispatch (`/v1/events:batch`, `/v1/consent`) |
-| `shardpilot/remote_config.lua` | Remote-config fetch (`GET /config/v1/...`), ETag cache, typed getters |
+| `shardpilot/remote_config.lua` | Remote-config fetch (`GET /config/v1/...`), ETag cache, typed getters, opt-in revalidation interval |
+| `shardpilot/experiments.lua` | Experiment-assignment fetch (`GET /api/cp/v1/runtime/experiments/assignment`), per-scope cache, sentinel drop, lane halt |
 | `shardpilot/storage.lua` | The **only** module allowed to call `sys.save`/`sys.load` |
 | `shardpilot/clock.lua` · `id.lua` · `platform.lua` · `sampling.lua` | Time, UUIDv7, platform detect, runtime sampling |
 | `shardpilot/version.lua` | Version string constant |
@@ -610,7 +744,7 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 | `shardpilot/crash/dump.lua` | Previous-session native dump → crash event |
 | `game.project` | Defold library metadata (`[library] include_dirs = shardpilot`) |
 | `examples/minimal/` | Copy-pasteable usage example |
-| `test/` | Lua test harness (`test_sdk.lua`, `test_crash.lua`, `test_remote_config.lua`) + Defold collection/script |
+| `test/` | Lua test harness (`test_sdk.lua`, `test_crash.lua`, `test_remote_config.lua`, `test_experiments.lua`) + Defold collection/script |
 | `docs/` | configuration · events · crash · privacy · release |
 | `scripts/` | `check_library.sh` (content guard), `package_release.sh` |
 

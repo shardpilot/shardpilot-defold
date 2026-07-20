@@ -1833,6 +1833,174 @@ local function test_cache_persist_failure_is_best_effort_and_diagnosed()
 	assert_true(diagnosed, "the lost offline copy must be surfaced through diagnostics")
 end
 
+-- ── opt-in periodic revalidation (GAP-017 wave; default OFF) ──────────────────
+
+local function count_requests()
+	return #requests
+end
+
+local function test_revalidation_config_validation()
+	reset()
+	local client, err = sdk.new(config({ remote_config_revalidate = "yes" }))
+	assert_nil(client)
+	assert_equal(err, "invalid_remote_config_revalidate")
+
+	local plain = config()
+	plain.remote_config_url = nil
+	plain.remote_config_revalidate = true
+	client, err = sdk.new(plain)
+	assert_nil(client)
+	assert_equal(err, "remote_config_revalidate_requires_url")
+
+	-- An explicit false is the default spelled out: valid without a URL.
+	plain.remote_config_revalidate = false
+	assert_true(sdk.new(plain) ~= nil)
+end
+
+local function test_revalidation_defaults_off()
+	reset()
+	-- The knob unset pins today's stance: the SDK never fetches on its own,
+	-- however stale the cache and however small the server's max-age.
+	local client = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	next_response_headers = { etag = 'W/"v1"', ["cache-control"] = "private, max-age=5" }
+	assert_true(fetch(client).ok)
+	assert_equal(count_requests(), 1)
+	client:update(9999)
+	client:update(9999)
+	client:update(9999)
+	assert_equal(count_requests(), 1, "without the opt-in, update() must never fetch configuration")
+end
+
+local function test_revalidation_fires_conditional_get_on_the_max_age_interval()
+	reset()
+	local client = assert(sdk.new(config({ remote_config_revalidate = true })))
+	next_status = 200
+	next_response_body = values_body({ a = 1 }, 1)
+	next_response_headers = { etag = 'W/"v1"', ["cache-control"] = "private, max-age=120" }
+	assert_true(fetch(client).ok)
+	assert_equal(count_requests(), 1)
+
+	-- Below the interval (the server's max-age) the timer stays quiet.
+	client:update(119)
+	assert_equal(count_requests(), 1)
+
+	-- Crossing it issues exactly ONE conditional GET: the cached ETag rides
+	-- as If-None-Match, and a 304 keeps serving the cached snapshot.
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = nil
+	client:update(1.5)
+	assert_equal(count_requests(), 2)
+	local request = last_request()
+	assert_equal(request.method, "GET")
+	assert_equal(request.headers["If-None-Match"], 'W/"v1"')
+	assert_equal(client:remote_config_number("a", 0), 1)
+
+	-- The accumulator reset on fire: the next tick needs a full interval
+	-- again (no burst, no extra retry inside an interval).
+	client:update(60)
+	assert_equal(count_requests(), 2)
+	client:update(61)
+	assert_equal(count_requests(), 3)
+end
+
+local function test_revalidation_interval_floor_and_default()
+	reset()
+	-- A max-age below the floor is raised to 60s (the per-scope server rate
+	-- limiter must not be revalidated into).
+	local client = assert(sdk.new(config({ remote_config_revalidate = true })))
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	next_response_headers = { etag = 'W/"v1"', ["cache-control"] = "private, max-age=30" }
+	assert_true(fetch(client).ok)
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = nil
+	client:update(59)
+	assert_equal(count_requests(), 1, "a 30s max-age must be floored to 60s")
+	client:update(2)
+	assert_equal(count_requests(), 2)
+
+	-- With no max-age observed the interval defaults to 300s.
+	reset()
+	client = assert(sdk.new(config({ remote_config_revalidate = true })))
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	next_response_headers = { etag = 'W/"v1"' }
+	assert_true(fetch(client).ok)
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = nil
+	client:update(299)
+	assert_equal(count_requests(), 1, "without a max-age the interval defaults to 300s")
+	client:update(2)
+	assert_equal(count_requests(), 2)
+end
+
+local function test_revalidation_transient_failure_keeps_the_schedule()
+	reset()
+	local client = assert(sdk.new(config({ remote_config_revalidate = true })))
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	next_response_headers = { etag = 'W/"v1"', ["cache-control"] = "max-age=60" }
+	assert_true(fetch(client).ok)
+
+	-- A transient failure on a tick serves the cache internally and keeps
+	-- the schedule: the next interval revalidates again, no tighter.
+	next_status = 500
+	next_response_body = nil
+	next_response_headers = nil
+	client:update(61)
+	assert_equal(count_requests(), 2)
+	client:update(30)
+	assert_equal(count_requests(), 2, "no extra retry inside an interval")
+	client:update(31)
+	assert_equal(count_requests(), 3)
+	assert_equal(client:remote_config_number("a", 0), 1, "the snapshot keeps serving through transients")
+end
+
+local function test_revalidation_halts_after_auth_refusal_manual_fetch_unaffected()
+	reset()
+	local client = assert(sdk.new(config({ remote_config_revalidate = true })))
+	next_status = 200
+	next_response_body = values_body({ a = 1 }, 1)
+	next_response_headers = { etag = 'W/"v1"', ["cache-control"] = "max-age=60" }
+	assert_true(fetch(client).ok)
+
+	-- An authoritative 401 on a tick halts the TIMER (an unattended loop
+	-- must not keep re-asking an endpoint that authoritatively refused it) —
+	-- while classification stays per fetch: no latch, getters keep serving.
+	next_status = 401
+	next_response_body = nil
+	next_response_headers = nil
+	client:update(61)
+	assert_equal(count_requests(), 2)
+	assert_equal(client.remote_config.auth_refused, true)
+	assert_equal(client:remote_config_number("a", 0), 1, "a 401 must not clear the getter snapshot")
+	client:update(200)
+	client:update(200)
+	assert_equal(count_requests(), 2, "the halted timer must stop scheduling fetches")
+
+	-- Manual fetches stay available and classify per fetch...
+	next_status = 200
+	next_response_body = values_body({ a = 2 }, 2)
+	next_response_headers = { etag = 'W/"v2"' }
+	local result = fetch(client)
+	assert_true(result.ok, "a manual fetch must still dispatch after the halt")
+	assert_equal(result.from_cache, false)
+	assert_equal(client:remote_config_number("a", 0), 2)
+	assert_equal(count_requests(), 3)
+
+	-- ...and a manual success does NOT auto-resume the timer: only re-init
+	-- (a new client) does.
+	client:update(200)
+	assert_equal(count_requests(), 3, "a manual success must not reopen the halted timer")
+	local second = assert(sdk.new(config({ remote_config_revalidate = true })))
+	assert_equal(second.remote_config.auth_refused, false, "re-init reopens the timer")
+end
+
 -- ── singleton facade ──────────────────────────────────────────────────────────
 
 local function test_facade_serves_defaults_when_not_initialized()
@@ -1921,6 +2089,12 @@ local tests = {
 	test_missing_transport_serves_cache_and_reports,
 	test_missing_json_decoder_fails_the_fetch,
 	test_cache_persist_failure_is_best_effort_and_diagnosed,
+	test_revalidation_config_validation,
+	test_revalidation_defaults_off,
+	test_revalidation_fires_conditional_get_on_the_max_age_interval,
+	test_revalidation_interval_floor_and_default,
+	test_revalidation_transient_failure_keeps_the_schedule,
+	test_revalidation_halts_after_auth_refusal_manual_fetch_unaffected,
 	test_facade_serves_defaults_when_not_initialized,
 	test_facade_delegates_to_the_default_client,
 }
