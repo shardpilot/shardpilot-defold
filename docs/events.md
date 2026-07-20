@@ -32,18 +32,6 @@ where it differs):
 - `tutorial_complete`
 - `perf_summary`
 - `network_summary`
-- `experiment_exposure` (from the `track_experiment_exposure()` producer)
-- `experiment_outcome` (from the `track_experiment_outcome()` producer)
-
-`experiment_exposure` / `experiment_outcome` are the experiment fact
-producers (dark today — see the README's "Experiment assignment" section).
-Their props are the ingest service's strict allowlist and nothing else:
-`experiment_key`, `experiment_version`, `assignment_key` (for
-`client_id`-unit assignments this is the derived `subject_fact_key`, never
-the raw spcid), `variant_key`, `assignment_unit`, plus `outcome_key` and
-`outcome_value` (finite number or boolean) on outcomes. Their envelope always
-carries `anonymous_id` and never `user_id`, and they ride the same
-consent-first gate as every other event below.
 
 `perf_summary` aggregates frame samples from `update(dt)` and uses
 `avg_fps`, `p50_frame_time_ms`, `p95_frame_time_ms`, `max_frame_time_ms`,

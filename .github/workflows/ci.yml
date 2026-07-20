@@ -97,6 +97,3 @@ jobs:
 
       - name: Lua remote-config tests
         run: ${{ matrix.interpreter }} test/test_remote_config.lua
-
-      - name: Lua experiments tests
-        run: ${{ matrix.interpreter }} test/test_experiments.lua

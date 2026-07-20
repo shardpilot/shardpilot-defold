@@ -27,13 +27,6 @@ local capabilities = {
 	-- `false` or `""` stops declaring). Detectable here because a config
 	-- field unknown to an older SDK would be silently ignored.
 	schema_revision_declaration = true,
-	-- The opt-in periodic remote-config revalidation timer exists (config
-	-- `remote_config_revalidate`, default off — a config field an older SDK
-	-- would silently ignore, so it needs a capability). The experiment
-	-- assignment surface itself is feature-detected by function presence
-	-- (`shardpilot.fetch_experiment_assignment ~= nil`), per this table's
-	-- convention.
-	remote_config_revalidation = true,
 }
 
 function M.supports(capability)
@@ -148,46 +141,6 @@ function M.remote_config_version()
 		return nil
 	end
 	return client:remote_config_version()
-end
-
--- Experiment assignment (GAP-017). `fetch_experiment_assignment` reports
--- "not_initialized" through the result callback too, like
--- fetch_remote_config. The snapshot getters mirror the remote-config getter
--- posture: nil (not `false, err`) when the SDK is not initialized, so a
--- missing snapshot is never confused with a served value.
-function M.fetch_experiment_assignment(experiment_key, callback)
-	local client = default()
-	if not client then
-		if type(callback) == "function" then
-			pcall(callback, { ok = false, from_cache = false, error = "not_initialized" })
-		end
-		return false, "not_initialized"
-	end
-	return client:fetch_experiment_assignment(experiment_key, callback)
-end
-
-function M.experiment_assignment(experiment_key)
-	local client = default()
-	if not client then
-		return nil
-	end
-	return client:experiment_assignment(experiment_key)
-end
-
-function M.get_spcid()
-	local client = default()
-	if not client then
-		return nil
-	end
-	return client:get_spcid()
-end
-
-function M.track_experiment_exposure(experiment_key)
-	return with_default("track_experiment_exposure", experiment_key)
-end
-
-function M.track_experiment_outcome(experiment_key, outcome_key, outcome_value)
-	return with_default("track_experiment_outcome", experiment_key, outcome_key, outcome_value)
 end
 
 function M.session_start(props)
