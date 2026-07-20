@@ -3351,6 +3351,302 @@ local function test_mismatched_app_or_environment_is_malformed()
 		"another environment's payload must never install")
 end
 
+-- ── round-11 regressions ──────────────────────────────────────────────────────
+
+local function test_non_string_scope_echo_is_malformed()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- A PRESENT but non-string scope echo must never "agree with the
+	-- request" by type accident: malformed serve-stale.
+	next_response_body = json.encode({
+		experiment_key = 123,
+		version = 9,
+		assigned = true,
+		assignment_key = "asgn_" .. string.rep("d", 32),
+		variant_key = "beta",
+		boundary = { assignment_unit = "client_id" },
+	})
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.from_cache)
+	assert_equal(result.error, "malformed_response")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"a wrong-typed echo must not install")
+end
+
+local function test_owed_drop_lands_against_retired_scope()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- The kill's durable drop fails: OWED, decided under the CURRENT scope.
+	state.fail_save = function(path)
+		return fail_experiment_saves(path)
+	end
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-checkout")
+	state.fail_save = nil
+
+	-- A grammar reject on ANOTHER experiment re-mints the subject (its
+	-- retry answers 404 — nothing installs, no new-scope write happens).
+	-- The owed drop's scope is now RETIRED, but the kill must still land
+	-- against the retired record: a failed subject persist could put the
+	-- old subject back at the next launch and resurrect it.
+	local grammar_reject = json.encode({
+		error = "experiment metadata must use synthetic local-safe identifiers only",
+	})
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = grammar_reject })
+		else
+			callback(nil, nil, { status = 404, response = "" })
+		end
+		return true
+	end
+	fetch(client, "exp-other")
+	responder = nil
+
+	client:update(0.016)
+	local record = storage.load_experiments(client.config)
+	assert_true(record == nil or record.entries["exp-checkout"] == nil,
+		"the owed kill must land against the retired scope's record")
+	restore()
+end
+
+local function test_rotation_cancels_owed_writes()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- A refresh write fails (owed), then the subject re-mints: the write's
+	-- source data dies with the rotation — the retired record must keep
+	-- its LAST durable state, never be reshaped from another subject's
+	-- memory or deleted by a decayed intent.
+	state.fail_save = function(path)
+		return fail_experiment_saves(path)
+	end
+	advance_seconds(2)
+	next_response_body = assignment_body({ version = 4, variant_key = "control" })
+	fetch(client, "exp-checkout")
+	state.fail_save = nil
+
+	local grammar_reject = json.encode({
+		error = "experiment metadata must use synthetic local-safe identifiers only",
+	})
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = grammar_reject })
+		else
+			callback(nil, nil, { status = 404, response = "" })
+		end
+		return true
+	end
+	fetch(client, "exp-other")
+	responder = nil
+
+	client:update(0.016)
+	client:update(0.016)
+	local record = storage.load_experiments(client.config)
+	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
+		"the retired record keeps its last durable state")
+	assert_equal(record.entries["exp-checkout"].variant_key, "treatment")
+	restore()
+end
+
+local function test_sibling_save_folds_owed_writes()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body({ experiment_key = "exp-a" })
+	fetch(client, "exp-a")
+	next_response_body = assignment_body({ experiment_key = "exp-b", variant_key = "beta" })
+	fetch(client, "exp-b")
+
+	-- exp-a's refresh write fails (owed; the tombstone save fails too, so
+	-- the SUPERSEDED variant stays reload truth for the moment).
+	state.fail_save = function(path)
+		return fail_experiment_saves(path)
+	end
+	advance_seconds(2)
+	next_response_body = assignment_body({
+		experiment_key = "exp-a",
+		version = 4,
+		variant_key = "fresh",
+	})
+	fetch(client, "exp-a")
+	state.fail_save = nil
+	local record = storage.load_experiments(client.config)
+	assert_equal(record.entries["exp-a"].variant_key, "treatment",
+		"the superseded variant is reload truth until something saves")
+
+	-- A successful save for the SIBLING (exp-b's kill) folds exp-a's owed
+	-- refreshed write with it: an exit before the retry tick must not
+	-- reload the superseded variant.
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-b")
+	record = storage.load_experiments(client.config)
+	assert_equal(record.entries["exp-a"].variant_key, "fresh",
+		"a successful sibling save must fold the owed refreshed write")
+	assert_nil(record.entries["exp-b"])
+	local relaunch = assert(sdk.new(config()))
+	assert_equal(relaunch:experiment_variant("exp-a"), "fresh")
+	restore()
+end
+
+local function test_shutdown_fails_when_housekeeping_events_cannot_persist()
+	reset()
+	local client = granted_client({ buffer_size = 2, spool_enabled = false })
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	-- The FIRST shutdown flush drains fine; the HOUSEKEEPING flush (the
+	-- deferred session end + owed exposure) hits a transient 500, and with
+	-- the spool disabled nothing captures it durably: shutdown must stay
+	-- retryable — never silently finalize over the just-queued facts.
+	local fail_housekeeping = true
+	responder = function(url, _, callback)
+		if not url:find("/v1/events:batch", 1, true) then
+			return false
+		end
+		local body = requests[#requests].body or ""
+		if fail_housekeeping
+			and (body:find("experiment_exposure", 1, true)
+				or body:find('"event_name":"session_end"', 1, true)) then
+			callback(nil, nil, { status = 500, response = "" })
+			return true
+		end
+		return false
+	end
+	local ok = client:shutdown()
+	assert_equal(ok, false,
+		"neither sent nor spooled: shutdown must stay retryable")
+	assert_equal(client.initialized, true,
+		"the client stays alive for a host retry")
+
+	-- The transient clears: the retried shutdown delivers and finalizes.
+	fail_housekeeping = false
+	assert_true(client:shutdown())
+	responder = nil
+	assert_equal(client.initialized, false)
+end
+
+local function test_restored_attributes_renormalize_before_revalidation()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout", { geo = "de" })
+	next_status = 202
+	next_response_body = nil
+	assert_true(client:shutdown())
+
+	-- Poison the stored attributes the way a corrupt or older-build record
+	-- could: a reserved name, an out-of-vocabulary name, and an overlong
+	-- value. Only the vocabulary-valid pair may ride the revalidation.
+	local record = storage.load_experiments(config())
+	record.entries["exp-checkout"].attributes = {
+		{ name = "experiment_key", value = "evil-key" },
+		{ name = "not_in_vocabulary", value = "x" },
+		{ name = "geo", value = "de" },
+		{ name = "user_segment", value = string.rep("v", 600) },
+	}
+	assert_true(storage.save_experiments(config(), record))
+
+	next_status = 200
+	local relaunch = assert(sdk.new(config()))
+	assert_equal(relaunch:experiment_variant("exp-checkout"), "treatment")
+	next_response_body = assignment_body()
+	relaunch:update(0.016)
+	local before = #assignment_requests()
+	advance_seconds(400)
+	relaunch:update(0.016)
+	assert_true(#assignment_requests() > before,
+		"the revalidation must actually fire")
+	local params, order = query_params(last_assignment_request().url)
+	assert_equal(params.experiment_key, "exp-checkout",
+		"a poisoned reserved name must not reshape the request")
+	assert_equal(params.geo, "de", "the vocabulary-valid pair survives")
+	assert_nil(params.not_in_vocabulary)
+	assert_nil(params.user_segment, "overlong values degrade to absence")
+	local occurrences = 0
+	for i = 1, #order do
+		if order[i] == "experiment_key" then
+			occurrences = occurrences + 1
+		end
+	end
+	assert_equal(occurrences, 1, "exactly one experiment_key parameter")
+	restore()
+end
+
+local function test_consent_purge_discards_dead_owed_exposures()
+	reset()
+	local client = granted_client({ buffer_size = 2 })
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	-- The assignment is KILLED (its owed snapshot survives the drop — the
+	-- facts-about-the-past retention), then consent is REVOKED: the purge
+	-- discards the unpublished fact. A re-grant must never publish a
+	-- treatment the server already killed.
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-checkout")
+	assert_true(client:set_consent(false))
+	assert_true(client:set_consent(true))
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 0,
+		"a purged owed exposure for a dead assignment must never publish")
+end
+
+local function test_owed_exposure_keeps_original_session_identity()
+	reset()
+	local client = granted_client({ buffer_size = 4 })
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+	assert_true(client:track("filler-c"))
+	assert_true(client:track("filler-d"))
+	local first_session = client.session_id
+	assert_true(first_session ~= nil)
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	-- The queue drains and the host RENEWS the session before the owed
+	-- fact does: the late drain rides the session the treatment APPLIED
+	-- in; the renewal's own exposure rides the new session.
+	assert_true(client:flush({ include_summaries = false }))
+	assert_true(client:session_start())
+	client:update(0.016)
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 2)
+	assert_equal(exposures[1].session_id, first_session,
+		"the owed exposure keeps the session it applied in")
+	assert_equal(exposures[2].session_id, client.session_id,
+		"the renewal's exposure rides the new session")
+	assert_true(exposures[1].event_id ~= exposures[2].event_id)
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -3442,6 +3738,14 @@ local tests = {
 	test_sibling_write_lands_owed_drops,
 	test_grammar_400_after_spent_budget_drops_entry,
 	test_mismatched_app_or_environment_is_malformed,
+	test_non_string_scope_echo_is_malformed,
+	test_owed_drop_lands_against_retired_scope,
+	test_rotation_cancels_owed_writes,
+	test_sibling_save_folds_owed_writes,
+	test_shutdown_fails_when_housekeeping_events_cannot_persist,
+	test_restored_attributes_renormalize_before_revalidation,
+	test_consent_purge_discards_dead_owed_exposures,
+	test_owed_exposure_keeps_original_session_identity,
 }
 
 for _, test in ipairs(tests) do

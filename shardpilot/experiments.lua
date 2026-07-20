@@ -307,6 +307,34 @@ function M.normalize_attributes(attributes)
 	return pairs_out, dropped
 end
 
+-- Re-validate a RESTORED attribute array against the SAME vocabulary and
+-- bounds a live fetch enforces, before it can ever ride a revalidation: a
+-- corrupt or older-build durable record must not emit reserved names
+-- (experiment_key, subject_key, …), out-of-vocabulary names, or
+-- empty/overlong values into the query. Anything that fails degrades to
+-- ABSENCE — a safe targeting miss — never a reshaped request.
+local function sanitize_restored_attributes(list)
+	if type(list) ~= "table" then
+		return nil
+	end
+	local out = {}
+	for i = 1, #list do
+		local pair = list[i]
+		if type(pair) == "table" and valid_attribute_name(pair.name)
+			and type(pair.value) == "string" then
+			local value = trim(pair.value)
+			if value ~= "" and #value <= max_attribute_value_bytes
+				and #out < max_attributes then
+				out[#out + 1] = { name = pair.name, value = value }
+			end
+		end
+	end
+	if #out == 0 then
+		return nil
+	end
+	return out
+end
+
 -- ── response handling ─────────────────────────────────────────────────────────
 
 -- Decode a JSON object body; nil for anything unusable. Objectness is checked
@@ -414,11 +442,19 @@ end
 --     subject id once and retry;
 --   * transient + retry_after_seconds — pace the revalidation backoff and
 --     honor a server Retry-After (429 and 5xx alike).
--- A response scope field that is PRESENT but disagrees with what the request
--- asked for (empty expectations never reject — nothing to disagree with).
-local function echo_mismatch(echoed, expected)
-	return type(echoed) == "string" and echoed ~= ""
-		and type(expected) == "string" and expected ~= ""
+-- A response scope echo is INVALID when the field is PRESENT but not a
+-- string (a wrong-typed echo must never "agree with the request" by type
+-- accident — the same presence/type split the not-assigned reason uses), or
+-- when it is a non-empty string that disagrees with what the request asked
+-- for. Absent fields and empty strings/expectations validate nothing.
+local function echo_invalid(echoed, expected)
+	if echoed == nil then
+		return false
+	end
+	if type(echoed) ~= "string" then
+		return true
+	end
+	return echoed ~= "" and type(expected) == "string" and expected ~= ""
 		and echoed ~= expected
 end
 
@@ -430,9 +466,9 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 		if not decoded then
 			return serve_entry_or_fail(entry, "malformed_response"), { transient = true }
 		end
-		if echo_mismatch(decoded.experiment_key, experiment_key)
-			or echo_mismatch(decoded.app_key, app_key)
-			or echo_mismatch(decoded.environment_key, environment_key) then
+		if echo_invalid(decoded.experiment_key, experiment_key)
+			or echo_invalid(decoded.app_key, app_key)
+			or echo_invalid(decoded.environment_key, environment_key) then
 			-- A 200 whose body names ANOTHER experiment, app, or environment
 			-- is routing/proxy confusion, not an answer to this request:
 			-- malformed BEFORE anything installs — never cache (or drop)
@@ -628,10 +664,15 @@ function M.new(config, deps)
 		-- real-subjects sentinel — whose fact keys must not outlive it —
 		-- discards them).
 		pending_exposure = {},
-		-- Durable-write convergence: experiment_key → { as_of, drop } for an
-		-- OWED sync (memory changed, disk did not), retried every tick; plus
-		-- an owed whole-record clear stamped by its resolution. The recorded
-		-- intent lets an ordinary fail-closed latch cancel owed WRITES (the
+		-- Durable-write convergence: (scope\31key) composite →
+		-- { key, scope, as_of, drop } for an OWED sync (memory changed,
+		-- disk did not), retried every tick; plus an owed whole-record
+		-- clear stamped by its resolution. Intents carry the SCOPE they
+		-- were decided under: a subject re-mint cancels owed writes (their
+		-- source data dies with the rotation) while owed drops still land
+		-- against the retired record, and combined-record saves only fold
+		-- intents of their own scope. The recorded drop/write intent also
+		-- lets an ordinary fail-closed latch cancel owed WRITES (the
 		-- 401/403 canon retains the durable record) while authoritative
 		-- drops still land.
 		durable_pending = {},
@@ -682,6 +723,11 @@ function M.new(config, deps)
 		local record = storage.load_experiments(config)
 		if record and record.scope == ex:scope_for(subject) then
 			for key, entry in pairs(record.entries) do
+				-- Restored attributes re-validate against the live fetch
+				-- vocabulary before any revalidation can send them: corrupt
+				-- or older-build records degrade to a safe targeting miss,
+				-- never a reshaped request.
+				entry.attributes = sanitize_restored_attributes(entry.attributes)
 				ex.entries[key] = entry
 				ex.pending_exposure[key] = {
 					{ entry = entry, session = ex.session_marker },
@@ -743,6 +789,17 @@ function Experiments:adopt_minted_subject_id()
 	-- anything the new subject arms.
 	self.entries = {}
 	self.exposed = {}
+	-- Owed durable WRITE intents die with the rotation: their source
+	-- entries were just cleared, and the retired subject's record must not
+	-- be reshaped from another subject's memory. Owed DROPS survive — they
+	-- carry the scope they were decided under and still land against the
+	-- retired record (a failed subject persist could otherwise resurrect a
+	-- kill at the next launch).
+	for pending_composite, pending in pairs(self.durable_pending) do
+		if not pending.drop then
+			self.durable_pending[pending_composite] = nil
+		end
+	end
 	if not self.deps.store_subject_id(minted) then
 		self:diagnose("persist_failed", "subject_id")
 	end
@@ -767,10 +824,15 @@ function Experiments:on_session_renewed(is_renewal)
 	self.session_marker = id.uuid()
 	self.exposed = {}
 	if not is_renewal then
+		local session_id = self.deps.analytics_session
+			and self.deps.analytics_session() or nil
 		for _, list in pairs(self.pending_exposure) do
 			for i = 1, #list do
 				if list[i].session == previous then
 					list[i].session = self.session_marker
+					-- The migrated snapshot belongs to the FIRST real
+					-- session — its analytics identity included.
+					list[i].session_id = session_id
 				end
 			end
 		end
@@ -780,13 +842,17 @@ function Experiments:on_session_renewed(is_renewal)
 	end
 end
 
--- A consent denial purges queued-but-unpublished analytics facts — exposure
--- facts included. Those facts never reached the server, so the session's
--- emissions re-arm: a later re-grant of the retained assignment emits the
--- exposure again instead of silently under-counting real treatment. Facts
--- that HAD already published simply collapse server-side as duplicates of
--- their deterministic event ids, so the blanket re-arm is safe.
+-- A consent denial purges queued-but-unpublished analytics facts — the OWED
+-- exposure snapshots included: they are queued-but-unsent facts, and the
+-- consent contract outranks the facts-about-the-past retention that governs
+-- auth latches and subject re-mints. Snapshots for since-dropped
+-- assignments die HERE (a re-grant must never publish a treatment the
+-- server already killed); still-LIVE assignments re-arm and re-emit on
+-- re-grant — with the same deterministic ids, so anything that HAD already
+-- published collapses server-side as a duplicate, and the session never
+-- under-counts real, still-served treatment.
 function Experiments:on_analytics_purge()
+	self.pending_exposure = {}
 	self.exposed = {}
 	for key, entry in pairs(self.entries) do
 		self:arm_exposure(key, entry)
@@ -856,6 +922,7 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 	local record = self:durable_record_for(scope)
 	local stored = record.entries[experiment_key]
 	local as_of = type(as_of_ms) == "number" and as_of_ms or 0
+	local composite = scope .. scope_separator .. experiment_key
 	if entry then
 		if stored and type(stored.fetched_at_ms) == "number"
 			and stored.fetched_at_ms > entry.fetched_at_ms then
@@ -863,7 +930,7 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 				-- A same-namespace sibling persisted a FRESHER entry after
 				-- this write was decided: never roll the shared record
 				-- back.
-				self.durable_pending[experiment_key] = nil
+				self.durable_pending[composite] = nil
 				return true
 			end
 			-- At DECISION time a fresh authoritative write supersedes the
@@ -879,7 +946,7 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 		record.entries[experiment_key] = entry
 	else
 		if stored == nil then
-			self.durable_pending[experiment_key] = nil
+			self.durable_pending[composite] = nil
 			return true
 		end
 		local stored_at = type(stored.fetched_at_ms) == "number"
@@ -889,7 +956,7 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 			-- drop was decided: a sibling client persisted a newer
 			-- assignment this drop never resolved. Deleting it would lose
 			-- newer valid state, so the outranked drop settles instead.
-			self.durable_pending[experiment_key] = nil
+			self.durable_pending[composite] = nil
 			return true
 		end
 		if not is_retry and stored_at >= as_of then
@@ -904,30 +971,45 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 		end
 		record.entries[experiment_key] = nil
 	end
-	-- Owed DROPS for OTHER keys ride every combined-record save: the record
-	-- is one file, so a save that reloaded the disk copy would otherwise
-	-- re-persist a sibling entry whose authoritative drop is still owed —
-	-- and an exit inside that window would resurrect the killed sibling at
-	-- the next launch. The sweep honors the drops' own retry fence: a
-	-- sibling record stamped strictly after the owed drop's decision is
-	-- newer state, left for that drop's own retry to yield against.
+	-- Owed intents for OTHER keys of THIS scope ride every combined-record
+	-- save — the record is one file, so a save that reloaded the disk copy
+	-- would otherwise re-persist a sibling entry whose authoritative DROP
+	-- is still owed (resurrecting a kill at the next launch) or a sibling's
+	-- STALE variant whose refreshed WRITE is still owed (rolling the reload
+	-- truth back). Drops fold when memory holds no live entry, honoring
+	-- their retry fence (a sibling record stamped strictly after the drop's
+	-- decision is newer state, left for that drop's own retry); writes fold
+	-- from the LIVE in-memory entry, honoring the write fence the same way.
+	-- Intents decided under ANOTHER scope never fold into this record.
 	local swept = nil
-	for key, pending in pairs(self.durable_pending) do
-		if key ~= experiment_key and pending.drop
-			and self.entries[key] == nil then
-			local sibling = record.entries[key]
-			local outranked = sibling ~= nil
+	for pending_composite, pending in pairs(self.durable_pending) do
+		if pending.scope == scope and pending.key ~= experiment_key then
+			local live = self.entries[pending.key]
+			local sibling = record.entries[pending.key]
+			local sibling_at = sibling ~= nil
 				and type(sibling.fetched_at_ms) == "number"
-				and sibling.fetched_at_ms > pending.as_of
-			if not outranked then
-				record.entries[key] = nil
+				and sibling.fetched_at_ms or 0
+			local folded = false
+			if pending.drop and live == nil then
+				if sibling == nil or sibling_at <= pending.as_of then
+					record.entries[pending.key] = nil
+					folded = true
+				end
+			elseif not pending.drop and live ~= nil
+				and type(live.fetched_at_ms) == "number" then
+				if sibling == nil or sibling_at <= live.fetched_at_ms then
+					record.entries[pending.key] = live
+					folded = true
+				end
+			end
+			if folded then
 				swept = swept or {}
-				swept[#swept + 1] = key
+				swept[#swept + 1] = pending_composite
 			end
 		end
 	end
 	if storage.save_experiments(self.config, record) then
-		self.durable_pending[experiment_key] = nil
+		self.durable_pending[composite] = nil
 		if swept then
 			for i = 1, #swept do
 				self.durable_pending[swept[i]] = nil
@@ -944,7 +1026,12 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 		record.entries[experiment_key] = nil
 		storage.save_experiments(self.config, record)
 	end
-	self.durable_pending[experiment_key] = { as_of = as_of, drop = entry == nil }
+	self.durable_pending[composite] = {
+		key = experiment_key,
+		scope = scope,
+		as_of = as_of,
+		drop = entry == nil,
+	}
 	self:diagnose("persist_failed", "cache")
 	return false
 end
@@ -977,7 +1064,15 @@ function Experiments:demote_owed_clear()
 				and stored.fetched_at_ms >= as_of then
 				as_of = stored.fetched_at_ms + 1
 			end
-			self.durable_pending[key] = { as_of = as_of, drop = true }
+			-- The conversion drops target the RECORD's scope — the state
+			-- the clear was decided over — which may already be a retired
+			-- subject's.
+			self.durable_pending[record.scope .. scope_separator .. key] = {
+				key = key,
+				scope = record.scope,
+				as_of = as_of,
+				drop = true,
+			}
 		end
 	end
 end
@@ -1007,19 +1102,63 @@ function Experiments:retry_durable_sync()
 		return
 	end
 	local scope = self:scope_for(subject)
-	local keys = {}
-	for key in pairs(self.durable_pending) do
-		keys[#keys + 1] = key
+	local composites = {}
+	for pending_composite in pairs(self.durable_pending) do
+		composites[#composites + 1] = pending_composite
 	end
-	table.sort(keys)
-	for i = 1, #keys do
+	table.sort(composites)
+	for i = 1, #composites do
 		-- An earlier iteration's combined-record save may have SWEPT this
-		-- key's owed drop along with it (settling the pending): skip what
-		-- already converged.
-		local pending = self.durable_pending[keys[i]]
+		-- intent along with it (settling the pending): skip what already
+		-- converged.
+		local pending = self.durable_pending[composites[i]]
 		if pending then
-			self:sync_durable_entry(scope, keys[i], pending.as_of, true)
+			if pending.scope == scope then
+				self:sync_durable_entry(scope, pending.key, pending.as_of, true)
+			elseif pending.drop then
+				-- Decided under a RETIRED scope (the subject re-minted
+				-- while the drop was owed): the kill must still land
+				-- against THAT record — current memory is another
+				-- subject's truth and is never consulted for it.
+				self:retry_foreign_scope_drop(composites[i], pending)
+			else
+				-- A foreign-scope WRITE intent has no source data left
+				-- (the rotation cleared the retired subject's entries;
+				-- rotation also cancels these — this is the belt).
+				self.durable_pending[composites[i]] = nil
+			end
 		end
+	end
+end
+
+-- Land an owed DROP decided under a scope the subject has since rotated
+-- away from. The retired record must still lose the killed entry — a failed
+-- subject-id persist can put the OLD subject back at the next launch, and
+-- the kill must not resurrect — but current memory belongs to the NEW
+-- subject and is never consulted. A new-scope write replaces the record
+-- file wholesale, so a scope mismatch on load means the retired record no
+-- longer exists and the drop settles; the usual retry fence still yields to
+-- an old-scope sibling instance's strictly fresher write.
+function Experiments:retry_foreign_scope_drop(composite, pending)
+	local record = storage.load_experiments(self.config)
+	if not record or record.scope ~= pending.scope then
+		self.durable_pending[composite] = nil
+		return
+	end
+	local stored = record.entries[pending.key]
+	if stored == nil then
+		self.durable_pending[composite] = nil
+		return
+	end
+	local stored_at = type(stored.fetched_at_ms) == "number"
+		and stored.fetched_at_ms or 0
+	if stored_at > pending.as_of then
+		self.durable_pending[composite] = nil
+		return
+	end
+	record.entries[pending.key] = nil
+	if storage.save_experiments(self.config, record) then
+		self.durable_pending[composite] = nil
 	end
 end
 
@@ -1049,13 +1188,24 @@ function Experiments:arm_exposure(experiment_key, entry)
 		list = {}
 		self.pending_exposure[experiment_key] = list
 	end
+	-- Each snapshot carries the ANALYTICS session identity active when the
+	-- application armed (nil before any session exists): a late drain after
+	-- a renewal enqueues with THAT identity, never misattributing the old
+	-- treatment to the new session.
+	local session_id = self.deps.analytics_session
+		and self.deps.analytics_session() or nil
 	local tail = list[#list]
 	if tail and tail.session == self.session_marker
 		and exposure_tuple(experiment_key, tail.entry) == exposure_tuple(experiment_key, entry) then
 		tail.entry = entry
+		tail.session_id = session_id
 		return
 	end
-	list[#list + 1] = { entry = entry, session = self.session_marker }
+	list[#list + 1] = {
+		entry = entry,
+		session = self.session_marker,
+		session_id = session_id,
+	}
 	if #list > max_owed_exposures then
 		table.remove(list, 1)
 		self:diagnose("exposure_skipped", "owed_overflow")
@@ -1099,7 +1249,7 @@ end
 -- and leaves the owed snapshot its arm 0 — the re-arm buys an EXTRA fact,
 -- never the owed one's slot — and the later sweep emits the arm 0 exactly
 -- once.
-function Experiments:emit_entry_exposure(experiment_key, entry, rearm, session_marker)
+function Experiments:emit_entry_exposure(experiment_key, entry, rearm, session_marker, session_id)
 	local refusal = consent_refusal(self.deps.consent())
 	if refusal then
 		return false, refusal
@@ -1153,7 +1303,7 @@ function Experiments:emit_entry_exposure(experiment_key, entry, rearm, session_m
 		assignment_key = fact_key,
 		variant_key = entry.variant_key,
 		assignment_unit = entry.assignment_unit,
-	}, event_id)
+	}, event_id, session_id)
 	if not ok then
 		return false, err
 	end
@@ -1175,7 +1325,8 @@ function Experiments:sweep_pending(experiment_key)
 	end
 	while list[1] do
 		local ok, _, terminal = self:emit_entry_exposure(
-			experiment_key, list[1].entry, false, list[1].session)
+			experiment_key, list[1].entry, false, list[1].session,
+			list[1].session_id)
 		if ok or terminal then
 			table.remove(list, 1)
 		else

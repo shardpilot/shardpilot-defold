@@ -532,10 +532,17 @@ function M.new(config)
 			consent = function()
 				return client.consent_state
 			end,
-			emit = function(event_name, props, event_id)
+			analytics_session = function()
+				return client.session_id
+			end,
+			emit = function(event_name, props, event_id, session_id)
+				-- `session_id` is the analytics session the fact BELONGS to
+				-- (an owed exposure drained late must ride its own session,
+				-- not the current one); nil means the current session.
 				return client:enqueue_event(event_name, props, nil, {
 					event_id = event_id,
 					omit_user_id = true,
+					session_id = session_id,
 				})
 			end,
 		})
@@ -1175,10 +1182,18 @@ function Client:enqueue_event(event_name, props, context, fact)
 	end
 	local user_id = self.user_id
 	local event_id = nil
+	local session_override = nil
 	if fact then
 		event_id = fact.event_id
 		if fact.omit_user_id then
 			user_id = nil
+		end
+		-- An owed experiment fact carries THE SESSION THE APPLICATION
+		-- BELONGED TO: a late drain after a renewal must not misattribute
+		-- the old treatment to the new session. Identity only — the
+		-- sequence counter stays the enqueue-time stream's.
+		if type(fact.session_id) == "string" and fact.session_id ~= "" then
+			session_override = fact.session_id
 		end
 	end
 	local event = {
@@ -1187,7 +1202,7 @@ function Client:enqueue_event(event_name, props, context, fact)
 		event_ts = clock.iso_utc(),
 		user_id = user_id,
 		anonymous_id = self.anonymous_id,
-		session_id = self.session_id,
+		session_id = session_override or self.session_id,
 		session_sequence = self.session_sequence + 1,
 		props = props_snapshot,
 		context = context_snapshot,
@@ -2397,8 +2412,20 @@ function Client:shutdown(reason)
 		self.experiments:sweep_owed()
 	end
 	if queue.size(self.queue) > before_housekeeping then
-		if not self:flush({ include_summaries = false }) then
-			self:spool_undelivered()
+		local sent, send_err = self:flush({ include_summaries = false })
+		if not sent then
+			-- The shutdown contract applies to the housekeeping pass too:
+			-- the just-queued deferred session end / owed exposure facts
+			-- are either SENT, durably SPOOLED, or shutdown stays
+			-- retryable — never dropped by a "successful" teardown. (A
+			-- terminal rejection dropped the batch: no remnant, and a
+			-- vacuous capture must not upgrade that failure — the first
+			-- flush's posture exactly.)
+			local has_remnant = self.in_flight_batch ~= nil
+				or queue.size(self.queue) > 0 or self:spool_pending()
+			if not has_remnant or not self:spool_undelivered() then
+				return false, send_err
+			end
 		end
 	end
 	if self.experiments then
