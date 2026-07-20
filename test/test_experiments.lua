@@ -1349,13 +1349,15 @@ local function test_out_of_order_responses_do_not_roll_back()
 	}) })
 	assert_equal(client:experiment_variant("exp-checkout"), "control")
 
-	-- ...then the older one completes late with the older assignment: its
-	-- caller still receives that response, but nothing installs over the
-	-- newer one.
+	-- ...then the older one completes late with the older assignment:
+	-- nothing installs over the newer one, and the fenced-out caller
+	-- receives the SETTLED current assignment — what the getters serve —
+	-- never its own superseded body.
 	held[1](nil, nil, { status = 200, response = assignment_body() })
-	assert_true(results.older.ok)
-	assert_equal(results.older.variant_key, "treatment",
-		"the older fetch still reports its own response")
+	assert_true(results.older.ok and results.older.from_cache)
+	assert_equal(results.older.variant_key, "control",
+		"the fenced-out fetch reports the settled assignment")
+	assert_equal(results.older.error, "superseded")
 	assert_equal(client:experiment_variant("exp-checkout"), "control",
 		"an out-of-order response must not roll the assignment back")
 end
@@ -2284,6 +2286,208 @@ local function test_owed_exposures_queue_across_replacements()
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 end
 
+-- ── round-5 regressions ───────────────────────────────────────────────────────
+
+local function test_ordinary_auth_failure_keeps_durable_cache_despite_owed_write()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- A refresh write fails and stays OWED (the tombstone save fails too, so
+	-- the ORIGINAL record remains the disk truth).
+	state.fail_save = function(path)
+		return fail_experiment_saves(path)
+	end
+	advance_seconds(2)
+	next_response_body = assignment_body({ version = 4, variant_key = "control" })
+	fetch(client, "exp-checkout")
+
+	-- An ORDINARY 401 then latches fail-closed while that write is still
+	-- owed. The documented behavior retains the durable record: the owed
+	-- WRITE — its source entry now cleared from memory — must not decay
+	-- into a delete at the next retry.
+	state.fail_save = nil
+	next_status = 401
+	next_response_body = json.encode({ error = "invalid runtime token" })
+	local latched = fetch(client, "exp-checkout")
+	assert_equal(latched.error, "unauthorized")
+	client:update(0.016)
+	local record = storage.load_experiments(client.config)
+	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
+		"an ordinary auth failure must retain the durable record")
+	assert_equal(record.entries["exp-checkout"].variant_key, "treatment")
+
+	next_status = 200
+	next_response_body = nil
+	local relaunch = assert(sdk.new(config()))
+	assert_equal(relaunch:experiment_variant("exp-checkout"), "treatment",
+		"a relaunch serves the retained last-known assignment")
+	restore()
+end
+
+local function test_fenced_out_response_reports_settled_state()
+	reset()
+	local client = granted_client()
+	local held = {}
+	local hold_next = false
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		if hold_next then
+			hold_next = false
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+
+	-- Phase 1: the newer settled outcome is a MISS (kill). The fenced-out
+	-- older 200 must report that miss — never its own discarded variant.
+	hold_next = true
+	local stale_a = nil
+	client:fetch_experiment_assignment("exp-checkout", function(result)
+		stale_a = result
+	end)
+	assert_equal(#held, 1)
+	next_response_body = not_assigned_body("kill_switch")
+	local newer = fetch(client, "exp-checkout")
+	assert_true(newer.ok)
+	held[1](nil, nil, { status = 200, response = assignment_body() })
+	assert_equal(stale_a.ok, false,
+		"a fenced-out response must not deliver its discarded variant")
+	assert_equal(stale_a.error, "superseded")
+	assert_nil(stale_a.variant_key)
+	assert_nil(client:experiment_variant("exp-checkout"))
+
+	-- Phase 2: the newer settled outcome ASSIGNS. The fenced-out response
+	-- reports the settled current assignment — exactly what the getters
+	-- serve, not the older body's variant.
+	hold_next = true
+	local stale_b = nil
+	client:fetch_experiment_assignment("exp-checkout", function(result)
+		stale_b = result
+	end)
+	assert_equal(#held, 2)
+	next_response_body = assignment_body({ version = 5, variant_key = "control" })
+	fetch(client, "exp-checkout")
+	held[2](nil, nil, { status = 200, response = assignment_body() })
+	responder = nil
+	assert_true(stale_b.ok and stale_b.assigned and stale_b.from_cache,
+		"a fenced-out response reports the settled current assignment")
+	assert_equal(stale_b.variant_key, "control")
+	assert_equal(stale_b.error, "superseded")
+	assert_equal(client:experiment_variant("exp-checkout"), "control")
+end
+
+local function test_owed_drop_retry_yields_to_fresher_sibling_write()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local first = granted_client()
+	next_response_body = assignment_body()
+	fetch(first, "exp-checkout")
+
+	-- The kill lands in memory but the durable drop write fails: OWED.
+	state.fail_save = function(path)
+		return fail_experiment_saves(path)
+	end
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(first, "exp-checkout")
+	assert_nil(first:experiment_variant("exp-checkout"))
+	state.fail_save = nil
+
+	-- A sibling client then persists a genuinely NEWER assignment for the
+	-- same subject and experiment.
+	advance_seconds(30)
+	local second = assert(sdk.new(config()))
+	next_response_body = assignment_body({ version = 9, variant_key = "beta" })
+	fetch(second, "exp-checkout")
+	local record = storage.load_experiments(second.config)
+	assert_equal(record.entries["exp-checkout"].variant_key, "beta")
+
+	-- The first client's owed drop retries — and must YIELD to the fresher
+	-- entry it never resolved instead of deleting it.
+	first:update(0.016)
+	record = storage.load_experiments(first.config)
+	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
+		"an owed drop must not delete a fresher sibling assignment")
+	assert_equal(record.entries["exp-checkout"].variant_key, "beta")
+
+	-- Settled, not looping: further ticks leave the record alone.
+	first:update(0.016)
+	record = storage.load_experiments(first.config)
+	assert_equal(record.entries["exp-checkout"].variant_key, "beta")
+	restore()
+end
+
+local function test_rearm_while_auto_exposure_owed_emits_both()
+	reset()
+	local client = granted_client({ buffer_size = 2 })
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+
+	-- The assignment applies while the queue is full: the automatic
+	-- exposure stays OWED.
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	-- The queue drains and the host explicitly re-arms BEFORE the tick
+	-- sweeps the owed automatic fact: the re-arm buys an EXTRA fact — it
+	-- must not consume the owed automatic slot.
+	assert_true(client:flush({ include_summaries = false }))
+	assert_true(client:track_exposure("exp-checkout"))
+	client:update(0.016)
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 2,
+		"the explicit re-arm AND the owed automatic exposure both emit")
+	assert_true(exposures[1].event_id ~= exposures[2].event_id,
+		"distinct arms derive distinct deterministic ids")
+
+	-- And exactly those two: the automatic slot emitted once.
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 2)
+end
+
+local function test_shutdown_sweeps_owed_exposure_after_flush()
+	reset()
+	local client = granted_client({ buffer_size = 2 })
+	-- End the session first: session_end tracks its own event, which a
+	-- deliberately FULL queue would reject, failing shutdown for reasons
+	-- this test is not about.
+	assert_true(client:session_end("pre-shutdown"))
+	assert_true(client:track("filler"))
+
+	-- The assignment applies under a FULL queue: the exposure is owed, and
+	-- no update() runs again before exit.
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	-- Shutdown's final flush frees the room: the owed fact must be swept
+	-- and delivered with the teardown, not lost with the process.
+	next_status = 202
+	next_response_body = nil
+	assert_true(client:shutdown())
+	local published = {}
+	for i = 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			local body = json.decode(requests[i].body)
+			for j = 1, #(body.events or {}) do
+				if body.events[j].event_name == "experiment_exposure" then
+					published[#published + 1] = body.events[j]
+				end
+			end
+		end
+	end
+	assert_equal(#published, 1,
+		"the owed exposure must ride a shutdown batch once the flush frees room")
+	assert_equal(published[1].props.experiment_key, "exp-checkout")
+	assert_equal(published[1].props.variant_key, "treatment")
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -2347,6 +2551,11 @@ local tests = {
 	test_consent_purge_rearms_unpublished_exposures,
 	test_pre_remint_response_reports_stale_subject,
 	test_owed_exposures_queue_across_replacements,
+	test_ordinary_auth_failure_keeps_durable_cache_despite_owed_write,
+	test_fenced_out_response_reports_settled_state,
+	test_owed_drop_retry_yields_to_fresher_sibling_write,
+	test_rearm_while_auto_exposure_owed_emits_both,
+	test_shutdown_sweeps_owed_exposure_after_flush,
 }
 
 for _, test in ipairs(tests) do

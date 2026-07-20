@@ -562,15 +562,22 @@ function M.new(config, deps)
 		-- survives a later drop of the live entry (a kill stops future
 		-- serving, not the record of an application that already happened).
 		pending_exposure = {},
-		-- Durable-write convergence: experiment_key → as-of stamp of an
-		-- OWED write (memory changed, disk did not), retried every tick;
-		-- plus an owed whole-record clear.
+		-- Durable-write convergence: experiment_key → { as_of, drop } for an
+		-- OWED sync (memory changed, disk did not), retried every tick; plus
+		-- an owed whole-record clear stamped by its resolution. The recorded
+		-- intent lets an ordinary fail-closed latch cancel owed WRITES (the
+		-- 401/403 canon retains the durable record) while authoritative
+		-- drops still land.
 		durable_pending = {},
 		durable_clear_pending = false,
 		-- Set by teardown(): an in-flight response landing afterwards must
 		-- not install, persist, pace, or call back into game code.
 		torn_down = false,
-		-- Session-scoped exposure dedup: tuple key → { arm }.
+		-- Session-scoped exposure dedup: tuple key → { arm, auto }. `arm` is
+		-- the highest arm handed out for the tuple; `auto` records whether
+		-- the AUTOMATIC arm-0 fact has emitted — an explicit re-arm may run
+		-- while that emission is still owed in the queue, and must not
+		-- consume its slot.
 		exposed = {},
 		-- One marker per constructed consumer (= per SDK session): part of
 		-- the deterministic exposure id, so each session's first application
@@ -743,13 +750,21 @@ end
 -- Converge one experiment's durable entry to the in-memory truth: an entry
 -- present in memory is written, an absent one is dropped. `as_of_ms` stamps
 -- the state change (the entry's own fetch time for a write, the resolution
--- time for a drop) and drives the sibling freshness fence. Returns true when
--- the disk agrees with memory (written, already-agreeing, or outranked by a
--- fresher sibling write — all settled states); false marks the key owed.
-function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms)
+-- time for a drop) and drives the sibling freshness fence. `is_retry` marks
+-- an owed-sync retry: only there does the fence apply to DROPS — at decision
+-- time a drop resolves whatever the shared record holds, clock rollbacks
+-- included, and its stamp is raised ABOVE that record; a retry may instead
+-- run after a sibling client persisted a genuinely newer assignment the
+-- drop never saw, and yields to it. Returns true when the disk agrees with
+-- memory (written, already-agreeing, or outranked by a fresher sibling
+-- state — all settled); false marks the key owed with the raised stamp and
+-- the intent (a later ordinary fail-closed latch cancels owed WRITES but
+-- must let owed authoritative DROPS land).
+function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retry)
 	local entry = self.entries[experiment_key]
 	local record = self:durable_record_for(scope)
 	local stored = record.entries[experiment_key]
+	local as_of = type(as_of_ms) == "number" and as_of_ms or 0
 	if entry then
 		if stored and type(stored.fetched_at_ms) == "number"
 			and stored.fetched_at_ms > entry.fetched_at_ms then
@@ -764,12 +779,26 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms)
 			self.durable_pending[experiment_key] = nil
 			return true
 		end
-		-- A drop ALWAYS wins over the stored record it resolves: the
-		-- decision came from a server response that postdates any stored
-		-- copy of this key visible here, and the wall clock can move
-		-- backward — fencing deletes on stamps would let a clock rollback
-		-- revive a killed variant at the next launch. The freshness fence
-		-- protects sibling WRITES only.
+		local stored_at = type(stored.fetched_at_ms) == "number"
+			and stored.fetched_at_ms or 0
+		if is_retry and stored_at > as_of then
+			-- The RETRY of an owed drop found an entry stamped after the
+			-- drop was decided: a sibling client persisted a newer
+			-- assignment this drop never resolved. Deleting it would lose
+			-- newer valid state, so the outranked drop settles instead.
+			self.durable_pending[experiment_key] = nil
+			return true
+		end
+		if not is_retry and stored_at >= as_of then
+			-- At DECISION time a drop always wins over the stored record it
+			-- resolves: the wall clock can move backward, and fencing the
+			-- delete on raw stamps would let a rollback revive a killed
+			-- variant at the next launch. Raise the drop's effective stamp
+			-- above the record instead — the kill lands now, and an owed
+			-- retry yields only to entries genuinely written AFTER this
+			-- decision.
+			as_of = stored_at + 1
+		end
 		record.entries[experiment_key] = nil
 	end
 	if storage.save_experiments(self.config, record) then
@@ -785,7 +814,7 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms)
 		record.entries[experiment_key] = nil
 		storage.save_experiments(self.config, record)
 	end
-	self.durable_pending[experiment_key] = type(as_of_ms) == "number" and as_of_ms or 0
+	self.durable_pending[experiment_key] = { as_of = as_of, drop = entry == nil }
 	self:diagnose("persist_failed", "cache")
 	return false
 end
@@ -802,13 +831,23 @@ function Experiments:retry_durable_sync()
 			-- the epoch-scoped clear must not wipe it. Convert the owed
 			-- whole-record clear into per-key drops for exactly the keys
 			-- the clear still covers — everything on disk that memory no
-			-- longer holds — and let the per-key sync converge those.
+			-- longer holds — each stamped by the clear decision, raised
+			-- above the covered record (the sentinel is decisive over the
+			-- state it withdrew), and let the per-key sync converge those.
+			local clear_as_of = type(self.durable_clear_pending) == "number"
+				and self.durable_clear_pending or 0
 			self.durable_clear_pending = false
 			local record = storage.load_experiments(self.config)
 			if record then
-				for key in pairs(record.entries) do
+				for key, stored in pairs(record.entries) do
 					if self.entries[key] == nil then
-						self.durable_pending[key] = 0
+						local as_of = clear_as_of
+						if type(stored) == "table"
+							and type(stored.fetched_at_ms) == "number"
+							and stored.fetched_at_ms >= as_of then
+							as_of = stored.fetched_at_ms + 1
+						end
+						self.durable_pending[key] = { as_of = as_of, drop = true }
 					end
 				end
 			end
@@ -831,7 +870,8 @@ function Experiments:retry_durable_sync()
 	end
 	table.sort(keys)
 	for i = 1, #keys do
-		self:sync_durable_entry(scope, keys[i], self.durable_pending[keys[i]])
+		local pending = self.durable_pending[keys[i]]
+		self:sync_durable_entry(scope, keys[i], pending.as_of, true)
 	end
 end
 
@@ -873,12 +913,32 @@ function Experiments:arm_exposure(experiment_key, entry)
 	end
 end
 
+-- True when `list` still holds an armed snapshot for `tuple`: the tuple's
+-- automatic arm-0 emission is owed in the queue, not yet emitted.
+local function owed_tuple_armed(list, experiment_key, tuple)
+	if type(list) ~= "table" then
+		return false
+	end
+	for i = 1, #list do
+		if exposure_tuple(experiment_key, list[i]) == tuple then
+			return true
+		end
+	end
+	return false
+end
+
 -- Emit one exposure fact for one applied-entry snapshot. Returns:
 --   true                      — emitted, or already emitted this session;
 --   false, code, true         — terminally skipped (no server-safe fact
 --                               key; the SDK subject id never egresses);
 --   false, code               — retryable (consent closed, queue full):
 --                               the armed snapshot stays for a later sweep.
+-- Arm accounting: `exposed[tuple]` records the highest arm handed out and
+-- whether the AUTOMATIC arm-0 fact has emitted. An explicit re-arm that
+-- runs while that automatic emission is still owed in the queue takes arm 1
+-- and leaves the owed snapshot its arm 0 — the re-arm buys an EXTRA fact,
+-- never the owed one's slot — and the later sweep emits the arm 0 exactly
+-- once.
 function Experiments:emit_entry_exposure(experiment_key, entry, rearm)
 	local refusal = consent_refusal(self.deps.consent())
 	if refusal then
@@ -886,7 +946,7 @@ function Experiments:emit_entry_exposure(experiment_key, entry, rearm)
 	end
 	local tuple = exposure_tuple(experiment_key, entry)
 	local exposed = self.exposed[tuple]
-	if exposed and not rearm then
+	if exposed and not rearm and exposed.auto then
 		return true
 	end
 	-- Facts carry ONLY the server-minted subject-fact key as the
@@ -901,8 +961,26 @@ function Experiments:emit_entry_exposure(experiment_key, entry, rearm)
 		return false, "exposure_no_subject_fact_key", true
 	end
 	local arm = 0
-	if exposed then
-		arm = exposed.arm + 1
+	local next_exposed
+	if rearm then
+		if exposed then
+			arm = exposed.arm + 1
+			next_exposed = { arm = arm, auto = exposed.auto }
+		elseif owed_tuple_armed(
+			self.pending_exposure[experiment_key], experiment_key, tuple) then
+			-- The automatic emission is still owed in the queue: the
+			-- explicit re-arm counts as the EXTRA fact on top of it.
+			arm = 1
+			next_exposed = { arm = 1, auto = false }
+		else
+			next_exposed = { arm = 0, auto = true }
+		end
+	else
+		-- The automatic emission: arm 0 by definition. Reachable with
+		-- `exposed` already set only while that arm-0 fact was owed behind
+		-- explicit re-arms — emitting it completes the auto slot without
+		-- lowering the recorded highest arm.
+		next_exposed = { arm = exposed and exposed.arm or 0, auto = true }
 	end
 	local event_id = M.exposure_event_id(
 		self.session_marker, entry.subject_key, experiment_key, entry.version, arm)
@@ -916,7 +994,7 @@ function Experiments:emit_entry_exposure(experiment_key, entry, rearm)
 	if not ok then
 		return false, err
 	end
-	self.exposed[tuple] = { arm = arm }
+	self.exposed[tuple] = next_exposed
 	return true
 end
 
@@ -939,6 +1017,28 @@ function Experiments:sweep_pending(experiment_key)
 		end
 	end
 	self.pending_exposure[experiment_key] = nil
+end
+
+-- Drain every experiment's owed exposures in per-experiment order,
+-- granted-plane only: a non-granted state leaves everything armed. Driven
+-- by the tick, and once more by the client's successful shutdown after the
+-- final flush frees queue room — a treatment applied under a FULL queue
+-- must not exit without its fact.
+function Experiments:sweep_owed()
+	if consent_refusal(self.deps.consent()) then
+		return
+	end
+	if not next(self.pending_exposure) then
+		return
+	end
+	local keys = {}
+	for key in pairs(self.pending_exposure) do
+		keys[#keys + 1] = key
+	end
+	table.sort(keys)
+	for i = 1, #keys do
+		self:sweep_pending(keys[i])
+	end
 end
 
 -- Settle an authoritative fetch outcome and, when it may, install it. Gates,
@@ -980,9 +1080,24 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 				self.durable_pending = {}
 			else
 				-- The withdrawn assignments are still on disk: mark the
-				-- clear OWED and retry it every tick until it lands.
-				self.durable_clear_pending = true
+				-- clear OWED — stamped by this resolution — and retry it
+				-- every tick until it lands.
+				self.durable_clear_pending =
+					type(resolved_at_ms) == "number" and resolved_at_ms or 0
 				self:diagnose("persist_failed", "cache_clear")
+			end
+		else
+			-- An ORDINARY 401/403 retains the durable record. An owed cache
+			-- WRITE whose entry this latch just cleared from memory must
+			-- not decay into a delete at the next retry — absence in memory
+			-- here is fail-closed serving, not a drop decision — so owed
+			-- writes are cancelled (their source data is gone; the disk
+			-- keeps its last-known record). Owed DROPS were authoritative
+			-- server decisions and still land.
+			for key, pending in pairs(self.durable_pending) do
+				if not pending.drop then
+					self.durable_pending[key] = nil
+				end
 			end
 		end
 		return
@@ -1220,6 +1335,11 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		if outcome.transient and auth_epoch == self.auth_epoch then
 			self:pace_transient(outcome.retry_after_seconds)
 		end
+		-- Captured BEFORE install (which may settle this very seq): true
+		-- when a NEWER outcome for this key already settled while this
+		-- response was in flight, i.e. the install below discards it.
+		local fenced_out =
+			seq <= (self.settled[scope .. scope_separator .. experiment_key] or 0)
 		self:install(seq, scope, experiment_key, outcome, auth_epoch, resolved_at_ms)
 		-- The epoch re-check guards the PUBLIC callback like the install:
 		-- a response that raced a fail-closed latch was discarded from
@@ -1238,6 +1358,17 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		local subject_now = self:current_subject_id()
 		if not subject_now or self:scope_for(subject_now) ~= scope then
 			finish({ ok = false, from_cache = false, error = "stale_subject" })
+			return
+		end
+		-- And the per-key sequence fence guards it last: an older
+		-- AUTHORITATIVE response that a newer settled outcome already
+		-- fenced out was discarded by the install, and its caller must
+		-- receive the SETTLED current state — the cached assignment the
+		-- getters serve, or the miss — never the fenced-out variant.
+		-- Transient results already derive from the current fenced entry
+		-- and pass through untouched.
+		if fenced_out and outcome.authoritative then
+			finish(serve_entry_or_fail(self.entries[experiment_key], "superseded"))
 			return
 		end
 		finish(result)
@@ -1264,16 +1395,7 @@ function Experiments:tick(_)
 	-- Owed-exposure sweep: cache-restored applications, locally failed
 	-- emissions, and applications whose facts a consent purge re-armed all
 	-- drain here, in per-experiment order, while consent is granted.
-	if next(self.pending_exposure) then
-		local keys = {}
-		for key in pairs(self.pending_exposure) do
-			keys[#keys + 1] = key
-		end
-		table.sort(keys)
-		for i = 1, #keys do
-			self:sweep_pending(keys[i])
-		end
-	end
+	self:sweep_owed()
 	if self.auth_blocked or not next(self.entries) then
 		return
 	end

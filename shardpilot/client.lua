@@ -2345,6 +2345,20 @@ function Client:shutdown(reason)
 		end
 	end
 	if self.experiments then
+		-- The final flush freed queue room: sweep owed exposure facts one
+		-- last time so a treatment applied under a FULL queue does not exit
+		-- without its fact, then deliver-or-spool whatever the sweep
+		-- enqueued. Best-effort by design: a still-failing send with no
+		-- durable spool is not a teardown blocker — the durable record
+		-- re-arms live assignments at the next launch (only a since-dropped
+		-- assignment's owed fact is lost with the process, as before).
+		local before_sweep = queue.size(self.queue)
+		self.experiments:sweep_owed()
+		if queue.size(self.queue) > before_sweep then
+			if not self:flush({ include_summaries = false }) then
+				self:spool_undelivered()
+			end
+		end
 		-- Stop the experiments consumer WITH the successful teardown (a
 		-- failed shutdown keeps the client — and the consumer — alive for
 		-- a host retry): an assignment response still in flight must not
