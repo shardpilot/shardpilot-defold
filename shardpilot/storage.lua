@@ -863,17 +863,30 @@ end
 function M.load_spool(scope)
 	local ns = spool_namespace(scope)
 	local record = nil
+	local read_failed = false
 	local path = save_path(ns, "spool")
 	if path then
 		local ok, loaded = pcall(sys.load, path)
 		if ok and type(loaded) == "table" then
 			record = loaded
+		elseif not ok then
+			read_failed = true
 		end
 	end
 	if record == nil then
 		record = spool_memory[ns]
 	end
 	if type(record) ~= "table" then
+		if read_failed then
+			-- The STORE errored on the read and no in-process shadow backs
+			-- it: the spool's content is UNKNOWN, not proven empty. The
+			-- collapse to an empty list stands for flow (nothing can be
+			-- re-sent from an unreadable file), but callers that must
+			-- prove spool CLEANLINESS — the experiments condemnation-
+			-- marker retire rule — read the third value and treat the
+			-- launch as unproven instead of clean.
+			return {}, nil, "unreadable"
+		end
 		return {}, nil
 	end
 	return sanitize_spool_events(record.events), sanitize_deadline(record.retry_after_until_ms)
@@ -1320,14 +1333,27 @@ end
 function M.load_experiments(scope)
 	local ns = spool_namespace(scope)
 	local record = nil
-	local read_failed = false
 	local path = save_path(ns, "experiments")
 	if path then
 		local ok, loaded = pcall(sys.load, path)
 		if ok and type(loaded) == "table" then
 			record = loaded
 		elseif not ok then
-			read_failed = true
+			-- The STORE errored on the read — distinct from a readable
+			-- miss (no file, or a record another scope replaced) and from
+			-- a parsed-but-corrupt record (which stays a plain miss, the
+			-- corrupt-is-a-miss canon: same bytes parse the same way
+			-- forever). The in-process memory shadow must NOT stand in for
+			-- the failed read: the file's current content is unknown — a
+			-- sibling client may have persisted entries after this
+			-- process's last successful save — and a shadow-backed answer
+			-- would let settle/save paths decide off a process-local
+			-- snapshot (wiping durable entries absent from the shadow, or
+			-- vacuously retiring a drop the file still holds). Callers
+			-- that must fail closed on ambiguity — the sync/settle/retire
+			-- paths — read the second value; everyone else keeps the
+			-- nil-is-a-miss contract unchanged.
+			return nil, "unreadable"
 		end
 	end
 	if record == nil then
@@ -1335,16 +1361,6 @@ function M.load_experiments(scope)
 	end
 	if type(record) ~= "table"
 		or type(record.scope) ~= "string" or record.scope == "" then
-		if read_failed and record == nil then
-			-- The STORE errored on the read — distinct from a readable
-			-- miss (no file, or a record another scope replaced) and from
-			-- a parsed-but-corrupt record (which stays a plain miss, the
-			-- corrupt-is-a-miss canon: same bytes parse the same way
-			-- forever). Callers that must fail closed on ambiguity — the
-			-- condemnation-marker settle check — read the second value;
-			-- everyone else keeps the nil-is-a-miss contract unchanged.
-			return nil, "unreadable"
-		end
 		return nil
 	end
 	return {
@@ -1434,17 +1450,33 @@ local experiments_clear_memory = {}
 function M.load_experiments_clear(scope)
 	local ns = spool_namespace(scope)
 	local record = nil
+	local read_failed = false
 	local path = save_path(ns, "experiments-clear")
 	if path then
 		local ok, loaded = pcall(sys.load, path)
 		if ok and type(loaded) == "table" then
 			record = loaded
+		elseif not ok then
+			read_failed = true
 		end
 	end
 	if record == nil then
 		record = experiments_clear_memory[ns]
 	end
 	if type(record) ~= "table" or type(record.stamp) ~= "number" then
+		if read_failed and record == nil then
+			-- The sidecar READ errored and no in-process shadow backs it:
+			-- an armed condemnation may be sitting in the unreadable file,
+			-- and reading that as "no marker" would let a perfectly
+			-- readable spool replay condemned facts after a restart (the
+			-- shadow is empty then by construction). The third return
+			-- lets consumers fail CLOSED — treat the marker as armed with
+			-- unknown stamp/scope — until a readable pass decides it. A
+			-- readable-but-garbled record still reads as absent (the
+			-- corrupt-is-a-miss canon), and a present shadow (a marker
+			-- this process saved) is served as armed like always.
+			return nil, nil, "unreadable"
+		end
 		return nil
 	end
 	local clear_scope = type(record.scope) == "string" and record.scope ~= ""

@@ -655,7 +655,7 @@ function M.new(config)
 			client.spool_purge_pending = true
 		end
 	else
-		local spooled, stored_deadline = storage.load_spool(normalized)
+		local spooled, stored_deadline, spool_miss = storage.load_spool(normalized)
 		-- Server-requested backpressure survives a relaunch: when the record
 		-- carries a still-future Retry-After deadline, seed the publish
 		-- deferral so the startup resend waits out the remaining window
@@ -699,7 +699,7 @@ function M.new(config)
 		local condemned = 0
 		local condemnation_covers = false
 		local condemnation_stamp_iso = nil
-		if #spooled > 0 then
+		if #spooled > 0 or spool_miss == "unreadable" then
 			if client.experiments then
 				condemnation_covers =
 					client.experiments:condemnation_covers_current_scope()
@@ -725,12 +725,32 @@ function M.new(config)
 				-- machinery can do — a marker whose facts are all
 				-- post-stamp condemns nothing below and retires in the
 				-- next ENABLED launch's first tick.
-				local marker_stamp = storage.load_experiments_clear(normalized)
+				local marker_stamp, _, marker_miss =
+					storage.load_experiments_clear(normalized)
 				if marker_stamp then
 					condemnation_covers = true
 					condemnation_stamp_iso = clock.iso_utc(marker_stamp)
+				elseif marker_miss == "unreadable" then
+					-- The sidecar READ failed: an armed condemnation may
+					-- sit in the unreadable file. Fail closed exactly like
+					-- the consumer's unknown-form marker — condemn with no
+					-- stamp, which blanket-filters the experiment facts
+					-- below (no partition is possible without the stamp).
+					condemnation_covers = true
 				end
 			end
+		end
+		if spool_miss == "unreadable" and condemnation_covers then
+			-- The spool READ failed while a condemnation is armed: spool
+			-- cleanliness is UNPROVEN, not clean — the unreadable file may
+			-- still hold pre-sentinel facts carrying withdrawn subject-fact
+			-- keys, and nothing was filtered or rewritten this launch.
+			-- Record the debt so the marker cannot retire on this launch's
+			-- evidence (the retire chokepoint consults this flag); any
+			-- later successful whole-file spool write proves cleanliness
+			-- and clears it, and an unhealed file simply leaves the marker
+			-- armed for the next launch's readable pass.
+			client.condemned_spool_pending = true
 		end
 		if condemnation_covers then
 			-- A real-subjects condemnation survived the exit (the sentinel's

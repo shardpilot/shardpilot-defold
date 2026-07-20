@@ -6438,6 +6438,378 @@ function extra_tests.test_restored_synthetic_fact_key_is_cleared()
 	storage.reset()
 end
 
+-- Shared staging for the condemned-spool rounds: launch 1 spools a captured
+-- exposure fact durably, then the real-subjects sentinel lands with the
+-- record and spool stores down — only the sidecar marker persists — and the
+-- process dies. Returns after storage.reset() with the fake disk holding
+-- the stale spool, the condemned record, and the armed marker.
+local function stage_condemned_spool_launch(state)
+	local client = granted_client()
+	assert_true(client:session_start())
+	assert_true(client:track("filler-host-event"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+	advance_seconds(2)
+	state.fail_save = function(path)
+		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	state.fail_save = nil
+	next_status = 200
+	next_response_body = nil
+	storage.reset()
+end
+
+function extra_tests.test_unreadable_spool_holds_marker_retirement()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	stage_condemned_spool_launch(state)
+
+	-- Launch 2: the SPOOL read throws (record and marker readable). The
+	-- record side settles — the re-armed clear lands against the readable
+	-- record — but spool cleanliness is UNPROVEN, so the marker must NOT
+	-- retire on this launch's evidence.
+	local saved_load = sys.load
+	sys.load = function(path)
+		if path:match("/spool$") then
+			error("io_error")
+		end
+		return saved_load(path)
+	end
+	local second = assert(sdk.new(config()))
+	second:update(0.016)
+	second:update(0.016)
+	local marker_path = nil
+	for key in pairs(stores) do
+		if key:match("/experiments%-clear$") then
+			marker_path = key
+		end
+	end
+	assert_true(marker_path ~= nil and type(stores[marker_path]) == "table"
+		and stores[marker_path].stamp ~= nil,
+		"an unreadable spool is unknown, not clean — the marker survives")
+
+	-- Launch 3: the spool heals. The surviving marker filters the
+	-- withdrawn fact at load; the host's spooled events still deliver.
+	sys.load = saved_load
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	local resent = 0
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			resent = resent + 1
+			assert_true(not requests[i].body:find("experiment_exposure", 1, true),
+				"the marker survived to condemn the withdrawn facts")
+			assert_true(requests[i].body:find("filler%-host%-event") ~= nil,
+				"while the host's spooled events still deliver")
+		end
+	end
+	assert_true(resent > 0, "the surviving spooled envelopes re-sent")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_midflight_revocation_still_applies_kill()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- A revalidation-shaped fetch goes out under GRANT; consent is revoked
+	-- while it is in flight; the server answers with the kill switch.
+	local held = {}
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	local result = nil
+	client:fetch_experiment_assignment("exp-checkout", function(value)
+		result = value
+	end)
+	responder = nil
+	assert_equal(#held, 1)
+	assert_true(client:set_consent(false))
+	held[1](nil, nil, { status = 200, response = not_assigned_body("kill_switch") })
+	assert_true(result ~= nil and result.ok == false,
+		"the caller receives the refusal, never a healthy result")
+
+	-- The destructive directive still applied: a re-grant must NOT
+	-- re-serve the assignment the server withdrew mid-flight.
+	assert_true(client:set_consent(true))
+	assert_nil(client:experiment_variant("exp-checkout"),
+		"the kill applied locally despite the mid-flight revocation")
+
+	-- And it landed durably: a relaunch restores nothing.
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-checkout"),
+		"the withdrawal converged to disk")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_unreadable_marker_fails_closed()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	stage_condemned_spool_launch(state)
+
+	-- Launch 2: only the MARKER read throws (record and spool readable).
+	-- Reading that as "no condemnation" would restore the withdrawn record
+	-- AND replay the condemned spooled facts — fail closed instead.
+	local saved_load = sys.load
+	sys.load = function(path)
+		if path:match("/experiments%-clear$") then
+			error("io_error")
+		end
+		return saved_load(path)
+	end
+	local second = assert(sdk.new(config()))
+	assert_nil(second:experiment_variant("exp-checkout"),
+		"an unreadable marker refuses restores conservatively")
+	local requests_before = #requests
+	assert_true(second:flush({ include_summaries = false }))
+	local resent = 0
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			resent = resent + 1
+			assert_true(not requests[i].body:find("experiment_exposure", 1, true),
+				"an unreadable marker blanket-filters the spooled facts")
+			assert_true(requests[i].body:find("filler%-host%-event") ~= nil,
+				"while the host's spooled events still deliver")
+		end
+	end
+	assert_true(resent > 0, "the surviving spooled envelopes re-sent")
+	sys.load = saved_load
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_shadow_never_masks_unreadable_record()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- A sibling process persists ANOTHER experiment into the shared record
+	-- (simulated by replacing the stored table — the in-process shadow
+	-- keeps the old object and diverges from the disk).
+	local record_path = nil
+	for key, stored in pairs(stores) do
+		if key:match("/experiments$") and type(stored) == "table"
+			and type(stored.entries) == "table"
+			and stored.entries["exp-checkout"] then
+			record_path = key
+		end
+	end
+	assert_true(record_path ~= nil, "the durable record was staged")
+	local old = stores[record_path]
+	local held_entry = old.entries["exp-checkout"]
+	stores[record_path] = {
+		scope = old.scope,
+		entries = {
+			["exp-checkout"] = held_entry,
+			["exp-b"] = {
+				assignment_key = held_entry.assignment_key,
+				variant_key = "treatment-b",
+				variant_payload = held_entry.variant_payload,
+				version = held_entry.version,
+				assignment_unit = held_entry.assignment_unit,
+				subject_fact_key = held_entry.subject_fact_key,
+				subject_key = held_entry.subject_key,
+				attributes = held_entry.attributes,
+				fetched_at_ms = held_entry.fetched_at_ms,
+			},
+		},
+	}
+
+	-- The record READ starts throwing while the shadow still exists: the
+	-- kill must keep its drop OWED — settling and saving off the shadow
+	-- would wipe the sibling's entry from the disk.
+	local saved_load = sys.load
+	sys.load = function(path)
+		if path:match("/experiments$") then
+			error("io_error")
+		end
+		return saved_load(path)
+	end
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-checkout")
+	assert_nil(client:experiment_variant("exp-checkout"))
+
+	-- The store heals: the retry decides over the REAL file — the kill
+	-- lands, the sibling's entry survives.
+	sys.load = saved_load
+	client:update(0.016)
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-checkout"),
+		"the kill landed against the real record")
+	assert_equal(relaunch:experiment_variant("exp-b"), "treatment-b",
+		"the sibling's durable entry was never wiped by a shadow-based save")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_stale_epoch_kill_still_lands_durably()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body({ experiment_key = "exp-a" })
+	fetch(client, "exp-a")
+	next_response_body = assignment_body({ experiment_key = "exp-b" })
+	fetch(client, "exp-b")
+
+	-- exp-b's revalidation-shaped fetch is in flight when exp-a's 401
+	-- latches the plane and bumps the auth epoch...
+	local held = {}
+	responder = function(url, _, callback)
+		if not url:find("experiment_key=exp-b", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	local result_b = nil
+	client:fetch_experiment_assignment("exp-b", function(value)
+		result_b = value
+	end)
+	responder = nil
+	assert_equal(#held, 1)
+	next_status = 401
+	next_response_body = json.encode({ error = "unauthorized" })
+	fetch(client, "exp-a")
+	next_status = 200
+
+	-- ...and exp-b's answer is the kill switch. The stale epoch suppresses
+	-- every constructive effect (the caller still gets the closed result;
+	-- nothing unlatches) but the destructive directive must land durably —
+	-- the ordinary latch RETAINED the record, and discarding the kill
+	-- would restore exp-b at the next init.
+	held[1](nil, nil, { status = 200, response = not_assigned_body("kill_switch") })
+	assert_true(result_b ~= nil and result_b.ok == false
+		and result_b.error == "unauthorized",
+		"the stale-epoch caller still receives the closed result")
+
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_equal(relaunch:experiment_variant("exp-a"), "treatment",
+		"the ordinary latch retained the durable record for exp-a")
+	assert_nil(relaunch:experiment_variant("exp-b"),
+		"the stale-epoch kill still withdrew exp-b durably")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_unreadable_demotion_keeps_clear_owed()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	-- The sentinel lands with the record store down: the clear fails, the
+	-- sidecar marker persists. Process death.
+	advance_seconds(2)
+	state.fail_save = fail_experiment_saves
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	state.fail_save = nil
+	next_status = 200
+	storage.reset()
+
+	-- Launch 2: the record file is fully down (reads throw, writes fail).
+	-- A fresh authorized install triggers demotion — which must NOT
+	-- consume the whole-record clear intent over the unreadable read.
+	local saved_load = sys.load
+	sys.load = function(path)
+		if path:match("/experiments$") then
+			error("io_error")
+		end
+		return saved_load(path)
+	end
+	state.fail_save = fail_experiment_saves
+	local second = assert(sdk.new(config()))
+	next_response_body = assignment_body({ experiment_key = "exp-two" })
+	fetch(second, "exp-two")
+
+	-- The store heals: the kept intent demotes with real evidence — the
+	-- condemned entry converges out of the record and the marker retires.
+	sys.load = saved_load
+	state.fail_save = nil
+	second:update(0.016)
+	second:update(0.016)
+	local record = storage.load_experiments(second.config)
+	assert_true(record ~= nil and record.entries["exp-two"] ~= nil,
+		"the fresh install converged durably")
+	assert_true(record.entries["exp-checkout"] == nil,
+		"the kept clear intent demoted and dropped the condemned entry")
+	local marker_path = nil
+	for key in pairs(stores) do
+		if key:match("/experiments%-clear$") then
+			marker_path = key
+		end
+	end
+	assert_true(marker_path == nil or type(stores[marker_path]) ~= "table"
+		or stores[marker_path].stamp == nil,
+		"the settled clear retired the marker")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_invalid_wire_version_is_malformed()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- A PRESENT version failing the positive-integer wire grammar is a
+	-- garbled answer: it must never execute the not-assigned path's
+	-- authoritative durable drop (the closed-vocabulary rule, applied to
+	-- the version field).
+	next_response_body = json.encode({
+		version = -3,
+		assigned = false,
+		reason = "kill_switch",
+		boundary = { assignment_unit = "client_id" },
+	})
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.from_cache,
+		"a negative-version not-assigned is malformed, never a drop")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the cached assignment survives the garbled answer")
+
+	-- The assigned path holds the same grammar: nothing installs on it.
+	next_response_body = assignment_body({ version = 2.5, variant_key = "half" })
+	local up = fetch(client, "exp-checkout")
+	assert_true(up.ok and up.from_cache, "a fractional version is malformed")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -6602,6 +6974,13 @@ local tests = {
 	extra_tests.test_disabled_relaunch_filters_condemned_spool,
 	extra_tests.test_unreadable_record_read_keeps_kill_drop_owed,
 	extra_tests.test_restored_synthetic_fact_key_is_cleared,
+	extra_tests.test_unreadable_spool_holds_marker_retirement,
+	extra_tests.test_midflight_revocation_still_applies_kill,
+	extra_tests.test_unreadable_marker_fails_closed,
+	extra_tests.test_shadow_never_masks_unreadable_record,
+	extra_tests.test_stale_epoch_kill_still_lands_durably,
+	extra_tests.test_unreadable_demotion_keeps_clear_owed,
+	extra_tests.test_invalid_wire_version_is_malformed,
 }
 
 for _, test in ipairs(tests) do

@@ -500,6 +500,17 @@ local function valid_subject_fact_key(value)
 	return value:match("^sfk1_[0-9a-f]+$") ~= nil
 end
 
+-- The positive wire grammar for an experiment version: a positive, finite
+-- integer. The version drives the exposure de-dupe tuple and the
+-- deterministic event ids, so a garbled value — negative, fractional, NaN —
+-- must read as MALFORMED: it never installs, and it never executes the
+-- not-assigned path's authoritative durable drop on garbage input (the
+-- closed-vocabulary rule, applied to the version field).
+local function valid_wire_version(value)
+	return type(value) == "number" and value > 0 and value < math.huge
+		and value % 1 == 0
+end
+
 -- Strip everything nested below the ROOT object from a JSON body (string-
 -- aware: quotes and escapes tracked, so braces inside string values cannot
 -- skew the depth), leaving only the top-level keys and scalar values. The
@@ -605,7 +616,7 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 		if decoded.assigned == true
 			and type(decoded.assignment_key) == "string" and decoded.assignment_key ~= ""
 			and type(decoded.variant_key) == "string" and decoded.variant_key ~= ""
-			and type(decoded.version) == "number"
+			and valid_wire_version(decoded.version)
 			and type(assignment_unit) == "string" and assignment_unit ~= "" then
 			if assignment_unit == "client_id"
 				and not valid_subject_fact_key(decoded.subject_fact_key) then
@@ -649,6 +660,15 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 			}, { authoritative = true, new_entry = new_entry }
 		end
 		if decoded.assigned == false then
+			if decoded.version ~= nil and not valid_wire_version(decoded.version) then
+				-- A PRESENT version failing the wire grammar (negative,
+				-- fractional, NaN, or mistyped) is a garbled answer: it
+				-- must not execute the authoritative durable drop below —
+				-- the same rule as an unknown reason. Absent stays fine
+				-- (the reason-only shapes carry none).
+				return serve_entry_or_fail(entry, "malformed_response",
+					requested_attributes), { transient = true }
+			end
 			-- The three not-assigned shapes, distinguished only by `reason`,
 			-- form a CLOSED vocabulary: ABSENT (deterministic traffic-gate
 			-- miss), "targeting_unmatched", "kill_switch". Each drops the
@@ -932,22 +952,39 @@ function M.new(config, deps)
 	-- post-sentinel authorized state and restore normally (the same
 	-- survivor partition the clear itself applies); the first tick lands
 	-- the clear.
-	local condemned_stamp, condemned_scope = storage.load_experiments_clear(config)
+	local condemned_stamp, condemned_scope, condemned_miss =
+		storage.load_experiments_clear(config)
 	if condemned_stamp then
 		ex.durable_clear_pending = condemned_stamp
 		ex.durable_clear_scope = condemned_scope
 		ex.clear_marker = { stamp = condemned_stamp, scope = condemned_scope }
+	elseif condemned_miss == "unreadable" then
+		-- The sidecar READ failed: an armed condemnation may be sitting in
+		-- the unreadable file, and reading that as "no marker" would
+		-- restore and serve a withdrawn record (and let a readable spool
+		-- replay condemned facts). Fail CLOSED: arm the clear in its
+		-- UNKNOWN form — boolean pending, stampless scope-less marker —
+		-- which condemns conservatively everywhere (restores refused
+		-- below, the spool filter blanket-drops, retire checks hold) and
+		-- can neither demote nor partition until the sync pass re-reads
+		-- the sidecar and either adopts the real stamp/scope or disproves
+		-- it with a readable miss.
+		ex.durable_clear_pending = true
+		ex.durable_clear_scope = nil
+		ex.clear_marker = { unreadable = true }
 	end
 	local subject = ex:current_subject_id()
 	if subject then
 		local record = storage.load_experiments(config)
 		if record and record.scope == ex:scope_for(subject) then
-			local record_condemned = condemned_stamp ~= nil
-				and (condemned_scope == nil or condemned_scope == record.scope)
+			local record_condemned = (condemned_stamp ~= nil
+				and (condemned_scope == nil or condemned_scope == record.scope))
+				or condemned_miss == "unreadable"
 			for key, entry in pairs(record.entries) do
 				local stored_at = type(entry.fetched_at_ms) == "number"
 					and entry.fetched_at_ms or 0
-				if not record_condemned or stored_at > condemned_stamp then
+				if not record_condemned or (type(condemned_stamp) == "number"
+					and stored_at > condemned_stamp) then
 					-- Restored attributes re-validate against the live
 					-- fetch vocabulary before any revalidation can send
 					-- them: corrupt or older-build records degrade to a
@@ -1426,9 +1463,30 @@ function Experiments:demote_owed_clear()
 	if not self.durable_clear_pending then
 		return
 	end
+	if self.durable_clear_pending == true then
+		-- The clear is armed in its UNKNOWN form (an unreadable sidecar:
+		-- stamp and scope unrecoverable): nothing can be demoted on it —
+		-- there is no stamp to partition covered keys by. The sync pass
+		-- re-reads the sidecar and settles the form first; until then the
+		-- intent stays owed and conservative.
+		return
+	end
 	local clear_as_of = type(self.durable_clear_pending) == "number"
 		and self.durable_clear_pending or 0
 	local clear_scope = self.durable_clear_scope
+	local record, record_miss = storage.load_experiments(self.config)
+	if record == nil and record_miss == "unreadable" then
+		-- The record READ failed: the demotion cannot prove which covered
+		-- keys remain, so consuming the whole-record intent here would
+		-- leave NOTHING owed in this process — has_owed_durable_sync()
+		-- would report clean, persist()/shutdown() would claim safety, and
+		-- the retries would stop while condemned entries still sit in the
+		-- (currently unreadable) file. The sidecar marker alone is an
+		-- exit-time guard, not a convergence engine. Keep the intent
+		-- pending; the next readable pass demotes it into per-key drops
+		-- (or settles it) with real evidence.
+		return
+	end
 	self.durable_clear_pending = false
 	self.durable_clear_scope = nil
 	-- The durable condemnation marker is deliberately NOT retired here:
@@ -1437,7 +1495,6 @@ function Experiments:demote_owed_clear()
 	-- durable refusal — otherwise a restart would restore the covered
 	-- stale entries the sentinel withdrew. The marker retires at the
 	-- durable-state check once nothing it condemns remains on disk.
-	local record = storage.load_experiments(self.config)
 	if not record then
 		return
 	end
@@ -1473,7 +1530,29 @@ end
 -- no serving decisions, so it runs regardless of the consent state — a
 -- kill drop decided under grant must land durably even if consent flips.
 function Experiments:retry_durable_sync()
-	if self.durable_clear_pending then
+	if self.durable_clear_pending == true then
+		-- The clear is armed in its UNKNOWN form (the sidecar was
+		-- unreadable at construction): re-read it each pass. A healed read
+		-- adopts the real stamp/scope — the normal demote/retry machinery
+		-- resumes on the next pass with real evidence. A READABLE miss
+		-- (absent file, or parsed-corrupt — the corrupt-is-a-miss canon
+		-- read positively) disproves the marker: disarm, and retire
+		-- through the chokepoint (which overwrites the garbled sidecar,
+		-- and still holds while condemned spool debt is owed — an
+		-- unretired marker file then keeps the next launch fail-closed,
+		-- exactly as intended). Still-unreadable stays armed and owed.
+		local stamp, marker_scope, marker_miss =
+			storage.load_experiments_clear(self.config)
+		if stamp then
+			self.durable_clear_pending = stamp
+			self.durable_clear_scope = marker_scope
+			self.clear_marker = { stamp = stamp, scope = marker_scope }
+		elseif marker_miss ~= "unreadable" then
+			self.durable_clear_pending = false
+			self.durable_clear_scope = nil
+			self:retire_clear_marker()
+		end
+	elseif self.durable_clear_pending then
 		if next(self.entries) ~= nil then
 			-- Newer authorized state was installed after the failed clear:
 			-- the epoch-scoped clear must not wipe it — demote it to the
@@ -1656,11 +1735,16 @@ function Experiments:retire_clear_marker_if_settled()
 	local remaining = false
 	if record and (self.clear_marker.scope == nil
 		or record.scope == self.clear_marker.scope) then
+		-- A STAMPLESS marker (the unreadable-sidecar form held alive by
+		-- spool debt) condemns conservatively: any in-scope entry counts
+		-- as remaining, so it retires only over a genuinely empty record.
+		local marker_stamp = type(self.clear_marker.stamp) == "number"
+			and self.clear_marker.stamp or math.huge
 		for _, stored in pairs(record.entries) do
 			local stored_at = type(stored) == "table"
 				and type(stored.fetched_at_ms) == "number"
 				and stored.fetched_at_ms or 0
-			if stored_at <= self.clear_marker.stamp then
+			if stored_at <= marker_stamp then
 				remaining = true
 			end
 		end
@@ -2071,6 +2155,239 @@ function Experiments:has_owed_durable_sync()
 	return next(self.durable_pending) ~= nil
 end
 
+-- The real-subjects sentinel's WITHDRAWAL half: wipe served and owed
+-- state, purge pipeline-resident facts, and land (or durably mark) the
+-- stamped whole-record clear. Factored out of the latch path so a
+-- sentinel that arrives with its constructive half SUPPRESSED — stale by
+-- auth epoch after a mid-batch latch, or answering a request whose
+-- consent was revoked mid-flight — still applies the platform's
+-- destructive directive: it never unlatches, never bumps the epoch, and
+-- installs nothing (the latch path sets its own latch state before
+-- calling in here).
+function Experiments:apply_sentinel_withdrawal(scope, resolved_at_ms, dispatched_at_ms)
+	local withdrawn_stamp_max = 0
+	local sentinel_dispatch_bound = nil
+	-- The clear's stamp must be decisively ABOVE the state it
+	-- withdraws (the drop rule: the wall clock can move backward,
+	-- and a rollback must not let withdrawn entries outrank their
+	-- own clear). Capture the withdrawn stamps BEFORE memory is
+	-- wiped. The DISK record is deliberately NOT folded in: an
+	-- entry there stamped after the dispatch bound is a sibling's
+	-- post-sentinel write the partition must see as a survivor,
+	-- not withdrawn state (same-clock best-effort, like every
+	-- write fence; a rollback-backdated withdrawn disk-only entry
+	-- surviving until its own next probe is the accepted corner).
+	-- The MEMORY scan honors the same dispatch bound: an entry
+	-- fetched AFTER this sentinel's request was dispatched is
+	-- post-sentinel authorized state, not withdrawn state — in a
+	-- revalidation batch where a sibling key's fresh 200 lands
+	-- before this sentinel's callback, folding that entry into the
+	-- scan would raise the clear stamp above the survivor and the
+	-- partition below would delete it as covered. Only entries
+	-- at/before the dispatch bound may raise the stamp (an
+	-- exactly-adjacent-millisecond tie stays the same-clock
+	-- best-effort corner every fence accepts).
+	sentinel_dispatch_bound = type(dispatched_at_ms) == "number"
+		and dispatched_at_ms
+		or (type(resolved_at_ms) == "number" and resolved_at_ms or 0)
+	for _, held in pairs(self.entries) do
+		if type(held) == "table"
+			and type(held.fetched_at_ms) == "number"
+			and held.fetched_at_ms <= sentinel_dispatch_bound
+			and held.fetched_at_ms > withdrawn_stamp_max then
+			withdrawn_stamp_max = held.fetched_at_ms
+		end
+	end
+	self.entries = {}
+	-- The sentinel withdraws the assignments AND their subject-fact
+	-- keys outright: owed exposure snapshots carry those keys and
+	-- go with them. (A snapshot whose entry survives the partition
+	-- below dies too — conservative toward the sentinel's privacy
+	-- mandate; the survivor re-arms from the durable record at the
+	-- next construction.)
+	self.pending_exposure = {}
+	-- The session's arm accounting resets WITH the discarded and
+	-- purged facts: a purged emission never egressed, so a
+	-- refetched same-session tuple (the platform flipping the flag
+	-- back on) must expose again — a retained `exposed` mark would
+	-- silently under-count the re-served treatment. Re-emission
+	-- derives the SAME deterministic id, so anything that had
+	-- already published collapses server-side (the consent-purge
+	-- rule, applied to the sentinel's discard).
+	self.exposed = {}
+	-- Queue-resident facts die with the snapshots: exposure and
+	-- outcome facts ALREADY ACCEPTED into the analytics pipeline
+	-- (queued below batch size, retained behind a publish retry
+	-- backoff, or spooled durably) carry the withdrawn subject-fact
+	-- keys verbatim, and shipping them on the next flush would keep
+	-- egressing what the platform just killed. The client purges
+	-- them from every pipeline surface — memory queue, retained
+	-- batch, loaded spool chunks, durable spool record (that
+	-- removal converging through the spool-rewrite machinery when
+	-- the store is down). Only a batch actually ON THE WIRE at this
+	-- instant is past recall — the same publish-in-flight carve-out
+	-- the consent purge accepts — and if that publish fails and
+	-- retains, the client filters the batch at settle time.
+	if self.deps.purge_facts then
+		self.deps.purge_facts()
+	end
+	-- The clear's authority is bounded by WHEN THIS FETCH ASKED:
+	-- the flag state this answer reports is no newer than the
+	-- request's dispatch, so an entry written while the sentinel
+	-- was in flight (a sibling's fresh 200 — the flag flipped back
+	-- on) postdates the directive and must survive. Stamp = the
+	-- dispatch bound, raised above the withdrawn memory image.
+	local stamp = sentinel_dispatch_bound
+	if withdrawn_stamp_max >= stamp then
+		stamp = withdrawn_stamp_max + 1
+	end
+	self.durable_clear_pending = stamp
+	-- The clear condemns only THE SCOPE it was decided for: the
+	-- record file is shared across assignment scopes, and another
+	-- environment/credential's entries must never be pruned on
+	-- this sentinel's stamp.
+	self.durable_clear_scope = scope
+	-- The SUCCESS path partitions exactly like the retry — a stale
+	-- in-flight sentinel must not erase a sibling's newer
+	-- post-sentinel write even when storage works — so the clear
+	-- goes through the one stamped implementation immediately.
+	self:retry_owed_clear()
+	if self.durable_clear_pending then
+		-- Still owed: the in-memory intent would die with the
+		-- process and the next launch would serve the withdrawn
+		-- record until its first probe. Make the condemnation
+		-- DURABLE — the sidecar tombstone carries the clear's
+		-- stamp AND scope, the constructor refuses what it covers
+		-- and re-arms the clear. Best-effort in the double-failure
+		-- corner (record AND sidecar stores down), diagnosed:
+		-- that corner is the documented storage-down-through-exit
+		-- residual.
+		if storage.save_experiments_clear(self.config, stamp, scope) then
+			self.clear_marker = { stamp = stamp, scope = scope }
+		else
+			self:diagnose("persist_failed", "cache_clear_tombstone")
+		end
+		self:diagnose("persist_failed", "cache_clear")
+	elseif not self.clear_marker
+		and self.deps.spool_condemned_pending
+		and self.deps.spool_condemned_pending() then
+		-- The cache side SETTLED, but condemned facts remain on
+		-- the durable spool (the purge's removal write could not
+		-- land): that debt is memory-only, and an exit before the
+		-- rewrite retries would leave the next launch with no
+		-- durable condemnation over the stale file — the
+		-- withdrawn facts would simply resend. Persist the marker
+		-- for the SPOOL's sake: the retire rule (record clean AND
+		-- spool clean) governs its lifetime, and the stamp
+		-- partition keeps it harmless to post-sentinel facts
+		-- meanwhile. Best-effort like the tombstone above —
+		-- both-stores-down stays the documented residual.
+		if storage.save_experiments_clear(self.config, stamp, scope) then
+			self.clear_marker = { stamp = stamp, scope = scope }
+		else
+			self:diagnose("persist_failed", "cache_clear_tombstone")
+		end
+	end
+end
+
+-- An authoritative per-key drop's WITHDRAWAL half (kill switch, 404, a
+-- permanent bad-request, an authoritative not-assigned): remove the
+-- served entry, durably capture the owed exposure snapshots the delete
+-- would orphan, and converge the durable record with the decision-time
+-- stamp raise. Shared by the normal install flow and the destructive
+-- partitions (stale-epoch / revoked-consent), which apply the server's
+-- withdrawal while suppressing every constructive effect.
+function Experiments:apply_entry_drop(scope, experiment_key, resolved_at_ms)
+	local dropped = self.entries[experiment_key]
+	self.entries[experiment_key] = nil
+	-- The OWED exposures deliberately survive the drop: an application
+	-- that already happened is a fact — the drop stops future serving,
+	-- not the record of real treatment. The sweep emits them from the
+	-- retained snapshots. The durable drop converges keyed on the DISK
+	-- state (a latch may have cleared serving while the record retains
+	-- the entry) and is retried until it lands — the kill rule demands
+	-- the drop reach the disk. And because this delete removes the only
+	-- persisted state the owed fact could have re-armed from, each owed
+	-- snapshot is durably CAPTURED into the analytics spool before the
+	-- delete: a process KILL before the next sweep/persist then replays
+	-- the fact at the next launch instead of losing it. Narrow by
+	-- contract — drop-time only; owed facts whose entries live on stay
+	-- memory-only until the ordinary dispatch-point captures
+	-- (persist/shutdown/failed publish). The snapshot stays armed for
+	-- the live process — the deterministic event_id collapses the
+	-- pair: a successful publish acks the spool copy away, a post-kill
+	-- replay dedups server-side. Best-effort corners, documented: no
+	-- session identity to stamp (a background capture opens no phantom
+	-- session), spool disabled, storage down — the
+	-- storage-down-through-exit family.
+	local owed = self.pending_exposure[experiment_key]
+	if owed and self.deps.capture_fact then
+		for i = 1, #owed do
+			local snapshot = owed[i]
+			local held = snapshot.entry
+			local fact_key = held and held.subject_fact_key
+			if type(fact_key) == "string" and fact_key ~= "" then
+				self.deps.capture_fact("experiment_exposure", {
+					experiment_key = experiment_key,
+					experiment_version = held.version,
+					assignment_key = fact_key,
+					variant_key = held.variant_key,
+					assignment_unit = held.assignment_unit,
+				}, M.exposure_event_id(snapshot.session,
+					held.subject_key, experiment_key,
+					held.version, 0), {
+					session_id = snapshot.session_id,
+					anonymous_id = snapshot.anonymous_id,
+					event_ts = snapshot.event_ts,
+				})
+			end
+		end
+	end
+	-- The drop's effective stamp is raised above the entry it
+	-- resolves: the wall clock can move backward, and a drop for X
+	-- must always outrank X's own stamp.
+	local as_of = type(resolved_at_ms) == "number" and resolved_at_ms or 0
+	if dropped and type(dropped.fetched_at_ms) == "number"
+		and dropped.fetched_at_ms >= as_of then
+		as_of = dropped.fetched_at_ms + 1
+	end
+	self:sync_durable_entry(scope, experiment_key, as_of)
+end
+
+-- Apply ONLY the destructive half of an authoritative server outcome —
+-- the durable withdrawal — for a response whose CONSTRUCTIVE half a gate
+-- suppressed: a stale auth epoch (a fail-closed latch raced the batch)
+-- or a mid-flight consent revocation. The request was dispatched under
+-- grant and the server withdrew the assignment; discarding the directive
+-- with the rest of the response would RETAIN the condemned durable cache
+-- (the ordinary latch keeps the record by design, and denial retains the
+-- cache for re-grant), so the next init or re-grant would restore and
+-- serve what the platform already killed. Nothing here unlatches,
+-- installs, arms exposures, paces, or reaches the public callback — the
+-- fence canon for constructive results is untouched — and the scope and
+-- per-key sequence fences still discard whole: another subject's or an
+-- out-of-order directive stays discarded.
+function Experiments:apply_destructive_outcome(seq, scope, experiment_key, outcome, resolved_at_ms, dispatched_at_ms)
+	if not (outcome.drop_all
+		or (outcome.authoritative and outcome.drop_entry)) then
+		return
+	end
+	local subject = self:current_subject_id()
+	if not subject or self:scope_for(subject) ~= scope then
+		return
+	end
+	local fence_key = scope .. scope_separator .. experiment_key
+	if seq <= (self.settled[fence_key] or 0) then
+		return
+	end
+	self.settled[fence_key] = seq
+	if outcome.drop_all then
+		self:apply_sentinel_withdrawal(scope, resolved_at_ms, dispatched_at_ms)
+		return
+	end
+	self:apply_entry_drop(scope, experiment_key, resolved_at_ms)
+end
+
 -- Settle an authoritative fetch outcome and, when it may, install it. Gates,
 -- in remote-config order: the auth epoch must still be current (an outcome
 -- whose fetch was already in flight when a fail-closed latch landed is
@@ -2080,6 +2397,14 @@ end
 -- the per-key sequence fence, then the outcome's own directives.
 function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, resolved_at_ms, dispatched_at_ms)
 	if auth_epoch ~= self.auth_epoch then
+		-- A stale-epoch response is discarded from CONSTRUCTIVE state — no
+		-- install, no unlatch (only a post-latch fetch may unlatch) — but a
+		-- destructive directive it carries still lands its withdrawal: the
+		-- latch retained the durable record, so dropping a kill/404/
+		-- sentinel answered to a sibling key of the same batch would
+		-- restore the withdrawn assignment at the next init.
+		self:apply_destructive_outcome(seq, scope, experiment_key, outcome,
+			resolved_at_ms, dispatched_at_ms)
 		return
 	end
 	local subject = self:current_subject_id()
@@ -2103,133 +2428,11 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 		-- assignments outright.
 		self.auth_blocked = true
 		self.auth_epoch = self.auth_epoch + 1
-		local withdrawn_stamp_max = 0
-		local sentinel_dispatch_bound = nil
 		if outcome.drop_all then
-			-- The clear's stamp must be decisively ABOVE the state it
-			-- withdraws (the drop rule: the wall clock can move backward,
-			-- and a rollback must not let withdrawn entries outrank their
-			-- own clear). Capture the withdrawn stamps BEFORE memory is
-			-- wiped. The DISK record is deliberately NOT folded in: an
-			-- entry there stamped after the dispatch bound is a sibling's
-			-- post-sentinel write the partition must see as a survivor,
-			-- not withdrawn state (same-clock best-effort, like every
-			-- write fence; a rollback-backdated withdrawn disk-only entry
-			-- surviving until its own next probe is the accepted corner).
-			-- The MEMORY scan honors the same dispatch bound: an entry
-			-- fetched AFTER this sentinel's request was dispatched is
-			-- post-sentinel authorized state, not withdrawn state — in a
-			-- revalidation batch where a sibling key's fresh 200 lands
-			-- before this sentinel's callback, folding that entry into the
-			-- scan would raise the clear stamp above the survivor and the
-			-- partition below would delete it as covered. Only entries
-			-- at/before the dispatch bound may raise the stamp (an
-			-- exactly-adjacent-millisecond tie stays the same-clock
-			-- best-effort corner every fence accepts).
-			sentinel_dispatch_bound = type(dispatched_at_ms) == "number"
-				and dispatched_at_ms
-				or (type(resolved_at_ms) == "number" and resolved_at_ms or 0)
-			for _, held in pairs(self.entries) do
-				if type(held) == "table"
-					and type(held.fetched_at_ms) == "number"
-					and held.fetched_at_ms <= sentinel_dispatch_bound
-					and held.fetched_at_ms > withdrawn_stamp_max then
-					withdrawn_stamp_max = held.fetched_at_ms
-				end
-			end
-		end
-		self.entries = {}
-		if outcome.drop_all then
-			-- The sentinel withdraws the assignments AND their subject-fact
-			-- keys outright: owed exposure snapshots carry those keys and
-			-- go with them. (A snapshot whose entry survives the partition
-			-- below dies too — conservative toward the sentinel's privacy
-			-- mandate; the survivor re-arms from the durable record at the
-			-- next construction.)
-			self.pending_exposure = {}
-			-- The session's arm accounting resets WITH the discarded and
-			-- purged facts: a purged emission never egressed, so a
-			-- refetched same-session tuple (the platform flipping the flag
-			-- back on) must expose again — a retained `exposed` mark would
-			-- silently under-count the re-served treatment. Re-emission
-			-- derives the SAME deterministic id, so anything that had
-			-- already published collapses server-side (the consent-purge
-			-- rule, applied to the sentinel's discard).
-			self.exposed = {}
-			-- Queue-resident facts die with the snapshots: exposure and
-			-- outcome facts ALREADY ACCEPTED into the analytics pipeline
-			-- (queued below batch size, retained behind a publish retry
-			-- backoff, or spooled durably) carry the withdrawn subject-fact
-			-- keys verbatim, and shipping them on the next flush would keep
-			-- egressing what the platform just killed. The client purges
-			-- them from every pipeline surface — memory queue, retained
-			-- batch, loaded spool chunks, durable spool record (that
-			-- removal converging through the spool-rewrite machinery when
-			-- the store is down). Only a batch actually ON THE WIRE at this
-			-- instant is past recall — the same publish-in-flight carve-out
-			-- the consent purge accepts — and if that publish fails and
-			-- retains, the client filters the batch at settle time.
-			if self.deps.purge_facts then
-				self.deps.purge_facts()
-			end
-			-- The clear's authority is bounded by WHEN THIS FETCH ASKED:
-			-- the flag state this answer reports is no newer than the
-			-- request's dispatch, so an entry written while the sentinel
-			-- was in flight (a sibling's fresh 200 — the flag flipped back
-			-- on) postdates the directive and must survive. Stamp = the
-			-- dispatch bound, raised above the withdrawn memory image.
-			local stamp = sentinel_dispatch_bound
-			if withdrawn_stamp_max >= stamp then
-				stamp = withdrawn_stamp_max + 1
-			end
-			self.durable_clear_pending = stamp
-			-- The clear condemns only THE SCOPE it was decided for: the
-			-- record file is shared across assignment scopes, and another
-			-- environment/credential's entries must never be pruned on
-			-- this sentinel's stamp.
-			self.durable_clear_scope = scope
-			-- The SUCCESS path partitions exactly like the retry — a stale
-			-- in-flight sentinel must not erase a sibling's newer
-			-- post-sentinel write even when storage works — so the clear
-			-- goes through the one stamped implementation immediately.
-			self:retry_owed_clear()
-			if self.durable_clear_pending then
-				-- Still owed: the in-memory intent would die with the
-				-- process and the next launch would serve the withdrawn
-				-- record until its first probe. Make the condemnation
-				-- DURABLE — the sidecar tombstone carries the clear's
-				-- stamp AND scope, the constructor refuses what it covers
-				-- and re-arms the clear. Best-effort in the double-failure
-				-- corner (record AND sidecar stores down), diagnosed:
-				-- that corner is the documented storage-down-through-exit
-				-- residual.
-				if storage.save_experiments_clear(self.config, stamp, scope) then
-					self.clear_marker = { stamp = stamp, scope = scope }
-				else
-					self:diagnose("persist_failed", "cache_clear_tombstone")
-				end
-				self:diagnose("persist_failed", "cache_clear")
-			elseif not self.clear_marker
-				and self.deps.spool_condemned_pending
-				and self.deps.spool_condemned_pending() then
-				-- The cache side SETTLED, but condemned facts remain on
-				-- the durable spool (the purge's removal write could not
-				-- land): that debt is memory-only, and an exit before the
-				-- rewrite retries would leave the next launch with no
-				-- durable condemnation over the stale file — the
-				-- withdrawn facts would simply resend. Persist the marker
-				-- for the SPOOL's sake: the retire rule (record clean AND
-				-- spool clean) governs its lifetime, and the stamp
-				-- partition keeps it harmless to post-sentinel facts
-				-- meanwhile. Best-effort like the tombstone above —
-				-- both-stores-down stays the documented residual.
-				if storage.save_experiments_clear(self.config, stamp, scope) then
-					self.clear_marker = { stamp = stamp, scope = scope }
-				else
-					self:diagnose("persist_failed", "cache_clear_tombstone")
-				end
-			end
+			self:apply_sentinel_withdrawal(scope, resolved_at_ms,
+				dispatched_at_ms)
 		else
+			self.entries = {}
 			-- An ORDINARY 401/403 retains the durable record — and the
 			-- owed EXPOSURE snapshots: a treatment that already ran is a
 			-- fact about the past, and the latch stops future serving, not
@@ -2272,60 +2475,7 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 	-- deferral setter already keeps only the LATEST deadline).
 	self.backoff_attempt = 0
 	if outcome.drop_entry then
-		local dropped = self.entries[experiment_key]
-		self.entries[experiment_key] = nil
-		-- The OWED exposures deliberately survive the drop: an application
-		-- that already happened is a fact — the drop stops future serving,
-		-- not the record of real treatment. The sweep emits them from the
-		-- retained snapshots. The durable drop converges keyed on the DISK
-		-- state (a latch may have cleared serving while the record retains
-		-- the entry) and is retried until it lands — the kill rule demands
-		-- the drop reach the disk. And because this delete removes the only
-		-- persisted state the owed fact could have re-armed from, each owed
-		-- snapshot is durably CAPTURED into the analytics spool before the
-		-- delete: a process KILL before the next sweep/persist then replays
-		-- the fact at the next launch instead of losing it. Narrow by
-		-- contract — drop-time only; owed facts whose entries live on stay
-		-- memory-only until the ordinary dispatch-point captures
-		-- (persist/shutdown/failed publish). The snapshot stays armed for
-		-- the live process — the deterministic event_id collapses the
-		-- pair: a successful publish acks the spool copy away, a post-kill
-		-- replay dedups server-side. Best-effort corners, documented: no
-		-- session identity to stamp (a background capture opens no phantom
-		-- session), spool disabled, storage down — the
-		-- storage-down-through-exit family.
-		local owed = self.pending_exposure[experiment_key]
-		if owed and self.deps.capture_fact then
-			for i = 1, #owed do
-				local snapshot = owed[i]
-				local held = snapshot.entry
-				local fact_key = held and held.subject_fact_key
-				if type(fact_key) == "string" and fact_key ~= "" then
-					self.deps.capture_fact("experiment_exposure", {
-						experiment_key = experiment_key,
-						experiment_version = held.version,
-						assignment_key = fact_key,
-						variant_key = held.variant_key,
-						assignment_unit = held.assignment_unit,
-					}, M.exposure_event_id(snapshot.session,
-						held.subject_key, experiment_key,
-						held.version, 0), {
-						session_id = snapshot.session_id,
-						anonymous_id = snapshot.anonymous_id,
-						event_ts = snapshot.event_ts,
-					})
-				end
-			end
-		end
-		-- The drop's effective stamp is raised above the entry it
-		-- resolves: the wall clock can move backward, and a drop for X
-		-- must always outrank X's own stamp.
-		local as_of = type(resolved_at_ms) == "number" and resolved_at_ms or 0
-		if dropped and type(dropped.fetched_at_ms) == "number"
-			and dropped.fetched_at_ms >= as_of then
-			as_of = dropped.fetched_at_ms + 1
-		end
-		self:sync_durable_entry(scope, experiment_key, as_of)
+		self:apply_entry_drop(scope, experiment_key, resolved_at_ms)
 		return
 	end
 	if outcome.new_entry then
@@ -2558,6 +2708,24 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		-- healthy assignment fetched under a consent that no longer holds.
 		local refusal_now = consent_refusal(self.deps.consent())
 		if refusal_now then
+			-- The plane is closed, but the request was DISPATCHED under
+			-- grant: a destructive directive in this answer (kill switch,
+			-- 404, authoritative not-assigned, the real-subjects sentinel)
+			-- still applies its local withdrawal — the cache is retained
+			-- across denial by design, so discarding the directive would
+			-- let a later re-grant re-serve the assignment (and re-arm
+			-- facts for a subject-fact key) the server already withdrew.
+			-- Constructive results stay suppressed, no subject id is ever
+			-- minted here (the grammar re-mint is NOT destructive and is
+			-- discarded), the owed-exposure capture inside the drop no-ops
+			-- (the denial purge already discarded the snapshots), and the
+			-- caller still receives the refusal.
+			local revoked_resolved_at_ms = clock.unix_ms()
+			local _, closed_outcome = M.apply(nil, response,
+				revoked_resolved_at_ms, experiment_key, self.config.app_id,
+				self.config.environment_id, normalized_attributes)
+			self:apply_destructive_outcome(seq, scope, experiment_key,
+				closed_outcome, revoked_resolved_at_ms, dispatched_at_ms)
 			finish({ ok = false, from_cache = false, error = refusal_now })
 			return
 		end
