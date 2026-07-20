@@ -638,12 +638,21 @@ Experiments.__index = Experiments
 
 -- `config` is the client's normalized configuration. `deps` wires the client
 -- without import cycles:
---   * subject_id()          — the persisted subject-id candidate (raw);
+--   * subject_id()          — the persisted subject-id candidate (raw; the
+--                             accessor re-reads the identity record at
+--                             mint-decision time so sibling clients converge
+--                             on one minted subject);
 --   * store_subject_id(v)   — adopt + persist a minted id (returns success);
 --   * consent()             — the CURRENT analytics consent state;
---   * emit(name, props, id) — enqueue one experiment fact on the analytics
---                             pipeline (consent-gated there, identity rules
---                             applied there).
+--   * analytics_session()   — the CURRENT analytics session id (nil before
+--                             one exists);
+--   * analytics_anonymous_id() — the CURRENT analytics anonymous id;
+--   * emit(name, props, id, overrides) — enqueue one experiment fact on the
+--                             analytics pipeline (consent-gated there,
+--                             identity rules applied there). `overrides`
+--                             carries the ARM-TIME identity of an owed fact
+--                             ({ session_id, anonymous_id, event_ts }); a
+--                             missing field means "stamp the current value".
 function M.new(config, deps)
 	local ex = setmetatable({
 		config = config,
@@ -729,9 +738,11 @@ function M.new(config, deps)
 				-- never a reshaped request.
 				entry.attributes = sanitize_restored_attributes(entry.attributes)
 				ex.entries[key] = entry
-				ex.pending_exposure[key] = {
-					{ entry = entry, session = ex.session_marker },
-				}
+				-- The restored assignment APPLIES at this restore (this
+				-- launch's serving), so the snapshot's identity is the
+				-- construction moment's — session nil until the first real
+				-- session migrates it, anonymous id and timestamp of NOW.
+				ex.pending_exposure[key] = { ex:exposure_snapshot(entry) }
 			end
 		end
 	end
@@ -831,7 +842,11 @@ function Experiments:on_session_renewed(is_renewal)
 				if list[i].session == previous then
 					list[i].session = self.session_marker
 					-- The migrated snapshot belongs to the FIRST real
-					-- session — its analytics identity included.
+					-- session — its analytics SESSION identity included.
+					-- The anonymous id and the timestamp deliberately stay
+					-- the ARM moment's: migration reattributes which
+					-- session the fact belongs to, not when it happened or
+					-- which device identity it happened under.
 					list[i].session_id = session_id
 				end
 			end
@@ -1037,10 +1052,15 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 end
 
 -- Demote an owed whole-record clear into per-key drops for exactly the keys
--- the clear still covers — everything on disk that memory does not hold —
--- each stamped by the clear decision, raised above the covered record (the
--- sentinel is decisive over the state it withdrew), and let the per-key
--- sync converge those. Runs from the retry tick AND at fresh-install time:
+-- the clear still covers — disk entries memory does not hold whose stamps do
+-- NOT outrank the clear. The clear's stamp was raised at decision time above
+-- everything the sentinel withdrew, so an entry stamped STRICTLY after it
+-- can only be a post-sentinel authorized write (a same-app sibling's fresh
+-- assignment): those SURVIVE — the owed clear covers only the record that
+-- existed when the sentinel landed, never state written after it. Covered
+-- keys become per-key drops stamped by the clear (already decisive over
+-- them), and the per-key sync converges those. Runs from the retry tick AND
+-- at fresh-install time:
 -- a fresh authorized assignment landing after the failed clear supersedes
 -- the whole-record form immediately, so a later ordinary auth latch —
 -- which empties memory while RETAINING the durable record — can never
@@ -1057,20 +1077,18 @@ function Experiments:demote_owed_clear()
 		return
 	end
 	for key, stored in pairs(record.entries) do
-		if self.entries[key] == nil then
-			local as_of = clear_as_of
-			if type(stored) == "table"
-				and type(stored.fetched_at_ms) == "number"
-				and stored.fetched_at_ms >= as_of then
-				as_of = stored.fetched_at_ms + 1
-			end
+		local stored_at = type(stored) == "table"
+			and type(stored.fetched_at_ms) == "number"
+			and stored.fetched_at_ms or 0
+		if self.entries[key] == nil and stored_at <= clear_as_of then
 			-- The conversion drops target the RECORD's scope — the state
 			-- the clear was decided over — which may already be a retired
-			-- subject's.
+			-- subject's. Entries stamped strictly after the clear are a
+			-- sibling's post-sentinel authorized state and get no drop.
 			self.durable_pending[record.scope .. scope_separator .. key] = {
 				key = key,
 				scope = record.scope,
-				as_of = as_of,
+				as_of = clear_as_of,
 				drop = true,
 			}
 		end
@@ -1089,9 +1107,12 @@ function Experiments:retry_durable_sync()
 			-- the epoch-scoped clear must not wipe it — demote it to the
 			-- per-key drops it still covers.
 			self:demote_owed_clear()
-		elseif storage.clear_experiments(self.config) then
-			self.durable_clear_pending = false
-			self.durable_pending = {}
+		else
+			-- Local memory is empty (latched) — but the DISK is inspected
+			-- before anything clears: a same-app sibling may have persisted
+			-- fresh authorized state since the sentinel landed, and the
+			-- owed clear covers only the record that existed then.
+			self:retry_owed_clear()
 		end
 	end
 	if next(self.durable_pending) == nil then
@@ -1128,6 +1149,61 @@ function Experiments:retry_durable_sync()
 				self.durable_pending[composites[i]] = nil
 			end
 		end
+	end
+end
+
+-- Retry an owed whole-record clear while local memory is EMPTY (this
+-- instance is latched). Never a blind whole-file clear: the disk record is
+-- partitioned by the clear's raised stamp — entries stamped STRICTLY after
+-- it can only be post-sentinel authorized writes (a same-app sibling's
+-- fresh assignment) and SURVIVE; covered entries are removed. The whole
+-- file clears only when nothing survives (an unreadable record included:
+-- corrupt is a miss everywhere else, and the sentinel's mandate stands for
+-- it). Consistent with the foreign-scope drop retry below: stamp-fenced
+-- per-key convergence against the record actually on disk.
+function Experiments:retry_owed_clear()
+	local clear_as_of = type(self.durable_clear_pending) == "number"
+		and self.durable_clear_pending or 0
+	local record = storage.load_experiments(self.config)
+	local survivors = nil
+	local covered = false
+	if record then
+		for key, stored in pairs(record.entries) do
+			local stored_at = type(stored) == "table"
+				and type(stored.fetched_at_ms) == "number"
+				and stored.fetched_at_ms or 0
+			if stored_at > clear_as_of then
+				survivors = survivors or {}
+				survivors[key] = stored
+			else
+				covered = true
+			end
+		end
+	end
+	if not survivors then
+		if storage.clear_experiments(self.config) then
+			self.durable_clear_pending = false
+			self.durable_pending = {}
+		end
+		return
+	end
+	if not covered then
+		-- Everything on disk postdates the sentinel: the clear's targets
+		-- are already gone (a new-scope or refreshed record replaced the
+		-- file wholesale) and the clear settles without touching the
+		-- sibling's state. Per-key owed intents stay to converge on their
+		-- own fences.
+		self.durable_clear_pending = false
+		return
+	end
+	record.entries = survivors
+	if storage.save_experiments(self.config, record) then
+		-- The covered keys are gone; the sibling's post-sentinel state
+		-- stays. Per-key owed intents are NOT wiped with the settled
+		-- clear — drops for covered keys settle on their own retries
+		-- (the stored entry is gone), and anything targeting a survivor
+		-- is protected by the usual strictly-fresher retry fences.
+		self.durable_clear_pending = false
 	end
 end
 
@@ -1182,30 +1258,47 @@ local max_owed_exposures = 8
 -- armed at the tail is refreshed in place (renewals and purges re-arm the
 -- same application; the de-dupe collapses same-tuple emissions anyway), so
 -- the queue only grows across genuinely distinct applications.
+-- One owed-application snapshot: the applied entry plus THE IDENTITY OF THE
+-- ARM MOMENT. A late drain enqueues with exactly this identity — the
+-- analytics session the treatment ran in, the anonymous id active when it
+-- ran, and the wall-clock instant it ran — never the values current at
+-- drain time (normal events snapshot all three at track time; an owed fact
+-- must not lose that property just because the queue was full). The
+-- envelope fields NOT snapshotted are each deliberate: event_id derives
+-- deterministically from the snapshot itself, user_id is omitted by the
+-- facts contract, props are the entry snapshot, and session_sequence stays
+-- the enqueue-time stream's (documented residual — see the client's fact
+-- handling).
+function Experiments:exposure_snapshot(entry)
+	return {
+		entry = entry,
+		session = self.session_marker,
+		session_id = self.deps.analytics_session
+			and self.deps.analytics_session() or nil,
+		anonymous_id = self.deps.analytics_anonymous_id
+			and self.deps.analytics_anonymous_id() or nil,
+		event_ts = clock.iso_utc(),
+	}
+end
+
 function Experiments:arm_exposure(experiment_key, entry)
 	local list = self.pending_exposure[experiment_key]
 	if type(list) ~= "table" then
 		list = {}
 		self.pending_exposure[experiment_key] = list
 	end
-	-- Each snapshot carries the ANALYTICS session identity active when the
-	-- application armed (nil before any session exists): a late drain after
-	-- a renewal enqueues with THAT identity, never misattributing the old
-	-- treatment to the new session.
-	local session_id = self.deps.analytics_session
-		and self.deps.analytics_session() or nil
+	local snapshot = self:exposure_snapshot(entry)
 	local tail = list[#list]
 	if tail and tail.session == self.session_marker
 		and exposure_tuple(experiment_key, tail.entry) == exposure_tuple(experiment_key, entry) then
-		tail.entry = entry
-		tail.session_id = session_id
+		-- A same-tuple re-arm refreshes the WHOLE application moment in
+		-- place — the entry and every identity field: the re-arm is a new
+		-- application of the same treatment, so its fact carries the newer
+		-- moment's identity.
+		list[#list] = snapshot
 		return
 	end
-	list[#list + 1] = {
-		entry = entry,
-		session = self.session_marker,
-		session_id = session_id,
-	}
+	list[#list + 1] = snapshot
 	if #list > max_owed_exposures then
 		table.remove(list, 1)
 		self:diagnose("exposure_skipped", "owed_overflow")
@@ -1235,26 +1328,29 @@ end
 --                               key; the SDK subject id never egresses);
 --   false, code               — retryable (consent closed, queue full):
 --                               the armed snapshot stays for a later sweep.
--- `session_marker` is the marker of the SESSION THE APPLICATION BELONGS TO
--- (an owed snapshot carries its own; nil means the current session): the
--- deterministic id derives from it, so a prior session's owed fact keeps
--- its own identity when it finally drains, and the current session's dedup
--- bookkeeping (`exposed`) is consulted and updated ONLY for current-session
--- emissions — a late prior-session drain must neither suppress nor be
--- suppressed by this session's arm accounting (its once-only guarantee is
--- the per-(session, tuple) arm-time coalescing plus FIFO removal).
+-- `snapshot` is the owed-application snapshot the emission drains (nil for
+-- an IMMEDIATE emission — the explicit re-arm path — which uses the current
+-- moment's identity by definition). Its session marker names the SESSION
+-- THE APPLICATION BELONGS TO: the deterministic id derives from it, so a
+-- prior session's owed fact keeps its own identity when it finally drains,
+-- and the current session's dedup bookkeeping (`exposed`) is consulted and
+-- updated ONLY for current-session emissions — a late prior-session drain
+-- must neither suppress nor be suppressed by this session's arm accounting
+-- (its once-only guarantee is the per-(session, tuple) arm-time coalescing
+-- plus FIFO removal). The snapshot's arm-time identity fields (session_id,
+-- anonymous_id, event_ts) ride the emit as envelope overrides.
 -- Arm accounting: `exposed[tuple]` records the highest arm handed out and
 -- whether the AUTOMATIC arm-0 fact has emitted. An explicit re-arm that
 -- runs while that automatic emission is still owed in the queue takes arm 1
 -- and leaves the owed snapshot its arm 0 — the re-arm buys an EXTRA fact,
 -- never the owed one's slot — and the later sweep emits the arm 0 exactly
 -- once.
-function Experiments:emit_entry_exposure(experiment_key, entry, rearm, session_marker, session_id)
+function Experiments:emit_entry_exposure(experiment_key, entry, rearm, snapshot)
 	local refusal = consent_refusal(self.deps.consent())
 	if refusal then
 		return false, refusal
 	end
-	local marker = session_marker or self.session_marker
+	local marker = snapshot and snapshot.session or self.session_marker
 	local current_session = marker == self.session_marker
 	local tuple = exposure_tuple(experiment_key, entry)
 	local exposed = current_session and self.exposed[tuple] or nil
@@ -1303,7 +1399,11 @@ function Experiments:emit_entry_exposure(experiment_key, entry, rearm, session_m
 		assignment_key = fact_key,
 		variant_key = entry.variant_key,
 		assignment_unit = entry.assignment_unit,
-	}, event_id, session_id)
+	}, event_id, snapshot and {
+		session_id = snapshot.session_id,
+		anonymous_id = snapshot.anonymous_id,
+		event_ts = snapshot.event_ts,
+	} or nil)
 	if not ok then
 		return false, err
 	end
@@ -1325,8 +1425,7 @@ function Experiments:sweep_pending(experiment_key)
 	end
 	while list[1] do
 		local ok, _, terminal = self:emit_entry_exposure(
-			experiment_key, list[1].entry, false, list[1].session,
-			list[1].session_id)
+			experiment_key, list[1].entry, false, list[1])
 		if ok or terminal then
 			table.remove(list, 1)
 		else
@@ -1356,6 +1455,23 @@ function Experiments:sweep_owed()
 	for i = 1, #keys do
 		self:sweep_pending(keys[i])
 	end
+end
+
+-- True while any application's exposure fact is still owed (armed but not
+-- yet enqueued). The client's shutdown loop and persist snapshot consult
+-- this to decide whether the process may claim every fact is captured.
+function Experiments:has_owed_exposures()
+	return next(self.pending_exposure) ~= nil
+end
+
+-- True while any durable cache write, drop, or whole-record clear is still
+-- owed: the disk does not yet reflect a decided state, so an app death now
+-- would revive a revoked assignment (or lose a refresh) at the next launch.
+function Experiments:has_owed_durable_sync()
+	if self.durable_clear_pending then
+		return true
+	end
+	return next(self.durable_pending) ~= nil
 end
 
 -- Settle an authoritative fetch outcome and, when it may, install it. Gates,
@@ -1390,6 +1506,21 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 		-- assignments outright.
 		self.auth_blocked = true
 		self.auth_epoch = self.auth_epoch + 1
+		local withdrawn_stamp_max = 0
+		if outcome.drop_all then
+			-- The clear's stamp must be decisively ABOVE the state it
+			-- withdraws (the drop rule: the wall clock can move backward,
+			-- and a rollback must not let withdrawn entries outrank their
+			-- own clear). Capture the withdrawn stamps BEFORE memory is
+			-- wiped.
+			for _, held in pairs(self.entries) do
+				if type(held) == "table"
+					and type(held.fetched_at_ms) == "number"
+					and held.fetched_at_ms > withdrawn_stamp_max then
+					withdrawn_stamp_max = held.fetched_at_ms
+				end
+			end
+		end
 		self.entries = {}
 		if outcome.drop_all then
 			-- The sentinel withdraws the assignments AND their subject-fact
@@ -1400,10 +1531,28 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 				self.durable_pending = {}
 			else
 				-- The withdrawn assignments are still on disk: mark the
-				-- clear OWED — stamped by this resolution — and retry it
-				-- every tick until it lands.
-				self.durable_clear_pending =
-					type(resolved_at_ms) == "number" and resolved_at_ms or 0
+				-- clear OWED and retry it every tick until it lands. Its
+				-- stamp is this resolution raised above every withdrawn
+				-- entry — memory's image and (best-effort) the disk
+				-- record's, which may hold entries a latch already cleared
+				-- from memory — so at retry time an entry stamped STRICTLY
+				-- after the clear can only be a post-sentinel authorized
+				-- write (a same-app sibling's) and survives the demotion.
+				local record = storage.load_experiments(self.config)
+				if record then
+					for _, held in pairs(record.entries) do
+						if type(held) == "table"
+							and type(held.fetched_at_ms) == "number"
+							and held.fetched_at_ms > withdrawn_stamp_max then
+							withdrawn_stamp_max = held.fetched_at_ms
+						end
+					end
+				end
+				local stamp = type(resolved_at_ms) == "number" and resolved_at_ms or 0
+				if withdrawn_stamp_max >= stamp then
+					stamp = withdrawn_stamp_max + 1
+				end
+				self.durable_clear_pending = stamp
 				self:diagnose("persist_failed", "cache_clear")
 			end
 		else

@@ -523,6 +523,23 @@ function M.new(config)
 	if normalized.experiments_enabled then
 		client.experiments = experiments_mod.new(normalized, {
 			subject_id = function()
+				if client.experiments_client_id == nil then
+					-- Two clients constructed before the first mint both
+					-- captured nil here: a sibling client in this process
+					-- may have minted AND persisted since. Re-read the
+					-- identity record at mint-decision time and adopt the
+					-- now-persisted subject — one install converges on ONE
+					-- subject id (and one cache scope) instead of the
+					-- second client re-minting over it. A raw field copy
+					-- (the consumer validates the grammar); a sibling
+					-- whose mint could not persist stays process-local by
+					-- the documented failed-persist rule, so there is
+					-- nothing on disk to adopt in that case.
+					local persisted = storage.load(normalized) or {}
+					if type(persisted.experiments_client_id) == "string" then
+						client.experiments_client_id = persisted.experiments_client_id
+					end
+				end
 				return client.experiments_client_id
 			end,
 			store_subject_id = function(value)
@@ -535,14 +552,22 @@ function M.new(config)
 			analytics_session = function()
 				return client.session_id
 			end,
-			emit = function(event_name, props, event_id, session_id)
-				-- `session_id` is the analytics session the fact BELONGS to
-				-- (an owed exposure drained late must ride its own session,
-				-- not the current one); nil means the current session.
+			analytics_anonymous_id = function()
+				return client.anonymous_id
+			end,
+			emit = function(event_name, props, event_id, overrides)
+				-- `overrides` is the ARM-TIME identity of an owed fact
+				-- (an exposure drained late must ride the session, the
+				-- anonymous id, and the timestamp of the moment its
+				-- treatment applied — not the current ones); absent
+				-- fields mean "current".
+				overrides = overrides or {}
 				return client:enqueue_event(event_name, props, nil, {
 					event_id = event_id,
 					omit_user_id = true,
-					session_id = session_id,
+					session_id = overrides.session_id,
+					anonymous_id = overrides.anonymous_id,
+					event_ts = overrides.event_ts,
 				})
 			end,
 		})
@@ -1183,25 +1208,41 @@ function Client:enqueue_event(event_name, props, context, fact)
 	local user_id = self.user_id
 	local event_id = nil
 	local session_override = nil
+	local anonymous_override = nil
+	local ts_override = nil
 	if fact then
 		event_id = fact.event_id
 		if fact.omit_user_id then
 			user_id = nil
 		end
-		-- An owed experiment fact carries THE SESSION THE APPLICATION
-		-- BELONGED TO: a late drain after a renewal must not misattribute
-		-- the old treatment to the new session. Identity only — the
-		-- sequence counter stays the enqueue-time stream's.
+		-- An owed experiment fact enqueued LATE carries the identity of
+		-- the moment its treatment applied. The full envelope audit for a
+		-- late-drained fact, field by field: event_id — deterministic,
+		-- derived from the arm-time snapshot; event_ts — the arm moment
+		-- (overridden here); user_id — omitted by the facts contract;
+		-- anonymous_id — the arm moment's (overridden here); session_id —
+		-- the session the application belonged to (overridden here);
+		-- props — the arm-time entry snapshot. The ONE enqueue-time field
+		-- is session_sequence: it stays the enqueue-stream's counter — a
+		-- documented residual, because back-numbering a foreign session's
+		-- sequence would need a per-session counter registry, and the
+		-- server's cross-session ordering key is the timestamp.
 		if type(fact.session_id) == "string" and fact.session_id ~= "" then
 			session_override = fact.session_id
+		end
+		if type(fact.anonymous_id) == "string" and fact.anonymous_id ~= "" then
+			anonymous_override = fact.anonymous_id
+		end
+		if type(fact.event_ts) == "string" and fact.event_ts ~= "" then
+			ts_override = fact.event_ts
 		end
 	end
 	local event = {
 		event_id = event_id or id.uuid(),
 		event_name = event_name,
-		event_ts = clock.iso_utc(),
+		event_ts = ts_override or clock.iso_utc(),
 		user_id = user_id,
-		anonymous_id = self.anonymous_id,
+		anonymous_id = anonymous_override or self.anonymous_id,
 		session_id = session_override or self.session_id,
 		session_sequence = self.session_sequence + 1,
 		props = props_snapshot,
@@ -2084,6 +2125,15 @@ function Client:persist()
 	-- recover a failed receipt write from its focus-loss listener.
 	-- Best-effort — the persist result stays about the EVENT snapshot.
 	self:retry_consent_outbox_persist()
+	if self.experiments then
+		-- Owed durable experiment syncs share the snapshot moment too, and
+		-- like the consent outbox they are independent of event spooling
+		-- (consent-independent local disk state): a kill drop or refresh
+		-- write still owed when the OS kills the app would leave a revoked
+		-- assignment as reload truth. Retried before the spool gates below
+		-- so even a spool-less configuration converges its cache here.
+		self.experiments:retry_durable_sync()
+	end
 	if not self.config.spool_enabled then
 		return false, "spool_disabled"
 	end
@@ -2095,11 +2145,32 @@ function Client:persist()
 	if self.consent_state ~= "granted" then
 		-- A consent-blocked client leaves nothing spoolable: denied already
 		-- cleared the queue (and the spool stays purged), and a consent-first
-		-- "unknown" client never queued anything to capture.
+		-- "unknown" client never queued anything to capture. A still-owed
+		-- durable cache sync is the one exception worth reporting: it is
+		-- consent-independent disk state an app death would leave stale.
+		if self.experiments and self.experiments:has_owed_durable_sync() then
+			return false, "experiments_pending"
+		end
 		return true
+	end
+	if self.experiments then
+		-- Owed exposure facts join the snapshot: the sweep is their normal
+		-- emission (they enter the queue, stay queued for regular delivery,
+		-- and ride the spool capture below — ack-based removal applies as
+		-- to any spooled event). A fact the full queue still refuses stays
+		-- owed and is reported below.
+		self.experiments:sweep_owed()
 	end
 	if not self:spool_undelivered() then
 		return false, "spool_persist_failed"
+	end
+	if self.experiments and (self.experiments:has_owed_exposures()
+		or self.experiments:has_owed_durable_sync()) then
+		-- Something owed was NOT captured (a full queue denied a swept
+		-- fact, or the cache write is still failing): an OS kill right
+		-- now would lose it, so the app-may-die snapshot must not claim
+		-- safety. The host's recourse is a flush() and another persist().
+		return false, "experiments_pending"
 	end
 	return true
 end
@@ -2380,52 +2451,77 @@ function Client:shutdown(reason)
 			return false, "consent_pending"
 		end
 	end
-	-- Post-flush housekeeping: the flush freed queue room, so the deferred
-	-- session end and the owed exposure facts get their last chance to
-	-- enqueue, then everything newly queued is delivered-or-spooled in one
-	-- more pass. Best-effort by design: a still-failing enqueue or send
-	-- with no durable spool is not a teardown blocker — the durable record
-	-- re-arms live assignments at the next launch (only a since-dropped
-	-- assignment's owed fact is lost with the process, as before).
-	local before_housekeeping = queue.size(self.queue)
-	if session_end_owed and self.session_active then
-		-- The room the full queue denied session_end() now exists (the
-		-- flush drained the queue, or its spooled remnant was evicted):
-		-- complete the session teardown. If the event STILL cannot
-		-- enqueue, do not silently finalize with the session active and
-		-- its event captured nowhere — report the failure and stay alive
-		-- for a host retry.
-		local retry_ok, retry_err = self:session_end(reason or "app_final")
-		if not retry_ok then
-			return false, retry_err
-		end
-	end
-	if self.experiments then
-		-- Owed durable syncs get one last retry too — a kill/not-assigned
-		-- drop (or refresh write) whose cache write failed transiently must
-		-- not stay reload truth on disk just because no update() tick ran
-		-- after storage recovered. Local disk housekeeping, best-effort: a
-		-- still-failing write is not a teardown blocker.
-		self.experiments:retry_durable_sync()
-		-- Sweep owed exposure facts one last time so a treatment applied
-		-- under a FULL queue does not exit without its fact.
-		self.experiments:sweep_owed()
-	end
-	if queue.size(self.queue) > before_housekeeping then
-		local sent, send_err = self:flush({ include_summaries = false })
-		if not sent then
-			-- The shutdown contract applies to the housekeeping pass too:
-			-- the just-queued deferred session end / owed exposure facts
-			-- are either SENT, durably SPOOLED, or shutdown stays
-			-- retryable — never dropped by a "successful" teardown. (A
-			-- terminal rejection dropped the batch: no remnant, and a
-			-- vacuous capture must not upgrade that failure — the first
-			-- flush's posture exactly.)
-			local has_remnant = self.in_flight_batch ~= nil
-				or queue.size(self.queue) > 0 or self:spool_pending()
-			if not has_remnant or not self:spool_undelivered() then
-				return false, send_err
+	-- Post-flush housekeeping LOOP: the flush freed queue room, so the
+	-- deferred session end and the owed exposure facts get their chance to
+	-- enqueue — in PASSES, because the freed room may be as small as one
+	-- slot (buffer_size = 1 is a valid config): each pass enqueues what
+	-- fits (the session end first), then delivers or durably spools the
+	-- just-queued events to free room for the next pass. The loop ends
+	-- when nothing deliverable is owed, or when a pass moves nothing —
+	-- and the shutdown contract governs throughout: every owed fact is
+	-- SENT, durably SPOOLED, or shutdown stays retryable, never dropped
+	-- by a "successful" teardown. Owed durable cache syncs are disk-side
+	-- housekeeping (no queue room involved): they get a retry each pass
+	-- and deliberately stay a non-blocker — a still-failing cache write
+	-- re-converges from the durable machinery at the next launch.
+	local owed_session_end = session_end_owed
+	while true do
+		local enqueued_any = false
+		if owed_session_end and self.session_active then
+			-- The room the full queue denied session_end() may exist now:
+			-- complete the session teardown. Only a STILL-full queue is
+			-- retryable by a later pass; any other failure keeps the old
+			-- contract — report it and stay alive for a host retry.
+			local retry_ok, retry_err = self:session_end(reason or "app_final")
+			if retry_ok then
+				owed_session_end = false
+				enqueued_any = true
+			elseif retry_err ~= "queue_full" then
+				return false, retry_err
 			end
+		end
+		if self.experiments then
+			self.experiments:retry_durable_sync()
+			-- Sweep owed exposure facts — as many as the queue admits this
+			-- pass — so a treatment applied under a FULL queue does not
+			-- exit without its fact.
+			local before_sweep = queue.size(self.queue)
+			self.experiments:sweep_owed()
+			if queue.size(self.queue) > before_sweep then
+				enqueued_any = true
+			end
+		end
+		-- Owed exposures count as deliverable only on the granted plane:
+		-- a non-granted state cannot enqueue them (the purge/consent canon
+		-- governs those snapshots, not the exit path).
+		local still_owed = (owed_session_end and self.session_active)
+			or (self.consent_state == "granted" and self.experiments ~= nil
+				and self.experiments:has_owed_exposures())
+		if enqueued_any then
+			local sent, send_err = self:flush({ include_summaries = false })
+			if not sent then
+				-- Same posture as the first flush: a terminal rejection
+				-- dropped the batch (no remnant), and a vacuous capture
+				-- must not upgrade that failure.
+				local has_remnant = self.in_flight_batch ~= nil
+					or queue.size(self.queue) > 0 or self:spool_pending()
+				if not has_remnant or not self:spool_undelivered() then
+					return false, send_err
+				end
+				-- Durably captured: EVICT the remnant so the next pass has
+				-- room (the spooled envelopes re-send at the next launch;
+				-- memory copies kept would wedge the loop and double-send).
+				queue.drain(self.queue, queue.size(self.queue))
+			end
+		end
+		if not still_owed then
+			break
+		end
+		if not enqueued_any then
+			-- A full pass moved nothing into the queue while something is
+			-- still owed: no forward progress is possible, and finalizing
+			-- would silently drop the owed facts — stay retryable.
+			return false, "queue_full"
 		end
 	end
 	if self.experiments then

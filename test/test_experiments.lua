@@ -3647,6 +3647,245 @@ local function test_owed_exposure_keeps_original_session_identity()
 	assert_true(exposures[1].event_id ~= exposures[2].event_id)
 end
 
+local function test_shutdown_buffer_one_drains_owed_exposure_after_session_end()
+	reset()
+	-- buffer_size = 1 (a valid config): after the first flush, EVERY freed
+	-- slot fits exactly one owed item — the deferred session end must not
+	-- consume the only slot and cost the owed exposure its fact.
+	local client = granted_client({ buffer_size = 1 })
+	assert_true(client:session_start())
+	assert_equal(#client.queue.items, 1, "session_started fills the whole queue")
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0,
+		"the full queue leaves the exposure owed")
+	-- The assignment is then DROPPED (404): the owed fact survives, but a
+	-- relaunch would NOT re-arm it from the durable cache — shutdown is its
+	-- only exit. Exactly the fatal flavor of the loop-less housekeeping.
+	next_status = 404
+	next_response_body = nil
+	fetch(client, "exp-checkout")
+	next_status = 200
+
+	assert_true(client:shutdown(), "shutdown completes by looping the housekeeping")
+	local exposure_sent = false
+	for i = 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true)
+			and type(requests[i].body) == "string"
+			and requests[i].body:find("experiment_exposure", 1, true) then
+			exposure_sent = true
+		end
+	end
+	assert_true(exposure_sent,
+		"the owed exposure must be delivered before teardown, not dropped")
+end
+
+local function test_sibling_client_adopts_persisted_subject()
+	reset()
+	-- Two clients constructed BEFORE the first fetch both capture a nil
+	-- subject id: after the first client mints and persists, the second
+	-- must adopt the persisted subject instead of re-minting over it.
+	seed_granted_consent()
+	local a = assert(sdk.new(config()))
+	local b = assert(sdk.new(config()))
+	next_response_body = assignment_body()
+	fetch(a, "exp-checkout")
+	local minted = query_params(last_assignment_request().url).subject_key
+	assert_match(minted, subject_grammar)
+	next_response_body = assignment_body()
+	fetch(b, "exp-checkout")
+	local adopted = query_params(last_assignment_request().url).subject_key
+	assert_equal(adopted, minted,
+		"the sibling client must fetch under the already-persisted subject")
+	assert_equal(storage.load(storage_scope).experiments_client_id, minted,
+		"one install converges on one persisted subject id")
+end
+
+local function test_owed_exposure_keeps_original_anonymous_id_and_timestamp()
+	reset()
+	local clock_mod = require "shardpilot.clock"
+	local client = granted_client({ buffer_size = 4 })
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+	assert_true(client:track("filler-c"))
+	assert_true(client:track("filler-d"))
+	local ts_before_arm = clock_mod.iso_utc()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	local ts_after_arm = clock_mod.iso_utc()
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	-- The queue drains, TIME PASSES, and the anonymous id ROTATES before
+	-- the owed fact does: the late drain rides the identity of the moment
+	-- the treatment applied — its own anonymous id and timestamp — while
+	-- fresh events ride the rotated identity.
+	assert_true(client:flush({ include_summaries = false }))
+	advance_seconds(120)
+	assert_true(client:set_anonymous_id("anon-rotated"))
+	client:update(0.016)
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1)
+	assert_equal(exposures[1].anonymous_id, "anon-client",
+		"the owed exposure keeps the anonymous id it applied under")
+	assert_true(ts_before_arm <= exposures[1].event_ts
+		and exposures[1].event_ts <= ts_after_arm,
+		"the owed exposure keeps the timestamp of the apply moment")
+	assert_true(client:track("post-rotation"))
+	assert_equal(queued_events(client, "post-rotation")[1].anonymous_id,
+		"anon-rotated", "fresh events ride the rotated identity")
+end
+
+local function test_persist_spools_owed_exposure_fact()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	local client = granted_client({ buffer_size = 4 })
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+	assert_true(client:track("filler-c"))
+	assert_true(client:track("filler-d"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	-- The queue drains; the host's focus-loss listener fires persist()
+	-- BEFORE any tick sweeps the owed fact. The app-may-die snapshot must
+	-- capture it: the sweep enqueues the fact and the spool write below
+	-- carries it — an OS kill right after persist() loses nothing.
+	assert_true(client:flush({ include_summaries = false }))
+	assert_true(client:persist())
+	assert_equal(#queued_events(client, "experiment_exposure"), 1,
+		"persist sweeps the owed fact into the queue (its normal emission)")
+	local spooled = false
+	for path, record in pairs(stores) do
+		if path:sub(-#"/spool") == "/spool"
+			and json.encode(record):find("experiment_exposure", 1, true) then
+			spooled = true
+		end
+	end
+	assert_true(spooled, "the spool snapshot must capture the owed exposure")
+	restore()
+	storage.reset()
+end
+
+local function test_persist_reports_uncaptured_experiment_state()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client({ buffer_size = 4 })
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+	assert_true(client:track("filler-c"))
+	assert_true(client:track("filler-d"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- The queue is STILL full: the sweep cannot capture the owed fact, so
+	-- persist must not claim the app-may-die snapshot is safe.
+	local ok, err = client:persist()
+	assert_equal(ok, false)
+	assert_equal(err, "experiments_pending")
+
+	-- Drain and let the fact through; then an owed DURABLE sync (a kill
+	-- drop whose cache write keeps failing) must equally fail the claim —
+	-- an OS kill would leave the revoked assignment as reload truth.
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	assert_true(client:persist(), "a captured snapshot reports success")
+	state.fail_save = fail_experiment_saves
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-checkout")
+	local drop_ok, drop_err = client:persist()
+	assert_equal(drop_ok, false)
+	assert_equal(drop_err, "experiments_pending")
+	state.fail_save = nil
+	assert_true(client:persist(),
+		"the recovered store lands the drop and the snapshot is safe")
+	local record = storage.load_experiments(config())
+	assert_true(record == nil or record.entries["exp-checkout"] == nil,
+		"the kill drop reached the disk")
+	restore()
+	storage.reset()
+end
+
+local function test_owed_clear_retry_preserves_sibling_fresh_write()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	seed_granted_consent()
+	local a = assert(sdk.new(config()))
+	next_response_body = assignment_body()
+	fetch(a, "exp-checkout")
+
+	-- The real-subjects sentinel lands while the experiments store cannot
+	-- write: the whole-record clear is OWED. A same-app sibling then
+	-- persists FRESH authorized state. The retry must remove only what the
+	-- sentinel covered — never the sibling's newer record.
+	state.fail_save = fail_experiment_saves
+	next_status = 403
+	next_response_body = json.encode({
+		error = "experiment real-subject assignment is disabled",
+	})
+	fetch(a, "exp-checkout")
+	state.fail_save = nil
+	next_status = 200
+	advance_seconds(5)
+	local b = assert(sdk.new(config()))
+	next_response_body = assignment_body({ experiment_key = "exp-onboarding" })
+	fetch(b, "exp-onboarding")
+
+	a:update(0.016)
+	local record = storage.load_experiments(config())
+	assert_true(record ~= nil, "the sibling's record must survive the retry")
+	assert_true(record.entries["exp-onboarding"] ~= nil,
+		"the sibling's post-sentinel assignment survives the owed clear")
+	assert_nil(record.entries["exp-checkout"],
+		"the state the sentinel withdrew is gone")
+	a:update(0.016)
+	record = storage.load_experiments(config())
+	assert_true(record ~= nil and record.entries["exp-onboarding"] ~= nil,
+		"the settled clear must not re-run against the sibling's record")
+	restore()
+	storage.reset()
+end
+
+local function test_owed_clear_demotion_preserves_fresh_disk_entry()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	seed_granted_consent()
+	local a = assert(sdk.new(config()))
+	next_response_body = assignment_body()
+	fetch(a, "exp-checkout")
+
+	-- Owed sentinel clear (as above), then a sibling persists a fresh
+	-- OTHER experiment, then THIS instance reinstalls its own key: the
+	-- install-time demotion walks the disk record and must leave the
+	-- sibling's post-sentinel entry alone — only covered state drops.
+	state.fail_save = fail_experiment_saves
+	next_status = 403
+	next_response_body = json.encode({
+		error = "experiment real-subject assignment is disabled",
+	})
+	fetch(a, "exp-checkout")
+	state.fail_save = nil
+	next_status = 200
+	advance_seconds(5)
+	local b = assert(sdk.new(config()))
+	next_response_body = assignment_body({ experiment_key = "exp-onboarding" })
+	fetch(b, "exp-onboarding")
+
+	next_response_body = assignment_body()
+	fetch(a, "exp-checkout")
+	local record = storage.load_experiments(config())
+	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
+		"the reinstalled assignment is on disk")
+	assert_true(record.entries["exp-onboarding"] ~= nil,
+		"the demotion must not drop the sibling's fresher entry")
+	a:update(0.016)
+	record = storage.load_experiments(config())
+	assert_true(record.entries["exp-onboarding"] ~= nil,
+		"no owed drop may linger against the sibling's fresher entry")
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -3746,6 +3985,13 @@ local tests = {
 	test_restored_attributes_renormalize_before_revalidation,
 	test_consent_purge_discards_dead_owed_exposures,
 	test_owed_exposure_keeps_original_session_identity,
+	test_shutdown_buffer_one_drains_owed_exposure_after_session_end,
+	test_sibling_client_adopts_persisted_subject,
+	test_owed_exposure_keeps_original_anonymous_id_and_timestamp,
+	test_persist_spools_owed_exposure_fact,
+	test_persist_reports_uncaptured_experiment_state,
+	test_owed_clear_retry_preserves_sibling_fresh_write,
+	test_owed_clear_demotion_preserves_fresh_disk_entry,
 }
 
 for _, test in ipairs(tests) do
