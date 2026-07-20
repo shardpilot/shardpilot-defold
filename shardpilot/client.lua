@@ -572,6 +572,7 @@ function M.new(config)
 					session_id = overrides.session_id,
 					anonymous_id = overrides.anonymous_id,
 					event_ts = overrides.event_ts,
+					retryable = overrides.retryable,
 				})
 			end,
 		})
@@ -1270,7 +1271,14 @@ function Client:enqueue_event(event_name, props, context, fact)
 			self.session_sequence = 0
 			self.session_active = false
 		end
-		self.stats.dropped = self.stats.dropped + 1
+		-- A RETRYABLE fact refusal is not a dropped event: the owed-snapshot
+		-- machinery keeps the fact armed and re-enqueues it once the queue
+		-- has room, so counting every full-queue sweep attempt would inflate
+		-- the dropped stat with events that eventually deliver. Terminal
+		-- outcomes (host events, immediate host-retried facts) still count.
+		if not (fact and fact.retryable) then
+			self.stats.dropped = self.stats.dropped + 1
+		end
 		return false, "queue_full"
 	end
 	self.session_sequence = event.session_sequence
@@ -2536,6 +2544,18 @@ function Client:shutdown(reason)
 		end
 	end
 	if self.experiments then
+		-- Owed durable cache syncs got a retry on every housekeeping pass;
+		-- if the store is STILL failing here, the per-key intents (a kill
+		-- drop, a refresh write, an owed whole-record clear) are memory-
+		-- only and a teardown now would leave a revoked assignment as
+		-- reload truth at the next launch. Stay retryable instead —
+		-- persist() parity. (This supersedes the earlier best-effort
+		-- posture for the FAILING-store case; a healthy store never
+		-- reaches this point owed.)
+		self.experiments:retry_durable_sync()
+		if self.experiments:has_owed_durable_sync() then
+			return false, "experiments_pending"
+		end
 		-- Stop the experiments consumer WITH the successful teardown (a
 		-- failed shutdown keeps the client — and the consumer — alive for
 		-- a host retry): an assignment response still in flight must not

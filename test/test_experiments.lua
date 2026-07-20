@@ -4192,6 +4192,297 @@ local function test_transient_pacing_shortens_next_revalidation()
 		"past the SHORT window the retry fires — not after the full cadence")
 end
 
+local function test_denied_restore_arms_intent_and_exposes_at_grant_identity()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	local seed_client = granted_client()
+	next_response_body = assignment_body()
+	fetch(seed_client, "exp-checkout")
+
+	-- Restart with a persisted DENIED consent: the restored assignment is
+	-- not being served (getters are consent-gated), so its exposure must
+	-- arm as INTENT — a construction-time snapshot would stamp the future
+	-- fact with the denied period's timestamp/identity. When consent is
+	-- granted mid-session, the fact materializes with the grant moment's.
+	local identity = storage.load(storage_scope)
+	identity.consent_analytics = "denied"
+	storage.save(storage_scope, identity)
+	local clock_mod = require "shardpilot.clock"
+	local client = assert(sdk.new(config()))
+	advance_seconds(120)
+	assert_true(client:set_anonymous_id("anon-rotated"))
+	assert_true(client:set_consent(true))
+	local ts_low = clock_mod.iso_utc()
+	client:update(0.016)
+	local ts_high = clock_mod.iso_utc()
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1)
+	assert_equal(exposures[1].anonymous_id, "anon-rotated",
+		"the restored exposure carries the grant-moment identity")
+	assert_true(ts_low <= exposures[1].event_ts
+		and exposures[1].event_ts <= ts_high,
+		"and the grant-moment timestamp, never the denied launch's")
+	restore()
+	storage.reset()
+end
+
+local function test_retryable_sweep_attempts_do_not_count_as_drops()
+	reset()
+	local client = granted_client({ buffer_size = 4 })
+	assert_true(client:track("filler-a"))
+	assert_true(client:track("filler-b"))
+	assert_true(client:track("filler-c"))
+	assert_true(client:track("filler-d"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- The owed exposure meets the full queue at the install sweep and at
+	-- every tick until room exists: each refusal is RETRYABLE (the
+	-- snapshot stays armed), so none of the attempts may count as a
+	-- dropped event — the fact eventually delivers.
+	client:update(0.016)
+	client:update(0.016)
+	assert_equal(client:snapshot().dropped, 0,
+		"retryable owed-exposure attempts are not drops")
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 1,
+		"the owed fact delivers once room exists")
+	assert_equal(client:snapshot().dropped, 0,
+		"a delivered fact never counted as dropped")
+end
+
+local function test_sentinel_clear_never_condemns_foreign_scope()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	seed_granted_consent()
+	-- A staging-scope client persists its assignment; a develop-scope
+	-- client then meets the real-subjects sentinel. The record file is
+	-- shared per app, but the sentinel condemns ONLY the scope it was
+	-- decided for — the staging entries (older-stamped by definition)
+	-- must survive both the immediate clear and any later condemnation.
+	local b = assert(sdk.new(config({ environment_id = "staging" })))
+	next_response_body = assignment_body({ environment_key = "staging" })
+	fetch(b, "exp-checkout")
+	local a = assert(sdk.new(config()))
+	next_status = 403
+	next_response_body = json.encode({
+		error = "experiment real-subject assignment is disabled",
+	})
+	fetch(a, "exp-checkout")
+	next_status = 200
+	local record = storage.load_experiments(config({ environment_id = "staging" }))
+	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
+		"another scope's record must survive the sentinel's clear")
+	assert_nil(storage.load_experiments_clear(config()),
+		"the foreign-scope clear settles without leaving a marker")
+
+	-- Same collision with the record store FAILING: the scope check must
+	-- settle the clear before any stamp-only condemnation can be minted,
+	-- so a staging restart still restores and serves its entries.
+	state.fail_save = fail_experiment_saves
+	next_status = 403
+	next_response_body = json.encode({
+		error = "experiment real-subject assignment is disabled",
+	})
+	fetch(a, "exp-checkout")
+	next_status = 200
+	state.fail_save = nil
+	assert_nil(storage.load_experiments_clear(config()),
+		"no marker may condemn a record the clear's scope does not own")
+	local b2 = assert(sdk.new(config({ environment_id = "staging" })))
+	next_status = 503
+	next_response_body = nil
+	local stale = fetch(b2, "exp-checkout")
+	assert_equal(stale.ok, true)
+	assert_equal(stale.from_cache, true,
+		"the foreign scope's restart serves its own retained assignment")
+	next_status = 200
+	restore()
+	storage.reset()
+end
+
+local function test_marker_survives_demotion_until_drops_durable()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	seed_granted_consent()
+	local a = assert(sdk.new(config()))
+	next_response_body = assignment_body()
+	fetch(a, "exp-checkout")
+	next_response_body = assignment_body({ experiment_key = "exp-onboarding" })
+	fetch(a, "exp-onboarding")
+
+	-- Sentinel with a failing record store: the clear is owed and the
+	-- condemnation marker persists. A fresh authorized install then
+	-- DEMOTES the clear while the store is STILL failing — the demoted
+	-- per-key drops are memory-only, so the marker must survive the
+	-- demotion: an exit in that window still refuses the covered state.
+	state.fail_save = fail_experiment_saves
+	next_status = 403
+	next_response_body = json.encode({
+		error = "experiment real-subject assignment is disabled",
+	})
+	fetch(a, "exp-checkout")
+	next_status = 200
+	next_response_body = assignment_body()
+	fetch(a, "exp-checkout")
+	assert_true(storage.load_experiments_clear(config()) ~= nil,
+		"the marker must outlive the demotion while the drops are not durable")
+	local b = assert(sdk.new(config()))
+	next_status = 503
+	next_response_body = nil
+	local stale = fetch(b, "exp-onboarding")
+	assert_equal(stale.ok, false,
+		"a restart in the window must still refuse the withdrawn state")
+	next_status = 200
+	state.fail_save = nil
+	b:update(0.016)
+	local record = storage.load_experiments(config())
+	assert_true(record == nil or record.entries["exp-onboarding"] == nil,
+		"the recovered store lands the owed refusal")
+	assert_nil(storage.load_experiments_clear(config()),
+		"the marker retires once nothing it condemns remains durable")
+	restore()
+	storage.reset()
+end
+
+local function test_shutdown_stays_retryable_while_cache_sync_owed()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- A kill drop is owed with the record store failing THROUGH shutdown:
+	-- tearing down would leave the revoked assignment as reload truth, so
+	-- shutdown stays retryable (persist() parity) until the sync lands.
+	state.fail_save = fail_experiment_saves
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-checkout")
+	local ok, err = client:shutdown()
+	assert_equal(ok, false,
+		"shutdown must not finalize while the kill drop is memory-only")
+	assert_equal(err, "experiments_pending")
+	state.fail_save = nil
+	assert_true(client:shutdown(),
+		"the recovered store lands the drop and shutdown completes")
+	local record = storage.load_experiments(config())
+	assert_true(record == nil or record.entries["exp-checkout"] == nil)
+	restore()
+	storage.reset()
+end
+
+local function test_superseded_serve_requires_matching_attributes()
+	reset()
+	local client = granted_client()
+	-- An older geo=CA request is held in flight while a newer
+	-- attribute-less request wins the race and installs the settled
+	-- entry. The race loser's callback must NOT receive that variant as
+	-- a successful cache serve — its targeting context differs, and the
+	-- superseded fallback honors the same attribute fence as the
+	-- transient serves. (A caller whose context MATCHES the settled
+	-- entry still gets the cache serve — the settled-state contract.)
+	local held = nil
+	responder = function(url, method, callback)
+		if held == nil and url:find("geo=CA", 1, true) then
+			held = callback
+			return true
+		end
+	end
+	local late_result = nil
+	client:fetch_experiment_assignment("exp-checkout", { geo = "CA" },
+		function(value)
+			late_result = value
+		end)
+	assert_true(held ~= nil)
+	responder = nil
+	next_response_body = assignment_body()
+	local fresh = fetch(client, "exp-checkout")
+	assert_true(fresh.ok and fresh.assigned)
+	held(nil, nil, { status = 200, response = assignment_body() })
+	assert_true(late_result ~= nil)
+	assert_equal(late_result.ok, false,
+		"the fenced-out geo=CA caller must not receive the mismatched variant")
+	assert_equal(late_result.error, "superseded")
+	assert_nil(late_result.variant_key)
+
+	-- The matching-context race loser still receives the settled serve.
+	local held_match = nil
+	responder = function(url, method, callback)
+		if held_match == nil
+			and url:find("/experiments/assignment", 1, true) then
+			held_match = callback
+			return true
+		end
+	end
+	local match_result = nil
+	client:fetch_experiment_assignment("exp-checkout", nil, function(value)
+		match_result = value
+	end)
+	assert_true(held_match ~= nil)
+	responder = nil
+	next_response_body = assignment_body({ version = 4 })
+	local newer = fetch(client, "exp-checkout")
+	assert_true(newer.ok and newer.assigned)
+	held_match(nil, nil, { status = 200, response = assignment_body() })
+	assert_true(match_result ~= nil)
+	assert_equal(match_result.ok, true)
+	assert_equal(match_result.from_cache, true)
+	assert_equal(match_result.error, "superseded")
+end
+
+local function test_rearm_during_regrant_window_keeps_auto_exposure()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	client:update(0.016)
+	assert_true(client:flush({ include_summaries = false }))
+
+	-- Consent cycles; in the window between the re-grant and the first
+	-- sweep the automatic exposure exists only as a pending re-arm
+	-- INTENT. An explicit track_exposure() there buys the EXTRA fact
+	-- (arm 1) — it must not consume the automatic slot: the intent still
+	-- materializes arm 0 and both facts emit with distinct ids.
+	assert_true(client:set_consent(false))
+	assert_true(client:set_consent(true))
+	assert_true(client:track_exposure("exp-checkout"))
+	client:update(0.016)
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 2,
+		"the explicit re-arm and the automatic post-grant fact both emit")
+	assert_true(exposures[1].event_id ~= exposures[2].event_id)
+end
+
+local function test_retry_after_arms_cadence_before_first_tick()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	local seed_client = granted_client()
+	next_response_body = assignment_body()
+	fetch(seed_client, "exp-checkout")
+
+	-- A restored assignment has no cadence armed before its first tick.
+	-- A transient fetch with a SHORT Retry-After must arm the cadence
+	-- from the pacing window (the min rule applies from birth) — not
+	-- leave it nil for the first tick to arm a fresh full interval.
+	local client = assert(sdk.new(config()))
+	next_status = 503
+	next_response_body = nil
+	next_response_headers = { ["retry-after"] = "5" }
+	local stale = fetch(client, "exp-checkout")
+	assert_equal(stale.from_cache, true)
+	local base = #assignment_requests()
+	next_status = 200
+	next_response_body = assignment_body()
+	next_response_headers = nil
+	advance_seconds(10)
+	client:update(0.016)
+	assert_equal(#assignment_requests(), base + 1,
+		"the probe fires at the server window, not a fresh full cadence")
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -4307,6 +4598,14 @@ local tests = {
 	test_mode_b_rotation_blocked_while_exposure_owed,
 	test_purge_rearm_materializes_at_grant_identity,
 	test_transient_pacing_shortens_next_revalidation,
+	test_denied_restore_arms_intent_and_exposes_at_grant_identity,
+	test_retryable_sweep_attempts_do_not_count_as_drops,
+	test_sentinel_clear_never_condemns_foreign_scope,
+	test_marker_survives_demotion_until_drops_durable,
+	test_shutdown_stays_retryable_while_cache_sync_owed,
+	test_superseded_serve_requires_matching_attributes,
+	test_rearm_during_regrant_window_keeps_auto_exposure,
+	test_retry_after_arms_cadence_before_first_tick,
 }
 
 for _, test in ipairs(tests) do

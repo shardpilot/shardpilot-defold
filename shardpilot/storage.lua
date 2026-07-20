@@ -1346,6 +1346,12 @@ end
 -- and the documented storage-down-through-exit residual applies).
 local experiments_clear_memory = {}
 
+-- The marker carries BOTH the clear's stamp and the assignment SCOPE it was
+-- decided for: the record file is shared across every assignment scope in
+-- this per-app namespace, and a sentinel for one environment/credential
+-- must never condemn another scope's entries just because their stamps are
+-- older. Returns (stamp, clear_scope); clear_scope may be nil only for a
+-- legacy/degenerate record, which consumers treat conservatively.
 function M.load_experiments_clear(scope)
 	local ns = spool_namespace(scope)
 	local record = nil
@@ -1362,15 +1368,18 @@ function M.load_experiments_clear(scope)
 	if type(record) ~= "table" or type(record.stamp) ~= "number" then
 		return nil
 	end
-	return record.stamp
+	local clear_scope = type(record.scope) == "string" and record.scope ~= ""
+		and record.scope or nil
+	return record.stamp, clear_scope
 end
 
-function M.save_experiments_clear(scope, stamp)
-	if type(stamp) ~= "number" then
+function M.save_experiments_clear(scope, stamp, clear_scope)
+	if type(stamp) ~= "number" or type(clear_scope) ~= "string"
+		or clear_scope == "" then
 		return false
 	end
 	local ns = spool_namespace(scope)
-	local stored = { stamp = stamp }
+	local stored = { stamp = stamp, scope = clear_scope }
 	local path = save_path(ns, "experiments-clear")
 	if not path then
 		experiments_clear_memory[ns] = stored

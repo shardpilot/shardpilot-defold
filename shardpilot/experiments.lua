@@ -727,6 +727,17 @@ function M.new(config, deps)
 		-- drops still land.
 		durable_pending = {},
 		durable_clear_pending = false,
+		-- The SCOPE the owed whole-record clear was decided for: the record
+		-- file is shared across assignment scopes in this app namespace,
+		-- and a sentinel for one environment/credential must never condemn
+		-- another scope's entries. Set and cleared with the pending clear.
+		durable_clear_scope = nil,
+		-- In-memory mirror of the DURABLE condemnation marker ({stamp,
+		-- scope} or nil). Outlives a demotion: the demoted per-key drops
+		-- are memory intents until their syncs land, and an exit in that
+		-- window must still find the durable refusal — the marker retires
+		-- only when nothing it condemns remains on disk.
+		clear_marker = nil,
 		-- Set by teardown(): an in-flight response landing afterwards must
 		-- not install, persist, pace, or call back into game code.
 		torn_down = false,
@@ -772,34 +783,55 @@ function M.new(config, deps)
 	if subject then
 		-- A durable condemnation outlives the process: a real-subjects
 		-- sentinel clear that could not land before an exit left its
-		-- stamp in the sidecar marker. Re-arm the clear here and REFUSE
-		-- everything it covers — serving the withdrawn record until its
-		-- first probe would defeat the sentinel. Entries stamped strictly
-		-- after the condemnation are a sibling's post-sentinel authorized
-		-- state and restore normally (the same survivor partition the
-		-- clear itself applies); the first tick lands the clear.
-		local condemned_stamp = storage.load_experiments_clear(config)
+		-- stamp AND scope in the sidecar marker. Re-arm the clear here
+		-- and REFUSE everything it covers — serving the withdrawn record
+		-- until its first probe would defeat the sentinel. The
+		-- condemnation applies ONLY to the scope it was decided for (a
+		-- legacy marker without one condemns conservatively): another
+		-- scope's record is untouched, and the first tick settles such a
+		-- stale marker. Entries stamped strictly after the condemnation
+		-- are a sibling's post-sentinel authorized state and restore
+		-- normally (the same survivor partition the clear itself
+		-- applies); the first tick lands the clear.
+		local condemned_stamp, condemned_scope = storage.load_experiments_clear(config)
 		if condemned_stamp then
 			ex.durable_clear_pending = condemned_stamp
+			ex.durable_clear_scope = condemned_scope
+			ex.clear_marker = { stamp = condemned_stamp, scope = condemned_scope }
 		end
 		local record = storage.load_experiments(config)
 		if record and record.scope == ex:scope_for(subject) then
+			local record_condemned = condemned_stamp ~= nil
+				and (condemned_scope == nil or condemned_scope == record.scope)
 			for key, entry in pairs(record.entries) do
 				local stored_at = type(entry.fetched_at_ms) == "number"
 					and entry.fetched_at_ms or 0
-				if not condemned_stamp or stored_at > condemned_stamp then
+				if not record_condemned or stored_at > condemned_stamp then
 					-- Restored attributes re-validate against the live
 					-- fetch vocabulary before any revalidation can send
 					-- them: corrupt or older-build records degrade to a
 					-- safe targeting miss, never a reshaped request.
 					entry.attributes = sanitize_restored_attributes(entry.attributes)
 					ex.entries[key] = entry
-					-- The restored assignment APPLIES at this restore
-					-- (this launch's serving), so the snapshot's identity
-					-- is the construction moment's — session nil until
-					-- the first real session migrates it, anonymous id
-					-- and timestamp of NOW.
-					ex.pending_exposure[key] = { ex:exposure_snapshot(entry) }
+					if deps.consent() == "granted" then
+						-- The restored assignment APPLIES at this restore
+						-- (this launch's serving), so the snapshot's
+						-- identity is the construction moment's — session
+						-- nil until the first real session migrates it,
+						-- anonymous id and timestamp of NOW.
+						ex.pending_exposure[key] = { ex:exposure_snapshot(entry) }
+					else
+						-- Restored under a NON-GRANTED persisted state:
+						-- the getters serve nothing while consent is
+						-- closed, so the assignment is not actually
+						-- applied yet. The exposure arms as INTENT and
+						-- materializes at the first granted sweep with
+						-- the serving-resumed identity — a launch-time
+						-- snapshot would stamp the future fact with a
+						-- denied-period timestamp (the same rule as the
+						-- consent-purge re-arm).
+						ex.pending_rearm[key] = true
+					end
 				end
 			end
 		end
@@ -1152,18 +1184,24 @@ function Experiments:demote_owed_clear()
 	end
 	local clear_as_of = type(self.durable_clear_pending) == "number"
 		and self.durable_clear_pending or 0
+	local clear_scope = self.durable_clear_scope
 	self.durable_clear_pending = false
-	-- The demotion also retires the durable condemnation marker: a fresh
-	-- AUTHORIZED install exists (that is what triggers demotion), which
-	-- disproves the sentinel state — the platform re-authorized the plane
-	-- — so a whole-record refusal at the next launch is no longer
-	-- warranted. The per-key drops the demotion mints are ordinary owed
-	-- intents from here on; a process death before they land is the
-	-- documented per-key storage-down-through-exit class, not the
-	-- sentinel-blanket one.
-	storage.clear_experiments_clear(self.config)
+	self.durable_clear_scope = nil
+	-- The durable condemnation marker is deliberately NOT retired here:
+	-- the per-key drops this demotion mints are memory intents until
+	-- their syncs land, and an exit in that window must still find the
+	-- durable refusal — otherwise a restart would restore the covered
+	-- stale entries the sentinel withdrew. The marker retires at the
+	-- durable-state check once nothing it condemns remains on disk.
 	local record = storage.load_experiments(self.config)
 	if not record then
+		return
+	end
+	if clear_scope and record.scope ~= clear_scope then
+		-- Another scope's record replaced the condemned one wholesale:
+		-- nothing the clear covered remains, so no drops are minted and
+		-- the marker retires with the vanished target.
+		self:retire_clear_marker()
 		return
 	end
 	for key, stored in pairs(record.entries) do
@@ -1206,10 +1244,12 @@ function Experiments:retry_durable_sync()
 		end
 	end
 	if next(self.durable_pending) == nil then
+		self:retire_clear_marker_if_settled()
 		return
 	end
 	local subject = self:current_subject_id()
 	if not subject then
+		self:retire_clear_marker_if_settled()
 		return
 	end
 	local scope = self:scope_for(subject)
@@ -1240,6 +1280,7 @@ function Experiments:retry_durable_sync()
 			end
 		end
 	end
+	self:retire_clear_marker_if_settled()
 end
 
 -- Retry an owed whole-record clear while local memory is EMPTY (this
@@ -1251,10 +1292,39 @@ end
 -- corrupt is a miss everywhere else, and the sentinel's mandate stands for
 -- it). Consistent with the foreign-scope drop retry below: stamp-fenced
 -- per-key convergence against the record actually on disk.
+-- Retire the durable condemnation marker (best-effort: a lingering marker
+-- is harmless — nothing it condemns remains when this is called, so a
+-- failed delete just means a later pass, or the next construction's first
+-- tick, retries it).
+function Experiments:retire_clear_marker()
+	if storage.clear_experiments_clear(self.config) then
+		self.clear_marker = nil
+	end
+end
+
+-- Settle the owed whole-record clear: the state it condemned no longer
+-- exists on disk (just cleared, rewritten to survivors only, or replaced
+-- wholesale by another scope's record), so the durable marker retires with
+-- it.
+function Experiments:settle_owed_clear()
+	self.durable_clear_pending = false
+	self.durable_clear_scope = nil
+	self:retire_clear_marker()
+end
+
 function Experiments:retry_owed_clear()
 	local clear_as_of = type(self.durable_clear_pending) == "number"
 		and self.durable_clear_pending or 0
+	local clear_scope = self.durable_clear_scope
 	local record = storage.load_experiments(self.config)
+	if record and clear_scope and record.scope ~= clear_scope then
+		-- Another scope's write replaced the condemned record wholesale:
+		-- the clear's target no longer exists, and a sentinel for one
+		-- environment/credential never condemns another scope's entries —
+		-- settle without touching the foreign record.
+		self:settle_owed_clear()
+		return
+	end
 	local survivors = nil
 	local covered = false
 	if record then
@@ -1272,24 +1342,18 @@ function Experiments:retry_owed_clear()
 	end
 	if not survivors then
 		if storage.clear_experiments(self.config) then
-			self.durable_clear_pending = false
 			self.durable_pending = {}
-			-- The landed clear retires its durable condemnation marker
-			-- (best-effort: a lingering marker is harmless — the next
-			-- construction re-arms a clear whose targets are gone, which
-			-- settles here and retries this delete).
-			storage.clear_experiments_clear(self.config)
+			self:settle_owed_clear()
 		end
 		return
 	end
 	if not covered then
 		-- Everything on disk postdates the sentinel: the clear's targets
-		-- are already gone (a new-scope or refreshed record replaced the
-		-- file wholesale) and the clear settles without touching the
-		-- sibling's state. Per-key owed intents stay to converge on their
-		-- own fences.
-		self.durable_clear_pending = false
-		storage.clear_experiments_clear(self.config)
+		-- are already gone (a refreshed record replaced the file
+		-- wholesale) and the clear settles without touching the sibling's
+		-- state. Per-key owed intents stay to converge on their own
+		-- fences.
+		self:settle_owed_clear()
 		return
 	end
 	record.entries = survivors
@@ -1299,8 +1363,35 @@ function Experiments:retry_owed_clear()
 		-- clear — drops for covered keys settle on their own retries
 		-- (the stored entry is gone), and anything targeting a survivor
 		-- is protected by the usual strictly-fresher retry fences.
-		self.durable_clear_pending = false
-		storage.clear_experiments_clear(self.config)
+		self:settle_owed_clear()
+	end
+end
+
+-- Retire a demotion-outlived condemnation marker once NOTHING it condemns
+-- remains durable: the demoted per-key drops (or the replacement record)
+-- must actually be on disk before the durable refusal may disappear —
+-- retiring at the demotion decision would leave an exit window in which a
+-- restart restores the withdrawn variants. Runs after every durable-sync
+-- pass and after an install's combined save.
+function Experiments:retire_clear_marker_if_settled()
+	if not self.clear_marker or self.durable_clear_pending then
+		return
+	end
+	local record = storage.load_experiments(self.config)
+	local remaining = false
+	if record and (self.clear_marker.scope == nil
+		or record.scope == self.clear_marker.scope) then
+		for _, stored in pairs(record.entries) do
+			local stored_at = type(stored) == "table"
+				and type(stored.fetched_at_ms) == "number"
+				and stored.fetched_at_ms or 0
+			if stored_at <= self.clear_marker.stamp then
+				remaining = true
+			end
+		end
+	end
+	if not remaining then
+		self:retire_clear_marker()
 	end
 end
 
@@ -1473,9 +1564,14 @@ function Experiments:emit_entry_exposure(experiment_key, entry, rearm, snapshot)
 			next_exposed = { arm = arm, auto = exposed.auto }
 		elseif owed_tuple_armed(
 			self.pending_exposure[experiment_key], experiment_key, tuple,
-			self.session_marker) then
-			-- The automatic emission is still owed in the queue: the
-			-- explicit re-arm counts as the EXTRA fact on top of it.
+			self.session_marker) or self.pending_rearm[experiment_key] then
+			-- The automatic emission is still owed — as an armed snapshot
+			-- in the queue, or as a purge-deferred INTENT that has not
+			-- materialized yet (the window between a re-grant and its
+			-- first sweep): the explicit re-arm counts as the EXTRA fact
+			-- on top of it, never consuming the automatic slot — the
+			-- intent still materializes arm 0 and both facts emit with
+			-- distinct deterministic ids.
 			arm = 1
 			next_exposed = { arm = 1, auto = false }
 		else
@@ -1500,6 +1596,12 @@ function Experiments:emit_entry_exposure(experiment_key, entry, rearm, snapshot)
 		session_id = snapshot.session_id,
 		anonymous_id = snapshot.anonymous_id,
 		event_ts = snapshot.event_ts,
+		-- A snapshot-backed emission is RETRYABLE by construction: a
+		-- queue-full refusal keeps the snapshot armed and the sweep tries
+		-- again, so the attempt is not a dropped event (the immediate
+		-- track_exposure path passes no snapshot and stays a countable,
+		-- host-retried failure).
+		retryable = true,
 	} or nil)
 	if not ok then
 		return false, err
@@ -1656,6 +1758,11 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 				stamp = withdrawn_stamp_max + 1
 			end
 			self.durable_clear_pending = stamp
+			-- The clear condemns only THE SCOPE it was decided for: the
+			-- record file is shared across assignment scopes, and another
+			-- environment/credential's entries must never be pruned on
+			-- this sentinel's stamp.
+			self.durable_clear_scope = scope
 			-- The SUCCESS path partitions exactly like the retry — a stale
 			-- in-flight sentinel must not erase a sibling's newer
 			-- post-sentinel write even when storage works — so the clear
@@ -1666,12 +1773,14 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 				-- process and the next launch would serve the withdrawn
 				-- record until its first probe. Make the condemnation
 				-- DURABLE — the sidecar tombstone carries the clear's
-				-- stamp, the constructor refuses what it covers and
-				-- re-arms the clear. Best-effort in the double-failure
+				-- stamp AND scope, the constructor refuses what it covers
+				-- and re-arms the clear. Best-effort in the double-failure
 				-- corner (record AND sidecar stores down), diagnosed:
 				-- that corner is the documented storage-down-through-exit
 				-- residual.
-				if not storage.save_experiments_clear(self.config, stamp) then
+				if storage.save_experiments_clear(self.config, stamp, scope) then
+					self.clear_marker = { stamp = stamp, scope = scope }
+				else
 					self:diagnose("persist_failed", "cache_clear_tombstone")
 				end
 				self:diagnose("persist_failed", "cache_clear")
@@ -1744,6 +1853,10 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 		-- canon must never let that clear delete state written after it.
 		self:demote_owed_clear()
 		self:sync_durable_entry(scope, experiment_key, entry.fetched_at_ms)
+		-- The combined save above may have just landed the demoted drops:
+		-- retire a demotion-outlived condemnation marker as soon as its
+		-- covered state is durably gone (no-op unless a marker is owed).
+		self:retire_clear_marker_if_settled()
 		self:arm_revalidation(clock.unix_ms())
 		-- The variant takes effect at this resolution (a variant change on
 		-- republish applies here too — no mid-session flapping guard beyond
@@ -1780,8 +1893,12 @@ function Experiments:defer_revalidation(seconds)
 	-- revalidate_at_ms` gate would suppress the retry until the full
 	-- cadence anyway. The effective next attempt becomes min(cadence,
 	-- pacing window); retry_after_ms above still lower-bounds it, so a
-	-- server wait LONGER than the cadence holds exactly as before.
-	if self.revalidate_at_ms and deadline < self.revalidate_at_ms then
+	-- server wait LONGER than the cadence holds exactly as before. The
+	-- min rule applies FROM BIRTH: with no cadence armed yet (a restored
+	-- assignment before its first tick), the pacing deadline becomes the
+	-- cadence — otherwise the first tick after the window would arm a
+	-- fresh full interval and delay the probe by the whole cadence.
+	if not self.revalidate_at_ms or deadline < self.revalidate_at_ms then
 		self.revalidate_at_ms = deadline
 	end
 end
@@ -2029,7 +2146,14 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		-- Transient results already derive from the current fenced entry
 		-- and pass through untouched.
 		if fenced_out and outcome.authoritative then
-			finish(serve_entry_or_fail(self.entries[experiment_key], "superseded"))
+			-- The superseded serve honors the SAME attribute fence as the
+			-- transient serves: the newer settled entry may have been
+			-- evaluated under a different targeting context than THIS
+			-- older request carried, and the race loser's callback must
+			-- not receive a mismatched variant as a successful cache
+			-- serve — it gets the closed superseded result instead.
+			finish(serve_entry_or_fail(self.entries[experiment_key],
+				"superseded", normalized_attributes))
 			return
 		end
 		finish(result)
