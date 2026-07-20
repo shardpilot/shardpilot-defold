@@ -610,7 +610,7 @@ function M.new(config, deps)
 		if record and record.scope == ex:scope_for(subject) then
 			for key, entry in pairs(record.entries) do
 				ex.entries[key] = entry
-				ex.pending_exposure[key] = entry
+				ex.pending_exposure[key] = { entry }
 			end
 		end
 	end
@@ -679,7 +679,20 @@ function Experiments:on_session_renewed()
 	self.session_marker = id.uuid()
 	self.exposed = {}
 	for key, entry in pairs(self.entries) do
-		self.pending_exposure[key] = entry
+		self:arm_exposure(key, entry)
+	end
+end
+
+-- A consent denial purges queued-but-unpublished analytics facts — exposure
+-- facts included. Those facts never reached the server, so the session's
+-- emissions re-arm: a later re-grant of the retained assignment emits the
+-- exposure again instead of silently under-counting real treatment. Facts
+-- that HAD already published simply collapse server-side as duplicates of
+-- their deterministic event ids, so the blanket re-arm is safe.
+function Experiments:on_analytics_purge()
+	self.exposed = {}
+	for key, entry in pairs(self.entries) do
+		self:arm_exposure(key, entry)
 	end
 end
 
@@ -751,13 +764,12 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms)
 			self.durable_pending[experiment_key] = nil
 			return true
 		end
-		if type(stored.fetched_at_ms) == "number" and type(as_of_ms) == "number"
-			and stored.fetched_at_ms > as_of_ms then
-			-- The stored entry postdates this drop decision (a sibling
-			-- re-fetched meanwhile): the drop no longer applies to it.
-			self.durable_pending[experiment_key] = nil
-			return true
-		end
+		-- A drop ALWAYS wins over the stored record it resolves: the
+		-- decision came from a server response that postdates any stored
+		-- copy of this key visible here, and the wall clock can move
+		-- backward — fencing deletes on stamps would let a clock rollback
+		-- revive a killed variant at the next launch. The freshness fence
+		-- protects sibling WRITES only.
 		record.entries[experiment_key] = nil
 	end
 	if storage.save_experiments(self.config, record) then
@@ -785,7 +797,22 @@ end
 -- kill drop decided under grant must land durably even if consent flips.
 function Experiments:retry_durable_sync()
 	if self.durable_clear_pending then
-		if storage.clear_experiments(self.config) then
+		if next(self.entries) ~= nil then
+			-- Newer authorized state was installed after the failed clear:
+			-- the epoch-scoped clear must not wipe it. Convert the owed
+			-- whole-record clear into per-key drops for exactly the keys
+			-- the clear still covers — everything on disk that memory no
+			-- longer holds — and let the per-key sync converge those.
+			self.durable_clear_pending = false
+			local record = storage.load_experiments(self.config)
+			if record then
+				for key in pairs(record.entries) do
+					if self.entries[key] == nil then
+						self.durable_pending[key] = 0
+					end
+				end
+			end
+		elseif storage.clear_experiments(self.config) then
 			self.durable_clear_pending = false
 			self.durable_pending = {}
 		end
@@ -818,53 +845,60 @@ local function exposure_tuple(experiment_key, entry)
 		.. "\31" .. tostring(entry.subject_key)
 end
 
--- Emit the exposure fact for an applied assignment, once per (experiment,
--- version, subject) per session; `rearm` (track_exposure) emits again with a
--- bumped arm counter. The auto path emits from the OWED APPLICATION
--- SNAPSHOT when the live entry is gone — an application that really
--- happened is a fact even after a later kill/not-assigned drop stops
--- serving — while the explicit re-arm targets the live assignment only.
--- Returns true when the fact was enqueued or the tuple was already exposed
--- this session; (false, code) when nothing was enqueued.
-function Experiments:try_expose(experiment_key, rearm)
-	local entry = self.entries[experiment_key]
-	if rearm then
-		if not entry then
-			return false, "no_assignment"
-		end
-	elseif not entry then
-		local pending = self.pending_exposure[experiment_key]
-		if type(pending) == "table" then
-			entry = pending
-		else
-			self.pending_exposure[experiment_key] = nil
-			return false, "no_assignment"
-		end
+-- Each experiment's owed exposures are a small FIFO of applied-entry
+-- snapshots (bounded; overflowing drops the OLDEST with a diagnostic), so a
+-- new application displacing the slot cannot silently lose the previous
+-- application's still-unemitted fact.
+local max_owed_exposures = 8
+
+-- Arm one application snapshot for emission. A same-tuple snapshot already
+-- armed at the tail is refreshed in place (renewals and purges re-arm the
+-- same application; the de-dupe collapses same-tuple emissions anyway), so
+-- the queue only grows across genuinely distinct applications.
+function Experiments:arm_exposure(experiment_key, entry)
+	local list = self.pending_exposure[experiment_key]
+	if type(list) ~= "table" then
+		list = {}
+		self.pending_exposure[experiment_key] = list
 	end
+	local tail = list[#list]
+	if tail and exposure_tuple(experiment_key, tail) == exposure_tuple(experiment_key, entry) then
+		list[#list] = entry
+		return
+	end
+	list[#list + 1] = entry
+	if #list > max_owed_exposures then
+		table.remove(list, 1)
+		self:diagnose("exposure_skipped", "owed_overflow")
+	end
+end
+
+-- Emit one exposure fact for one applied-entry snapshot. Returns:
+--   true                      — emitted, or already emitted this session;
+--   false, code, true         — terminally skipped (no server-safe fact
+--                               key; the SDK subject id never egresses);
+--   false, code               — retryable (consent closed, queue full):
+--                               the armed snapshot stays for a later sweep.
+function Experiments:emit_entry_exposure(experiment_key, entry, rearm)
 	local refusal = consent_refusal(self.deps.consent())
 	if refusal then
-		-- Nothing queued, nothing spooled: the analytics plane is closed.
-		-- The pending mark survives, so a grant later in the session emits.
 		return false, refusal
 	end
 	local tuple = exposure_tuple(experiment_key, entry)
 	local exposed = self.exposed[tuple]
 	if exposed and not rearm then
-		self.pending_exposure[experiment_key] = nil
 		return true
 	end
 	-- Facts carry ONLY the server-minted subject-fact key as the
 	-- assignment_key prop (opaque, verbatim — the ingest service
 	-- structurally requires it for client_id-unit facts). The SDK-minted
 	-- subject id NEVER egresses on the analytics plane, so an assignment
-	-- without a subject-fact key — a synthetic-unit answer included, since
-	-- this SDK has no server-safe fact key for it — emits NO fact: skipped,
-	-- not retried, surfaced through diagnostics.
+	-- without a subject-fact key — a synthetic-unit answer included —
+	-- emits NO fact: skipped terminally, surfaced through diagnostics.
 	local fact_key = entry.subject_fact_key
 	if type(fact_key) ~= "string" or fact_key == "" then
-		self.pending_exposure[experiment_key] = nil
 		self:diagnose("exposure_skipped", "no_subject_fact_key")
-		return false, "exposure_no_subject_fact_key"
+		return false, "exposure_no_subject_fact_key", true
 	end
 	local arm = 0
 	if exposed then
@@ -880,14 +914,31 @@ function Experiments:try_expose(experiment_key, rearm)
 		assignment_unit = entry.assignment_unit,
 	}, event_id)
 	if not ok then
-		-- Emission failed locally (queue full, torn down): keep the pending
-		-- mark so a later tick retries; the deterministic id keeps any
-		-- eventual double emission collapsible server-side.
 		return false, err
 	end
 	self.exposed[tuple] = { arm = arm }
-	self.pending_exposure[experiment_key] = nil
 	return true
+end
+
+-- Drain one experiment's owed-exposure queue in order: emitted and
+-- terminally skipped snapshots leave the queue; a retryable failure (queue
+-- full, consent closed) stops the drain and keeps the remainder armed for a
+-- later sweep, so an older application's fact is never leapfrogged or lost.
+function Experiments:sweep_pending(experiment_key)
+	local list = self.pending_exposure[experiment_key]
+	if type(list) ~= "table" then
+		self.pending_exposure[experiment_key] = nil
+		return
+	end
+	while list[1] do
+		local ok, _, terminal = self:emit_entry_exposure(experiment_key, list[1])
+		if ok or terminal then
+			table.remove(list, 1)
+		else
+			return
+		end
+	end
+	self.pending_exposure[experiment_key] = nil
 end
 
 -- Settle an authoritative fetch outcome and, when it may, install it. Gates,
@@ -953,40 +1004,41 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 	-- deferral setter already keeps only the LATEST deadline).
 	self.backoff_attempt = 0
 	if outcome.drop_entry then
+		local dropped = self.entries[experiment_key]
 		self.entries[experiment_key] = nil
-		-- The OWED exposure deliberately survives the drop: an application
+		-- The OWED exposures deliberately survive the drop: an application
 		-- that already happened is a fact — the drop stops future serving,
-		-- not the record of real treatment. The sweep emits it from the
-		-- retained snapshot. The durable drop converges keyed on the DISK
+		-- not the record of real treatment. The sweep emits them from the
+		-- retained snapshots. The durable drop converges keyed on the DISK
 		-- state (a latch may have cleared serving while the record retains
 		-- the entry) and is retried until it lands — the kill rule demands
-		-- the drop reach the disk.
-		self:sync_durable_entry(scope, experiment_key, resolved_at_ms)
+		-- the drop reach the disk. The drop's effective stamp is raised
+		-- above the entry it resolves: the wall clock can move backward,
+		-- and a drop for X must always outrank X's own stamp.
+		local as_of = type(resolved_at_ms) == "number" and resolved_at_ms or 0
+		if dropped and type(dropped.fetched_at_ms) == "number"
+			and dropped.fetched_at_ms >= as_of then
+			as_of = dropped.fetched_at_ms + 1
+		end
+		self:sync_durable_entry(scope, experiment_key, as_of)
 		return
 	end
 	if outcome.new_entry then
 		local entry = outcome.new_entry
 		entry.subject_key = subject
 		entry.attributes = outcome.attributes
-		-- Flush an owed exposure from the PREVIOUS application before this
-		-- resolution replaces its snapshot slot (best-effort: the previous
-		-- application really ran, and its fact should not be silently
-		-- superseded by the new one).
-		if type(self.pending_exposure[experiment_key]) == "table" then
-			self:try_expose(experiment_key)
-		end
 		self.entries[experiment_key] = entry
 		self:sync_durable_entry(scope, experiment_key, entry.fetched_at_ms)
 		self:arm_revalidation(clock.unix_ms())
 		-- The variant takes effect at this resolution (a variant change on
 		-- republish applies here too — no mid-session flapping guard beyond
-		-- the fetch cadence): the application point, so the exposure fact
-		-- is emitted now, deduplicated per session tuple. The pending
-		-- snapshot is armed FIRST and cleared only by a successful (or
-		-- terminally skipped) emission, so a locally failed emit — a full
-		-- queue — is retried by the tick sweep instead of being lost.
-		self.pending_exposure[experiment_key] = entry
-		self:try_expose(experiment_key)
+		-- the fetch cadence): the application point. The snapshot is ARMED
+		-- behind any still-owed earlier applications (the queue preserves
+		-- them — a full analytics queue must not cost the previous
+		-- treatment its fact) and the sweep drains in order; a locally
+		-- failed emit is retried by the tick sweep instead of being lost.
+		self:arm_exposure(experiment_key, entry)
+		self:sweep_pending(experiment_key)
 	end
 end
 
@@ -1179,6 +1231,15 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 			finish({ ok = false, from_cache = false, error = "unauthorized" })
 			return
 		end
+		-- The subject-scope re-check guards the callback the same way: a
+		-- subject re-minted while this response was in flight makes it
+		-- ANOTHER subject's assignment — the install discarded it, and the
+		-- caller must receive the miss, never the discarded variant.
+		local subject_now = self:current_subject_id()
+		if not subject_now or self:scope_for(subject_now) ~= scope then
+			finish({ ok = false, from_cache = false, error = "stale_subject" })
+			return
+		end
 		finish(result)
 	end, headers, nil, options)
 	return true
@@ -1200,9 +1261,9 @@ function Experiments:tick(_)
 	if consent_refusal(self.deps.consent()) then
 		return
 	end
-	-- Exposure sweep for cache-restored assignments: emitted on the first
-	-- granted tick of the session (the application point for a variant that
-	-- was restored rather than fetched).
+	-- Owed-exposure sweep: cache-restored applications, locally failed
+	-- emissions, and applications whose facts a consent purge re-armed all
+	-- drain here, in per-experiment order, while consent is granted.
 	if next(self.pending_exposure) then
 		local keys = {}
 		for key in pairs(self.pending_exposure) do
@@ -1210,7 +1271,7 @@ function Experiments:tick(_)
 		end
 		table.sort(keys)
 		for i = 1, #keys do
-			self:try_expose(keys[i])
+			self:sweep_pending(keys[i])
 		end
 	end
 	if self.auth_blocked or not next(self.entries) then
@@ -1285,7 +1346,13 @@ function Experiments:track_exposure(experiment_key)
 	if type(experiment_key) ~= "string" or experiment_key == "" then
 		return false, "experiment_key_required"
 	end
-	return self:try_expose(experiment_key, true)
+	-- The explicit re-arm targets the LIVE assignment only.
+	local entry = self.entries[experiment_key]
+	if not entry then
+		return false, "no_assignment"
+	end
+	local ok, err = self:emit_entry_exposure(experiment_key, entry, true)
+	return ok, err
 end
 
 -- Host-triggered outcome fact: stamps the same per-unit props from the

@@ -2099,6 +2099,191 @@ local function test_no_callback_install_or_persist_after_shutdown()
 	restore()
 end
 
+-- ── round-4 regressions ───────────────────────────────────────────────────────
+
+local function test_clock_rollback_cannot_revive_killed_variant()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	local record = storage.load_experiments(client.config)
+	assert_true(record.entries["exp-checkout"] ~= nil)
+
+	-- The wall clock rolls BACK before the kill resolves: the drop's
+	-- resolution stamp is older than the stored entry's, but a drop for the
+	-- entry it resolves must always win — a fenced delete would revive the
+	-- killed variant at the next launch.
+	socket.now = socket.now - 100
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-checkout")
+	record = storage.load_experiments(client.config)
+	assert_true(record == nil or record.entries["exp-checkout"] == nil,
+		"a clock rollback must not fence the kill drop off the disk")
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-checkout"),
+		"a relaunch must not revive the killed variant")
+	restore()
+end
+
+local function test_owed_clear_never_wipes_newer_state()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body({ experiment_key = "exp-a" })
+	fetch(client, "exp-a")
+	next_response_body = assignment_body({ experiment_key = "exp-b", variant_key = "beta" })
+	fetch(client, "exp-b")
+
+	-- The real-subjects sentinel arrives while the durable clear fails:
+	-- the clear is owed.
+	state.fail_save = function(path)
+		return fail_experiment_saves(path)
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-a")
+	state.fail_save = nil
+
+	-- A LATER authorized fetch installs fresh state before the owed clear
+	-- lands. The epoch-scoped clear must drop only what it still covers —
+	-- the withdrawn sibling — never the newer install.
+	next_status = 200
+	next_response_body = assignment_body({ experiment_key = "exp-a", variant_key = "fresh" })
+	fetch(client, "exp-a")
+	client:update(0.016)
+	local record = storage.load_experiments(client.config)
+	assert_true(record ~= nil and record.entries["exp-a"] ~= nil,
+		"the owed clear must not wipe newer authorized state")
+	assert_equal(record.entries["exp-a"].variant_key, "fresh")
+	assert_nil(record.entries["exp-b"],
+		"the withdrawn sibling the clear still covers must drop")
+	restore()
+end
+
+local function test_consent_purge_rearms_unpublished_exposures()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1)
+	local original_event_id = exposures[1].event_id
+
+	-- The denial purges the queued-but-unpublished exposure fact; the
+	-- session's emission must re-arm so the re-granted assignment counts.
+	assert_true(client:set_consent(false))
+	assert_equal(#queued_events(client), 0, "the purge cleared the queue")
+	assert_true(client:set_consent(true))
+	client:update(0.016)
+	exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1,
+		"the purged exposure must re-emit after a re-grant")
+	assert_equal(exposures[1].event_id, original_event_id,
+		"the re-emission derives the SAME deterministic id (published"
+		.. " duplicates collapse server-side)")
+
+	-- Still once per session: no growth on further ticks.
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+end
+
+local function test_pre_remint_response_reports_stale_subject()
+	reset()
+	local client = granted_client()
+	local held = {}
+	local grammar_reject = json.encode({
+		error = "experiment metadata must use synthetic local-safe identifiers only",
+	})
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		if url:find("experiment_key=exp%-a", 1) then
+			held[#held + 1] = callback
+			return true
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = grammar_reject })
+		else
+			callback(nil, nil, {
+				status = 200,
+				response = assignment_body({ experiment_key = "exp-b", variant_key = "beta" }),
+			})
+		end
+		return true
+	end
+	local stale = nil
+	client:fetch_experiment_assignment("exp-a", function(result)
+		stale = result
+	end)
+	assert_equal(#held, 1)
+
+	-- A grammar reject on ANOTHER experiment re-mints the subject while the
+	-- first request is still in flight.
+	local result = fetch(client, "exp-b")
+	responder = nil
+	assert_true(result.ok and result.assigned)
+
+	-- The pre-re-mint 200 lands late: the install discards it, and the
+	-- caller must receive the miss, never the discarded variant.
+	held[1](nil, nil, { status = 200, response = assignment_body({ experiment_key = "exp-a" }) })
+	assert_equal(stale.ok, false,
+		"a pre-re-mint response must not report a healthy assignment")
+	assert_equal(stale.error, "stale_subject")
+	assert_nil(stale.variant_key)
+	assert_nil(client:experiment_variant("exp-a"))
+end
+
+local function test_owed_exposures_queue_across_replacements()
+	reset()
+	local client = granted_client({ buffer_size = 1 })
+	assert_true(client:track("filler"))
+
+	-- Two applications land while the analytics queue is full: BOTH facts
+	-- are owed, in order — the second application must not cost the first
+	-- its exposure.
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	next_response_body = assignment_body({ version = 4, variant_key = "control" })
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1, "the OLDER owed exposure emits first")
+	assert_equal(exposures[1].props.experiment_version, 3)
+	assert_equal(exposures[1].props.variant_key, "treatment")
+
+	-- Draining again releases the second owed fact, in order.
+	assert_true(client:flush({ include_summaries = false }))
+	local batch = nil
+	for i = #requests, 1, -1 do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			batch = requests[i]
+			break
+		end
+	end
+	assert_true(batch ~= nil)
+	local published = json.decode(batch.body).events
+	assert_equal(published[1].props.experiment_version, 3,
+		"the published batch carries the version-3 exposure")
+	client:update(0.016)
+	exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1)
+	assert_equal(exposures[1].props.experiment_version, 4,
+		"the newer owed exposure follows once the queue drains")
+	assert_equal(exposures[1].props.variant_key, "control")
+
+	-- Nothing further is owed.
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 0)
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -2157,6 +2342,11 @@ local tests = {
 	test_drop_preserves_owed_exposure,
 	test_stale_sibling_write_does_not_clobber_fresher_record,
 	test_no_callback_install_or_persist_after_shutdown,
+	test_clock_rollback_cannot_revive_killed_variant,
+	test_owed_clear_never_wipes_newer_state,
+	test_consent_purge_rearms_unpublished_exposures,
+	test_pre_remint_response_reports_stale_subject,
+	test_owed_exposures_queue_across_replacements,
 }
 
 for _, test in ipairs(tests) do

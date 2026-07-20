@@ -998,6 +998,14 @@ function Client:set_consent(decision)
 		-- after a re-grant would summarize pre-denial activity.
 		self.perf = sampling.new_perf()
 		self.network = sampling.new_network()
+		if self.experiments then
+			-- The purge above discarded any queued-but-unpublished
+			-- experiment exposure facts: re-arm this session's emissions so
+			-- a later re-grant of a retained assignment emits its exposure
+			-- again (already-published facts collapse server-side on their
+			-- deterministic event ids) instead of under-counting treatment.
+			self.experiments:on_analytics_purge()
+		end
 	end
 	local persisted = self:persist_identity()
 	if not persisted then
