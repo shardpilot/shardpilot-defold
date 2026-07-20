@@ -8,6 +8,15 @@ ShardPilot Defold SDK v0 is configured with a Lua table:
   -- Optional: enables remote config (a SEPARATE service from the ingest
   -- endpoint; requires api_key — see "Remote config" below).
   -- remote_config_url = "https://config.shardpilot.com",
+  -- Optional: periodic remote-config revalidation, default OFF (requires
+  -- remote_config_url — see "Remote config" below).
+  -- remote_config_revalidate = true,
+  -- Optional: experiment assignment (dark today; requires api_key — the
+  -- control-plane ORIGIN plus the app/environment KEYS, see "Experiment
+  -- assignment" below).
+  -- experiments_url = "https://cp.shardpilot.com",
+  -- experiments_app_key = "app",
+  -- experiments_environment_key = "production",
   workspace_id = "workspace",
   app_id = "app",
   environment_id = "production",
@@ -121,6 +130,50 @@ the `api_key` authenticates only the remote-config fetch.
   configuration is available). Full semantics — ETag revalidation, offline
   fallback, the `401`/`403` fail-closed rule, and the cache's scope check —
   are in the README's "Remote config" section.
+- **`remote_config_revalidate`** (default `false`, boolean; requires
+  `remote_config_url`; feature-detect with
+  `supports("remote_config_revalidation")`). Opt-in periodic revalidation:
+  the `update(dt)` tick paces a conditional GET of the configuration (the
+  cached ETag as `If-None-Match`) on the server's `Cache-Control` max-age,
+  floored at 60s, 300s while unknown — so a running client converges on a
+  server-side kill or change within one interval. Unset, the SDK keeps its
+  no-automatic-refresh stance exactly. Transient failures keep the schedule;
+  the timer halts after an authoritative `401`/`403` until a new client is
+  constructed, while explicit `fetch_remote_config` calls stay available and
+  classify per fetch. Full semantics in the README's "Opt-in periodic
+  revalidation" subsection.
+
+## Experiment assignment
+
+Dark today: the platform's assignment flags are off in every environment, so
+every fetch answers `403` until enablement — the SDK handles that as a clean
+per-fetch fail-closed outcome (see the README's "Experiment assignment"
+section for the full wire contract and semantics).
+
+- **`experiments_url`** (default `nil` = disabled, string). The control-plane
+  **origin** (same URL shape rules; no path) — the SDK appends
+  `/api/cp/v1/runtime/experiments/assignment`. When set, the client mints and
+  persists the `spcid_…` subject id and exposes
+  `fetch_experiment_assignment(experiment_key, callback)`,
+  `experiment_assignment(experiment_key)`, `get_spcid()`, and the
+  `track_experiment_exposure` / `track_experiment_outcome` producers.
+  Requires the publishable `api_key` (in Mode B configure both credentials:
+  the minted token keeps the ingest Bearer, the api_key authenticates only
+  the config-plane fetches). NOTE: today a stock publishable key answers
+  `401 invalid runtime token` — the key gains the assignment-read scope with
+  the control-plane auth leg; until then integration tests need an
+  explicitly-scoped token.
+- **`experiments_app_key`** / **`experiments_environment_key`** (required
+  with `experiments_url`, non-empty strings). The control-plane app and
+  environment **keys** the endpoint routes and authorizes by — keys, never
+  ids; a mismatched key surfaces as `401`, not `404`.
+- **`spcid`** (optional, string). A pre-provisioned subject id override,
+  accepted only when it matches `^spcid_[A-Za-z0-9_-]{20,64}$`; an invalid
+  value falls through to the stored or freshly minted id, exactly like an
+  invalid config `anonymous_id`. Precedence: config → stored → minted
+  (`spcid_` + UUIDv7, only when the surface is configured). The spcid is a
+  dedicated id: never derived from the anonymous id, never replacing it, and
+  there is no runtime setter.
 
 ## Schema-revision declaration
 

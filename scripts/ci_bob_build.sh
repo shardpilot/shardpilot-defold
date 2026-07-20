@@ -123,6 +123,7 @@ for built in \
   build/default/shardpilot/sdk.luac \
   build/default/shardpilot/crash.luac \
   build/default/shardpilot/remote_config.luac \
+  build/default/shardpilot/experiments.luac \
   build/default/game.arcd; do
   test -f "test/bob-harness/${built}" || {
     echo "expected build output missing: test/bob-harness/${built}" >&2

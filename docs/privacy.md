@@ -103,12 +103,13 @@ persisted opt-out record cannot be **read** (a storage error — as opposed to
 cleanly absent on a fresh install), the crash client **fails closed** and
 sends nothing until an explicit `set_enabled` decision is persisted again.
 
-- Durable storage is limited to six small, bounded records, all written
+- Durable storage is limited to seven small, bounded records, all written
   through Defold `sys.save`: the identity record described above, a bounded
   crash-retry sidecar, the crash-reporting settings record (both described
   below), the bounded offline event spool, the bounded consent-receipt
-  outbox (both described below), and the remote-config cache (described
-  below). No cookies and no other browser or tracking storage.
+  outbox (both described below), the remote-config cache, and the
+  experiment-assignment cache (both described below). No cookies and no
+  other browser or tracking storage.
 - All persistence goes through Defold `sys.save` only; on HTML5 builds Defold
   backs `sys.save` with browser storage, still limited to those records.
 
@@ -296,3 +297,36 @@ unsanitized stack/backtrace payloads.
 
 Use HTTPS for non-local production-like URLs. Public production readiness is not
 claimed by this source SDK wave.
+
+## Experiment assignment (spcid, cache, facts)
+
+When the experiment surface is enabled (`experiments_url`; dark today — the
+platform flags are off everywhere):
+
+- **The experiment subject id (`spcid_…`)** is a dedicated pseudonymous
+  installation id minted by the SDK (`spcid_` + UUIDv7) and persisted in the
+  same per-app identity record as the anonymous id. It is **never derived
+  from the anonymous id** and never replaces it; it is not an email, device
+  id, or advertising id. It leaves the device ONLY as the assignment fetch's
+  `subject_key` query parameter — **it never rides analytics events**:
+  `client_id`-unit facts carry the server-derived `subject_fact_key`
+  (`sfk1_` + SHA-256 hex) instead, and the raw spcid never appears in event
+  props. Without the opt-in, no spcid is ever minted and the identity record
+  is unchanged.
+- **The assignment fetch is not consent-gated**, exactly like the
+  remote-config fetch: it is config-plane delivery carrying no analytics
+  payload (the spcid in the query only scopes which decision to serve).
+  ADR-0259 is silent on assignment-fetch consent, so remote-config parity is
+  the implemented default — flagged for the privacy review (CBI-056).
+- **The exposure/outcome facts are analytics telemetry** and ride the exact
+  consent-first pipeline above — unknown ⇒ **dropped**, denied ⇒ **dropped**,
+  only an explicit grant opens them — through the same queue and
+  `/v1/events:batch` pipe; **no new network path** exists for them. Their
+  envelope always carries `anonymous_id` (required server-side: the GDPR
+  erasure cascade reaches the fact through it) and **never** `user_id`.
+- **The assignment cache** is a bounded per-app durable record set
+  (scope-stamped like the remote-config cache) storing served assignment
+  bodies only — never tokens. A `401`/`403` fetch outcome is never served
+  from it, and the exact flag-off sentinel (`403` body
+  `experiment real-subject assignment is disabled`) drops the affected
+  scope's record and its `subject_fact_key` durably.

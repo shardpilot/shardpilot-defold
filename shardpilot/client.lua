@@ -1,5 +1,6 @@
 local envelope = require "shardpilot.envelope"
 local clock = require "shardpilot.clock"
+local experiments_mod = require "shardpilot.experiments"
 local id = require "shardpilot.id"
 local platform = require "shardpilot.platform"
 local queue = require "shardpilot.queue"
@@ -257,6 +258,36 @@ local function validate_config(config)
 		return nil, "invalid_remote_config_url"
 	end
 	local has_remote_config = config.remote_config_url ~= nil
+	-- Optional experiment assignment (GAP-017): `experiments_url` is the
+	-- CONTROL-PLANE base URL (an origin, no path — the SDK appends the
+	-- public-prefix route /api/cp/v1/runtime/experiments/assignment), and it
+	-- requires the app/environment KEYS the assignment endpoint routes and
+	-- authorizes by (keys, never ids — a wrong key surfaces as 401
+	-- server-side). Omit `experiments_url` to keep the whole surface off:
+	-- nothing is minted, nothing is fetched, no producer works.
+	if config.experiments_url ~= nil and not valid_ingest_url(config.experiments_url) then
+		return nil, "invalid_experiments_url"
+	end
+	local has_experiments = config.experiments_url ~= nil
+	if has_experiments then
+		if type(config.experiments_app_key) ~= "string" or config.experiments_app_key == "" then
+			return nil, "experiments_app_key_required"
+		end
+		if type(config.experiments_environment_key) ~= "string" or config.experiments_environment_key == "" then
+			return nil, "experiments_environment_key_required"
+		end
+	end
+	-- Optional periodic remote-config revalidation (kill-switch reach,
+	-- ADR-0259 gate 2(a)): a boolean opt-in, DEFAULT OFF — unset, the SDK
+	-- keeps its no-automatic-refresh stance byte-for-byte. It only paces
+	-- conditional GETs of the already-configured remote-config endpoint, so
+	-- it requires remote_config_url.
+	if config.remote_config_revalidate ~= nil and type(config.remote_config_revalidate) ~= "boolean" then
+		return nil, "invalid_remote_config_revalidate"
+	end
+	if config.remote_config_revalidate == true and not has_remote_config then
+		return nil, "remote_config_revalidate_requires_url"
+	end
 	-- Dual-mode auth. EITHER a Mode B async `token_provider` (a
 	-- per-tenant ingest JWT minted by the host) OR a Mode A `api_key` (the
 	-- non-secret publishable `sp_ingest_...` key, safe to embed client-side)
@@ -264,15 +295,15 @@ local function validate_config(config)
 	-- `token_provider` yields the ingest Bearer (Mode B); otherwise the
 	-- `api_key` is the ingest Bearer (Mode A).
 	--
-	-- Remote config is the one exception to "configure exactly one". The
-	-- remote-config endpoint authenticates with the publishable api_key
-	-- only — a Mode B ingest token is scoped to event ingest and the
-	-- remote-config endpoint rejects it. So with remote_config_url set, an
-	-- api_key is required even in Mode B, and configuring both credentials
-	-- becomes valid: the token_provider keeps the ingest Bearer, the
-	-- api_key authenticates only the remote-config fetch. Without remote
-	-- config, configuring both stays rejected so the ingest auth source is
-	-- never ambiguous.
+	-- Remote config and experiment assignment are the exceptions to
+	-- "configure exactly one". Both endpoints authenticate with the
+	-- publishable api_key only — a Mode B ingest token is scoped to event
+	-- ingest and both endpoints reject it. So with remote_config_url or
+	-- experiments_url set, an api_key is required even in Mode B, and
+	-- configuring both credentials becomes valid: the token_provider keeps
+	-- the ingest Bearer, the api_key authenticates only the config-plane
+	-- fetches. Without either surface, configuring both stays rejected so
+	-- the ingest auth source is never ambiguous.
 	if config.token_provider ~= nil and type(config.token_provider) ~= "function" then
 		return nil, "invalid_token_provider"
 	end
@@ -281,7 +312,7 @@ local function validate_config(config)
 	end
 	local has_token_provider = type(config.token_provider) == "function"
 	local has_api_key = type(config.api_key) == "string" and config.api_key ~= ""
-	if has_token_provider and has_api_key and not has_remote_config then
+	if has_token_provider and has_api_key and not has_remote_config and not has_experiments then
 		return nil, "auth_mode_conflict"
 	end
 	if not has_token_provider and not has_api_key then
@@ -289,6 +320,9 @@ local function validate_config(config)
 	end
 	if has_remote_config and not has_api_key then
 		return nil, "remote_config_api_key_required"
+	end
+	if has_experiments and not has_api_key then
+		return nil, "experiments_api_key_required"
 	end
 	local source = config.source or "client"
 	if source ~= "client" and source ~= "server" and source ~= "backend" then
@@ -361,6 +395,10 @@ local function validate_config(config)
 	local out = {
 		ingest_url = trim_slash(config.ingest_url),
 		remote_config_url = has_remote_config and trim_slash(config.remote_config_url) or nil,
+		remote_config_revalidate = config.remote_config_revalidate == true,
+		experiments_url = has_experiments and trim_slash(config.experiments_url) or nil,
+		experiments_app_key = has_experiments and config.experiments_app_key or nil,
+		experiments_environment_key = has_experiments and config.experiments_environment_key or nil,
 		workspace_id = config.workspace_id,
 		app_id = config.app_id,
 		environment_id = config.environment_id,
@@ -402,6 +440,25 @@ function M.new(config)
 	else
 		anonymous_id = id.uuid_v7()
 	end
+	-- Dedicated experiment subject id (GAP-017): a persisted `spcid_...`
+	-- installation id (`^spcid_[A-Za-z0-9_-]{20,64}$`), SEPARATE from the
+	-- anonymous id — never derived from it, never replacing it; the
+	-- anonymous id keeps its value and format untouched, and stays the
+	-- remote-config client id. Precedence mirrors the anonymous id (config →
+	-- stored → mint), a grammar-invalid value falling through exactly like
+	-- an invalid config anonymous_id. A stored spcid is always adopted — so
+	-- a later launch WITHOUT the experiments opt-in can never lose it
+	-- through an identity-record rewrite — but a fresh one is minted only
+	-- when the experiments surface is configured: an un-opted install keeps
+	-- today's identity record byte-identical.
+	local spcid = nil
+	if experiments_mod.valid_spcid(config.spcid) then
+		spcid = config.spcid
+	elseif experiments_mod.valid_spcid(stored.spcid) then
+		spcid = stored.spcid
+	elseif normalized.experiments_url then
+		spcid = "spcid_" .. id.uuid_v7()
+	end
 	local consent_state = "unknown"
 	if stored.consent_analytics == "granted" or consent_denied_state(stored.consent_analytics) then
 		consent_state = stored.consent_analytics
@@ -441,6 +498,23 @@ function M.new(config)
 		publish_backoff_attempt = 0,
 		user_id = valid_identity(config.user_id) and config.user_id or nil,
 		anonymous_id = anonymous_id,
+		spcid = spcid,
+		-- Client-side exposure de-duplication (the server does not
+		-- de-duplicate): one DELIVERED experiment_exposure per assignment
+		-- IDENTITY — experiment, version, and fact subject (see
+		-- exposure_dedupe_key) — per client lifetime (per launch, in
+		-- practice). Keys commit on enqueue and re-arm when a consent
+		-- revocation purges the still-undelivered event (see
+		-- rearm_purged_exposures).
+		exposure_tracked = {},
+		-- The opt-in remote-config revalidation timer's dt accumulator
+		-- (update-driven, like the flush pacing) and the completed-fetch
+		-- count it last re-armed against: the accumulator measures time
+		-- since the LATEST completed remote-config fetch on any lane, so a
+		-- freshly observed (e.g. server-shortened) max-age governs the next
+		-- tick instead of a stale previously-armed deadline firing first.
+		rc_revalidate_elapsed = 0,
+		rc_revalidate_completed = 0,
 		consent_state = consent_state,
 		-- Durable consent-receipt outbox (mirror of the persisted record,
 		-- oldest receipt first). Receipts are delivered serially, strictly in
@@ -474,7 +548,7 @@ function M.new(config)
 		flush_elapsed_seconds = 0,
 		initialized = true,
 	}, Client)
-	if stored.anonymous_id ~= anonymous_id then
+	if stored.anonymous_id ~= anonymous_id or stored.spcid ~= spcid then
 		client:persist_identity()
 	end
 	-- Remote config rides the client's identity: the persisted anonymous id
@@ -486,6 +560,16 @@ function M.new(config)
 	if normalized.remote_config_url then
 		client.remote_config = remote_config_mod.new(normalized, function()
 			return client.anonymous_id
+		end)
+	end
+	-- Experiment assignment (GAP-017) rides the DEDICATED spcid subject —
+	-- never the anonymous id — read through an accessor at fetch time like
+	-- the remote-config identity closure. Constructed after the spcid is
+	-- resolved so cached assignments for this exact scope are served by the
+	-- getters and the producers immediately, before (and without) any fetch.
+	if normalized.experiments_url then
+		client.experiments = experiments_mod.new(normalized, function()
+			return client.spcid
 		end)
 	end
 	-- Offline event spool: re-load the envelopes a previous launch could not
@@ -637,6 +721,13 @@ end
 
 function Client:persist_identity()
 	local record = { anonymous_id = self.anonymous_id }
+	if self.spcid then
+		-- The experiment subject id shares the identity record. It is
+		-- carried on EVERY rewrite once provisioned (a stored spcid is
+		-- always adopted at init, opt-in or not), so no later
+		-- persist_identity can drop it and silently re-bucket the subject.
+		record.spcid = self.spcid
+	end
 	if self.consent_state == "granted" or consent_denied_state(self.consent_state) then
 		record.consent_analytics = self.consent_state
 	end
@@ -704,6 +795,14 @@ end
 -- it returns here — but it does not itself verify the bind.
 function Client:get_anonymous_id()
 	return self.anonymous_id
+end
+
+-- The persisted experiment subject id (`spcid_...`), or nil while none has
+-- been provisioned (the experiments surface never configured on this
+-- install). Read-only: there is deliberately no setter — the subject is a
+-- stable installation id, and rotating it would re-bucket every assignment.
+function Client:get_spcid()
+	return self.spcid
 end
 
 -- ── remote config ─────────────────────────────────────────────────────────────
@@ -784,6 +883,89 @@ function Client:remote_config_version()
 	return self.remote_config:get_version()
 end
 
+-- ── experiment assignment (GAP-017) ───────────────────────────────────────────
+--
+-- Thin delegates over the assignment client (shardpilot/experiments.lua),
+-- present only when `experiments_url` is configured. Every fetch here is an
+-- explicit host-triggered call — the SDK schedules no automatic assignment
+-- fetch — and, like the remote-config fetch, it is deliberately NOT
+-- consent-gated: an assignment is config-plane delivery carrying no
+-- analytics payload (the spcid in the query only scopes which decision to
+-- serve; the ADR is silent on assignment-fetch consent, so remote-config
+-- parity is the implemented default, flagged for the privacy review). The
+-- exposure/outcome FACTS are consent-gated — see the producers below.
+
+function Client:fetch_experiment_assignment(experiment_key, callback)
+	-- The callback is game code; never let it break the SDK.
+	if not self.initialized then
+		-- Like every other network-producing call on a torn-down client.
+		if type(callback) == "function" then
+			pcall(callback, { ok = false, from_cache = false, error = "shutdown" })
+		end
+		return false, "shutdown"
+	end
+	if not self.experiments then
+		if type(callback) == "function" then
+			pcall(callback, {
+				ok = false,
+				from_cache = false,
+				error = "experiments_not_configured",
+			})
+		end
+		return false, "experiments_not_configured"
+	end
+	return self.experiments:fetch(experiment_key, callback)
+end
+
+-- A copy of the last served assignment snapshot for this experiment, or nil
+-- when none has been served (or experiments are not configured). Never
+-- touches the network, never throws.
+function Client:experiment_assignment(experiment_key)
+	if not self.experiments then
+		return nil
+	end
+	return self.experiments:get_assignment(experiment_key)
+end
+
+-- The exposure dedupe key: the FULL assignment identity — experiment key,
+-- version, and fact subject — joined with a separator none of them carries.
+-- Keying on the fact subject alone could suppress a different assignment's
+-- exposure whose subject coincides: the client_id-unit subject_fact_key
+-- derives from the experiment salt and the subject only, so it is stable
+-- across versions of one experiment (a re-fetched bumped version is a NEW
+-- assignment that must emit its own exposure) and identical across any two
+-- experiments that happen to share a salt.
+local function exposure_dedupe_key(experiment_key, version, subject)
+	return tostring(experiment_key) .. "\31" .. tostring(version) .. "\31" .. tostring(subject)
+end
+
+-- Re-arm the per-launch exposure de-duplication for exposure facts a consent
+-- revocation purged BEFORE delivery: the dedupe key is committed at enqueue,
+-- but a purged fact never left the device — leaving the key burned would
+-- make the exposure permanently unreportable this launch (duplicate_exposure
+-- after a later re-grant, with nothing ever sent). Only consent purges
+-- re-arm; a DELIVERED exposure stays deduped for the launch (re-arming it
+-- would double-count the fact). Works on queued events and on retained
+-- batch/spool envelope shapes alike (both carry event_name + props); keys
+-- from another launch's spooled envelopes are absent from this launch's map,
+-- so re-arming them is a no-op.
+local function rearm_purged_exposures(self, events)
+	if type(events) ~= "table" then
+		return
+	end
+	for i = 1, #events do
+		local event = events[i]
+		if type(event) == "table" and event.event_name == "experiment_exposure"
+			and type(event.props) == "table"
+			and event.props.assignment_key ~= nil then
+			self.exposure_tracked[exposure_dedupe_key(
+				event.props.experiment_key,
+				event.props.experiment_version,
+				event.props.assignment_key)] = nil
+		end
+	end
+end
+
 function Client:set_consent(decision)
 	if not self.initialized then
 		return false, "shutdown"
@@ -820,10 +1002,14 @@ function Client:set_consent(decision)
 	if not granted then
 		local cleared = queue.size(self.queue)
 		if cleared > 0 then
-			queue.drain(self.queue, cleared)
+			-- The purged events never left the device: re-arm any exposure
+			-- dedupe keys they carried, so a later re-grant can report the
+			-- exposure (see rearm_purged_exposures).
+			rearm_purged_exposures(self, queue.drain(self.queue, cleared))
 		end
 		if self.in_flight_batch and not self.publish_in_flight then
 			cleared = cleared + #self.in_flight_batch
+			rearm_purged_exposures(self, self.in_flight_batch)
 			self.in_flight_batch = nil
 		end
 		if #self.spool_batches > 0 then
@@ -962,15 +1148,15 @@ function Client:tutorial_complete(tutorial_id)
 	return self:track("tutorial_complete", { tutorial_id = tutorial_id })
 end
 
-function Client:track(event_name, props, context)
-	if not self.initialized then
-		self.stats.dropped = self.stats.dropped + 1
-		return false, "shutdown"
-	end
-	if type(event_name) ~= "string" or event_name == "" then
-		self.stats.dropped = self.stats.dropped + 1
-		return false, "event_name_required"
-	end
+-- The consent-gated enqueue every analytics event funnels through — the body
+-- of track() from its consent gate down, shared with the experiment fact
+-- producers below so their events ride the exact same consent-first
+-- semantics (unknown ⇒ dropped, denied ⇒ dropped; never held, never spooled
+-- pre-consent, no other network path) and the same queue/batch pipe.
+-- `omit_user_id` builds the event without a user_id snapshot: experiment
+-- facts must never carry one — the ingest service rejects it, and erasure
+-- reachability is anchored on anonymous_id instead.
+local function enqueue_gated_event(self, event_name, props, context, omit_user_id)
 	if consent_denied_state(self.consent_state) then
 		self.stats.dropped = self.stats.dropped + 1
 		return false, "consent_denied"
@@ -1011,11 +1197,15 @@ function Client:track(event_name, props, context)
 		self.session_active = true
 		opened_lazy_session = true
 	end
+	local user_id = nil
+	if not omit_user_id then
+		user_id = self.user_id
+	end
 	local event = {
 		event_id = id.uuid(),
 		event_name = event_name,
 		event_ts = clock.iso_utc(),
-		user_id = self.user_id,
+		user_id = user_id,
 		anonymous_id = self.anonymous_id,
 		session_id = self.session_id,
 		session_sequence = self.session_sequence + 1,
@@ -1041,6 +1231,140 @@ function Client:track(event_name, props, context)
 	return true
 end
 
+function Client:track(event_name, props, context)
+	if not self.initialized then
+		self.stats.dropped = self.stats.dropped + 1
+		return false, "shutdown"
+	end
+	if type(event_name) ~= "string" or event_name == "" then
+		self.stats.dropped = self.stats.dropped + 1
+		return false, "event_name_required"
+	end
+	return enqueue_gated_event(self, event_name, props, context, false)
+end
+
+-- ── experiment fact producers (GAP-017) ───────────────────────────────────────
+--
+-- experiment_exposure / experiment_outcome facts for a served ASSIGNED
+-- decision, entering the pipeline through the SAME consent-gated enqueue as
+-- every tracked event (consent unknown ⇒ dropped, denied ⇒ dropped; no new
+-- unconsented path) and riding the existing events:batch pipe. Props are the
+-- server's STRICT allowlist and nothing else; values come verbatim from the
+-- cached assignment snapshot. For client_id-unit assignments the fact
+-- subject (`assignment_key` prop) is the derived `subject_fact_key`
+-- (`sfk1_...`) — the raw spcid NEVER rides event props — and the envelope
+-- always carries anonymous_id (erasure reachability) and never user_id.
+-- Server-side, client-tier admission for these two event names is
+-- decision-gated and CLOSED today: built dark, the producers work end to
+-- end locally and the facts are rejected at ingest until the platform
+-- decision + flags open the lane.
+
+-- Resolve the assignment snapshot a fact may be produced from: experiments
+-- configured, a served snapshot for this experiment, an affirmative
+-- `assigned = true` (facts are NEVER emitted for a not-assigned decision),
+-- and a usable anonymous identity for the envelope.
+local function fact_snapshot(self, experiment_key)
+	if not self.initialized then
+		return nil, "shutdown"
+	end
+	if not self.experiments then
+		return nil, "experiments_not_configured"
+	end
+	local snapshot = self.experiments:assignment_snapshot(experiment_key)
+	if not snapshot then
+		return nil, "assignment_unavailable"
+	end
+	if snapshot.assigned ~= true then
+		return nil, "not_assigned"
+	end
+	if not valid_identity(self.anonymous_id) then
+		return nil, "identity_required"
+	end
+	return snapshot
+end
+
+-- The strict prop allowlist, and nothing else. client_id unit: the subject
+-- is the sfk (grammar-checked once more here — defense in depth against a
+-- foreign cache record); synthetic unit: the assignment_key from the
+-- response.
+local function fact_props(snapshot)
+	local subject = snapshot.assignment_key
+	if snapshot.assignment_unit == "client_id" then
+		subject = snapshot.subject_fact_key
+		if not experiments_mod.valid_subject_fact_key(subject) then
+			return nil, "subject_fact_key_unavailable"
+		end
+	end
+	return {
+		experiment_key = snapshot.experiment_key,
+		experiment_version = snapshot.version,
+		assignment_key = subject,
+		variant_key = snapshot.variant_key,
+		assignment_unit = snapshot.assignment_unit,
+	}
+end
+
+-- Emit ONE experiment_exposure when the game first acts on this assignment.
+-- De-duplicated client-side per assignment identity (experiment, version,
+-- fact subject — see exposure_dedupe_key) per launch; the server does not
+-- de-duplicate. A repeat call reports `duplicate_exposure`. The dedupe
+-- commits only on a successful enqueue, so an exposure dropped by the
+-- consent gate is NOT burned — it emits normally after a later grant.
+function Client:track_experiment_exposure(experiment_key)
+	local snapshot, err = fact_snapshot(self, experiment_key)
+	if not snapshot then
+		return false, err
+	end
+	local props, props_err = fact_props(snapshot)
+	if not props then
+		return false, props_err
+	end
+	-- The check-then-mark pair below cannot race: Defold runs all script
+	-- code — game calls and http callbacks alike — on one Lua VM thread, and
+	-- nothing between the check, the synchronous enqueue, and the mark
+	-- yields, so two exposure calls can never interleave here.
+	local dedupe_key = exposure_dedupe_key(
+		snapshot.experiment_key, snapshot.version, props.assignment_key)
+	if self.exposure_tracked[dedupe_key] then
+		return false, "duplicate_exposure"
+	end
+	local ok, enqueue_err = enqueue_gated_event(self, "experiment_exposure", props, nil, true)
+	if ok then
+		self.exposure_tracked[dedupe_key] = true
+	end
+	return ok, enqueue_err
+end
+
+-- Emit an experiment_outcome for a measured outcome of this assignment.
+-- `outcome_value` must be a finite number or a boolean (the server rejects
+-- anything else); outcomes are deliberately not de-duplicated — a metric can
+-- legitimately land more than once.
+function Client:track_experiment_outcome(experiment_key, outcome_key, outcome_value)
+	local snapshot, err = fact_snapshot(self, experiment_key)
+	if not snapshot then
+		return false, err
+	end
+	if type(outcome_key) ~= "string" or outcome_key == "" then
+		return false, "outcome_key_required"
+	end
+	local value_type = type(outcome_value)
+	if value_type == "number" then
+		if outcome_value ~= outcome_value
+			or outcome_value == math.huge or outcome_value == -math.huge then
+			return false, "invalid_outcome_value"
+		end
+	elseif value_type ~= "boolean" then
+		return false, "invalid_outcome_value"
+	end
+	local props, props_err = fact_props(snapshot)
+	if not props then
+		return false, props_err
+	end
+	props.outcome_key = outcome_key
+	props.outcome_value = outcome_value
+	return enqueue_gated_event(self, "experiment_outcome", props, nil, true)
+end
+
 function Client:update(dt)
 	if not self.initialized then
 		return
@@ -1057,6 +1381,50 @@ function Client:update(dt)
 		self.flush_elapsed_seconds = 0
 		self:flush({ include_summaries = false })
 	end
+	self:update_remote_config_revalidation(dt)
+end
+
+-- The opt-in periodic remote-config revalidation tick (default OFF — config
+-- `remote_config_revalidate`; without it this returns before touching any
+-- state, preserving the no-automatic-refresh stance byte-for-byte). When
+-- armed, every elapsed interval issues ONE conditional GET through the
+-- normal fetch path — the cached ETag rides as If-None-Match, so an
+-- unchanged configuration answers 304 and a kill/config change converges
+-- within one interval for a running client. The interval is
+-- max(server Cache-Control max-age, 60s), 300s while unknown [interval
+-- anchoring pends coordinator ratification]. A transient failure keeps the
+-- schedule (the durable cache serves; no extra retry inside an interval),
+-- and the timer HALTS after any authoritative 401/403 on this plane until a
+-- new client is constructed [halt mirroring pends ratification] — manual
+-- fetch_remote_config calls stay available and classify per fetch
+-- throughout. No 429 cooldown is consulted: this SDK's remote-config lane
+-- has none, and adding one is out of scope for this wave.
+function Client:update_remote_config_revalidation(dt)
+	if not self.config.remote_config_revalidate or not self.remote_config then
+		return
+	end
+	if self.remote_config.auth_refused then
+		return
+	end
+	if type(dt) ~= "number" or dt <= 0 then
+		return
+	end
+	-- Re-arm from the latest COMPLETED fetch (any lane): that fetch just
+	-- revalidated the configuration — and may have observed a NEW max-age —
+	-- so the next revalidation is due one CURRENT interval after it. A
+	-- server-shortened max-age thereby takes effect at the next tick
+	-- instead of a stale longer deadline firing first, and a host fetch is
+	-- never followed by a near-immediate redundant timer fetch.
+	if self.remote_config.fetches_completed ~= self.rc_revalidate_completed then
+		self.rc_revalidate_completed = self.remote_config.fetches_completed
+		self.rc_revalidate_elapsed = 0
+	end
+	self.rc_revalidate_elapsed = self.rc_revalidate_elapsed + dt
+	if self.rc_revalidate_elapsed < self.remote_config:revalidate_interval_seconds() then
+		return
+	end
+	self.rc_revalidate_elapsed = 0
+	self.remote_config:fetch(nil)
 end
 
 function Client:observe_ping_ms(ms)
@@ -2010,6 +2378,13 @@ function Client:start_publish_batch()
 		if not retain and self.in_flight_batch == events then
 			self.stats.dropped = self.stats.dropped + batch_count
 			self.in_flight_batch = nil
+			-- A batch dropped because consent was revoked while it was in
+			-- flight is a consent purge like the set_consent one: its
+			-- undelivered exposures re-arm (a terminal rejection under an
+			-- unchanged grant does not — that dedupe stands for the launch).
+			if consent_denied_state(self.consent_state) then
+				rearm_purged_exposures(self, events)
+			end
 			-- A terminally rejected batch also leaves the spool, or it would
 			-- be re-sent (and re-rejected) on every later launch. Surfaced via
 			-- diagnostics so the drop of durable entries is observable.
