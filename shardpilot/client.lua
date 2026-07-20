@@ -2336,6 +2336,13 @@ function Client:shutdown(reason)
 			return false, "consent_pending"
 		end
 	end
+	if self.experiments then
+		-- Stop the experiments consumer WITH the successful teardown (a
+		-- failed shutdown keeps the client — and the consumer — alive for
+		-- a host retry): an assignment response still in flight must not
+		-- install, persist, or call back into game code from now on.
+		self.experiments:teardown()
+	end
 	self.initialized = false
 	return true
 end

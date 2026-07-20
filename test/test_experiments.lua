@@ -260,9 +260,11 @@ end
 
 -- A fake sys persistence layer (mirrors shardpilot/storage.lua's contract) so
 -- restart-shaped tests exercise the real durable path, not just the memory
--- fallback. Returns (restore, stores).
+-- fallback. Returns (restore, stores, state); `state.fail_save(path, record)`
+-- may be set to make selected writes fail (durability-failure tests).
 local function install_fake_sys_storage()
 	local stores = {}
+	local state = {}
 	local saved_get = sys.get_save_file
 	local saved_save = sys.save
 	local saved_load = sys.load
@@ -270,6 +272,9 @@ local function install_fake_sys_storage()
 		return application_id .. "/" .. file_name
 	end
 	sys.save = function(path, record)
+		if state.fail_save and state.fail_save(path, record) then
+			return false
+		end
 		stores[path] = record
 		return true
 	end
@@ -280,7 +285,14 @@ local function install_fake_sys_storage()
 		sys.get_save_file = saved_get
 		sys.save = saved_save
 		sys.load = saved_load
-	end, stores
+	end, stores, state
+end
+
+-- A predicate for state.fail_save that fails only the experiments-cache
+-- writes (the identity record keeps persisting, so sibling clients share
+-- one subject id).
+local function fail_experiment_saves(path)
+	return path:sub(-#"/experiments") == "/experiments"
 end
 
 -- Token-shaped fixture values are built from obviously synthetic constant
@@ -1917,6 +1929,176 @@ local function test_prelatch_response_fails_closed_to_caller()
 	assert_nil(client:experiment_variant("exp-a"))
 end
 
+-- ── round-3 regressions ───────────────────────────────────────────────────────
+
+local function test_failed_refresh_write_never_leaves_superseded_variant()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	local record = storage.load_experiments(client.config)
+	assert_equal(record.entries["exp-checkout"].variant_key, "treatment")
+
+	-- The refresh write fails (only when the record carries the refreshed
+	-- variant — the size-limited shape): the superseded stored entry must
+	-- be tombstoned, never left as reload truth.
+	state.fail_save = function(path, saved)
+		if not fail_experiment_saves(path) then
+			return false
+		end
+		local entry = saved.entries and saved.entries["exp-checkout"]
+		return entry ~= nil and entry.variant_key == "control"
+	end
+	advance_seconds(2)
+	next_response_body = assignment_body({ version = 4, variant_key = "control" })
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "control",
+		"memory serves the refreshed variant")
+	record = storage.load_experiments(client.config)
+	assert_true(record == nil or record.entries["exp-checkout"] == nil,
+		"a failed refresh write must tombstone the superseded stored entry")
+
+	-- The owed write converges once storage recovers.
+	state.fail_save = nil
+	client:update(0.016)
+	record = storage.load_experiments(client.config)
+	assert_equal(record.entries["exp-checkout"].variant_key, "control",
+		"the owed refresh write must land at the next tick")
+	local relaunch = assert(sdk.new(config()))
+	assert_equal(relaunch:experiment_variant("exp-checkout"), "control")
+	restore()
+end
+
+local function test_failed_kill_drop_retried_until_durable()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- The kill lands in memory but every durable write fails: the drop is
+	-- OWED and retried, and once storage recovers the revoked assignment
+	-- leaves the disk — a relaunch must not serve it.
+	state.fail_save = function(path)
+		return fail_experiment_saves(path)
+	end
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-checkout")
+	assert_nil(client:experiment_variant("exp-checkout"))
+	local record = storage.load_experiments(client.config)
+	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
+		"the failed drop leaves the entry on disk for the moment")
+
+	state.fail_save = nil
+	client:update(0.016)
+	record = storage.load_experiments(client.config)
+	assert_true(record == nil or record.entries["exp-checkout"] == nil,
+		"the owed kill drop must land at the next tick")
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-checkout"),
+		"a relaunch must not revive the killed assignment")
+	restore()
+end
+
+local function test_drop_preserves_owed_exposure()
+	reset()
+	local client = granted_client({ buffer_size = 1 })
+	assert_true(client:track("filler"))
+
+	-- The assignment applies while the queue is full: the exposure fact is
+	-- OWED. A kill then stops serving — but the application already
+	-- happened, and its fact must still be emitted.
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0,
+		"the full queue kept the exposure owed")
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-checkout")
+	assert_nil(client:experiment_variant("exp-checkout"),
+		"the kill stops serving")
+
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1,
+		"the owed exposure for the pre-kill application must still emit")
+	assert_equal(exposures[1].props.variant_key, "treatment")
+	assert_equal(exposures[1].props.experiment_version, 3)
+
+	-- Once, and no revival of serving.
+	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	assert_nil(client:experiment_variant("exp-checkout"))
+end
+
+local function test_stale_sibling_write_does_not_clobber_fresher_record()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local first = granted_client()
+	-- The first client's cache write fails (identity still persists, so a
+	-- sibling shares the same subject id) and stays OWED with an old stamp.
+	state.fail_save = function(path)
+		return fail_experiment_saves(path)
+	end
+	next_response_body = assignment_body()
+	fetch(first, "exp-checkout")
+	state.fail_save = nil
+
+	-- A sibling client fetches FRESHER state and persists it.
+	advance_seconds(10)
+	local second = assert(sdk.new(config()))
+	next_response_body = assignment_body({ version = 4, variant_key = "beta" })
+	fetch(second, "exp-checkout")
+	local record = storage.load_experiments(second.config)
+	assert_equal(record.entries["exp-checkout"].variant_key, "beta")
+
+	-- The first client's owed retry fires — and must NOT roll the shared
+	-- record back to its older state.
+	first:update(0.016)
+	record = storage.load_experiments(first.config)
+	assert_equal(record.entries["exp-checkout"].variant_key, "beta",
+		"an older owed write must never clobber a fresher sibling record")
+	restore()
+end
+
+local function test_no_callback_install_or_persist_after_shutdown()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	local held = {}
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	local result = nil
+	client:fetch_experiment_assignment("exp-checkout", function(value)
+		result = value
+	end)
+	responder = nil
+	assert_equal(#held, 1)
+
+	next_status = 202
+	next_response_body = nil
+	assert_true(client:shutdown())
+
+	-- The response lands after teardown: nothing installs, nothing
+	-- persists, no exposure is queued, and game code is never called back.
+	held[1](nil, nil, { status = 200, response = assignment_body() })
+	assert_nil(result, "no callback may run after shutdown")
+	assert_nil(client:experiment_variant("exp-checkout"),
+		"nothing installs after shutdown")
+	local record = storage.load_experiments(client.config)
+	assert_true(record == nil or record.entries["exp-checkout"] == nil,
+		"nothing persists after shutdown")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0,
+		"no exposure is queued after shutdown")
+	restore()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -1970,6 +2152,11 @@ local tests = {
 	test_transient_serve_reflects_current_fenced_entry,
 	test_midflight_consent_revocation_fails_closed,
 	test_prelatch_response_fails_closed_to_caller,
+	test_failed_refresh_write_never_leaves_superseded_variant,
+	test_failed_kill_drop_retried_until_durable,
+	test_drop_preserves_owed_exposure,
+	test_stale_sibling_write_does_not_clobber_fresher_record,
+	test_no_callback_install_or_persist_after_shutdown,
 }
 
 for _, test in ipairs(tests) do

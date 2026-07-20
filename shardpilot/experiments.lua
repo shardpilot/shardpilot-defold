@@ -555,9 +555,21 @@ function M.new(config, deps)
 		-- In-memory serving cache: experiment_key → entry. Only assigned
 		-- entries exist here; every not-assigned outcome drops its key.
 		entries = {},
-		-- Cache-restored entries whose exposure has not been emitted this
-		-- session yet; swept on tick while consent is granted.
+		-- Applications whose exposure fact is still OWED this session:
+		-- experiment_key → the applied entry snapshot. Swept on tick while
+		-- consent is granted. The snapshot — not the serving cache — is the
+		-- emission source, so an owed fact for a variant that really ran
+		-- survives a later drop of the live entry (a kill stops future
+		-- serving, not the record of an application that already happened).
 		pending_exposure = {},
+		-- Durable-write convergence: experiment_key → as-of stamp of an
+		-- OWED write (memory changed, disk did not), retried every tick;
+		-- plus an owed whole-record clear.
+		durable_pending = {},
+		durable_clear_pending = false,
+		-- Set by teardown(): an in-flight response landing afterwards must
+		-- not install, persist, pace, or call back into game code.
+		torn_down = false,
 		-- Session-scoped exposure dedup: tuple key → { arm }.
 		exposed = {},
 		-- One marker per constructed consumer (= per SDK session): part of
@@ -598,11 +610,19 @@ function M.new(config, deps)
 		if record and record.scope == ex:scope_for(subject) then
 			for key, entry in pairs(record.entries) do
 				ex.entries[key] = entry
-				ex.pending_exposure[key] = true
+				ex.pending_exposure[key] = entry
 			end
 		end
 	end
 	return ex
+end
+
+-- Stop everything: called by the client at teardown. An in-flight response
+-- landing afterwards is discarded outright — nothing installs, persists,
+-- paces, or reaches game code (the fetch docs promise no late callbacks
+-- after shutdown).
+function Experiments:teardown()
+	self.torn_down = true
 end
 
 function Experiments:diagnose(status, code)
@@ -658,8 +678,8 @@ end
 function Experiments:on_session_renewed()
 	self.session_marker = id.uuid()
 	self.exposed = {}
-	for key in pairs(self.entries) do
-		self.pending_exposure[key] = true
+	for key, entry in pairs(self.entries) do
+		self.pending_exposure[key] = entry
 	end
 end
 
@@ -684,10 +704,18 @@ end
 -- The durable record is maintained INCREMENTALLY, decoupled from the
 -- in-memory serving set: a fail-closed latch clears serving while the disk
 -- deliberately retains the record, so writing `self.entries` wholesale would
--- clobber retained sibling entries (installing one experiment post-latch
--- would erase the others) and a permanent drop landing while nothing is
--- served in memory would never reach the disk at all. Both helpers are
--- best-effort: a failed write costs offline serving only and is diagnosed.
+-- clobber retained sibling entries and a permanent drop landing while
+-- nothing is served in memory would never reach the disk at all. The
+-- in-memory state is the truth the disk CONVERGES to: a failed write marks
+-- the key OWED and every tick retries it until it lands (kill drops in
+-- particular must land durably), and a failed REFRESH write additionally
+-- tombstones the superseded stored entry best-effort — a smaller record
+-- often still saves when the refreshed one could not — so the disk never
+-- keeps serving a variant memory has already replaced. Writes carry a
+-- freshness fence for same-namespace sibling clients: a stored entry
+-- stamped FRESHER than this client's knowledge is never overwritten or
+-- deleted (stamps order same-clock writes only — the fence is a
+-- best-effort guard, not a distributed clock).
 
 -- The stored record for `scope`, or a fresh empty one (a record stamped for
 -- any other scope is dead weight and is overwritten by the next write).
@@ -699,27 +727,84 @@ function Experiments:durable_record_for(scope)
 	return { scope = scope, entries = {} }
 end
 
-function Experiments:durable_set_entry(scope, experiment_key, entry)
+-- Converge one experiment's durable entry to the in-memory truth: an entry
+-- present in memory is written, an absent one is dropped. `as_of_ms` stamps
+-- the state change (the entry's own fetch time for a write, the resolution
+-- time for a drop) and drives the sibling freshness fence. Returns true when
+-- the disk agrees with memory (written, already-agreeing, or outranked by a
+-- fresher sibling write — all settled states); false marks the key owed.
+function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms)
+	local entry = self.entries[experiment_key]
 	local record = self:durable_record_for(scope)
-	record.entries[experiment_key] = entry
-	if not storage.save_experiments(self.config, record) then
-		self:diagnose("persist_failed", "cache")
+	local stored = record.entries[experiment_key]
+	if entry then
+		if stored and type(stored.fetched_at_ms) == "number"
+			and stored.fetched_at_ms > entry.fetched_at_ms then
+			-- A same-namespace sibling persisted a FRESHER entry after this
+			-- client's state formed: never roll the shared record back.
+			self.durable_pending[experiment_key] = nil
+			return true
+		end
+		record.entries[experiment_key] = entry
+	else
+		if stored == nil then
+			self.durable_pending[experiment_key] = nil
+			return true
+		end
+		if type(stored.fetched_at_ms) == "number" and type(as_of_ms) == "number"
+			and stored.fetched_at_ms > as_of_ms then
+			-- The stored entry postdates this drop decision (a sibling
+			-- re-fetched meanwhile): the drop no longer applies to it.
+			self.durable_pending[experiment_key] = nil
+			return true
+		end
+		record.entries[experiment_key] = nil
 	end
+	if storage.save_experiments(self.config, record) then
+		self.durable_pending[experiment_key] = nil
+		return true
+	end
+	if entry and stored then
+		-- The refresh write failed with a superseded entry still stored:
+		-- tombstone it best-effort (the smaller record often fits where the
+		-- refreshed one did not), so a relaunch starts clean rather than
+		-- serving the variant memory already replaced. The owed retry below
+		-- still converges the disk to the full entry when storage recovers.
+		record.entries[experiment_key] = nil
+		storage.save_experiments(self.config, record)
+	end
+	self.durable_pending[experiment_key] = type(as_of_ms) == "number" and as_of_ms or 0
+	self:diagnose("persist_failed", "cache")
+	return false
 end
 
--- Drop one experiment's entry from the durable record. Keyed on the DISK
--- state, never on the in-memory serving set: a permanent drop (404, any
--- not-assigned shape) must reach the record even when a fail-closed latch
--- already cleared serving — otherwise the stale assignment would revive at
--- the next launch.
-function Experiments:durable_drop_entry(scope, experiment_key)
-	local record = storage.load_experiments(self.config)
-	if not record or record.scope ~= scope or record.entries[experiment_key] == nil then
+-- Retry every owed durable write (and an owed whole-record clear) so the
+-- disk converges as soon as storage recovers, instead of waiting for an
+-- unrelated write or a relaunch. Local disk housekeeping only: no network,
+-- no serving decisions, so it runs regardless of the consent state — a
+-- kill drop decided under grant must land durably even if consent flips.
+function Experiments:retry_durable_sync()
+	if self.durable_clear_pending then
+		if storage.clear_experiments(self.config) then
+			self.durable_clear_pending = false
+			self.durable_pending = {}
+		end
+	end
+	if next(self.durable_pending) == nil then
 		return
 	end
-	record.entries[experiment_key] = nil
-	if not storage.save_experiments(self.config, record) then
-		self:diagnose("persist_failed", "cache")
+	local subject = self:current_subject_id()
+	if not subject then
+		return
+	end
+	local scope = self:scope_for(subject)
+	local keys = {}
+	for key in pairs(self.durable_pending) do
+		keys[#keys + 1] = key
+	end
+	table.sort(keys)
+	for i = 1, #keys do
+		self:sync_durable_entry(scope, keys[i], self.durable_pending[keys[i]])
 	end
 end
 
@@ -733,14 +818,28 @@ local function exposure_tuple(experiment_key, entry)
 		.. "\31" .. tostring(entry.subject_key)
 end
 
--- Emit the exposure fact for a cached assignment, once per (experiment,
+-- Emit the exposure fact for an applied assignment, once per (experiment,
 -- version, subject) per session; `rearm` (track_exposure) emits again with a
--- bumped arm counter. Returns true when the fact was enqueued or the tuple
--- was already exposed this session; (false, code) when nothing was enqueued.
+-- bumped arm counter. The auto path emits from the OWED APPLICATION
+-- SNAPSHOT when the live entry is gone — an application that really
+-- happened is a fact even after a later kill/not-assigned drop stops
+-- serving — while the explicit re-arm targets the live assignment only.
+-- Returns true when the fact was enqueued or the tuple was already exposed
+-- this session; (false, code) when nothing was enqueued.
 function Experiments:try_expose(experiment_key, rearm)
 	local entry = self.entries[experiment_key]
-	if not entry then
-		return false, "no_assignment"
+	if rearm then
+		if not entry then
+			return false, "no_assignment"
+		end
+	elseif not entry then
+		local pending = self.pending_exposure[experiment_key]
+		if type(pending) == "table" then
+			entry = pending
+		else
+			self.pending_exposure[experiment_key] = nil
+			return false, "no_assignment"
+		end
 	end
 	local refusal = consent_refusal(self.deps.consent())
 	if refusal then
@@ -798,7 +897,7 @@ end
 -- assignments), the scope must still be current (a subject re-minted while
 -- the response was in flight makes it another subject's assignment), then
 -- the per-key sequence fence, then the outcome's own directives.
-function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch)
+function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, resolved_at_ms)
 	if auth_epoch ~= self.auth_epoch then
 		return
 	end
@@ -826,7 +925,12 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch)
 		self.entries = {}
 		self.pending_exposure = {}
 		if outcome.drop_all then
-			if not storage.clear_experiments(self.config) then
+			if storage.clear_experiments(self.config) then
+				self.durable_pending = {}
+			else
+				-- The withdrawn assignments are still on disk: mark the
+				-- clear OWED and retry it every tick until it lands.
+				self.durable_clear_pending = true
 				self:diagnose("persist_failed", "cache_clear")
 			end
 		end
@@ -850,28 +954,38 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch)
 	self.backoff_attempt = 0
 	if outcome.drop_entry then
 		self.entries[experiment_key] = nil
-		self.pending_exposure[experiment_key] = nil
-		-- The durable drop is keyed on the disk state, not the in-memory
-		-- serving set: a latch may have cleared serving while the record
-		-- retains the entry, and the permanent drop must still land.
-		self:durable_drop_entry(scope, experiment_key)
+		-- The OWED exposure deliberately survives the drop: an application
+		-- that already happened is a fact — the drop stops future serving,
+		-- not the record of real treatment. The sweep emits it from the
+		-- retained snapshot. The durable drop converges keyed on the DISK
+		-- state (a latch may have cleared serving while the record retains
+		-- the entry) and is retried until it lands — the kill rule demands
+		-- the drop reach the disk.
+		self:sync_durable_entry(scope, experiment_key, resolved_at_ms)
 		return
 	end
 	if outcome.new_entry then
 		local entry = outcome.new_entry
 		entry.subject_key = subject
 		entry.attributes = outcome.attributes
+		-- Flush an owed exposure from the PREVIOUS application before this
+		-- resolution replaces its snapshot slot (best-effort: the previous
+		-- application really ran, and its fact should not be silently
+		-- superseded by the new one).
+		if type(self.pending_exposure[experiment_key]) == "table" then
+			self:try_expose(experiment_key)
+		end
 		self.entries[experiment_key] = entry
-		self:durable_set_entry(scope, experiment_key, entry)
+		self:sync_durable_entry(scope, experiment_key, entry.fetched_at_ms)
 		self:arm_revalidation(clock.unix_ms())
 		-- The variant takes effect at this resolution (a variant change on
 		-- republish applies here too — no mid-session flapping guard beyond
 		-- the fetch cadence): the application point, so the exposure fact
-		-- is emitted now, deduplicated per session tuple. The pending mark
-		-- is set FIRST and cleared only by a successful (or terminally
-		-- skipped) emission, so a locally failed emit — a full queue — is
-		-- retried by the tick sweep instead of being lost.
-		self.pending_exposure[experiment_key] = true
+		-- is emitted now, deduplicated per session tuple. The pending
+		-- snapshot is armed FIRST and cleared only by a successful (or
+		-- terminally skipped) emission, so a locally failed emit — a full
+		-- queue — is retried by the tick sweep instead of being lost.
+		self.pending_exposure[experiment_key] = entry
 		self:try_expose(experiment_key)
 	end
 end
@@ -1005,7 +1119,13 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	}
 
 	http.request(url, "GET", function(_, _, response)
-		-- The consent re-check comes FIRST: a revocation while the request
+		-- A torn-down consumer discards in-flight responses outright:
+		-- nothing installs, persists, or paces, and game code is not
+		-- called back after shutdown (the documented teardown contract).
+		if self.torn_down then
+			return
+		end
+		-- The consent re-check comes next: a revocation while the request
 		-- was in flight closes the plane. Nothing installs, nothing paces,
 		-- nothing re-mints, and the caller receives the refusal — never a
 		-- healthy assignment fetched under a consent that no longer holds.
@@ -1026,7 +1146,8 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 				entry_now = self.entries[experiment_key]
 			end
 		end
-		local result, outcome = M.apply(entry_now, response, clock.unix_ms())
+		local resolved_at_ms = clock.unix_ms()
+		local result, outcome = M.apply(entry_now, response, resolved_at_ms)
 		outcome.attributes = normalized_attributes
 		if outcome.remint and not self.reminted then
 			-- The persisted subject id failed the wire grammar (storage
@@ -1047,7 +1168,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		if outcome.transient and auth_epoch == self.auth_epoch then
 			self:pace_transient(outcome.retry_after_seconds)
 		end
-		self:install(seq, scope, experiment_key, outcome, auth_epoch)
+		self:install(seq, scope, experiment_key, outcome, auth_epoch, resolved_at_ms)
 		-- The epoch re-check guards the PUBLIC callback like the install:
 		-- a response that raced a fail-closed latch was discarded from
 		-- state above, and its caller must not receive a healthy
@@ -1068,6 +1189,14 @@ end
 -- latched, and at least one assignment is cached; a parked revalidation
 -- never blocks anything — there is no pending state to drain at shutdown.
 function Experiments:tick(_)
+	if self.torn_down then
+		return
+	end
+	-- Owed durable writes retry FIRST and regardless of consent: this is
+	-- local disk housekeeping (no network, no serving decisions), and a
+	-- kill drop decided under grant must land durably even if consent
+	-- flipped meanwhile.
+	self:retry_durable_sync()
 	if consent_refusal(self.deps.consent()) then
 		return
 	end
