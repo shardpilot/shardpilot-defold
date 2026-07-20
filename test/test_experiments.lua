@@ -4955,7 +4955,10 @@ local function test_condemned_relaunch_filters_spooled_facts()
 	-- the spool rewrite both fail — only the sidecar marker persists. The
 	-- process then dies. The relaunch must not re-send the spooled facts:
 	-- the armed condemnation is consulted at spool load and the withdrawn
-	-- facts are dropped there, durably.
+	-- facts are dropped there, durably. (The clock moves past the capture
+	-- second first: a same-second fact sits in the survive-biased boundary
+	-- window by design.)
+	advance_seconds(2)
 	state.fail_save = function(path)
 		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
 	end
@@ -5326,16 +5329,18 @@ local function test_replacement_fact_capture_survives_settled_purge()
 	fetch(client, "exp-checkout")
 
 	-- The flag flips back on: the refetched tuple re-exposes with the
-	-- SAME deterministic id. persist() must not let the stale settled
-	-- mark turn the replacement's capture into a masked no-op — the
-	-- capture re-legitimizes the id, so the on-disk copy stands as the
-	-- replacement's durable form.
+	-- SAME deterministic id. The capture re-legitimizes the id and
+	-- REWRITES the stored copy with the replacement's post-sentinel
+	-- identity — and with the spool store still down that write cannot
+	-- land, so persist reports the truth: not yet durable (the mirror
+	-- holds the replacement and the deferred rewrite converges it).
 	next_status = 200
 	next_response_body = assignment_body()
 	fetch(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1,
 		"the re-served treatment re-exposes")
-	assert_true(client:persist(), "persist claims the fact captured")
+	assert_true(not client:persist(),
+		"persist reports the replacement not yet durable while the store is down")
 	state.fail_save = nil
 
 	-- The store recovers and the deferred removal rewrite lands (flush
@@ -5455,7 +5460,9 @@ local function test_condemned_marker_holds_without_subject()
 	responder = nil
 
 	-- Sentinel with record AND spool stores down: only the sidecar marker
-	-- lands; the withdrawn fact stays spooled.
+	-- lands; the withdrawn fact stays spooled. (Past the capture second:
+	-- same-second facts sit in the survive-biased boundary by design.)
+	advance_seconds(2)
 	state.fail_save = function(path)
 		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
 	end
@@ -5516,7 +5523,9 @@ local function test_condemnation_survives_failed_spool_clear()
 	assert_true(not client:flush({ include_summaries = false }))
 	responder = nil
 	-- Sentinel with record AND spool stores down: only the marker lands;
-	-- the spool file keeps the withdrawn fact (its only content).
+	-- the spool file keeps the withdrawn fact (its only content). (Past
+	-- the capture second: the boundary is survive-biased by design.)
+	advance_seconds(2)
 	state.fail_save = function(path)
 		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
 	end
@@ -5709,6 +5718,289 @@ local function test_backend_owed_fact_capture_without_session()
 	storage.reset()
 end
 
+local function test_spool_only_debt_persists_marker()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+
+	-- Sentinel with ONLY the spool store down: the cache clear LANDS, but
+	-- the purge's spool rewrite fails — the condemnation debt is
+	-- spool-only. It must still persist the sidecar marker: with the
+	-- cache side settled nothing else durable records the condemnation,
+	-- and an exit here would leave the next launch resending the
+	-- withdrawn fact from the stale file.
+	advance_seconds(2)
+	state.fail_save = function(path)
+		return path:match("/spool$") ~= nil
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	local marker_path = nil
+	for key in pairs(stores) do
+		if key:match("/experiments%-clear$") then
+			marker_path = key
+		end
+	end
+	assert_true(marker_path ~= nil and type(stores[marker_path]) == "table"
+		and stores[marker_path].stamp ~= nil,
+		"spool-only condemnation debt persists the marker")
+
+	storage.reset()
+	state.fail_save = nil
+	local relaunch = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			assert_true(not requests[i].body:find("experiment_exposure", 1, true),
+				"the withdrawn fact never resends across the spool-only-debt exit")
+		end
+	end
+	restore()
+	storage.reset()
+end
+
+local function test_same_key_replacement_carries_post_sentinel_identity()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+	advance_seconds(2)
+	-- Sentinel with record AND spool stores down: marker persists, the
+	-- spooled PRE-sentinel copy stays.
+	state.fail_save = function(path)
+		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+
+	-- The flag flips back with the SAME subject-fact key: identical props,
+	-- same deterministic id — but the replacement's event_ts is
+	-- POST-sentinel, and that identity must become the durable copy: the
+	-- relaunch's stamp partition would drop a pre-sentinel timestamp as
+	-- withdrawn while the capture had reported the fact durable.
+	advance_seconds(2)
+	state.fail_save = fail_experiment_saves
+	next_status = 200
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	-- persist() reports false here — the refetched entry's cache write is
+	-- owed against the still-failing record store — but its SPOOL capture
+	-- (healed store) lands the replacement's post-sentinel bytes, which is
+	-- what the relaunch below depends on.
+	client:persist()
+
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	local resent_exposure = false
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true)
+			and requests[i].body:find("experiment_exposure", 1, true) then
+			resent_exposure = true
+		end
+	end
+	assert_true(resent_exposure,
+		"the same-key replacement's post-sentinel identity survives the partition and replays")
+	restore()
+	storage.reset()
+end
+
+local function test_same_second_fresh_fact_survives_partition()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local clock_mod = require "shardpilot.clock"
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	client:update(0.016)
+	assert_true(client:flush({ include_summaries = false }))
+
+	-- Anchor the clock at a fresh second, then land the sentinel inside
+	-- it (record store down: the marker persists; the sidecar delete then
+	-- fails so the settled marker survives the settle).
+	socket.now = math.floor(socket.now) + 100
+	local anchor_second = math.floor(socket.now)
+	state.fail_save = fail_experiment_saves
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	state.fail_save = function(path)
+		return path:match("/experiments%-clear$") ~= nil
+	end
+	client:update(0.016)
+	assert_true(client.experiments.durable_clear_pending == false)
+
+	-- A fresh post-sentinel fact captured in the SAME UTC second as the
+	-- stamp: second-granular envelope timestamps compare EQUAL, and the
+	-- boundary is biased to SURVIVE — dropping it would eat a legitimate
+	-- fact (the mirror-image ≤1s pre-sentinel leak is the documented
+	-- residual). Roll the clock back inside the sentinel's second for the
+	-- re-exposure's arm moment.
+	socket.now = anchor_second + 0.5
+	next_status = 200
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1)
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+	state.fail_save = nil
+
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	local resent_exposure = false
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true)
+			and requests[i].body:find("experiment_exposure", 1, true) then
+			resent_exposure = true
+		end
+	end
+	assert_true(resent_exposure,
+		"a same-second post-sentinel fact survives the survive-biased boundary")
+	restore()
+	storage.reset()
+end
+
+local function test_presettle_persist_excludes_wire_batch_facts()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	assert_true(client:session_start())
+	assert_true(client:track("filler-host-event"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+
+	-- The batch goes ON THE WIRE and stays unsettled (held callback).
+	local held = nil
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			held = callback
+			return true
+		end
+		return false
+	end
+	client:flush({ include_summaries = false })
+	assert_true(held ~= nil, "the publish is in flight")
+	responder = nil
+
+	-- The sentinel lands mid-flight: the wire attempt is past recall and
+	-- the settle callback will filter the batch later — but a persist()
+	-- BEFORE the settle must not snapshot the withdrawn facts into the
+	-- durable spool: a crash pre-settle would replay them.
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	client:persist()
+
+	-- CRASH before the publish ever settles.
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = nil
+	local requests_before = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	local saw_filler = false
+	for i = requests_before + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			assert_true(not requests[i].body:find("experiment_exposure", 1, true),
+				"a pre-settle snapshot must not capture the wire batch's withdrawn facts")
+			if requests[i].body:find("filler%-host%-event") then
+				saw_filler = true
+			end
+		end
+	end
+	assert_true(saw_filler, "the host's events still capture and replay")
+	restore()
+	storage.reset()
+end
+
+local function test_corrupt_stored_subject_never_rides_identity_writes()
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	-- Seed an identity record whose experiments subject field is
+	-- grammar-shaped but OVERSIZED (outside the wire grammar's 26-70
+	-- bound): copied verbatim it would ride every later identity write —
+	-- consent saves included, even with experiments OFF — and an
+	-- oversized value can permanently fail those unrelated writes.
+	storage.save(storage_scope, {
+		consent_analytics = "granted",
+		experiments_client_id = "spcid_" .. string.rep("a", 200),
+	})
+	local off = config()
+	off.experiments_enabled = nil
+	local client = assert(sdk.new(off))
+	assert_true(client:set_consent(true))
+	local identity_path = nil
+	for key in pairs(stores) do
+		if key:match("/identity$") then
+			identity_path = key
+		end
+	end
+	assert_true(identity_path ~= nil and stores[identity_path] ~= nil)
+	assert_nil(stores[identity_path].experiments_client_id,
+		"an invalid stored subject reads as absent and never rides identity rewrites")
+
+	-- With experiments ON, a fresh mint replaces it cleanly.
+	storage.reset()
+	storage.save(storage_scope, {
+		consent_analytics = "granted",
+		experiments_client_id = "spcid_" .. string.rep("a", 200),
+	})
+	local enabled = assert(sdk.new(config()))
+	next_response_body = assignment_body()
+	fetch(enabled, "exp-checkout")
+	local params = query_params(last_assignment_request().url)
+	assert_match(params.subject_key, "^spcid_%x+$",
+		"the corrupt value is never egressed — a fresh subject mints")
+	assert_true(#params.subject_key <= 70)
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -5857,6 +6149,11 @@ local tests = {
 	test_evicted_replacement_reports_capture_failure,
 	test_settled_marker_spares_fresh_facts,
 	test_backend_owed_fact_capture_without_session,
+	test_spool_only_debt_persists_marker,
+	test_same_key_replacement_carries_post_sentinel_identity,
+	test_same_second_fresh_fact_survives_partition,
+	test_presettle_persist_excludes_wire_batch_facts,
+	test_corrupt_stored_subject_never_rides_identity_writes,
 }
 
 for _, test in ipairs(tests) do

@@ -503,11 +503,17 @@ function M.new(config)
 		initialized = true,
 	}, Client)
 	-- The experiments subject id is loaded BEFORE any identity rewrite below:
-	-- persist_identity carries it forward verbatim, so a rewrite triggered by
-	-- a changed anonymous id can never drop a previously minted id (dropping
+	-- persist_identity carries it forward, so a rewrite triggered by a
+	-- changed anonymous id can never drop a previously minted id (dropping
 	-- would silently re-bucket the subject on a later re-enable). Loaded
-	-- regardless of the experiments flag — a raw field copy, no minting.
-	client.experiments_client_id = type(stored.experiments_client_id) == "string"
+	-- regardless of the experiments flag — but VALIDATED, never verbatim: a
+	-- grammar-invalid or oversized stored value would otherwise ride every
+	-- later identity write (consent saves included, even with experiments
+	-- off), and an oversized one could permanently fail those unrelated
+	-- writes. Invalid reads as absent — the consumer mints a fresh subject
+	-- at first need, exactly like any other corrupt identity field.
+	client.experiments_client_id = experiments_mod.valid_subject_id(
+			stored.experiments_client_id)
 		and stored.experiments_client_id or nil
 	if stored.anonymous_id ~= anonymous_id then
 		client:persist_identity()
@@ -553,7 +559,11 @@ function M.new(config)
 					-- process-local by the documented failed-persist rule,
 					-- so there is nothing on disk to adopt in that case.
 					local persisted = storage.load(normalized) or {}
-					if type(persisted.experiments_client_id) == "string" then
+					-- Adopt only a VALID sibling value: copying a corrupt
+					-- or oversized field would poison this client's
+					-- identity writes the same way the init-time load
+					-- guard prevents.
+					if experiments_mod.valid_subject_id(persisted.experiments_client_id) then
 						client.experiments_client_id = persisted.experiments_client_id
 					end
 				end
@@ -712,9 +722,19 @@ function M.new(config)
 				local name = env.event_name
 				local is_fact = name == "experiment_exposure"
 					or name == "experiment_outcome"
+				-- The boundary is biased to SURVIVE: envelope timestamps
+				-- are second-granular while the marker stamp is
+				-- milliseconds, so a fact captured in the SAME UTC second
+				-- as the sentinel compares EQUAL — dropping it would eat a
+				-- legitimate post-sentinel fact. Equal-or-after survives;
+				-- the residual is the mirror-image ≤1s window in which a
+				-- pre-sentinel fact shares the sentinel's second and
+				-- escapes the drop — accepted and documented (the fact was
+				-- real treatment reporting; the deterministic id keeps it
+				-- collapsible server-side).
 				if is_fact and not (stamp_iso ~= nil
 					and type(env.event_ts) == "string"
-					and env.event_ts > stamp_iso) then
+					and env.event_ts >= stamp_iso) then
 					condemned = condemned + 1
 				else
 					kept[#kept + 1] = env
@@ -2021,31 +2041,6 @@ local function is_experiment_fact(event)
 	return name == "experiment_exposure" or name == "experiment_outcome"
 end
 
--- Order-independent deep equality over envelope prop tables (scalar values,
--- shallow nesting at most): the replacement-detection compare for a
--- re-captured deterministic id — identity fields (timestamps, session,
--- anon) deliberately excluded, props are the wire content whose staleness
--- matters (a withdrawn assignment_key must never resend).
-local function props_equal(a, b)
-	if a == b then
-		return true
-	end
-	if type(a) ~= "table" or type(b) ~= "table" then
-		return a == b
-	end
-	for key, value in pairs(a) do
-		if not props_equal(value, b[key]) then
-			return false
-		end
-	end
-	for key in pairs(b) do
-		if a[key] == nil then
-			return false
-		end
-	end
-	return true
-end
-
 -- Remove experiment facts from a batch IN PLACE and rebuild its cached wire
 -- payload (the payload snapshots the envelopes at first attempt — a filtered
 -- batch resending the unfiltered capture would defeat the purge). Returns
@@ -2343,35 +2338,34 @@ function Client:spool_envelopes(envelopes)
 				-- A replacement fact re-derived a deterministic id whose
 				-- prior copy a sentinel purge condemned while the removal
 				-- rewrite is still owed: capturing the replacement
-				-- RE-LEGITIMIZES the id — clear the settled mark. The
-				-- on-disk copy stands as the replacement's durable form
-				-- ONLY when its content actually matches: the server may
-				-- have reissued the same tuple/version with a DIFFERENT
-				-- subject-fact key (same deterministic id, different
-				-- assignment_key prop), and the pre-sentinel envelope
-				-- carrying the withdrawn key must never resend as the
-				-- replacement. On a props mismatch the stored envelope is
-				-- OVERWRITTEN with the replacement's bytes and the write
-				-- below must land (else the deferred-rewrite machinery
-				-- converges the mirror). Where a durable condemnation
-				-- marker survives to the next launch, the scope-gated
-				-- load filter still governs every spooled fact equally —
-				-- the sentinel mandate outranks capture. (An acked-but-
-				-- unrewritten published id re-captured the same way just
-				-- resurrects a delivered envelope; the deterministic id
-				-- collapses the re-send server-side.)
+				-- RE-LEGITIMIZES the id — clear the settled mark — and
+				-- the stored envelope is ALWAYS overwritten with the
+				-- replacement's bytes. The pre-sentinel copy can differ
+				-- in props (a reissued subject-fact key: the withdrawn
+				-- key must never resend) OR only in identity fields — and
+				-- the identity matters just as much: the old copy carries
+				-- a PRE-sentinel event_ts, which the relaunch's stamp
+				-- partition would drop as withdrawn while this capture
+				-- had reported the fact durable. The replacement's
+				-- post-sentinel identity is the durable form, full stop.
+				-- The write below must land (else the deferred-rewrite
+				-- machinery converges the mirror and the capture reports
+				-- not-yet-durable). Where a condemnation marker survives
+				-- to the next launch, the scope-gated stamp partition
+				-- governs every spooled fact equally. (An acked-but-
+				-- unrewritten published id re-captured this way just
+				-- resurrects a delivered envelope with fresher identity;
+				-- the deterministic id collapses the re-send server-side.)
 				self.spool_settled[event_id] = nil
 				if self.spool_index[event_id] then
 					for j = 1, #self.spool_record do
 						local stored = self.spool_record[j]
 						if type(stored) == "table"
 							and stored.event_id == event_id then
-							if not props_equal(stored.props, env.props) then
-								self.spool_record[j] = env
-								replaced = true
-								replaced_ids = replaced_ids or {}
-								replaced_ids[event_id] = true
-							end
+							self.spool_record[j] = env
+							replaced = true
+							replaced_ids = replaced_ids or {}
+							replaced_ids[event_id] = true
 							break
 						end
 					end
@@ -2492,7 +2486,18 @@ function Client:spool_undelivered()
 	if self.in_flight_batch then
 		local payload = self:ensure_batch_payload(self.in_flight_batch)
 		for i = 1, #payload.events do
-			envelopes[#envelopes + 1] = payload.events[i]
+			local env = payload.events[i]
+			-- A sentinel purge that found this batch ON THE WIRE could not
+			-- touch it (past recall) — the settle callback filters it at
+			-- retention. But a persist/shutdown snapshot BEFORE the settle
+			-- must not capture the withdrawn facts into the durable spool:
+			-- a crash pre-settle would replay them at the next launch. The
+			-- QUEUE part below is deliberately unfiltered — facts there
+			-- postdate the purge (a flip-back re-exposure) and are
+			-- legitimate.
+			if not (self.experiment_purge_awaited and is_experiment_fact(env)) then
+				envelopes[#envelopes + 1] = env
+			end
 		end
 	end
 	for i = 1, #self.queue.items do

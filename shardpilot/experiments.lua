@@ -2017,6 +2017,25 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 					self:diagnose("persist_failed", "cache_clear_tombstone")
 				end
 				self:diagnose("persist_failed", "cache_clear")
+			elseif not self.clear_marker
+				and self.deps.spool_condemned_pending
+				and self.deps.spool_condemned_pending() then
+				-- The cache side SETTLED, but condemned facts remain on
+				-- the durable spool (the purge's removal write could not
+				-- land): that debt is memory-only, and an exit before the
+				-- rewrite retries would leave the next launch with no
+				-- durable condemnation over the stale file — the
+				-- withdrawn facts would simply resend. Persist the marker
+				-- for the SPOOL's sake: the retire rule (record clean AND
+				-- spool clean) governs its lifetime, and the stamp
+				-- partition keeps it harmless to post-sentinel facts
+				-- meanwhile. Best-effort like the tombstone above —
+				-- both-stores-down stays the documented residual.
+				if storage.save_experiments_clear(self.config, stamp, scope) then
+					self.clear_marker = { stamp = stamp, scope = scope }
+				else
+					self:diagnose("persist_failed", "cache_clear_tombstone")
+				end
 			end
 		else
 			-- An ORDINARY 401/403 retains the durable record — and the
