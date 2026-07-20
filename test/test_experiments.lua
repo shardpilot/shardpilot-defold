@@ -3207,6 +3207,150 @@ local function test_failed_sentinel_clear_never_resurrects_serving()
 	restore()
 end
 
+-- ── round-10 regressions ──────────────────────────────────────────────────────
+
+local function test_non_string_reason_is_malformed()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- A PRESENT but non-string reason must not coerce into the "absent"
+	-- vocabulary entry and execute a drop: malformed serve-stale.
+	next_response_body = json.encode({
+		version = 3,
+		assigned = false,
+		reason = 123,
+		boundary = { assignment_unit = "client_id" },
+	})
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.from_cache)
+	assert_equal(result.error, "malformed_response")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"a non-string reason must not drop the cached assignment")
+
+	-- A genuinely ABSENT reason (the traffic-gate miss) still drops.
+	next_response_body = not_assigned_body(nil)
+	fetch(client, "exp-checkout")
+	assert_nil(client:experiment_variant("exp-checkout"))
+end
+
+local function test_sibling_write_lands_owed_drops()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body({ experiment_key = "exp-a" })
+	fetch(client, "exp-a")
+	next_response_body = assignment_body({ experiment_key = "exp-b", variant_key = "beta" })
+	fetch(client, "exp-b")
+
+	-- exp-a's kill fails to persist: the drop is OWED and the disk record
+	-- still carries the killed assignment.
+	state.fail_save = function(path)
+		return fail_experiment_saves(path)
+	end
+	next_response_body = not_assigned_body("kill_switch")
+	fetch(client, "exp-a")
+	state.fail_save = nil
+	local record = storage.load_experiments(client.config)
+	assert_true(record.entries["exp-a"] ~= nil,
+		"the failed drop leaves the entry on disk for the moment")
+
+	-- A later SUCCESSFUL write for the sibling carries the owed drop with
+	-- it: the record is ONE file, and an exit before the next tick must
+	-- not leave the killed sibling as reload truth.
+	next_response_body = assignment_body({
+		experiment_key = "exp-b",
+		variant_key = "beta",
+		version = 4,
+	})
+	fetch(client, "exp-b")
+	record = storage.load_experiments(client.config)
+	assert_nil(record.entries["exp-a"],
+		"a successful sibling write must land the owed drop")
+	assert_equal(record.entries["exp-b"].variant_key, "beta")
+
+	-- The swept drop SETTLED: a relaunch serves only the sibling.
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-a"))
+	assert_equal(relaunch:experiment_variant("exp-b"), "beta")
+	restore()
+end
+
+local function test_grammar_400_after_spent_budget_drops_entry()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	local grammar_reject = json.encode({
+		error = "experiment metadata must use synthetic local-safe identifiers only",
+	})
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = grammar_reject })
+		else
+			callback(nil, nil, { status = 200, response = assignment_body() })
+		end
+		return true
+	end
+	-- The first grammar reject spends the one-shot budget; its retry
+	-- installs the assignment for the fresh subject.
+	local result = fetch(client, "exp-checkout")
+	responder = nil
+	assert_true(result.ok and result.assigned)
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- A LATER grammar reject with the budget spent is a permanent 400 for
+	-- this subject: the cached assignment fails closed — a durable drop —
+	-- instead of serving indefinitely against it.
+	next_status = 400
+	next_response_body = grammar_reject
+	local rejected = fetch(client, "exp-checkout")
+	assert_equal(rejected.ok, false)
+	assert_equal(rejected.error, "bad_request")
+	assert_nil(client:experiment_variant("exp-checkout"),
+		"a budget-exhausted grammar 400 must stop serving")
+	local record = storage.load_experiments(client.config)
+	assert_true(record == nil or record.entries["exp-checkout"] == nil,
+		"the drop is durable")
+	restore()
+end
+
+local function test_mismatched_app_or_environment_is_malformed()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+
+	-- A 200 echoing ANOTHER app is another scope's payload: malformed
+	-- serve-stale, never an install (or drop) under this cache scope.
+	next_response_body = assignment_body({
+		app_key = "app-other",
+		variant_key = "beta",
+		version = 9,
+	})
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.from_cache)
+	assert_equal(result.error, "malformed_response")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- Same for a mismatched environment.
+	next_response_body = assignment_body({
+		environment_key = "prod-other",
+		variant_key = "beta",
+		version = 9,
+	})
+	result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.from_cache)
+	assert_equal(result.error, "malformed_response")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"another environment's payload must never install")
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -3294,6 +3438,10 @@ local tests = {
 	test_mismatched_experiment_key_is_malformed,
 	test_unknown_not_assigned_reason_is_malformed,
 	test_failed_sentinel_clear_never_resurrects_serving,
+	test_non_string_reason_is_malformed,
+	test_sibling_write_lands_owed_drops,
+	test_grammar_400_after_spent_budget_drops_entry,
+	test_mismatched_app_or_environment_is_malformed,
 }
 
 for _, test in ipairs(tests) do

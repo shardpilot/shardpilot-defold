@@ -414,7 +414,15 @@ end
 --     subject id once and retry;
 --   * transient + retry_after_seconds — pace the revalidation backoff and
 --     honor a server Retry-After (429 and 5xx alike).
-function M.apply(entry, response, now_ms, experiment_key)
+-- A response scope field that is PRESENT but disagrees with what the request
+-- asked for (empty expectations never reject — nothing to disagree with).
+local function echo_mismatch(echoed, expected)
+	return type(echoed) == "string" and echoed ~= ""
+		and type(expected) == "string" and expected ~= ""
+		and echoed ~= expected
+end
+
+function M.apply(entry, response, now_ms, experiment_key, app_key, environment_key)
 	local status = type(response) == "table" and response.status or 0
 
 	if status == 200 then
@@ -422,13 +430,14 @@ function M.apply(entry, response, now_ms, experiment_key)
 		if not decoded then
 			return serve_entry_or_fail(entry, "malformed_response"), { transient = true }
 		end
-		if type(decoded.experiment_key) == "string" and decoded.experiment_key ~= ""
-			and type(experiment_key) == "string"
-			and decoded.experiment_key ~= experiment_key then
-			-- A 200 whose body names ANOTHER experiment is routing/proxy
-			-- confusion, not an answer to this request: malformed BEFORE
-			-- anything installs — never cache (or drop) under the requested
-			-- key on another experiment's payload.
+		if echo_mismatch(decoded.experiment_key, experiment_key)
+			or echo_mismatch(decoded.app_key, app_key)
+			or echo_mismatch(decoded.environment_key, environment_key) then
+			-- A 200 whose body names ANOTHER experiment, app, or environment
+			-- is routing/proxy confusion, not an answer to this request:
+			-- malformed BEFORE anything installs — never cache (or drop)
+			-- under the current scope on another scope's payload or
+			-- subject-fact key.
 			return serve_entry_or_fail(entry, "malformed_response"), { transient = true }
 		end
 		local boundary = type(decoded.boundary) == "table" and decoded.boundary or nil
@@ -460,17 +469,20 @@ function M.apply(entry, response, now_ms, experiment_key)
 		end
 		if decoded.assigned == false then
 			-- The three not-assigned shapes, distinguished only by `reason`,
-			-- form a CLOSED vocabulary: absent (deterministic traffic-gate
+			-- form a CLOSED vocabulary: ABSENT (deterministic traffic-gate
 			-- miss), "targeting_unmatched", "kill_switch". Each drops the
 			-- cached assignment: the server just said this subject has no
 			-- variant NOW, and a kill in particular must stop applying at
-			-- the next safe point and emit no exposure. An UNKNOWN reason is
-			-- semantics this client cannot honor — treated as MALFORMED
+			-- the next safe point and emit no exposure. Anything else a
+			-- PRESENT reason field carries — an unknown string, or a
+			-- non-string value that must not be coerced into the "absent"
+			-- entry — is semantics this client cannot honor: MALFORMED
 			-- (serve-stale transient), never executed as a drop directive it
 			-- does not understand.
-			local reason = type(decoded.reason) == "string" and decoded.reason or nil
-			if reason ~= nil and reason ~= "kill_switch"
-				and reason ~= "targeting_unmatched" then
+			local reason = decoded.reason
+			if reason ~= nil and (type(reason) ~= "string"
+				or (reason ~= "kill_switch"
+					and reason ~= "targeting_unmatched")) then
 				return serve_entry_or_fail(entry, "malformed_response"),
 					{ transient = true }
 			end
@@ -892,8 +904,35 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 		end
 		record.entries[experiment_key] = nil
 	end
+	-- Owed DROPS for OTHER keys ride every combined-record save: the record
+	-- is one file, so a save that reloaded the disk copy would otherwise
+	-- re-persist a sibling entry whose authoritative drop is still owed —
+	-- and an exit inside that window would resurrect the killed sibling at
+	-- the next launch. The sweep honors the drops' own retry fence: a
+	-- sibling record stamped strictly after the owed drop's decision is
+	-- newer state, left for that drop's own retry to yield against.
+	local swept = nil
+	for key, pending in pairs(self.durable_pending) do
+		if key ~= experiment_key and pending.drop
+			and self.entries[key] == nil then
+			local sibling = record.entries[key]
+			local outranked = sibling ~= nil
+				and type(sibling.fetched_at_ms) == "number"
+				and sibling.fetched_at_ms > pending.as_of
+			if not outranked then
+				record.entries[key] = nil
+				swept = swept or {}
+				swept[#swept + 1] = key
+			end
+		end
+	end
 	if storage.save_experiments(self.config, record) then
 		self.durable_pending[experiment_key] = nil
+		if swept then
+			for i = 1, #swept do
+				self.durable_pending[swept[i]] = nil
+			end
+		end
 		return true
 	end
 	if entry and stored then
@@ -974,8 +1013,13 @@ function Experiments:retry_durable_sync()
 	end
 	table.sort(keys)
 	for i = 1, #keys do
+		-- An earlier iteration's combined-record save may have SWEPT this
+		-- key's owed drop along with it (settling the pending): skip what
+		-- already converged.
 		local pending = self.durable_pending[keys[i]]
-		self:sync_durable_entry(scope, keys[i], pending.as_of, true)
+		if pending then
+			self:sync_durable_entry(scope, keys[i], pending.as_of, true)
+		end
 	end
 end
 
@@ -1456,7 +1500,8 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 			end
 		end
 		local resolved_at_ms = clock.unix_ms()
-		local result, outcome = M.apply(entry_now, response, resolved_at_ms, experiment_key)
+		local result, outcome = M.apply(entry_now, response, resolved_at_ms,
+			experiment_key, self.config.app_id, self.config.environment_id)
 		outcome.attributes = normalized_attributes
 		-- Captured BEFORE install (which may settle this very seq): true
 		-- when a NEWER outcome for this key already settled while this
@@ -1491,6 +1536,17 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 					is_revalidation, normalized_attributes)
 				return
 			end
+		end
+		if outcome.remint and self.reminted then
+			-- The one-shot re-mint budget is already spent: this grammar
+			-- reject is now a PERMANENT 400 for the current subject/input
+			-- set, and the cached assignment must not keep serving
+			-- indefinitely against it — fail closed exactly like every
+			-- other permanent bad-request (durable drop, decision-time
+			-- stamp raise, closed result). The carve-out covers only the
+			-- path that actually re-mints; fenced/stale rejects are still
+			-- discarded whole by the install gates.
+			outcome.drop_entry = true
 		end
 		if outcome.transient and auth_epoch == self.auth_epoch then
 			-- Pacing is gated on scope currency exactly like the install:
