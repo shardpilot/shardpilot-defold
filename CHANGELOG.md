@@ -6,6 +6,48 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **A changed configured `anonymous_id` no longer inherits the previous
+  actor's consent (fresh identity on override mismatch).** A config
+  `anonymous_id` override that replaces a DIFFERENT valid persisted
+  anonymous id used to install the new actor while restoring the old
+  record's consent decision — the fresh actor booted `granted` without ever
+  deciding, loaded the old actor's offline spool, and the boot rewrite
+  durably re-recorded the old decision under the new id. Fleet rule
+  adopted: such an override boots a FRESH identity — consent `unknown`, the
+  persisted decision ignored (never applied to the new actor), the spool
+  purged through the standard non-granted init path (a failed purge fails
+  closed under the owed-wipe rule, refusing `set_consent(true)` with
+  `spool_purge_failed` until the wipe lands), and the override persisted
+  with no consent state carried over. A matching override — or none —
+  restores unchanged. Surfaced via the `diagnostics` hook as
+  `{ scope = "consent", status = "dropped", code = "identity_override_changed" }`.
+  The Mode B in-spool `identity_changed` drop (and the Mode A verbatim
+  re-send) still applies to identity changes inside a restored grant, e.g.
+  the corrupt/oversized-stored-anon self-heal.
+- **The consent-plane deferral resets when an actor change parks the
+  receipt that armed it.** The consent Retry-After/backoff window is
+  plane-wide by design, but when `identify()` switches the vouched actor
+  and thereby PARKS the arming dispatch head, the window used to outlive
+  its owner — holding the next dispatchable head (possibly a fresh denial)
+  for up to the 24h clamp while the parked receipt could not retry at all.
+  An actor change that parks the arming head now clears the deferral and
+  its backoff attempt count; plain same-actor retries, and identity changes
+  that do not park the arming head, keep honoring the window unchanged.
+  Likewise a receipt that parks while its POST is in flight settles
+  retained without arming the window.
+- **Exit summaries survive a full queue: shutdown work rides the durable
+  spool.** Building `perf_summary`/`network_summary` consumes the sampler
+  state, and a full queue at the final flush silently dropped both built
+  summaries (the flush enqueues them before any room is freed) even though
+  the next step delivers or durably spools the queue. A summary refused by
+  a full queue is now retained as an owed snapshot (bounded at one per
+  summary type — no fresh summary is built while one is owed) and
+  re-enqueued once room frees; shutdown's housekeeping passes drain owed
+  summaries after the deferred session end and refuse to finalize over one
+  — like every other owed exit work, a summary is sent, durably spooled, or
+  shutdown stays retryable. A denial still drops owed summaries with the
+  rest of the un-egressed analytics data.
+
 - **Canonical-actor consent-receipt keying (ADR-0222 §1, ADR-0202 2026-07-20
   amendment).** A consent receipt's actor is now chosen by the event plane's
   canonical-actor rule at decision time: the verified `user_id` ONLY when a

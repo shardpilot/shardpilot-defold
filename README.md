@@ -333,9 +333,14 @@ again retries it immediately. Revocation cleanup completes **before** a new
 grant takes effect: `set_consent(true)` while that purge is still owed
 retries it first and, if it still fails, returns `false, "spool_purge_failed"`
 without applying the grant — the persisted decision stays denied, so a
-relaunch cannot replay the pre-revocation record. Under Mode B auth, tokens
-are minted bound to the *current* anonymous ID — so if an init-time
-`anonymous_id` override changes the identity, spooled envelopes carrying the
+relaunch cannot replay the pre-revocation record. A configured
+`anonymous_id` override that replaces a DIFFERENT persisted identity boots a
+**fresh identity** in both auth modes: consent starts `unknown`, the
+previous actor's spool is purged at init, and their persisted decision is
+never applied to the new actor (see [`docs/privacy.md`](docs/privacy.md)).
+Within a restored grant, Mode B tokens are minted bound to the *current*
+anonymous ID — so when the stored anonymous id itself was replaced at load
+(the corrupt/oversized-record self-heal), spooled envelopes carrying the
 previous one are dropped from the record at load (surfaced via the
 `diagnostics` hook as `scope = "spool"`, code `identity_changed`) instead of
 being re-sent into a guaranteed rejection; Mode A has no token binding and

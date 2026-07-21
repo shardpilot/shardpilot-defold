@@ -87,9 +87,12 @@ the record: a relaunch inside the window waits out the remainder before
 re-sending. Durable capture is strict: when the runtime has no save-file API,
 or
 the caps evicted part of the remnant being captured, `shutdown()`/`persist()`
-report failure instead of claiming durability. Under Mode B auth, an
-init-time `anonymous_id` override drops spooled envelopes carrying the
-previous identity at load (diagnostics code `identity_changed`); Mode A
+report failure instead of claiming durability. A config
+`anonymous_id` override that replaces a different persisted identity boots a
+fresh identity — consent `unknown`, spool purged at init (see
+[`docs/privacy.md`](privacy.md)). Within a restored grant, Mode B auth drops
+spooled envelopes whose anonymous id no longer matches the client's at load
+(diagnostics code `identity_changed`); Mode A
 re-sends historic identities unchanged. See the README's "Offline
 durability" section for the window-listener recipe and
 [`docs/configuration.md`](configuration.md) for the knobs.
