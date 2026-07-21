@@ -4059,6 +4059,99 @@ end
 -- A malformed outbox record on disk is fail-safe: garbled entries are dropped
 -- at load — never sent, never a crash into game code — and they never block
 -- the deliverable receipts stored around them.
+-- Load-order pin (fleet audit, from unreal round 2): the outbox load-side
+-- drops — the sanitizer inside load_consent_outbox and the M.new
+-- identity/vouch drop — run BEFORE any cap enforcement, which lives only in
+-- save_consent_outbox. Were the 32-cap applied to the loaded file first, the
+-- stale to-be-dropped entries would count against it and the
+-- denial-preferring eviction would take the ONE deliverable receipt (worst
+-- case: the only current-anon pure grant among 39 stale denials — the first
+-- pure grant the eviction loop scans). Pinned: zero cap evictions, the grant
+-- survives the drops and delivers.
+local function test_outbox_load_drops_run_before_cap_enforcement()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- Learn the outbox path (and pin the current anon) with a real receipt.
+	next_status = 500
+	local seeder = assert(sdk.new(config({ anonymous_id = "anon-current" })))
+	assert_true(seeder:set_consent(false))
+	local _, outbox_path = stored_consent_outbox_record(stores)
+	assert_true(outbox_path ~= nil)
+	-- Hand-write an OVER-CAP record: 39 stale old-anon denials (Mode-B-only
+	-- identity_changed fodder) with the one deliverable current-anon pure
+	-- GRANT newest, behind all of them.
+	local receipts = {}
+	for i = 1, 39 do
+		receipts[i] = {
+			workspace_id = "workspace-example",
+			app_id = "app-example",
+			environment_id = "develop",
+			actor_identifier = "anon-old",
+			kind = "anon",
+			categories = { analytics = false },
+			decided_at = "2026-07-01T00:00:00Z",
+			idempotency_key = "receipt-stale-" .. i,
+			anonymous_id = "anon-old",
+		}
+	end
+	receipts[40] = {
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "anon-current",
+		kind = "anon",
+		categories = { analytics = true },
+		decided_at = "2026-07-01T00:00:01Z",
+		idempotency_key = "receipt-deliverable-grant",
+		anonymous_id = "anon-current",
+	}
+	stores[outbox_path] = { receipts = receipts }
+	storage.reset() -- the hand-written FILE is what loads
+
+	reset()
+	next_status = 500 -- keep the grant RETAINED so retention is observable
+	local issues = {}
+	local client = assert(sdk.new(config({
+		anonymous_id = "anon-current",
+		diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end,
+	})))
+	assert_equal(#client.consent_outbox, 1,
+		"the 39 stale entries drop; the deliverable grant survives")
+	assert_equal(client.consent_outbox[1].idempotency_key,
+		"receipt-deliverable-grant")
+	assert_equal(client:snapshot().consent_outbox_evicted, 0,
+		"zero cap evictions: the drops run before the cap can see an overflow")
+	local saw_overflow = false
+	local identity_drop = nil
+	for i = 1, #issues do
+		if issues[i].code == "outbox_overflow" then
+			saw_overflow = true
+		end
+		if issues[i].code == "identity_changed" then
+			identity_drop = issues[i]
+		end
+	end
+	assert_equal(saw_overflow, false, "no outbox_overflow may fire at load")
+	assert_true(identity_drop ~= nil and identity_drop.count == 39,
+		"the stale entries leave as identity_changed drops")
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1, "the persisted record keeps only the grant")
+	assert_equal(record.receipts[1].idempotency_key, "receipt-deliverable-grant")
+
+	-- The surviving grant actually delivers once the endpoint recovers.
+	reset()
+	next_status = 202
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body,
+		'"idempotency_key":"receipt-deliverable-grant"')
+	restore()
+	storage.reset()
+end
+
 local function test_malformed_consent_outbox_dropped_failsafe()
 	reset()
 	storage.reset()
@@ -5994,6 +6087,7 @@ local tests = {
 	test_consent_outbox_cap_denial_evicted_only_among_denials,
 	test_grant_refused_on_denial_full_outbox_fails_closed,
 	test_grant_append_proceeds_when_old_grant_evictable,
+	test_outbox_load_drops_run_before_cap_enforcement,
 	test_malformed_consent_outbox_dropped_failsafe,
 	test_rotation_blocked_while_prune_rewrite_owed,
 	test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts,
