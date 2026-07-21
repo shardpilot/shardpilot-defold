@@ -58,7 +58,7 @@
   (`outbox_overflow`). The grant side of the rule FAILS CLOSED: when
   appending a grant's receipt would overflow the cap with no pre-existing
   pure grant to evict (a denial-full outbox), `set_consent(true)` is
-  refused with the distinct `false, "consent_outbox_overflow"` — the state
+  refused with the distinct `false, "consent_outbox_full"` — the state
   does not flip, nothing is evicted, every denial stays retained — and the
   same grant succeeds once the outbox drains below the cap. This extends
   the floor's fail-closed family (a grant already refuses while a spool

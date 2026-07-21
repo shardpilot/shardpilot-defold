@@ -574,7 +574,7 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   still proceeds and the write retries automatically — including from
   `persist()` even with the event spool disabled). On a **denial-full
   outbox** — 32 retained receipts with no pure grant available to evict —
-  `set_consent(true)` is refused with `false, "consent_outbox_overflow"`:
+  `set_consent(true)` is refused with `false, "consent_outbox_full"`:
   the grant is not applied and nothing is evicted (a recorded denial is
   never traded for a grant, and a grant receipt evicted before dispatch
   would open the local pipeline with no grant row ever reaching the

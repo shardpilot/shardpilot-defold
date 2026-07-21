@@ -196,7 +196,7 @@ decision stays denied), so a relaunch can never replay the pre-revocation
 record under a granted decision. The same fail-closed family covers the
 receipt outbox: on a denial-full outbox (32 retained receipts, no pure
 grant available to evict) `set_consent(true)` is refused with
-`false, "consent_outbox_overflow"` — the state does not flip and nothing
+`false, "consent_outbox_full"` — the state does not flip and nothing
 is evicted — until the outbox drains below the cap. Spooled
 envelopes are re-sent verbatim (stable `event_id`/`event_ts`), so the ingest
 service de-duplicates re-sends; when a `429` `Retry-After` arrives while a

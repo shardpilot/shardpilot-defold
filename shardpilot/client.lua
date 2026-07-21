@@ -1257,7 +1257,7 @@ function Client:set_consent(decision)
 	-- pure grant first; an all-denials overflow evicts the oldest denial —
 	-- a fresh denial outranks a stale one).
 	if granted and self:consent_outbox_denial_full() then
-		return false, "consent_outbox_overflow"
+		return false, "consent_outbox_full"
 	end
 	self.consent_state = next_state
 	if state_changed and self.experiments then
@@ -1965,7 +1965,7 @@ end
 -- denial-preferring eviction loop would then reach denial-carrying
 -- receipts — or the incoming receipt itself, appended newest and therefore
 -- the LAST pure grant it scans. set_consent(true) consults this to refuse
--- the grant (`consent_outbox_overflow`) instead of letting either happen;
+-- the grant (`consent_outbox_full`) instead of letting either happen;
 -- see the gate there for the full rationale. Uses the storage layer's own
 -- cap and pure-grant predicate so this prediction and the eviction loop
 -- can never disagree.

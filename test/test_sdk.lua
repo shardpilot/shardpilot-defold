@@ -3874,7 +3874,7 @@ end
 -- grant's receipt would overflow the 32-entry cap with no pre-existing pure
 -- grant for the denial-preferring loop to evict, the loop's only candidates
 -- are denial-carrying receipts or the just-appended grant itself — so
--- set_consent(true) is REFUSED with the distinct consent_outbox_overflow:
+-- set_consent(true) is REFUSED with the distinct consent_outbox_full:
 -- the state does not flip, nothing is evicted, every denial stays, and no
 -- wire traffic results. A DENIAL append at the same cap keeps the shipped
 -- semantics (the all-denials overflow evicts the OLDEST denial — a fresh
@@ -3894,7 +3894,7 @@ local function test_grant_refused_on_denial_full_outbox_fails_closed()
 	local wire_before = #requests
 	local ok, err = client:set_consent(true)
 	assert_equal(ok, false)
-	assert_equal(err, "consent_outbox_overflow")
+	assert_equal(err, "consent_outbox_full")
 	assert_equal(client.consent_state, "denied", "a refused grant must not flip the state")
 	assert_equal(#client.consent_outbox, 32, "a refused grant evicts nothing")
 	for i = 1, #client.consent_outbox do

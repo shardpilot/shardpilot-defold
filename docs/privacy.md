@@ -223,7 +223,7 @@ outbox:
   without limit. The grant side of the same rule **fails closed**: when
   appending a grant's receipt would overflow the cap with no pure grant
   available to evict (a denial-full outbox), `set_consent(true)` is
-  refused with `false, "consent_outbox_overflow"` — the state does not
+  refused with `false, "consent_outbox_full"` — the state does not
   flip, nothing is evicted, every denial stays — and succeeds once the
   outbox drains below the cap; a denial append still applies (an
   all-denials overflow evicts the oldest denial in favor of the fresh

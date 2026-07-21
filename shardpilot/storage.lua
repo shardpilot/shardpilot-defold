@@ -981,7 +981,7 @@ local consent_outbox_memory = {}
 
 local max_consent_outbox_entries = 32
 -- Exported so the client's grant-append fail-closed gate (set_consent
--- refusing `consent_outbox_overflow` on a denial-full outbox) reasons about
+-- refusing `consent_outbox_full` on a denial-full outbox) reasons about
 -- the SAME cap this store enforces, from one definition.
 M.max_consent_outbox_entries = max_consent_outbox_entries
 
