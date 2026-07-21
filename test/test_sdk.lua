@@ -2991,6 +2991,237 @@ local function test_persist_snapshots_queue_while_running()
 	storage.reset()
 end
 
+-- P2 review fix (round 1): persist() must make owed summaries durable. A
+-- full-queue refusal turns a built perf/network summary into an owed entry
+-- whose sampler window is already consumed; a focus-loss persist() that
+-- snapshots only the queue/in-flight tail would report the tail durable
+-- while a process death still loses both summaries. persist() now enqueues
+-- owed entries when the queue has room and appends the still-refused ones
+-- to the durable spool directly — a relaunch re-sends them verbatim
+-- (original event_id / identity / session).
+local function test_persist_captures_owed_summaries_across_relaunch()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	next_status = 500
+	local client = assert(sdk.new(config({
+		buffer_size = 1,
+		flush_interval_seconds = 9999,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:session_start())
+	local original_session = client.session_id
+	client:update(0.016)
+	client:update(0.020)
+	client:observe_ping_ms(42)
+	assert_equal(#client.queue.items, 1)
+
+	-- The flush builds both summaries against the FULL queue (they become
+	-- owed) and fails the publish transiently (offline).
+	assert_equal(client:flush(), false)
+	assert_equal(#client.owed_summaries, 2, "both built summaries are owed")
+	-- Refill the single-slot queue so the persist below cannot enqueue the
+	-- owed entries — forcing the direct-spool arm.
+	assert_true(client:track("filler_event"))
+	local owed_ids = {}
+	for i = 1, #client.owed_summaries do
+		local event = client.owed_summaries[i].event
+		owed_ids[event.event_name] = event.event_id
+	end
+
+	assert_true(client:persist(),
+		"persist must succeed once the owed summaries are durably captured")
+	assert_equal(#client.owed_summaries, 2,
+		"direct-spooled entries stay owed in memory for live delivery")
+	local record = stored_spool_record(stores)
+	assert_true(record ~= nil)
+	local spooled = {}
+	for i = 1, #record.events do
+		spooled[record.events[i].event_name] = record.events[i]
+	end
+	assert_true(spooled["perf_summary"] ~= nil,
+		"persist must capture the owed perf summary durably")
+	assert_true(spooled["network_summary"] ~= nil,
+		"persist must capture the owed network summary durably")
+	assert_equal(spooled["perf_summary"].event_id, owed_ids["perf_summary"],
+		"the spooled copy is the owed envelope verbatim")
+	assert_equal(spooled["network_summary"].event_id, owed_ids["network_summary"])
+	assert_equal(spooled["perf_summary"].user_id, "user-example",
+		"the spooled copy preserves the build-time actor")
+	assert_equal(spooled["perf_summary"].session_id, original_session,
+		"the spooled copy preserves the build-time session")
+
+	-- A second persist appends nothing new (event_id-idempotent).
+	local events_before = #record.events
+	assert_true(client:persist())
+	record = stored_spool_record(stores)
+	assert_equal(#record.events, events_before,
+		"repeated persists must not duplicate owed entries")
+
+	-- Simulated process death + relaunch, back online: the spooled remnant
+	-- re-sends and both summaries land on the wire.
+	reset()
+	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(#relaunch.spool_batches > 0)
+	assert_true(relaunch:flush())
+	local resent = {}
+	for i = 1, #requests do
+		for name in string.gmatch(requests[i].body or "", '"event_name":"([^"]+)"') do
+			resent[name] = true
+		end
+	end
+	assert_true(resent["perf_summary"] ~= nil,
+		"the owed perf summary must land on the wire after the relaunch")
+	assert_true(resent["network_summary"] ~= nil,
+		"the owed network summary must land on the wire after the relaunch")
+	restore()
+	storage.reset()
+end
+
+-- P2 review fix (round 1): an owed summary replays under the identity it
+-- was BUILT with. Mode A (no per-session credential): identify() after the
+-- refusal proceeds, and the drained summary lands attributed to the
+-- original user and session while post-switch events carry the new user.
+local function test_owed_summary_preserves_actor_across_identify_mode_a()
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a({
+		buffer_size = 1,
+		flush_interval_seconds = 9999,
+	})))
+	assert_true(client:identify("user-alpha"))
+	assert_true(client:session_start())
+	local original_session = client.session_id
+	client:update(0.016)
+	client:update(0.020)
+
+	-- The flush builds the perf summary against the FULL queue: it becomes
+	-- owed, snapshotted under user-alpha; the queued session start publishes.
+	assert_true(client:flush())
+	assert_equal(#client.owed_summaries, 1, "the perf summary is owed")
+	assert_equal(client.owed_summaries[1].event.user_id, "user-alpha",
+		"the owed snapshot preserves the build-time actor")
+
+	assert_true(client:identify("user-beta"),
+		"Mode A has no per-session credential — the switch proceeds")
+	assert_true(client:flush(), "the owed drain delivers under the old actor")
+	assert_true(client:track("post_switch_event"))
+	assert_true(client:flush())
+
+	local summary_user = nil
+	local summary_session = nil
+	local post_switch_user = nil
+	for i = 1, #requests do
+		local body = requests[i].body or ""
+		if string.find(body, '"event_name":"perf_summary"', 1, true) then
+			summary_user = string.match(body, '"user_id":"([^"]+)"')
+			summary_session = string.match(body, '"session_id":"([^"]+)"')
+		end
+		if string.find(body, '"event_name":"post_switch_event"', 1, true) then
+			post_switch_user = string.match(body, '"user_id":"([^"]+)"')
+		end
+	end
+	assert_equal(summary_user, "user-alpha",
+		"the owed summary must land attributed to the actor it was built under")
+	assert_equal(summary_session, original_session,
+		"the owed summary must keep its build-time session")
+	assert_equal(post_switch_user, "user-beta",
+		"post-switch events carry the new actor")
+	storage.reset()
+end
+
+-- P2 review fix (round 1), Mode B arm: an owed summary snapshotted to
+-- another verified user is undrained event work a credential minted for
+-- the incoming user cannot vouch for — identify() refuses (events_pending,
+-- the same pending-work family as queued/in-flight/spooled events) until
+-- the owed entry drains; the drained summary lands under the original
+-- actor and the switch then proceeds.
+local function test_identify_refused_while_owed_summary_pending_mode_b()
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({
+		buffer_size = 1,
+		flush_interval_seconds = 9999,
+	})))
+	assert_true(client:identify("user-alpha"))
+	assert_true(client:session_start())
+	client:update(0.016)
+	client:update(0.020)
+
+	assert_true(client:flush())
+	assert_equal(#client.owed_summaries, 1)
+	assert_equal(#client.queue.items, 0,
+		"only the owed snapshot remains undrained")
+	assert_equal(client.in_flight_batch, nil)
+
+	local ok, err = client:identify("user-beta")
+	assert_equal(ok, false,
+		"Mode B must refuse the switch while an owed summary is snapshotted to another user")
+	assert_equal(err, "events_pending")
+	assert_equal(client.user_id, "user-alpha", "the refused switch must not apply")
+
+	-- The host recourse: flush first (drains the owed summary under the
+	-- original actor), then re-identify.
+	assert_true(client:flush())
+	assert_equal(#client.owed_summaries, 0)
+	local summary_user = nil
+	for i = 1, #requests do
+		local body = requests[i].body or ""
+		if string.find(body, '"event_name":"perf_summary"', 1, true) then
+			summary_user = string.match(body, '"user_id":"([^"]+)"')
+		end
+	end
+	assert_equal(summary_user, "user-alpha")
+	assert_true(client:identify("user-beta"), "the drained pipeline admits the switch")
+	storage.reset()
+end
+
+-- P2 review fix (round 1), Mode B rotation arm: owed summaries are pending
+-- old-anon work that sits outside the queue (their built envelopes carry
+-- the old anon verbatim), so set_anonymous_id refuses like it does for
+-- queued/in-flight/spooled work until they drain.
+local function test_set_anonymous_id_rejected_while_owed_summary_pending_mode_b()
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({
+		buffer_size = 1,
+		flush_interval_seconds = 9999,
+	})))
+	assert_true(client:session_start())
+	client:update(0.016)
+	client:update(0.020)
+	local original_anon = client.anonymous_id
+
+	assert_true(client:flush())
+	assert_equal(#client.owed_summaries, 1)
+	assert_equal(#client.queue.items, 0)
+
+	local ok, err = client:set_anonymous_id("anon-rotated-example")
+	assert_equal(ok, false,
+		"Mode B must refuse rotation while an owed summary carries the old anon")
+	assert_equal(err, "events_pending")
+	assert_equal(client.anonymous_id, original_anon, "the refused rotation must not apply")
+
+	assert_true(client:flush())
+	assert_equal(#client.owed_summaries, 0)
+	local summary_anon = nil
+	for i = 1, #requests do
+		local body = requests[i].body or ""
+		if string.find(body, '"event_name":"perf_summary"', 1, true) then
+			summary_anon = string.match(body, '"anonymous_id":"([^"]+)"')
+		end
+	end
+	assert_equal(summary_anon, original_anon,
+		"the drained summary carries the anon it was built under")
+	assert_true(client:set_anonymous_id("anon-rotated-example"),
+		"the drained pipeline admits the rotation")
+	storage.reset()
+end
+
 -- Mode B anon rotation waits for pending spooled work the same way it waits
 -- for queued/in-flight events: the spooled envelopes carry the historic anon.
 local function test_set_anonymous_id_rejected_while_spool_pending_mode_b()
@@ -6066,6 +6297,10 @@ local tests = {
 	test_shutdown_spools_undelivered_and_finalizes,
 	test_shutdown_full_queue_spools_session_end_and_summaries,
 	test_persist_snapshots_queue_while_running,
+	test_persist_captures_owed_summaries_across_relaunch,
+	test_owed_summary_preserves_actor_across_identify_mode_a,
+	test_identify_refused_while_owed_summary_pending_mode_b,
+	test_set_anonymous_id_rejected_while_owed_summary_pending_mode_b,
 	test_set_anonymous_id_rejected_while_spool_pending_mode_b,
 	test_shutdown_fails_when_remnant_evicted_by_caps,
 	test_spool_identity_mismatch_dropped_mode_b_kept_mode_a,

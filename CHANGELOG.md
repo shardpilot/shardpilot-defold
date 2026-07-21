@@ -46,7 +46,15 @@
   summaries after the deferred session end and refuse to finalize over one
   — like every other owed exit work, a summary is sent, durably spooled, or
   shutdown stays retryable. A denial still drops owed summaries with the
-  rest of the un-egressed analytics data.
+  rest of the un-egressed analytics data. The owed snapshot is the BUILT
+  event: actor, anonymous id, session, and timestamps replay verbatim (an
+  `identify()` or anon change between refusal and drain cannot
+  misattribute the old window's samples), Mode B's pending-work refusals
+  (`identify()`'s `events_pending`, the anon-rotation guard) count owed
+  summaries like queued events, and `persist()` captures owed summaries
+  too — enqueued when the queue has room, appended directly to the durable
+  spool when it does not — so a focus-loss snapshot cannot lose a consumed
+  sampler window.
 
 - **Canonical-actor consent-receipt keying (ADR-0222 §1, ADR-0202 2026-07-20
   amendment).** A consent receipt's actor is now chosen by the event plane's

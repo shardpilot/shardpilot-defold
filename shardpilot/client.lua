@@ -583,10 +583,17 @@ function M.new(config)
 		-- retained here instead and re-enqueued at the next summary point
 		-- (bounded: at most one perf and one network entry, because no fresh
 		-- summary is built while one is still owed — the samplers keep
-		-- accumulating, self-bounded by their own sample caps). Shutdown's
-		-- housekeeping passes drain these so exit-time summaries ride the
-		-- final flush (or the durable spool) instead of vanishing; a denial
-		-- clears them with the rest of the un-egressed analytics data.
+		-- accumulating, self-bounded by their own sample caps). Each entry
+		-- keeps the BUILT event: identity, session, and timestamps stay as
+		-- stamped at the refusal moment and replay verbatim once the queue
+		-- frees (enqueue_owed_summary — never re-tracked under a later
+		-- actor), and the Mode B pending-work guards (identify()'s
+		-- events_pending refusal, the anon-rotation guard) count these
+		-- entries like queued events. Shutdown's housekeeping passes drain
+		-- these so exit-time summaries ride the final flush (or the durable
+		-- spool) instead of vanishing; persist() captures a still-owed entry
+		-- into the durable spool the same way; a denial clears them with the
+		-- rest of the un-egressed analytics data.
 		owed_summaries = {},
 		flush_elapsed_seconds = 0,
 		initialized = true,
@@ -1025,9 +1032,11 @@ function Client:persist_identity()
 	return storage.save(self.config, record)
 end
 
--- True while undrained event work — queued, in an in-flight batch, or
--- reloaded on the durable spool — carries a USER identity snapshot other
--- than `user_id`. Events snapshot the identity in force at enqueue time
+-- True while undrained event work — queued, in an in-flight batch,
+-- reloaded on the durable spool, or retained as an owed summary snapshot
+-- (a BUILT summary a full queue refused; it replays verbatim) — carries a
+-- USER identity snapshot other than `user_id`. Events snapshot the
+-- identity in force at enqueue time
 -- (and spooled envelopes re-send verbatim), so this is exactly the work a
 -- credential minted after identifying as `user_id` could not vouch for: a
 -- flush after the switch would ship the previous user's events under the
@@ -1051,6 +1060,12 @@ function Client:user_events_pending_for_other(user_id)
 			if snapshot ~= nil and snapshot ~= user_id then
 				return true
 			end
+		end
+	end
+	for i = 1, #self.owed_summaries do
+		local snapshot = self.owed_summaries[i].event.user_id
+		if snapshot ~= nil and snapshot ~= user_id then
+			return true
 		end
 	end
 	for i = 1, #self.spool_record do
@@ -1177,11 +1192,19 @@ function Client:set_anonymous_id(anonymous_id)
 	--     queue does not mean the old anon is drained — rotating first would
 	--     send the old-anon fact under a token minted for the new anon and
 	--     the bind_anon check would reject the whole batch.
+	--   * OWED summary snapshots are the same shape one step further along:
+	--     a full queue refused an already-BUILT perf/network summary, and
+	--     the built envelope carries the old anon verbatim (it re-enqueues
+	--     verbatim once the queue frees — never re-stamped), so rotating
+	--     first would ship an old-anon summary under a token minted for the
+	--     new anon — the same whole-batch bind_anon rejection as the spool
+	--     case.
 	-- The host retries the rotation once the pending work clears.
 	local rotating = self.config.token_provider and anonymous_id ~= self.anonymous_id
 	if rotating and (queue.size(self.queue) > 0 or self.in_flight_batch ~= nil
 		or self.token_request_in_flight or self:consent_outbox_anon_pending()
 		or self:spool_pending()
+		or #self.owed_summaries > 0
 		or (self.experiments and self.experiments:has_owed_exposures())) then
 		return false, "events_pending"
 	end
@@ -1727,7 +1750,12 @@ function Client:enqueue_event(event_name, props, context, fact)
 		if not (fact and fact.retryable) then
 			self.stats.dropped = self.stats.dropped + 1
 		end
-		return false, "queue_full"
+		-- The built (identity-stamped) event rides the refusal so
+		-- enqueue_summaries can retain it as an owed snapshot: a summary
+		-- must replay under the identity and session it was built with —
+		-- never re-stamped with whatever actor is current when the queue
+		-- finally frees. Other callers ignore the extra value.
+		return false, "queue_full", event
 	end
 	self.session_sequence = event.session_sequence
 	self.stats.enqueued = self.stats.enqueued + 1
@@ -1776,6 +1804,39 @@ function Client:observe_disconnect(reason)
 	sampling.disconnect(self.network, reason)
 end
 
+-- Re-enqueue one owed summary snapshot with its BUILT event preserved: the
+-- summary was built — identity stamped, sampler window consumed — at the
+-- moment the full queue refused it, so the retry pushes that original
+-- event verbatim (event_id, event_ts, user_id, anonymous_id, session_id)
+-- instead of re-tracking under whatever actor/session is current at drain
+-- time — an identify() or anon rotation between refusal and drain must not
+-- misattribute samples collected under the old actor/session. The ONE
+-- enqueue-time field is session_sequence: exactly like a late-drained
+-- experiment fact, it stays the enqueue stream's counter (the refusal-time
+-- number was never committed, so later events may have claimed it — the
+-- server's cross-session ordering key is the timestamp).
+function Client:enqueue_owed_summary(entry)
+	if not self.initialized then
+		return false, "shutdown"
+	end
+	if consent_denied_state(self.consent_state) then
+		return false, "consent_denied"
+	end
+	if self.consent_state ~= "granted" then
+		return false, "consent_unknown"
+	end
+	local event = entry.event
+	event.session_sequence = self.session_sequence + 1
+	if not queue.push(self.queue, event) then
+		-- Still owed — never counted dropped here: like a retryable owed
+		-- fact, the snapshot stays armed and re-enqueues once room frees.
+		return false, "queue_full"
+	end
+	self.session_sequence = event.session_sequence
+	self.stats.enqueued = self.stats.enqueued + 1
+	return true
+end
+
 function Client:enqueue_summaries()
 	-- Summary events ride the same consent gate as track(). While the
 	-- pipeline is closed the accumulated samples are DROPPED, not held — the
@@ -1791,14 +1852,15 @@ function Client:enqueue_summaries()
 	end
 	-- Owed-first: a summary a FULL queue refused earlier was already built —
 	-- its sampler window is consumed — so it re-enqueues ahead of any fresh
-	-- one (older window first). Only a still-full queue keeps it owed;
-	-- any other refusal is terminal for a summary (best-effort telemetry —
-	-- track already counted the drop).
+	-- one (older window first), envelope preserved (enqueue_owed_summary).
+	-- Only a still-full queue keeps it owed; any other refusal is terminal
+	-- for a summary (best-effort telemetry — track already counted the drop
+	-- at build time).
 	local owed = self.owed_summaries
 	self.owed_summaries = {}
 	for i = 1, #owed do
 		local entry = owed[i]
-		local ok, err = self:track(entry.event_name, entry.props)
+		local ok, err = self:enqueue_owed_summary(entry)
 		if not ok and err == "queue_full" then
 			self.owed_summaries[#self.owed_summaries + 1] = entry
 		end
@@ -1812,18 +1874,18 @@ function Client:enqueue_summaries()
 	end
 	local perf = sampling.perf_summary(self.perf)
 	if perf then
-		local ok, err = self:track("perf_summary", perf)
+		local ok, err, refused = self:track("perf_summary", perf)
 		if not ok and err == "queue_full" then
 			self.owed_summaries[#self.owed_summaries + 1] =
-				{ event_name = "perf_summary", props = perf }
+				{ event_name = "perf_summary", event = refused }
 		end
 	end
 	local network = sampling.network_summary(self.network, self.config.transport)
 	if network then
-		local ok, err = self:track("network_summary", network)
+		local ok, err, refused = self:track("network_summary", network)
 		if not ok and err == "queue_full" then
 			self.owed_summaries[#self.owed_summaries + 1] =
-				{ event_name = "network_summary", props = network }
+				{ event_name = "network_summary", event = refused }
 		end
 	end
 end
@@ -3132,7 +3194,39 @@ function Client:persist()
 		-- owed and is reported below.
 		self.experiments:sweep_owed()
 	end
+	-- Owed summaries join the snapshot too: their sampler windows are
+	-- already consumed into the built events, so a process death after this
+	-- persist would lose them even with the queue tail captured below.
+	-- Enqueue what fits (owed-first, envelopes preserved — the same drain
+	-- the flush cadence runs) so it rides the queue capture; an entry the
+	-- still-full queue refuses is appended to the durable record DIRECTLY
+	-- and stays owed in memory for normal delivery — the spool copy is
+	-- crash insurance only: the event_id keeps the append idempotent across
+	-- repeated persists, the eventual acknowledged publish removes it
+	-- (ack-based, like any persisted copy), and a relaunch re-sends it
+	-- verbatim.
+	local owed_direct = nil
+	if #self.owed_summaries > 0 then
+		local owed = self.owed_summaries
+		self.owed_summaries = {}
+		for i = 1, #owed do
+			local entry = owed[i]
+			local ok, err = self:enqueue_owed_summary(entry)
+			if not ok and err == "queue_full" then
+				self.owed_summaries[#self.owed_summaries + 1] = entry
+				owed_direct = owed_direct or {}
+				owed_direct[#owed_direct + 1] =
+					envelope.build(self.config, self, entry.event)
+			end
+		end
+	end
 	if not self:spool_undelivered() then
+		return false, "spool_persist_failed"
+	end
+	if owed_direct and not self:spool_envelopes(owed_direct) then
+		-- A still-owed summary could not be durably captured: the
+		-- app-may-die snapshot must not claim safety over it (persist()
+		-- parity with owed exposure facts).
 		return false, "spool_persist_failed"
 	end
 	if self.experiments and (self.experiments:has_owed_exposures()
