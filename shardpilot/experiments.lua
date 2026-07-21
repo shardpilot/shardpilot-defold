@@ -561,6 +561,25 @@ local function top_level_projection(body)
 	return table.concat(out)
 end
 
+-- JSON lets any character of a KEY be spelled as a \uXXXX escape, so a
+-- valid body's `"reason": null` DECODES to reason while a literal
+-- raw-text scan sees only the escaped spelling — the present-null would
+-- slip to the ABSENT path (authoritative drops included) on null→nil
+-- runtimes. Normalize, SCAN-SCOPED, only the escapes landing in the
+-- scanned keys' alphabet ([a-z_]): structural characters (quotes, braces,
+-- colons) never materialize, so the projection this feeds cannot be
+-- reshaped, and the parse path is untouched. An escape inside a string
+-- VALUE can at worst manufacture the literal false-positive the scan
+-- already accepts — toward MALFORMED, the safe direction.
+local function unescape_scanned_keys(text)
+	return (text:gsub("\\u(%x%x%x%x)", function(hex)
+		local code = tonumber(hex, 16)
+		if code == 0x5f or (code >= 0x61 and code <= 0x7a) then
+			return string.char(code)
+		end
+	end))
+end
+
 -- Defold's decoder (and the plain-Lua fallback) maps JSON null to Lua nil,
 -- which makes a present `"field": null` indistinguishable from an ABSENT
 -- field by table lookup alone — and the presence/type split treats those
@@ -568,8 +587,10 @@ end
 -- malformed; an absent one is the deterministic traffic-gate miss). On
 -- runtimes whose decoder yields a null SENTINEL (json.null), the ordinary
 -- type checks already catch present-null as a wrong type; for null→nil
--- decoders this raw-body scan restores field PRESENCE. Terminator-guarded;
--- a literal '"field":null' inside a string VALUE can false-positive toward
+-- decoders this raw-body scan restores field PRESENCE. It runs on the
+-- key-unescaped projection (see unescape_scanned_keys) so an escaped key
+-- spelling is recognized too. Terminator-guarded; a literal
+-- '"field":null' inside a string VALUE can false-positive toward
 -- MALFORMED, which is the safe direction (serve-stale, never a directive
 -- misread).
 local function body_field_is_null(body_text, field)
@@ -590,8 +611,11 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 			and type(response.response) == "string" and response.response or ""
 		-- Null-presence scans run on the TOP-LEVEL projection only: a
 		-- nested "app_key": null inside a legitimate variant payload must
-		-- not read as a malformed scope echo.
-		local body_scan = top_level_projection(body_text)
+		-- not read as a malformed scope echo. The projection walks the
+		-- PRISTINE body (its string-awareness stays exact), then the
+		-- scan-scoped key unescape restores escaped spellings of the
+		-- scanned keys.
+		local body_scan = unescape_scanned_keys(top_level_projection(body_text))
 		local decoded = decode_object(type(response) == "table" and response.response or nil)
 		if not decoded then
 			return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
@@ -1107,25 +1131,52 @@ function Experiments:adopt_minted_subject_id()
 	-- re-mint retired. Mint decisive per-key DROPS against the old scope
 	-- (stamped above each entry, rollback-proof) — they land through the
 	-- foreign-scope drop retries whether or not the identity write
-	-- succeeds (a healthy remint's old record is dead weight anyway),
-	-- leaving only the both-writes-failed storage-dead exit window as the
-	-- documented residual.
+	-- succeeds (a healthy remint's old record is dead weight anyway).
+	-- The tombstones come from live memory UNION the old durable scope,
+	-- read HERE at remint time: an ordinary 401/403 latch clears live
+	-- memory while intentionally RETAINING the cache file, so live
+	-- entries alone would cover nothing exactly when the durable record
+	-- still holds the rejected subject's assignments. An UNREADABLE read
+	-- arms a conservative whole-old-scope drop instead — STAMPLESS, by
+	-- design: a grammar-rejected subject's scope must never serve again,
+	-- so no survivor class exists to partition for. It stays owed over
+	-- unreadable passes (the fail-closed canon) and lands as a wholesale
+	-- clear on the first readable one, leaving only the storage-dead-
+	-- through-exit window as the documented residual.
 	if old_scope then
 		local now_ms = clock.unix_ms()
-		for key, held in pairs(retired_entries) do
-			local held_at = type(held) == "table"
-				and type(held.fetched_at_ms) == "number"
-				and held.fetched_at_ms or 0
-			local drop_as_of = now_ms
-			if held_at >= drop_as_of then
-				drop_as_of = held_at + 1
-			end
-			self.durable_pending[old_scope .. scope_separator .. key] = {
-				key = key,
+		local record, record_miss = storage.load_experiments(self.config)
+		if record == nil and record_miss == "unreadable" then
+			self.durable_pending[old_scope .. scope_separator] = {
+				key = "",
 				scope = old_scope,
-				as_of = drop_as_of,
+				as_of = now_ms,
 				drop = true,
+				scope_wide = true,
 			}
+		else
+			if record ~= nil and record.scope == old_scope then
+				for key, stored in pairs(record.entries) do
+					if retired_entries[key] == nil then
+						retired_entries[key] = stored
+					end
+				end
+			end
+			for key, held in pairs(retired_entries) do
+				local held_at = type(held) == "table"
+					and type(held.fetched_at_ms) == "number"
+					and held.fetched_at_ms or 0
+				local drop_as_of = now_ms
+				if held_at >= drop_as_of then
+					drop_as_of = held_at + 1
+				end
+				self.durable_pending[old_scope .. scope_separator .. key] = {
+					key = key,
+					scope = old_scope,
+					as_of = drop_as_of,
+					drop = true,
+				}
+			end
 		end
 	end
 	if not self.deps.store_subject_id(minted) then
@@ -1854,6 +1905,17 @@ function Experiments:retry_foreign_scope_drop(composite, pending)
 		self.durable_pending[composite] = nil
 		return
 	end
+	if pending.scope_wide then
+		-- The remint's unreadable-fallback condemnation: this record IS the
+		-- rejected subject's (a scope mismatch settled above), and the whole
+		-- scope is dead — stampless by design, no survivor class exists for
+		-- a scope that must never serve again. A wholesale clear lands it;
+		-- the unreadable pass above kept it owed.
+		if storage.clear_experiments(self.config) then
+			self.durable_pending[composite] = nil
+		end
+		return
+	end
 	local stored = record.entries[pending.key]
 	if stored == nil then
 		self.durable_pending[composite] = nil
@@ -2286,13 +2348,34 @@ function Experiments:apply_sentinel_withdrawal(scope, resolved_at_ms, dispatched
 	-- writes are withdrawn state and cancel, the ordinary latch's rule.
 	for pending_composite, pending in pairs(self.durable_pending) do
 		if not pending.drop then
-			local live = self.entries[pending.key]
-			if pending.scope == scope and pending.entry == nil
-				and live ~= nil and type(live.fetched_at_ms) == "number"
-				and live.fetched_at_ms > sentinel_dispatch_bound then
-				pending.entry = live
-			elseif pending.entry == nil then
-				self.durable_pending[pending_composite] = nil
+			if pending.entry ~= nil then
+				-- A snapshot preserved through an EARLIER sentinel's wipe
+				-- partitions under THIS sentinel exactly like live state: a
+				-- snapshot at/before this sentinel's dispatch bound is state
+				-- the newer sentinel withdraws — leaving it owed would let
+				-- retry_durable_sync() write it back AFTER this clear
+				-- settles, resurrecting the assignment and its subject-fact
+				-- key. Its write half cancels here (owed DROPS are untouched
+				-- by this loop and still land, as always); a post-dispatch
+				-- snapshot stays a preserved survivor, and another scope's
+				-- snapshot is not this sentinel's to judge. A snapshot with
+				-- no readable stamp cannot prove it postdates the dispatch
+				-- and cancels conservatively.
+				if pending.scope == scope
+					and (type(pending.entry.fetched_at_ms) ~= "number"
+						or pending.entry.fetched_at_ms
+							<= sentinel_dispatch_bound) then
+					self.durable_pending[pending_composite] = nil
+				end
+			else
+				local live = self.entries[pending.key]
+				if pending.scope == scope
+					and live ~= nil and type(live.fetched_at_ms) == "number"
+					and live.fetched_at_ms > sentinel_dispatch_bound then
+					pending.entry = live
+				else
+					self.durable_pending[pending_composite] = nil
+				end
 			end
 		end
 	end

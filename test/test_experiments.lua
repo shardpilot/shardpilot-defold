@@ -122,9 +122,18 @@ local function json_decode(text)
 				return table.concat(parts)
 			elseif ch == "\\" then
 				local esc = string.sub(text, pos + 1, pos + 1)
-				local map = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", n = "\n", t = "\t", r = "\r", b = "\b", f = "\f" }
-				parts[#parts + 1] = map[esc] or esc
-				pos = pos + 2
+				if esc == "u" then
+					-- Real Defold's decoder resolves \uXXXX escapes per the
+					-- JSON grammar; the ASCII range is all the tests need
+					-- (escaped-key spellings of scanned field names).
+					parts[#parts + 1] = string.char(
+						tonumber(string.sub(text, pos + 2, pos + 5), 16))
+					pos = pos + 6
+				else
+					local map = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", n = "\n", t = "\t", r = "\r", b = "\b", f = "\f" }
+					parts[#parts + 1] = map[esc] or esc
+					pos = pos + 2
+				end
 			else
 				parts[#parts + 1] = ch
 				pos = pos + 1
@@ -7203,6 +7212,219 @@ function extra_tests.test_remint_tombstones_old_scope_durably()
 	storage.reset()
 end
 
+function extra_tests.test_latched_remint_tombstones_durable_entries()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- An ORDINARY 401 latches the plane: live memory is cleared while the
+	-- durable record is intentionally retained.
+	next_status = 401
+	next_response_body = "{}"
+	fetch(client, "exp-checkout")
+	next_status = 200
+	next_response_body = nil
+
+	-- The grammar sentinel then forces a re-mint whose IDENTITY persist
+	-- fails. The tombstones must come from the DURABLE old scope: live
+	-- memory is empty post-latch, so tombstones built from it alone cover
+	-- nothing — and the relaunch would restore the old subject and serve
+	-- the very assignments the server just rejected. (The re-mint retry
+	-- answers transient so no new-scope record replaces the file.)
+	state.fail_save = function(path)
+		return path:match("/identity$") ~= nil
+	end
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = json.encode({
+				error = "experiment metadata must use synthetic local-safe identifiers only",
+			}) })
+		else
+			callback(nil, nil, { status = 503, response = "{}" })
+		end
+		return true
+	end
+	fetch(client, "exp-checkout")
+	responder = nil
+	state.fail_save = nil
+	client:update(0.016)
+
+	-- Process death: the relaunch restores the OLD subject (its identity
+	-- write failed) — and must find the latch-retained record tombstoned.
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-checkout"),
+		"a latch-cleared remint still tombstones the old durable scope")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_later_sentinel_cancels_covered_snapshot_write()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body({ experiment_key = "exp-a" })
+	fetch(client, "exp-a")
+
+	-- Sentinel ONE goes out; after its dispatch exp-b lands with its
+	-- install save failing. The first wipe preserves exp-b's owed write as
+	-- a pending.entry snapshot (the R23 rule).
+	local held = {}
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	client:fetch_experiment_assignment("exp-a", function() end)
+	responder = nil
+	assert_equal(#held, 1)
+	advance_seconds(1)
+	state.fail_save = fail_experiment_saves
+	next_response_body = assignment_body({
+		experiment_key = "exp-b", variant_key = "treatment-b",
+	})
+	fetch(client, "exp-b")
+	next_response_body = nil
+	held[1](nil, nil, { status = 403,
+		response = json.encode({ error = "experiment real-subject assignment is disabled" }) })
+
+	-- Sentinel TWO is dispatched AFTER exp-b's stamp — its authority
+	-- covers the snapshot — and a fresh exp-d lands after ITS dispatch
+	-- (save still failing). The second wipe must cancel exp-b's covered
+	-- snapshot while preserving exp-d's post-dispatch one.
+	advance_seconds(1)
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	client:fetch_experiment_assignment("exp-a", function() end)
+	responder = nil
+	assert_equal(#held, 2)
+	advance_seconds(1)
+	next_response_body = assignment_body({
+		experiment_key = "exp-d", variant_key = "treatment-d",
+	})
+	fetch(client, "exp-d")
+	next_response_body = nil
+	held[2](nil, nil, { status = 403,
+		response = json.encode({ error = "experiment real-subject assignment is disabled" }) })
+	state.fail_save = nil
+
+	-- The store heals: sentinel TWO's clear settles first, then the owed
+	-- writes retry — exp-b's withdrawn snapshot must NOT be written back
+	-- after the clear, while exp-d's preserved write still lands.
+	client:update(0.016)
+	client:update(0.016)
+	storage.reset()
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-b"),
+		"a later sentinel's covered snapshot is never written back")
+	assert_equal(relaunch:experiment_variant("exp-d"), "treatment-d",
+		"the post-dispatch survivor of the later sentinel still lands")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_escaped_null_presence_keys_are_malformed()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+
+	-- A valid JSON body may spell any KEY character as a \uXXXX escape:
+	-- the decoder still yields reason == nil for a present null, but a
+	-- literal raw-body scan misses the escaped spelling — the present-null
+	-- must not slip to the ABSENT path's authoritative drop.
+	next_response_body = '{"assigned":false,"r\\u0065ason":null,'
+		.. '"boundary":{"assignment_unit":"client_id"}}'
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.from_cache,
+		"an escaped present-null reason is malformed, never the absent drop")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the cached assignment survives the escaped-reason null")
+
+	-- The same class through the version scan.
+	next_response_body = '{"assigned":false,"v\\u0065rsion":null,'
+		.. '"reason":"kill_switch",'
+		.. '"boundary":{"assignment_unit":"client_id"}}'
+	result = fetch(client, "exp-checkout")
+	assert_true(result.ok and result.from_cache,
+		"an escaped present-null version is malformed, never a drop")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"the cached assignment survives the escaped-version null")
+end
+
+function extra_tests.test_spool_purge_clears_condemnation_debt()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = 503, response = "{}" })
+			return true
+		end
+		return false
+	end
+	assert_true(not client:flush({ include_summaries = false }))
+	responder = nil
+
+	-- Sentinel with the spool store down: the cache clear lands, the
+	-- purge's spool rewrite fails — condemnation debt recorded, marker
+	-- persisted for the spool's sake.
+	advance_seconds(2)
+	state.fail_save = function(path)
+		return path:match("/spool$") ~= nil
+	end
+	next_status = 403
+	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	fetch(client, "exp-checkout")
+	next_status = 200
+	next_response_body = nil
+	local marker_path = nil
+	for key in pairs(stores) do
+		if key:match("/experiments%-clear$") then
+			marker_path = key
+		end
+	end
+	assert_true(marker_path ~= nil and type(stores[marker_path]) == "table"
+		and stores[marker_path].stamp ~= nil,
+		"the spool-only condemnation debt persists the marker")
+
+	-- Consent is revoked while the spool store is still down (the denial
+	-- purge goes owed), then the store heals and the RETRIED purge empties
+	-- the durable spool. An emptied spool proves cleanliness exactly like
+	-- a whole-file write: the debt must clear with it, and the settled
+	-- record side then retires the marker instead of keeping the sidecar
+	-- alive for the rest of the process on a stale flag.
+	client:set_consent(false)
+	state.fail_save = nil
+	client:flush({ include_summaries = false })
+	client:update(0.016)
+	client:update(0.016)
+	assert_true(stores[marker_path] == nil
+		or type(stores[marker_path]) ~= "table"
+		or stores[marker_path].stamp == nil,
+		"a successful spool purge lets the condemnation marker retire")
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -7381,6 +7603,10 @@ local tests = {
 	extra_tests.test_invalid_cached_version_never_restores,
 	extra_tests.test_unreadable_record_keeps_whole_clear_owed,
 	extra_tests.test_remint_tombstones_old_scope_durably,
+	extra_tests.test_latched_remint_tombstones_durable_entries,
+	extra_tests.test_later_sentinel_cancels_covered_snapshot_write,
+	extra_tests.test_escaped_null_presence_keys_are_malformed,
+	extra_tests.test_spool_purge_clears_condemnation_debt,
 }
 
 for _, test in ipairs(tests) do

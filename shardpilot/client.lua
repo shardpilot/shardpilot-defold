@@ -1204,6 +1204,13 @@ function Client:set_consent(decision)
 		if storage.clear_spool(self.config) then
 			self.spool_purge_pending = false
 			self.spool_disk_deadline_ms = nil
+			-- An emptied durable spool proves cleanliness exactly like a
+			-- whole-file write does: nothing condemned can remain in a
+			-- cleared record, so the condemnation debt settles with it and
+			-- the fail-closed marker may retire once the record side is
+			-- clean — instead of surviving the whole process on a stale
+			-- flag.
+			self.condemned_spool_pending = false
 		else
 			if not self.spool_purge_pending then
 				self.stats.spool_persist_failed = self.stats.spool_persist_failed + 1
@@ -2357,6 +2364,11 @@ function Client:retry_spool_purge()
 		self.spool_settled = {}
 		self.spool_rewrite_pending = false
 		self.spool_disk_deadline_ms = nil
+		-- The emptied spool also settles any condemnation debt: an empty
+		-- durable record proves cleanliness exactly like a successful
+		-- whole-file write proves it, so the fail-closed marker may retire
+		-- once the record side settles.
+		self.condemned_spool_pending = false
 		return true
 	end
 	return false
