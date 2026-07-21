@@ -68,7 +68,18 @@
   is now a consent dispatch point for exactly that — so an undelivered
   verified denial survives signed-out relaunches. Parked-ness is derived at
   load/dispatch from the receipt's kind and actor, never persisted as its
-  own field. The load-time `identity_changed` drop narrows to
+  own field. A parked receipt never blocks a Mode B `set_anonymous_id`
+  rotation: the rotation guard counts only consent work bound to the OLD
+  anon — anon-keyed retained receipts and an owed durable rewrite — since a
+  verified-keyed receipt keys to its user and survives anon changes by
+  design (its actor may stay signed out indefinitely, and blocking on it
+  would wedge rotation for exactly that long). And the dispatch `identify()`
+  unlocks never rides the previous session's credential: an identity CHANGE
+  drops the cached Mode B token — and a mint still in flight across the
+  change discards its stale result — so the unpark dispatch mints fresh for
+  the just-identified session (an actor/subject mismatch on `/v1/consent`
+  is terminal and would drop the receipt, a retained withdrawal included).
+  The load-time `identity_changed` drop narrows to
   the one configuration where a receipt could never send on any credential:
   anon-keyed entries with a mismatched decision-time anon snapshot in a
   Mode-B-ONLY configuration (with an `api_key` configured, historic-anon

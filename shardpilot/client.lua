@@ -487,6 +487,11 @@ function M.new(config)
 		token = nil,
 		token_expires_at_ms = nil,
 		token_request_in_flight = false,
+		-- Identity epoch for Mode B mints: bumped when identify() changes the
+		-- user, so a mint still in flight for the PREVIOUS session discards
+		-- its result instead of installing a token that cannot vouch for the
+		-- current one (refresh_token fences its callback on this).
+		token_epoch = 0,
 		in_flight_batch = nil,
 		-- Set when a sentinel fact purge finds a publish mid-flight: the
 		-- batch on the wire is past recall, but if it fails and is
@@ -957,7 +962,23 @@ function Client:identify(user_id)
 	if not valid_identity(user_id) then
 		return false, "invalid_user_id"
 	end
+	local identity_changed = user_id ~= self.user_id
 	self.user_id = user_id
+	if identity_changed and self.config.token_provider then
+		-- A cached Mode B JWT vouches for the session it was minted in — the
+		-- anonymous session, or a previously identified user. Reusing it for
+		-- work unlocked by THIS identity change (most immediately the parked
+		-- user_verified receipt dispatch below) would send the new actor
+		-- under a credential that cannot vouch for it: the consent route
+		-- rejects an actor/subject mismatch terminally, dropping the receipt
+		-- — a retained withdrawal included. Drop the cached token so the next
+		-- dispatch mints one bound to the just-identified session (mirroring
+		-- the anon-rotation token drop below), and bump the epoch so a mint
+		-- already in flight discards its stale result on arrival.
+		self.token = nil
+		self.token_expires_at_ms = nil
+		self.token_epoch = self.token_epoch + 1
+	end
 	-- A newly presentable verified identity is a consent dispatch point: a
 	-- user_verified receipt parked for exactly this actor (receipt_parked)
 	-- becomes dispatchable the moment a Mode B session can vouch for it, so
@@ -985,11 +1006,18 @@ function Client:set_anonymous_id(anonymous_id)
 	--   * token_request_in_flight: an async mint (e.g. a set_consent receipt) is
 	--     running with the old anon and its callback would cache a stale-bind_anon
 	--     JWT after we rotate;
-	--   * retained consent receipts (the durable outbox — including receipts
-	--     reloaded from a previous launch) carry the old anon actor_identifier
-	--     and survive even after the token request settles (e.g. a
-	--     token_provider error leaves them queued); their retry would mint for
-	--     the new anon but send the old actor.
+	--   * retained ANON-KEYED consent receipts (the durable outbox — including
+	--     receipts reloaded from a previous launch) carry the old anon
+	--     actor_identifier and survive even after the token request settles
+	--     (e.g. a token_provider error leaves them queued); their retry would
+	--     mint for the new anon but send the old actor. A user_verified-keyed
+	--     receipt never blocks rotation: it keys to the verified user and
+	--     dispatches only under a JWT vouching for that user, so the anon id
+	--     never enters its dispatch — and a PARKED one can outlive its
+	--     actor's session indefinitely, so blocking on it would wedge
+	--     rotation for as long as that user stays signed out
+	--     (consent_outbox_anon_pending; an owed durable rewrite still
+	--     blocks).
 	--   * spooled envelopes loaded from a previous launch carry their historic
 	--     anonymous_id snapshot; re-sending them under a token minted for the
 	--     NEW anon would be rejected the same way, so rotation waits until the
@@ -1003,7 +1031,7 @@ function Client:set_anonymous_id(anonymous_id)
 	-- The host retries the rotation once the pending work clears.
 	local rotating = self.config.token_provider and anonymous_id ~= self.anonymous_id
 	if rotating and (queue.size(self.queue) > 0 or self.in_flight_batch ~= nil
-		or self.token_request_in_flight or self:consent_outbox_pending()
+		or self.token_request_in_flight or self:consent_outbox_anon_pending()
 		or self:spool_pending()
 		or (self.experiments and self.experiments:has_owed_exposures())) then
 		return false, "events_pending"
@@ -1615,8 +1643,17 @@ function Client:refresh_token()
 		return false
 	end
 	self.token_request_in_flight = true
+	-- The mint is fenced to the identity epoch it was requested under: the
+	-- host mints for its CURRENT session, so a callback landing after
+	-- identify() changed the user would install a token vouching for the
+	-- previous identity. Such a late callback still settles the in-flight
+	-- flag but discards its result — the next dispatch point mints fresh.
+	local epoch = self.token_epoch
 	local ok, err = pcall(self.config.token_provider, function(new_token, new_expires_at, callback_error)
 		self.token_request_in_flight = false
+		if epoch ~= self.token_epoch then
+			return
+		end
 		if callback_error or type(new_token) ~= "string" or new_token == "" then
 			self.token = nil
 			self.token_expires_at_ms = nil
@@ -1872,11 +1909,32 @@ end
 -- server acknowledgment (including receipts reloaded from a previous launch),
 -- OR an owed durable rewrite. The dirty case matters even with an empty
 -- mirror — a failed post-delivery prune leaves the acknowledged receipt on
--- disk, where the next launch reloads and re-sends it; a Mode B anon rotation
--- must wait for that rewrite too, or the stale receipt would replay an old
--- actor under a token minted for the new one.
+-- disk, where the next launch reloads and re-sends it — so teardown's
+-- consent_pending contract and the anon-rotation guard both wait for that
+-- rewrite (the guard through consent_outbox_anon_pending below).
 function Client:consent_outbox_pending()
 	return #self.consent_outbox > 0 or self.consent_outbox_dirty
+end
+
+-- The anon-rotation guard's view of the outbox: only work BOUND TO THE OLD
+-- ANON blocks a rotation. That is every ANON-KEYED retained receipt (its
+-- actor IS the old anon — a post-rotation retry would mint for the new anon
+-- and send the old actor) and any owed durable rewrite (a stale on-disk
+-- record could replay an old-anon receipt on the next launch). A
+-- user_verified-keyed receipt never blocks: it keys to the verified user,
+-- dispatches only under a JWT vouching for that user, and survives anon
+-- changes by design — a PARKED one (its actor signed out) could otherwise
+-- hold set_anonymous_id in events_pending indefinitely.
+function Client:consent_outbox_anon_pending()
+	if self.consent_outbox_dirty then
+		return true
+	end
+	for i = 1, #self.consent_outbox do
+		if self.consent_outbox[i].kind ~= "user_verified" then
+			return true
+		end
+	end
+	return false
 end
 
 -- Consent-receipt delivery paces its retries independently of the events

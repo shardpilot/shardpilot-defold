@@ -224,10 +224,16 @@ outbox:
   user signed in (another actor's minted token could never deliver the
   receipt): a parked receipt is retained and persisted — still counted
   toward the cap — but excluded from dispatch and from the events-plane
-  grant gate (it never wedges `flush()` or teardown), and delivers
-  verbatim, same `idempotency_key`, the moment a Mode B session identifies
-  as its actor again (`identify()` is a consent dispatch point), so an
-  undelivered verified denial survives signed-out relaunches;
+  grant gate (it never wedges `flush()` or teardown, and never blocks a
+  Mode B `set_anonymous_id` rotation — only anon-keyed receipts and an
+  owed durable rewrite do, since a verified receipt keys to its user, not
+  the anon), and delivers verbatim, same `idempotency_key`, the moment a
+  Mode B session identifies as its actor again (`identify()` is a consent
+  dispatch point) — always under a token minted for the vouching session:
+  an identity change drops the cached Mode B token and fences any mint
+  still in flight, so an unparked receipt never rides a credential minted
+  for a previous session — so an undelivered verified denial survives
+  signed-out relaunches;
 - is **cleared on an identity change only when the receipt could never
   send**: in a Mode-B-ONLY configuration (no publishable `api_key`),
   anon-keyed receipts whose decision-time anonymous id no longer matches

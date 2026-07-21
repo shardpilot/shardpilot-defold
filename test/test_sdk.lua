@@ -1211,12 +1211,16 @@ local function test_set_anonymous_id_rejected_while_consent_pending_mode_b()
 			callback(nil, nil, "no token")
 		end,
 	})))
-	assert_true(client:identify("user-example"))
 	assert_true(client:set_consent(true))
 	assert_equal(#client.consent_outbox, 1, "consent stays pending after a token error")
+	assert_equal(client.consent_outbox[1].kind, "anon",
+		"a pre-identify Mode B decision keys to the anon actor")
 	assert_equal(client.token_request_in_flight, false)
-	-- A consent receipt bound to the OLD anon is still pending, so rotation must
-	-- be blocked even though no token request is in flight.
+	-- An ANON-KEYED consent receipt carries the OLD anon as its actor, so
+	-- rotation must be blocked even though no token request is in flight —
+	-- a post-rotation retry would mint for the new anon but send the old
+	-- actor. (A user_verified-keyed receipt does not block: see
+	-- test_rotation_allowed_with_only_parked_verified_receipts.)
 	local ok, err = client:set_anonymous_id("anon-new")
 	assert_equal(ok, false)
 	assert_equal(err, "events_pending")
@@ -4264,6 +4268,128 @@ local function test_parked_receipt_never_blocks_dispatch_or_gates_events()
 	storage.reset()
 end
 
+-- The anon-rotation guard is scoped to work bound to the OLD anon: a
+-- user_verified receipt PARKED for a signed-out actor is anon-independent
+-- (it keys to the verified user and dispatches only under that user's JWT),
+-- so it must not hold set_anonymous_id in events_pending — its actor may
+-- never sign in again, so blocking on it could wedge rotation forever.
+-- Anon-keyed receipts still block, and an owed durable rewrite still blocks
+-- (test_rotation_blocked_while_prune_rewrite_owed).
+local function test_rotation_allowed_with_only_parked_verified_receipts()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- Launch 1 (Mode B, signed in): user A's denial cannot deliver (500) and
+	-- is retained user_verified-keyed.
+	next_status = 500
+	local first = assert(sdk.new(config()))
+	assert_true(first:identify("user-a"))
+	assert_true(first:set_consent(false))
+	assert_equal(#first.consent_outbox, 1)
+	assert_true(first:shutdown("app_final"))
+
+	-- Launch 2 (Mode B, signed out): the receipt parks; rotation proceeds.
+	reset()
+	next_status = 202
+	local second = assert(sdk.new(config()))
+	assert_equal(#second.consent_outbox, 1, "the verified receipt is parked, not dropped")
+	assert_equal(second.consent_outbox[1].kind, "user_verified")
+	assert_true(second:set_anonymous_id("anon-rotated"),
+		"a parked verified receipt must not block anon rotation")
+	assert_equal(second.anonymous_id, "anon-rotated")
+	assert_equal(#second.consent_outbox, 1, "rotation leaves the parked receipt retained")
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1, "the parked receipt stays durably retained")
+
+	-- Contrast pin: an ANON-keyed retained receipt still blocks the next
+	-- rotation (its actor IS the old anon).
+	next_status = 500
+	assert_true(second:set_consent(true))
+	assert_equal(#second.consent_outbox, 2)
+	assert_equal(second.consent_outbox[2].kind, "anon")
+	local ok, err = second:set_anonymous_id("anon-rotated-again")
+	assert_equal(ok, false)
+	assert_equal(err, "events_pending")
+	restore()
+	storage.reset()
+end
+
+-- identify() is a consent dispatch point, and the dispatch it unlocks must
+-- never ride a credential minted for a DIFFERENT session: the consent route
+-- binds the actor to the token subject, and an actor/subject mismatch is
+-- rejected terminally — dropping the receipt, a retained withdrawal
+-- included. An identity CHANGE therefore invalidates the cached Mode B
+-- token before the unpark dispatch (the dispatch mints fresh for the
+-- just-identified session), and a mint still in flight across the change
+-- discards its stale result instead of installing it.
+local function test_identify_invalidates_stale_token_before_unpark_dispatch()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local token_calls = 0
+	local counting_mode_b = function()
+		return config({
+			token_provider = function(callback)
+				token_calls = token_calls + 1
+				callback("token-" .. tostring(token_calls), nil, nil)
+			end,
+		})
+	end
+	-- Launch 1 (Mode B): user A's withdrawal cannot deliver (500) and is
+	-- retained user_verified-keyed.
+	next_status = 500
+	local first = assert(sdk.new(counting_mode_b()))
+	assert_true(first:identify("user-a"))
+	assert_true(first:set_consent(false))
+	assert_true(first:shutdown("app_final"))
+
+	-- Launch 2 (Mode B): user B signs in and delivers a decision of their
+	-- own, leaving a cached token that vouches for B's session only.
+	reset()
+	next_status = 202
+	local second = assert(sdk.new(counting_mode_b()))
+	assert_equal(#second.consent_outbox, 1, "A's receipt is parked, not dropped")
+	assert_true(second:identify("user-b"))
+	assert_true(second:set_consent(true))
+	assert_equal(#requests, 1)
+	local cached = second.token
+	assert_true(cached ~= nil, "B's delivery leaves a cached token")
+
+	-- The account switches to A in the same process: identify() must drop
+	-- B's cached token so the unpark dispatch mints fresh — reusing it would
+	-- send A's receipt under a credential that cannot vouch for A.
+	assert_true(second:identify("user-a"))
+	assert_equal(#requests, 2, "identify() dispatches A's parked receipt")
+	assert_contains(requests[2].body, '"actor_identifier":"user-a"')
+	assert_not_equal(requests[2].headers["Authorization"], "Bearer " .. cached,
+		"the unpark dispatch must not ride the previous session's token")
+	assert_equal(requests[2].headers["Authorization"],
+		"Bearer token-" .. tostring(token_calls))
+	assert_equal(#second.consent_outbox, 0, "A's receipt delivered under the fresh mint")
+
+	-- A mint in flight ACROSS an identity change discards its stale result:
+	-- the late callback settles the in-flight flag but installs nothing, and
+	-- the next dispatch point mints for the current session.
+	reset()
+	next_status = 500
+	local pending_mint = nil
+	local third = assert(sdk.new(config({
+		token_provider = function(callback)
+			pending_mint = callback
+		end,
+	})))
+	assert_true(third:set_consent(false)) -- anon receipt; the mint stays in flight
+	assert_true(third.token_request_in_flight)
+	assert_true(third:identify("user-c")) -- identity changes mid-mint
+	pending_mint("stale-anon-token", nil, nil)
+	assert_equal(third.token_request_in_flight, false,
+		"a stale mint callback still settles the in-flight flag")
+	assert_equal(third.token, nil,
+		"a mint from before the identity change must not install its token")
+	restore()
+	storage.reset()
+end
+
 -- Head-of-queue audit: with parking, the dispatch head can sit BEHIND the
 -- queue front, so every piece of dispatch bookkeeping must key to the
 -- ACTUAL dispatch-head receipt, never to index 1 — the dispatch selection
@@ -5086,6 +5212,8 @@ local tests = {
 	test_consent_kind_emission_escape_hatch_suppresses_wire_field,
 	test_verified_receipt_parks_signed_out_and_dispatches_when_token_returns,
 	test_parked_receipt_never_blocks_dispatch_or_gates_events,
+	test_rotation_allowed_with_only_parked_verified_receipts,
+	test_identify_invalidates_stale_token_before_unpark_dispatch,
 	test_gate_and_in_flight_release_key_to_dispatch_head_not_front,
 	test_per_receipt_credential_and_401_follows_credential_used,
 	test_legacy_kindless_receipt_backfills_anon_and_invalid_kind_drops,
