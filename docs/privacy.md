@@ -218,13 +218,16 @@ outbox:
   at load — never sent, never a crash, never a blocker for well-formed
   receipts (an entry with a non-allowlisted `kind` counts as malformed; a
   legacy pre-kind entry is kept with `kind` backfilled to `"anon"`);
-- **parks `user_verified` receipts while no `token_provider` is
-  configured** (a signed-out relaunch under the publishable key alone): a
-  parked receipt is retained and persisted — still counted toward the cap —
-  but excluded from dispatch and from the events-plane grant gate (it never
-  wedges `flush()` or teardown), and delivers verbatim, same
-  `idempotency_key`, at the first launch that configures a `token_provider`
-  again, so an undelivered verified denial survives signed-out relaunches;
+- **parks `user_verified` receipts while the current session cannot vouch
+  for their actor** — no `token_provider` configured (a signed-out relaunch
+  under the publishable key alone), no `identify()` yet, or a different
+  user signed in (another actor's minted token could never deliver the
+  receipt): a parked receipt is retained and persisted — still counted
+  toward the cap — but excluded from dispatch and from the events-plane
+  grant gate (it never wedges `flush()` or teardown), and delivers
+  verbatim, same `idempotency_key`, the moment a Mode B session identifies
+  as its actor again (`identify()` is a consent dispatch point), so an
+  undelivered verified denial survives signed-out relaunches;
 - is **cleared on an identity change only when the receipt could never
   send**: in a Mode-B-ONLY configuration (no publishable `api_key`),
   anon-keyed receipts whose decision-time anonymous id no longer matches

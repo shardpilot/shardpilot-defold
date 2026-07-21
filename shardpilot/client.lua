@@ -911,7 +911,7 @@ function M.new(config)
 		-- user_verified-keyed receipt is NEVER dropped for a merely-absent
 		-- identity: it may be the only record of that actor's consent change
 		-- (worst case an undelivered withdrawal), so it parks instead
-		-- (receipt_parked below) until a Mode B credential can present it.
+		-- (receipt_parked) until a Mode B session vouches for its actor.
 		local kept_receipts = {}
 		local mismatched_receipts = 0
 		for i = 1, #client.consent_outbox do
@@ -958,6 +958,13 @@ function Client:identify(user_id)
 		return false, "invalid_user_id"
 	end
 	self.user_id = user_id
+	-- A newly presentable verified identity is a consent dispatch point: a
+	-- user_verified receipt parked for exactly this actor (receipt_parked)
+	-- becomes dispatchable the moment a Mode B session can vouch for it, so
+	-- attempt delivery immediately instead of waiting for the next cadence.
+	-- Cheap when nothing is parked for this actor: an empty or fully
+	-- undispatchable outbox returns before any credential work.
+	self:try_send_consent_outbox()
 	return true
 end
 
@@ -1858,8 +1865,8 @@ end
 -- keyed receipts only under a Mode B minted token (never a publishable
 -- fallback: the route binds the actor to the token subject, and a
 -- publishable-key dispatch would rebind or reject the write). A
--- user_verified receipt with no token_provider configured PARKS
--- (receipt_parked below) rather than dropping or dispatching wrong.
+-- user_verified receipt whose actor the current session cannot vouch for
+-- PARKS (receipt_parked below) rather than dropping or dispatching wrong.
 
 -- True while any consent-receipt state is still unsettled: a receipt awaiting
 -- server acknowledgment (including receipts reloaded from a previous launch),
@@ -1901,24 +1908,35 @@ function Client:consent_send_deferred()
 	return self.consent_retry_after_ms ~= nil and clock.unix_ms() < self.consent_retry_after_ms
 end
 
--- A user_verified-keyed receipt PARKS while no Mode B token_provider is
--- configured to present that identity (a signed-out relaunch under the
--- publishable key alone): it is retained and persisted — still counted
--- toward the outbox cap and eviction — but excluded from dispatch selection
--- and from the grant-dispatch gate, so an undelivered verified decision
--- (worst case a withdrawal) survives signed-out relaunches and delivers
--- verbatim, same idempotency_key, at the first launch that configures a
--- token_provider again. Dispatching it under the publishable key instead
--- would rebind or reject the actor server-side and terminally drop the
--- receipt. Parked-ness is DERIVED here from the receipt's kind and the
--- current credential configuration, never persisted as its own field.
+-- A user_verified-keyed receipt PARKS while the current session cannot
+-- VOUCH FOR ITS ACTOR: it is dispatchable only when a Mode B
+-- token_provider is configured AND the session's identified user is
+-- exactly the receipt's actor. Everything else parks it — no
+-- token_provider (a signed-out relaunch under the publishable key alone),
+-- no identify() yet, or a DIFFERENT user signed in: the minted token
+-- vouches for the current user, so dispatching another actor's receipt
+-- under it would retry forever on the auth mismatch or be terminally
+-- rejected — and dispatching under the publishable key would rebind or
+-- reject the actor server-side. Either way an undelivered verified
+-- decision (worst case a withdrawal) would be lost or wedge the trail.
+-- A parked receipt is retained and persisted — still counted toward the
+-- outbox cap and eviction — but excluded from dispatch selection and from
+-- the grant-dispatch gate; it delivers verbatim, same idempotency_key, the
+-- moment a Mode B session identifies as its actor again (identify() is a
+-- consent dispatch point for exactly this reason). Parked-ness is DERIVED
+-- here from the receipt's kind/actor and the current session, never
+-- persisted as its own field.
 -- NOTE: an explicit host API for discarding parked receipts (and the
 -- verified-login re-key enqueue with its once-per-decision ledger) is
 -- deliberately deferred pending godot-package ratification; until it
--- lands, a parked receipt's only exits are a returning Mode B credential
--- or cap eviction.
+-- lands, a parked receipt's only exits are a vouching Mode B session or
+-- cap eviction.
 function Client:receipt_parked(receipt)
-	return receipt.kind == "user_verified" and not self.config.token_provider
+	if receipt.kind ~= "user_verified" then
+		return false
+	end
+	return not (self.config.token_provider
+		and self.user_id == receipt.actor_identifier)
 end
 
 -- The oldest receipt eligible for dispatch under the current credential

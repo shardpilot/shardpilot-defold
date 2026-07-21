@@ -3549,7 +3549,9 @@ local function test_consent_receipt_survives_restart_and_retries_until_acked()
 
 	next_status = 500
 	local first = assert(sdk.new(config()))
-	assert_true(first:identify("user-example"))
+	-- Anon-keyed on purpose: a user_verified receipt would park on the
+	-- pre-identify relaunches below; this test pins the restart/retry/ack
+	-- mechanics themselves.
 	assert_true(first:set_consent(false))
 	assert_equal(#requests, 1)
 	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
@@ -3558,6 +3560,7 @@ local function test_consent_receipt_survives_restart_and_retries_until_acked()
 	assert_equal(#record.receipts, 1)
 	local original_key = record.receipts[1].idempotency_key
 	assert_equal(record.receipts[1].categories.analytics, false)
+	assert_equal(record.receipts[1].kind, "anon")
 
 	-- "next launch": init re-attempts delivery immediately — while the
 	-- persisted state is denied
@@ -3623,9 +3626,12 @@ local function test_shutdown_completes_with_durable_outbox_and_next_launch_deliv
 	local record = stored_consent_outbox_record(stores)
 	assert_equal(#record.receipts, 1, "the receipt survives teardown on disk")
 
-	-- next launch (working token backend) delivers it at init
+	-- next launch (working token backend): the verified-keyed receipt stays
+	-- parked until the session vouches for its actor; identify() delivers it
 	reset()
 	local second = assert(sdk.new(config()))
+	assert_equal(#requests, 0, "a verified receipt stays parked before identify")
+	assert_true(second:identify("user-example"))
 	assert_equal(#requests, 1)
 	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
 	assert_contains(requests[1].body, '"categories":{"analytics":true}')
@@ -3718,15 +3724,17 @@ local function test_toggled_grant_behind_in_flight_head_still_holds_events()
 end
 
 -- Audit 3a follow-up (restart): a relaunch mid-window reloads the durable
--- outbox but no deferral state — the gate needs none: the retained grant is
--- handed to the transport at init, ahead of anything the fresh process can
--- publish, so the first post-restart batch always follows the receipt on the
--- wire (and is never ack-gated on it).
+-- outbox but no deferral state — the gate needs none: the retained
+-- verified-keyed grant is handed to the transport the moment the session
+-- vouches for its actor again (identify() is that dispatch point; until
+-- then it is parked), ahead of anything the fresh process can publish, so
+-- the first post-restart batch always follows the receipt on the wire (and
+-- is never ack-gated on it).
 local function test_restart_dispatches_retained_grant_before_first_batch()
 	reset()
 	storage.reset()
 	local stores, restore = install_stub_sys_storage()
-	-- First launch: the grant receipt is parked by a server Retry-After and
+	-- First launch: the grant receipt is held by a server Retry-After and
 	-- the app closes with the receipt durably retained.
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
@@ -3738,9 +3746,10 @@ local function test_restart_dispatches_retained_grant_before_first_batch()
 	next_response_headers = nil
 	assert_true(client:shutdown())
 	local record = stored_consent_outbox_record(stores)
-	assert_equal(#record.receipts, 1, "the parked grant survives on disk")
+	assert_equal(#record.receipts, 1, "the deferred grant survives on disk")
 
-	-- Relaunch (async transport): init hands the retained grant over first.
+	-- Relaunch (async transport): the verified receipt stays parked until
+	-- the session vouches for its actor; identify() hands it over first.
 	reset()
 	local original_request = http.request
 	local callbacks = {}
@@ -3749,9 +3758,10 @@ local function test_restart_dispatches_retained_grant_before_first_batch()
 		callbacks[#callbacks + 1] = callback
 	end
 	local second = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
-	assert_equal(#requests, 1, "init hands the retained grant to the transport")
-	assert_true(requests[1].url:find("/v1/consent", 1, true) ~= nil)
+	assert_equal(#requests, 0, "a verified receipt stays parked until the session vouches for it")
 	assert_true(second:identify("user-example"))
+	assert_equal(#requests, 1, "identify hands the retained grant to the transport")
+	assert_true(requests[1].url:find("/v1/consent", 1, true) ~= nil)
 	assert_true(second:track("post_restart_event"), "the persisted grant reopens the pipeline")
 	local flushed, reason = second:flush()
 	assert_equal(flushed, false)
@@ -3864,10 +3874,10 @@ local function test_malformed_consent_outbox_dropped_failsafe()
 	storage.reset()
 	local stores, restore = install_stub_sys_storage()
 
-	-- persist one real receipt (a transient failure keeps it retained)
+	-- persist one real receipt (a transient failure keeps it retained;
+	-- anon-keyed so the pre-identify relaunch below can dispatch it)
 	next_status = 500
 	local first = assert(sdk.new(config()))
-	assert_true(first:identify("user-example"))
 	assert_true(first:set_consent(false))
 	local record, path = stored_consent_outbox_record(stores)
 	assert_true(record ~= nil and path ~= nil)
@@ -4000,7 +4010,8 @@ local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 
 	-- Mode-B-only, user_verified-keyed: the same anon rotation must NOT drop
 	-- the receipt (it may be the only record of that actor's decision); it
-	-- delivers under the minted token.
+	-- parks until the session vouches for its actor, then delivers under the
+	-- minted token.
 	reset()
 	storage.reset()
 	next_status = 500
@@ -4019,7 +4030,10 @@ local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 		end,
 	})))
 	assert_equal(#verified_issues, 0, "a verified-keyed receipt must never drop as identity_changed")
-	assert_equal(#requests, 1, "the verified receipt delivers under the minted token")
+	assert_equal(#verified_second.consent_outbox, 1, "the verified receipt is retained")
+	assert_equal(#requests, 0, "and parked until the session vouches for its actor")
+	assert_true(verified_second:identify("user-verified-example"))
+	assert_equal(#requests, 1, "identify delivers the retained verified receipt")
 	assert_contains(requests[1].body, '"actor_identifier":"user-verified-example"')
 	assert_contains(requests[1].body, '"kind":"user_verified"')
 	assert_equal(verified_second:snapshot().consent_recorded, 1)
@@ -4138,12 +4152,13 @@ local function test_consent_kind_emission_escape_hatch_suppresses_wire_field()
 end
 
 -- Parking (the amended §12 path-5 narrowing): a user_verified-keyed receipt
--- on a launch with NO token_provider (a signed-out relaunch under the
--- publishable key) PARKS — retained, persisted, excluded from dispatch, and
--- never dispatched under the publishable key (the route would rebind or
--- reject the actor and the terminal drop would lose an undelivered denial).
--- It delivers verbatim (same idempotency_key) at the first launch that
--- configures a token_provider again.
+-- parks while the current session cannot VOUCH FOR ITS ACTOR — no
+-- token_provider (a signed-out relaunch under the publishable key), no
+-- identify() yet, or a DIFFERENT user signed in. Parked = retained,
+-- persisted, excluded from dispatch, and never dispatched under the
+-- publishable key or another actor's token (either would lose or wedge an
+-- undelivered denial). It delivers verbatim (same idempotency_key) the
+-- moment a Mode B session identifies as its actor again.
 local function test_verified_receipt_parks_signed_out_and_dispatches_when_token_returns()
 	reset()
 	storage.reset()
@@ -4175,11 +4190,24 @@ local function test_verified_receipt_parks_signed_out_and_dispatches_when_token_
 	assert_equal(#record.receipts, 1, "the parked receipt survives teardown on disk")
 	assert_equal(record.receipts[1].idempotency_key, original_key)
 
-	-- Launch 3 (a token_provider returns): the receipt unparks and delivers
-	-- verbatim under the minted token
+	-- Launch 3 (token_provider back, but a DIFFERENT user signs in): the
+	-- receipt must STAY parked — the minted token vouches for the current
+	-- user, and dispatching another actor's receipt under it would retry
+	-- forever on the auth mismatch or be terminally dropped.
 	reset()
 	local third = assert(sdk.new(config()))
-	assert_equal(#requests, 1, "a returning token_provider must dispatch the parked receipt")
+	assert_equal(#requests, 0, "a verified receipt stays parked before identify")
+	assert_true(third:identify("some-other-user"))
+	third:update(third.config.flush_interval_seconds)
+	assert_true(third:flush())
+	assert_equal(#requests, 0,
+		"another user's session must not dispatch the parked receipt")
+	assert_equal(#third.consent_outbox, 1, "the parked receipt stays retained")
+
+	-- The receipt's own actor signs in: the session now vouches for it —
+	-- identify() dispatches it immediately, verbatim, under the minted token.
+	assert_true(third:identify("user-verified-example"))
+	assert_equal(#requests, 1, "a vouching Mode B session must dispatch the parked receipt")
 	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
 	assert_contains(requests[1].body, '"idempotency_key":"' .. original_key .. '"')
 	assert_contains(requests[1].body, '"actor_identifier":"user-verified-example"')
@@ -4232,6 +4260,79 @@ local function test_parked_receipt_never_blocks_dispatch_or_gates_events()
 	assert_equal(second.consent_outbox[1].kind, "user_verified")
 	local record = stored_consent_outbox_record(stores)
 	assert_equal(#record.receipts, 1)
+	restore()
+	storage.reset()
+end
+
+-- Head-of-queue audit: with parking, the dispatch head can sit BEHIND the
+-- queue front, so every piece of dispatch bookkeeping must key to the
+-- ACTUAL dispatch-head receipt, never to index 1 — the dispatch selection
+-- skips the parked front, the grant-dispatch gate holds for an
+-- undispatched grant while a DIFFERENT (non-front) receipt is in flight,
+-- the in-flight exemption releases only the receipt whose idempotency_key
+-- is in flight, and a settled non-front receipt chains the next
+-- dispatchable one while the parked front stays untouched.
+local function test_gate_and_in_flight_release_key_to_dispatch_head_not_front()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- Launch 1 (Mode B, signed in): an undeliverable verified GRANT that
+	-- will sit parked at the FRONT of the next launch's outbox.
+	next_status = 500
+	local first = assert(sdk.new(config()))
+	assert_true(first:identify("user-verified-example"))
+	assert_true(first:set_consent(true))
+	assert_true(first:shutdown("app_final"))
+
+	-- Launch 2 (signed out, publishable key, async transport): the parked
+	-- verified grant is the front; fresh anon decisions queue behind it.
+	reset()
+	local original_request = http.request
+	local callbacks = {}
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		callbacks[#callbacks + 1] = callback
+	end
+	local second = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(#second.consent_outbox, 1)
+	assert_true(second:set_consent(false)) -- anon denial: dispatch head, behind the parked front
+	assert_equal(#requests, 1, "the dispatch head is the receipt BEHIND the parked front")
+	assert_contains(requests[1].body, '"analytics":false')
+	assert_true(second:set_consent(true)) -- anon grant: queued while the denial is in flight
+	assert_equal(#requests, 1)
+	assert_equal(#second.consent_outbox, 3)
+	assert_true(second:track("post_toggle_event"))
+
+	-- The parked front grant must not gate; the undispatched anon grant
+	-- must — even though the in-flight receipt is not the front.
+	local flushed, reason = second:flush({ include_summaries = false })
+	assert_equal(flushed, false)
+	assert_equal(reason, "consent_receipt_pending")
+	assert_equal(#requests, 1, "no batch while the queued anon grant awaits dispatch")
+
+	-- The non-front in-flight denial settles: the chain dispatches the anon
+	-- grant (again skipping the parked front), whose own handoff releases
+	-- the gate for itself only.
+	callbacks[1](nil, nil, { status = 202, response = "{}" })
+	assert_equal(#requests, 2)
+	assert_contains(requests[2].body, '"analytics":true')
+	local batch_flushed, batch_reason = second:flush({ include_summaries = false })
+	assert_equal(batch_flushed, false)
+	assert_equal(batch_reason, "pending")
+	assert_equal(#requests, 3, "the batch follows the dispatched anon grant")
+	assert_true(requests[3].url:find("/v1/events:batch", 1, true) ~= nil)
+	callbacks[2](nil, nil, { status = 202, response = "{}" })
+	callbacks[3](nil, nil, { status = 202, response = '{"accepted":1}' })
+
+	-- The parked front was never dispatched, never released, never pruned;
+	-- the settled non-front receipts reset the retry bookkeeping.
+	assert_equal(#second.consent_outbox, 1, "only the parked front remains")
+	assert_equal(second.consent_outbox[1].kind, "user_verified")
+	assert_equal(second:snapshot().consent_recorded, 2)
+	assert_equal(second.consent_backoff_attempt, 0)
+	assert_true(not second:consent_send_deferred(),
+		"settled non-front receipts must leave no stale deferral behind")
+	http.request = original_request
 	restore()
 	storage.reset()
 end
@@ -4677,12 +4778,15 @@ local function test_no_receipt_chaining_after_shutdown()
 	local record = stored_consent_outbox_record(stores)
 	assert_equal(#record.receipts, 1, "the remaining receipt stays durably retained")
 
-	-- the next launch delivers it
+	-- the next launch delivers it once the session vouches for its verified
+	-- actor again (parked until then)
 	reset()
 	callbacks = {}
 	http.request = original_request
 	next_status = 202
 	local second = assert(sdk.new(config()))
+	assert_equal(#requests, 0, "the verified receipt stays parked before identify")
+	assert_true(second:identify("user-example"))
 	assert_equal(#requests, 1)
 	assert_contains(requests[1].body, '"categories":{"analytics":true}')
 	assert_equal(second:snapshot().consent_recorded, 1)
@@ -4982,6 +5086,7 @@ local tests = {
 	test_consent_kind_emission_escape_hatch_suppresses_wire_field,
 	test_verified_receipt_parks_signed_out_and_dispatches_when_token_returns,
 	test_parked_receipt_never_blocks_dispatch_or_gates_events,
+	test_gate_and_in_flight_release_key_to_dispatch_head_not_front,
 	test_per_receipt_credential_and_401_follows_credential_used,
 	test_legacy_kindless_receipt_backfills_anon_and_invalid_kind_drops,
 	test_set_consent_surfaces_receipt_persist_failure,

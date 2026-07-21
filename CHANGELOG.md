@@ -50,16 +50,25 @@
   only during a successful save, a failed write never evicts, and evictions
   stay counted (`consent_outbox_evicted`) and diagnosed
   (`outbox_overflow`).
-- **Verified-keyed receipts park across signed-out relaunches.** A
-  `user_verified`-keyed receipt on a launch with no `token_provider`
-  configured (a signed-out relaunch under the publishable key alone) now
-  PARKS instead of dispatching wrong or dropping: it stays retained and
-  durably persisted — still counted toward the cap and eviction — is
-  excluded from dispatch selection and from the events-plane grant-dispatch
-  gate (a parked grant never wedges `flush()` or teardown), and delivers
-  verbatim, same `idempotency_key`, at the first launch that configures a
-  `token_provider` again — so an undelivered verified denial survives
-  signed-out relaunches. The load-time `identity_changed` drop narrows to
+- **Verified-keyed receipts park until a session vouches for their actor.**
+  A `user_verified`-keyed receipt is dispatchable only while a Mode B
+  `token_provider` is configured AND the session's identified user is
+  exactly the receipt's actor; in every other session — no `token_provider`
+  (a signed-out relaunch under the publishable key alone), no `identify()`
+  yet, or a DIFFERENT user signed in — it PARKS instead of dispatching
+  wrong or dropping (another actor's token would retry forever on the auth
+  mismatch or be terminally rejected; the publishable key would rebind or
+  reject the actor). A parked receipt stays retained and durably persisted
+  — still counted toward the cap and eviction — is excluded from dispatch
+  selection and from the events-plane grant-dispatch gate (a parked grant
+  never wedges `flush()` or teardown; the gate's in-flight exemption is
+  keyed by `idempotency_key`, since with parking the dispatch head is not
+  always the queue front), and delivers verbatim, same `idempotency_key`,
+  the moment a Mode B session identifies as its actor again — `identify()`
+  is now a consent dispatch point for exactly that — so an undelivered
+  verified denial survives signed-out relaunches. Parked-ness is derived at
+  load/dispatch from the receipt's kind and actor, never persisted as its
+  own field. The load-time `identity_changed` drop narrows to
   the one configuration where a receipt could never send on any credential:
   anon-keyed entries with a mismatched decision-time anon snapshot in a
   Mode-B-ONLY configuration (with an `api_key` configured, historic-anon

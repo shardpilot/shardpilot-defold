@@ -543,10 +543,12 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   `docs/configuration.md`), and each receipt dispatches under the credential
   its kind requires: anon-keyed under the publishable `api_key` where one is
   configured, `user_verified` only under the minted Mode B token. A
-  `user_verified` receipt on a launch with no `token_provider` **parks** —
-  retained durably, skipped by dispatch and the grant gate, delivered
-  verbatim when a token provider returns — so an undelivered verified
-  denial survives signed-out relaunches. Transient
+  `user_verified` receipt **parks** while the current session cannot vouch
+  for its actor — no `token_provider`, no `identify()` yet, or a different
+  user signed in: retained durably, skipped by dispatch and the grant gate,
+  delivered verbatim the moment a Mode B session identifies as that actor
+  again (`identify()` is a consent dispatch point) — so an undelivered
+  verified denial survives signed-out relaunches. Transient
   failures — no token yet (e.g. an async Mode B `token_provider` still in
   flight), a minted-token 401, offline, timeout, `429`, `5xx` — keep the
   receipt and retry at every dispatch point (init/`update`/`flush`/`shutdown`) with
