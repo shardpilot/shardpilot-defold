@@ -159,6 +159,29 @@ local function consent_denied_state(state)
 	return state == "denied" or state == "denied_forced_minor"
 end
 
+-- Canonical-actor selection for consent receipts (ADR-0222 §1, the ADR-0202
+-- 2026-07-20 amendment), mirroring how the event plane binds identity in
+-- Mode B: a host-supplied user_id is an identity the SDK can stand behind
+-- only when a Mode B token_provider backs the session — the per-tenant JWT
+-- the host mints is the credential that vouches for it. So the receipt keys
+-- to the verified user identity (kind "user_verified") only under a
+-- configured token_provider with an identified user; in every other case —
+-- Mode A, or a Mode B decision made before identify() — it keys to the
+-- SDK-managed anonymous_id with kind "anon". A Mode A self-asserted user_id
+-- is NEVER the receipt actor (that class is spoofable by any caller, and
+-- the publishable-key ingress binds the write to the caller's own anon
+-- scope regardless — a user-keyed receipt could misrecord the decision
+-- under an actor the server never consults). This deliberately supersedes
+-- the v0.9.1 user-first snapshot. Returns actor_identifier, kind — the
+-- only kinds the SDK ever produces are "anon" and "user_verified", never
+-- "user_unverified".
+local function receipt_actor(client)
+	if client.config.token_provider and valid_identity(client.user_id) then
+		return client.user_id, "user_verified"
+	end
+	return client.anonymous_id, "anon"
+end
+
 -- Decode a server JSON body when a decoder is available (the real Defold
 -- runtime exposes json.decode; the test stub may not). Returns the decoded
 -- table or nil; never throws.
@@ -372,6 +395,19 @@ local function validate_config(config)
 	else
 		return nil, "invalid_schema_revision"
 	end
+	-- Consent-receipt `kind` emission (ADR-0202 2026-07-20 amendment).
+	-- Default (nil/true): every `POST /v1/consent` body carries the
+	-- receipt's stored actor class next to `actor_identifier`. `false` is
+	-- the escape hatch for a deployment whose ingest service still runs the
+	-- pre-amendment `INGEST_CONSENT_KIND_MODE=off` strict decoder, which
+	-- 400-rejects a kind-bearing body as an unknown field — a terminal
+	-- outcome that would drop the receipt, denials included. Suppression is
+	-- wire-build-time only: the kind is always chosen, persisted with the
+	-- receipt, and used for dispatch-credential selection.
+	if config.consent_kind_emission_enabled ~= nil
+		and type(config.consent_kind_emission_enabled) ~= "boolean" then
+		return nil, "invalid_consent_kind_emission_enabled"
+	end
 	local out = {
 		ingest_url = trim_slash(config.ingest_url),
 		remote_config_url = has_remote_config and trim_slash(config.remote_config_url) or nil,
@@ -382,6 +418,7 @@ local function validate_config(config)
 		app_build = config.app_build,
 		source = source,
 		schema_revision = declared_schema_revision,
+		consent_kind_emission_enabled = config.consent_kind_emission_enabled ~= false,
 		platform = config.platform or platform.detect(),
 		transport = config.transport,
 		token_provider = config.token_provider,
@@ -450,6 +487,11 @@ function M.new(config)
 		token = nil,
 		token_expires_at_ms = nil,
 		token_request_in_flight = false,
+		-- Identity epoch for Mode B mints: bumped when identify() changes the
+		-- user, so a mint still in flight for the PREVIOUS session discards
+		-- its result instead of installing a token that cannot vouch for the
+		-- current one (refresh_token fences its callback on this).
+		token_epoch = 0,
 		in_flight_batch = nil,
 		-- Set when a sentinel fact purge finds a publish mid-flight: the
 		-- batch on the wire is past recall, but if it fails and is
@@ -475,10 +517,14 @@ function M.new(config)
 		-- decision order; consent_outbox_dirty marks a durable write that is
 		-- still owed (retried at every consent dispatch point), and the
 		-- consent deferral fields pace retries independently of the events
-		-- plane's publish deferral.
+		-- plane's publish deferral. While a dispatch is in flight,
+		-- consent_in_flight_key holds that receipt's idempotency_key (parked
+		-- receipts are skipped, so the in-flight receipt is not always the
+		-- head — the grant-dispatch gate releases by key identity).
 		consent_outbox = {},
 		consent_outbox_dirty = false,
 		consent_send_in_flight = false,
+		consent_in_flight_key = nil,
 		consent_retry_after_ms = nil,
 		consent_backoff_attempt = 0,
 		spool_record = {},
@@ -853,22 +899,44 @@ function M.new(config)
 	-- install nothing: an empty outbox returns before any token is minted, so
 	-- an undecided client stays fully dark.
 	client.consent_outbox = storage.load_consent_outbox(normalized)
-	if normalized.token_provider and #client.consent_outbox > 0 then
-		-- Mode B tokens are minted bound to the CURRENT anonymous ID.
-		-- Retained receipts carry their decision-time anon snapshot; after an
-		-- init-time anonymous_id override changed the identity, re-sending
-		-- one would pair the old actor with a token bound to the new anon and
-		-- be rejected on every retry — a wedged head that blocks the rest of
-		-- the trail forever. Drop them at load — deterministic, surfaced via
-		-- diagnostics — exactly like the event spool's identity_changed rule
-		-- above. Mode A has no token binding, so historic-identity receipts
-		-- re-send unchanged there (the historic actor is the correct subject
-		-- of those decisions).
+	if normalized.token_provider and not normalized.api_key
+		and #client.consent_outbox > 0 then
+		-- The narrow could-never-send anti-wedge drop, scoped to the ONE
+		-- configuration where it is true: Mode B with no publishable key.
+		-- Mode B tokens are minted bound to the CURRENT anonymous ID, so an
+		-- ANON-keyed receipt whose decision-time anon snapshot no longer
+		-- matches would pair the old actor with a token bound to the new
+		-- anon and be rejected on every retry — a wedged head that blocks
+		-- the rest of the trail forever. Drop exactly those at load —
+		-- deterministic, surfaced via diagnostics — like the event spool's
+		-- identity_changed rule above. The same rule covers the ACTOR
+		-- itself: with no publishable key the minted token is the only
+		-- credential, and it vouches solely for the current anon (or a
+		-- user_verified receipt's verified user) — an anon-KIND receipt
+		-- whose actor_identifier is NOT the current anon (a legacy pre-kind
+		-- entry that stored v0.9.1's user-first actor and backfilled to
+		-- anon, its anon snapshot still current) has no credential that
+		-- could ever lawfully carry it: dispatched under the token it would
+		-- be terminally rejected on the actor/subject mismatch or land the
+		-- decision under the wrong actor, and retained it would hold
+		-- set_anonymous_id's rotation guard in events_pending for as long
+		-- as it sat anon-keyed in the outbox. With a publishable api_key
+		-- configured (Mode A, or Mode B + api_key), anon-keyed receipts
+		-- dispatch under the key instead — the historic actor is the
+		-- correct subject of those decisions — so nothing is dropped there.
+		-- And a user_verified-keyed receipt is NEVER dropped for a
+		-- merely-absent identity: it may be the only record of that actor's
+		-- consent change (worst case an undelivered withdrawal), so it
+		-- parks instead (receipt_parked) until a Mode B session vouches for
+		-- its actor.
 		local kept_receipts = {}
 		local mismatched_receipts = 0
 		for i = 1, #client.consent_outbox do
-			if client.consent_outbox[i].anonymous_id == client.anonymous_id then
-				kept_receipts[#kept_receipts + 1] = client.consent_outbox[i]
+			local receipt = client.consent_outbox[i]
+			if receipt.kind == "user_verified"
+				or (receipt.anonymous_id == client.anonymous_id
+					and receipt.actor_identifier == client.anonymous_id) then
+				kept_receipts[#kept_receipts + 1] = receipt
 			else
 				mismatched_receipts = mismatched_receipts + 1
 			end
@@ -903,11 +971,93 @@ function Client:persist_identity()
 	return storage.save(self.config, record)
 end
 
+-- True while undrained event work — queued, in an in-flight batch, or
+-- reloaded on the durable spool — carries a USER identity snapshot other
+-- than `user_id`. Events snapshot the identity in force at enqueue time
+-- (and spooled envelopes re-send verbatim), so this is exactly the work a
+-- credential minted after identifying as `user_id` could not vouch for: a
+-- flush after the switch would ship the previous user's events under the
+-- new user's Bearer — the event-plane twin of the consent actor/subject
+-- mismatch. Anon-snapshotted work (a nil user snapshot: pre-identify
+-- events, and facts under the omit_user_id contract) never counts — the
+-- mint binds the CURRENT anon as bind_anon regardless of the verified
+-- subject, so those envelopes stay vouched for across an identify. Spool
+-- entries already settled (delivered or terminally rejected, awaiting only
+-- their removal rewrite) can never re-send, so they never count either.
+function Client:user_events_pending_for_other(user_id)
+	for i = 1, #self.queue.items do
+		local snapshot = self.queue.items[i].user_id
+		if snapshot ~= nil and snapshot ~= user_id then
+			return true
+		end
+	end
+	if self.in_flight_batch then
+		for i = 1, #self.in_flight_batch do
+			local snapshot = self.in_flight_batch[i].user_id
+			if snapshot ~= nil and snapshot ~= user_id then
+				return true
+			end
+		end
+	end
+	for i = 1, #self.spool_record do
+		local env = self.spool_record[i]
+		if env.user_id ~= nil and env.user_id ~= user_id
+			and not self.spool_settled[env.event_id] then
+			return true
+		end
+	end
+	return false
+end
+
 function Client:identify(user_id)
 	if not valid_identity(user_id) then
 		return false, "invalid_user_id"
 	end
+	local identity_changed = user_id ~= self.user_id
+	-- A Mode B identity CHANGE is REFUSED while event work snapshotted to
+	-- another verified user remains undrained (queued, in flight, or on the
+	-- durable spool) — the event-plane twin of set_anonymous_id's rotation
+	-- guard below, and the same pending-work refusal family. Accepting the
+	-- switch would drop the cached token that vouches for that work (the
+	-- invalidation below), and the next flush would mint for the NEW user
+	-- and ship the previous user's events under a Bearer that cannot vouch
+	-- for those envelopes — a rejected batch, or worse a misattributed one.
+	-- The host flushes first, then re-identifies. Anon-snapshotted work
+	-- never blocks (the mint's bind_anon vouches for it regardless of the
+	-- verified subject), so the common track-then-first-identify flow is
+	-- untouched — and Mode A is untouched wholesale: with no per-session
+	-- credential there is nothing a switch could strand.
+	if identity_changed and self.config.token_provider
+		and self:user_events_pending_for_other(user_id) then
+		return false, "events_pending"
+	end
 	self.user_id = user_id
+	if identity_changed and self.config.token_provider then
+		-- A cached Mode B JWT vouches for the session it was minted in — the
+		-- anonymous session, or a previously identified user. Reusing it for
+		-- work unlocked by THIS identity change (most immediately the parked
+		-- user_verified receipt dispatch below) would send the new actor
+		-- under a credential that cannot vouch for it: the consent route
+		-- rejects an actor/subject mismatch terminally, dropping the receipt
+		-- — a retained withdrawal included. Drop the cached token so the next
+		-- dispatch mints one bound to the just-identified session (mirroring
+		-- the anon-rotation token drop below), and bump the epoch so a mint
+		-- already in flight discards its stale result on arrival. The
+		-- pending-events refusal above guarantees the drop runs only when no
+		-- other user's event work is still undrained, so it can never strand
+		-- a previous user's envelopes under the next session's mint; the
+		-- epoch fence keeps its own job — stale-mint protection — either way.
+		self.token = nil
+		self.token_expires_at_ms = nil
+		self.token_epoch = self.token_epoch + 1
+	end
+	-- A newly presentable verified identity is a consent dispatch point: a
+	-- user_verified receipt parked for exactly this actor (receipt_parked)
+	-- becomes dispatchable the moment a Mode B session can vouch for it, so
+	-- attempt delivery immediately instead of waiting for the next cadence.
+	-- Cheap when nothing is parked for this actor: an empty or fully
+	-- undispatchable outbox returns before any credential work.
+	self:try_send_consent_outbox()
 	return true
 end
 
@@ -928,11 +1078,18 @@ function Client:set_anonymous_id(anonymous_id)
 	--   * token_request_in_flight: an async mint (e.g. a set_consent receipt) is
 	--     running with the old anon and its callback would cache a stale-bind_anon
 	--     JWT after we rotate;
-	--   * retained consent receipts (the durable outbox — including receipts
-	--     reloaded from a previous launch) carry the old anon actor_identifier
-	--     and survive even after the token request settles (e.g. a
-	--     token_provider error leaves them queued); their retry would mint for
-	--     the new anon but send the old actor.
+	--   * retained ANON-KEYED consent receipts (the durable outbox — including
+	--     receipts reloaded from a previous launch) carry the old anon
+	--     actor_identifier and survive even after the token request settles
+	--     (e.g. a token_provider error leaves them queued); their retry would
+	--     mint for the new anon but send the old actor. A user_verified-keyed
+	--     receipt never blocks rotation: it keys to the verified user and
+	--     dispatches only under a JWT vouching for that user, so the anon id
+	--     never enters its dispatch — and a PARKED one can outlive its
+	--     actor's session indefinitely, so blocking on it would wedge
+	--     rotation for as long as that user stays signed out
+	--     (consent_outbox_anon_pending; an owed durable rewrite still
+	--     blocks).
 	--   * spooled envelopes loaded from a previous launch carry their historic
 	--     anonymous_id snapshot; re-sending them under a token minted for the
 	--     NEW anon would be rejected the same way, so rotation waits until the
@@ -946,7 +1103,7 @@ function Client:set_anonymous_id(anonymous_id)
 	-- The host retries the rotation once the pending work clears.
 	local rotating = self.config.token_provider and anonymous_id ~= self.anonymous_id
 	if rotating and (queue.size(self.queue) > 0 or self.in_flight_batch ~= nil
-		or self.token_request_in_flight or self:consent_outbox_pending()
+		or self.token_request_in_flight or self:consent_outbox_anon_pending()
 		or self:spool_pending()
 		or (self.experiments and self.experiments:has_owed_exposures())) then
 		return false, "events_pending"
@@ -1153,6 +1310,26 @@ function Client:set_consent(decision)
 	-- purge at init and stays fail-closed until the stale record is gone.
 	if granted and self.spool_purge_pending and not self:retry_spool_purge() then
 		return false, "spool_purge_failed"
+	end
+	-- GRANT-APPEND FAILS CLOSED ON A DENIAL-FULL OUTBOX: when appending this
+	-- grant's receipt would overflow the cap with no pre-existing pure grant
+	-- for the denial-preferring eviction to take, the loop's only candidates
+	-- are denial-carrying receipts — or the just-appended grant itself.
+	-- Neither is acceptable: a recorded denial is the legal record and is
+	-- never traded for a grant, and a grant receipt evicted before its
+	-- DISPATCH would silently open the local pipeline with no grant row ever
+	-- reaching the server (the grant-dispatch gate's release condition is
+	-- dispatch — on a strict-consent workspace every later batch would be
+	-- terminally suppressed). So the grant is REFUSED, extending the floor's
+	-- fail-closed family (a grant is refused while a spool wipe is owed,
+	-- above; it is equally refused while its receipt cannot be durably
+	-- retained): the state does not flip, nothing is evicted, every denial
+	-- stays, and the host retries once the outbox drains below the cap.
+	-- Denial appends keep the shipped eviction semantics unchanged (oldest
+	-- pure grant first; an all-denials overflow evicts the oldest denial —
+	-- a fresh denial outranks a stale one).
+	if granted and self:consent_outbox_denial_full() then
+		return false, "consent_outbox_full"
 	end
 	self.consent_state = next_state
 	if state_changed and self.experiments then
@@ -1558,8 +1735,17 @@ function Client:refresh_token()
 		return false
 	end
 	self.token_request_in_flight = true
+	-- The mint is fenced to the identity epoch it was requested under: the
+	-- host mints for its CURRENT session, so a callback landing after
+	-- identify() changed the user would install a token vouching for the
+	-- previous identity. Such a late callback still settles the in-flight
+	-- flag but discards its result — the next dispatch point mints fresh.
+	local epoch = self.token_epoch
 	local ok, err = pcall(self.config.token_provider, function(new_token, new_expires_at, callback_error)
 		self.token_request_in_flight = false
+		if epoch ~= self.token_epoch then
+			return
+		end
 		if callback_error or type(new_token) ~= "string" or new_token == "" then
 			self.token = nil
 			self.token_expires_at_ms = nil
@@ -1801,16 +1987,75 @@ end
 -- receipt documents the decision itself, which is its legal purpose.
 -- Receipts deliver serially, strictly in decision order (FIFO), so the
 -- server applies the decision trail exactly as the player produced it.
+-- Each receipt is keyed to the canonical actor chosen at decision time
+-- (receipt_actor above) and carries that actor's class as `kind`; delivery
+-- selects the dispatch credential PER RECEIPT, most-vouching first — the
+-- minted Mode B token whenever it vouches for the receipt's actor (current
+-- verified user, or current-anon subject in the dual configuration; grants
+-- stay deliverable there), the publishable api_key only for receipts the
+-- token cannot vouch for (historic-anon) and in pure Mode A.
+-- user_verified-keyed receipts dispatch only under a Mode B minted token,
+-- never a publishable fallback: the route binds the actor to the token
+-- subject, and a publishable-key dispatch would rebind or reject the write. A
+-- user_verified receipt whose actor the current session cannot vouch for
+-- PARKS (receipt_parked below) rather than dropping or dispatching wrong.
 
 -- True while any consent-receipt state is still unsettled: a receipt awaiting
 -- server acknowledgment (including receipts reloaded from a previous launch),
 -- OR an owed durable rewrite. The dirty case matters even with an empty
 -- mirror — a failed post-delivery prune leaves the acknowledged receipt on
--- disk, where the next launch reloads and re-sends it; a Mode B anon rotation
--- must wait for that rewrite too, or the stale receipt would replay an old
--- actor under a token minted for the new one.
+-- disk, where the next launch reloads and re-sends it — so teardown's
+-- consent_pending contract and the anon-rotation guard both wait for that
+-- rewrite (the guard through consent_outbox_anon_pending below).
 function Client:consent_outbox_pending()
 	return #self.consent_outbox > 0 or self.consent_outbox_dirty
+end
+
+-- The anon-rotation guard's view of the outbox: only work BOUND TO THE OLD
+-- ANON blocks a rotation. That is every ANON-KEYED retained receipt (its
+-- actor IS the old anon — a post-rotation retry would mint for the new anon
+-- and send the old actor) and any owed durable rewrite (a stale on-disk
+-- record could replay an old-anon receipt on the next launch). A
+-- user_verified-keyed receipt never blocks: it keys to the verified user,
+-- dispatches only under a JWT vouching for that user, and survives anon
+-- changes by design — a PARKED one (its actor signed out) could otherwise
+-- hold set_anonymous_id in events_pending indefinitely.
+function Client:consent_outbox_anon_pending()
+	if self.consent_outbox_dirty then
+		return true
+	end
+	for i = 1, #self.consent_outbox do
+		if self.consent_outbox[i].kind ~= "user_verified" then
+			return true
+		end
+	end
+	return false
+end
+
+-- True when appending ONE more receipt would push the outbox over the cap
+-- with fewer pre-existing pure grants than the overflow needs: the
+-- denial-preferring eviction loop would then reach denial-carrying
+-- receipts — or the incoming receipt itself, appended newest and therefore
+-- the LAST pure grant it scans. set_consent(true) consults this to refuse
+-- the grant (`consent_outbox_full`) instead of letting either happen;
+-- see the gate there for the full rationale. Uses the storage layer's own
+-- cap and pure-grant predicate so this prediction and the eviction loop
+-- can never disagree.
+function Client:consent_outbox_denial_full()
+	local overflow = #self.consent_outbox + 1 - storage.max_consent_outbox_entries
+	if overflow < 1 then
+		return false
+	end
+	local evictable_grants = 0
+	for i = 1, #self.consent_outbox do
+		if storage.receipt_is_pure_grant(self.consent_outbox[i]) then
+			evictable_grants = evictable_grants + 1
+			if evictable_grants >= overflow then
+				return false
+			end
+		end
+	end
+	return true
 end
 
 -- Consent-receipt delivery paces its retries independently of the events
@@ -1842,10 +2087,76 @@ function Client:consent_send_deferred()
 	return self.consent_retry_after_ms ~= nil and clock.unix_ms() < self.consent_retry_after_ms
 end
 
+-- A user_verified-keyed receipt PARKS while the current session cannot
+-- VOUCH FOR ITS ACTOR: it is dispatchable only when a Mode B
+-- token_provider is configured AND the session's identified user is
+-- exactly the receipt's actor. Everything else parks it — no
+-- token_provider (a signed-out relaunch under the publishable key alone),
+-- no identify() yet, or a DIFFERENT user signed in: the minted token
+-- vouches for the current user, so dispatching another actor's receipt
+-- under it would retry forever on the auth mismatch or be terminally
+-- rejected — and dispatching under the publishable key would rebind or
+-- reject the actor server-side. Either way an undelivered verified
+-- decision (worst case a withdrawal) would be lost or wedge the trail.
+-- A parked receipt is retained and persisted — still counted toward the
+-- outbox cap and eviction — but excluded from dispatch selection and from
+-- the grant-dispatch gate; it delivers verbatim, same idempotency_key, the
+-- moment a Mode B session identifies as its actor again (identify() is a
+-- consent dispatch point for exactly this reason). Parked-ness is DERIVED
+-- here from the receipt's kind/actor and the current session, never
+-- persisted as its own field.
+-- NOTE: an explicit host API for discarding parked receipts (and the
+-- verified-login re-key enqueue with its once-per-decision ledger) is
+-- deliberately deferred pending godot-package ratification; until it
+-- lands, a parked receipt's only exits are a vouching Mode B session or
+-- cap eviction.
+function Client:receipt_parked(receipt)
+	if receipt.kind ~= "user_verified" then
+		return false
+	end
+	return not (self.config.token_provider
+		and self.user_id == receipt.actor_identifier)
+end
+
+-- True when some configured credential can lawfully carry this receipt's
+-- actor: the minted Mode B token (it vouches for the current verified user
+-- and for the CURRENT anon it binds as its subject) or the publishable
+-- api_key (anon-keyed receipts, historic actors included). The Mode-B-only
+-- load drop already removes anon receipts with a never-vouchable actor, so
+-- this is the dispatch-side BELT for the same rule: a receipt nothing
+-- vouches for is SKIPPED by selection — never handed to the token as a
+-- fall-through non-vouching credential. user_verified receipts answer true
+-- here by construction: receipt_parked (above) is the vouching gate for
+-- that kind, and only the minted token ever carries it.
+function Client:receipt_credential_available(receipt)
+	if receipt.kind == "user_verified" then
+		return true
+	end
+	return self.config.api_key ~= nil
+		or (self.config.token_provider ~= nil
+			and receipt.actor_identifier == self.anonymous_id)
+end
+
+-- The oldest receipt eligible for dispatch under the current credential
+-- configuration: parked receipts — and receipts no configured credential
+-- vouches for — are skipped, never head-blocking, and deliverable receipts
+-- behind them deliver (delivery order stays FIFO per actor, which is the
+-- ordering guarantee the server relies on).
+function Client:next_dispatchable_receipt()
+	for i = 1, #self.consent_outbox do
+		local receipt = self.consent_outbox[i]
+		if not self:receipt_parked(receipt)
+			and self:receipt_credential_available(receipt) then
+			return receipt
+		end
+	end
+	return nil
+end
+
 -- True while the durable outbox retains an analytics GRANT receipt that has
 -- NOT yet been handed to the transport. Delivery is serial and in decision
--- order, so the only receipt that can have been handed over is the head
--- currently in flight — a grant anywhere else (parked behind a deferral or
+-- order, so the only receipt that can have been handed over is the one
+-- currently in flight — a grant anywhere else (held behind a deferral or
 -- backoff window, queued behind another receipt, or simply not yet
 -- dispatched, e.g. right after a relaunch that reloaded the durable outbox)
 -- is still awaiting its handoff, and an event batch dispatched meanwhile
@@ -1854,15 +2165,22 @@ end
 -- terminally suppressed. The condition is DISPATCH, never acknowledgment: a
 -- grant in flight (handed to the transport, response pending) does not hold
 -- events — its request already precedes any batch dispatched after it.
+-- PARKED grants are skipped: a parked receipt is not dispatchable on this
+-- launch at all, and holding the batch leg for it would wedge every flush
+-- (and teardown's final flush) for as long as the credential stays absent.
 function Client:grant_receipt_pending_dispatch()
 	for i = 1, #self.consent_outbox do
 		local receipt = self.consent_outbox[i]
-		if type(receipt.categories) == "table" and receipt.categories.analytics == true then
-			-- The head being handed over right now releases the gate only
-			-- for ITSELF: skip it and keep scanning, so a later grant queued
-			-- behind it (grant→deny→grant toggling before the first receipt
-			-- settles) still holds events until its own handoff.
-			if not (i == 1 and self.consent_send_in_flight) then
+		if not self:receipt_parked(receipt)
+			and type(receipt.categories) == "table" and receipt.categories.analytics == true then
+			-- The receipt being handed over right now releases the gate only
+			-- for ITSELF (matched by key identity — with parked receipts
+			-- skipped the in-flight receipt is not always the head): a later
+			-- grant queued behind it (grant→deny→grant toggling before the
+			-- first receipt settles) still holds events until its own
+			-- handoff.
+			if not (self.consent_send_in_flight
+				and receipt.idempotency_key == self.consent_in_flight_key) then
 				return true
 			end
 		end
@@ -1934,17 +2252,24 @@ end
 -- undelivered with the durable append owed (a process death would lose it);
 -- set_consent surfaces that as consent_outbox_persist_failed.
 function Client:send_consent_decision()
+	local actor, kind = receipt_actor(self)
 	local payload = {
 		workspace_id = self.config.workspace_id,
 		app_id = self.config.app_id,
 		environment_id = self.config.environment_id,
-		actor_identifier = valid_identity(self.user_id) and self.user_id or self.anonymous_id,
+		actor_identifier = actor,
+		-- The actor's ADR-0222 identity class, chosen by the same canonical
+		-- selection as the actor itself. Persisted with the receipt and
+		-- re-sent verbatim; it also drives the per-receipt dispatch
+		-- credential and the parked predicate.
+		kind = kind,
 		categories = { analytics = self.consent_state == "granted" },
 		decided_at = clock.iso_utc(),
 		idempotency_key = id.uuid_v7(),
 		-- Retention metadata, never sent on the wire: the decision-time
 		-- anonymous id, so a later Mode B launch whose identity changed can
-		-- recognize (and drop) a receipt its minted token could never send.
+		-- recognize (and drop) an anon-keyed receipt its minted token could
+		-- never send.
 		anonymous_id = self.anonymous_id,
 	}
 	if self.consent_state == "denied_forced_minor" then
@@ -1991,17 +2316,30 @@ function Client:send_consent_decision()
 	return true
 end
 
--- Deliver the outbox serially, oldest receipt first — one receipt in flight
--- at a time, so receipts arrive in DECISION ORDER and a grant-then-deny can
--- never settle deny-then-grant. Returns true when the outbox is empty or a
+-- Deliver the outbox serially, oldest dispatchable receipt first — one
+-- receipt in flight at a time, so receipts arrive in DECISION ORDER (parked
+-- receipts are skipped, which per-actor FIFO makes safe) and a
+-- grant-then-deny can never settle deny-then-grant. Returns true when
+-- nothing is dispatchable (empty, or every retained receipt is parked or
+-- has no vouching credential) or a
 -- dispatch was started (transport failures are counted inside the result
 -- callback); false while delivery is blocked — a receipt already in flight,
--- an open backoff window, or no usable token yet. Failure handling mirrors
--- the publish path: retryable outcomes keep the receipt at the head (a
--- Retry-After or backoff paces the retry; a Mode B 401 retries immediately
--- with a freshly minted token), while terminal outcomes — including a Mode A
--- 401, whose static key cannot change — drop the receipt (surfaced through
--- diagnostics) rather than wedging every receipt queued behind it.
+-- an open backoff window, or no usable credential yet. The dispatch
+-- credential is selected PER RECEIPT, most-vouching first: the minted
+-- Mode B token whenever it vouches for the receipt's actor (the current
+-- verified user, or the current anon the mint binds as its subject — so
+-- current-anon grants stay deliverable in the dual configuration), the
+-- publishable api_key only for receipts the token cannot vouch for
+-- (historic-anon actors) and in pure Mode A. Failure handling mirrors
+-- the publish path: retryable outcomes keep the receipt for the next
+-- dispatch point (a Retry-After or backoff paces the retry; a 401 under a
+-- minted token re-mints and retries immediately), while terminal outcomes —
+-- including a 401 on a dispatch that used the publishable key, whose static
+-- credential cannot change — drop the receipt (surfaced through
+-- diagnostics) rather than wedging every receipt queued behind it. A 401 is
+-- classified by the credential the dispatch ACTUALLY USED: a
+-- publishable-key 401 is terminal even in a dual-credential configuration,
+-- and never invalidates the cached Mode B token.
 function Client:try_send_consent_outbox()
 	-- A torn-down client dispatches nothing: a late async ack from a receipt
 	-- that was in flight at shutdown() must not chain further /v1/consent
@@ -2012,33 +2350,64 @@ function Client:try_send_consent_outbox()
 	end
 	-- An owed durable write is retried on the same cadence as delivery.
 	self:retry_consent_outbox_persist()
-	local payload = self.consent_outbox[1]
+	local payload = self:next_dispatchable_receipt()
 	if not payload then
 		return true
 	end
 	if self.consent_send_in_flight or self:consent_send_deferred() then
 		return false
 	end
-	if not self:can_publish() then
-		return false
+	local credential
+	-- MOST-VOUCHING credential selection: the receipt rides the minted
+	-- Mode B token whenever that token vouches for the receipt's ACTOR —
+	-- the current verified user (a dispatchable user_verified receipt has
+	-- already passed the vouching predicate), or the CURRENT anonymous id,
+	-- which the mint binds as the token's subject — so in the dual
+	-- token_provider + api_key configuration a current-anon receipt may
+	-- carry a GRANT the publishable key terminally could not (the route
+	-- accepts grants only from a credential bound to the actor). Only a
+	-- receipt the token cannot vouch for falls back to the publishable key
+	-- where one is configured: the HISTORIC-anon receipt, whose actor this
+	-- session can no longer mint for — the key needs no mint and no
+	-- identity gate and is the one credential that can still carry it (a
+	-- historic-anon pure grant takes the documented terminal grant 403;
+	-- the one-way anon-scope outcome) — and every anon receipt in pure
+	-- Mode A, where no token exists.
+	local vouched_by_token = self.config.token_provider ~= nil
+		and (payload.kind == "user_verified"
+			or payload.actor_identifier == self.anonymous_id)
+	local used_publishable_key = not vouched_by_token and self.config.api_key ~= nil
+	if used_publishable_key then
+		credential = self.config.api_key
+	else
+		if not self:can_publish() then
+			return false
+		end
+		credential = self.token
 	end
 	-- The stored entry carries retention metadata (the decision-time
 	-- anonymous_id snapshot read by the Mode B identity check at load); the
-	-- wire payload is the receipt's contract fields only.
+	-- wire payload is the receipt's contract fields only. `kind` rides the
+	-- body by default; consent_kind_emission_enabled = false suppresses the
+	-- field for deployments whose ingest still strict-decodes the
+	-- pre-amendment schema (see validate_config).
 	local wire = {
 		workspace_id = payload.workspace_id,
 		app_id = payload.app_id,
 		environment_id = payload.environment_id,
 		actor_identifier = payload.actor_identifier,
+		kind = self.config.consent_kind_emission_enabled and payload.kind or nil,
 		categories = payload.categories,
 		decided_at = payload.decided_at,
 		idempotency_key = payload.idempotency_key,
 		reason = payload.reason,
 	}
 	self.consent_send_in_flight = true
-	local dispatched = transport.send_consent(self.config, self.token, wire,
+	self.consent_in_flight_key = payload.idempotency_key
+	local dispatched = transport.send_consent(self.config, credential, wire,
 		function(ok, err, unauthorized, retryable, _, retry_after)
 			self.consent_send_in_flight = false
+			self.consent_in_flight_key = nil
 			if ok then
 				self.stats.consent_recorded = self.stats.consent_recorded + 1
 				self.consent_retry_after_ms = nil
@@ -2052,17 +2421,22 @@ function Client:try_send_consent_outbox()
 			end
 			self.stats.consent_failed = self.stats.consent_failed + 1
 			self.stats.last_consent_error = err
-			if unauthorized then
+			if unauthorized and not used_publishable_key then
+				-- Only the credential that failed is invalidated: a minted
+				-- token is dropped for a fresh mint, while a publishable-key
+				-- 401 must not clear a cached Mode B token that was never on
+				-- this request.
 				self.token = nil
 				self.token_expires_at_ms = nil
 			end
-			local mode_b = self.config.token_provider ~= nil
-			if is_retryable_publish_failure(err, unauthorized, retryable, mode_b) then
-				-- The receipt stays at the head of the durable outbox for the
+			if is_retryable_publish_failure(err, unauthorized, retryable,
+				not used_publishable_key and self.config.token_provider ~= nil) then
+				-- The receipt stays retained in the durable outbox for the
 				-- next dispatch point. A 401 is an auth problem, not
-				-- backpressure — never deferred (Mode B re-mints and retries
-				-- immediately); transport transients honor a Retry-After or
-				-- back off so a dead endpoint is not hammered every tick.
+				-- backpressure — never deferred (a minted-token dispatch
+				-- re-mints and retries immediately); transport transients
+				-- honor a Retry-After or back off so a dead endpoint is not
+				-- hammered every tick.
 				if not unauthorized then
 					if retry_after and retry_after > 0 then
 						self:defer_consent(retry_after)
@@ -2072,9 +2446,10 @@ function Client:try_send_consent_outbox()
 				end
 				return
 			end
-			-- Terminal: the server will never accept this payload (or the Mode
-			-- A key can never authorize it). Drop it — surfaced through
-			-- diagnostics — so the receipts queued behind it still deliver.
+			-- Terminal: the server will never accept this payload (or the
+			-- static publishable key can never authorize it). Drop it —
+			-- surfaced through diagnostics — so the receipts queued behind it
+			-- still deliver.
 			self:remove_consent_receipt(payload.idempotency_key)
 			self:diagnose({
 				scope = "consent",
@@ -2089,6 +2464,7 @@ function Client:try_send_consent_outbox()
 		-- receipt retained per its retryability, so the dispatch counts as
 		-- attempted either way.
 		self.consent_send_in_flight = false
+		self.consent_in_flight_key = nil
 	end
 	return true
 end
@@ -2832,12 +3208,12 @@ function Client:flush(options)
 	end
 
 	-- Strict-enforce hardening (audit 3a follow-up): the event-batch leg of
-	-- this flush is held while the outbox retains an analytics GRANT receipt
-	-- that has not yet been HANDED TO THE TRANSPORT (the dispatch above may
-	-- have started only the head, and http.request is asynchronous — a grant
-	-- parked behind a deferral/backoff window, queued behind another
-	-- receipt, or awaiting its first post-relaunch dispatch has not been
-	-- handed over yet). Publishing meanwhile would invert the
+	-- this flush is held while the outbox retains a DISPATCHABLE analytics
+	-- GRANT receipt that has not yet been HANDED TO THE TRANSPORT (the
+	-- dispatch above may have started only one receipt, and http.request is
+	-- asynchronous — a grant held behind a deferral/backoff window, queued
+	-- behind another receipt, or awaiting its first post-relaunch dispatch
+	-- has not been handed over yet). Publishing meanwhile would invert the
 	-- receipt-before-batch ordering and hand a strict-enforce workspace
 	-- post-grant events with no consent row to admit them (terminal
 	-- suppressed_no_consent). The condition is dispatch, NOT acknowledgment
@@ -2845,7 +3221,10 @@ function Client:flush(options)
 	-- with its response still pending. The gate only fires when there ARE
 	-- events to hold: an empty pipeline must keep returning success so a
 	-- durably-retained undispatched receipt alone never blocks teardown
-	-- (shutdown's outbox-durability contract).
+	-- (shutdown's outbox-durability contract). PARKED verified-keyed grants
+	-- never gate — they cannot dispatch on this launch at all, and holding
+	-- the batch leg for them would wedge every flush until the Mode B
+	-- credential returns (grant_receipt_pending_dispatch skips them).
 	if self:grant_receipt_pending_dispatch()
 		and (self.in_flight_batch ~= nil or queue.size(self.queue) > 0 or self:spool_pending()) then
 		return false, "consent_receipt_pending"

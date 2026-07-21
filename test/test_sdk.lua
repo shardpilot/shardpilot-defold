@@ -323,6 +323,8 @@ local function test_config_validation()
 		{ { schema_revision = 42 }, "invalid_schema_revision" },
 		{ { schema_revision = true }, "invalid_schema_revision" },
 		{ { schema_revision = {} }, "invalid_schema_revision" },
+		{ { consent_kind_emission_enabled = "yes" }, "invalid_consent_kind_emission_enabled" },
+		{ { consent_kind_emission_enabled = 1 }, "invalid_consent_kind_emission_enabled" },
 	}
 	for _, entry in ipairs(invalid_cases) do
 		client, err = sdk.new(config(entry[1]))
@@ -354,6 +356,8 @@ local function test_config_validation()
 	assert_equal(client.config.spool_max_bytes, 262144)
 	-- Default: declare the SDK's built-in schema-set revision on batch ingest.
 	assert_equal(client.config.schema_revision, schema_revision.REVISION)
+	-- Default: consent receipts carry their actor kind on the wire.
+	assert_equal(client.config.consent_kind_emission_enabled, true)
 
 	-- Dual-mode auth: exactly one of token_provider / api_key.
 	-- Neither configured -> auth_required.
@@ -529,10 +533,17 @@ local function test_session_start_rolls_back_on_invalid_props()
 	assert_equal(client.session_active, previous_active)
 end
 
+-- Mode A deliberately: the pin is that identity/session/time are
+-- SNAPSHOTTED at enqueue — an event tracked under user-a ships user-a even
+-- after the host re-identifies — and Mode A is where that mixed-user batch
+-- remains lawful (a static publishable key vouches for no particular
+-- user). Mode B now REFUSES the un-flushed switch outright, exactly so a
+-- mixed batch can never ride one minted Bearer: pinned by
+-- test_identify_refused_while_other_user_events_pending.
 local function test_track_snapshots_identity_session_and_time()
 	reset()
 	seed_granted_consent()
-	local client = assert(sdk.new(config()))
+	local client = assert(sdk.new(config_mode_a()))
 	assert_true(client:identify("user-a"))
 	assert_true(client:session_start())
 	local session_a = client.session_id
@@ -741,6 +752,9 @@ local function test_consent_tri_state_gating_and_queue_clear()
 	assert_contains(consent_request.body, '"app_id":"app-example"')
 	assert_contains(consent_request.body, '"environment_id":"develop"')
 	assert_contains(consent_request.body, '"actor_identifier":"user-example"')
+	-- Mode B + identify(): the canonical actor is the verified user id, and
+	-- its kind rides the wire by default.
+	assert_contains(consent_request.body, '"kind":"user_verified"')
 	assert_contains(consent_request.body, '"categories":{"analytics":false}')
 	assert_contains(consent_request.body, '"decided_at":"')
 	assert_contains(consent_request.body, '"idempotency_key":"')
@@ -1204,12 +1218,16 @@ local function test_set_anonymous_id_rejected_while_consent_pending_mode_b()
 			callback(nil, nil, "no token")
 		end,
 	})))
-	assert_true(client:identify("user-example"))
 	assert_true(client:set_consent(true))
 	assert_equal(#client.consent_outbox, 1, "consent stays pending after a token error")
+	assert_equal(client.consent_outbox[1].kind, "anon",
+		"a pre-identify Mode B decision keys to the anon actor")
 	assert_equal(client.token_request_in_flight, false)
-	-- A consent receipt bound to the OLD anon is still pending, so rotation must
-	-- be blocked even though no token request is in flight.
+	-- An ANON-KEYED consent receipt carries the OLD anon as its actor, so
+	-- rotation must be blocked even though no token request is in flight —
+	-- a post-rotation retry would mint for the new anon but send the old
+	-- actor. (A user_verified-keyed receipt does not block: see
+	-- test_rotation_allowed_with_only_parked_verified_receipts.)
 	local ok, err = client:set_anonymous_id("anon-new")
 	assert_equal(ok, false)
 	assert_equal(err, "events_pending")
@@ -3465,6 +3483,7 @@ local function test_ac8_forced_minor_sole_request_is_the_receipt()
 	assert_contains(receipt.body, '"categories":{"analytics":false}')
 	assert_contains(receipt.body, '"reason":"denied_forced_minor"')
 	assert_contains(receipt.body, '"actor_identifier":"user-minor"')
+	assert_contains(receipt.body, '"kind":"user_verified"')
 	assert_contains(receipt.body, '"idempotency_key":"')
 	assert_contains(receipt.body, '"decided_at":"')
 	-- the retention-metadata anon snapshot stored on the outbox entry never
@@ -3541,7 +3560,9 @@ local function test_consent_receipt_survives_restart_and_retries_until_acked()
 
 	next_status = 500
 	local first = assert(sdk.new(config()))
-	assert_true(first:identify("user-example"))
+	-- Anon-keyed on purpose: a user_verified receipt would park on the
+	-- pre-identify relaunches below; this test pins the restart/retry/ack
+	-- mechanics themselves.
 	assert_true(first:set_consent(false))
 	assert_equal(#requests, 1)
 	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
@@ -3550,6 +3571,7 @@ local function test_consent_receipt_survives_restart_and_retries_until_acked()
 	assert_equal(#record.receipts, 1)
 	local original_key = record.receipts[1].idempotency_key
 	assert_equal(record.receipts[1].categories.analytics, false)
+	assert_equal(record.receipts[1].kind, "anon")
 
 	-- "next launch": init re-attempts delivery immediately — while the
 	-- persisted state is denied
@@ -3615,9 +3637,12 @@ local function test_shutdown_completes_with_durable_outbox_and_next_launch_deliv
 	local record = stored_consent_outbox_record(stores)
 	assert_equal(#record.receipts, 1, "the receipt survives teardown on disk")
 
-	-- next launch (working token backend) delivers it at init
+	-- next launch (working token backend): the verified-keyed receipt stays
+	-- parked until the session vouches for its actor; identify() delivers it
 	reset()
 	local second = assert(sdk.new(config()))
+	assert_equal(#requests, 0, "a verified receipt stays parked before identify")
+	assert_true(second:identify("user-example"))
 	assert_equal(#requests, 1)
 	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
 	assert_contains(requests[1].body, '"categories":{"analytics":true}')
@@ -3710,15 +3735,17 @@ local function test_toggled_grant_behind_in_flight_head_still_holds_events()
 end
 
 -- Audit 3a follow-up (restart): a relaunch mid-window reloads the durable
--- outbox but no deferral state — the gate needs none: the retained grant is
--- handed to the transport at init, ahead of anything the fresh process can
--- publish, so the first post-restart batch always follows the receipt on the
--- wire (and is never ack-gated on it).
+-- outbox but no deferral state — the gate needs none: the retained
+-- verified-keyed grant is handed to the transport the moment the session
+-- vouches for its actor again (identify() is that dispatch point; until
+-- then it is parked), ahead of anything the fresh process can publish, so
+-- the first post-restart batch always follows the receipt on the wire (and
+-- is never ack-gated on it).
 local function test_restart_dispatches_retained_grant_before_first_batch()
 	reset()
 	storage.reset()
 	local stores, restore = install_stub_sys_storage()
-	-- First launch: the grant receipt is parked by a server Retry-After and
+	-- First launch: the grant receipt is held by a server Retry-After and
 	-- the app closes with the receipt durably retained.
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_true(client:identify("user-example"))
@@ -3730,9 +3757,10 @@ local function test_restart_dispatches_retained_grant_before_first_batch()
 	next_response_headers = nil
 	assert_true(client:shutdown())
 	local record = stored_consent_outbox_record(stores)
-	assert_equal(#record.receipts, 1, "the parked grant survives on disk")
+	assert_equal(#record.receipts, 1, "the deferred grant survives on disk")
 
-	-- Relaunch (async transport): init hands the retained grant over first.
+	-- Relaunch (async transport): the verified receipt stays parked until
+	-- the session vouches for its actor; identify() hands it over first.
 	reset()
 	local original_request = http.request
 	local callbacks = {}
@@ -3741,9 +3769,10 @@ local function test_restart_dispatches_retained_grant_before_first_batch()
 		callbacks[#callbacks + 1] = callback
 	end
 	local second = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
-	assert_equal(#requests, 1, "init hands the retained grant to the transport")
-	assert_true(requests[1].url:find("/v1/consent", 1, true) ~= nil)
+	assert_equal(#requests, 0, "a verified receipt stays parked until the session vouches for it")
 	assert_true(second:identify("user-example"))
+	assert_equal(#requests, 1, "identify hands the retained grant to the transport")
+	assert_true(requests[1].url:find("/v1/consent", 1, true) ~= nil)
 	assert_true(second:track("post_restart_event"), "the persisted grant reopens the pipeline")
 	local flushed, reason = second:flush()
 	assert_equal(flushed, false)
@@ -3757,31 +3786,49 @@ local function test_restart_dispatches_retained_grant_before_first_batch()
 	storage.reset()
 end
 
--- The outbox is bounded: storage evicts the OLDEST receipts beyond the fixed
--- cap (32 — the newest decisions are the operative ones), and the client
--- surfaces the eviction of a still-undelivered receipt via stats/diagnostics.
-local function test_consent_outbox_bounded_evicts_oldest()
+-- Builds a well-formed outbox entry for the cap/eviction tests. Odd indices
+-- are denials (analytics=false, eviction-protected), even indices pure
+-- grants (analytics=true, evictable).
+local function cap_test_receipt(i)
+	return {
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "user-example",
+		kind = "anon",
+		categories = { analytics = (i % 2) == 0 },
+		decided_at = "2026-07-11T00:00:00Z",
+		idempotency_key = "receipt-" .. tostring(i),
+	}
+end
+
+-- The outbox is bounded (cap 32) with DENIAL-PREFERRING eviction: overflow
+-- evicts the OLDEST PURE-GRANT receipts first — a recorded denial is the
+-- compliance-critical write (a lost denial fail-opens the actor
+-- server-side; a lost grant only delays pipeline opening and is
+-- re-writable) — and the client surfaces the eviction of a
+-- still-undelivered receipt via stats/diagnostics. Rewrites the retired
+-- plain-FIFO cap pin.
+local function test_consent_outbox_cap_evicts_oldest_pure_grants_first()
 	reset()
 	storage.reset()
-	local function receipt(i)
-		return {
-			workspace_id = "workspace-example",
-			app_id = "app-example",
-			environment_id = "develop",
-			actor_identifier = "user-example",
-			categories = { analytics = (i % 2) == 0 },
-			decided_at = "2026-07-11T00:00:00Z",
-			idempotency_key = "receipt-" .. tostring(i),
-		}
-	end
 	local entries = {}
 	for i = 1, 40 do
-		entries[i] = receipt(i)
+		entries[i] = cap_test_receipt(i)
 	end
 	local saved = storage.save_consent_outbox(identity_scope, entries)
 	assert_equal(#saved, 32, "the outbox must hold at most 32 receipts")
-	assert_equal(saved[1].idempotency_key, "receipt-9", "the oldest receipts are evicted first")
+	-- 8 over cap: the 8 OLDEST GRANTS (even 2..16) go; every denial stays.
+	assert_equal(saved[1].idempotency_key, "receipt-1", "the oldest DENIAL must survive the cap")
+	assert_equal(saved[2].idempotency_key, "receipt-3", "grants older than it are evicted instead")
 	assert_equal(saved[32].idempotency_key, "receipt-40")
+	local denials = 0
+	for i = 1, #saved do
+		if saved[i].categories.analytics == false then
+			denials = denials + 1
+		end
+	end
+	assert_equal(denials, 20, "cap pressure must never evict a denial while grants remain")
 
 	-- the client mirror adopts the trim and counts the eviction
 	reset()
@@ -3793,13 +3840,131 @@ local function test_consent_outbox_bounded_evicts_oldest()
 		end,
 	})))
 	for i = 1, 33 do
-		client.consent_outbox[i] = receipt(100 + i)
+		client.consent_outbox[i] = cap_test_receipt(100 + i)
 	end
 	assert_true(client:persist_consent_outbox())
 	assert_equal(#client.consent_outbox, 32)
+	assert_equal(client.consent_outbox[1].idempotency_key, "receipt-101",
+		"the denial head survives; the oldest grant was evicted")
+	assert_equal(client.consent_outbox[2].idempotency_key, "receipt-103")
 	assert_equal(client:snapshot().consent_outbox_evicted, 1)
 	assert_equal(issues[#issues].scope, "consent")
 	assert_equal(issues[#issues].code, "outbox_overflow")
+	storage.reset()
+end
+
+-- The denial-preferring fallback: a denial-carrying receipt is evicted —
+-- oldest first — ONLY when everything over the cap carries denials. The
+-- forced-minor reason-bearing denial is denial-carrying too (its category
+-- map is analytics=false), so it enjoys the same protection.
+local function test_consent_outbox_cap_denial_evicted_only_among_denials()
+	reset()
+	storage.reset()
+	local entries = {}
+	for i = 1, 33 do
+		local entry = cap_test_receipt(i)
+		entry.categories = { analytics = false }
+		if i == 1 then
+			entry.reason = "denied_forced_minor"
+		end
+		entries[i] = entry
+	end
+	local saved = storage.save_consent_outbox(identity_scope, entries)
+	assert_equal(#saved, 32)
+	assert_equal(saved[1].idempotency_key, "receipt-2",
+		"with nothing but denials over cap, the oldest denial goes")
+	assert_equal(saved[32].idempotency_key, "receipt-33")
+	storage.reset()
+end
+
+-- GRANT-APPEND FAILS CLOSED ON A DENIAL-FULL OUTBOX: when appending a
+-- grant's receipt would overflow the 32-entry cap with no pre-existing pure
+-- grant for the denial-preferring loop to evict, the loop's only candidates
+-- are denial-carrying receipts or the just-appended grant itself — so
+-- set_consent(true) is REFUSED with the distinct consent_outbox_full:
+-- the state does not flip, nothing is evicted, every denial stays, and no
+-- wire traffic results. A DENIAL append at the same cap keeps the shipped
+-- semantics (the all-denials overflow evicts the OLDEST denial — a fresh
+-- denial outranks a stale one). Once the outbox drains below the cap, the
+-- same grant succeeds and dispatches.
+local function test_grant_refused_on_denial_full_outbox_fails_closed()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	next_status = 500
+	local client = assert(sdk.new(config_mode_a()))
+	for _ = 1, 32 do
+		assert_true(client:set_consent(false))
+	end
+	assert_equal(#client.consent_outbox, 32, "32 undelivered denials retained")
+
+	local wire_before = #requests
+	local ok, err = client:set_consent(true)
+	assert_equal(ok, false)
+	assert_equal(err, "consent_outbox_full")
+	assert_equal(client.consent_state, "denied", "a refused grant must not flip the state")
+	assert_equal(#client.consent_outbox, 32, "a refused grant evicts nothing")
+	for i = 1, #client.consent_outbox do
+		assert_equal(client.consent_outbox[i].categories.analytics, false,
+			"every retained denial survives the refused grant")
+	end
+	assert_equal(#requests, wire_before, "a refused grant produces no wire traffic")
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 32, "the durable record is untouched")
+
+	-- a DENIAL append still applies at the same cap: the all-denials
+	-- overflow evicts the OLDEST denial in favor of the fresh one
+	local oldest_key = client.consent_outbox[1].idempotency_key
+	assert_true(client:set_consent(false))
+	assert_equal(#client.consent_outbox, 32)
+	assert_not_equal(client.consent_outbox[1].idempotency_key, oldest_key,
+		"a fresh denial evicts the oldest denial, never the reverse")
+
+	-- drain below the cap: the same grant now succeeds and dispatches
+	next_status = 202
+	client.consent_retry_after_ms = nil
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(#client.consent_outbox, 0, "the outbox drains once the transport recovers")
+	assert_true(client:set_consent(true), "the grant succeeds once the outbox drained")
+	assert_equal(client.consent_state, "granted")
+	assert_contains(requests[#requests].body, '"categories":{"analytics":true}')
+	assert_equal(#client.consent_outbox, 0, "the grant receipt delivered")
+	restore()
+	storage.reset()
+end
+
+-- The refusal is scoped exactly to the denial-full case: with a
+-- pre-existing pure grant available to absorb the overflow, a new grant
+-- append proceeds and the shipped denial-preferring loop evicts that
+-- OLDEST grant — the fresh grant is retained and every denial survives.
+local function test_grant_append_proceeds_when_old_grant_evictable()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	next_status = 500
+	local client = assert(sdk.new(config_mode_a()))
+	for _ = 1, 31 do
+		assert_true(client:set_consent(false))
+	end
+	assert_true(client:set_consent(true), "under the cap the grant appends normally")
+	assert_equal(#client.consent_outbox, 32)
+	local old_grant_key = client.consent_outbox[32].idempotency_key
+	assert_true(client:set_consent(true),
+		"with an old pure grant evictable, a new grant is not refused")
+	assert_equal(#client.consent_outbox, 32)
+	local denials = 0
+	for i = 1, #client.consent_outbox do
+		if client.consent_outbox[i].categories.analytics == false then
+			denials = denials + 1
+		end
+	end
+	assert_equal(denials, 31, "every denial survives the grant-for-grant eviction")
+	assert_equal(client.consent_outbox[32].categories.analytics, true,
+		"the fresh grant is retained")
+	assert_not_equal(client.consent_outbox[32].idempotency_key, old_grant_key,
+		"the OLD grant is the one evicted")
+	assert_equal(client:snapshot().consent_outbox_evicted, 1)
+	restore()
 	storage.reset()
 end
 
@@ -3811,10 +3976,10 @@ local function test_malformed_consent_outbox_dropped_failsafe()
 	storage.reset()
 	local stores, restore = install_stub_sys_storage()
 
-	-- persist one real receipt (a transient failure keeps it retained)
+	-- persist one real receipt (a transient failure keeps it retained;
+	-- anon-keyed so the pre-identify relaunch below can dispatch it)
 	next_status = 500
 	local first = assert(sdk.new(config()))
-	assert_true(first:identify("user-example"))
 	assert_true(first:set_consent(false))
 	local record, path = stored_consent_outbox_record(stores)
 	assert_true(record ~= nil and path ~= nil)
@@ -3903,17 +4068,25 @@ local function test_rotation_blocked_while_prune_rewrite_owed()
 	storage.reset()
 end
 
--- Mode B tokens bind the CURRENT anonymous id, so receipts retained under a
--- previous identity are dropped at load (diagnosed as identity_changed, like
--- the event spool) instead of wedging the trail behind a guaranteed 401;
--- Mode A has no token binding and re-sends the historic actor unchanged.
-local function test_outbox_identity_mismatch_dropped_mode_b_kept_mode_a()
+-- The identity-changed anti-wedge drop at load is scoped to receipts that
+-- could NEVER send on any configured credential: ANON-keyed receipts with a
+-- rotated anon snapshot, in a Mode-B-ONLY configuration (the minted token
+-- binds the CURRENT anon, so replaying them would wedge the trail behind a
+-- guaranteed rejection; diagnosed as identity_changed, like the event
+-- spool). Everything else keeps delivering: Mode A re-sends the historic
+-- actor unchanged, a Mode B + api_key configuration dispatches
+-- HISTORIC-anon receipts under the publishable key (the historic actor is
+-- the correct subject of those decisions, and the key is the one
+-- credential that can still carry it — a current-anon receipt rides the
+-- minted token instead, most-vouching), and a user_verified-keyed receipt
+-- is never dropped for a merely-absent identity.
+local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 	reset()
 	storage.reset()
 	local stores, restore = install_stub_sys_storage()
 
-	-- Mode B: retain a receipt under the original anon, then relaunch with an
-	-- identity override
+	-- Mode-B-only: retain an anon-keyed receipt under the original anon,
+	-- then relaunch with an identity override
 	next_status = 500
 	local first = assert(sdk.new(config()))
 	assert_true(first:set_consent(false))
@@ -3921,6 +4094,7 @@ local function test_outbox_identity_mismatch_dropped_mode_b_kept_mode_a()
 	local record = stored_consent_outbox_record(stores)
 	assert_equal(record.receipts[1].anonymous_id, first.anonymous_id,
 		"the entry must carry its decision-time anon snapshot")
+	assert_equal(record.receipts[1].kind, "anon")
 
 	reset()
 	next_status = 202
@@ -3931,12 +4105,75 @@ local function test_outbox_identity_mismatch_dropped_mode_b_kept_mode_a()
 			issues[#issues + 1] = issue
 		end,
 	})))
-	assert_equal(#second.consent_outbox, 0, "a mismatched receipt must be dropped at load")
+	assert_equal(#second.consent_outbox, 0, "a mismatched anon receipt must be dropped at load")
 	assert_equal(#requests, 0, "a dropped receipt must not be dispatched")
 	assert_equal(issues[#issues].scope, "consent")
 	assert_equal(issues[#issues].code, "identity_changed")
 	record = stored_consent_outbox_record(stores)
 	assert_equal(#record.receipts, 0, "the drop must be persisted")
+
+	-- Mode-B-only, user_verified-keyed: the same anon rotation must NOT drop
+	-- the receipt (it may be the only record of that actor's decision); it
+	-- parks until the session vouches for its actor, then delivers under the
+	-- minted token.
+	reset()
+	storage.reset()
+	next_status = 500
+	local verified_first = assert(sdk.new(config()))
+	assert_true(verified_first:identify("user-verified-example"))
+	assert_true(verified_first:set_consent(false))
+	assert_equal(#verified_first.consent_outbox, 1)
+
+	reset()
+	next_status = 202
+	local verified_issues = {}
+	local verified_second = assert(sdk.new(config({
+		anonymous_id = "anon-override",
+		diagnostics = function(issue)
+			verified_issues[#verified_issues + 1] = issue
+		end,
+	})))
+	assert_equal(#verified_issues, 0, "a verified-keyed receipt must never drop as identity_changed")
+	assert_equal(#verified_second.consent_outbox, 1, "the verified receipt is retained")
+	assert_equal(#requests, 0, "and parked until the session vouches for its actor")
+	assert_true(verified_second:identify("user-verified-example"))
+	assert_equal(#requests, 1, "identify delivers the retained verified receipt")
+	assert_contains(requests[1].body, '"actor_identifier":"user-verified-example"')
+	assert_contains(requests[1].body, '"kind":"user_verified"')
+	assert_equal(verified_second:snapshot().consent_recorded, 1)
+
+	-- Mode B + api_key (the remote-config dual-credential configuration): an
+	-- anon-keyed receipt with a rotated anon KEEPS delivering — a HISTORIC
+	-- anon actor is one the minted token cannot vouch for, so it goes under
+	-- the publishable key, which has no token binding. (The explicit anon
+	-- makes the first launch's actor genuinely historic on the relaunch:
+	-- the stubbed sys stores survive storage.reset(), so a generated-or-
+	-- inherited anon could collide with the relaunch override and read as
+	-- CURRENT — which would ride the token instead.)
+	reset()
+	storage.reset()
+	next_status = 500
+	local dual_config = {
+		remote_config_url = "http://localhost:9090",
+		api_key = "sp_ingest_publishable_key",
+		anonymous_id = "anon-dual-historic",
+	}
+	local dual_first = assert(sdk.new(config(dual_config)))
+	local dual_historic_anon = dual_first.anonymous_id
+	assert_true(dual_first:set_consent(false))
+	assert_equal(#dual_first.consent_outbox, 1)
+
+	reset()
+	next_status = 202
+	local dual_second = assert(sdk.new(config({
+		remote_config_url = "http://localhost:9090",
+		api_key = "sp_ingest_publishable_key",
+		anonymous_id = "anon-override",
+	})))
+	assert_equal(#requests, 1, "Mode B + api_key must re-send the historic anon receipt")
+	assert_equal(requests[1].headers["Authorization"], "Bearer sp_ingest_publishable_key")
+	assert_contains(requests[1].body, '"actor_identifier":"' .. dual_historic_anon .. '"')
+	assert_equal(dual_second:snapshot().consent_recorded, 1)
 
 	-- Mode A: same retained-receipt situation re-sends the historic actor
 	reset()
@@ -3954,6 +4191,768 @@ local function test_outbox_identity_mismatch_dropped_mode_b_kept_mode_a()
 	assert_contains(requests[1].body, '"actor_identifier":"' .. historic_anon .. '"')
 	assert_not_contains(requests[1].body, '"anonymous_id"')
 	assert_equal(fourth:snapshot().consent_recorded, 1)
+	restore()
+	storage.reset()
+end
+
+-- Canonical-actor keying (ADR-0222 §1 / the ADR-0202 2026-07-20 amendment):
+-- a Mode A self-asserted user id is NEVER the receipt actor — the
+-- publishable key cannot vouch for it, and the ingress binds the write to
+-- the caller's own anon scope regardless — so the receipt keys to the
+-- SDK-managed anonymous id with kind "anon". Replaces the retired v0.9.1
+-- user-first snapshot rule (which took a set user_id even in Mode A).
+local function test_receipt_actor_canonical_anon_under_publishable_key()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-actor"))
+	assert_true(client:set_consent(false))
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
+	assert_equal(requests[1].headers["Authorization"], "Bearer sp_ingest_publishable_key")
+	assert_contains(requests[1].body, '"actor_identifier":"' .. client.anonymous_id .. '"')
+	assert_not_contains(requests[1].body, "user-actor")
+	assert_contains(requests[1].body, '"kind":"anon"')
+	storage.reset()
+end
+
+-- Mode B canonical keying + default kind emission: a decision made before
+-- identify() keys to the anonymous id (kind "anon"); once a token_provider-
+-- backed session has an identified user, the receipt keys to the verified
+-- user id with kind "user_verified" — and the kind rides the wire body BY
+-- DEFAULT in both cases.
+local function test_receipt_kind_verified_in_mode_b_and_emitted_by_default()
+	reset()
+	storage.reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:set_consent(false))
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"actor_identifier":"' .. client.anonymous_id .. '"')
+	assert_contains(requests[1].body, '"kind":"anon"')
+	assert_true(client:identify("user-verified-example"))
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 2)
+	assert_contains(requests[2].body, '"actor_identifier":"user-verified-example"')
+	assert_contains(requests[2].body, '"kind":"user_verified"')
+	storage.reset()
+end
+
+-- The kind-emission escape hatch for deployments whose ingest service still
+-- runs the pre-amendment INGEST_CONSENT_KIND_MODE=off strict decoder (which
+-- 400-rejects a kind-bearing body as an unknown field):
+-- consent_kind_emission_enabled = false suppresses the WIRE field only —
+-- the kind is still chosen, persisted with the receipt, and drives
+-- dispatch-credential selection.
+local function test_consent_kind_emission_escape_hatch_suppresses_wire_field()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	next_status = 500
+	local client = assert(sdk.new(config({ consent_kind_emission_enabled = false })))
+	assert_true(client:identify("user-verified-example"))
+	assert_true(client:set_consent(false))
+	assert_equal(#requests, 1)
+	assert_not_contains(requests[1].body, '"kind"')
+	assert_contains(requests[1].body, '"actor_identifier":"user-verified-example"')
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(record.receipts[1].kind, "user_verified",
+		"the suppressed kind must still be persisted with the receipt")
+	restore()
+	storage.reset()
+end
+
+-- Parking (the amended §12 path-5 narrowing): a user_verified-keyed receipt
+-- parks while the current session cannot VOUCH FOR ITS ACTOR — no
+-- token_provider (a signed-out relaunch under the publishable key), no
+-- identify() yet, or a DIFFERENT user signed in. Parked = retained,
+-- persisted, excluded from dispatch, and never dispatched under the
+-- publishable key or another actor's token (either would lose or wedge an
+-- undelivered denial). It delivers verbatim (same idempotency_key) the
+-- moment a Mode B session identifies as its actor again.
+local function test_verified_receipt_parks_signed_out_and_dispatches_when_token_returns()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- Launch 1 (Mode B, signed in): the denial's receipt cannot deliver (500)
+	next_status = 500
+	local first = assert(sdk.new(config()))
+	assert_true(first:identify("user-verified-example"))
+	assert_true(first:set_consent(false))
+	assert_equal(#first.consent_outbox, 1)
+	local record = stored_consent_outbox_record(stores)
+	local original_key = record.receipts[1].idempotency_key
+	assert_equal(record.receipts[1].kind, "user_verified")
+	assert_true(first:shutdown("app_final"))
+
+	-- Launch 2 (signed out: publishable key only): the receipt parks —
+	-- loaded, retained, durably persisted, dispatched by NOTHING
+	reset()
+	next_status = 202
+	local second = assert(sdk.new(config_mode_a()))
+	assert_equal(#requests, 0, "a parked receipt must not dispatch under the publishable key")
+	assert_equal(#second.consent_outbox, 1, "a parked receipt stays retained")
+	second:update(second.config.flush_interval_seconds)
+	assert_true(second:flush())
+	assert_equal(#requests, 0, "no dispatch point may send a parked receipt")
+	assert_true(second:shutdown("app_final"),
+		"a durably retained parked receipt must not block teardown")
+	record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1, "the parked receipt survives teardown on disk")
+	assert_equal(record.receipts[1].idempotency_key, original_key)
+
+	-- Launch 3 (token_provider back, but a DIFFERENT user signs in): the
+	-- receipt must STAY parked — the minted token vouches for the current
+	-- user, and dispatching another actor's receipt under it would retry
+	-- forever on the auth mismatch or be terminally dropped.
+	reset()
+	local third = assert(sdk.new(config()))
+	assert_equal(#requests, 0, "a verified receipt stays parked before identify")
+	assert_true(third:identify("some-other-user"))
+	third:update(third.config.flush_interval_seconds)
+	assert_true(third:flush())
+	assert_equal(#requests, 0,
+		"another user's session must not dispatch the parked receipt")
+	assert_equal(#third.consent_outbox, 1, "the parked receipt stays retained")
+
+	-- The receipt's own actor signs in: the session now vouches for it —
+	-- identify() dispatches it immediately, verbatim, under the minted token.
+	assert_true(third:identify("user-verified-example"))
+	assert_equal(#requests, 1, "a vouching Mode B session must dispatch the parked receipt")
+	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
+	assert_contains(requests[1].body, '"idempotency_key":"' .. original_key .. '"')
+	assert_contains(requests[1].body, '"actor_identifier":"user-verified-example"')
+	assert_contains(requests[1].body, '"kind":"user_verified"')
+	assert_equal(third:snapshot().consent_recorded, 1)
+	record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 0, "the delivered receipt is pruned")
+	restore()
+	storage.reset()
+end
+
+-- Parked receipts are excluded from dispatch selection AND from the
+-- grant-dispatch gate: a parked GRANT never holds the event-batch leg
+-- hostage (flush would otherwise wedge in consent_receipt_pending for as
+-- long as the credential stays absent), and deliverable receipts behind a
+-- parked one still deliver, under their own per-receipt credential.
+local function test_parked_receipt_never_blocks_dispatch_or_gates_events()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- Launch 1 (Mode B): an undeliverable GRANT receipt (verified-keyed)
+	next_status = 500
+	local first = assert(sdk.new(config()))
+	assert_true(first:identify("user-verified-example"))
+	assert_true(first:set_consent(true))
+	assert_true(first:shutdown("app_final"))
+
+	-- Launch 2 (signed out, publishable key): the verified grant parks; the
+	-- persisted granted state reopens the local pipeline, and the parked
+	-- grant must not gate the batch leg.
+	reset()
+	next_status = 202
+	local second = assert(sdk.new(config_mode_a()))
+	assert_equal(#second.consent_outbox, 1)
+	assert_true(second:track("post_park_event"))
+	assert_true(second:flush({ include_summaries = false }),
+		"a parked grant must not gate the batch leg")
+	assert_equal(#requests, 1)
+	assert_true(requests[1].url:find("/v1/events:batch", 1, true) ~= nil)
+
+	-- A new decision on this launch keys to the anon actor and delivers
+	-- under the publishable key, past the parked verified receipt.
+	assert_true(second:set_consent(false))
+	assert_equal(#requests, 2)
+	assert_equal(requests[2].url, "http://localhost:8080/v1/consent")
+	assert_contains(requests[2].body, '"actor_identifier":"' .. second.anonymous_id .. '"')
+	assert_contains(requests[2].body, '"kind":"anon"')
+	assert_equal(#second.consent_outbox, 1,
+		"the delivered anon receipt is pruned; the parked one stays")
+	assert_equal(second.consent_outbox[1].kind, "user_verified")
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1)
+	restore()
+	storage.reset()
+end
+
+-- The anon-rotation guard is scoped to work bound to the OLD anon: a
+-- user_verified receipt PARKED for a signed-out actor is anon-independent
+-- (it keys to the verified user and dispatches only under that user's JWT),
+-- so it must not hold set_anonymous_id in events_pending — its actor may
+-- never sign in again, so blocking on it could wedge rotation forever.
+-- Anon-keyed receipts still block, and an owed durable rewrite still blocks
+-- (test_rotation_blocked_while_prune_rewrite_owed).
+local function test_rotation_allowed_with_only_parked_verified_receipts()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- Launch 1 (Mode B, signed in): user A's denial cannot deliver (500) and
+	-- is retained user_verified-keyed.
+	next_status = 500
+	local first = assert(sdk.new(config()))
+	assert_true(first:identify("user-a"))
+	assert_true(first:set_consent(false))
+	assert_equal(#first.consent_outbox, 1)
+	assert_true(first:shutdown("app_final"))
+
+	-- Launch 2 (Mode B, signed out): the receipt parks; rotation proceeds.
+	reset()
+	next_status = 202
+	local second = assert(sdk.new(config()))
+	assert_equal(#second.consent_outbox, 1, "the verified receipt is parked, not dropped")
+	assert_equal(second.consent_outbox[1].kind, "user_verified")
+	assert_true(second:set_anonymous_id("anon-rotated"),
+		"a parked verified receipt must not block anon rotation")
+	assert_equal(second.anonymous_id, "anon-rotated")
+	assert_equal(#second.consent_outbox, 1, "rotation leaves the parked receipt retained")
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 1, "the parked receipt stays durably retained")
+
+	-- Contrast pin: an ANON-keyed retained receipt still blocks the next
+	-- rotation (its actor IS the old anon).
+	next_status = 500
+	assert_true(second:set_consent(true))
+	assert_equal(#second.consent_outbox, 2)
+	assert_equal(second.consent_outbox[2].kind, "anon")
+	local ok, err = second:set_anonymous_id("anon-rotated-again")
+	assert_equal(ok, false)
+	assert_equal(err, "events_pending")
+	restore()
+	storage.reset()
+end
+
+-- identify() is a consent dispatch point, and the dispatch it unlocks must
+-- never ride a credential minted for a DIFFERENT session: the consent route
+-- binds the actor to the token subject, and an actor/subject mismatch is
+-- rejected terminally — dropping the receipt, a retained withdrawal
+-- included. An identity CHANGE therefore invalidates the cached Mode B
+-- token before the unpark dispatch (the dispatch mints fresh for the
+-- just-identified session), and a mint still in flight across the change
+-- discards its stale result instead of installing it.
+local function test_identify_invalidates_stale_token_before_unpark_dispatch()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local token_calls = 0
+	local counting_mode_b = function()
+		return config({
+			token_provider = function(callback)
+				token_calls = token_calls + 1
+				callback("token-" .. tostring(token_calls), nil, nil)
+			end,
+		})
+	end
+	-- Launch 1 (Mode B): user A's withdrawal cannot deliver (500) and is
+	-- retained user_verified-keyed.
+	next_status = 500
+	local first = assert(sdk.new(counting_mode_b()))
+	assert_true(first:identify("user-a"))
+	assert_true(first:set_consent(false))
+	assert_true(first:shutdown("app_final"))
+
+	-- Launch 2 (Mode B): user B signs in and delivers a decision of their
+	-- own, leaving a cached token that vouches for B's session only.
+	reset()
+	next_status = 202
+	local second = assert(sdk.new(counting_mode_b()))
+	assert_equal(#second.consent_outbox, 1, "A's receipt is parked, not dropped")
+	assert_true(second:identify("user-b"))
+	assert_true(second:set_consent(true))
+	assert_equal(#requests, 1)
+	local cached = second.token
+	assert_true(cached ~= nil, "B's delivery leaves a cached token")
+
+	-- The account switches to A in the same process: identify() must drop
+	-- B's cached token so the unpark dispatch mints fresh — reusing it would
+	-- send A's receipt under a credential that cannot vouch for A.
+	assert_true(second:identify("user-a"))
+	assert_equal(#requests, 2, "identify() dispatches A's parked receipt")
+	assert_contains(requests[2].body, '"actor_identifier":"user-a"')
+	assert_not_equal(requests[2].headers["Authorization"], "Bearer " .. cached,
+		"the unpark dispatch must not ride the previous session's token")
+	assert_equal(requests[2].headers["Authorization"],
+		"Bearer token-" .. tostring(token_calls))
+	assert_equal(#second.consent_outbox, 0, "A's receipt delivered under the fresh mint")
+
+	-- A mint in flight ACROSS an identity change discards its stale result:
+	-- the late callback settles the in-flight flag but installs nothing, and
+	-- the next dispatch point mints for the current session.
+	reset()
+	next_status = 500
+	local pending_mint = nil
+	local third = assert(sdk.new(config({
+		token_provider = function(callback)
+			pending_mint = callback
+		end,
+	})))
+	assert_true(third:set_consent(false)) -- anon receipt; the mint stays in flight
+	assert_true(third.token_request_in_flight)
+	assert_true(third:identify("user-c")) -- identity changes mid-mint
+	pending_mint("stale-anon-token", nil, nil)
+	assert_equal(third.token_request_in_flight, false,
+		"a stale mint callback still settles the in-flight flag")
+	assert_equal(third.token, nil,
+		"a mint from before the identity change must not install its token")
+	restore()
+	storage.reset()
+end
+
+-- P1 (round-2 review): identify() REFUSES a Mode B identity CHANGE while
+-- event work snapshotted to another verified user is still undrained —
+-- queued in this process, or reloaded on the durable spool. Events snapshot
+-- their user at enqueue time, so accepting the switch would drop the token
+-- that vouches for them and the next flush would mint for the NEW user and
+-- ship the previous user's events under a credential that cannot vouch for
+-- those envelopes (rejected, or worse misattributed). Same refusal family
+-- as the anon-rotation guard: false, "events_pending" — the host flushes,
+-- then re-identifies. Anon-snapshotted work never blocks (the mint's
+-- bind_anon vouches for it regardless of the verified subject), and Mode A
+-- is untouched (no per-session credential exists to mismatch).
+local function test_identify_refused_while_other_user_events_pending()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	local token_calls = 0
+	local counting_mode_b = function(overrides)
+		local out = config(overrides)
+		out.token_provider = function(callback)
+			token_calls = token_calls + 1
+			callback("token-" .. tostring(token_calls), nil, nil)
+		end
+		return out
+	end
+	local client = assert(sdk.new(counting_mode_b()))
+	assert_true(client:identify("user-a"))
+	assert_true(client:track("bound_to_a"))
+	next_status = 202
+	assert_true(client:flush({ include_summaries = false }))
+	assert_equal(token_calls, 1, "A's delivery minted A's session token")
+	assert_true(client:track("second_bound_to_a"))
+
+	-- A's event is queued: the switch to B is refused, nothing flips, and
+	-- the cached token that vouches for A's work stays put.
+	local ok, err = client:identify("user-b")
+	assert_equal(ok, false)
+	assert_equal(err, "events_pending")
+	assert_equal(client.user_id, "user-a", "a refused identify must not flip the identity")
+	assert_equal(client.token, "token-1", "a refused identify must not drop the vouching token")
+
+	-- The queued event drains under A's own credential — no re-mint, the
+	-- queue was left intact.
+	local wire_before = #requests
+	assert_true(client:flush({ include_summaries = false }))
+	assert_equal(#requests, wire_before + 1, "the refused identify left the queued event in place")
+	assert_contains(requests[#requests].body, '"second_bound_to_a"')
+	assert_contains(requests[#requests].body, '"user_id":"user-a"')
+	assert_equal(requests[#requests].headers["Authorization"], "Bearer token-1")
+	assert_equal(token_calls, 1, "draining A's events must not mint a new credential")
+
+	-- Drained: the switch succeeds, and the round-1 invalidation (now safe)
+	-- still drops the cached token so B's next work mints fresh.
+	assert_true(client:identify("user-b"), "identify allowed once A's events drained")
+	assert_equal(client.token, nil, "an accepted identity change still drops the cached token")
+	assert_true(client:track("bound_to_b"))
+	assert_true(client:flush({ include_summaries = false }))
+	assert_equal(requests[#requests].headers["Authorization"], "Bearer token-2")
+	assert_equal(token_calls, 2, "B's work minted B's own credential")
+
+	-- Spooled work blocks the same way ACROSS a relaunch: A's failed batch
+	-- spools; the next launch starts anonymous, and identifying as B before
+	-- the spool drains would re-send A's envelopes under B's mint.
+	reset()
+	next_status = 500
+	local first = assert(sdk.new(counting_mode_b({ flush_interval_seconds = 9999 })))
+	assert_true(first:identify("user-a"))
+	assert_true(first:track("spooled_for_a"))
+	assert_equal(first:flush({ include_summaries = false }), false)
+
+	reset()
+	next_status = 202
+	local second = assert(sdk.new(counting_mode_b({ flush_interval_seconds = 9999 })))
+	assert_equal(#second.spool_batches, 1, "A's envelope is on the spool")
+	local ok2, err2 = second:identify("user-b")
+	assert_equal(ok2, false, "identify must refuse while another user's spooled events pend")
+	assert_equal(err2, "events_pending")
+	assert_true(second:flush({ include_summaries = false }))
+	assert_equal(#second.spool_batches, 0)
+	assert_true(second:identify("user-b"), "identify allowed once the spool drained")
+
+	-- Mode A: no per-session credential exists to mismatch — the switch
+	-- stays allowed while A's event is queued (scoped like the rotation
+	-- guard, which must not over-restrict Mode A either).
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local plain = assert(sdk.new(config_mode_a()))
+	assert_true(plain:identify("user-a"))
+	assert_true(plain:track("queued_mode_a"))
+	assert_true(plain:identify("user-b"), "Mode A identify stays allowed while events pend")
+	restore()
+	storage.reset()
+end
+
+-- Head-of-queue audit: with parking, the dispatch head can sit BEHIND the
+-- queue front, so every piece of dispatch bookkeeping must key to the
+-- ACTUAL dispatch-head receipt, never to index 1 — the dispatch selection
+-- skips the parked front, the grant-dispatch gate holds for an
+-- undispatched grant while a DIFFERENT (non-front) receipt is in flight,
+-- the in-flight exemption releases only the receipt whose idempotency_key
+-- is in flight, and a settled non-front receipt chains the next
+-- dispatchable one while the parked front stays untouched.
+local function test_gate_and_in_flight_release_key_to_dispatch_head_not_front()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- Launch 1 (Mode B, signed in): an undeliverable verified GRANT that
+	-- will sit parked at the FRONT of the next launch's outbox.
+	next_status = 500
+	local first = assert(sdk.new(config()))
+	assert_true(first:identify("user-verified-example"))
+	assert_true(first:set_consent(true))
+	assert_true(first:shutdown("app_final"))
+
+	-- Launch 2 (signed out, publishable key, async transport): the parked
+	-- verified grant is the front; fresh anon decisions queue behind it.
+	reset()
+	local original_request = http.request
+	local callbacks = {}
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		callbacks[#callbacks + 1] = callback
+	end
+	local second = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(#second.consent_outbox, 1)
+	assert_true(second:set_consent(false)) -- anon denial: dispatch head, behind the parked front
+	assert_equal(#requests, 1, "the dispatch head is the receipt BEHIND the parked front")
+	assert_contains(requests[1].body, '"analytics":false')
+	assert_true(second:set_consent(true)) -- anon grant: queued while the denial is in flight
+	assert_equal(#requests, 1)
+	assert_equal(#second.consent_outbox, 3)
+	assert_true(second:track("post_toggle_event"))
+
+	-- The parked front grant must not gate; the undispatched anon grant
+	-- must — even though the in-flight receipt is not the front.
+	local flushed, reason = second:flush({ include_summaries = false })
+	assert_equal(flushed, false)
+	assert_equal(reason, "consent_receipt_pending")
+	assert_equal(#requests, 1, "no batch while the queued anon grant awaits dispatch")
+
+	-- The non-front in-flight denial settles: the chain dispatches the anon
+	-- grant (again skipping the parked front), whose own handoff releases
+	-- the gate for itself only.
+	callbacks[1](nil, nil, { status = 202, response = "{}" })
+	assert_equal(#requests, 2)
+	assert_contains(requests[2].body, '"analytics":true')
+	local batch_flushed, batch_reason = second:flush({ include_summaries = false })
+	assert_equal(batch_flushed, false)
+	assert_equal(batch_reason, "pending")
+	assert_equal(#requests, 3, "the batch follows the dispatched anon grant")
+	assert_true(requests[3].url:find("/v1/events:batch", 1, true) ~= nil)
+	callbacks[2](nil, nil, { status = 202, response = "{}" })
+	callbacks[3](nil, nil, { status = 202, response = '{"accepted":1}' })
+
+	-- The parked front was never dispatched, never released, never pruned;
+	-- the settled non-front receipts reset the retry bookkeeping.
+	assert_equal(#second.consent_outbox, 1, "only the parked front remains")
+	assert_equal(second.consent_outbox[1].kind, "user_verified")
+	assert_equal(second:snapshot().consent_recorded, 2)
+	assert_equal(second.consent_backoff_attempt, 0)
+	assert_true(not second:consent_send_deferred(),
+		"settled non-front receipts must leave no stale deferral behind")
+	http.request = original_request
+	restore()
+	storage.reset()
+end
+
+-- Most-vouching dispatch-credential selection in the dual-credential
+-- configuration (token_provider + api_key via remote_config_url): a receipt
+-- rides the minted Mode B token whenever it vouches for the receipt's
+-- actor — the current verified user, or the CURRENT anon the mint binds as
+-- its subject — so a current-anon GRANT stays deliverable (the publishable
+-- key would take the terminal grant 403). Only a receipt the token cannot
+-- vouch for (a HISTORIC-anon actor) falls back to the publishable key, the
+-- one credential that can still carry it, with no mint. A 401 stays
+-- classified by the credential the dispatch ACTUALLY USED: a minted-token
+-- 401 re-mints and retries the same receipt; a publishable-key 401 is
+-- terminal (the static key can never change) and must not invalidate the
+-- cached Mode B token.
+local function test_most_vouching_credential_and_401_follows_credential_used()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local token_calls = 0
+	local dual = function()
+		return config({
+			remote_config_url = "http://localhost:9090",
+			api_key = "sp_ingest_publishable_key",
+			token_provider = function(callback)
+				token_calls = token_calls + 1
+				callback("token-" .. tostring(token_calls), nil, nil)
+			end,
+		})
+	end
+	local client = assert(sdk.new(dual()))
+	-- a current-anon receipt (pre-identify) rides the minted token — and its
+	-- 401 re-mints and retries the SAME receipt
+	next_status = 401
+	assert_true(client:set_consent(false))
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].headers["Authorization"], "Bearer token-1",
+		"a current-anon receipt rides the minted token, not the key")
+	assert_equal(#client.consent_outbox, 1, "a minted-token 401 must retain the receipt")
+	next_status = 202
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(#requests, 2)
+	assert_equal(requests[2].headers["Authorization"], "Bearer token-2")
+	assert_contains(requests[2].body, '"kind":"anon"')
+	assert_equal(#client.consent_outbox, 0)
+
+	-- a current-anon GRANT rides the token too and DELIVERS — under the
+	-- publishable key it would be the terminal grant 403
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 3)
+	assert_equal(requests[3].headers["Authorization"], "Bearer token-2",
+		"a still-valid cached token is reused for a vouched receipt")
+	assert_contains(requests[3].body, '"categories":{"analytics":true}')
+	assert_equal(client:snapshot().consent_recorded, 2)
+
+	-- a verified receipt rides the token by the vouching predicate (the
+	-- identity change re-mints: identify() drops the cached token)
+	assert_true(client:identify("user-verified-example"))
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 4)
+	assert_equal(requests[4].headers["Authorization"], "Bearer token-3")
+	assert_contains(requests[4].body, '"kind":"user_verified"')
+	assert_equal(#client.consent_outbox, 0)
+
+	-- relaunch with a HISTORIC-anon receipt on disk (the dual configuration
+	-- keeps it at load): the token cannot vouch for that actor, so it
+	-- dispatches under the publishable key, with no mint
+	local _, outbox_path = stored_consent_outbox_record(stores)
+	assert_true(outbox_path ~= nil)
+	stores[outbox_path] = { receipts = { {
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "anon-historic",
+		kind = "anon",
+		categories = { analytics = false },
+		decided_at = "2026-07-01T00:00:00Z",
+		idempotency_key = "receipt-historic-anon",
+		anonymous_id = "anon-historic",
+	} } }
+	storage.reset() -- drop the in-memory shadow so the seeded FILE is what loads
+	reset()
+	next_status = 202
+	local minted_before = token_calls
+	local second = assert(sdk.new(dual()))
+	assert_equal(#requests, 1, "the historic-anon receipt dispatches at boot")
+	assert_equal(requests[1].headers["Authorization"], "Bearer sp_ingest_publishable_key",
+		"a historic-anon actor stays on the publishable key")
+	assert_contains(requests[1].body, '"actor_identifier":"anon-historic"')
+	assert_equal(token_calls, minted_before, "a historic-anon dispatch must not mint")
+	assert_equal(#second.consent_outbox, 0)
+
+	-- with a token cached for current-anon work, a publishable-key 401 on a
+	-- historic receipt is terminal and must NOT invalidate that token
+	assert_true(second:set_consent(false))
+	assert_equal(requests[2].headers["Authorization"], "Bearer token-" .. tostring(token_calls))
+	local cached = second.token
+	assert_true(cached ~= nil)
+	second.consent_outbox = { {
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "anon-historic-2",
+		kind = "anon",
+		categories = { analytics = false },
+		decided_at = "2026-07-01T00:00:00Z",
+		idempotency_key = "receipt-historic-anon-2",
+		anonymous_id = "anon-historic-2",
+	} }
+	next_status = 401
+	second:update(second.config.flush_interval_seconds)
+	assert_equal(#requests, 3)
+	assert_equal(requests[3].headers["Authorization"], "Bearer sp_ingest_publishable_key")
+	assert_equal(#second.consent_outbox, 0, "a publishable-key 401 must drop the receipt")
+	assert_equal(second.token, cached,
+		"a publishable-key 401 must not invalidate the cached Mode B token")
+	next_status = 202
+	second:update(second.config.flush_interval_seconds)
+	assert_equal(#requests, 3, "a publishable-key 401 must not be retried")
+	restore()
+	storage.reset()
+end
+
+-- Outbox upgrade path for kind: a LEGACY record written before kind existed
+-- loads with kind backfilled to "anon" — the pre-kind ingress bound every
+-- client write to the caller's anon scope, so anon is the class those
+-- receipts were recorded under — while an entry carrying a non-allowlisted
+-- kind ("user_unverified" included, which the SDK never produces) is
+-- dropped fail-safe like any other malformed entry.
+local function test_legacy_kindless_receipt_backfills_anon_and_invalid_kind_drops()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- seed a real record once to learn the outbox path, then replace it with
+	-- a hand-written legacy file
+	next_status = 500
+	local seeder = assert(sdk.new(config_mode_a()))
+	assert_true(seeder:set_consent(false))
+	local _, outbox_path = stored_consent_outbox_record(stores)
+	assert_true(outbox_path ~= nil)
+	local function legacy_entry(key, kind)
+		return {
+			workspace_id = "workspace-example",
+			app_id = "app-example",
+			environment_id = "develop",
+			actor_identifier = "anon-legacy",
+			kind = kind,
+			categories = { analytics = false },
+			decided_at = "2026-07-01T00:00:00Z",
+			idempotency_key = key,
+			anonymous_id = "anon-legacy",
+		}
+	end
+	stores[outbox_path] = { receipts = {
+		legacy_entry("receipt-legacy", nil),
+		legacy_entry("receipt-unverified", "user_unverified"),
+		legacy_entry("receipt-garbled-kind", 42),
+	} }
+	storage.reset() -- drop the in-memory shadow so the legacy FILE is what loads
+
+	local salvaged = storage.load_consent_outbox(identity_scope)
+	assert_equal(#salvaged, 1, "non-allowlisted kinds must drop; the kindless legacy entry stays")
+	assert_equal(salvaged[1].idempotency_key, "receipt-legacy")
+	assert_equal(salvaged[1].kind, "anon", "a pre-kind receipt must backfill kind anon")
+
+	-- and the backfilled receipt delivers with kind on the wire
+	reset()
+	next_status = 202
+	local upgraded = assert(sdk.new(config_mode_a()))
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"idempotency_key":"receipt-legacy"')
+	assert_contains(requests[1].body, '"kind":"anon"')
+	assert_contains(requests[1].body, '"actor_identifier":"anon-legacy"')
+	assert_equal(upgraded:snapshot().consent_recorded, 1)
+	restore()
+	storage.reset()
+end
+
+-- P1 (round-2 review): a receipt NO configured credential can vouch for
+-- must never ride the minted token. The concrete case: a legacy kindless
+-- receipt that stored v0.9.1's user-first ACTOR backfills to kind="anon"
+-- at load with its retained anon snapshot still matching the current anon
+-- — in a Mode-B-ONLY configuration the token vouches only for the current
+-- anon (or a verified user), no publishable key exists, and the old
+-- fall-through sent the user-shaped actor under the token anyway: a
+-- terminal auth failure or a wrong-actor write, and, anon-keyed as it is,
+-- a standing events_pending wedge of the rotation guard. Such a receipt
+-- now drops at the load-time could-never-send gate exactly like the
+-- narrow identity_changed rule (counted, diagnosed, persisted), dispatch
+-- selection skips it as a belt (never falling through to a non-vouching
+-- credential, never head-blocking the trail), and in the dual
+-- token_provider + api_key configuration the SAME receipt is retained and
+-- delivered under the publishable key as today.
+local function test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- seed a real record once to learn the outbox path, then replace it
+	-- with a hand-written legacy file
+	next_status = 500
+	local seeder = assert(sdk.new(config({ anonymous_id = "anon-current" })))
+	assert_true(seeder:set_consent(false))
+	local _, outbox_path = stored_consent_outbox_record(stores)
+	assert_true(outbox_path ~= nil)
+	local function legacy_user_entry(key)
+		return {
+			workspace_id = "workspace-example",
+			app_id = "app-example",
+			environment_id = "develop",
+			actor_identifier = "user-legacy-example",
+			categories = { analytics = false },
+			decided_at = "2026-07-01T00:00:00Z",
+			idempotency_key = key,
+			anonymous_id = "anon-current",
+		}
+	end
+	local function current_anon_entry(key)
+		return {
+			workspace_id = "workspace-example",
+			app_id = "app-example",
+			environment_id = "develop",
+			actor_identifier = "anon-current",
+			kind = "anon",
+			categories = { analytics = false },
+			decided_at = "2026-07-01T00:00:01Z",
+			idempotency_key = key,
+			anonymous_id = "anon-current",
+		}
+	end
+	stores[outbox_path] = { receipts = {
+		legacy_user_entry("receipt-legacy-user"),
+		current_anon_entry("receipt-current-anon"),
+	} }
+	storage.reset() -- drop the in-memory shadow so the legacy FILE is what loads
+
+	-- Mode-B-only: the user-actor entry drops at load; the current-anon
+	-- entry behind it still delivers under the mint — no wedge, and the
+	-- unvouchable actor never touches the wire.
+	reset()
+	next_status = 202
+	local issues = {}
+	local upgraded = assert(sdk.new(config({
+		anonymous_id = "anon-current",
+		diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end,
+	})))
+	assert_equal(#requests, 1, "the deliverable current-anon receipt still dispatches")
+	assert_contains(requests[1].body, '"idempotency_key":"receipt-current-anon"')
+	assert_not_contains(requests[1].body, "user-legacy-example")
+	assert_equal(issues[1].scope, "consent")
+	assert_equal(issues[1].status, "dropped")
+	assert_equal(issues[1].code, "identity_changed")
+	assert_equal(issues[1].count, 1)
+	assert_equal(#upgraded.consent_outbox, 0, "delivered plus dropped leaves nothing retained")
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 0, "the drop is persisted")
+
+	-- Belt: an unvouchable anon receipt reaching the mirror mid-process is
+	-- skipped by dispatch selection — never sent under the token — and the
+	-- receipt appended behind it still delivers.
+	upgraded.consent_outbox[#upgraded.consent_outbox + 1] =
+		legacy_user_entry("receipt-injected")
+	local wire_before = #requests
+	assert_true(upgraded:set_consent(false))
+	assert_equal(#requests, wire_before + 1, "the receipt behind the unvouchable one still delivers")
+	assert_contains(requests[#requests].body, '"actor_identifier":"anon-current"')
+	assert_not_contains(requests[#requests].body, "user-legacy-example")
+
+	-- Dual (token_provider + api_key): the SAME legacy receipt is retained
+	-- at load and delivers under the publishable key — the historic-actor
+	-- path, unchanged.
+	reset()
+	storage.reset()
+	stores[outbox_path] = { receipts = { legacy_user_entry("receipt-legacy-user-dual") } }
+	storage.reset() -- the overwritten FILE is what the dual client loads
+	next_status = 202
+	local dual_issues = {}
+	local dual = assert(sdk.new(config({
+		anonymous_id = "anon-current",
+		remote_config_url = "http://localhost:9090",
+		api_key = "sp_ingest_publishable_key",
+		diagnostics = function(issue)
+			dual_issues[#dual_issues + 1] = issue
+		end,
+	})))
+	assert_equal(#dual_issues, 0, "with a publishable key the legacy receipt is NOT dropped")
+	assert_equal(#requests, 1, "the legacy receipt re-sends under the key")
+	assert_equal(requests[1].headers["Authorization"], "Bearer sp_ingest_publishable_key")
+	assert_contains(requests[1].body, '"actor_identifier":"user-legacy-example"')
+	assert_contains(requests[1].body, '"kind":"anon"')
+	assert_equal(dual:snapshot().consent_recorded, 1)
 	restore()
 	storage.reset()
 end
@@ -4296,12 +5295,15 @@ local function test_no_receipt_chaining_after_shutdown()
 	local record = stored_consent_outbox_record(stores)
 	assert_equal(#record.receipts, 1, "the remaining receipt stays durably retained")
 
-	-- the next launch delivers it
+	-- the next launch delivers it once the session vouches for its verified
+	-- actor again (parked until then)
 	reset()
 	callbacks = {}
 	http.request = original_request
 	next_status = 202
 	local second = assert(sdk.new(config()))
+	assert_equal(#requests, 0, "the verified receipt stays parked before identify")
+	assert_true(second:identify("user-example"))
 	assert_equal(#requests, 1)
 	assert_contains(requests[1].body, '"categories":{"analytics":true}')
 	assert_equal(second:snapshot().consent_recorded, 1)
@@ -4591,10 +5593,25 @@ local tests = {
 	test_forced_minor_persists_and_gates_like_denied,
 	test_consent_receipt_survives_restart_and_retries_until_acked,
 	test_shutdown_completes_with_durable_outbox_and_next_launch_delivers,
-	test_consent_outbox_bounded_evicts_oldest,
+	test_consent_outbox_cap_evicts_oldest_pure_grants_first,
+	test_consent_outbox_cap_denial_evicted_only_among_denials,
+	test_grant_refused_on_denial_full_outbox_fails_closed,
+	test_grant_append_proceeds_when_old_grant_evictable,
 	test_malformed_consent_outbox_dropped_failsafe,
 	test_rotation_blocked_while_prune_rewrite_owed,
-	test_outbox_identity_mismatch_dropped_mode_b_kept_mode_a,
+	test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts,
+	test_receipt_actor_canonical_anon_under_publishable_key,
+	test_receipt_kind_verified_in_mode_b_and_emitted_by_default,
+	test_consent_kind_emission_escape_hatch_suppresses_wire_field,
+	test_verified_receipt_parks_signed_out_and_dispatches_when_token_returns,
+	test_parked_receipt_never_blocks_dispatch_or_gates_events,
+	test_rotation_allowed_with_only_parked_verified_receipts,
+	test_identify_invalidates_stale_token_before_unpark_dispatch,
+	test_identify_refused_while_other_user_events_pending,
+	test_gate_and_in_flight_release_key_to_dispatch_head_not_front,
+	test_most_vouching_credential_and_401_follows_credential_used,
+	test_legacy_kindless_receipt_backfills_anon_and_invalid_kind_drops,
+	test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual,
 	test_set_consent_surfaces_receipt_persist_failure,
 	test_transient_outbox_save_failure_never_evicts,
 	test_identifier_byte_clamp_boundary,

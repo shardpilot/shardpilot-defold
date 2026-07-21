@@ -59,11 +59,35 @@ explicit **granted** decision opens the event pipeline.
 
 Explicit decisions are reported to `POST {ingest_url}/v1/consent` and never
 ride the event envelope. Each decision becomes exactly one receipt —
-workspace/app/environment, the actor identifier, `categories{analytics}`, a
-`decided_at` stamp, an `idempotency_key`, and (forced-minor only) the
-`reason` — retained in the **durable consent-receipt outbox** (see below)
-until the server acknowledges it: receipts survive process death, re-send on
-later launches, and retry with backoff until delivered, in decision order.
+workspace/app/environment, the actor identifier and its `kind`,
+`categories{analytics}`, a `decided_at` stamp, an `idempotency_key`, and
+(forced-minor only) the `reason` — retained in the **durable
+consent-receipt outbox** (see below) until the server acknowledges it:
+receipts survive process death, re-send on later launches, and retry with
+backoff until delivered, in decision order.
+
+**The receipt's actor is the canonical actor** (ADR-0222), chosen at
+decision time exactly like the event plane binds identity: the verified
+`user_id` (`kind = "user_verified"`) only when a Mode B `token_provider`
+backs the session and the host has called `identify()`; the SDK-managed
+`anonymous_id` (`kind = "anon"`) in every other case. A Mode A
+self-asserted `user_id` is never the receipt actor — the publishable key
+cannot vouch for it, and the server binds a publishable-key write to the
+caller's own anon scope regardless. The `kind` rides the wire body by
+default; `consent_kind_emission_enabled = false`
+(see `docs/configuration.md`) suppresses the wire field for deployments
+whose ingest service still strict-decodes the pre-amendment body — the
+kind is still chosen, persisted, and used to pick the dispatch credential.
+Credential selection is **most-vouching**: a receipt is sent under the
+minted Mode B token whenever that token vouches for the receipt's actor —
+the current verified `user_id`, or the current `anonymous_id` the mint
+binds as its subject, so a current-anon grant stays deliverable in the
+dual `token_provider` + `api_key` configuration — and under the
+publishable `api_key` only when the token cannot vouch for it: a
+HISTORIC-anon receipt (the key is the one credential that can still carry
+it; a historic-anon pure grant takes the documented terminal `403`), and
+every anon receipt in pure Mode A. `user_verified` receipts go only under
+the minted Mode B token, never a publishable fallback.
 `shutdown` tears the client down while receipts are still pending only when
 they are safely on disk; otherwise it returns `false, "consent_pending"` so
 the host can retry. While consent is unknown no receipt exists to send: the
@@ -166,8 +190,9 @@ is retained in a small per-app durable outbox so an offline or crashed commit
 still produces a server-side consent record once connectivity returns. This
 outbox:
 
-- stores only **consent receipts** — the decision's category flags, the actor
-  identifier the decision was made under, the workspace/app/environment
+- stores only **consent receipts** — the decision's category flags, the
+  canonical actor identifier the decision was keyed to and its `kind`
+  (`"anon"` or `"user_verified"`, see above), the workspace/app/environment
   scope, a `decided_at` timestamp, an `idempotency_key`, (for the
   forced-minor state) the `reason`, and one piece of retention metadata that
   never reaches the wire: the decision-time anonymous id snapshot; **never
@@ -189,16 +214,49 @@ outbox:
 - is **pruned on success** — an acknowledged receipt leaves the record
   immediately; a re-send that raced an acknowledgment is de-duplicated
   server-side on the receipt's `idempotency_key`;
-- is **bounded** (32 receipts, oldest evicted first — the newest decisions
-  are the operative ones) so it can never grow without limit;
+- is **bounded** (32 receipts) with **denial-preferring eviction**: overflow
+  evicts the oldest pure-GRANT receipt first, and a denial-carrying receipt
+  is evicted (oldest first) only when everything over the cap carries
+  denials — a recorded denial is the compliance-critical write (a lost
+  denial fail-opens the actor server-side), while a lost grant only delays
+  pipeline opening and is re-writable — so the record can never grow
+  without limit. The grant side of the same rule **fails closed**: when
+  appending a grant's receipt would overflow the cap with no pure grant
+  available to evict (a denial-full outbox), `set_consent(true)` is
+  refused with `false, "consent_outbox_full"` — the state does not
+  flip, nothing is evicted, every denial stays — and succeeds once the
+  outbox drains below the cap; a denial append still applies (an
+  all-denials overflow evicts the oldest denial in favor of the fresh
+  one);
 - is **fail-safe against corruption**: a malformed entry on disk is dropped
   at load — never sent, never a crash, never a blocker for well-formed
-  receipts;
-- is **cleared on an identity change under Mode B auth** — like the event
-  spool, receipts whose decision-time anonymous id no longer matches the
-  client's are dropped at load (diagnosed as `identity_changed`) rather than
-  replayed into a guaranteed auth rejection that would wedge the trail;
-  Mode A re-sends historic-identity receipts unchanged;
+  receipts (an entry with a non-allowlisted `kind` counts as malformed; a
+  legacy pre-kind entry is kept with `kind` backfilled to `"anon"`);
+- **parks `user_verified` receipts while the current session cannot vouch
+  for their actor** — no `token_provider` configured (a signed-out relaunch
+  under the publishable key alone), no `identify()` yet, or a different
+  user signed in (another actor's minted token could never deliver the
+  receipt): a parked receipt is retained and persisted — still counted
+  toward the cap — but excluded from dispatch and from the events-plane
+  grant gate (it never wedges `flush()` or teardown, and never blocks a
+  Mode B `set_anonymous_id` rotation — only anon-keyed receipts and an
+  owed durable rewrite do, since a verified receipt keys to its user, not
+  the anon), and delivers verbatim, same `idempotency_key`, the moment a
+  Mode B session identifies as its actor again (`identify()` is a consent
+  dispatch point) — always under a token minted for the vouching session:
+  an identity change drops the cached Mode B token and fences any mint
+  still in flight, so an unparked receipt never rides a credential minted
+  for a previous session — so an undelivered verified denial survives
+  signed-out relaunches;
+- is **cleared on an identity change only when the receipt could never
+  send**: in a Mode-B-ONLY configuration (no publishable `api_key`),
+  anon-keyed receipts whose decision-time anonymous id no longer matches
+  the client's are dropped at load (diagnosed as `identity_changed`) rather
+  than replayed into a guaranteed auth rejection that would wedge the
+  trail; with an `api_key` configured (Mode A, or Mode B + `api_key`),
+  historic-anon receipts re-send under the publishable key unchanged — the
+  historic actor is the correct subject of those decisions — and
+  `user_verified` receipts are never dropped this way (they park, above);
 - **surfaces a failed durable append**: when the write fails while the
   receipt is still undelivered, `set_consent` returns
   `false, "consent_outbox_persist_failed"` (the decision itself applied and
