@@ -2879,6 +2879,75 @@ local function test_shutdown_spools_undelivered_and_finalizes()
 	storage.reset()
 end
 
+-- Full-queue shutdown, end to end: shutdown work must ride the durable spool
+-- rather than drop. The summary events built by the final flush's
+-- enqueue_summaries CONSUME the sampler state — when the still-full queue
+-- refuses them, the built snapshots become OWED and the housekeeping passes
+-- re-enqueue them (after the deferred session end) once the flush/spool
+-- eviction frees room. Offline throughout (every publish 500s), everything —
+-- queued event, session end, perf and network summaries — must land durably
+-- on the spool, teardown must complete, and the next launch re-sends it all.
+local function test_shutdown_full_queue_spools_session_end_and_summaries()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	next_status = 500
+	local client = assert(sdk.new(config({
+		buffer_size = 1,
+		flush_interval_seconds = 9999,
+	})))
+	assert_true(client:identify("user-example"))
+	assert_true(client:session_start())
+	-- The queue is now FULL (buffer_size = 1 holds app.session_started).
+	-- Sample runtime signals so both summaries have data to summarize.
+	client:update(0.016)
+	client:update(0.020)
+	client:observe_ping_ms(42)
+	client:observe_disconnect("net_down")
+	assert_equal(#client.queue.items, 1)
+
+	assert_true(client:shutdown("app_final"),
+		"a full queue with a durable spool must not wedge or fail teardown")
+	assert_equal(client.initialized, false)
+	assert_equal(client.session_active, false)
+	assert_equal(#client.owed_summaries, 0, "no summary may stay owed past teardown")
+	local record = stored_spool_record(stores)
+	assert_true(record ~= nil)
+	local spooled_names = {}
+	for i = 1, #record.events do
+		spooled_names[record.events[i].event_name] = true
+	end
+	assert_true(spooled_names["app.session_started"] ~= nil)
+	assert_true(spooled_names["session_end"] ~= nil,
+		"the deferred session end must ride the durable spool")
+	assert_true(spooled_names["perf_summary"] ~= nil,
+		"a full queue must not drop the exit perf summary — it rides the spool")
+	assert_true(spooled_names["network_summary"] ~= nil,
+		"a full queue must not drop the exit network summary — it rides the spool")
+
+	-- Next launch, back online: the spooled remnant re-sends verbatim.
+	reset()
+	next_status = 202
+	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(#relaunch.spool_batches > 0)
+	assert_true(relaunch:flush())
+	local resent = {}
+	for i = 1, #requests do
+		for name in string.gmatch(requests[i].body or "", '"event_name":"([^"]+)"') do
+			resent[name] = true
+		end
+	end
+	assert_true(resent["app.session_started"] ~= nil)
+	assert_true(resent["session_end"] ~= nil)
+	assert_true(resent["perf_summary"] ~= nil)
+	assert_true(resent["network_summary"] ~= nil)
+	assert_equal(#storage.load_spool(spool_scope), 0,
+		"the acknowledged re-send clears the record")
+	restore()
+	storage.reset()
+end
+
 -- persist() snapshots queued events into the durable spool while the client
 -- keeps running; a later acknowledged publish removes them (ack-based).
 local function test_persist_snapshots_queue_while_running()
@@ -5902,6 +5971,7 @@ local tests = {
 	test_identity_read_failure_purges_spool,
 	test_spool_permanent_reject_removes_entry_and_diagnoses,
 	test_shutdown_spools_undelivered_and_finalizes,
+	test_shutdown_full_queue_spools_session_end_and_summaries,
 	test_persist_snapshots_queue_while_running,
 	test_set_anonymous_id_rejected_while_spool_pending_mode_b,
 	test_shutdown_fails_when_remnant_evicted_by_caps,

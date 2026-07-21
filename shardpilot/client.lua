@@ -577,6 +577,17 @@ function M.new(config)
 		session_active = false,
 		perf = sampling.new_perf(),
 		network = sampling.new_network(),
+		-- Summary events a FULL queue refused at their build moment. Building
+		-- a summary CONSUMES the sampler state, so a failed enqueue would
+		-- silently lose the whole sampled window — the built snapshot is
+		-- retained here instead and re-enqueued at the next summary point
+		-- (bounded: at most one perf and one network entry, because no fresh
+		-- summary is built while one is still owed — the samplers keep
+		-- accumulating, self-bounded by their own sample caps). Shutdown's
+		-- housekeeping passes drain these so exit-time summaries ride the
+		-- final flush (or the durable spool) instead of vanishing; a denial
+		-- clears them with the rest of the un-egressed analytics data.
+		owed_summaries = {},
 		flush_elapsed_seconds = 0,
 		initialized = true,
 	}, Client)
@@ -1469,9 +1480,12 @@ function Client:set_consent(decision)
 		self.publish_backoff_attempt = 0
 		-- Sampled-but-not-yet-summarized runtime signals are in-memory
 		-- analytics data too: drop them with the queue, or the first flush
-		-- after a re-grant would summarize pre-denial activity.
+		-- after a re-grant would summarize pre-denial activity. A summary
+		-- already BUILT but still owed to a full queue is the same pre-denial
+		-- data one step later — dropped with them.
 		self.perf = sampling.new_perf()
 		self.network = sampling.new_network()
+		self.owed_summaries = {}
 		if self.experiments then
 			-- The purge above discarded any queued-but-unpublished
 			-- experiment exposure facts: re-arm this session's emissions so
@@ -1767,19 +1781,50 @@ function Client:enqueue_summaries()
 	-- pipeline is closed the accumulated samples are DROPPED, not held — the
 	-- samplers are reset so runtime signals observed before a grant (or
 	-- through a denial) can never surface in a summary emitted after a later
-	-- grant.
+	-- grant. Owed summaries are analytics data from the same closed window:
+	-- dropped with them.
 	if self.consent_state ~= "granted" then
 		self.perf = sampling.new_perf()
 		self.network = sampling.new_network()
+		self.owed_summaries = {}
+		return
+	end
+	-- Owed-first: a summary a FULL queue refused earlier was already built —
+	-- its sampler window is consumed — so it re-enqueues ahead of any fresh
+	-- one (older window first). Only a still-full queue keeps it owed;
+	-- any other refusal is terminal for a summary (best-effort telemetry —
+	-- track already counted the drop).
+	local owed = self.owed_summaries
+	self.owed_summaries = {}
+	for i = 1, #owed do
+		local entry = owed[i]
+		local ok, err = self:track(entry.event_name, entry.props)
+		if not ok and err == "queue_full" then
+			self.owed_summaries[#self.owed_summaries + 1] = entry
+		end
+	end
+	if #self.owed_summaries > 0 then
+		-- The queue is still full: leave the samplers accumulating (they
+		-- self-bound at their sample caps) instead of consuming them into
+		-- ever more owed snapshots — the owed list stays bounded at one
+		-- entry per summary type.
 		return
 	end
 	local perf = sampling.perf_summary(self.perf)
 	if perf then
-		self:track("perf_summary", perf)
+		local ok, err = self:track("perf_summary", perf)
+		if not ok and err == "queue_full" then
+			self.owed_summaries[#self.owed_summaries + 1] =
+				{ event_name = "perf_summary", props = perf }
+		end
 	end
 	local network = sampling.network_summary(self.network, self.config.transport)
 	if network then
-		self:track("network_summary", network)
+		local ok, err = self:track("network_summary", network)
+		if not ok and err == "queue_full" then
+			self.owed_summaries[#self.owed_summaries + 1] =
+				{ event_name = "network_summary", props = network }
+		end
 	end
 end
 
@@ -3444,6 +3489,19 @@ function Client:shutdown(reason)
 				return false, retry_err
 			end
 		end
+		if not suppress_wire and #self.owed_summaries > 0 then
+			-- Summary events the full queue refused during the final flush's
+			-- enqueue_summaries (their sampler windows are already consumed
+			-- into the owed snapshots): give them the freed room, after the
+			-- session end. What enqueues here is delivered or durably
+			-- spooled by this pass's flush below; a still-full queue keeps
+			-- the remainder owed for the next pass.
+			local before_summaries = queue.size(self.queue)
+			self:enqueue_summaries()
+			if queue.size(self.queue) > before_summaries then
+				enqueued_any = true
+			end
+		end
 		if self.experiments then
 			self.experiments:retry_durable_sync()
 			-- Sweep owed exposure facts — as many as the queue admits this
@@ -3473,10 +3531,11 @@ function Client:shutdown(reason)
 			-- or is already carried by owed_session_end.
 			owed_session_end = true
 		end
-		-- Owed exposures count as deliverable only on the granted plane:
-		-- a non-granted state cannot enqueue them (the purge/consent canon
-		-- governs those snapshots, not the exit path).
+		-- Owed exposures and owed summaries count as deliverable only on the
+		-- granted plane: a non-granted state cannot enqueue them (the
+		-- purge/consent canon governs those snapshots, not the exit path).
 		local still_owed = (owed_session_end and self.session_active)
+			or (self.consent_state == "granted" and #self.owed_summaries > 0)
 			or (self.consent_state == "granted" and self.experiments ~= nil
 				and self.experiments:has_owed_exposures())
 		if enqueued_any then
