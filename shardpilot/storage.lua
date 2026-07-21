@@ -968,9 +968,14 @@ end
 -- consent-purged: a receipt documents the decision itself, so it is retained
 -- and delivered under denied/unknown states alike. The list is bounded by a
 -- fixed entry count (receipts are small, fixed-shape, and rare — one per
--- explicit player decision), evicting the OLDEST first when it overflows
--- (the newest decisions are the operative ones). There is deliberately NO
--- TTL: an undelivered receipt is retried until acknowledged.
+-- explicit player decision); overflow eviction is DENIAL-PREFERRING: the
+-- oldest PURE-GRANT receipt is evicted first, and a denial-carrying receipt
+-- is evicted (oldest first) only when everything over the cap carries
+-- denials. A recorded denial is the compliance-critical write — the server
+-- honors a stored denial unconditionally, while a LOST denial fail-opens
+-- the actor under its fail-open-on-missing rule — whereas a lost grant only
+-- delays pipeline opening and is re-writable. There is deliberately NO TTL:
+-- an undelivered receipt is retried until acknowledged.
 
 local consent_outbox_memory = {}
 
@@ -1002,6 +1007,17 @@ local function valid_receipt_identifier(value)
 	return valid_receipt_field(value) and #value <= M.max_identifier_bytes
 end
 
+-- The ADR-0222 actor-identity classes a receipt may carry. The SDK itself
+-- produces only these two — never "user_unverified" (a self-asserted Mode A
+-- user id is a class any caller could spoof, and the ingest service rejects
+-- SDK writes carrying it) — and the sanitizer holds loaded records to the
+-- same closed set: an entry with any other kind is dropped fail-safe like
+-- any malformed field, while a LEGACY entry with no kind at all (written
+-- before kind existed) is kept and backfilled "anon" — the pre-kind ingress
+-- bound every client write to the caller's anon scope, so anon is the class
+-- those receipts were recorded under.
+local valid_receipt_kinds = { anon = true, user_verified = true }
+
 -- Keep only entries that are complete, well-formed receipts, copied down to
 -- the known fields — the wire fields plus one piece of retention metadata,
 -- `anonymous_id` (the decision-time anon snapshot the client's Mode B
@@ -1022,6 +1038,7 @@ local function sanitize_outbox_entries(entries)
 			and valid_receipt_field(entry.app_id)
 			and valid_receipt_field(entry.environment_id)
 			and valid_receipt_identifier(entry.actor_identifier)
+			and (entry.kind == nil or valid_receipt_kinds[entry.kind] == true)
 			and valid_receipt_field(entry.decided_at)
 			and type(entry.categories) == "table"
 			and type(entry.categories.analytics) == "boolean"
@@ -1033,6 +1050,7 @@ local function sanitize_outbox_entries(entries)
 				app_id = entry.app_id,
 				environment_id = entry.environment_id,
 				actor_identifier = entry.actor_identifier,
+				kind = entry.kind or "anon",
 				decided_at = entry.decided_at,
 				categories = { analytics = entry.categories.analytics },
 				reason = entry.reason,
@@ -1041,6 +1059,20 @@ local function sanitize_outbox_entries(entries)
 		end
 	end
 	return out
+end
+
+-- A receipt counts as a pure grant for eviction purposes when its category
+-- map carries NO false value — any false makes it denial-carrying and
+-- eviction-protected (under the default legitimate-interest posture the map
+-- is exactly `analytics: true/false`; the loop keeps the rule correct
+-- should the snapshot ever grow more categories).
+local function receipt_is_pure_grant(receipt)
+	for _, value in pairs(receipt.categories) do
+		if value ~= true then
+			return false
+		end
+	end
+	return true
 end
 
 local function write_consent_outbox(ns, receipts)
@@ -1084,7 +1116,10 @@ function M.load_consent_outbox(scope)
 end
 
 -- Replace the persisted outbox with `receipts` (oldest first), enforcing the
--- fixed entry cap by evicting the OLDEST entries first. Returns the list that
+-- fixed entry cap with DENIAL-PREFERRING eviction: while over the cap, the
+-- oldest PURE-GRANT receipt is evicted; only when every retained receipt
+-- carries a denial does the oldest denial go (see the section header for
+-- why a recorded denial outranks a grant). Returns the list that
 -- was actually persisted — possibly shorter than the input after the cap
 -- eviction — or nil when the durable write failed. Unlike the event spool,
 -- a FAILED WRITE never evicts: receipts are consent records whose retention
@@ -1099,7 +1134,14 @@ function M.save_consent_outbox(scope, receipts)
 	local ns = spool_namespace(scope)
 	local kept = sanitize_outbox_entries(receipts)
 	while #kept > max_consent_outbox_entries do
-		table.remove(kept, 1)
+		local evict_index = 1
+		for i = 1, #kept do
+			if receipt_is_pure_grant(kept[i]) then
+				evict_index = i
+				break
+			end
+		end
+		table.remove(kept, evict_index)
 	end
 	if not write_consent_outbox(ns, kept) then
 		return nil
