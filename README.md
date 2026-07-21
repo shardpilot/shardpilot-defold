@@ -540,9 +540,12 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   server acknowledges it, delivered serially, in decision order. The `kind`
   rides the wire body by default (`consent_kind_emission_enabled = false` is
   the escape hatch for pre-amendment ingest deployments — see
-  `docs/configuration.md`), and each receipt dispatches under the credential
-  its kind requires: anon-keyed under the publishable `api_key` where one is
-  configured, `user_verified` only under the minted Mode B token. A
+  `docs/configuration.md`), and each receipt dispatches under the
+  **most-vouching credential**: the minted Mode B token whenever it vouches
+  for the receipt's actor (the current verified user, or the current anon
+  the mint binds as its subject — so current-anon grants stay deliverable
+  in the dual configuration), the publishable `api_key` only for
+  historic-anon receipts the token cannot vouch for and in pure Mode A. A
   `user_verified` receipt **parks** while the current session cannot vouch
   for its actor — no `token_provider`, no `identify()` yet, or a different
   user signed in: retained durably, skipped by dispatch and the grant gate,
@@ -569,7 +572,14 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   fails while it is still undelivered, `set_consent` returns
   `false, "consent_outbox_persist_failed"` (the decision applied; delivery
   still proceeds and the write retries automatically — including from
-  `persist()` even with the event spool disabled). `shutdown()` completes
+  `persist()` even with the event spool disabled). On a **denial-full
+  outbox** — 32 retained receipts with no pure grant available to evict —
+  `set_consent(true)` is refused with `false, "consent_outbox_overflow"`:
+  the grant is not applied and nothing is evicted (a recorded denial is
+  never traded for a grant, and a grant receipt evicted before dispatch
+  would open the local pipeline with no grant row ever reaching the
+  server); retry once the outbox drains. Denial appends still apply at the
+  cap (an all-denials overflow evicts the oldest denial). `shutdown()` completes
   over a durably retained receipt (it re-sends next launch — a receipt still
   in flight at teardown never chains further requests) and returns
   `false, "consent_pending"` only when the receipt could not be durably

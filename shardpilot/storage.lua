@@ -980,6 +980,10 @@ end
 local consent_outbox_memory = {}
 
 local max_consent_outbox_entries = 32
+-- Exported so the client's grant-append fail-closed gate (set_consent
+-- refusing `consent_outbox_overflow` on a denial-full outbox) reasons about
+-- the SAME cap this store enforces, from one definition.
+M.max_consent_outbox_entries = max_consent_outbox_entries
 
 -- Shared byte budget for host-supplied identifiers, exported so the client's
 -- acceptance gate (valid_identity in client.lua) and this sanitizer enforce
@@ -1074,6 +1078,10 @@ local function receipt_is_pure_grant(receipt)
 	end
 	return true
 end
+-- Exported alongside the cap above: the client's grant-append gate must
+-- predict this store's eviction choices with the SAME predicate the
+-- eviction loop applies.
+M.receipt_is_pure_grant = receipt_is_pure_grant
 
 local function write_consent_outbox(ns, receipts)
 	local record = { receipts = receipts }

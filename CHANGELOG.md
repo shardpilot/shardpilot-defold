@@ -15,11 +15,17 @@
   never the receipt actor (the publishable key cannot vouch for it, and the
   ingress binds the write to the caller's own anon scope regardless). This
   retires the v0.9.1 user-first snapshot, which took a set `user_id` even in
-  Mode A. Delivery selects the dispatch credential PER RECEIPT: anon-keyed
-  receipts go under the publishable `api_key` wherever one is configured —
-  Mode A, and the Mode B + `api_key` remote-config configuration alike, with
-  no token mint — while `user_verified` receipts go only under the minted
-  Mode B token, never a publishable fallback. A consent 401 is classified by
+  Mode A. Delivery selects the dispatch credential PER RECEIPT,
+  most-vouching first: the minted Mode B token whenever it vouches for the
+  receipt's actor — the current verified user, or the CURRENT anonymous id
+  the mint binds as its subject, so a current-anon grant stays deliverable
+  in the dual `token_provider` + `api_key` configuration — and the
+  publishable `api_key` only for receipts the token cannot vouch for: a
+  HISTORIC-anon actor (the key is the one credential that can still carry
+  it, with no mint; a historic-anon pure grant takes the documented
+  terminal grant 403 — the one-way anon-scope outcome), and every anon
+  receipt in pure Mode A. `user_verified` receipts go only under the
+  minted Mode B token, never a publishable fallback. A consent 401 is classified by
   the credential the dispatch actually used: a publishable-key 401 is
   terminal even in a dual-credential configuration and no longer invalidates
   the cached Mode B token; a minted-token 401 still re-mints and retries.
@@ -49,7 +55,21 @@
   re-writable. Everything else about the cap is unchanged: eviction happens
   only during a successful save, a failed write never evicts, and evictions
   stay counted (`consent_outbox_evicted`) and diagnosed
-  (`outbox_overflow`).
+  (`outbox_overflow`). The grant side of the rule FAILS CLOSED: when
+  appending a grant's receipt would overflow the cap with no pre-existing
+  pure grant to evict (a denial-full outbox), `set_consent(true)` is
+  refused with the distinct `false, "consent_outbox_overflow"` — the state
+  does not flip, nothing is evicted, every denial stays retained — and the
+  same grant succeeds once the outbox drains below the cap. This extends
+  the floor's fail-closed family (a grant already refuses while a spool
+  wipe is owed; it now equally refuses while its receipt cannot be durably
+  retained), preserves the dispatch-gate premise (the gate's release
+  condition is DISPATCH — a grant receipt evicted before dispatch would
+  silently open the local pipeline with no grant row ever reaching the
+  server, into strict-mode suppression), and never trades a denial (the
+  legal record) for a grant. Denial appends are unchanged: an all-denials
+  overflow still evicts the oldest denial — a fresh denial outranks a
+  stale one.
 - **Verified-keyed receipts park until a session vouches for their actor.**
   A `user_verified`-keyed receipt is dispatchable only while a Mode B
   `token_provider` is configured AND the session's identified user is

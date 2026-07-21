@@ -193,7 +193,11 @@ launch. Revocation cleanup completes before a new grant takes effect:
 `set_consent(true)` retries an owed purge first and is NOT applied while it
 keeps failing (same `false, "spool_purge_failed"` return; the persisted
 decision stays denied), so a relaunch can never replay the pre-revocation
-record under a granted decision. Spooled
+record under a granted decision. The same fail-closed family covers the
+receipt outbox: on a denial-full outbox (32 retained receipts, no pure
+grant available to evict) `set_consent(true)` is refused with
+`false, "consent_outbox_overflow"` — the state does not flip and nothing
+is evicted — until the outbox drains below the cap. Spooled
 envelopes are re-sent verbatim (stable `event_id`/`event_ts`), so the ingest
 service de-duplicates re-sends; when a `429` `Retry-After` arrives while a
 batch is spooled, the deadline is stored with the record and a relaunch

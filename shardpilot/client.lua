@@ -1239,6 +1239,26 @@ function Client:set_consent(decision)
 	if granted and self.spool_purge_pending and not self:retry_spool_purge() then
 		return false, "spool_purge_failed"
 	end
+	-- GRANT-APPEND FAILS CLOSED ON A DENIAL-FULL OUTBOX: when appending this
+	-- grant's receipt would overflow the cap with no pre-existing pure grant
+	-- for the denial-preferring eviction to take, the loop's only candidates
+	-- are denial-carrying receipts — or the just-appended grant itself.
+	-- Neither is acceptable: a recorded denial is the legal record and is
+	-- never traded for a grant, and a grant receipt evicted before its
+	-- DISPATCH would silently open the local pipeline with no grant row ever
+	-- reaching the server (the grant-dispatch gate's release condition is
+	-- dispatch — on a strict-consent workspace every later batch would be
+	-- terminally suppressed). So the grant is REFUSED, extending the floor's
+	-- fail-closed family (a grant is refused while a spool wipe is owed,
+	-- above; it is equally refused while its receipt cannot be durably
+	-- retained): the state does not flip, nothing is evicted, every denial
+	-- stays, and the host retries once the outbox drains below the cap.
+	-- Denial appends keep the shipped eviction semantics unchanged (oldest
+	-- pure grant first; an all-denials overflow evicts the oldest denial —
+	-- a fresh denial outranks a stale one).
+	if granted and self:consent_outbox_denial_full() then
+		return false, "consent_outbox_overflow"
+	end
 	self.consent_state = next_state
 	if state_changed and self.experiments then
 		-- Every consent TRANSITION opens a new consent epoch: responses
@@ -1897,11 +1917,14 @@ end
 -- server applies the decision trail exactly as the player produced it.
 -- Each receipt is keyed to the canonical actor chosen at decision time
 -- (receipt_actor above) and carries that actor's class as `kind`; delivery
--- selects the dispatch credential PER RECEIPT — anon-keyed receipts go
--- under the publishable api_key where one is configured, user_verified-
--- keyed receipts only under a Mode B minted token (never a publishable
--- fallback: the route binds the actor to the token subject, and a
--- publishable-key dispatch would rebind or reject the write). A
+-- selects the dispatch credential PER RECEIPT, most-vouching first — the
+-- minted Mode B token whenever it vouches for the receipt's actor (current
+-- verified user, or current-anon subject in the dual configuration; grants
+-- stay deliverable there), the publishable api_key only for receipts the
+-- token cannot vouch for (historic-anon) and in pure Mode A.
+-- user_verified-keyed receipts dispatch only under a Mode B minted token,
+-- never a publishable fallback: the route binds the actor to the token
+-- subject, and a publishable-key dispatch would rebind or reject the write. A
 -- user_verified receipt whose actor the current session cannot vouch for
 -- PARKS (receipt_parked below) rather than dropping or dispatching wrong.
 
@@ -1935,6 +1958,32 @@ function Client:consent_outbox_anon_pending()
 		end
 	end
 	return false
+end
+
+-- True when appending ONE more receipt would push the outbox over the cap
+-- with fewer pre-existing pure grants than the overflow needs: the
+-- denial-preferring eviction loop would then reach denial-carrying
+-- receipts — or the incoming receipt itself, appended newest and therefore
+-- the LAST pure grant it scans. set_consent(true) consults this to refuse
+-- the grant (`consent_outbox_overflow`) instead of letting either happen;
+-- see the gate there for the full rationale. Uses the storage layer's own
+-- cap and pure-grant predicate so this prediction and the eviction loop
+-- can never disagree.
+function Client:consent_outbox_denial_full()
+	local overflow = #self.consent_outbox + 1 - storage.max_consent_outbox_entries
+	if overflow < 1 then
+		return false
+	end
+	local evictable_grants = 0
+	for i = 1, #self.consent_outbox do
+		if storage.receipt_is_pure_grant(self.consent_outbox[i]) then
+			evictable_grants = evictable_grants + 1
+			if evictable_grants >= overflow then
+				return false
+			end
+		end
+	end
+	return true
 end
 
 -- Consent-receipt delivery paces its retries independently of the events
@@ -2182,10 +2231,12 @@ end
 -- dispatch was started (transport failures are counted inside the result
 -- callback); false while delivery is blocked — a receipt already in flight,
 -- an open backoff window, or no usable credential yet. The dispatch
--- credential is selected PER RECEIPT by its kind: anon-keyed receipts go
--- under the publishable api_key where one is configured (no token mint —
--- Mode A, and the Mode B + api_key remote-config configuration alike),
--- everything else under the resolved Mode B token. Failure handling mirrors
+-- credential is selected PER RECEIPT, most-vouching first: the minted
+-- Mode B token whenever it vouches for the receipt's actor (the current
+-- verified user, or the current anon the mint binds as its subject — so
+-- current-anon grants stay deliverable in the dual configuration), the
+-- publishable api_key only for receipts the token cannot vouch for
+-- (historic-anon actors) and in pure Mode A. Failure handling mirrors
 -- the publish path: retryable outcomes keep the receipt for the next
 -- dispatch point (a Retry-After or backoff paces the retry; a 401 under a
 -- minted token re-mints and retries immediately), while terminal outcomes —
@@ -2213,12 +2264,26 @@ function Client:try_send_consent_outbox()
 		return false
 	end
 	local credential
-	local used_publishable_key = payload.kind == "anon" and self.config.api_key ~= nil
+	-- MOST-VOUCHING credential selection: the receipt rides the minted
+	-- Mode B token whenever that token vouches for the receipt's ACTOR —
+	-- the current verified user (a dispatchable user_verified receipt has
+	-- already passed the vouching predicate), or the CURRENT anonymous id,
+	-- which the mint binds as the token's subject — so in the dual
+	-- token_provider + api_key configuration a current-anon receipt may
+	-- carry a GRANT the publishable key terminally could not (the route
+	-- accepts grants only from a credential bound to the actor). Only a
+	-- receipt the token cannot vouch for falls back to the publishable key
+	-- where one is configured: the HISTORIC-anon receipt, whose actor this
+	-- session can no longer mint for — the key needs no mint and no
+	-- identity gate and is the one credential that can still carry it (a
+	-- historic-anon pure grant takes the documented terminal grant 403;
+	-- the one-way anon-scope outcome) — and every anon receipt in pure
+	-- Mode A, where no token exists.
+	local vouched_by_token = self.config.token_provider ~= nil
+		and (payload.kind == "user_verified"
+			or payload.actor_identifier == self.anonymous_id)
+	local used_publishable_key = not vouched_by_token and self.config.api_key ~= nil
 	if used_publishable_key then
-		-- The publishable key needs no mint and no identity gate: the
-		-- receipt carries its own actor, and the key is the correct
-		-- credential for an anon-scope write (including a historic anon
-		-- actor — the ingress has no token binding on this credential).
 		credential = self.config.api_key
 	else
 		if not self:can_publish() then

@@ -3870,6 +3870,97 @@ local function test_consent_outbox_cap_denial_evicted_only_among_denials()
 	storage.reset()
 end
 
+-- GRANT-APPEND FAILS CLOSED ON A DENIAL-FULL OUTBOX: when appending a
+-- grant's receipt would overflow the 32-entry cap with no pre-existing pure
+-- grant for the denial-preferring loop to evict, the loop's only candidates
+-- are denial-carrying receipts or the just-appended grant itself — so
+-- set_consent(true) is REFUSED with the distinct consent_outbox_overflow:
+-- the state does not flip, nothing is evicted, every denial stays, and no
+-- wire traffic results. A DENIAL append at the same cap keeps the shipped
+-- semantics (the all-denials overflow evicts the OLDEST denial — a fresh
+-- denial outranks a stale one). Once the outbox drains below the cap, the
+-- same grant succeeds and dispatches.
+local function test_grant_refused_on_denial_full_outbox_fails_closed()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	next_status = 500
+	local client = assert(sdk.new(config_mode_a()))
+	for _ = 1, 32 do
+		assert_true(client:set_consent(false))
+	end
+	assert_equal(#client.consent_outbox, 32, "32 undelivered denials retained")
+
+	local wire_before = #requests
+	local ok, err = client:set_consent(true)
+	assert_equal(ok, false)
+	assert_equal(err, "consent_outbox_overflow")
+	assert_equal(client.consent_state, "denied", "a refused grant must not flip the state")
+	assert_equal(#client.consent_outbox, 32, "a refused grant evicts nothing")
+	for i = 1, #client.consent_outbox do
+		assert_equal(client.consent_outbox[i].categories.analytics, false,
+			"every retained denial survives the refused grant")
+	end
+	assert_equal(#requests, wire_before, "a refused grant produces no wire traffic")
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 32, "the durable record is untouched")
+
+	-- a DENIAL append still applies at the same cap: the all-denials
+	-- overflow evicts the OLDEST denial in favor of the fresh one
+	local oldest_key = client.consent_outbox[1].idempotency_key
+	assert_true(client:set_consent(false))
+	assert_equal(#client.consent_outbox, 32)
+	assert_not_equal(client.consent_outbox[1].idempotency_key, oldest_key,
+		"a fresh denial evicts the oldest denial, never the reverse")
+
+	-- drain below the cap: the same grant now succeeds and dispatches
+	next_status = 202
+	client.consent_retry_after_ms = nil
+	client:update(client.config.flush_interval_seconds)
+	assert_equal(#client.consent_outbox, 0, "the outbox drains once the transport recovers")
+	assert_true(client:set_consent(true), "the grant succeeds once the outbox drained")
+	assert_equal(client.consent_state, "granted")
+	assert_contains(requests[#requests].body, '"categories":{"analytics":true}')
+	assert_equal(#client.consent_outbox, 0, "the grant receipt delivered")
+	restore()
+	storage.reset()
+end
+
+-- The refusal is scoped exactly to the denial-full case: with a
+-- pre-existing pure grant available to absorb the overflow, a new grant
+-- append proceeds and the shipped denial-preferring loop evicts that
+-- OLDEST grant — the fresh grant is retained and every denial survives.
+local function test_grant_append_proceeds_when_old_grant_evictable()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	next_status = 500
+	local client = assert(sdk.new(config_mode_a()))
+	for _ = 1, 31 do
+		assert_true(client:set_consent(false))
+	end
+	assert_true(client:set_consent(true), "under the cap the grant appends normally")
+	assert_equal(#client.consent_outbox, 32)
+	local old_grant_key = client.consent_outbox[32].idempotency_key
+	assert_true(client:set_consent(true),
+		"with an old pure grant evictable, a new grant is not refused")
+	assert_equal(#client.consent_outbox, 32)
+	local denials = 0
+	for i = 1, #client.consent_outbox do
+		if client.consent_outbox[i].categories.analytics == false then
+			denials = denials + 1
+		end
+	end
+	assert_equal(denials, 31, "every denial survives the grant-for-grant eviction")
+	assert_equal(client.consent_outbox[32].categories.analytics, true,
+		"the fresh grant is retained")
+	assert_not_equal(client.consent_outbox[32].idempotency_key, old_grant_key,
+		"the OLD grant is the one evicted")
+	assert_equal(client:snapshot().consent_outbox_evicted, 1)
+	restore()
+	storage.reset()
+end
+
 -- A malformed outbox record on disk is fail-safe: garbled entries are dropped
 -- at load — never sent, never a crash into game code — and they never block
 -- the deliverable receipts stored around them.
@@ -3976,10 +4067,12 @@ end
 -- binds the CURRENT anon, so replaying them would wedge the trail behind a
 -- guaranteed rejection; diagnosed as identity_changed, like the event
 -- spool). Everything else keeps delivering: Mode A re-sends the historic
--- actor unchanged, a Mode B + api_key configuration dispatches anon-keyed
--- receipts under the publishable key (the historic actor is the correct
--- subject of those decisions), and a user_verified-keyed receipt is never
--- dropped for a merely-absent identity.
+-- actor unchanged, a Mode B + api_key configuration dispatches
+-- HISTORIC-anon receipts under the publishable key (the historic actor is
+-- the correct subject of those decisions, and the key is the one
+-- credential that can still carry it — a current-anon receipt rides the
+-- minted token instead, most-vouching), and a user_verified-keyed receipt
+-- is never dropped for a merely-absent identity.
 local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 	reset()
 	storage.reset()
@@ -4043,14 +4136,20 @@ local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 	assert_equal(verified_second:snapshot().consent_recorded, 1)
 
 	-- Mode B + api_key (the remote-config dual-credential configuration): an
-	-- anon-keyed receipt with a rotated anon KEEPS delivering — under the
-	-- publishable key, which has no token binding.
+	-- anon-keyed receipt with a rotated anon KEEPS delivering — a HISTORIC
+	-- anon actor is one the minted token cannot vouch for, so it goes under
+	-- the publishable key, which has no token binding. (The explicit anon
+	-- makes the first launch's actor genuinely historic on the relaunch:
+	-- the stubbed sys stores survive storage.reset(), so a generated-or-
+	-- inherited anon could collide with the relaunch override and read as
+	-- CURRENT — which would ride the token instead.)
 	reset()
 	storage.reset()
 	next_status = 500
 	local dual_config = {
 		remote_config_url = "http://localhost:9090",
 		api_key = "sp_ingest_publishable_key",
+		anonymous_id = "anon-dual-historic",
 	}
 	local dual_first = assert(sdk.new(config(dual_config)))
 	local dual_historic_anon = dual_first.anonymous_id
@@ -4463,51 +4562,123 @@ local function test_gate_and_in_flight_release_key_to_dispatch_head_not_front()
 	storage.reset()
 end
 
--- Per-receipt dispatch credential in the dual-credential configuration
--- (token_provider + api_key via remote_config_url): anon-keyed receipts go
--- under the publishable key with NO token mint; user_verified-keyed
--- receipts go under the minted Mode B token. A 401 is classified by the
--- credential the dispatch ACTUALLY USED: a publishable-key 401 is terminal
--- (the static key can never change) and must not invalidate the cached
--- Mode B token; a minted-token 401 re-mints and retries the same receipt.
-local function test_per_receipt_credential_and_401_follows_credential_used()
+-- Most-vouching dispatch-credential selection in the dual-credential
+-- configuration (token_provider + api_key via remote_config_url): a receipt
+-- rides the minted Mode B token whenever it vouches for the receipt's
+-- actor — the current verified user, or the CURRENT anon the mint binds as
+-- its subject — so a current-anon GRANT stays deliverable (the publishable
+-- key would take the terminal grant 403). Only a receipt the token cannot
+-- vouch for (a HISTORIC-anon actor) falls back to the publishable key, the
+-- one credential that can still carry it, with no mint. A 401 stays
+-- classified by the credential the dispatch ACTUALLY USED: a minted-token
+-- 401 re-mints and retries the same receipt; a publishable-key 401 is
+-- terminal (the static key can never change) and must not invalidate the
+-- cached Mode B token.
+local function test_most_vouching_credential_and_401_follows_credential_used()
 	reset()
 	storage.reset()
+	local stores, restore = install_stub_sys_storage()
 	local token_calls = 0
-	local client = assert(sdk.new(config({
-		remote_config_url = "http://localhost:9090",
-		api_key = "sp_ingest_publishable_key",
-		token_provider = function(callback)
-			token_calls = token_calls + 1
-			callback("token-" .. tostring(token_calls), nil, nil)
-		end,
-	})))
-	-- anon receipt (pre-identify) dispatches under the publishable key...
+	local dual = function()
+		return config({
+			remote_config_url = "http://localhost:9090",
+			api_key = "sp_ingest_publishable_key",
+			token_provider = function(callback)
+				token_calls = token_calls + 1
+				callback("token-" .. tostring(token_calls), nil, nil)
+			end,
+		})
+	end
+	local client = assert(sdk.new(dual()))
+	-- a current-anon receipt (pre-identify) rides the minted token — and its
+	-- 401 re-mints and retries the SAME receipt
 	next_status = 401
 	assert_true(client:set_consent(false))
 	assert_equal(#requests, 1)
-	assert_equal(requests[1].headers["Authorization"], "Bearer sp_ingest_publishable_key")
-	assert_equal(token_calls, 0, "an anon-keyed receipt must not mint a token")
-	-- ...and its 401 is terminal: dropped, never retried against the static key
-	assert_equal(#client.consent_outbox, 0, "a publishable-key 401 must drop the receipt")
-	client:update(client.config.flush_interval_seconds)
-	assert_equal(#requests, 1, "a publishable-key 401 must not be retried")
-
-	-- a verified receipt dispatches under the minted token; its 401 re-mints
-	-- and retries the SAME receipt
-	assert_true(client:identify("user-verified-example"))
-	next_status = 401
-	assert_true(client:set_consent(true))
-	assert_equal(#requests, 2)
-	assert_equal(requests[2].headers["Authorization"], "Bearer token-1")
+	assert_equal(requests[1].headers["Authorization"], "Bearer token-1",
+		"a current-anon receipt rides the minted token, not the key")
 	assert_equal(#client.consent_outbox, 1, "a minted-token 401 must retain the receipt")
 	next_status = 202
 	client:update(client.config.flush_interval_seconds)
-	assert_equal(#requests, 3)
-	assert_equal(requests[3].headers["Authorization"], "Bearer token-2")
-	assert_contains(requests[3].body, '"kind":"user_verified"')
+	assert_equal(#requests, 2)
+	assert_equal(requests[2].headers["Authorization"], "Bearer token-2")
+	assert_contains(requests[2].body, '"kind":"anon"')
 	assert_equal(#client.consent_outbox, 0)
-	assert_equal(client:snapshot().consent_recorded, 1)
+
+	-- a current-anon GRANT rides the token too and DELIVERS — under the
+	-- publishable key it would be the terminal grant 403
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 3)
+	assert_equal(requests[3].headers["Authorization"], "Bearer token-2",
+		"a still-valid cached token is reused for a vouched receipt")
+	assert_contains(requests[3].body, '"categories":{"analytics":true}')
+	assert_equal(client:snapshot().consent_recorded, 2)
+
+	-- a verified receipt rides the token by the vouching predicate (the
+	-- identity change re-mints: identify() drops the cached token)
+	assert_true(client:identify("user-verified-example"))
+	assert_true(client:set_consent(true))
+	assert_equal(#requests, 4)
+	assert_equal(requests[4].headers["Authorization"], "Bearer token-3")
+	assert_contains(requests[4].body, '"kind":"user_verified"')
+	assert_equal(#client.consent_outbox, 0)
+
+	-- relaunch with a HISTORIC-anon receipt on disk (the dual configuration
+	-- keeps it at load): the token cannot vouch for that actor, so it
+	-- dispatches under the publishable key, with no mint
+	local _, outbox_path = stored_consent_outbox_record(stores)
+	assert_true(outbox_path ~= nil)
+	stores[outbox_path] = { receipts = { {
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "anon-historic",
+		kind = "anon",
+		categories = { analytics = false },
+		decided_at = "2026-07-01T00:00:00Z",
+		idempotency_key = "receipt-historic-anon",
+		anonymous_id = "anon-historic",
+	} } }
+	storage.reset() -- drop the in-memory shadow so the seeded FILE is what loads
+	reset()
+	next_status = 202
+	local minted_before = token_calls
+	local second = assert(sdk.new(dual()))
+	assert_equal(#requests, 1, "the historic-anon receipt dispatches at boot")
+	assert_equal(requests[1].headers["Authorization"], "Bearer sp_ingest_publishable_key",
+		"a historic-anon actor stays on the publishable key")
+	assert_contains(requests[1].body, '"actor_identifier":"anon-historic"')
+	assert_equal(token_calls, minted_before, "a historic-anon dispatch must not mint")
+	assert_equal(#second.consent_outbox, 0)
+
+	-- with a token cached for current-anon work, a publishable-key 401 on a
+	-- historic receipt is terminal and must NOT invalidate that token
+	assert_true(second:set_consent(false))
+	assert_equal(requests[2].headers["Authorization"], "Bearer token-" .. tostring(token_calls))
+	local cached = second.token
+	assert_true(cached ~= nil)
+	second.consent_outbox = { {
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "anon-historic-2",
+		kind = "anon",
+		categories = { analytics = false },
+		decided_at = "2026-07-01T00:00:00Z",
+		idempotency_key = "receipt-historic-anon-2",
+		anonymous_id = "anon-historic-2",
+	} }
+	next_status = 401
+	second:update(second.config.flush_interval_seconds)
+	assert_equal(#requests, 3)
+	assert_equal(requests[3].headers["Authorization"], "Bearer sp_ingest_publishable_key")
+	assert_equal(#second.consent_outbox, 0, "a publishable-key 401 must drop the receipt")
+	assert_equal(second.token, cached,
+		"a publishable-key 401 must not invalidate the cached Mode B token")
+	next_status = 202
+	second:update(second.config.flush_interval_seconds)
+	assert_equal(#requests, 3, "a publishable-key 401 must not be retried")
+	restore()
 	storage.reset()
 end
 
@@ -5204,6 +5375,8 @@ local tests = {
 	test_shutdown_completes_with_durable_outbox_and_next_launch_delivers,
 	test_consent_outbox_cap_evicts_oldest_pure_grants_first,
 	test_consent_outbox_cap_denial_evicted_only_among_denials,
+	test_grant_refused_on_denial_full_outbox_fails_closed,
+	test_grant_append_proceeds_when_old_grant_evictable,
 	test_malformed_consent_outbox_dropped_failsafe,
 	test_rotation_blocked_while_prune_rewrite_owed,
 	test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts,
@@ -5215,7 +5388,7 @@ local tests = {
 	test_rotation_allowed_with_only_parked_verified_receipts,
 	test_identify_invalidates_stale_token_before_unpark_dispatch,
 	test_gate_and_in_flight_release_key_to_dispatch_head_not_front,
-	test_per_receipt_credential_and_401_follows_credential_used,
+	test_most_vouching_credential_and_401_follows_credential_used,
 	test_legacy_kindless_receipt_backfills_anon_and_invalid_kind_drops,
 	test_set_consent_surfaces_receipt_persist_failure,
 	test_transient_outbox_save_failure_never_evicts,

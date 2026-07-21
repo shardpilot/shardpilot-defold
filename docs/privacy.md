@@ -77,10 +77,17 @@ caller's own anon scope regardless. The `kind` rides the wire body by
 default; `consent_kind_emission_enabled = false`
 (see `docs/configuration.md`) suppresses the wire field for deployments
 whose ingest service still strict-decodes the pre-amendment body — the
-kind is still chosen, persisted, and used to pick the dispatch credential:
-anon-keyed receipts are sent under the publishable `api_key` wherever one
-is configured, `user_verified` receipts only under the minted Mode B
-token, never a publishable fallback.
+kind is still chosen, persisted, and used to pick the dispatch credential.
+Credential selection is **most-vouching**: a receipt is sent under the
+minted Mode B token whenever that token vouches for the receipt's actor —
+the current verified `user_id`, or the current `anonymous_id` the mint
+binds as its subject, so a current-anon grant stays deliverable in the
+dual `token_provider` + `api_key` configuration — and under the
+publishable `api_key` only when the token cannot vouch for it: a
+HISTORIC-anon receipt (the key is the one credential that can still carry
+it; a historic-anon pure grant takes the documented terminal `403`), and
+every anon receipt in pure Mode A. `user_verified` receipts go only under
+the minted Mode B token, never a publishable fallback.
 `shutdown` tears the client down while receipts are still pending only when
 they are safely on disk; otherwise it returns `false, "consent_pending"` so
 the host can retry. While consent is unknown no receipt exists to send: the
@@ -213,7 +220,14 @@ outbox:
   denials — a recorded denial is the compliance-critical write (a lost
   denial fail-opens the actor server-side), while a lost grant only delays
   pipeline opening and is re-writable — so the record can never grow
-  without limit;
+  without limit. The grant side of the same rule **fails closed**: when
+  appending a grant's receipt would overflow the cap with no pure grant
+  available to evict (a denial-full outbox), `set_consent(true)` is
+  refused with `false, "consent_outbox_overflow"` — the state does not
+  flip, nothing is evicted, every denial stays — and succeeds once the
+  outbox drains below the cap; a denial append still applies (an
+  all-denials overflow evicts the oldest denial in favor of the fresh
+  one);
 - is **fail-safe against corruption**: a malformed entry on disk is dropped
   at load — never sent, never a crash, never a blocker for well-formed
   receipts (an entry with a non-allowlisted `kind` counts as malformed; a
