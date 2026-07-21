@@ -1,5 +1,6 @@
 local envelope = require "shardpilot.envelope"
 local clock = require "shardpilot.clock"
+local experiments_mod = require "shardpilot.experiments"
 local id = require "shardpilot.id"
 local platform = require "shardpilot.platform"
 local queue = require "shardpilot.queue"
@@ -257,6 +258,19 @@ local function validate_config(config)
 		return nil, "invalid_remote_config_url"
 	end
 	local has_remote_config = config.remote_config_url ~= nil
+	-- Experiments (dark by default): `experiments_enabled = true` opts into
+	-- the assignment consumer. The assignment endpoint lives on the same
+	-- control-plane host as the remote-config fetch and authenticates with
+	-- the same publishable api_key, so the flag requires `remote_config_url`
+	-- (which in turn requires the api_key). Default false — and while false,
+	-- zero experiment code paths execute.
+	if config.experiments_enabled ~= nil and type(config.experiments_enabled) ~= "boolean" then
+		return nil, "invalid_experiments_enabled"
+	end
+	local experiments_enabled = config.experiments_enabled == true
+	if experiments_enabled and not has_remote_config then
+		return nil, "experiments_requires_remote_config_url"
+	end
 	-- Dual-mode auth. EITHER a Mode B async `token_provider` (a
 	-- per-tenant ingest JWT minted by the host) OR a Mode A `api_key` (the
 	-- non-secret publishable `sp_ingest_...` key, safe to embed client-side)
@@ -372,6 +386,7 @@ local function validate_config(config)
 		transport = config.transport,
 		token_provider = config.token_provider,
 		api_key = has_api_key and config.api_key or nil,
+		experiments_enabled = experiments_enabled,
 		diagnostics = config.diagnostics,
 		batch_size = batch_size,
 		buffer_size = buffer_size,
@@ -436,6 +451,19 @@ function M.new(config)
 		token_expires_at_ms = nil,
 		token_request_in_flight = false,
 		in_flight_batch = nil,
+		-- Set when a sentinel fact purge finds a publish mid-flight: the
+		-- batch on the wire is past recall, but if it fails and is
+		-- retained, the settle path filters the withdrawn facts before any
+		-- retry or spool capture.
+		experiment_purge_awaited = false,
+		-- Set while CONDEMNED experiment facts remain on the durable spool
+		-- because their removal write failed (the sentinel purge's rewrite,
+		-- or the relaunch condemnation filter): durable work still owed.
+		-- The condemnation marker's retire check consults this — the
+		-- marker must outlive the stale file, or the launch after next
+		-- replays the withdrawn keys. Cleared by any successful spool
+		-- write (the whole file is rewritten from the filtered state).
+		condemned_spool_pending = false,
 		publish_in_flight = false,
 		publish_retry_after_ms = nil,
 		publish_backoff_attempt = 0,
@@ -474,6 +502,19 @@ function M.new(config)
 		flush_elapsed_seconds = 0,
 		initialized = true,
 	}, Client)
+	-- The experiments subject id is loaded BEFORE any identity rewrite below:
+	-- persist_identity carries it forward, so a rewrite triggered by a
+	-- changed anonymous id can never drop a previously minted id (dropping
+	-- would silently re-bucket the subject on a later re-enable). Loaded
+	-- regardless of the experiments flag — but VALIDATED, never verbatim: a
+	-- grammar-invalid or oversized stored value would otherwise ride every
+	-- later identity write (consent saves included, even with experiments
+	-- off), and an oversized one could permanently fail those unrelated
+	-- writes. Invalid reads as absent — the consumer mints a fresh subject
+	-- at first need, exactly like any other corrupt identity field.
+	client.experiments_client_id = experiments_mod.valid_subject_id(
+			stored.experiments_client_id)
+		and stored.experiments_client_id or nil
 	if stored.anonymous_id ~= anonymous_id then
 		client:persist_identity()
 	end
@@ -487,6 +528,97 @@ function M.new(config)
 		client.remote_config = remote_config_mod.new(normalized, function()
 			return client.anonymous_id
 		end)
+	end
+	-- Experiment-assignment consumer (dark unless `experiments_enabled`).
+	-- Constructed only when the flag is on — while off there is no subject-id
+	-- mint, no fetch, no revalidation, no exposure and no new persistence
+	-- keys. The subject id is SDK-managed: it is loaded from the identity
+	-- record above (never from config — no host override path exists),
+	-- minted lazily by the consumer at first need, and persisted through
+	-- persist_identity. Experiment facts are enqueued through the normal
+	-- analytics pipeline with the envelope identity rules the facts contract
+	-- requires (no user_id; the standard anonymous_id — never the
+	-- experiments subject id).
+	if normalized.experiments_enabled then
+		client.experiments = experiments_mod.new(normalized, {
+			subject_id = function()
+				if not experiments_mod.valid_subject_id(client.experiments_client_id) then
+					-- No USABLE captured subject — nil, or a stored value
+					-- that fails the wire grammar. Either way a sibling
+					-- client in this process may have minted (or healed)
+					-- AND persisted a valid subject since this client
+					-- captured its copy: re-read the identity record at
+					-- mint-decision time and adopt it — one install
+					-- converges on ONE subject id (and one cache scope)
+					-- instead of the second client re-minting over the
+					-- sibling's. Gating on VALIDITY, not nilness, matters:
+					-- a captured corrupt string must not block the reload
+					-- while the consumer treats it as absent and mints. A
+					-- raw field copy (the consumer validates the grammar);
+					-- a sibling whose mint could not persist stays
+					-- process-local by the documented failed-persist rule,
+					-- so there is nothing on disk to adopt in that case.
+					local persisted = storage.load(normalized) or {}
+					-- Adopt only a VALID sibling value: copying a corrupt
+					-- or oversized field would poison this client's
+					-- identity writes the same way the init-time load
+					-- guard prevents.
+					if experiments_mod.valid_subject_id(persisted.experiments_client_id) then
+						client.experiments_client_id = persisted.experiments_client_id
+					end
+				end
+				return client.experiments_client_id
+			end,
+			store_subject_id = function(value)
+				client.experiments_client_id = value
+				return client:persist_identity()
+			end,
+			consent = function()
+				return client.consent_state
+			end,
+			analytics_session = function()
+				return client.session_id
+			end,
+			analytics_anonymous_id = function()
+				return client.anonymous_id
+			end,
+			emit = function(event_name, props, event_id, overrides)
+				-- `overrides` is the ARM-TIME identity of an owed fact
+				-- (an exposure drained late must ride the session, the
+				-- anonymous id, and the timestamp of the moment its
+				-- treatment applied — not the current ones); absent
+				-- fields mean "current".
+				overrides = overrides or {}
+				return client:enqueue_event(event_name, props, nil, {
+					event_id = event_id,
+					omit_user_id = true,
+					session_id = overrides.session_id,
+					anonymous_id = overrides.anonymous_id,
+					event_ts = overrides.event_ts,
+					retryable = overrides.retryable,
+				})
+			end,
+			purge_facts = function()
+				-- The real-subjects sentinel withdrew the assignments AND
+				-- their subject-fact keys: experiment facts already
+				-- accepted into the analytics pipeline carry those keys
+				-- verbatim and must not egress on a later flush.
+				return client:purge_experiment_facts()
+			end,
+			capture_fact = function(event_name, props, event_id, overrides)
+				-- Drop-time durable capture: a durable entry delete with
+				-- an exposure still owed must not let a process kill lose
+				-- the fact — the spool copy replays it at the next launch.
+				return client:capture_experiment_fact(
+					event_name, props, event_id, overrides)
+			end,
+			spool_condemned_pending = function()
+				-- Condemned facts still on the durable spool (a removal
+				-- write that could not land): the condemnation marker
+				-- must not retire over them.
+				return client.condemned_spool_pending == true
+			end,
+		})
 	end
 	-- Offline event spool: re-load the envelopes a previous launch could not
 	-- deliver so they re-send (chunked to batch_size) before fresh events. The
@@ -523,7 +655,7 @@ function M.new(config)
 			client.spool_purge_pending = true
 		end
 	else
-		local spooled, stored_deadline = storage.load_spool(normalized)
+		local spooled, stored_deadline, spool_miss = storage.load_spool(normalized)
 		-- Server-requested backpressure survives a relaunch: when the record
 		-- carries a still-future Retry-After deadline, seed the publish
 		-- deferral so the startup resend waits out the remaining window
@@ -564,7 +696,116 @@ function M.new(config)
 				})
 			end
 		end
-		if #spooled > 0 or mismatched > 0 then
+		local condemned = 0
+		local condemnation_covers = false
+		local condemnation_stamp_iso = nil
+		if #spooled > 0 or spool_miss == "unreadable" then
+			if client.experiments then
+				condemnation_covers =
+					client.experiments:condemnation_covers_current_scope()
+				if condemnation_covers then
+					condemnation_stamp_iso =
+						client.experiments:condemnation_stamp_iso()
+				end
+			else
+				-- Experiments DISABLED (the dark default, or a rollback
+				-- launch after an enabled run): the consumer is not
+				-- constructed, but the SPOOL is still live — and a prior
+				-- enabled run's real-subjects condemnation may still be
+				-- armed. A sentinel + failed spool rewrite + death leaves
+				-- the sidecar marker as the ONLY guard against replaying
+				-- the withdrawn subject-fact keys, so the marker is
+				-- honored INDEPENDENTLY of the flag: the sidecar file is
+				-- read directly, and with no subject/scope machinery
+				-- constructed to disprove it, it condemns conservatively —
+				-- the same fail-closed rule the consumer applies when its
+				-- comparator goes blind. The marker is deliberately NEVER
+				-- retired here: retiring requires proving the covered
+				-- record AND spool durably clean, which only the full
+				-- machinery can do — a marker whose facts are all
+				-- post-stamp condemns nothing below and retires in the
+				-- next ENABLED launch's first tick.
+				local marker_stamp, _, marker_miss =
+					storage.load_experiments_clear(normalized)
+				if marker_stamp then
+					condemnation_covers = true
+					condemnation_stamp_iso = clock.iso_utc(marker_stamp)
+				elseif marker_miss == "unreadable" then
+					-- The sidecar READ failed: an armed condemnation may
+					-- sit in the unreadable file. Fail closed exactly like
+					-- the consumer's unknown-form marker — condemn with no
+					-- stamp, which blanket-filters the experiment facts
+					-- below (no partition is possible without the stamp).
+					condemnation_covers = true
+				end
+			end
+		end
+		if spool_miss == "unreadable" and condemnation_covers then
+			-- The spool READ failed while a condemnation is armed: spool
+			-- cleanliness is UNPROVEN, not clean — the unreadable file may
+			-- still hold pre-sentinel facts carrying withdrawn subject-fact
+			-- keys, and nothing was filtered or rewritten this launch.
+			-- Record the debt so the marker cannot retire on this launch's
+			-- evidence (the retire chokepoint consults this flag); any
+			-- later successful whole-file spool write proves cleanliness
+			-- and clears it, and an unhealed file simply leaves the marker
+			-- armed for the next launch's readable pass.
+			client.condemned_spool_pending = true
+		end
+		if condemnation_covers then
+			-- A real-subjects condemnation survived the exit (the sentinel's
+			-- clear or its sidecar marker is still armed) AND covers the
+			-- current scope: spooled experiment facts carrying the withdrawn
+			-- subject-fact keys — a sentinel purge's failed spool rewrite
+			-- followed by a process death leaves them here — must not
+			-- re-send. The drop is PARTITIONED by the marker's own stamp,
+			-- the record partition's dispatch-bound rule extended to the
+			-- spool: a fact whose event_ts is STRICTLY AFTER the stamp
+			-- postdates the sentinel's authority (a flip-back re-exposure
+			-- captured before the exit) and SURVIVES; a fact at/before it
+			-- is what the sentinel withdrew and drops. A marker whose
+			-- in-scope facts are ALL post-stamp therefore condemns nothing
+			-- — the settled-but-unretired sidecar case — and retires on
+			-- the first tick instead of eating fresh facts. A stale marker
+			-- from a retired environment/credential/subject never reaches
+			-- this branch at all (fail-closed when nothing can disprove it:
+			-- a blind consumer comparator, or no consumer at all).
+			local stamp_iso = condemnation_stamp_iso
+			local kept = {}
+			for i = 1, #spooled do
+				local env = spooled[i]
+				local name = env.event_name
+				local is_fact = name == "experiment_exposure"
+					or name == "experiment_outcome"
+				-- The boundary is biased to SURVIVE: envelope timestamps
+				-- are second-granular while the marker stamp is
+				-- milliseconds, so a fact captured in the SAME UTC second
+				-- as the sentinel compares EQUAL — dropping it would eat a
+				-- legitimate post-sentinel fact. Equal-or-after survives;
+				-- the residual is the mirror-image ≤1s window in which a
+				-- pre-sentinel fact shares the sentinel's second and
+				-- escapes the drop — accepted and documented (the fact was
+				-- real treatment reporting; the deterministic id keeps it
+				-- collapsible server-side).
+				if is_fact and not (stamp_iso ~= nil
+					and type(env.event_ts) == "string"
+					and env.event_ts >= stamp_iso) then
+					condemned = condemned + 1
+				else
+					kept[#kept + 1] = env
+				end
+			end
+			if condemned > 0 then
+				spooled = kept
+				client:diagnose({
+					scope = "spool",
+					status = "dropped",
+					code = "experiments_condemned",
+					count = condemned,
+				})
+			end
+		end
+		if #spooled > 0 or mismatched > 0 or condemned > 0 then
 			if #spooled == 0 then
 				client.spool_retry_after_ms = nil
 			end
@@ -576,6 +817,18 @@ function M.new(config)
 			-- and the caps apply on the next successful write.
 			if client:write_spool_record(spooled) then
 				spooled = client.spool_record
+			elseif condemned > 0 then
+				-- The CONDEMNATION could not land durably: the stale file
+				-- still carries the withdrawn facts, and with everything
+				-- condemned there may be nothing left to resend/ack that
+				-- would ever rewrite it. This is durable work — record the
+				-- debt so the rewrite retries at every dispatch point, and
+				-- so the condemnation marker stays alive (the retire check
+				-- consults it) until the file is actually clean; a retired
+				-- marker over a stale file would replay the withdrawn keys
+				-- at the launch after next.
+				client.spool_rewrite_pending = true
+				client.condemned_spool_pending = true
 			end
 		end
 		if #spooled > 0 then
@@ -640,6 +893,13 @@ function Client:persist_identity()
 	if self.consent_state == "granted" or consent_denied_state(self.consent_state) then
 		record.consent_analytics = self.consent_state
 	end
+	-- The experiments subject id rides the identity record whenever one is
+	-- held — including when the experiments flag is currently off — so an
+	-- identity rewrite can never drop a previously minted id (dropping would
+	-- silently re-bucket the subject on a later re-enable).
+	if type(self.experiments_client_id) == "string" and self.experiments_client_id ~= "" then
+		record.experiments_client_id = self.experiments_client_id
+	end
 	return storage.save(self.config, record)
 end
 
@@ -677,11 +937,18 @@ function Client:set_anonymous_id(anonymous_id)
 	--     anonymous_id snapshot; re-sending them under a token minted for the
 	--     NEW anon would be rejected the same way, so rotation waits until the
 	--     spool has drained.
+	--   * OWED experiment-exposure snapshots are pending old-anon work that
+	--     sits OUTSIDE the queue: their arm-time anonymous_id enters the
+	--     envelope only when the sweep finally enqueues them, so a flushed
+	--     queue does not mean the old anon is drained — rotating first would
+	--     send the old-anon fact under a token minted for the new anon and
+	--     the bind_anon check would reject the whole batch.
 	-- The host retries the rotation once the pending work clears.
 	local rotating = self.config.token_provider and anonymous_id ~= self.anonymous_id
 	if rotating and (queue.size(self.queue) > 0 or self.in_flight_batch ~= nil
 		or self.token_request_in_flight or self:consent_outbox_pending()
-		or self:spool_pending()) then
+		or self:spool_pending()
+		or (self.experiments and self.experiments:has_owed_exposures())) then
 		return false, "events_pending"
 	end
 	self.anonymous_id = anonymous_id
@@ -784,6 +1051,77 @@ function Client:remote_config_version()
 	return self.remote_config:get_version()
 end
 
+-- ── experiments ───────────────────────────────────────────────────────────────
+--
+-- Thin delegates over the experiment-assignment consumer
+-- (shardpilot/experiments.lua), present only when `experiments_enabled` is
+-- configured true. Unlike the remote-config fetch, the assignment plane IS
+-- consent-gated (granted-only, forced-minor fully off — see the module
+-- header); the getters serve nil rather than failing, so game code can ship
+-- one code path with the control experience as its default.
+
+function Client:fetch_experiment_assignment(experiment_key, attributes, callback)
+	-- `attributes` is optional: (key, callback) is accepted too.
+	if type(attributes) == "function" and callback == nil then
+		callback = attributes
+		attributes = nil
+	end
+	-- The callback is game code; never let it break the SDK.
+	if not self.initialized then
+		-- No request is dispatched on a torn-down client, nothing is
+		-- written, game code is not called back later.
+		if type(callback) == "function" then
+			pcall(callback, { ok = false, from_cache = false, error = "shutdown" })
+		end
+		return false, "shutdown"
+	end
+	if not self.experiments then
+		if type(callback) == "function" then
+			pcall(callback, {
+				ok = false,
+				from_cache = false,
+				error = "experiments_not_configured",
+			})
+		end
+		return false, "experiments_not_configured"
+	end
+	return self.experiments:fetch(experiment_key, attributes, callback)
+end
+
+function Client:experiment_variant(experiment_key)
+	if not self.experiments then
+		return nil
+	end
+	return self.experiments:variant(experiment_key)
+end
+
+function Client:experiment_payload(experiment_key)
+	if not self.experiments then
+		return nil
+	end
+	return self.experiments:payload(experiment_key)
+end
+
+function Client:track_exposure(experiment_key)
+	if not self.initialized then
+		return false, "shutdown"
+	end
+	if not self.experiments then
+		return false, "experiments_not_configured"
+	end
+	return self.experiments:track_exposure(experiment_key)
+end
+
+function Client:track_outcome(experiment_key, outcome_key, outcome_value)
+	if not self.initialized then
+		return false, "shutdown"
+	end
+	if not self.experiments then
+		return false, "experiments_not_configured"
+	end
+	return self.experiments:track_outcome(experiment_key, outcome_key, outcome_value)
+end
+
 function Client:set_consent(decision)
 	if not self.initialized then
 		return false, "shutdown"
@@ -805,6 +1143,7 @@ function Client:set_consent(decision)
 		return false, "invalid_consent"
 	end
 	local granted = next_state == "granted"
+	local state_changed = self.consent_state ~= next_state
 	-- Revocation cleanup completes before a new grant takes effect. The
 	-- purge-owed flag is memory-only: if a grant were applied (and persisted)
 	-- while the purge of an earlier revocation is still owed, a relaunch
@@ -816,6 +1155,21 @@ function Client:set_consent(decision)
 		return false, "spool_purge_failed"
 	end
 	self.consent_state = next_state
+	if state_changed and self.experiments then
+		-- Every consent TRANSITION opens a new consent epoch: responses
+		-- dispatched before it must not install their constructive half
+		-- (destructive directives still land — the R22 partition). A
+		-- repeated same-state call is not a transition and fences nothing.
+		self.experiments.consent_epoch = self.experiments.consent_epoch + 1
+	end
+	if granted and self.experiments then
+		-- Purge/denied-restore re-arm intents materialize AT THE GRANT:
+		-- serving resumes this instant, so the replacement snapshots
+		-- capture this exact moment's identity — and has_owed_exposures()
+		-- reflects the owed automatic facts immediately, before any Mode B
+		-- rotation can be requested in the regrant window.
+		self.experiments:on_consent_granted()
+	end
 	local purged = true
 	if not granted then
 		local cleared = queue.size(self.queue)
@@ -850,6 +1204,13 @@ function Client:set_consent(decision)
 		if storage.clear_spool(self.config) then
 			self.spool_purge_pending = false
 			self.spool_disk_deadline_ms = nil
+			-- An emptied durable spool proves cleanliness exactly like a
+			-- whole-file write does: nothing condemned can remain in a
+			-- cleared record, so the condemnation debt settles with it and
+			-- the fail-closed marker may retire once the record side is
+			-- clean — instead of surviving the whole process on a stale
+			-- flag.
+			self.condemned_spool_pending = false
 		else
 			if not self.spool_purge_pending then
 				self.stats.spool_persist_failed = self.stats.spool_persist_failed + 1
@@ -868,6 +1229,14 @@ function Client:set_consent(decision)
 		-- after a re-grant would summarize pre-denial activity.
 		self.perf = sampling.new_perf()
 		self.network = sampling.new_network()
+		if self.experiments then
+			-- The purge above discarded any queued-but-unpublished
+			-- experiment exposure facts: re-arm this session's emissions so
+			-- a later re-grant of a retained assignment emits its exposure
+			-- again (already-published facts collapse server-side on their
+			-- deterministic event ids) instead of under-counting treatment.
+			self.experiments:on_analytics_purge()
+		end
 	end
 	local persisted = self:persist_identity()
 	if not persisted then
@@ -916,6 +1285,21 @@ function Client:session_start(props)
 		self.session_active = previous_session_active
 		return false, err
 	end
+	if self.experiments then
+		-- The exposure contract is once per (experiment, version, subject)
+		-- per SESSION: an explicit session renewal re-arms it, so a
+		-- still-applied assignment emits one exposure into the new session
+		-- (with its own deterministic id) on the next application sweep.
+		-- Whether this start is a genuine RENEWAL (any session — lazy or
+		-- explicit — existed before it) decides what happens to owed
+		-- pre-session exposure snapshots: the first real session adopts
+		-- them; a renewal preserves them as prior sessions' facts — and
+		-- stamps any still-unattributed pre-session snapshot with the
+		-- PREVIOUS session's id (the lazy first session it lived through),
+		-- which the renewal path needs the id itself for.
+		self.experiments:on_session_renewed(
+			previous_session_id ~= nil, previous_session_id)
+	end
 	return true
 end
 
@@ -963,6 +1347,19 @@ function Client:tutorial_complete(tutorial_id)
 end
 
 function Client:track(event_name, props, context)
+	return self:enqueue_event(event_name, props, context, nil)
+end
+
+-- The shared enqueue path behind track() and the SDK-internal experiment
+-- facts. `fact` (internal only — never host-supplied) carries the two
+-- deviations an experiment fact needs from an ordinary event: a
+-- pre-derived `event_id` (the deterministic exposure id, so at-least-once
+-- retries and same-session double emissions collapse server-side) and
+-- `omit_user_id` (the facts contract forbids user_id on the envelope; the
+-- identity is the standard anonymous_id alone). Everything else — the
+-- consent-first gates, identity requirement, lazy session, queue caps —
+-- applies to facts exactly as to events.
+function Client:enqueue_event(event_name, props, context, fact)
 	if not self.initialized then
 		self.stats.dropped = self.stats.dropped + 1
 		return false, "shutdown"
@@ -1011,13 +1408,45 @@ function Client:track(event_name, props, context)
 		self.session_active = true
 		opened_lazy_session = true
 	end
+	local user_id = self.user_id
+	local event_id = nil
+	local session_override = nil
+	local anonymous_override = nil
+	local ts_override = nil
+	if fact then
+		event_id = fact.event_id
+		if fact.omit_user_id then
+			user_id = nil
+		end
+		-- An owed experiment fact enqueued LATE carries the identity of
+		-- the moment its treatment applied. The full envelope audit for a
+		-- late-drained fact, field by field: event_id — deterministic,
+		-- derived from the arm-time snapshot; event_ts — the arm moment
+		-- (overridden here); user_id — omitted by the facts contract;
+		-- anonymous_id — the arm moment's (overridden here); session_id —
+		-- the session the application belonged to (overridden here);
+		-- props — the arm-time entry snapshot. The ONE enqueue-time field
+		-- is session_sequence: it stays the enqueue-stream's counter — a
+		-- documented residual, because back-numbering a foreign session's
+		-- sequence would need a per-session counter registry, and the
+		-- server's cross-session ordering key is the timestamp.
+		if type(fact.session_id) == "string" and fact.session_id ~= "" then
+			session_override = fact.session_id
+		end
+		if type(fact.anonymous_id) == "string" and fact.anonymous_id ~= "" then
+			anonymous_override = fact.anonymous_id
+		end
+		if type(fact.event_ts) == "string" and fact.event_ts ~= "" then
+			ts_override = fact.event_ts
+		end
+	end
 	local event = {
-		event_id = id.uuid(),
+		event_id = event_id or id.uuid(),
 		event_name = event_name,
-		event_ts = clock.iso_utc(),
-		user_id = self.user_id,
-		anonymous_id = self.anonymous_id,
-		session_id = self.session_id,
+		event_ts = ts_override or clock.iso_utc(),
+		user_id = user_id,
+		anonymous_id = anonymous_override or self.anonymous_id,
+		session_id = session_override or self.session_id,
 		session_sequence = self.session_sequence + 1,
 		props = props_snapshot,
 		context = context_snapshot,
@@ -1033,7 +1462,14 @@ function Client:track(event_name, props, context)
 			self.session_sequence = 0
 			self.session_active = false
 		end
-		self.stats.dropped = self.stats.dropped + 1
+		-- A RETRYABLE fact refusal is not a dropped event: the owed-snapshot
+		-- machinery keeps the fact armed and re-enqueues it once the queue
+		-- has room, so counting every full-queue sweep attempt would inflate
+		-- the dropped stat with events that eventually deliver. Terminal
+		-- outcomes (host events, immediate host-retried facts) still count.
+		if not (fact and fact.retryable) then
+			self.stats.dropped = self.stats.dropped + 1
+		end
 		return false, "queue_full"
 	end
 	self.session_sequence = event.session_sequence
@@ -1052,6 +1488,13 @@ function Client:update(dt)
 		-- Frame samples are analytics data: a session kept active through a
 		-- denial must not keep feeding the perf sampler.
 		sampling.sample_frame(self.perf, dt)
+	end
+	if self.experiments then
+		-- Revalidation cadence + the cache-restored exposure sweep. Runs
+		-- before the flush check so a fact enqueued by this tick can ride
+		-- this same update's flush; internally a no-op unless consent is
+		-- granted and an assignment is cached.
+		self.experiments:tick(dt)
 	end
 	if queue.size(self.queue) >= self.config.batch_size or self.flush_elapsed_seconds >= self.config.flush_interval_seconds then
 		self.flush_elapsed_seconds = 0
@@ -1660,6 +2103,191 @@ end
 -- `spool_record` mirrors the persisted list and `spool_index` its event_ids,
 -- so appends are de-duplicated and acknowledged batches are removed cheaply.
 
+-- The experiments plane's two fact shapes on the analytics pipeline. Queue
+-- items and wire envelopes both carry event_name, so one predicate serves
+-- every surface.
+local function is_experiment_fact(event)
+	local name = type(event) == "table" and event.event_name or nil
+	return name == "experiment_exposure" or name == "experiment_outcome"
+end
+
+-- Remove experiment facts from a batch IN PLACE and rebuild its cached wire
+-- payload (the payload snapshots the envelopes at first attempt — a filtered
+-- batch resending the unfiltered capture would defeat the purge). Returns
+-- the number removed.
+local function filter_batch_facts(batch)
+	local kept = {}
+	for i = 1, #batch do
+		if not is_experiment_fact(batch[i]) then
+			kept[#kept + 1] = batch[i]
+		end
+	end
+	local removed = #batch - #kept
+	if removed == 0 then
+		return 0
+	end
+	for i = #batch, 1, -1 do
+		batch[i] = nil
+	end
+	for i = 1, #kept do
+		batch[i] = kept[i]
+	end
+	if batch.payload then
+		if batch.spool_origin then
+			-- Spool-origin batches carry the persisted envelopes verbatim
+			-- as BOTH the array part and the payload: rebuild the payload
+			-- from the filtered array (the envelopes must survive
+			-- unrebuilt — event_id/event_ts round-trip intact).
+			local envelopes = {}
+			for i = 1, #kept do
+				envelopes[i] = kept[i]
+			end
+			batch.payload = { events = envelopes }
+		else
+			-- Queue-origin batches rebuild lazily at the next dispatch
+			-- (ensure_batch_payload); envelope.build is deterministic over
+			-- the immutable event snapshots, so the kept envelopes are
+			-- bit-identical to the first attempt's.
+			batch.payload = nil
+		end
+	end
+	return removed
+end
+
+-- Purge experiment facts from every analytics pipeline surface. Invoked by
+-- the experiments consumer when the real-subjects sentinel lands: the
+-- withdrawn subject-fact keys ride these facts verbatim, and a fact that
+-- ships after the platform flipped real subjects off keeps egressing what
+-- the kill switch killed. SELECTIVE by event name — the host's events are
+-- untouched (unlike the consent purge, which closes the whole plane).
+-- Surfaces, in pipeline order: the memory queue (accepted facts below batch
+-- size); the retained in-flight batch — only between attempts; a batch
+-- actually ON THE WIRE is past recall (the consent purge's
+-- publish-in-flight carve-out), and if that publish fails and retains, the
+-- settle path filters it via experiment_purge_awaited; the in-memory spool
+-- chunks awaiting re-send; and the durable spool record, converging through
+-- the settled/rewrite machinery when the store is down. A failed rewrite
+-- followed by process death before the retry lands re-sends those spooled
+-- facts on the next launch — the documented storage-down-through-exit
+-- residual family.
+function Client:purge_experiment_facts()
+	local purged = queue.remove_matching(self.queue, is_experiment_fact)
+	if self.in_flight_batch then
+		if self.publish_in_flight then
+			self.experiment_purge_awaited = true
+		else
+			purged = purged + filter_batch_facts(self.in_flight_batch)
+			if #self.in_flight_batch == 0 then
+				self.in_flight_batch = nil
+				-- The armed backpressure deferral belonged to the batch the
+				-- purge just emptied — the consent-purge stale-deadline
+				-- rule: leaving it would block the next granted batch for a
+				-- window the server set for discarded work.
+				self.publish_retry_after_ms = nil
+				self.publish_backoff_attempt = 0
+				self.spool_retry_after_ms = nil
+			end
+		end
+	end
+	if #self.spool_batches > 0 then
+		local kept_chunks = {}
+		for i = 1, #self.spool_batches do
+			local chunk = self.spool_batches[i]
+			local kept = {}
+			for j = 1, #chunk do
+				if is_experiment_fact(chunk[j]) then
+					purged = purged + 1
+				else
+					kept[#kept + 1] = chunk[j]
+				end
+			end
+			if #kept > 0 then
+				kept_chunks[#kept_chunks + 1] = kept
+			end
+		end
+		self.spool_batches = kept_chunks
+	end
+	-- Durable spool: mark the fact envelopes settled — every successful
+	-- write drops settled entries — and attempt the rewrite immediately; a
+	-- failed write leaves spool_rewrite_pending for the normal retry
+	-- cadence (flush/persist/shutdown dispatch points). The facts marked
+	-- here are the durable shadows of copies already counted on the memory
+	-- surfaces (or of prior-launch chunks counted above), so they do not
+	-- bump the purged count again.
+	local marked = false
+	for i = 1, #self.spool_record do
+		local env = self.spool_record[i]
+		if is_experiment_fact(env) and type(env.event_id) == "string" then
+			self.spool_settled[env.event_id] = true
+			marked = true
+		end
+	end
+	if marked and not self:write_spool_record(self.spool_record) then
+		self.spool_rewrite_pending = true
+		-- The withdrawn facts are still on disk: durable debt — the
+		-- condemnation marker must not retire until a write lands.
+		self.condemned_spool_pending = true
+	end
+	if purged > 0 then
+		-- Terminal non-delivery by server mandate: counted like the
+		-- consent purge counts its clears, never like a retryable sweep
+		-- refusal.
+		self.stats.dropped = self.stats.dropped + purged
+	end
+	return purged
+end
+
+-- Durably capture ONE experiment fact straight into the spool, bypassing the
+-- memory queue. Invoked by the experiments consumer when a durable entry
+-- DROP lands while that entry's exposure is still owed in memory: the delete
+-- removes the only persisted source the fact could re-arm from, so a process
+-- KILL before the next sweep/persist would lose it — the spool copy makes a
+-- relaunch replay it. NARROW by contract: only drop-time capture — owed
+-- facts whose entries live on stay memory-only until the ordinary
+-- dispatch-point captures (persist/shutdown/failed publish). The snapshot
+-- stays armed in memory afterwards: the live process still emits it through
+-- the normal sweep, and the deterministic event_id makes the pair collapse —
+-- a successful publish acks the spool copy away, a replayed copy after a
+-- kill dedups server-side. Fails (false) without a durable write when the
+-- spool is disabled, consent is not granted, storage is down (the
+-- storage-down-through-exit residual), or no session identity exists to
+-- stamp — a background capture must not lazily open a session any more than
+-- the background sweep may.
+function Client:capture_experiment_fact(event_name, props, event_id, overrides)
+	if not self.initialized or self.consent_state ~= "granted" then
+		return false
+	end
+	overrides = overrides or {}
+	local session_id = overrides.session_id or self.session_id
+	if type(session_id) ~= "string" or session_id == "" then
+		session_id = nil
+		-- Mirror the enqueue path's source-conditional session rule: a
+		-- backend-source client legitimately ships sessionless envelopes
+		-- (enqueue never lazily opens a session for it), so its drop-time
+		-- capture must not refuse for lacking one — a backend owed fact
+		-- behind a full queue would otherwise die with the entry on a
+		-- kill. Every OTHER source still requires a session identity: a
+		-- background capture opens no phantom session.
+		if self.config.source ~= "backend" then
+			return false
+		end
+	end
+	local props_snapshot = copy_table(props, "invalid_props")
+	local event = {
+		event_id = event_id,
+		event_name = event_name,
+		event_ts = overrides.event_ts or clock.iso_utc(),
+		user_id = nil,
+		anonymous_id = overrides.anonymous_id or self.anonymous_id,
+		session_id = session_id,
+		session_sequence = self.session_sequence + 1,
+		props = props_snapshot,
+		context = nil,
+	}
+	self.session_sequence = event.session_sequence
+	return self:spool_envelopes({ envelope.build(self.config, self, event) })
+end
+
 -- True while envelopes loaded from a previous launch still await re-send.
 function Client:spool_pending()
 	return #self.spool_batches > 0
@@ -1715,6 +2343,9 @@ function Client:write_spool_record(events)
 	end
 	self.spool_settled = {}
 	self.spool_rewrite_pending = false
+	-- The whole file was just rewritten from the filtered state: no
+	-- condemned content can remain on disk.
+	self.condemned_spool_pending = false
 	self.spool_disk_deadline_ms = self.spool_retry_after_ms
 	return true
 end
@@ -1733,6 +2364,11 @@ function Client:retry_spool_purge()
 		self.spool_settled = {}
 		self.spool_rewrite_pending = false
 		self.spool_disk_deadline_ms = nil
+		-- The emptied spool also settles any condemnation debt: an empty
+		-- durable record proves cleanliness exactly like a successful
+		-- whole-file write proves it, so the fail-closed marker may retire
+		-- once the record side settles.
+		self.condemned_spool_pending = false
 		return true
 	end
 	return false
@@ -1767,16 +2403,56 @@ function Client:spool_envelopes(envelopes)
 	end
 	local fresh = {}
 	local seen = {}
+	local replaced = false
+	local replaced_ids = nil
 	for i = 1, #envelopes do
 		local env = envelopes[i]
 		local event_id = type(env) == "table" and env.event_id or nil
-		if type(event_id) == "string" and event_id ~= ""
-			and not self.spool_index[event_id] and not seen[event_id] then
-			seen[event_id] = true
-			fresh[#fresh + 1] = env
+		if type(event_id) == "string" and event_id ~= "" then
+			if self.spool_settled[event_id] then
+				-- A replacement fact re-derived a deterministic id whose
+				-- prior copy a sentinel purge condemned while the removal
+				-- rewrite is still owed: capturing the replacement
+				-- RE-LEGITIMIZES the id — clear the settled mark — and
+				-- the stored envelope is ALWAYS overwritten with the
+				-- replacement's bytes. The pre-sentinel copy can differ
+				-- in props (a reissued subject-fact key: the withdrawn
+				-- key must never resend) OR only in identity fields — and
+				-- the identity matters just as much: the old copy carries
+				-- a PRE-sentinel event_ts, which the relaunch's stamp
+				-- partition would drop as withdrawn while this capture
+				-- had reported the fact durable. The replacement's
+				-- post-sentinel identity is the durable form, full stop.
+				-- The write below must land (else the deferred-rewrite
+				-- machinery converges the mirror and the capture reports
+				-- not-yet-durable). Where a condemnation marker survives
+				-- to the next launch, the scope-gated stamp partition
+				-- governs every spooled fact equally. (An acked-but-
+				-- unrewritten published id re-captured this way just
+				-- resurrects a delivered envelope with fresher identity;
+				-- the deterministic id collapses the re-send server-side.)
+				self.spool_settled[event_id] = nil
+				if self.spool_index[event_id] then
+					for j = 1, #self.spool_record do
+						local stored = self.spool_record[j]
+						if type(stored) == "table"
+							and stored.event_id == event_id then
+							self.spool_record[j] = env
+							replaced = true
+							replaced_ids = replaced_ids or {}
+							replaced_ids[event_id] = true
+							break
+						end
+					end
+				end
+			end
+			if not self.spool_index[event_id] and not seen[event_id] then
+				seen[event_id] = true
+				fresh[#fresh + 1] = env
+			end
 		end
 	end
-	if #fresh == 0 then
+	if #fresh == 0 and not replaced then
 		return true
 	end
 	local combined = {}
@@ -1787,6 +2463,12 @@ function Client:spool_envelopes(envelopes)
 		combined[#combined + 1] = fresh[i]
 	end
 	if not self:write_spool_record(combined) then
+		if replaced then
+			-- The disk still carries the superseded (withdrawn-key) bytes
+			-- while the mirror holds the replacement: converge through the
+			-- deferred-rewrite machinery at the next dispatch point.
+			self.spool_rewrite_pending = true
+		end
 		return false
 	end
 	-- Cap eviction may have discarded some of THESE envelopes: the caps evict
@@ -1804,6 +2486,18 @@ function Client:spool_envelopes(envelopes)
 		end
 	end
 	self.stats.spooled = self.stats.spooled + survivors
+	if replaced_ids then
+		-- An in-place replacement sits at its ORIGINAL position, so the
+		-- caps' oldest-first eviction can reach it exactly like any old
+		-- entry: a replacement that did not survive into the saved record
+		-- was NOT captured, and a durability-dependent caller must not
+		-- report it safe on the strength of the overwrite alone.
+		for event_id in pairs(replaced_ids) do
+			if not self.spool_index[event_id] then
+				return false
+			end
+		end
+	end
 	return survivors == #fresh
 end
 
@@ -1867,7 +2561,18 @@ function Client:spool_undelivered()
 	if self.in_flight_batch then
 		local payload = self:ensure_batch_payload(self.in_flight_batch)
 		for i = 1, #payload.events do
-			envelopes[#envelopes + 1] = payload.events[i]
+			local env = payload.events[i]
+			-- A sentinel purge that found this batch ON THE WIRE could not
+			-- touch it (past recall) — the settle callback filters it at
+			-- retention. But a persist/shutdown snapshot BEFORE the settle
+			-- must not capture the withdrawn facts into the durable spool:
+			-- a crash pre-settle would replay them at the next launch. The
+			-- QUEUE part below is deliberately unfiltered — facts there
+			-- postdate the purge (a flip-back re-exposure) and are
+			-- legitimate.
+			if not (self.experiment_purge_awaited and is_experiment_fact(env)) then
+				envelopes[#envelopes + 1] = env
+			end
 		end
 	end
 	for i = 1, #self.queue.items do
@@ -1892,6 +2597,15 @@ function Client:persist()
 	-- recover a failed receipt write from its focus-loss listener.
 	-- Best-effort — the persist result stays about the EVENT snapshot.
 	self:retry_consent_outbox_persist()
+	if self.experiments then
+		-- Owed durable experiment syncs share the snapshot moment too, and
+		-- like the consent outbox they are independent of event spooling
+		-- (consent-independent local disk state): a kill drop or refresh
+		-- write still owed when the OS kills the app would leave a revoked
+		-- assignment as reload truth. Retried before the spool gates below
+		-- so even a spool-less configuration converges its cache here.
+		self.experiments:retry_durable_sync()
+	end
 	if not self.config.spool_enabled then
 		return false, "spool_disabled"
 	end
@@ -1903,11 +2617,32 @@ function Client:persist()
 	if self.consent_state ~= "granted" then
 		-- A consent-blocked client leaves nothing spoolable: denied already
 		-- cleared the queue (and the spool stays purged), and a consent-first
-		-- "unknown" client never queued anything to capture.
+		-- "unknown" client never queued anything to capture. A still-owed
+		-- durable cache sync is the one exception worth reporting: it is
+		-- consent-independent disk state an app death would leave stale.
+		if self.experiments and self.experiments:has_owed_durable_sync() then
+			return false, "experiments_pending"
+		end
 		return true
+	end
+	if self.experiments then
+		-- Owed exposure facts join the snapshot: the sweep is their normal
+		-- emission (they enter the queue, stay queued for regular delivery,
+		-- and ride the spool capture below — ack-based removal applies as
+		-- to any spooled event). A fact the full queue still refuses stays
+		-- owed and is reported below.
+		self.experiments:sweep_owed()
 	end
 	if not self:spool_undelivered() then
 		return false, "spool_persist_failed"
+	end
+	if self.experiments and (self.experiments:has_owed_exposures()
+		or self.experiments:has_owed_durable_sync()) then
+		-- Something owed was NOT captured (a full queue denied a swept
+		-- fact, or the cache write is still failing): an OS kill right
+		-- now would lose it, so the app-may-die snapshot must not claim
+		-- safety. The host's recourse is a flush() and another persist().
+		return false, "experiments_pending"
 	end
 	return true
 end
@@ -1932,6 +2667,13 @@ function Client:start_publish_batch()
 		completed = true
 		succeeded = ok == true
 		self.publish_in_flight = false
+		-- A sentinel purge that ran while this batch was ON THE WIRE could
+		-- not touch it (the attempt itself is past recall); settle the
+		-- deferred recall now, whatever the outcome — a successful publish
+		-- means the facts egressed with the attempt (the accepted
+		-- carve-out), a retained failure filters them below.
+		local purge_awaited = self.experiment_purge_awaited
+		self.experiment_purge_awaited = false
 		if ok then
 			self.stats.published = self.stats.published + batch_count
 			-- A successful publish clears any backpressure deferral/backoff.
@@ -1977,6 +2719,31 @@ function Client:start_publish_batch()
 		-- this FIRST so the deferral below is only set for a batch we keep.
 		local retain = is_retryable_publish_failure(err, unauthorized, retryable, mode_b)
 			and not consent_denied_state(self.consent_state)
+		if retain and purge_awaited then
+			-- The failed batch is retained for retry, but a sentinel purge
+			-- ran mid-flight: the withdrawn facts must not ride the next
+			-- attempt or the spool capture below. Filter them now (their
+			-- spool shadows were already marked settled by the purge); an
+			-- emptied batch has nothing left to retain, defer, or spool —
+			-- and its facts were counted dropped per-item here, so the
+			-- terminal not-retained accounting below must not run for it.
+			local removed = filter_batch_facts(events)
+			if removed > 0 then
+				self.stats.dropped = self.stats.dropped + removed
+			end
+			if #events == 0 then
+				if self.in_flight_batch == events then
+					self.in_flight_batch = nil
+				end
+				retain = false
+				-- Nothing is retained, so no deferral may arm below — and
+				-- any deadline a previous attempt of this batch armed is
+				-- stale now (the consent-purge rule).
+				self.publish_retry_after_ms = nil
+				self.publish_backoff_attempt = 0
+				self.spool_retry_after_ms = nil
+			end
+		end
 		if unauthorized then
 			self.token = nil
 			self.token_expires_at_ms = nil
@@ -1998,7 +2765,10 @@ function Client:start_publish_batch()
 			-- event_id index de-duplicates repeats) so an app kill before the
 			-- in-process retry succeeds cannot lose it. Permanent rejects are
 			-- NEVER spooled: they would fail forever on every later launch.
-			self:spool_envelopes(events.payload.events)
+			-- ensure_batch_payload: a mid-flight fact purge invalidates a
+			-- queue-origin batch's cached payload; rebuild it here so the
+			-- spool captures exactly the kept envelopes.
+			self:spool_envelopes(self:ensure_batch_payload(events).events)
 			-- The append is a no-op when every envelope is already persisted
 			-- (a spooled re-send failing again); an extended server-requested
 			-- deadline must still reach the record.
@@ -2126,13 +2896,24 @@ function Client:shutdown(reason)
 	-- at the next launch by the persisted denial/disabled configuration).
 	self:retry_spool_purge()
 	local suppress_wire = self.consent_state ~= "granted"
+	local session_end_owed = false
 	if self.session_active then
 		-- session_end completes the local teardown even while consent is
 		-- denied or unknown (the wire event is suppressed inside session_end);
 		-- summary events are suppressed below via include_summaries.
 		local session_ok, session_err = self:session_end(reason or "app_final")
 		if not session_ok then
-			return false, session_err
+			if session_err == "queue_full" then
+				-- A FULL queue is exactly the scenario the flush below
+				-- exists to drain (and the one that leaves an exposure
+				-- owed): it must not short-circuit shutdown's last-chance
+				-- housekeeping. The session end is retried after the flush
+				-- frees the room, best-effort like the rest of the exit
+				-- path.
+				session_end_owed = true
+			else
+				return false, session_err
+			end
 		end
 	end
 	local ok, err = self:flush({ include_summaries = not suppress_wire })
@@ -2156,6 +2937,12 @@ function Client:shutdown(reason)
 		if not has_remnant or not self:spool_undelivered() then
 			return false, err
 		end
+		-- The remnant is now durably on disk: EVICT it from the in-memory
+		-- queue so the post-flush housekeeping (the deferred session end,
+		-- owed exposure facts) has room to enqueue. The spooled envelopes
+		-- re-send at the next launch; keeping the memory copies would both
+		-- wedge that housekeeping behind a still-full queue and double-send.
+		queue.drain(self.queue, queue.size(self.queue))
 	end
 	if self:consent_outbox_pending() then
 		-- Undelivered consent receipts behave like the event spool at
@@ -2170,6 +2957,116 @@ function Client:shutdown(reason)
 		if self.consent_outbox_dirty or not storage.consent_outbox_is_durable(self.config) then
 			return false, "consent_pending"
 		end
+	end
+	-- Post-flush housekeeping LOOP: the flush freed queue room, so the
+	-- deferred session end and the owed exposure facts get their chance to
+	-- enqueue — in PASSES, because the freed room may be as small as one
+	-- slot (buffer_size = 1 is a valid config): each pass enqueues what
+	-- fits (the session end first), then delivers or durably spools the
+	-- just-queued events to free room for the next pass. The loop ends
+	-- when nothing deliverable is owed, or when a pass moves nothing —
+	-- and the shutdown contract governs throughout: every owed fact is
+	-- SENT, durably SPOOLED, or shutdown stays retryable, never dropped
+	-- by a "successful" teardown. Owed durable cache syncs are disk-side
+	-- housekeeping (no queue room involved): they get a retry each pass
+	-- and deliberately stay a non-blocker — a still-failing cache write
+	-- re-converges from the durable machinery at the next launch.
+	local owed_session_end = session_end_owed
+	while true do
+		local enqueued_any = false
+		if owed_session_end and self.session_active then
+			-- The room the full queue denied session_end() may exist now:
+			-- complete the session teardown. Only a STILL-full queue is
+			-- retryable by a later pass; any other failure keeps the old
+			-- contract — report it and stay alive for a host retry.
+			local retry_ok, retry_err = self:session_end(reason or "app_final")
+			if retry_ok then
+				owed_session_end = false
+				enqueued_any = true
+			elseif retry_err ~= "queue_full" then
+				return false, retry_err
+			end
+		end
+		if self.experiments then
+			self.experiments:retry_durable_sync()
+			-- Sweep owed exposure facts — as many as the queue admits this
+			-- pass — so a treatment applied under a FULL queue does not
+			-- exit without its fact. FINAL sweep: pre-session snapshots the
+			-- tick sweep held for their first-session attribution drain
+			-- here too — no later session_start can double-arm at
+			-- teardown, and the fact must not exit unemitted (it rides the
+			-- exit-time session, lazily opened at the very end when none
+			-- ever existed).
+			local before_sweep = queue.size(self.queue)
+			self.experiments:sweep_owed(true)
+			if queue.size(self.queue) > before_sweep then
+				enqueued_any = true
+			end
+		end
+		if self.consent_state == "granted" and self.session_active
+			and not owed_session_end then
+			-- The final drain lazily opened a session (a pre-session owed
+			-- fact with no session ever started rides the exit-time
+			-- session): it must close like every session this shutdown
+			-- finalizes. Pick it up as an owed session_end so the next
+			-- pass enqueues and delivers it — tearing down here would
+			-- leave session_active with no session_end on the wire. Only
+			-- reachable for drain-opened sessions: a session active at
+			-- shutdown entry either ended before the loop (inactive now)
+			-- or is already carried by owed_session_end.
+			owed_session_end = true
+		end
+		-- Owed exposures count as deliverable only on the granted plane:
+		-- a non-granted state cannot enqueue them (the purge/consent canon
+		-- governs those snapshots, not the exit path).
+		local still_owed = (owed_session_end and self.session_active)
+			or (self.consent_state == "granted" and self.experiments ~= nil
+				and self.experiments:has_owed_exposures())
+		if enqueued_any then
+			local sent, send_err = self:flush({ include_summaries = false })
+			if not sent then
+				-- Same posture as the first flush: a terminal rejection
+				-- dropped the batch (no remnant), and a vacuous capture
+				-- must not upgrade that failure.
+				local has_remnant = self.in_flight_batch ~= nil
+					or queue.size(self.queue) > 0 or self:spool_pending()
+				if not has_remnant or not self:spool_undelivered() then
+					return false, send_err
+				end
+				-- Durably captured: EVICT the remnant so the next pass has
+				-- room (the spooled envelopes re-send at the next launch;
+				-- memory copies kept would wedge the loop and double-send).
+				queue.drain(self.queue, queue.size(self.queue))
+			end
+		end
+		if not still_owed then
+			break
+		end
+		if not enqueued_any then
+			-- A full pass moved nothing into the queue while something is
+			-- still owed: no forward progress is possible, and finalizing
+			-- would silently drop the owed facts — stay retryable.
+			return false, "queue_full"
+		end
+	end
+	if self.experiments then
+		-- Owed durable cache syncs got a retry on every housekeeping pass;
+		-- if the store is STILL failing here, the per-key intents (a kill
+		-- drop, a refresh write, an owed whole-record clear) are memory-
+		-- only and a teardown now would leave a revoked assignment as
+		-- reload truth at the next launch. Stay retryable instead —
+		-- persist() parity. (This supersedes the earlier best-effort
+		-- posture for the FAILING-store case; a healthy store never
+		-- reaches this point owed.)
+		self.experiments:retry_durable_sync()
+		if self.experiments:has_owed_durable_sync() then
+			return false, "experiments_pending"
+		end
+		-- Stop the experiments consumer WITH the successful teardown (a
+		-- failed shutdown keeps the client — and the consumer — alive for
+		-- a host retry): an assignment response still in flight must not
+		-- install, persist, or call back into game code from now on.
+		self.experiments:teardown()
 	end
 	self.initialized = false
 	return true

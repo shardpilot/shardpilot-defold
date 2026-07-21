@@ -27,6 +27,13 @@ local capabilities = {
 	-- `false` or `""` stops declaring). Detectable here because a config
 	-- field unknown to an older SDK would be silently ignored.
 	schema_revision_declaration = true,
+	-- The experiment-assignment consumer exists: the config knob
+	-- `experiments_enabled` (default false — dark) and the
+	-- fetch_experiment_assignment / experiment_variant / experiment_payload /
+	-- track_exposure / track_outcome surface. Detectable here because a
+	-- config field unknown to an older SDK would be silently ignored, and
+	-- the enablement preconditions live server-side.
+	experiments_assignment = true,
 }
 
 function M.supports(capability)
@@ -141,6 +148,51 @@ function M.remote_config_version()
 		return nil
 	end
 	return client:remote_config_version()
+end
+
+-- Experiments (dark behind `experiments_enabled`, default false).
+-- `fetch_experiment_assignment` reports "not_initialized" through the result
+-- callback too, mirroring fetch_remote_config. The getters serve nil when
+-- the SDK is not initialized (indistinguishable from "no assignment" — game
+-- code treats both as the control experience). `attributes` is optional:
+-- (key, callback) is accepted.
+function M.fetch_experiment_assignment(experiment_key, attributes, callback)
+	if type(attributes) == "function" and callback == nil then
+		callback = attributes
+		attributes = nil
+	end
+	local client = default()
+	if not client then
+		if type(callback) == "function" then
+			pcall(callback, { ok = false, from_cache = false, error = "not_initialized" })
+		end
+		return false, "not_initialized"
+	end
+	return client:fetch_experiment_assignment(experiment_key, attributes, callback)
+end
+
+function M.experiment_variant(experiment_key)
+	local client = default()
+	if not client then
+		return nil
+	end
+	return client:experiment_variant(experiment_key)
+end
+
+function M.experiment_payload(experiment_key)
+	local client = default()
+	if not client then
+		return nil
+	end
+	return client:experiment_payload(experiment_key)
+end
+
+function M.track_exposure(experiment_key)
+	return with_default("track_exposure", experiment_key)
+end
+
+function M.track_outcome(experiment_key, outcome_key, outcome_value)
+	return with_default("track_outcome", experiment_key, outcome_key, outcome_value)
 end
 
 function M.session_start(props)

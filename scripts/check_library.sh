@@ -14,6 +14,7 @@ required_files=(
   shardpilot/queue.lua
   shardpilot/transport.lua
   shardpilot/remote_config.lua
+  shardpilot/experiments.lua
   shardpilot/clock.lua
   shardpilot/id.lua
   shardpilot/platform.lua
@@ -33,6 +34,7 @@ required_files=(
   test/test_sdk.lua
   test/test_crash.lua
   test/test_remote_config.lua
+  test/test_experiments.lua
   test/bob-harness/game.project
   test/bob-harness/main/harness.collection
   test/bob-harness/main/harness.script

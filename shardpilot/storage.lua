@@ -228,9 +228,20 @@ local function pending_namespace(scope)
 	return crash_scope_base(scope) .. ".pending-crashes"
 end
 
+-- The fixed byte charge for a non-string scalar (number, boolean) and for a
+-- non-string table key: sys.save serializes them as tagged binary values
+-- (numbers as doubles plus framing), so charging a conservative fixed
+-- estimate keeps the check honest for numeric/boolean-heavy payloads — an
+-- estimator that counted only strings would declare such a record fit,
+-- and the sys-layer write would then fail on every retry with nothing to
+-- evict. Overshoot is the safe direction: evicting early costs a refetch,
+-- undershooting wedges the durable sync permanently.
+local non_string_scalar_bytes = 16
+
 local function approx_record_bytes(record)
 	-- A cheap upper-bound size estimate without pulling in a JSON encoder:
-	-- count the bytes of every string scalar in the record tree.
+	-- count the bytes of every string scalar plus a fixed conservative
+	-- charge per non-string scalar and non-string key in the record tree.
 	local total = 0
 	local function walk(value, depth)
 		if depth > 32 then
@@ -239,10 +250,14 @@ local function approx_record_bytes(record)
 		local value_type = type(value)
 		if value_type == "string" then
 			total = total + #value
+		elseif value_type == "number" or value_type == "boolean" then
+			total = total + non_string_scalar_bytes
 		elseif value_type == "table" then
 			for key, child in pairs(value) do
 				if type(key) == "string" then
 					total = total + #key
+				else
+					total = total + non_string_scalar_bytes
 				end
 				walk(child, depth + 1)
 			end
@@ -853,6 +868,19 @@ function M.load_spool(scope)
 		local ok, loaded = pcall(sys.load, path)
 		if ok and type(loaded) == "table" then
 			record = loaded
+		elseif not ok then
+			-- The STORE errored on the read: the spool's DURABLE content is
+			-- UNKNOWN, not proven empty — and the in-process shadow must
+			-- NOT stand in for it (the same rule as the experiments
+			-- record): the shadow is this runtime's last successful write,
+			-- while the file may hold facts it never saw, so a
+			-- shadow-backed answer would let an armed condemnation marker
+			-- retire off a process-local snapshot. The collapse to an
+			-- empty list stands for flow (nothing can be re-sent from an
+			-- unreadable file); callers that must prove spool CLEANLINESS
+			-- — the condemnation-marker retire rule — read the third value
+			-- and treat the launch as unproven instead of clean.
+			return {}, nil, "unreadable"
 		end
 	end
 	if record == nil then
@@ -1187,6 +1215,339 @@ function M.save_remote_config(scope, record)
 	return true
 end
 
+-- ── experiment-assignment cache ──────────────────────────────────────────────
+--
+-- One durable last-known-good record per app for the experiments client: a map
+-- of experiment_key → the assignment entry served for it, stamped with the
+-- (workspace, environment, subject, url) scope string the fetches were made
+-- for. The scope check itself lives in the experiments client; this store only
+-- persists and validates the record shape. Like the remote-config cache, the
+-- record is best-effort — a failed write costs only offline serving, never the
+-- fetched assignment — and a corrupt or partially garbled record degrades to
+-- the salvageable subset (corrupt = miss, clean start).
+
+local experiments_memory = {}
+
+-- Defold documents that sys.save caps a saved table at 512 KB; refuse a record
+-- whose string-scalar estimate approaches it (parity with the remote-config
+-- body clamp) so the write cannot fail at the sys layer with the record half
+-- formed. The previously cached record stays untouched.
+local max_experiments_record_bytes = 393216
+
+-- Keep only attribute pairs that are usable for a revalidation fetch: a
+-- { name, value } table of non-empty strings.
+local function sanitize_experiment_attributes(attributes)
+	if type(attributes) ~= "table" then
+		return nil
+	end
+	local out = nil
+	for i = 1, #attributes do
+		local pair = attributes[i]
+		if type(pair) == "table"
+			and type(pair.name) == "string" and pair.name ~= ""
+			and type(pair.value) == "string" then
+			out = out or {}
+			out[#out + 1] = { name = pair.name, value = pair.value }
+		end
+	end
+	return out
+end
+
+-- Deep copy for a cached variant payload (decoded JSON: acyclic; the depth
+-- cap only bounds the walk). Non-table scalars are stored as-is.
+local function copy_experiment_payload(value, depth)
+	if type(value) ~= "table" then
+		return value
+	end
+	if depth >= 16 then
+		return nil
+	end
+	local out = {}
+	for key, child in pairs(value) do
+		if type(key) == "string" or type(key) == "number" then
+			out[key] = copy_experiment_payload(child, depth + 1)
+		end
+	end
+	return out
+end
+
+-- The positive wire grammar for a server-minted subject-fact key (kept in
+-- sync with shardpilot/experiments.lua's valid_subject_fact_key — storage
+-- cannot require experiments without a cycle): sfk1_ + exactly 64 lowercase
+-- hex. A restored client_id entry whose key fails it would serve a variant
+-- with every fact terminally skipped — the zero-reporting bias the live
+-- install path rejects — so it reads as a safe scope-miss instead. Every
+-- OTHER unit restores the entry but has the failing FIELD cleared (live
+-- install parity: the install path stores the key on no unit unless it
+-- passes this grammar): a corrupted or pre-grammar-build value — an
+-- SDK-subject-shaped `spcid_...` included — must not ride
+-- `props.assignment_key` onto the analytics plane at the next emit, and a
+-- key-less synthetic entry keeps the documented fact-less serving posture.
+local function valid_subject_fact_key(value)
+	if type(value) ~= "string" or #value ~= 69 then
+		return false
+	end
+	return value:match("^sfk1_[0-9a-f]+$") ~= nil
+end
+
+-- The positive wire grammar for an experiment version (kept in sync with
+-- shardpilot/experiments.lua's valid_wire_version — same no-cycle rule as
+-- the fact-key grammar above): a positive, finite integer. A cached entry
+-- restored with a garbled version would go LIVE and stamp every emitted
+-- fact with an invalid experiment_version, so non-conforming entries drop
+-- at load (greenfield store: no legacy tolerance needed).
+local function valid_wire_version(value)
+	return type(value) == "number" and value > 0 and value < math.huge
+		and value % 1 == 0
+end
+
+-- Keep only entries that are complete, well-formed assignment records, copied
+-- down to the known fields. Anything else — a corrupt file, a truncated entry,
+-- a garbled field — is dropped rather than served or crashed on.
+local function sanitize_experiment_entries(entries)
+	local out = {}
+	if type(entries) ~= "table" then
+		return out
+	end
+	for key, entry in pairs(entries) do
+		if type(key) == "string" and key ~= ""
+			and type(entry) == "table"
+			and type(entry.assignment_key) == "string" and entry.assignment_key ~= ""
+			and type(entry.variant_key) == "string" and entry.variant_key ~= ""
+			and valid_wire_version(entry.version)
+			and type(entry.assignment_unit) == "string" and entry.assignment_unit ~= ""
+			and (entry.assignment_unit ~= "client_id"
+				or valid_subject_fact_key(entry.subject_fact_key))
+			and (entry.subject_key == nil or type(entry.subject_key) == "string")
+			and type(entry.fetched_at_ms) == "number" then
+			out[key] = {
+				assignment_key = entry.assignment_key,
+				variant_key = entry.variant_key,
+				variant_payload = copy_experiment_payload(entry.variant_payload, 0),
+				version = entry.version,
+				assignment_unit = entry.assignment_unit,
+				subject_fact_key = valid_subject_fact_key(entry.subject_fact_key)
+					and entry.subject_fact_key or nil,
+				subject_key = entry.subject_key,
+				attributes = sanitize_experiment_attributes(entry.attributes),
+				fetched_at_ms = entry.fetched_at_ms,
+			}
+		end
+	end
+	return out
+end
+
+-- Load the cached experiment-assignment record for this app (the same per-app
+-- namespace scheme as the spool), or nil when absent or unusable. A record
+-- without a scope stamp cannot be attributed to any (workspace, environment,
+-- subject, url) tuple — it reads as no cache. Never throws.
+function M.load_experiments(scope)
+	local ns = spool_namespace(scope)
+	local record = nil
+	local path = save_path(ns, "experiments")
+	if path then
+		local ok, loaded = pcall(sys.load, path)
+		if ok and type(loaded) == "table" then
+			record = loaded
+		elseif not ok then
+			-- The STORE errored on the read — distinct from a readable
+			-- miss (no file, or a record another scope replaced) and from
+			-- a parsed-but-corrupt record (which stays a plain miss, the
+			-- corrupt-is-a-miss canon: same bytes parse the same way
+			-- forever). The in-process memory shadow must NOT stand in for
+			-- the failed read: the file's current content is unknown — a
+			-- sibling client may have persisted entries after this
+			-- process's last successful save — and a shadow-backed answer
+			-- would let settle/save paths decide off a process-local
+			-- snapshot (wiping durable entries absent from the shadow, or
+			-- vacuously retiring a drop the file still holds). Callers
+			-- that must fail closed on ambiguity — the sync/settle/retire
+			-- paths — read the second value; everyone else keeps the
+			-- nil-is-a-miss contract unchanged.
+			return nil, "unreadable"
+		end
+	end
+	if record == nil then
+		record = experiments_memory[ns]
+	end
+	if type(record) ~= "table"
+		or type(record.scope) ~= "string" or record.scope == "" then
+		return nil
+	end
+	return {
+		scope = record.scope,
+		entries = sanitize_experiment_entries(record.entries),
+	}
+end
+
+-- Replace the cached experiment-assignment record
+-- (`{ scope, entries = { [experiment_key] = entry } }`). Returns true when
+-- stored — in the durable save file, or in the in-memory fallback on hosts
+-- without the save-file API (which then lasts only for the process lifetime).
+function M.save_experiments(scope, record)
+	if type(record) ~= "table"
+		or type(record.scope) ~= "string" or record.scope == "" then
+		return false
+	end
+	local stored = {
+		scope = record.scope,
+		entries = sanitize_experiment_entries(record.entries),
+	}
+	-- The size cap is a DETERMINISTIC bound, so an oversized record must
+	-- never surface as a retryable failure: the caller would record an owed
+	-- durable sync that can never land and persist()/shutdown() would wedge
+	-- on experiments_pending forever. Spool parity instead — evict entries
+	-- oldest-fetched-first until the record fits (including the offender
+	-- itself when a single entry alone exceeds the cap). Evicted entries
+	-- simply stop being durable: memory keeps serving them for this
+	-- process, the next launch refetches (absence is a refetch, never
+	-- wrong serving), and drops always land because removal only shrinks
+	-- the record. The evicted count returns as a second value so callers
+	-- can surface a diagnostic.
+	local evicted = 0
+	while approx_record_bytes(stored) > max_experiments_record_bytes do
+		local oldest_key = nil
+		local oldest_at = nil
+		for key, entry in pairs(stored.entries) do
+			local at = type(entry) == "table"
+				and type(entry.fetched_at_ms) == "number"
+				and entry.fetched_at_ms or 0
+			if oldest_at == nil or at < oldest_at then
+				oldest_at = at
+				oldest_key = key
+			end
+		end
+		if oldest_key == nil then
+			-- Nothing left to evict and the record still exceeds the cap:
+			-- deterministic and terminal for this input, surfaced as a
+			-- plain failure (callers treat it like any failed save; no
+			-- retry can change it, but no entry data exists to wedge on).
+			return false, evicted
+		end
+		stored.entries[oldest_key] = nil
+		evicted = evicted + 1
+	end
+	local ns = spool_namespace(scope)
+	local path = save_path(ns, "experiments")
+	if not path then
+		experiments_memory[ns] = stored
+		return true, evicted
+	end
+	local ok, saved = pcall(sys.save, path, stored)
+	if not (ok and saved == true) then
+		return false, evicted
+	end
+	experiments_memory[ns] = stored
+	return true, evicted
+end
+
+-- Durable condemnation marker for the experiment cache: when the
+-- real-subjects sentinel's whole-record clear cannot land, the CLEAR ITSELF
+-- is persisted — its stamp — in a sidecar file, so the intent survives the
+-- process and the next launch refuses the withdrawn record instead of
+-- serving it until the first probe. Deliberately a SEPARATE file: the
+-- record file's write is what is failing, and this marker is the cheapest
+-- possible durable mark (a per-file failure of the record must not take the
+-- condemnation down with it; if the whole store is down, both writes fail
+-- and the documented storage-down-through-exit residual applies).
+local experiments_clear_memory = {}
+
+-- The marker carries BOTH the clear's stamp and the assignment SCOPE it was
+-- decided for: the record file is shared across every assignment scope in
+-- this per-app namespace, and a sentinel for one environment/credential
+-- must never condemn another scope's entries just because their stamps are
+-- older. Returns (stamp, clear_scope); clear_scope may be nil only for a
+-- legacy/degenerate record, which consumers treat conservatively.
+function M.load_experiments_clear(scope)
+	local ns = spool_namespace(scope)
+	local record = nil
+	local read_failed = false
+	local path = save_path(ns, "experiments-clear")
+	if path then
+		local ok, loaded = pcall(sys.load, path)
+		if ok and type(loaded) == "table" then
+			record = loaded
+		elseif not ok then
+			read_failed = true
+		end
+	end
+	if record == nil then
+		record = experiments_clear_memory[ns]
+	end
+	if type(record) ~= "table" or type(record.stamp) ~= "number" then
+		if read_failed and record == nil then
+			-- The sidecar READ errored and no in-process shadow backs it:
+			-- an armed condemnation may be sitting in the unreadable file,
+			-- and reading that as "no marker" would let a perfectly
+			-- readable spool replay condemned facts after a restart (the
+			-- shadow is empty then by construction). The third return
+			-- lets consumers fail CLOSED — treat the marker as armed with
+			-- unknown stamp/scope — until a readable pass decides it. A
+			-- readable-but-garbled record still reads as absent (the
+			-- corrupt-is-a-miss canon), and a present shadow (a marker
+			-- this process saved) is served as armed like always.
+			return nil, nil, "unreadable"
+		end
+		return nil
+	end
+	local clear_scope = type(record.scope) == "string" and record.scope ~= ""
+		and record.scope or nil
+	return record.stamp, clear_scope
+end
+
+function M.save_experiments_clear(scope, stamp, clear_scope)
+	if type(stamp) ~= "number" or type(clear_scope) ~= "string"
+		or clear_scope == "" then
+		return false
+	end
+	local ns = spool_namespace(scope)
+	local stored = { stamp = stamp, scope = clear_scope }
+	local path = save_path(ns, "experiments-clear")
+	if not path then
+		experiments_clear_memory[ns] = stored
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, stored)
+	if not (ok and saved == true) then
+		return false
+	end
+	experiments_clear_memory[ns] = stored
+	return true
+end
+
+function M.clear_experiments_clear(scope)
+	local ns = spool_namespace(scope)
+	local path = save_path(ns, "experiments-clear")
+	if not path then
+		experiments_clear_memory[ns] = nil
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, {})
+	if not (ok and saved == true) then
+		return false
+	end
+	experiments_clear_memory[ns] = nil
+	return true
+end
+
+-- Drop the cached experiment-assignment record: an empty record is written in
+-- its place (which loads as "no cache") and the in-memory fallback is cleared.
+-- Returns true when the clear landed.
+function M.clear_experiments(scope)
+	local ns = spool_namespace(scope)
+	local path = save_path(ns, "experiments")
+	if not path then
+		experiments_memory[ns] = nil
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, {})
+	if not (ok and saved == true) then
+		return false
+	end
+	experiments_memory[ns] = nil
+	return true
+end
+
 -- Clears the in-memory fallback records only; intended for tests.
 function M.reset()
 	memory_records = {}
@@ -1195,6 +1556,8 @@ function M.reset()
 	spool_memory = {}
 	consent_outbox_memory = {}
 	remote_config_memory = {}
+	experiments_memory = {}
+	experiments_clear_memory = {}
 end
 
 return M
