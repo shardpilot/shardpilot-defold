@@ -533,10 +533,17 @@ local function test_session_start_rolls_back_on_invalid_props()
 	assert_equal(client.session_active, previous_active)
 end
 
+-- Mode A deliberately: the pin is that identity/session/time are
+-- SNAPSHOTTED at enqueue — an event tracked under user-a ships user-a even
+-- after the host re-identifies — and Mode A is where that mixed-user batch
+-- remains lawful (a static publishable key vouches for no particular
+-- user). Mode B now REFUSES the un-flushed switch outright, exactly so a
+-- mixed batch can never ride one minted Bearer: pinned by
+-- test_identify_refused_while_other_user_events_pending.
 local function test_track_snapshots_identity_session_and_time()
 	reset()
 	seed_granted_consent()
-	local client = assert(sdk.new(config()))
+	local client = assert(sdk.new(config_mode_a()))
 	assert_true(client:identify("user-a"))
 	assert_true(client:session_start())
 	local session_a = client.session_id
@@ -4489,6 +4496,101 @@ local function test_identify_invalidates_stale_token_before_unpark_dispatch()
 	storage.reset()
 end
 
+-- P1 (round-2 review): identify() REFUSES a Mode B identity CHANGE while
+-- event work snapshotted to another verified user is still undrained —
+-- queued in this process, or reloaded on the durable spool. Events snapshot
+-- their user at enqueue time, so accepting the switch would drop the token
+-- that vouches for them and the next flush would mint for the NEW user and
+-- ship the previous user's events under a credential that cannot vouch for
+-- those envelopes (rejected, or worse misattributed). Same refusal family
+-- as the anon-rotation guard: false, "events_pending" — the host flushes,
+-- then re-identifies. Anon-snapshotted work never blocks (the mint's
+-- bind_anon vouches for it regardless of the verified subject), and Mode A
+-- is untouched (no per-session credential exists to mismatch).
+local function test_identify_refused_while_other_user_events_pending()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	local token_calls = 0
+	local counting_mode_b = function(overrides)
+		local out = config(overrides)
+		out.token_provider = function(callback)
+			token_calls = token_calls + 1
+			callback("token-" .. tostring(token_calls), nil, nil)
+		end
+		return out
+	end
+	local client = assert(sdk.new(counting_mode_b()))
+	assert_true(client:identify("user-a"))
+	assert_true(client:track("bound_to_a"))
+	next_status = 202
+	assert_true(client:flush({ include_summaries = false }))
+	assert_equal(token_calls, 1, "A's delivery minted A's session token")
+	assert_true(client:track("second_bound_to_a"))
+
+	-- A's event is queued: the switch to B is refused, nothing flips, and
+	-- the cached token that vouches for A's work stays put.
+	local ok, err = client:identify("user-b")
+	assert_equal(ok, false)
+	assert_equal(err, "events_pending")
+	assert_equal(client.user_id, "user-a", "a refused identify must not flip the identity")
+	assert_equal(client.token, "token-1", "a refused identify must not drop the vouching token")
+
+	-- The queued event drains under A's own credential — no re-mint, the
+	-- queue was left intact.
+	local wire_before = #requests
+	assert_true(client:flush({ include_summaries = false }))
+	assert_equal(#requests, wire_before + 1, "the refused identify left the queued event in place")
+	assert_contains(requests[#requests].body, '"second_bound_to_a"')
+	assert_contains(requests[#requests].body, '"user_id":"user-a"')
+	assert_equal(requests[#requests].headers["Authorization"], "Bearer token-1")
+	assert_equal(token_calls, 1, "draining A's events must not mint a new credential")
+
+	-- Drained: the switch succeeds, and the round-1 invalidation (now safe)
+	-- still drops the cached token so B's next work mints fresh.
+	assert_true(client:identify("user-b"), "identify allowed once A's events drained")
+	assert_equal(client.token, nil, "an accepted identity change still drops the cached token")
+	assert_true(client:track("bound_to_b"))
+	assert_true(client:flush({ include_summaries = false }))
+	assert_equal(requests[#requests].headers["Authorization"], "Bearer token-2")
+	assert_equal(token_calls, 2, "B's work minted B's own credential")
+
+	-- Spooled work blocks the same way ACROSS a relaunch: A's failed batch
+	-- spools; the next launch starts anonymous, and identifying as B before
+	-- the spool drains would re-send A's envelopes under B's mint.
+	reset()
+	next_status = 500
+	local first = assert(sdk.new(counting_mode_b({ flush_interval_seconds = 9999 })))
+	assert_true(first:identify("user-a"))
+	assert_true(first:track("spooled_for_a"))
+	assert_equal(first:flush({ include_summaries = false }), false)
+
+	reset()
+	next_status = 202
+	local second = assert(sdk.new(counting_mode_b({ flush_interval_seconds = 9999 })))
+	assert_equal(#second.spool_batches, 1, "A's envelope is on the spool")
+	local ok2, err2 = second:identify("user-b")
+	assert_equal(ok2, false, "identify must refuse while another user's spooled events pend")
+	assert_equal(err2, "events_pending")
+	assert_true(second:flush({ include_summaries = false }))
+	assert_equal(#second.spool_batches, 0)
+	assert_true(second:identify("user-b"), "identify allowed once the spool drained")
+
+	-- Mode A: no per-session credential exists to mismatch — the switch
+	-- stays allowed while A's event is queued (scoped like the rotation
+	-- guard, which must not over-restrict Mode A either).
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local plain = assert(sdk.new(config_mode_a()))
+	assert_true(plain:identify("user-a"))
+	assert_true(plain:track("queued_mode_a"))
+	assert_true(plain:identify("user-b"), "Mode A identify stays allowed while events pend")
+	restore()
+	storage.reset()
+end
+
 -- Head-of-queue audit: with parking, the dispatch head can sit BEHIND the
 -- queue front, so every piece of dispatch bookkeeping must key to the
 -- ACTUAL dispatch-head receipt, never to index 1 — the dispatch selection
@@ -4733,6 +4835,124 @@ local function test_legacy_kindless_receipt_backfills_anon_and_invalid_kind_drop
 	assert_contains(requests[1].body, '"kind":"anon"')
 	assert_contains(requests[1].body, '"actor_identifier":"anon-legacy"')
 	assert_equal(upgraded:snapshot().consent_recorded, 1)
+	restore()
+	storage.reset()
+end
+
+-- P1 (round-2 review): a receipt NO configured credential can vouch for
+-- must never ride the minted token. The concrete case: a legacy kindless
+-- receipt that stored v0.9.1's user-first ACTOR backfills to kind="anon"
+-- at load with its retained anon snapshot still matching the current anon
+-- — in a Mode-B-ONLY configuration the token vouches only for the current
+-- anon (or a verified user), no publishable key exists, and the old
+-- fall-through sent the user-shaped actor under the token anyway: a
+-- terminal auth failure or a wrong-actor write, and, anon-keyed as it is,
+-- a standing events_pending wedge of the rotation guard. Such a receipt
+-- now drops at the load-time could-never-send gate exactly like the
+-- narrow identity_changed rule (counted, diagnosed, persisted), dispatch
+-- selection skips it as a belt (never falling through to a non-vouching
+-- credential, never head-blocking the trail), and in the dual
+-- token_provider + api_key configuration the SAME receipt is retained and
+-- delivered under the publishable key as today.
+local function test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- seed a real record once to learn the outbox path, then replace it
+	-- with a hand-written legacy file
+	next_status = 500
+	local seeder = assert(sdk.new(config({ anonymous_id = "anon-current" })))
+	assert_true(seeder:set_consent(false))
+	local _, outbox_path = stored_consent_outbox_record(stores)
+	assert_true(outbox_path ~= nil)
+	local function legacy_user_entry(key)
+		return {
+			workspace_id = "workspace-example",
+			app_id = "app-example",
+			environment_id = "develop",
+			actor_identifier = "user-legacy-example",
+			categories = { analytics = false },
+			decided_at = "2026-07-01T00:00:00Z",
+			idempotency_key = key,
+			anonymous_id = "anon-current",
+		}
+	end
+	local function current_anon_entry(key)
+		return {
+			workspace_id = "workspace-example",
+			app_id = "app-example",
+			environment_id = "develop",
+			actor_identifier = "anon-current",
+			kind = "anon",
+			categories = { analytics = false },
+			decided_at = "2026-07-01T00:00:01Z",
+			idempotency_key = key,
+			anonymous_id = "anon-current",
+		}
+	end
+	stores[outbox_path] = { receipts = {
+		legacy_user_entry("receipt-legacy-user"),
+		current_anon_entry("receipt-current-anon"),
+	} }
+	storage.reset() -- drop the in-memory shadow so the legacy FILE is what loads
+
+	-- Mode-B-only: the user-actor entry drops at load; the current-anon
+	-- entry behind it still delivers under the mint — no wedge, and the
+	-- unvouchable actor never touches the wire.
+	reset()
+	next_status = 202
+	local issues = {}
+	local upgraded = assert(sdk.new(config({
+		anonymous_id = "anon-current",
+		diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end,
+	})))
+	assert_equal(#requests, 1, "the deliverable current-anon receipt still dispatches")
+	assert_contains(requests[1].body, '"idempotency_key":"receipt-current-anon"')
+	assert_not_contains(requests[1].body, "user-legacy-example")
+	assert_equal(issues[1].scope, "consent")
+	assert_equal(issues[1].status, "dropped")
+	assert_equal(issues[1].code, "identity_changed")
+	assert_equal(issues[1].count, 1)
+	assert_equal(#upgraded.consent_outbox, 0, "delivered plus dropped leaves nothing retained")
+	local record = stored_consent_outbox_record(stores)
+	assert_equal(#record.receipts, 0, "the drop is persisted")
+
+	-- Belt: an unvouchable anon receipt reaching the mirror mid-process is
+	-- skipped by dispatch selection — never sent under the token — and the
+	-- receipt appended behind it still delivers.
+	upgraded.consent_outbox[#upgraded.consent_outbox + 1] =
+		legacy_user_entry("receipt-injected")
+	local wire_before = #requests
+	assert_true(upgraded:set_consent(false))
+	assert_equal(#requests, wire_before + 1, "the receipt behind the unvouchable one still delivers")
+	assert_contains(requests[#requests].body, '"actor_identifier":"anon-current"')
+	assert_not_contains(requests[#requests].body, "user-legacy-example")
+
+	-- Dual (token_provider + api_key): the SAME legacy receipt is retained
+	-- at load and delivers under the publishable key — the historic-actor
+	-- path, unchanged.
+	reset()
+	storage.reset()
+	stores[outbox_path] = { receipts = { legacy_user_entry("receipt-legacy-user-dual") } }
+	storage.reset() -- the overwritten FILE is what the dual client loads
+	next_status = 202
+	local dual_issues = {}
+	local dual = assert(sdk.new(config({
+		anonymous_id = "anon-current",
+		remote_config_url = "http://localhost:9090",
+		api_key = "sp_ingest_publishable_key",
+		diagnostics = function(issue)
+			dual_issues[#dual_issues + 1] = issue
+		end,
+	})))
+	assert_equal(#dual_issues, 0, "with a publishable key the legacy receipt is NOT dropped")
+	assert_equal(#requests, 1, "the legacy receipt re-sends under the key")
+	assert_equal(requests[1].headers["Authorization"], "Bearer sp_ingest_publishable_key")
+	assert_contains(requests[1].body, '"actor_identifier":"user-legacy-example"')
+	assert_contains(requests[1].body, '"kind":"anon"')
+	assert_equal(dual:snapshot().consent_recorded, 1)
 	restore()
 	storage.reset()
 end
@@ -5387,9 +5607,11 @@ local tests = {
 	test_parked_receipt_never_blocks_dispatch_or_gates_events,
 	test_rotation_allowed_with_only_parked_verified_receipts,
 	test_identify_invalidates_stale_token_before_unpark_dispatch,
+	test_identify_refused_while_other_user_events_pending,
 	test_gate_and_in_flight_release_key_to_dispatch_head_not_front,
 	test_most_vouching_credential_and_401_follows_credential_used,
 	test_legacy_kindless_receipt_backfills_anon_and_invalid_kind_drops,
+	test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual,
 	test_set_consent_surfaces_receipt_persist_failure,
 	test_transient_outbox_save_failure_never_evicts,
 	test_identifier_byte_clamp_boundary,

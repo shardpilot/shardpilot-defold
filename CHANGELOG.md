@@ -99,12 +99,27 @@
   change discards its stale result — so the unpark dispatch mints fresh for
   the just-identified session (an actor/subject mismatch on `/v1/consent`
   is terminal and would drop the receipt, a retained withdrawal included).
+  The mirror-image guard covers the EVENT plane: `identify()` REFUSES an
+  identity change (`false, "events_pending"` — `set_anonymous_id`'s
+  pending-work family) while event work snapshotted to another verified
+  user is still queued, in flight, or on the durable spool, so the token
+  drop can never strand a previous user's undrained events under the next
+  user's mint — the host flushes first, then re-identifies.
+  Anon-snapshotted work never blocks (the mint's `bind_anon` vouches for
+  it regardless of the verified subject), and Mode A is untouched.
   The load-time `identity_changed` drop narrows to
-  the one configuration where a receipt could never send on any credential:
-  anon-keyed entries with a mismatched decision-time anon snapshot in a
-  Mode-B-ONLY configuration (with an `api_key` configured, historic-anon
+  the one configuration where a receipt could never send on any credential
+  — Mode-B-ONLY — and there covers both could-never-send shapes: anon-keyed
+  entries with a mismatched decision-time anon snapshot, and anon-KIND
+  entries whose stored ACTOR no credential can ever vouch for (a legacy
+  pre-kind entry carrying v0.9.1's user-first actor, backfilled to anon
+  with its anon snapshot still current — the token vouches only for the
+  current anon, and retained anon-keyed it would additionally wedge the
+  rotation guard in `events_pending`); dispatch selection also skips a
+  no-credential receipt as a belt, never falling through to a non-vouching
+  token. With an `api_key` configured, historic-anon
   receipts dispatch under it instead — the historic actor is the correct
-  subject of those decisions). The identity re-key enqueue on verified
+  subject of those decisions. The identity re-key enqueue on verified
   login, its durable once-per-decision ledger, and an explicit host API for
   discarding parked receipts are deliberately deferred pending
   godot-package ratification.

@@ -909,20 +909,33 @@ function M.new(config)
 		-- anon and be rejected on every retry — a wedged head that blocks
 		-- the rest of the trail forever. Drop exactly those at load —
 		-- deterministic, surfaced via diagnostics — like the event spool's
-		-- identity_changed rule above. With a publishable api_key configured
-		-- (Mode A, or Mode B + api_key), anon-keyed receipts dispatch under
-		-- the key instead — the historic actor is the correct subject of
-		-- those decisions — so nothing is dropped there. And a
-		-- user_verified-keyed receipt is NEVER dropped for a merely-absent
-		-- identity: it may be the only record of that actor's consent change
-		-- (worst case an undelivered withdrawal), so it parks instead
-		-- (receipt_parked) until a Mode B session vouches for its actor.
+		-- identity_changed rule above. The same rule covers the ACTOR
+		-- itself: with no publishable key the minted token is the only
+		-- credential, and it vouches solely for the current anon (or a
+		-- user_verified receipt's verified user) — an anon-KIND receipt
+		-- whose actor_identifier is NOT the current anon (a legacy pre-kind
+		-- entry that stored v0.9.1's user-first actor and backfilled to
+		-- anon, its anon snapshot still current) has no credential that
+		-- could ever lawfully carry it: dispatched under the token it would
+		-- be terminally rejected on the actor/subject mismatch or land the
+		-- decision under the wrong actor, and retained it would hold
+		-- set_anonymous_id's rotation guard in events_pending for as long
+		-- as it sat anon-keyed in the outbox. With a publishable api_key
+		-- configured (Mode A, or Mode B + api_key), anon-keyed receipts
+		-- dispatch under the key instead — the historic actor is the
+		-- correct subject of those decisions — so nothing is dropped there.
+		-- And a user_verified-keyed receipt is NEVER dropped for a
+		-- merely-absent identity: it may be the only record of that actor's
+		-- consent change (worst case an undelivered withdrawal), so it
+		-- parks instead (receipt_parked) until a Mode B session vouches for
+		-- its actor.
 		local kept_receipts = {}
 		local mismatched_receipts = 0
 		for i = 1, #client.consent_outbox do
 			local receipt = client.consent_outbox[i]
 			if receipt.kind == "user_verified"
-				or receipt.anonymous_id == client.anonymous_id then
+				or (receipt.anonymous_id == client.anonymous_id
+					and receipt.actor_identifier == client.anonymous_id) then
 				kept_receipts[#kept_receipts + 1] = receipt
 			else
 				mismatched_receipts = mismatched_receipts + 1
@@ -958,11 +971,66 @@ function Client:persist_identity()
 	return storage.save(self.config, record)
 end
 
+-- True while undrained event work — queued, in an in-flight batch, or
+-- reloaded on the durable spool — carries a USER identity snapshot other
+-- than `user_id`. Events snapshot the identity in force at enqueue time
+-- (and spooled envelopes re-send verbatim), so this is exactly the work a
+-- credential minted after identifying as `user_id` could not vouch for: a
+-- flush after the switch would ship the previous user's events under the
+-- new user's Bearer — the event-plane twin of the consent actor/subject
+-- mismatch. Anon-snapshotted work (a nil user snapshot: pre-identify
+-- events, and facts under the omit_user_id contract) never counts — the
+-- mint binds the CURRENT anon as bind_anon regardless of the verified
+-- subject, so those envelopes stay vouched for across an identify. Spool
+-- entries already settled (delivered or terminally rejected, awaiting only
+-- their removal rewrite) can never re-send, so they never count either.
+function Client:user_events_pending_for_other(user_id)
+	for i = 1, #self.queue.items do
+		local snapshot = self.queue.items[i].user_id
+		if snapshot ~= nil and snapshot ~= user_id then
+			return true
+		end
+	end
+	if self.in_flight_batch then
+		for i = 1, #self.in_flight_batch do
+			local snapshot = self.in_flight_batch[i].user_id
+			if snapshot ~= nil and snapshot ~= user_id then
+				return true
+			end
+		end
+	end
+	for i = 1, #self.spool_record do
+		local env = self.spool_record[i]
+		if env.user_id ~= nil and env.user_id ~= user_id
+			and not self.spool_settled[env.event_id] then
+			return true
+		end
+	end
+	return false
+end
+
 function Client:identify(user_id)
 	if not valid_identity(user_id) then
 		return false, "invalid_user_id"
 	end
 	local identity_changed = user_id ~= self.user_id
+	-- A Mode B identity CHANGE is REFUSED while event work snapshotted to
+	-- another verified user remains undrained (queued, in flight, or on the
+	-- durable spool) — the event-plane twin of set_anonymous_id's rotation
+	-- guard below, and the same pending-work refusal family. Accepting the
+	-- switch would drop the cached token that vouches for that work (the
+	-- invalidation below), and the next flush would mint for the NEW user
+	-- and ship the previous user's events under a Bearer that cannot vouch
+	-- for those envelopes — a rejected batch, or worse a misattributed one.
+	-- The host flushes first, then re-identifies. Anon-snapshotted work
+	-- never blocks (the mint's bind_anon vouches for it regardless of the
+	-- verified subject), so the common track-then-first-identify flow is
+	-- untouched — and Mode A is untouched wholesale: with no per-session
+	-- credential there is nothing a switch could strand.
+	if identity_changed and self.config.token_provider
+		and self:user_events_pending_for_other(user_id) then
+		return false, "events_pending"
+	end
 	self.user_id = user_id
 	if identity_changed and self.config.token_provider then
 		-- A cached Mode B JWT vouches for the session it was minted in — the
@@ -974,7 +1042,11 @@ function Client:identify(user_id)
 		-- — a retained withdrawal included. Drop the cached token so the next
 		-- dispatch mints one bound to the just-identified session (mirroring
 		-- the anon-rotation token drop below), and bump the epoch so a mint
-		-- already in flight discards its stale result on arrival.
+		-- already in flight discards its stale result on arrival. The
+		-- pending-events refusal above guarantees the drop runs only when no
+		-- other user's event work is still undrained, so it can never strand
+		-- a previous user's envelopes under the next session's mint; the
+		-- epoch fence keeps its own job — stale-mint protection — either way.
 		self.token = nil
 		self.token_expires_at_ms = nil
 		self.token_epoch = self.token_epoch + 1
@@ -2046,14 +2118,35 @@ function Client:receipt_parked(receipt)
 		and self.user_id == receipt.actor_identifier)
 end
 
+-- True when some configured credential can lawfully carry this receipt's
+-- actor: the minted Mode B token (it vouches for the current verified user
+-- and for the CURRENT anon it binds as its subject) or the publishable
+-- api_key (anon-keyed receipts, historic actors included). The Mode-B-only
+-- load drop already removes anon receipts with a never-vouchable actor, so
+-- this is the dispatch-side BELT for the same rule: a receipt nothing
+-- vouches for is SKIPPED by selection — never handed to the token as a
+-- fall-through non-vouching credential. user_verified receipts answer true
+-- here by construction: receipt_parked (above) is the vouching gate for
+-- that kind, and only the minted token ever carries it.
+function Client:receipt_credential_available(receipt)
+	if receipt.kind == "user_verified" then
+		return true
+	end
+	return self.config.api_key ~= nil
+		or (self.config.token_provider ~= nil
+			and receipt.actor_identifier == self.anonymous_id)
+end
+
 -- The oldest receipt eligible for dispatch under the current credential
--- configuration: parked receipts are skipped — never head-blocking — and
--- deliverable receipts behind them deliver (delivery order stays FIFO per
--- actor, which is the ordering guarantee the server relies on).
+-- configuration: parked receipts — and receipts no configured credential
+-- vouches for — are skipped, never head-blocking, and deliverable receipts
+-- behind them deliver (delivery order stays FIFO per actor, which is the
+-- ordering guarantee the server relies on).
 function Client:next_dispatchable_receipt()
 	for i = 1, #self.consent_outbox do
 		local receipt = self.consent_outbox[i]
-		if not self:receipt_parked(receipt) then
+		if not self:receipt_parked(receipt)
+			and self:receipt_credential_available(receipt) then
 			return receipt
 		end
 	end
@@ -2227,7 +2320,8 @@ end
 -- receipt in flight at a time, so receipts arrive in DECISION ORDER (parked
 -- receipts are skipped, which per-actor FIFO makes safe) and a
 -- grant-then-deny can never settle deny-then-grant. Returns true when
--- nothing is dispatchable (empty, or every retained receipt is parked) or a
+-- nothing is dispatchable (empty, or every retained receipt is parked or
+-- has no vouching credential) or a
 -- dispatch was started (transport failures are counted inside the result
 -- callback); false while delivery is blocked — a receipt already in flight,
 -- an open backoff window, or no usable credential yet. The dispatch
