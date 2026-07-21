@@ -1,7 +1,8 @@
 -- Durable persistence for the identity record (anonymous ID + consent state),
--- the pending-crash sidecar, the crash-reporting settings record (the
--- persisted opt-out), the offline event spool, and the consent-receipt
--- outbox.
+-- the consent denial marker (the write-ahead witness for a denial whose
+-- identity write failed), the pending-crash sidecar, the crash-reporting
+-- settings record (the persisted opt-out), the offline event spool, and the
+-- consent-receipt outbox.
 -- This is the only SDK module allowed to call Defold sys persistence. Every
 -- call is pcall-guarded so plain Lua hosts without the Defold `sys` API
 -- degrade gracefully to in-memory state for the process lifetime.
@@ -107,6 +108,83 @@ function M.save(scope, record)
 	end
 	local ok, saved = pcall(sys.save, path, record)
 	return ok and saved == true
+end
+
+-- ── consent denial marker ────────────────────────────────────────────────────
+--
+-- A small write-ahead record for DENIED consent decisions, paired 1:1 with
+-- the identity record's scope. set_consent writes it BEFORE the identity
+-- write for every denied-state decision and retires it only once the identity
+-- record durably holds the denial (or a later successfully persisted decision
+-- supersedes it): should the identity write fail and the process exit, the
+-- marker is the durable witness that stops the next launch from restoring the
+-- stale pre-denial record — a grant re-opened against an explicit revocation.
+-- Like the crash-settings record, the load DISTINGUISHES an absent marker
+-- from a failed read: an unreadable marker may witness a denial, so the
+-- client fails closed over a granted restore instead of ignoring it.
+
+local consent_denial_memory = {}
+
+-- Load the consent denial marker. Returns (record, err):
+--   * a table when a marker is stored (an empty table — Defold's sys.load
+--     result for a file that does not exist, and the retired form written by
+--     clear_consent_denial_marker — reads as "no marker");
+--   * nil, nil when no marker exists at all (fresh install, or a plain-Lua
+--     host whose in-memory fallback holds nothing);
+--   * nil, "consent_marker_read_failed" when the durable read itself failed
+--     (sys.load threw, or produced a non-table) and no in-process shadow —
+--     written by a successful save this session — can answer instead.
+function M.load_consent_denial_marker(scope)
+	local ns = namespace(scope)
+	local path = save_path(ns, "consent-denial")
+	if not path then
+		return clone(consent_denial_memory[ns]), nil
+	end
+	local ok, record = pcall(sys.load, path)
+	if ok and type(record) == "table" then
+		return record, nil
+	end
+	local fallback = clone(consent_denial_memory[ns])
+	if fallback ~= nil then
+		return fallback, nil
+	end
+	if ok and record == nil then
+		-- The backend answered cleanly with nothing: no marker exists.
+		return nil, nil
+	end
+	return nil, "consent_marker_read_failed"
+end
+
+-- Replace the consent denial marker. Returns true when the record was durably
+-- stored (or stored in the in-memory fallback on hosts without the save-file
+-- API, which then lasts only for the process lifetime).
+function M.save_consent_denial_marker(scope, record)
+	if type(record) ~= "table" then
+		return false
+	end
+	local ns = namespace(scope)
+	local path = save_path(ns, "consent-denial")
+	if not path then
+		-- No durable backend: the in-memory record IS the store.
+		consent_denial_memory[ns] = clone(record)
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, record)
+	if not (ok and saved == true) then
+		-- Mirror the crash-settings rule: never seed the in-process shadow
+		-- from a failed durable write — the shadow answers a failed READ, so
+		-- it must only ever reflect a marker that actually persisted.
+		return false
+	end
+	consent_denial_memory[ns] = clone(record)
+	return true
+end
+
+-- Retire the marker (the identity record durably holds the denial, or a later
+-- successfully persisted decision superseded it). An empty record reads as
+-- "no marker".
+function M.clear_consent_denial_marker(scope)
+	return M.save_consent_denial_marker(scope, {})
 end
 
 -- ── pending crash reports ────────────────────────────────────────────────────
@@ -1601,6 +1679,7 @@ end
 -- Clears the in-memory fallback records only; intended for tests.
 function M.reset()
 	memory_records = {}
+	consent_denial_memory = {}
 	pending_memory = {}
 	crash_settings_memory = {}
 	spool_memory = {}

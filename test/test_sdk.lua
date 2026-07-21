@@ -278,6 +278,36 @@ local function reset()
 	next_response_headers = nil
 end
 
+-- Swap the synchronous http fake for one that HOLDS every callback (real
+-- Defold http.request is asynchronous): requests are still recorded, but the
+-- response callback is captured for the test to fire manually. Returns the
+-- held-callback list and a restore function. Firing a callback with a 202
+-- settles the in-flight batch without re-entering the flush loop — exactly
+-- the production window in which owed summaries linger between flushes.
+local function hold_http_requests()
+	local held = {}
+	local real_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = {
+			url = url,
+			method = method,
+			headers = headers,
+			body = body,
+			options = options,
+		}
+		held[#held + 1] = callback
+	end
+	return held, function()
+		http.request = real_request
+	end
+end
+
+local function release_held_request(held)
+	local callback = table.remove(held, 1)
+	assert_true(callback ~= nil, "expected a held http request to release")
+	callback(nil, nil, { status = 202, response = '{"accepted":1}' })
+end
+
 local identity_scope = { workspace_id = "workspace-example", app_id = "app-example" }
 
 -- Consent-first: a client whose consent is still "unknown" transmits nothing,
@@ -2523,7 +2553,12 @@ local function test_spool_corrupted_record_starts_clean()
 	end
 	-- Seeded through the in-memory shadow: the throwing sys.load falls back to
 	-- it, so the client still starts granted and the spool path is exercised.
+	-- The denial marker's shadow is seeded as affirmatively ABSENT the same
+	-- way (a successful clear this session): an UNREADABLE marker with no
+	-- shadow fails closed over a granted restore by design, which is not
+	-- what this spool-corruption test is about.
 	seed_granted_consent()
+	assert_true(storage.clear_consent_denial_marker(identity_scope))
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_equal(#client.spool_batches, 0, "a throwing sys.load must start a clean spool")
 	assert_true(client:identify("user-example"))
@@ -3083,6 +3118,9 @@ end
 -- was BUILT with. Mode A (no per-session credential): identify() after the
 -- refusal proceeds, and the drained summary lands attributed to the
 -- original user and session while post-switch events carry the new user.
+-- (Round 2 re-choreography: flush() now drains owed summaries within the
+-- same call, so the lingering owed state is produced the way production
+-- produces it — an ASYNC publish settling between flushes.)
 local function test_owed_summary_preserves_actor_across_identify_mode_a()
 	reset()
 	storage.reset()
@@ -3098,15 +3136,28 @@ local function test_owed_summary_preserves_actor_across_identify_mode_a()
 	client:update(0.020)
 
 	-- The flush builds the perf summary against the FULL queue: it becomes
-	-- owed, snapshotted under user-alpha; the queued session start publishes.
-	assert_true(client:flush())
+	-- owed, snapshotted under user-alpha; the queued session start goes on
+	-- the wire and is HELD (async transport), so the flush truthfully
+	-- reports pending work instead of success over the owed entry.
+	local held, restore_http = hold_http_requests()
+	local flush_ok, flush_err = client:flush()
+	assert_equal(flush_ok, false,
+		"flush must not report success while a summary stays owed")
+	assert_equal(flush_err, "pending")
 	assert_equal(#client.owed_summaries, 1, "the perf summary is owed")
 	assert_equal(client.owed_summaries[1].event.user_id, "user-alpha",
 		"the owed snapshot preserves the build-time actor")
+	release_held_request(held)
+	restore_http()
+	assert_equal(client.in_flight_batch, nil)
+	assert_equal(#client.owed_summaries, 1,
+		"the async settle leaves the owed summary for the next flush")
 
 	assert_true(client:identify("user-beta"),
 		"Mode A has no per-session credential — the switch proceeds")
 	assert_true(client:flush(), "the owed drain delivers under the old actor")
+	assert_equal(#client.owed_summaries, 0,
+		"the flush drains the owed summary in the same call")
 	assert_true(client:track("post_switch_event"))
 	assert_true(client:flush())
 
@@ -3151,8 +3202,14 @@ local function test_identify_refused_while_owed_summary_pending_mode_b()
 	client:update(0.016)
 	client:update(0.020)
 
-	assert_true(client:flush())
+	-- Async transport: the flush parks the summary owed (full queue at build
+	-- time), reports pending, and the held batch settles WITHOUT draining
+	-- it — the production window between flushes.
+	local held, restore_http = hold_http_requests()
+	assert_equal(client:flush(), false)
 	assert_equal(#client.owed_summaries, 1)
+	release_held_request(held)
+	restore_http()
 	assert_equal(#client.queue.items, 0,
 		"only the owed snapshot remains undrained")
 	assert_equal(client.in_flight_batch, nil)
@@ -3196,9 +3253,15 @@ local function test_set_anonymous_id_rejected_while_owed_summary_pending_mode_b(
 	client:update(0.020)
 	local original_anon = client.anonymous_id
 
-	assert_true(client:flush())
+	-- Async transport: the owed summary outlives the flush (held batch
+	-- settles without draining it) — the state the rotation guard must see.
+	local held, restore_http = hold_http_requests()
+	assert_equal(client:flush(), false)
 	assert_equal(#client.owed_summaries, 1)
+	release_held_request(held)
+	restore_http()
 	assert_equal(#client.queue.items, 0)
+	assert_equal(client.in_flight_batch, nil)
 
 	local ok, err = client:set_anonymous_id("anon-rotated-example")
 	assert_equal(ok, false,
@@ -3219,6 +3282,424 @@ local function test_set_anonymous_id_rejected_while_owed_summary_pending_mode_b(
 		"the drained summary carries the anon it was built under")
 	assert_true(client:set_anonymous_id("anon-rotated-example"),
 		"the drained pipeline admits the rotation")
+	storage.reset()
+end
+
+-- P2 review fix (round 2): flush() treats newly owed summaries as ITS OWN
+-- pending work. Building summaries against a full queue used to park them
+-- owed while the same flush drained the queue and returned true — a Mode B
+-- caller following the documented flush-then-re-identify recourse hit
+-- events_pending right after a "successful" flush, and outside
+-- shutdown/persist the built summary sat memory-only until another explicit
+-- flush. The loop now re-drains owed entries into the room it frees and only
+-- reports success once nothing stays owed. P3 fix pinned alongside: the
+-- refuse→owe→deliver cycle counts the summary once as published, never as
+-- dropped — the denial wipe is the one point where an owed summary counts
+-- as a real loss.
+local function test_flush_drains_owed_summaries_within_same_call()
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({
+		buffer_size = 1,
+		flush_interval_seconds = 9999,
+	})))
+	assert_true(client:session_start())
+	client:update(0.016)
+	client:update(0.020)
+	client:observe_ping_ms(42)
+	assert_equal(#client.queue.items, 1, "the single-slot queue is full at build time")
+
+	assert_true(client:flush(),
+		"the flush is only successful once it drained what it built")
+	assert_equal(#client.owed_summaries, 0,
+		"no summary may stay owed past a successful flush")
+	assert_equal(#client.queue.items, 0)
+	local sent = {}
+	for i = 1, #requests do
+		for name in string.gmatch(requests[i].body or "", '"event_name":"([^"]+)"') do
+			sent[name] = true
+		end
+	end
+	assert_true(sent["app.session_started"] ~= nil)
+	assert_true(sent["perf_summary"] ~= nil,
+		"the refused perf summary must deliver within the same flush call")
+	assert_true(sent["network_summary"] ~= nil,
+		"the refused network summary must deliver within the same flush call")
+	assert_equal(client:snapshot().dropped, 0,
+		"owed retention must never leave the queue_full refusal counted dropped")
+	assert_equal(client:snapshot().published, 3,
+		"each summary counts exactly once, as published")
+	-- The Mode B recourse, end to end: a successful flush leaves no owed
+	-- work, so identify-after-flush proceeds immediately.
+	assert_true(client:identify("user-after-flush"),
+		"the documented flush-then-re-identify flow must succeed")
+
+	-- The one terminal loss point still counts: a denial wipes an owed
+	-- summary as a real drop. Park one owed via the async window, then deny.
+	client:update(0.016)
+	client:update(0.020)
+	assert_true(client:track("refill_slot"))
+	local held, restore_http = hold_http_requests()
+	assert_equal(client:flush(), false)
+	assert_equal(#client.owed_summaries, 1)
+	assert_equal(client:snapshot().dropped, 0,
+		"the owed snapshot is retention, not loss")
+	release_held_request(held)
+	restore_http()
+	assert_true(client:set_consent(false))
+	assert_equal(#client.owed_summaries, 0)
+	assert_equal(client:snapshot().dropped, 1,
+		"the denial wipe is where an owed summary becomes a counted drop")
+	storage.reset()
+end
+
+-- P2 review fix (round 2): persist() captures the WHOLE remnant in one
+-- durable write. Direct-spooling still-owed summaries in a second append
+-- used to evict just-captured queue/in-flight envelopes on a near-full
+-- spool (oldest first) while only the second write's own batch was
+-- survivor-checked — a focus-loss persist reported durability over an
+-- evicted remnant. One write sized against the caps as a whole either
+-- captures everything or reports spool_persist_failed truthfully.
+local function test_persist_single_write_keeps_whole_remnant_under_caps()
+	-- Direction 1 — the remnant fits the caps: persist() claims durability
+	-- and a relaunch re-sends every envelope it claimed.
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	next_status = 500
+	local client = assert(sdk.new(config({
+		buffer_size = 1,
+		flush_interval_seconds = 9999,
+	})))
+	assert_true(client:session_start())
+	client:update(0.016)
+	client:update(0.020)
+	client:observe_ping_ms(42)
+	assert_equal(client:flush(), false, "offline: the batch is retained")
+	assert_equal(#client.owed_summaries, 2, "both built summaries are owed")
+	assert_true(client:track("filler_event"))
+
+	assert_true(client:persist(),
+		"a remnant within the caps may be claimed durable")
+	local record = stored_spool_record(stores)
+	assert_true(record ~= nil)
+	assert_equal(#record.events, 4,
+		"one write captured in-flight + queue + both owed summaries")
+	reset()
+	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(relaunch:flush())
+	local resent = {}
+	for i = 1, #requests do
+		for name in string.gmatch(requests[i].body or "", '"event_name":"([^"]+)"') do
+			resent[name] = true
+		end
+	end
+	assert_true(resent["app.session_started"] ~= nil,
+		"nothing persist() claimed durable may be lost across the relaunch")
+	assert_true(resent["filler_event"] ~= nil)
+	assert_true(resent["perf_summary"] ~= nil)
+	assert_true(resent["network_summary"] ~= nil)
+	restore()
+	storage.reset()
+
+	-- Direction 2 — spool_max_events = 2 cannot hold the four-envelope
+	-- remnant: appending the owed summaries evicts the just-captured
+	-- queue/in-flight envelopes, so persist() must refuse to claim
+	-- durability (pre-fix, the second append's own survivor check passed
+	-- and the call returned success over the evicted remnant).
+	reset()
+	storage.reset()
+	stores, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	next_status = 500
+	local capped = assert(sdk.new(config({
+		buffer_size = 1,
+		flush_interval_seconds = 9999,
+		spool_max_events = 2,
+	})))
+	assert_true(capped:session_start())
+	capped:update(0.016)
+	capped:update(0.020)
+	capped:observe_ping_ms(42)
+	assert_equal(capped:flush(), false)
+	assert_equal(#capped.owed_summaries, 2)
+	assert_true(capped:track("filler_event"))
+
+	local ok, err = capped:persist()
+	assert_equal(ok, false,
+		"a capped-out remnant must not be claimed durable")
+	assert_equal(err, "spool_persist_failed")
+	restore()
+	storage.reset()
+end
+
+-- P1 (denial-marker gap, folded from the godot#1 round-10 fleet finding):
+-- with a persisted grant on disk, a denial whose identity persist FAILED
+-- only surfaced consent_persist_failed — an app exit before a successful
+-- retry made the next init() restore GRANTED and events flowed against an
+-- explicit revocation. set_consent now writes a write-ahead denial marker
+-- BEFORE the identity write; init imposes a present marker over any
+-- restored record for its actor, consolidates the record, and retires the
+-- marker only once the record durably holds the denial.
+local function test_denial_marker_imposes_over_stale_granted_record()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "granted")
+	local actor = client.anonymous_id
+	-- The identity write starts failing; the marker file still works.
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:sub(-9) == "/identity" then
+			return false
+		end
+		return real_save(path, record)
+	end
+	local ok, err = client:set_consent(false)
+	assert_equal(ok, false)
+	assert_equal(err, "consent_persist_failed")
+	local identity_path = nil
+	local marker_record = nil
+	for path, record in pairs(stores) do
+		if path:sub(-9) == "/identity" then
+			identity_path = path
+		elseif path:sub(-15) == "/consent-denial" then
+			marker_record = record
+		end
+	end
+	assert_equal(stores[identity_path].consent_analytics, "granted",
+		"the stale record still carries the pre-denial grant — the exact gap")
+	assert_true(marker_record ~= nil and marker_record.consent_analytics == "denied",
+		"the write-ahead marker durably witnesses the denial")
+	assert_equal(marker_record.anonymous_id, actor,
+		"the marker is scoped to the denying actor")
+
+	-- Simulated app exit; storage heals for the next launch. The relaunch
+	-- must impose the marker over the restored granted record.
+	sys.save = real_save
+	reset()
+	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(relaunch.consent_state, "denied",
+		"the marker must impose the denial over the stale granted record")
+	local tok, terr = relaunch:track("post_denial_event")
+	assert_equal(tok, false)
+	assert_equal(terr, "consent_denied")
+	-- Consolidation on that same boot: the record converged and the marker
+	-- retired.
+	assert_equal(stores[identity_path].consent_analytics, "denied",
+		"consolidation must converge the identity record")
+	local retired = nil
+	for path, record in pairs(stores) do
+		if path:sub(-15) == "/consent-denial" then
+			retired = record
+		end
+	end
+	assert_true(retired ~= nil and next(retired) == nil,
+		"the healed record retires the marker")
+	-- Relaunch after the heal: denied purely from the record, no marker.
+	local third = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(third.consent_state, "denied",
+		"after the heal the record alone carries the denial")
+	restore()
+	storage.reset()
+end
+
+-- P1 denial marker: the denied_forced_minor flavor survives the marker path
+-- — the imposed boot state is the band-forced denial, not a generic one.
+local function test_denial_marker_preserves_forced_minor_flavor()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:sub(-9) == "/identity" then
+			return false
+		end
+		return real_save(path, record)
+	end
+	local ok, err = client:set_consent("denied_forced_minor")
+	assert_equal(ok, false)
+	assert_equal(err, "consent_persist_failed")
+	sys.save = real_save
+	reset()
+	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(relaunch.consent_state, "denied_forced_minor",
+		"the marker must carry the denial flavor through the relaunch")
+	restore()
+	storage.reset()
+end
+
+-- P1 denial marker, actor scope: a marker witnesses ITS OWN actor's denial.
+-- A fresh identity (configured override replacing a different persisted
+-- actor) never inherits it — no manufactured decision — and the foreign
+-- marker is NOT silently deleted while its own actor's record is
+-- unresolved.
+local function test_foreign_actor_denial_marker_stays_inert_and_undeleted()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local old_anon = client.anonymous_id
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:sub(-9) == "/identity" then
+			return false
+		end
+		return real_save(path, record)
+	end
+	local ok = client:set_consent(false)
+	assert_equal(ok, false, "the denial persist fails, arming the marker")
+	sys.save = real_save
+
+	reset()
+	local fresh = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		anonymous_id = "anon-override-fresh",
+	})))
+	assert_equal(fresh.consent_state, "unknown",
+		"a foreign-actor marker must never manufacture a decision")
+	local marker_record = nil
+	for path, record in pairs(stores) do
+		if path:sub(-15) == "/consent-denial" then
+			marker_record = record
+		end
+	end
+	assert_true(marker_record ~= nil and marker_record.consent_analytics == "denied",
+		"the foreign marker must stay on disk for its own actor")
+	assert_equal(marker_record.anonymous_id, old_anon)
+	restore()
+	storage.reset()
+end
+
+-- P1 denial marker, belt leg: a RETAINED (undelivered) denial receipt for
+-- this actor stamped strictly newer than the restored record's decision
+-- blocks a granted restore — the cheap cross-check for trails where the
+-- marker is gone. Strictness pinned both ways: an older receipt (a
+-- deny-then-grant whose denial receipt is still undelivered) never flips a
+-- genuinely newer grant.
+local function test_newer_denial_receipt_blocks_granted_restore()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-belt-example",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, { {
+		idempotency_key = "belt-denial-key",
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "anon-belt-example",
+		kind = "anon",
+		decided_at = "2026-07-02T00:00:00.000Z",
+		categories = { analytics = false },
+		reason = "denied_forced_minor",
+		anonymous_id = "anon-belt-example",
+	} }) ~= false)
+	local client = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "denied_forced_minor",
+		"a strictly newer retained denial receipt must block the granted restore")
+	local tok, terr = client:track("post_belt_event")
+	assert_equal(tok, false)
+	assert_equal(terr, "consent_denied")
+	local identity_record = nil
+	for path, record in pairs(stores) do
+		if path:sub(-9) == "/identity" then
+			identity_record = record
+		end
+	end
+	assert_true(identity_record ~= nil
+			and identity_record.consent_analytics == "denied_forced_minor",
+		"the belt converges the record for the next boot")
+	restore()
+	storage.reset()
+
+	-- Counter-direction: the same receipt against a NEWER grant stamp.
+	reset()
+	storage.reset()
+	stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-belt-example",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-03T00:00:00.000Z",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, { {
+		idempotency_key = "belt-denial-key",
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "anon-belt-example",
+		kind = "anon",
+		decided_at = "2026-07-02T00:00:00.000Z",
+		categories = { analytics = false },
+		anonymous_id = "anon-belt-example",
+	} }) ~= false)
+	local granted_client = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(granted_client.consent_state, "granted",
+		"an older denial receipt must not flip a genuinely newer grant")
+	restore()
+	storage.reset()
+end
+
+-- P1 denial marker, teardown leg: shutdown() refuses (consent_pending
+-- family) while the latest denial has NO durable witness anywhere — record
+-- write failed, marker write failed, and the receipt already delivered and
+-- left the outbox (a delivered receipt proves nothing to the next boot).
+-- The refusal retries both writes first, so a recovered store converges and
+-- finalizes. Residual, documented: a process KILL before any durable write
+-- lands is data-free loss no client-side ordering can close.
+local function test_shutdown_refuses_denial_with_no_durable_witness()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "granted")
+	-- Identity AND marker writes fail; the outbox works, and the receipt
+	-- DELIVERS (202) — so it leaves the outbox and nothing durable
+	-- witnesses the denial.
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:sub(-9) == "/identity" or path:sub(-15) == "/consent-denial" then
+			return false
+		end
+		return real_save(path, record)
+	end
+	local ok, err = client:set_consent(false)
+	assert_equal(ok, false)
+	assert_equal(err, "consent_persist_failed")
+	assert_equal(#client.consent_outbox, 0,
+		"the receipt delivered and left the outbox")
+
+	local down, derr = client:shutdown("app_final")
+	assert_equal(down, false,
+		"shutdown must refuse a denial with no durable witness")
+	assert_equal(derr, "consent_pending")
+
+	-- Storage recovers: the shutdown retry converges the record, retires
+	-- the marker debt, and finalizes.
+	sys.save = real_save
+	assert_true(client:shutdown("app_final"),
+		"the retried teardown lands the record and completes")
+	local identity_record = nil
+	for path, record in pairs(stores) do
+		if path:sub(-9) == "/identity" then
+			identity_record = record
+		end
+	end
+	assert_true(identity_record ~= nil
+			and identity_record.consent_analytics == "denied",
+		"the retried teardown must leave the denial durable")
+	restore()
 	storage.reset()
 end
 
@@ -6301,6 +6782,13 @@ local tests = {
 	test_owed_summary_preserves_actor_across_identify_mode_a,
 	test_identify_refused_while_owed_summary_pending_mode_b,
 	test_set_anonymous_id_rejected_while_owed_summary_pending_mode_b,
+	test_flush_drains_owed_summaries_within_same_call,
+	test_persist_single_write_keeps_whole_remnant_under_caps,
+	test_denial_marker_imposes_over_stale_granted_record,
+	test_denial_marker_preserves_forced_minor_flavor,
+	test_foreign_actor_denial_marker_stays_inert_and_undeleted,
+	test_newer_denial_receipt_blocks_granted_restore,
+	test_shutdown_refuses_denial_with_no_durable_witness,
 	test_set_anonymous_id_rejected_while_spool_pending_mode_b,
 	test_shutdown_fails_when_remnant_evicted_by_caps,
 	test_spool_identity_mismatch_dropped_mode_b_kept_mode_a,

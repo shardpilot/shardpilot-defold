@@ -482,6 +482,56 @@ function M.new(config)
 		-- the per-receipt credential rules.
 		consent_state = stored.consent_analytics
 	end
+	-- The stamp of the decision the restored state came from (persisted by
+	-- persist_identity since the denial-marker fix; legacy records carry
+	-- none). The belt below compares retained denial receipts against it.
+	local consent_decided_at = nil
+	if consent_state ~= "unknown" and type(stored.consent_decided_at) == "string"
+		and stored.consent_decided_at ~= "" then
+		consent_decided_at = stored.consent_decided_at
+	end
+	-- WRITE-AHEAD DENIAL MARKER: a denied-state set_consent writes this small
+	-- witness BEFORE the identity write and retires it only once the record
+	-- durably holds the decision — so a denial whose identity persist failed
+	-- (surfaced then as consent_persist_failed) followed by a process exit
+	-- cannot leave the stale pre-denial record as the only thing this launch
+	-- reads. A present marker is IMPOSED over whatever the record restored
+	-- for ITS OWN actor — the actor match is the scope rule: the marker
+	-- witnesses a decision that actor really made, so a granted (or absent)
+	-- restore yields to it, while a fresh or overriding actor never inherits
+	-- it (a marker must not MANUFACTURE a decision — the #40 laundering rule
+	-- extends to markers; a mismatched-actor marker stays inert AND stays on
+	-- disk, because its own actor's record is still unresolved). An
+	-- unreadable or malformed marker may witness a denial but cannot name
+	-- its actor: it fails closed over a granted restore only — the one
+	-- restore it could be contradicting — and is never retired on this
+	-- launch's evidence.
+	local marker, marker_err = storage.load_consent_denial_marker(normalized)
+	local marker_present = type(marker) == "table" and next(marker) ~= nil
+	local marker_valid = marker_present
+		and consent_denied_state(marker.consent_analytics)
+		and valid_identity(marker.anonymous_id)
+	local imposed_denial_marker = false
+	local imposed_marker_code = nil
+	if marker_valid and marker.anonymous_id == anonymous_id then
+		if consent_state ~= marker.consent_analytics then
+			imposed_marker_code = "denial_marker_imposed"
+		end
+		consent_state = marker.consent_analytics
+		if type(marker.decided_at) == "string" and marker.decided_at ~= "" then
+			consent_decided_at = marker.decided_at
+		end
+		imposed_denial_marker = true
+	elseif (marker_err ~= nil or (marker_present and not marker_valid))
+		and consent_state == "granted" then
+		-- Fail closed on the granted restore alone: a non-granted boot is
+		-- already safe, and the record stays UNTOUCHED (no consolidation
+		-- write) — a transient read failure must not durably flip a real
+		-- grant; the next launch re-evaluates against a healed marker.
+		consent_state = "denied"
+		consent_decided_at = nil
+		imposed_marker_code = "denial_marker_unreadable"
+	end
 	local client = setmetatable({
 		config = normalized,
 		queue = queue.new(normalized.buffer_size),
@@ -536,6 +586,20 @@ function M.new(config)
 		user_id = valid_identity(config.user_id) and config.user_id or nil,
 		anonymous_id = anonymous_id,
 		consent_state = consent_state,
+		-- The ISO stamp of the decision consent_state came from (an explicit
+		-- set_consent, the restored record, an imposed marker, or the belt
+		-- receipt below) — persisted with the identity record so a later
+		-- granted restore can be cross-checked against strictly-newer
+		-- retained denial receipts. nil for "unknown" and legacy records.
+		consent_decided_at = consent_decided_at,
+		-- Set while the LATEST decision is a denial whose respective durable
+		-- write is still owed (identity record / write-ahead marker).
+		-- shutdown() retries both and refuses to finalize (consent_pending)
+		-- while NO durable witness of the denial exists anywhere — a stale
+		-- granted record silently surviving an explicit revocation is the
+		-- one loss teardown can always prevent.
+		consent_denial_record_pending = false,
+		consent_denial_marker_pending = false,
 		-- Durable consent-receipt outbox (mirror of the persisted record,
 		-- oldest receipt first). Receipts are delivered serially, strictly in
 		-- decision order; consent_outbox_dirty marks a durable write that is
@@ -611,8 +675,30 @@ function M.new(config)
 	client.experiments_client_id = experiments_mod.valid_subject_id(
 			stored.experiments_client_id)
 		and stored.experiments_client_id or nil
-	if stored.anonymous_id ~= anonymous_id then
+	if imposed_denial_marker then
+		-- CONSOLIDATION: the marker imposed this boot's denied state; converge
+		-- the identity record (which also carries any anonymous-id rewrite)
+		-- and retire the marker only once the record durably holds the
+		-- denial. A failed write leaves the marker armed — it stays the only
+		-- durable witness until the record catches up at a later launch.
+		if client:persist_identity() then
+			storage.clear_consent_denial_marker(normalized)
+		else
+			client.stats.consent_persist_failed =
+				client.stats.consent_persist_failed + 1
+		end
+	elseif stored.anonymous_id ~= anonymous_id then
 		client:persist_identity()
+	end
+	if imposed_marker_code then
+		-- Surface the fail-closed boot: the restored record did not decide
+		-- this launch's consent state — the write-ahead marker (or its
+		-- unreadable remains) did.
+		client:diagnose({
+			scope = "consent",
+			status = "restored",
+			code = imposed_marker_code,
+		})
 	end
 	if override_replaced_actor then
 		-- Surface the fresh-identity reset: the persisted decision was NOT
@@ -726,6 +812,115 @@ function M.new(config)
 				return client.condemned_spool_pending == true
 			end,
 		})
+	end
+	-- Durable consent-receipt outbox: reload the receipts a previous launch
+	-- could not deliver. Deliberately UNCONDITIONAL on the consent state — the
+	-- exact opposite of the event spool below: a receipt documents an explicit
+	-- decision, so delivering it is permitted (and is the record's whole legal
+	-- point) precisely when the analytics pipeline is closed. It still costs a
+	-- fresh consent-first install nothing: an empty outbox returns before any
+	-- token is minted, so an undecided client stays fully dark. Loaded BEFORE
+	-- the spool so the belt cross-check below settles the boot consent state
+	-- first — the spool load/purge decision must read the FINAL state.
+	client.consent_outbox = storage.load_consent_outbox(normalized)
+	if normalized.token_provider and not normalized.api_key
+		and #client.consent_outbox > 0 then
+		-- The narrow could-never-send anti-wedge drop, scoped to the ONE
+		-- configuration where it is true: Mode B with no publishable key.
+		-- Mode B tokens are minted bound to the CURRENT anonymous ID, so an
+		-- ANON-keyed receipt whose decision-time anon snapshot no longer
+		-- matches would pair the old actor with a token bound to the new
+		-- anon and be rejected on every retry — a wedged head that blocks
+		-- the rest of the trail forever. Drop exactly those at load —
+		-- deterministic, surfaced via diagnostics — like the event spool's
+		-- identity_changed rule below. The same rule covers the ACTOR
+		-- itself: with no publishable key the minted token is the only
+		-- credential, and it vouches solely for the current anon (or a
+		-- user_verified receipt's verified user) — an anon-KIND receipt
+		-- whose actor_identifier is NOT the current anon (a legacy pre-kind
+		-- entry that stored v0.9.1's user-first actor and backfilled to
+		-- anon, its anon snapshot still current) has no credential that
+		-- could ever lawfully carry it: dispatched under the token it would
+		-- be terminally rejected on the actor/subject mismatch or land the
+		-- decision under the wrong actor, and retained it would hold
+		-- set_anonymous_id's rotation guard in events_pending for as long
+		-- as it sat anon-keyed in the outbox. With a publishable api_key
+		-- configured (Mode A, or Mode B + api_key), anon-keyed receipts
+		-- dispatch under the key instead — the historic actor is the
+		-- correct subject of those decisions — so nothing is dropped there.
+		-- And a user_verified-keyed receipt is NEVER dropped for a
+		-- merely-absent identity: it may be the only record of that actor's
+		-- consent change (worst case an undelivered withdrawal), so it
+		-- parks instead (receipt_parked) until a Mode B session vouches for
+		-- its actor.
+		local kept_receipts = {}
+		local mismatched_receipts = 0
+		for i = 1, #client.consent_outbox do
+			local receipt = client.consent_outbox[i]
+			if receipt.kind == "user_verified"
+				or (receipt.anonymous_id == client.anonymous_id
+					and receipt.actor_identifier == client.anonymous_id) then
+				kept_receipts[#kept_receipts + 1] = receipt
+			else
+				mismatched_receipts = mismatched_receipts + 1
+			end
+		end
+		if mismatched_receipts > 0 then
+			client.consent_outbox = kept_receipts
+			client:persist_consent_outbox()
+			client:diagnose({
+				scope = "consent",
+				status = "dropped",
+				code = "identity_changed",
+				count = mismatched_receipts,
+			})
+		end
+	end
+	-- BELT against a stale granted record: the write-ahead marker above is
+	-- the primary witness for a denial whose identity write failed, but a
+	-- RETAINED (undelivered) denial receipt is durable evidence too — scoped,
+	-- stamped, and already loaded. A denial-carrying receipt for THIS actor
+	-- whose decided_at is STRICTLY newer than the restored record's decision
+	-- proves the granted restore stale (the denial's record write never
+	-- landed and its marker is gone or was never written — the pre-marker
+	-- releases): boot the receipt's denial instead and converge the record
+	-- best-effort; the receipt itself stays retained and delivers under its
+	-- own rules. The strictness keeps a genuinely newer grant in charge — a
+	-- same-stamp or older denial receipt (a deny-then-grant whose denial
+	-- receipt is still undelivered) never flips it. A legacy granted record
+	-- with NO stamp cannot prove it postdates the receipt, so it fails
+	-- closed to the denial; receipts without a decision-time anon snapshot
+	-- (legacy entries) are skipped — they cannot prove actor scope.
+	if client.consent_state == "granted" then
+		local stale_denial = nil
+		for i = 1, #client.consent_outbox do
+			local receipt = client.consent_outbox[i]
+			if type(receipt.categories) == "table"
+				and receipt.categories.analytics == false
+				and receipt.anonymous_id == client.anonymous_id
+				and type(receipt.decided_at) == "string"
+				and (client.consent_decided_at == nil
+					or receipt.decided_at > client.consent_decided_at)
+				and (stale_denial == nil
+					or receipt.decided_at > stale_denial.decided_at) then
+				stale_denial = receipt
+			end
+		end
+		if stale_denial then
+			client.consent_state = stale_denial.reason == "denied_forced_minor"
+				and "denied_forced_minor" or "denied"
+			client.consent_decided_at = stale_denial.decided_at
+			consent_state = client.consent_state
+			if not client:persist_identity() then
+				client.stats.consent_persist_failed =
+					client.stats.consent_persist_failed + 1
+			end
+			client:diagnose({
+				scope = "consent",
+				status = "restored",
+				code = "denial_receipt_newer",
+			})
+		end
 	end
 	-- Offline event spool: re-load the envelopes a previous launch could not
 	-- deliver so they re-send (chunked to batch_size) before fresh events. The
@@ -951,68 +1146,9 @@ function M.new(config)
 			end
 		end
 	end
-	-- Durable consent-receipt outbox: reload the receipts a previous launch
-	-- could not deliver and attempt delivery immediately. Deliberately
-	-- UNCONDITIONAL on the consent state — the exact opposite of the event
-	-- spool above: a receipt documents an explicit decision, so delivering it
-	-- is permitted (and is the record's whole legal point) precisely when the
-	-- analytics pipeline is closed. It still costs a fresh consent-first
-	-- install nothing: an empty outbox returns before any token is minted, so
-	-- an undecided client stays fully dark.
-	client.consent_outbox = storage.load_consent_outbox(normalized)
-	if normalized.token_provider and not normalized.api_key
-		and #client.consent_outbox > 0 then
-		-- The narrow could-never-send anti-wedge drop, scoped to the ONE
-		-- configuration where it is true: Mode B with no publishable key.
-		-- Mode B tokens are minted bound to the CURRENT anonymous ID, so an
-		-- ANON-keyed receipt whose decision-time anon snapshot no longer
-		-- matches would pair the old actor with a token bound to the new
-		-- anon and be rejected on every retry — a wedged head that blocks
-		-- the rest of the trail forever. Drop exactly those at load —
-		-- deterministic, surfaced via diagnostics — like the event spool's
-		-- identity_changed rule above. The same rule covers the ACTOR
-		-- itself: with no publishable key the minted token is the only
-		-- credential, and it vouches solely for the current anon (or a
-		-- user_verified receipt's verified user) — an anon-KIND receipt
-		-- whose actor_identifier is NOT the current anon (a legacy pre-kind
-		-- entry that stored v0.9.1's user-first actor and backfilled to
-		-- anon, its anon snapshot still current) has no credential that
-		-- could ever lawfully carry it: dispatched under the token it would
-		-- be terminally rejected on the actor/subject mismatch or land the
-		-- decision under the wrong actor, and retained it would hold
-		-- set_anonymous_id's rotation guard in events_pending for as long
-		-- as it sat anon-keyed in the outbox. With a publishable api_key
-		-- configured (Mode A, or Mode B + api_key), anon-keyed receipts
-		-- dispatch under the key instead — the historic actor is the
-		-- correct subject of those decisions — so nothing is dropped there.
-		-- And a user_verified-keyed receipt is NEVER dropped for a
-		-- merely-absent identity: it may be the only record of that actor's
-		-- consent change (worst case an undelivered withdrawal), so it
-		-- parks instead (receipt_parked) until a Mode B session vouches for
-		-- its actor.
-		local kept_receipts = {}
-		local mismatched_receipts = 0
-		for i = 1, #client.consent_outbox do
-			local receipt = client.consent_outbox[i]
-			if receipt.kind == "user_verified"
-				or (receipt.anonymous_id == client.anonymous_id
-					and receipt.actor_identifier == client.anonymous_id) then
-				kept_receipts[#kept_receipts + 1] = receipt
-			else
-				mismatched_receipts = mismatched_receipts + 1
-			end
-		end
-		if mismatched_receipts > 0 then
-			client.consent_outbox = kept_receipts
-			client:persist_consent_outbox()
-			client:diagnose({
-				scope = "consent",
-				status = "dropped",
-				code = "identity_changed",
-				count = mismatched_receipts,
-			})
-		end
-	end
+	-- The retained receipts (reloaded above, before the spool) get their
+	-- delivery attempt after the whole init settled — the same dispatch
+	-- timing the load-at-the-end shape always had.
 	client:try_send_consent_outbox()
 	return client
 end
@@ -1021,6 +1157,13 @@ function Client:persist_identity()
 	local record = { anonymous_id = self.anonymous_id }
 	if self.consent_state == "granted" or consent_denied_state(self.consent_state) then
 		record.consent_analytics = self.consent_state
+		-- The decision's own stamp rides the record so a later granted
+		-- restore can be cross-checked against strictly-newer retained
+		-- denial receipts (the boot belt). Absent for legacy records — the
+		-- belt then fails closed to a retained denial.
+		if type(self.consent_decided_at) == "string" then
+			record.consent_decided_at = self.consent_decided_at
+		end
 	end
 	-- The experiments subject id rides the identity record whenever one is
 	-- held — including when the experiments flag is currently off — so an
@@ -1505,9 +1648,16 @@ function Client:set_consent(decision)
 		-- analytics data too: drop them with the queue, or the first flush
 		-- after a re-grant would summarize pre-denial activity. A summary
 		-- already BUILT but still owed to a full queue is the same pre-denial
-		-- data one step later — dropped with them.
+		-- data one step later — dropped with them, and COUNTED here: owed
+		-- retention deliberately leaves the build-time queue_full refusal
+		-- uncounted (the snapshot re-enqueues once room frees and is counted
+		-- published when it delivers), so this wipe is the point where an
+		-- owed summary becomes a real, terminal loss.
 		self.perf = sampling.new_perf()
 		self.network = sampling.new_network()
+		if #self.owed_summaries > 0 then
+			self.stats.dropped = self.stats.dropped + #self.owed_summaries
+		end
 		self.owed_summaries = {}
 		if self.experiments then
 			-- The purge above discarded any queued-but-unpublished
@@ -1518,11 +1668,45 @@ function Client:set_consent(decision)
 			self.experiments:on_analytics_purge()
 		end
 	end
+	-- One decision, one stamp: the identity record persists it (the boot
+	-- belt's comparison base), the receipt below re-uses it, and a
+	-- denied-state write-ahead marker carries it.
+	self.consent_decided_at = clock.iso_utc()
+	local marker_durable = true
+	if not granted then
+		-- WRITE-AHEAD DENIAL MARKER — written BEFORE the identity write so a
+		-- persist failure followed by a process exit cannot leave the stale
+		-- pre-denial record as the only thing the next launch reads (it
+		-- would restore "granted" against an explicit revocation). Init
+		-- imposes a present marker over ANY restored record for its actor,
+		-- retries the record write, and retires the marker only once the
+		-- record durably holds the denial. A failed marker write is not
+		-- surfaced on its own — the identity write below stays the primary
+		-- durability and its failure keeps the consent_persist_failed
+		-- contract — but shutdown() refuses to finalize while a denial has
+		-- NO durable witness at all (record, marker, or retained receipt).
+		marker_durable = storage.save_consent_denial_marker(self.config, {
+			consent_analytics = next_state,
+			anonymous_id = self.anonymous_id,
+			decided_at = self.consent_decided_at,
+		})
+	end
 	local persisted = self:persist_identity()
-	if not persisted then
+	if persisted then
+		-- The identity record durably holds THIS decision, so the write-ahead
+		-- marker has served its purpose — the denial's own marker, or a stale
+		-- one a newer successfully-persisted decision just superseded
+		-- (leaving that behind would impose an outdated denial over the fresh
+		-- record at the next boot). Best-effort: an unretired same-state
+		-- marker re-imposes idempotently and retires at the next
+		-- consolidation point.
+		storage.clear_consent_denial_marker(self.config)
+	else
 		self.stats.consent_persist_failed = self.stats.consent_persist_failed + 1
 		self.stats.last_consent_error = "consent_persist_failed"
 	end
+	self.consent_denial_record_pending = (not granted) and not persisted
+	self.consent_denial_marker_pending = (not granted) and not marker_durable
 	local receipt_safe = self:send_consent_decision()
 	if not persisted then
 		-- The decision is applied in memory and reported to the wire, but
@@ -1636,7 +1820,10 @@ end
 -- pre-derived `event_id` (the deterministic exposure id, so at-least-once
 -- retries and same-session double emissions collapse server-side) and
 -- `omit_user_id` (the facts contract forbids user_id on the envelope; the
--- identity is the standard anonymous_id alone). Everything else — the
+-- identity is the standard anonymous_id alone). `retryable` marks an
+-- enqueue whose queue_full refusal is RETENTION, not loss — owed exposure
+-- facts and the summary builds in enqueue_summaries, whose refused snapshot
+-- is kept and re-enqueued once room frees. Everything else — the
 -- consent-first gates, identity requirement, lazy session, queue caps —
 -- applies to facts exactly as to events.
 function Client:enqueue_event(event_name, props, context, fact)
@@ -1742,11 +1929,15 @@ function Client:enqueue_event(event_name, props, context, fact)
 			self.session_sequence = 0
 			self.session_active = false
 		end
-		-- A RETRYABLE fact refusal is not a dropped event: the owed-snapshot
-		-- machinery keeps the fact armed and re-enqueues it once the queue
-		-- has room, so counting every full-queue sweep attempt would inflate
-		-- the dropped stat with events that eventually deliver. Terminal
-		-- outcomes (host events, immediate host-retried facts) still count.
+		-- A RETRYABLE refusal is not a dropped event: the owed-snapshot
+		-- machinery (exposure facts, the enqueue_summaries builds) keeps the
+		-- work armed and re-enqueues it once the queue has room, so counting
+		-- every full-queue attempt would inflate the dropped stat with
+		-- events that eventually deliver — a summary would read as both
+		-- dropped AND published across one refuse→owe→deliver cycle. The
+		-- terminal loss points count instead (the denial wipe of owed
+		-- snapshots). Terminal outcomes here (host events, immediate
+		-- host-retried facts) still count.
 		if not (fact and fact.retryable) then
 			self.stats.dropped = self.stats.dropped + 1
 		end
@@ -1837,13 +2028,41 @@ function Client:enqueue_owed_summary(entry)
 	return true
 end
 
+-- Drain owed summary snapshots into the queue, oldest first, envelopes
+-- preserved (enqueue_owed_summary). Only a still-full queue keeps an entry
+-- owed; any other refusal is terminal for a summary (best-effort telemetry —
+-- the terminal wipe points do the loss accounting). Shared by
+-- enqueue_summaries and the flush loop: owed entries are PENDING WORK for
+-- every flush — including the update cadence's include_summaries = false
+-- flushes, which build nothing fresh but must still deliver what is already
+-- built. Returns true when at least one entry entered the queue.
+function Client:drain_owed_summaries()
+	if #self.owed_summaries == 0 then
+		return false
+	end
+	local owed = self.owed_summaries
+	self.owed_summaries = {}
+	local drained = false
+	for i = 1, #owed do
+		local entry = owed[i]
+		local ok, err = self:enqueue_owed_summary(entry)
+		if ok then
+			drained = true
+		elseif err == "queue_full" then
+			self.owed_summaries[#self.owed_summaries + 1] = entry
+		end
+	end
+	return drained
+end
+
 function Client:enqueue_summaries()
 	-- Summary events ride the same consent gate as track(). While the
 	-- pipeline is closed the accumulated samples are DROPPED, not held — the
 	-- samplers are reset so runtime signals observed before a grant (or
 	-- through a denial) can never surface in a summary emitted after a later
 	-- grant. Owed summaries are analytics data from the same closed window:
-	-- dropped with them.
+	-- dropped with them (the denial wipe in set_consent counts them; this
+	-- belt-and-suspenders clear is only reachable already-empty).
 	if self.consent_state ~= "granted" then
 		self.perf = sampling.new_perf()
 		self.network = sampling.new_network()
@@ -1852,19 +2071,8 @@ function Client:enqueue_summaries()
 	end
 	-- Owed-first: a summary a FULL queue refused earlier was already built —
 	-- its sampler window is consumed — so it re-enqueues ahead of any fresh
-	-- one (older window first), envelope preserved (enqueue_owed_summary).
-	-- Only a still-full queue keeps it owed; any other refusal is terminal
-	-- for a summary (best-effort telemetry — track already counted the drop
-	-- at build time).
-	local owed = self.owed_summaries
-	self.owed_summaries = {}
-	for i = 1, #owed do
-		local entry = owed[i]
-		local ok, err = self:enqueue_owed_summary(entry)
-		if not ok and err == "queue_full" then
-			self.owed_summaries[#self.owed_summaries + 1] = entry
-		end
-	end
+	-- one (older window first), envelope preserved.
+	self:drain_owed_summaries()
 	if #self.owed_summaries > 0 then
 		-- The queue is still full: leave the samplers accumulating (they
 		-- self-bound at their sample caps) instead of consuming them into
@@ -1872,9 +2080,16 @@ function Client:enqueue_summaries()
 		-- entry per summary type.
 		return
 	end
+	-- Fresh builds enqueue through the retryable arm: a queue_full refusal is
+	-- RETENTION (the built event becomes the owed snapshot below and
+	-- re-enqueues once room frees), not a loss — counting it dropped would
+	-- double-book a summary that later delivers as both dropped and
+	-- published. The terminal loss point — the denial wipe of owed
+	-- snapshots — counts instead.
 	local perf = sampling.perf_summary(self.perf)
 	if perf then
-		local ok, err, refused = self:track("perf_summary", perf)
+		local ok, err, refused = self:enqueue_event("perf_summary", perf, nil,
+			{ retryable = true })
 		if not ok and err == "queue_full" then
 			self.owed_summaries[#self.owed_summaries + 1] =
 				{ event_name = "perf_summary", event = refused }
@@ -1882,7 +2097,8 @@ function Client:enqueue_summaries()
 	end
 	local network = sampling.network_summary(self.network, self.config.transport)
 	if network then
-		local ok, err, refused = self:track("network_summary", network)
+		local ok, err, refused = self:enqueue_event("network_summary", network,
+			nil, { retryable = true })
 		if not ok and err == "queue_full" then
 			self.owed_summaries[#self.owed_summaries + 1] =
 				{ event_name = "network_summary", event = refused }
@@ -2417,6 +2633,31 @@ function Client:remove_consent_receipt(idempotency_key)
 	self:persist_consent_outbox()
 end
 
+-- True when the durable consent outbox still RETAINS a denial-carrying
+-- receipt for the current actor stamped at (or after) the latest decision —
+-- durable evidence the boot belt reads, acceptable at teardown when the
+-- identity record and the write-ahead marker both failed. A receipt that
+-- already DELIVERED left the outbox and proves nothing to the next boot, so
+-- it never satisfies this check.
+function Client:denial_receipt_retained_durably()
+	if self.consent_outbox_dirty
+		or not storage.consent_outbox_is_durable(self.config) then
+		return false
+	end
+	for i = 1, #self.consent_outbox do
+		local receipt = self.consent_outbox[i]
+		if type(receipt.categories) == "table"
+			and receipt.categories.analytics == false
+			and receipt.anonymous_id == self.anonymous_id
+			and type(receipt.decided_at) == "string"
+			and (self.consent_decided_at == nil
+				or receipt.decided_at >= self.consent_decided_at) then
+			return true
+		end
+	end
+	return false
+end
+
 -- Snapshot the decision into a receipt and enqueue it for durable, ordered
 -- delivery. Called from set_consent only — receipts exist for explicit
 -- decisions, never for the undecided state. Returns true when this receipt
@@ -2437,7 +2678,11 @@ function Client:send_consent_decision()
 		-- credential and the parked predicate.
 		kind = kind,
 		categories = { analytics = self.consent_state == "granted" },
-		decided_at = clock.iso_utc(),
+		-- The stamp set_consent minted for THIS decision — shared with the
+		-- identity record and any write-ahead denial marker, so the boot
+		-- belt's strictly-newer comparison never trips over two clock reads
+		-- of one decision.
+		decided_at = self.consent_decided_at or clock.iso_utc(),
 		idempotency_key = id.uuid_v7(),
 		-- Retention metadata, never sent on the wire: the decision-time
 		-- anonymous id, so a later Mode B launch whose identity changed can
@@ -2965,7 +3210,6 @@ function Client:spool_envelopes(envelopes)
 	local fresh = {}
 	local seen = {}
 	local replaced = false
-	local replaced_ids = nil
 	for i = 1, #envelopes do
 		local env = envelopes[i]
 		local event_id = type(env) == "table" and env.event_id or nil
@@ -3000,8 +3244,6 @@ function Client:spool_envelopes(envelopes)
 							and stored.event_id == event_id then
 							self.spool_record[j] = env
 							replaced = true
-							replaced_ids = replaced_ids or {}
-							replaced_ids[event_id] = true
 							break
 						end
 					end
@@ -3032,14 +3274,19 @@ function Client:spool_envelopes(envelopes)
 		end
 		return false
 	end
-	-- Cap eviction may have discarded some of THESE envelopes: the caps evict
-	-- oldest-first across the whole record, and once the older entries are
-	-- gone the eviction reaches into the batch being appended. Evicting OLDER
-	-- entries to make room is the documented FIFO; but an envelope from the
-	-- CURRENT batch that did not survive into the saved record was NOT
-	-- captured — count only survivors and report failure so a
-	-- durability-dependent caller (shutdown/persist) does not claim the whole
-	-- remnant is safe on disk.
+	-- Cap eviction may have discarded envelopes: the caps evict oldest-first
+	-- across the whole record, and once the older entries are gone the
+	-- eviction reaches into the batch being appended. Evicting entries this
+	-- call was NOT asked to persist is the documented FIFO; but ANY envelope
+	-- of THIS request that is absent from the saved record was not captured —
+	-- whether it entered as fresh, sat at its original position as an
+	-- in-place replacement (the resurrect path above), or was ALREADY
+	-- persisted by an earlier write and just got pushed out by this very
+	-- append (a persist() remnant whose older half this write evicted while
+	-- "succeeding"). Count the new survivors for the stat, then verify the
+	-- whole requested set, so a durability-dependent caller
+	-- (shutdown/persist) never claims a remnant safe on the strength of a
+	-- write that evicted part of it.
 	local survivors = 0
 	for i = 1, #fresh do
 		if self.spool_index[fresh[i].event_id] then
@@ -3047,19 +3294,15 @@ function Client:spool_envelopes(envelopes)
 		end
 	end
 	self.stats.spooled = self.stats.spooled + survivors
-	if replaced_ids then
-		-- An in-place replacement sits at its ORIGINAL position, so the
-		-- caps' oldest-first eviction can reach it exactly like any old
-		-- entry: a replacement that did not survive into the saved record
-		-- was NOT captured, and a durability-dependent caller must not
-		-- report it safe on the strength of the overwrite alone.
-		for event_id in pairs(replaced_ids) do
-			if not self.spool_index[event_id] then
-				return false
-			end
+	for i = 1, #envelopes do
+		local env = envelopes[i]
+		local event_id = type(env) == "table" and env.event_id or nil
+		if type(event_id) == "string" and event_id ~= ""
+			and not self.spool_index[event_id] then
+			return false
 		end
 	end
-	return survivors == #fresh
+	return true
 end
 
 -- Ack-based removal: once the server acknowledged a batch (2xx) — or the batch
@@ -3103,12 +3346,16 @@ function Client:clear_spooled_batch(events)
 	return count
 end
 
--- Persist every not-yet-acknowledged envelope: the retained/in-flight batch
--- and the queued events. (Loaded spool chunks are already persisted; the
+-- Persist every not-yet-acknowledged envelope: the retained/in-flight batch,
+-- the queued events, and any extra already-built envelopes the caller must
+-- capture in the SAME write (persist()'s still-owed summaries) — one write,
+-- because a second append onto a near-full spool can evict what the first
+-- one just captured (oldest-first) while only the second write's own batch
+-- gets survivor-checked. (Loaded spool chunks are already persisted; the
 -- append de-duplicates by event_id either way.) Returns true only when the
 -- whole undelivered remnant is DURABLY recorded — a memory-only fallback
 -- write or a remnant partially evicted by the caps does not qualify.
-function Client:spool_undelivered()
+function Client:spool_undelivered(extra_envelopes)
 	if not self.config.spool_enabled or self.consent_state ~= "granted" then
 		return false
 	end
@@ -3138,6 +3385,11 @@ function Client:spool_undelivered()
 	end
 	for i = 1, #self.queue.items do
 		envelopes[#envelopes + 1] = envelope.build(self.config, self, self.queue.items[i])
+	end
+	if extra_envelopes then
+		for i = 1, #extra_envelopes do
+			envelopes[#envelopes + 1] = extra_envelopes[i]
+		end
 	end
 	return self:spool_envelopes(envelopes)
 end
@@ -3199,12 +3451,17 @@ function Client:persist()
 	-- persist would lose them even with the queue tail captured below.
 	-- Enqueue what fits (owed-first, envelopes preserved — the same drain
 	-- the flush cadence runs) so it rides the queue capture; an entry the
-	-- still-full queue refuses is appended to the durable record DIRECTLY
-	-- and stays owed in memory for normal delivery — the spool copy is
-	-- crash insurance only: the event_id keeps the append idempotent across
-	-- repeated persists, the eventual acknowledged publish removes it
-	-- (ack-based, like any persisted copy), and a relaunch re-sends it
-	-- verbatim.
+	-- still-full queue refuses joins the SAME durable write as the
+	-- queue/in-flight remnant — ONE write, sized against the caps as a
+	-- whole, because a separate second append could evict the just-captured
+	-- tail (oldest-first) while its own survivor check still reported
+	-- success — and stays owed in memory for normal delivery. The spool
+	-- copy is crash insurance only: the event_id keeps the capture
+	-- idempotent across repeated persists, the eventual acknowledged
+	-- publish removes it (ack-based, like any persisted copy), and a
+	-- relaunch re-sends it verbatim. When the whole remnant does not fit
+	-- the caps, NOTHING is claimed durable — spool_persist_failed reports
+	-- the truth instead of a partially evicted capture.
 	local owed_direct = nil
 	if #self.owed_summaries > 0 then
 		local owed = self.owed_summaries
@@ -3220,13 +3477,7 @@ function Client:persist()
 			end
 		end
 	end
-	if not self:spool_undelivered() then
-		return false, "spool_persist_failed"
-	end
-	if owed_direct and not self:spool_envelopes(owed_direct) then
-		-- A still-owed summary could not be durably captured: the
-		-- app-may-die snapshot must not claim safety over it (persist()
-		-- parity with owed exposure facts).
+	if not self:spool_undelivered(owed_direct) then
 		return false, "spool_persist_failed"
 	end
 	if self.experiments and (self.experiments:has_owed_exposures()
@@ -3418,7 +3669,11 @@ function Client:flush(options)
 	end
 	self.flush_elapsed_seconds = 0
 	if self.publish_in_flight then
-		if self.in_flight_batch or queue.size(self.queue) > 0 or self:spool_pending() then
+		-- Owed summaries count as pending work here too: a "successful"
+		-- flush over one would strand a BUILT event memory-only (its sampler
+		-- window is already consumed) until some later flush.
+		if self.in_flight_batch or queue.size(self.queue) > 0 or self:spool_pending()
+			or #self.owed_summaries > 0 then
 			return false, "pending"
 		end
 		return true
@@ -3441,9 +3696,12 @@ function Client:flush(options)
 	-- (shutdown's outbox-durability contract). PARKED verified-keyed grants
 	-- never gate — they cannot dispatch on this launch at all, and holding
 	-- the batch leg for them would wedge every flush until the Mode B
-	-- credential returns (grant_receipt_pending_dispatch skips them).
+	-- credential returns (grant_receipt_pending_dispatch skips them). Owed
+	-- summaries are events this flush would otherwise publish (the loop
+	-- drains them into freed room), so they hold the gate like queued work.
 	if self:grant_receipt_pending_dispatch()
-		and (self.in_flight_batch ~= nil or queue.size(self.queue) > 0 or self:spool_pending()) then
+		and (self.in_flight_batch ~= nil or queue.size(self.queue) > 0 or self:spool_pending()
+			or #self.owed_summaries > 0) then
 		return false, "consent_receipt_pending"
 	end
 
@@ -3452,7 +3710,25 @@ function Client:flush(options)
 		if not self.in_flight_batch then
 			local resend_spool = self:spool_pending()
 			if not resend_spool and queue.size(self.queue) == 0 then
-				return true
+				-- Owed summaries are THIS flush's pending work: the
+				-- enqueue_summaries above may have BUILT them against a
+				-- queue this loop has since drained (summaries are built
+				-- before the first batch frees any room), and returning
+				-- success over one would strand a built summary memory-only
+				-- — a Mode B caller following the documented
+				-- flush-then-re-identify recourse would hit events_pending
+				-- right after a "successful" flush. Re-drain into the freed
+				-- room and keep publishing; if an entry still cannot
+				-- enqueue, report pending truthfully instead of success.
+				if #self.owed_summaries > 0 then
+					self:drain_owed_summaries()
+				end
+				if queue.size(self.queue) == 0 then
+					if #self.owed_summaries > 0 then
+						return false, "pending"
+					end
+					return true
+				end
 			end
 			if not self:can_publish() then
 				return false
@@ -3551,6 +3827,37 @@ function Client:shutdown(reason)
 		-- recovers, instead of silently dropping a decision at teardown.
 		self:retry_consent_outbox_persist()
 		if self.consent_outbox_dirty or not storage.consent_outbox_is_durable(self.config) then
+			return false, "consent_pending"
+		end
+	end
+	if consent_denied_state(self.consent_state)
+		and (self.consent_denial_record_pending or self.consent_denial_marker_pending) then
+		-- A denial with NO durable witness must not be finalized away: with
+		-- the identity record and the write-ahead marker both failed AND no
+		-- retained receipt left (a delivered receipt leaves the outbox and
+		-- stops no restore), a teardown here would let the next launch read
+		-- the stale pre-denial record and boot GRANTED against an explicit
+		-- revocation. Retry both writes now; failing that, accept a durably
+		-- RETAINED denial receipt (the boot belt reads it). Only when no
+		-- durable witness exists anywhere does teardown stay retryable
+		-- (consent_pending family), exactly like an undurable outbox above.
+		-- Residual, documented: a process KILL before any durable write
+		-- lands loses the denial without trace — no client-side ordering can
+		-- close that; this refusal covers every exit the host controls.
+		if self:persist_identity() then
+			storage.clear_consent_denial_marker(self.config)
+			self.consent_denial_record_pending = false
+			self.consent_denial_marker_pending = false
+		elseif self.consent_denial_marker_pending
+			and storage.save_consent_denial_marker(self.config, {
+				consent_analytics = self.consent_state,
+				anonymous_id = self.anonymous_id,
+				decided_at = self.consent_decided_at,
+			}) then
+			self.consent_denial_marker_pending = false
+		end
+		if self.consent_denial_record_pending and self.consent_denial_marker_pending
+			and not self:denial_receipt_retained_durably() then
 			return false, "consent_pending"
 		end
 	end

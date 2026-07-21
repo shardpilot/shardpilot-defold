@@ -46,16 +46,57 @@
   summaries after the deferred session end and refuse to finalize over one
   — like every other owed exit work, a summary is sent, durably spooled, or
   shutdown stays retryable. A denial still drops owed summaries with the
-  rest of the un-egressed analytics data. The owed snapshot is the BUILT
-  event: actor, anonymous id, session, and timestamps replay verbatim (an
-  `identify()` or anon change between refusal and drain cannot
-  misattribute the old window's samples), Mode B's pending-work refusals
-  (`identify()`'s `events_pending`, the anon-rotation guard) count owed
-  summaries like queued events, and `persist()` captures owed summaries
-  too — enqueued when the queue has room, appended directly to the durable
-  spool when it does not — so a focus-loss snapshot cannot lose a consumed
-  sampler window.
+  rest of the un-egressed analytics data — and that wipe is where an owed
+  summary counts in `snapshot().dropped`: the queue_full refusal that
+  parked it is retention, not loss, so a summary that later delivers is
+  counted once (published), never double-booked as dropped. The owed
+  snapshot is the BUILT event: actor, anonymous id, session, and
+  timestamps replay verbatim (an `identify()` or anon change between
+  refusal and drain cannot misattribute the old window's samples), Mode
+  B's pending-work refusals (`identify()`'s `events_pending`, the
+  anon-rotation guard) count owed summaries like queued events, and owed
+  entries are pending work for EVERY `flush()` — the flush loop re-drains
+  them into the room it frees and only reports success once nothing stays
+  owed (the documented Mode B flush-then-re-identify recourse cannot hit
+  `events_pending` right after a successful flush), with the update
+  cadence's summary-less flushes delivering already-built owed entries
+  too. `persist()` captures owed summaries as well — enqueued when the
+  queue has room, and otherwise joined to the queue/in-flight remnant in
+  ONE durable write sized against the spool caps as a whole: a partially
+  evicted capture reports `spool_persist_failed` instead of claiming
+  durability over envelopes the append itself pushed out — so a
+  focus-loss snapshot cannot lose a consumed sampler window and cannot
+  overreport what survived it.
 
+- **A denial survives a failed identity write: the write-ahead denial
+  marker.** With a grant persisted on disk, `set_consent(false)` (or
+  `"denied_forced_minor"`) whose identity persist failed used to surface
+  `consent_persist_failed` and leave the OLD granted record authoritative —
+  an app exit before a successful retry made the next `init()` restore
+  `granted` and analytics flowed against an explicit revocation. Every
+  denied-state decision now writes a small per-app write-ahead marker
+  (actor, flavor, decision stamp) BEFORE the identity write; init imposes a
+  present marker over whatever the record restored for ITS OWN actor
+  (`denied_forced_minor` flavor preserved), converges the record, and
+  retires the marker only once the record durably holds the denial. The
+  marker never manufactures a decision for a fresh or overriding actor — a
+  foreign-actor marker stays inert AND stays on disk while its own actor's
+  record is unresolved — and an UNREADABLE marker fails closed over a
+  granted restore only (crash-plane opt-out precedent), without rewriting
+  the record. Belt: a RETAINED (undelivered) denial receipt for this actor
+  stamped strictly newer than the restored record's decision blocks a
+  granted restore too (the identity record now persists
+  `consent_decided_at` for the comparison; a legacy stampless grant fails
+  closed to the retained denial). Teardown: `shutdown()` refuses
+  (`consent_pending`) while the latest denial has NO durable witness at
+  all — record, marker, and retained receipt (a delivered receipt leaves
+  the outbox and proves nothing to the next boot) — retrying both writes
+  before refusing. Surfaced via diagnostics as `{ scope = "consent",
+  status = "restored", code = "denial_marker_imposed" |
+  "denial_marker_unreadable" | "denial_receipt_newer" }`. Residual,
+  documented: a process KILL before any durable write lands still loses
+  the denial without trace — no client-side ordering can close that
+  window.
 - **Canonical-actor consent-receipt keying (ADR-0222 §1, ADR-0202 2026-07-20
   amendment).** A consent receipt's actor is now chosen by the event plane's
   canonical-actor rule at decision time: the verified `user_id` ONLY when a
