@@ -447,15 +447,39 @@ function M.new(config)
 	end
 	local stored = storage.load(normalized) or {}
 	local anonymous_id
+	-- A configured anonymous_id override that REPLACES a different valid
+	-- persisted actor boots a FRESH IDENTITY: the persisted consent decision
+	-- belongs to the actor that made it and is never applied to the new one.
+	-- Restoring it would launder consent across actors — the new actor would
+	-- boot "granted" without ever deciding, load the old actor's spool, and
+	-- the identity rewrite below would durably re-record the old actor's
+	-- decision under the new id. A MATCHING override restores unchanged.
+	local override_replaced_actor = false
 	if valid_identity(config.anonymous_id) then
 		anonymous_id = config.anonymous_id
+		override_replaced_actor = valid_identity(stored.anonymous_id)
+			and stored.anonymous_id ~= config.anonymous_id
 	elseif valid_identity(stored.anonymous_id) then
 		anonymous_id = stored.anonymous_id
 	else
 		anonymous_id = id.uuid_v7()
 	end
 	local consent_state = "unknown"
-	if stored.consent_analytics == "granted" or consent_denied_state(stored.consent_analytics) then
+	if not override_replaced_actor
+		and (stored.consent_analytics == "granted" or consent_denied_state(stored.consent_analytics)) then
+		-- The persisted decision is restored only for the actor that made it
+		-- (no override, a matching override, or a freshly minted/self-healed
+		-- anon inheriting this install's record). On an override mismatch the
+		-- new actor starts "unknown": the untouched-on-disk decision is
+		-- ignored, the identity rewrite below persists the override WITHOUT a
+		-- consent key (persist_identity writes one only for explicit states),
+		-- and the "unknown" state routes init through the non-granted spool
+		-- purge — the old actor's envelopes never load for the new actor, and
+		-- a failed purge fails closed exactly like every other non-granted
+		-- init (spool_purge_pending). Retained consent RECEIPTS are not
+		-- consent state and keep their own load rules below: they document
+		-- the OLD actor's decisions and still deliver (or drop/park) under
+		-- the per-receipt credential rules.
 		consent_state = stored.consent_analytics
 	end
 	local client = setmetatable({
@@ -563,6 +587,17 @@ function M.new(config)
 		and stored.experiments_client_id or nil
 	if stored.anonymous_id ~= anonymous_id then
 		client:persist_identity()
+	end
+	if override_replaced_actor then
+		-- Surface the fresh-identity reset: the persisted decision was NOT
+		-- carried over to the overriding actor (distinct from the load-time
+		-- "identity_changed" receipt/spool drops — nothing here was sent or
+		-- deleted, the old decision simply does not apply to the new actor).
+		client:diagnose({
+			scope = "consent",
+			status = "dropped",
+			code = "identity_override_changed",
+		})
 	end
 	-- Remote config rides the client's identity: the persisted anonymous id
 	-- is the client id every fetch is scoped by, read through the accessor at

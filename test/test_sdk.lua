@@ -3007,6 +3007,15 @@ end
 -- Mode B tokens bind the CURRENT anonymous ID, so an init-time anonymous_id
 -- override drops spooled envelopes carrying the previous identity (they would
 -- be rejected on every re-send); Mode A keeps and re-sends them unchanged.
+-- The in-spool identity drop applies to GRANTED launches whose anonymous id
+-- changed without an override mismatch (a config override replacing a
+-- different persisted actor boots a FRESH identity and purges the spool
+-- outright — test_anonymous_override_mismatch_boots_fresh_identity). The
+-- reachable trigger here is the identity self-heal: a stored anonymous id
+-- that fails validation (corrupt/oversized) is replaced by a fresh mint
+-- while this install's persisted grant restores — under Mode B the historic
+-- envelopes could never send (the minted token binds the CURRENT anon) and
+-- drop at load; Mode A has no token binding and re-sends them verbatim.
 local function test_spool_identity_mismatch_dropped_mode_b_kept_mode_a()
 	reset()
 	storage.reset()
@@ -3016,16 +3025,23 @@ local function test_spool_identity_mismatch_dropped_mode_b_kept_mode_a()
 	assert_true(first:track("historic_anon_event"))
 	assert_equal(first:flush(), false)
 	assert_equal(#first.spool_record, 1)
+	-- Corrupt the persisted anonymous id (oversized fails validation); the
+	-- persisted grant survives, so the healed launch is still granted.
+	local corrupt = storage.load(identity_scope) or {}
+	corrupt.anonymous_id = string.rep("x", 513)
+	assert_true(storage.save(identity_scope, corrupt))
 
 	reset()
 	local issues = {}
 	local second = assert(sdk.new(config({
 		flush_interval_seconds = 9999,
-		anonymous_id = "anon-overridden",
 		diagnostics = function(issue)
 			issues[#issues + 1] = issue
 		end,
 	})))
+	assert_equal(second.consent_state, "granted",
+		"the self-healed launch restores this install's decision")
+	assert_not_equal(second.anonymous_id, first.anonymous_id)
 	assert_equal(#second.spool_batches, 0, "mismatched envelopes must not load for re-send")
 	assert_equal(#storage.load_spool(spool_scope), 0, "mismatched envelopes must leave the record")
 	assert_equal(#issues, 1)
@@ -3045,11 +3061,14 @@ local function test_spool_identity_mismatch_dropped_mode_b_kept_mode_a()
 	assert_true(seeder:track("historic_mode_a_event"))
 	assert_equal(seeder:flush(), false)
 	local historic_anon = seeder.anonymous_id
+	local corrupt_a = storage.load(identity_scope) or {}
+	corrupt_a.anonymous_id = string.rep("y", 513)
+	assert_true(storage.save(identity_scope, corrupt_a))
 	reset()
 	local mode_a = assert(sdk.new(config_mode_a({
 		flush_interval_seconds = 9999,
-		anonymous_id = "anon-a-overridden",
 	})))
+	assert_equal(mode_a.consent_state, "granted")
 	assert_equal(#mode_a.spool_batches, 1, "Mode A keeps historic-identity envelopes")
 	assert_true(mode_a:flush())
 	assert_equal(#requests, 1)
@@ -4133,7 +4152,13 @@ local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 			verified_issues[#verified_issues + 1] = issue
 		end,
 	})))
-	assert_equal(#verified_issues, 0, "a verified-keyed receipt must never drop as identity_changed")
+	for i = 1, #verified_issues do
+		-- The override boot may surface its own fresh-identity reset
+		-- (identity_override_changed); what must NEVER appear is an
+		-- identity_changed DROP of the verified-keyed receipt.
+		assert_not_equal(verified_issues[i].code, "identity_changed",
+			"a verified-keyed receipt must never drop as identity_changed")
+	end
 	assert_equal(#verified_second.consent_outbox, 1, "the verified receipt is retained")
 	assert_equal(#requests, 0, "and parked until the session vouches for its actor")
 	assert_true(verified_second:identify("user-verified-example"))
@@ -4957,6 +4982,178 @@ local function test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual()
 	storage.reset()
 end
 
+-- Fleet rule (restore-across-override): a configured anonymous_id override
+-- that REPLACES a different valid persisted actor boots a FRESH identity —
+-- consent "unknown" (the old actor's persisted decision is ignored, never
+-- applied to the new actor), the old actor's spool purged by the standard
+-- non-granted init path, and the identity rewrite persists the override with
+-- NO consent key carried over. Without this, the new actor would boot
+-- "granted" without ever deciding, load the old actor's envelopes, and the
+-- boot rewrite would durably re-record the old decision under the new id.
+local function test_anonymous_override_mismatch_boots_fresh_identity()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- Launch 1: actor "anon-one" grants (receipt acked), then a transient
+	-- publish failure leaves granted-era envelopes on the durable spool.
+	local first = assert(sdk.new(config({
+		anonymous_id = "anon-one",
+		flush_interval_seconds = 9999,
+	})))
+	assert_true(first:set_consent(true))
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"actor_identifier":"anon-one"')
+	local first_key = requests[1].body:match('"idempotency_key":"([^"]+)"')
+	local first_decided = requests[1].body:match('"decided_at":"([^"]+)"')
+	assert_true(first_key ~= nil and first_decided ~= nil)
+	next_status = 500
+	assert_true(first:track("granted_era_event"))
+	assert_equal(first:flush(), false)
+	assert_true(first:shutdown("app_final"))
+	local spool_before = stored_spool_record(stores)
+	assert_true(spool_before ~= nil and #spool_before.events > 0,
+		"launch 1 must leave a granted-era spool behind")
+
+	-- Launch 2: a DIFFERENT override. Fresh identity: consent unknown, the
+	-- old actor's spool purged unloaded, nothing laundered into the record.
+	reset()
+	next_status = 202
+	socket.now = socket.now + 5 -- a later wall clock for the fresh decision
+	local issues = {}
+	local second = assert(sdk.new(config({
+		anonymous_id = "anon-two",
+		flush_interval_seconds = 9999,
+		diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end,
+	})))
+	assert_equal(second.anonymous_id, "anon-two")
+	assert_equal(second.consent_state, "unknown",
+		"an overriding actor must not inherit the previous actor's decision")
+	assert_equal(#second.spool_batches, 0, "the old actor's spool must not load")
+	assert_equal(second.spool_purge_pending, false)
+	assert_equal(#stored_spool_record(stores).events, 0,
+		"the old actor's spool is purged by the non-granted init path")
+	local blocked, blocked_err = second:track("blocked_after_override")
+	assert_equal(blocked, false)
+	assert_equal(blocked_err, "consent_unknown")
+	assert_true(second:flush())
+	assert_equal(#requests, 0, "a fresh identity boots dark")
+	local identity_record = storage.load(identity_scope)
+	assert_equal(identity_record.anonymous_id, "anon-two")
+	assert_equal(identity_record.consent_analytics, nil,
+		"the boot rewrite must not re-record the old decision under the new id")
+	local saw_reset = false
+	for i = 1, #issues do
+		if issues[i].scope == "consent"
+			and issues[i].code == "identity_override_changed" then
+			saw_reset = true
+		end
+	end
+	assert_true(saw_reset, "the fresh-identity reset must surface via diagnostics")
+
+	-- A grant after the mismatch is the NEW actor's own decision: fresh
+	-- receipt, fresh idempotency key, its own decided_at.
+	assert_true(second:set_consent(true))
+	assert_equal(#requests, 1)
+	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
+	assert_contains(requests[1].body, '"actor_identifier":"anon-two"')
+	local fresh_key = requests[1].body:match('"idempotency_key":"([^"]+)"')
+	local fresh_decided = requests[1].body:match('"decided_at":"([^"]+)"')
+	assert_not_equal(fresh_key, first_key,
+		"a fresh decision mints a fresh idempotency key")
+	assert_not_equal(fresh_decided, first_decided,
+		"a fresh decision stamps its own decided_at")
+	restore()
+	storage.reset()
+end
+
+-- The override rule is a MISMATCH rule: an override matching the persisted
+-- actor restores the persisted decision (and the granted-era spool) exactly
+-- like an override-less relaunch.
+local function test_anonymous_override_match_restores_unchanged()
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	local first = assert(sdk.new(config({
+		anonymous_id = "anon-stable",
+		flush_interval_seconds = 9999,
+	})))
+	assert_true(first:set_consent(true))
+	next_status = 500
+	assert_true(first:track("granted_era_event"))
+	assert_equal(first:flush(), false)
+	assert_true(first:shutdown("app_final"))
+
+	reset()
+	next_status = 202
+	local second = assert(sdk.new(config({
+		anonymous_id = "anon-stable",
+		flush_interval_seconds = 9999,
+	})))
+	assert_equal(second.consent_state, "granted",
+		"a matching override restores the persisted decision unchanged")
+	assert_true(#second.spool_batches > 0,
+		"the granted-era spool loads for re-send under the same actor")
+	assert_true(second:flush())
+	assert_true(#requests > 0)
+	local resent = false
+	for i = 1, #requests do
+		if requests[i].body
+			and requests[i].body:find('"event_name":"granted_era_event"', 1, true) then
+			resent = true
+		end
+	end
+	assert_true(resent, "the same actor's envelopes re-send unchanged")
+	restore()
+	storage.reset()
+end
+
+-- The owed-wipe rule applies to the override-mismatch purge like to every
+-- other non-granted init purge: a failed wipe fails closed — the old actor's
+-- record never loads, set_consent(true) is refused (spool_purge_failed) until
+-- the retried wipe lands, and only then does the new actor's grant apply.
+local function test_override_mismatch_purge_failure_fails_closed()
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	local first = assert(sdk.new(config({
+		anonymous_id = "anon-one",
+		flush_interval_seconds = 9999,
+	})))
+	assert_true(first:set_consent(true))
+	next_status = 500
+	assert_true(first:track("granted_era_event"))
+	assert_equal(first:flush(), false)
+	assert_true(first:shutdown("app_final"))
+
+	reset()
+	next_status = 202
+	local heal = break_spool_saves()
+	local second = assert(sdk.new(config({
+		anonymous_id = "anon-two",
+		flush_interval_seconds = 9999,
+	})))
+	assert_equal(second.consent_state, "unknown")
+	assert_equal(second.spool_purge_pending, true,
+		"a failed override-mismatch purge fails closed")
+	assert_equal(#second.spool_batches, 0)
+	local ok, err = second:set_consent(true)
+	assert_equal(ok, false)
+	assert_equal(err, "spool_purge_failed",
+		"the grant is refused while the wipe is owed")
+	assert_equal(second.consent_state, "unknown")
+	heal()
+	assert_true(second:set_consent(true))
+	assert_equal(second.consent_state, "granted")
+	assert_equal(#second.spool_batches, 0,
+		"nothing of the old actor's spool survives the retried purge")
+	assert_equal(#storage.load_spool(spool_scope), 0,
+		"the retried purge cleared the old actor's record")
+	restore()
+	storage.reset()
+end
+
 -- A failed durable append is SURFACED, not silent: set_consent returns
 -- false, "consent_outbox_persist_failed" while the undelivered receipt exists
 -- only in memory (delivery is still attempted — the server-side record is the
@@ -5612,6 +5809,9 @@ local tests = {
 	test_most_vouching_credential_and_401_follows_credential_used,
 	test_legacy_kindless_receipt_backfills_anon_and_invalid_kind_drops,
 	test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual,
+	test_anonymous_override_mismatch_boots_fresh_identity,
+	test_anonymous_override_match_restores_unchanged,
+	test_override_mismatch_purge_failure_fails_closed,
 	test_set_consent_surfaces_receipt_persist_failure,
 	test_transient_outbox_save_failure_never_evicts,
 	test_identifier_byte_clamp_boundary,
