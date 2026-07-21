@@ -216,13 +216,28 @@ clean). A failed acknowledgment-removal rewrite keeps the
 settled entries marked and retries the rewrite on the flush cadence, so the
 record converges as soon as storage recovers.
 
-The **consent-receipt outbox** is separate from the spool and has no
-configuration knobs: undelivered `POST /v1/consent` receipts are always
-retained durably (fixed cap of 32, oldest evicted first, no TTL) and retried
+The **consent-receipt outbox** is separate from the spool and has one
+configuration knob (below): undelivered `POST /v1/consent` receipts are
+always retained durably (fixed cap of 32, denial-preferring eviction —
+oldest pure grant first, denials only among denials — no TTL) and retried
 until acknowledged. `spool_enabled = false` does not affect it, and — unlike
 the spool — it is never consent-purged: receipts deliver under denied and
 unknown states alike, because a receipt documents the decision itself. See
 `docs/privacy.md`.
+
+- **`consent_kind_emission_enabled`** (default `true`, boolean;
+  `invalid_consent_kind_emission_enabled` otherwise). Every `/v1/consent`
+  body carries the receipt's actor class — `kind = "anon"` or
+  `"user_verified"`, chosen by the canonical-actor rule described in
+  `docs/privacy.md` — next to `actor_identifier`. `false` is the escape
+  hatch for a deployment whose ingest service still runs the pre-amendment
+  strict decoder (`INGEST_CONSENT_KIND_MODE=off` rejects a kind-bearing
+  body `400` as an unknown field, a terminal outcome that would drop the
+  receipt, denials included): it suppresses the **wire field only** — the
+  kind is still chosen at decision time, persisted with the receipt, and
+  used to select the dispatch credential (anon-keyed receipts under the
+  publishable `api_key` where configured; `user_verified` receipts only
+  under the minted Mode B token).
 
 The optional `diagnostics` hook is invoked with each non-accepted ingest
 outcome the server reports. Inside a `202` events-batch response the SDK parses
@@ -232,7 +247,7 @@ non-2xx it reports the parsed error envelope (`error.code` plus per-field
 detail codes); when a permanent reject drops entries from the offline
 spool it reports `{ scope = "spool", status = "dropped", code, count }`; and
 when a consent receipt is dropped (a permanent rejection, an overflow of
-the outbox cap, or a Mode B identity change at load) it reports
+the outbox cap, or the Mode-B-only identity-change drop at load) it reports
 `{ scope = "consent", status = "dropped", code }` (codes `outbox_overflow`
 and `identity_changed` carry a `count`).
 Counts are also available on `snapshot()` (`accepted`,

@@ -470,7 +470,9 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   identity record (anonymous ID + consent decision), the offline event spool
   (only envelopes already bound for the wire; cleared on acknowledgment and on
   consent denial), the consent-receipt outbox (undelivered `/v1/consent`
-  receipts only — at most 32, oldest evicted first, pruned the moment the
+  receipts only — at most 32, denial-preferring eviction: the oldest pure
+  grant is evicted first and a denial only when everything over the cap
+  carries denials; pruned the moment the
   server acknowledges one; never event payloads, never purged by a denial —
   see the consent bullet below), a bounded, per-app, TTL'd pending-crash
   sidecar (see the crash note below) that holds the already-PII-scrubbed wire
@@ -530,19 +532,35 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 - Explicit consent decisions are reported to `POST {ingest_url}/v1/consent` over
   the same authenticated transport; consent never rides the event envelope.
   Every decision becomes exactly one receipt (with its own `idempotency_key`),
-  retained in the **durable consent-receipt outbox** until the server
-  acknowledges it and delivered serially, in decision order. Transient
+  keyed to the **canonical actor** at decision time — the verified `user_id`
+  with `kind = "user_verified"` only when a Mode B `token_provider` backs an
+  identified session; the SDK-managed `anonymous_id` with `kind = "anon"` in
+  every other case (a Mode A self-asserted `user_id` is never the receipt
+  actor) — and retained in the **durable consent-receipt outbox** until the
+  server acknowledges it, delivered serially, in decision order. The `kind`
+  rides the wire body by default (`consent_kind_emission_enabled = false` is
+  the escape hatch for pre-amendment ingest deployments — see
+  `docs/configuration.md`), and each receipt dispatches under the credential
+  its kind requires: anon-keyed under the publishable `api_key` where one is
+  configured, `user_verified` only under the minted Mode B token. A
+  `user_verified` receipt on a launch with no `token_provider` **parks** —
+  retained durably, skipped by dispatch and the grant gate, delivered
+  verbatim when a token provider returns — so an undelivered verified
+  denial survives signed-out relaunches. Transient
   failures — no token yet (e.g. an async Mode B `token_provider` still in
-  flight), a Mode B 401, offline, timeout, `429`, `5xx` — keep the receipt
-  and retry at every dispatch point (init/`update`/`flush`/`shutdown`) with
+  flight), a minted-token 401, offline, timeout, `429`, `5xx` — keep the
+  receipt and retry at every dispatch point (init/`update`/`flush`/`shutdown`) with
   `Retry-After`/backoff pacing, across launches, until delivered; permanent
-  rejections (including a Mode A 401) are dropped and surfaced through the
-  `diagnostics` hook (`scope = "consent"`). Under Mode B auth, receipts
+  rejections (including a publishable-key 401, classified by the credential
+  the dispatch actually used) are dropped and surfaced through the
+  `diagnostics` hook (`scope = "consent"`). In a Mode-B-ONLY configuration
+  (no publishable key), anon-keyed receipts
   retained under a previous anonymous id are dropped at load like the event
   spool's `identity_changed` rule (each entry keeps a decision-time anon
   snapshot as retention metadata, never sent on the wire) — a minted token
   binds the current identity, so replaying them could only wedge the trail;
-  Mode A re-sends historic actors unchanged. Receipt delivery is
+  with an `api_key` configured, historic-anon receipts re-send under it
+  unchanged. Receipt delivery is
   **consent-plane traffic**: it stays permitted while analytics consent is
   denied or unknown — the receipt documents the decision itself — and the
   outbox never carries analytics events. If the receipt's durable append

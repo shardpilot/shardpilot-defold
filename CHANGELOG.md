@@ -6,6 +6,68 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **Canonical-actor consent-receipt keying (ADR-0222 §1, ADR-0202 2026-07-20
+  amendment).** A consent receipt's actor is now chosen by the event plane's
+  canonical-actor rule at decision time: the verified `user_id` ONLY when a
+  Mode B `token_provider` backs the session and the host has identified
+  (`kind = "user_verified"`); the SDK-managed `anonymous_id` with
+  `kind = "anon"` in every other case — a Mode A self-asserted `user_id` is
+  never the receipt actor (the publishable key cannot vouch for it, and the
+  ingress binds the write to the caller's own anon scope regardless). This
+  retires the v0.9.1 user-first snapshot, which took a set `user_id` even in
+  Mode A. Delivery selects the dispatch credential PER RECEIPT: anon-keyed
+  receipts go under the publishable `api_key` wherever one is configured —
+  Mode A, and the Mode B + `api_key` remote-config configuration alike, with
+  no token mint — while `user_verified` receipts go only under the minted
+  Mode B token, never a publishable fallback. A consent 401 is classified by
+  the credential the dispatch actually used: a publishable-key 401 is
+  terminal even in a dual-credential configuration and no longer invalidates
+  the cached Mode B token; a minted-token 401 still re-mints and retries.
+- **Kind-carrying consent receipts, emitted by default with an escape
+  hatch.** Every receipt persists its actor's identity class
+  (`kind ∈ {"anon", "user_verified"}` — the SDK never produces any other
+  value, `"user_unverified"` included) and re-sends it verbatim in the
+  `/v1/consent` body next to `actor_identifier`. Emission is ON by default;
+  the new config `consent_kind_emission_enabled = false` (boolean;
+  `invalid_consent_kind_emission_enabled` otherwise) suppresses the WIRE
+  field only, as the escape hatch for a deployment whose ingest service
+  still strict-decodes the pre-amendment schema
+  (`INGEST_CONSENT_KIND_MODE=off` 400-rejects a kind-bearing body as an
+  unknown field) — the kind is still chosen, persisted, and used for
+  dispatch-credential selection. The outbox load sanitizer holds records to
+  the same closed set: entries with a non-allowlisted kind drop fail-safe,
+  and legacy pre-kind entries are kept with kind backfilled to `"anon"`
+  (the pre-kind ingress bound every client write to the caller's anon
+  scope, so anon is the class those receipts were recorded under).
+- **Denial-preferring consent-outbox cap eviction.** Overflow at the fixed
+  32-entry cap now evicts the oldest PURE-GRANT receipt first; a
+  denial-carrying receipt (any false category value — the forced-minor
+  reason-bearing denial included) is evicted, oldest first, only when
+  everything over the cap carries denials. A recorded denial is the
+  compliance-critical write — a lost denial fail-opens the actor
+  server-side, while a lost grant only delays pipeline opening and is
+  re-writable. Everything else about the cap is unchanged: eviction happens
+  only during a successful save, a failed write never evicts, and evictions
+  stay counted (`consent_outbox_evicted`) and diagnosed
+  (`outbox_overflow`).
+- **Verified-keyed receipts park across signed-out relaunches.** A
+  `user_verified`-keyed receipt on a launch with no `token_provider`
+  configured (a signed-out relaunch under the publishable key alone) now
+  PARKS instead of dispatching wrong or dropping: it stays retained and
+  durably persisted — still counted toward the cap and eviction — is
+  excluded from dispatch selection and from the events-plane grant-dispatch
+  gate (a parked grant never wedges `flush()` or teardown), and delivers
+  verbatim, same `idempotency_key`, at the first launch that configures a
+  `token_provider` again — so an undelivered verified denial survives
+  signed-out relaunches. The load-time `identity_changed` drop narrows to
+  the one configuration where a receipt could never send on any credential:
+  anon-keyed entries with a mismatched decision-time anon snapshot in a
+  Mode-B-ONLY configuration (with an `api_key` configured, historic-anon
+  receipts dispatch under it instead — the historic actor is the correct
+  subject of those decisions). The identity re-key enqueue on verified
+  login, its durable once-per-decision ledger, and an explicit host API for
+  discarding parked receipts are deliberately deferred pending
+  godot-package ratification.
 - **Experiment-assignment consumer (ADR-0259 SDK leg), dark behind
   `experiments_enabled` (default `false`).** New module
   `shardpilot/experiments.lua`: fetches the server-evaluated assignment from
