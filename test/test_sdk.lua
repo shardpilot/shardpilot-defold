@@ -4521,6 +4521,136 @@ local function test_identify_invalidates_stale_token_before_unpark_dispatch()
 	storage.reset()
 end
 
+-- The consent deferral is plane-wide by design — but only for heads that can
+-- still retry. When identify() switches the vouched actor and thereby PARKS
+-- the receipt whose failure armed the window, the window would outlive its
+-- owner and hold the NEW head (possibly a fresh denial) for up to the 24h
+-- clamp while the arming receipt cannot retry at all. The actor change
+-- resets the plane deferral (and its backoff attempt count); the parked
+-- receipt itself stays retained.
+local function test_actor_change_parking_armed_head_resets_consent_deferral()
+	reset()
+	storage.reset()
+	-- Mode B: user-a's denial hits a long Retry-After — the plane defers.
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "3600" }
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-window-a"))
+	assert_true(client:set_consent(false))
+	assert_equal(#requests, 1)
+	assert_equal(#client.consent_outbox, 1, "the 429 retains the receipt")
+	assert_true(client.consent_retry_after_ms ~= nil,
+		"the 429 Retry-After must arm the consent deferral")
+
+	-- A DIFFERENT user signs in: the arming receipt parks, and the window
+	-- resets with it.
+	reset()
+	next_status = 202
+	next_response_headers = nil
+	assert_true(client:identify("user-window-b"))
+	assert_equal(client.consent_retry_after_ms, nil,
+		"parking the arming head must reset the plane deferral")
+	assert_equal(client.consent_backoff_attempt, 0)
+	assert_equal(#client.consent_outbox, 1, "the parked receipt stays retained")
+	assert_equal(#requests, 0, "nothing dispatchable yet — the parked head is skipped")
+
+	-- The new session's fresh denial dispatches immediately instead of
+	-- waiting out the parked actor's window.
+	assert_true(client:set_consent(false))
+	assert_equal(#requests, 1, "the fresh head must dispatch immediately")
+	assert_contains(requests[1].body, '"actor_identifier":"user-window-b"')
+	assert_equal(#client.consent_outbox, 1,
+		"the delivered fresh receipt is pruned; the parked one stays")
+	assert_equal(client.consent_outbox[1].actor_identifier, "user-window-a")
+	storage.reset()
+end
+
+-- The reset above is scoped to the ARMING HEAD PARKING — everything else
+-- keeps honoring the plane-wide window: plain same-actor retries (no
+-- identity change), and an identity change that does NOT park the arming
+-- receipt (an anon-keyed head never parks).
+local function test_consent_window_holds_for_same_actor_and_non_parking_changes()
+	reset()
+	storage.reset()
+	-- An ANON-keyed denial arms the window.
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "3600" }
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:set_consent(false))
+	assert_equal(#requests, 1)
+	assert_true(client.consent_retry_after_ms ~= nil)
+	local armed_deadline = client.consent_retry_after_ms
+
+	-- Same-actor retries keep honoring the window: no dispatch on any
+	-- cadence while the deadline is open.
+	reset()
+	next_status = 202
+	next_response_headers = nil
+	client:update(client.config.flush_interval_seconds)
+	assert_true(client:flush())
+	assert_equal(#requests, 0, "the retained head must wait out its own window")
+	assert_equal(client.consent_retry_after_ms, armed_deadline)
+
+	-- identify() — an identity change that does NOT park the anon-keyed
+	-- arming head — must leave the window in place.
+	assert_true(client:identify("user-window-c"))
+	assert_equal(client.consent_retry_after_ms, armed_deadline,
+		"a non-parking identity change must not reset the plane deferral")
+	assert_equal(#requests, 0, "the window still paces the anon head")
+
+	-- identify() with the SAME user again: no identity change, no reset.
+	assert_true(client:identify("user-window-c"))
+	assert_equal(client.consent_retry_after_ms, armed_deadline)
+	assert_equal(#requests, 0)
+	storage.reset()
+end
+
+-- The in-flight sibling: a receipt that PARKS while its POST is on the wire
+-- (identify() switches the actor before the response lands) settles retained
+-- but must NOT arm the plane deferral — the wait would belong to a receipt
+-- that cannot retry, and a fresh head behind it must not inherit it.
+local function test_receipt_parking_in_flight_settles_without_arming_window()
+	reset()
+	storage.reset()
+	local original_request = http.request
+	local held = {}
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = {
+			url = url,
+			method = method,
+			headers = headers,
+			body = body,
+			options = options,
+		}
+		held[#held + 1] = callback
+	end
+
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-flight-a"))
+	assert_true(client:set_consent(false))
+	assert_equal(#held, 1, "the receipt POST is in flight")
+	assert_equal(client.consent_send_in_flight, true)
+
+	-- The actor switches while the POST is on the wire; then the response
+	-- lands as a retryable 429 WITH a Retry-After the settle must ignore.
+	assert_true(client:identify("user-flight-b"))
+	held[1](nil, nil, { status = 429, headers = { ["retry-after"] = "3600" } })
+	assert_equal(client.consent_send_in_flight, false)
+	assert_equal(client.consent_retry_after_ms, nil,
+		"a receipt parking mid-flight must settle without arming the window")
+	assert_equal(client.consent_backoff_attempt, 0)
+	assert_equal(#client.consent_outbox, 1, "the parked receipt stays retained")
+
+	-- A fresh decision for the new actor dispatches immediately.
+	http.request = original_request
+	reset()
+	next_status = 202
+	assert_true(client:set_consent(false))
+	assert_equal(#requests, 1, "the fresh head dispatches with no inherited wait")
+	assert_contains(requests[1].body, '"actor_identifier":"user-flight-b"')
+	storage.reset()
+end
+
 -- P1 (round-2 review): identify() REFUSES a Mode B identity CHANGE while
 -- event work snapshotted to another verified user is still undrained —
 -- queued in this process, or reloaded on the durable spool. Events snapshot
@@ -5804,6 +5934,9 @@ local tests = {
 	test_parked_receipt_never_blocks_dispatch_or_gates_events,
 	test_rotation_allowed_with_only_parked_verified_receipts,
 	test_identify_invalidates_stale_token_before_unpark_dispatch,
+	test_actor_change_parking_armed_head_resets_consent_deferral,
+	test_consent_window_holds_for_same_actor_and_non_parking_changes,
+	test_receipt_parking_in_flight_settles_without_arming_window,
 	test_identify_refused_while_other_user_events_pending,
 	test_gate_and_in_flight_release_key_to_dispatch_head_not_front,
 	test_most_vouching_credential_and_401_follows_credential_used,

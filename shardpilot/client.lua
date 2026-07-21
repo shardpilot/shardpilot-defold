@@ -551,6 +551,14 @@ function M.new(config)
 		consent_in_flight_key = nil,
 		consent_retry_after_ms = nil,
 		consent_backoff_attempt = 0,
+		-- The idempotency_key of the receipt whose retryable failure armed
+		-- the CURRENT consent deferral window. The window is plane-wide by
+		-- design (same-actor retries must keep pacing), but when identify()
+		-- switches the vouched actor and thereby PARKS the arming receipt,
+		-- the window would outlive its owner and hold the next dispatchable
+		-- head — possibly a fresh decision — for up to the 24h clamp; the
+		-- identity change resets it (see identify).
+		consent_deferral_armed_key = nil,
 		spool_record = {},
 		spool_index = {},
 		spool_batches = {},
@@ -1085,6 +1093,29 @@ function Client:identify(user_id)
 		self.token = nil
 		self.token_expires_at_ms = nil
 		self.token_epoch = self.token_epoch + 1
+	end
+	if identity_changed and self.consent_deferral_armed_key then
+		-- Consent-plane deferral hygiene for the actor switch: the open
+		-- Retry-After/backoff window was armed by ONE dispatch head. If THIS
+		-- identity change just parked that receipt, the window has outlived
+		-- its owner — left in place it would hold the NEXT dispatchable head
+		-- (possibly a fresh denial enqueued moments from now) for up to the
+		-- 24h clamp while the arming receipt itself cannot retry at all.
+		-- Reset the deferral and its attempt count so the new head paces
+		-- itself from its own failures. A window whose arming receipt is
+		-- still dispatchable is deliberately untouched: plain same-actor
+		-- retries keep honoring it (the plane-wide pacing is the design).
+		for i = 1, #self.consent_outbox do
+			local receipt = self.consent_outbox[i]
+			if receipt.idempotency_key == self.consent_deferral_armed_key then
+				if self:receipt_parked(receipt) then
+					self.consent_retry_after_ms = nil
+					self.consent_backoff_attempt = 0
+					self.consent_deferral_armed_key = nil
+				end
+				break
+			end
+		end
 	end
 	-- A newly presentable verified identity is a consent dispatch point: a
 	-- user_verified receipt parked for exactly this actor (receipt_parked)
@@ -2447,6 +2478,7 @@ function Client:try_send_consent_outbox()
 				self.stats.consent_recorded = self.stats.consent_recorded + 1
 				self.consent_retry_after_ms = nil
 				self.consent_backoff_attempt = 0
+				self.consent_deferral_armed_key = nil
 				self:remove_consent_receipt(payload.idempotency_key)
 				-- Chain the next retained receipt immediately (bounded by the
 				-- outbox cap) so one healthy dispatch point drains the whole
@@ -2473,11 +2505,22 @@ function Client:try_send_consent_outbox()
 				-- honor a Retry-After or back off so a dead endpoint is not
 				-- hammered every tick.
 				if not unauthorized then
+					-- The receipt may have PARKED while its POST was in
+					-- flight (identify() switched the vouched actor before
+					-- the response landed): it settles retained but WITHOUT
+					-- arming the plane deferral — the wait belongs to ITS
+					-- retry sequence, and this receipt will not retry until
+					-- a session vouches for its actor again; a fresh head
+					-- behind it must not inherit the window.
+					if self:receipt_parked(payload) then
+						return
+					end
 					if retry_after and retry_after > 0 then
 						self:defer_consent(retry_after)
 					else
 						self:defer_consent_backoff()
 					end
+					self.consent_deferral_armed_key = payload.idempotency_key
 				end
 				return
 			end
