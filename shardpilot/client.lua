@@ -541,17 +541,40 @@ function M.new(config)
 	local imposed_denial_marker = false
 	local imposed_marker_code = nil
 	if marker_valid and marker.anonymous_id == anonymous_id then
-		if consent_state ~= marker.consent_analytics then
-			imposed_marker_code = "denial_marker_imposed"
+		-- STALE-MARKER GUARD (Codex #40 round 3): a marker whose decision
+		-- pair the RECORD strictly supersedes is RETIRED, never imposed —
+		-- the record proves a newer decision (a later grant included)
+		-- landed durably while this marker's best-effort retirement failed
+		-- (grant-side clears are deliberately not fail-closed; this
+		-- comparison is what keeps them honest, so a stale denial marker
+		-- can never override a freshly persisted grant at the next boot).
+		-- An EQUAL pair keeps imposing — idempotent for the marker's own
+		-- persisted denial, fail-closed for ties — and a stamp-less marker
+		-- or record keeps the unconditional fail-closed imposition (neither
+		-- side can prove order). Retirement is best-effort: a failed clear
+		-- leaves a marker the next boot again declines to impose.
+		local marker_stamp = (type(marker.decided_at) == "string"
+			and marker.decided_at ~= "") and marker.decided_at or nil
+		local marker_seq = (type(marker.decision_seq) == "number"
+			and marker.decision_seq >= 0)
+			and math.floor(marker.decision_seq) or 0
+		local record_supersedes_marker = marker_stamp ~= nil
+			and consent_decided_at ~= nil
+			and decision_pair_newer(consent_decided_at, consent_decision_seq,
+				marker_stamp, marker_seq)
+		if record_supersedes_marker then
+			storage.clear_consent_denial_marker(normalized)
+		else
+			if consent_state ~= marker.consent_analytics then
+				imposed_marker_code = "denial_marker_imposed"
+			end
+			consent_state = marker.consent_analytics
+			if marker_stamp ~= nil then
+				consent_decided_at = marker_stamp
+				consent_decision_seq = marker_seq
+			end
+			imposed_denial_marker = true
 		end
-		consent_state = marker.consent_analytics
-		if type(marker.decided_at) == "string" and marker.decided_at ~= "" then
-			consent_decided_at = marker.decided_at
-			consent_decision_seq = (type(marker.decision_seq) == "number"
-				and marker.decision_seq >= 0)
-				and math.floor(marker.decision_seq) or 0
-		end
-		imposed_denial_marker = true
 	elseif (marker_err ~= nil or (marker_present and not marker_valid))
 		and consent_state == "granted" then
 		-- Fail closed on the granted restore alone: a non-granted boot is
@@ -719,7 +742,19 @@ function M.new(config)
 			client.stats.consent_persist_failed =
 				client.stats.consent_persist_failed + 1
 		end
-	elseif stored.anonymous_id ~= anonymous_id then
+	elseif stored.anonymous_id ~= anonymous_id
+		and imposed_marker_code ~= "denial_marker_unreadable" then
+		-- The anonymous-id self-heal rewrite (corrupt/oversized/missing
+		-- stored anon) — but NEVER while the unreadable-marker arm has
+		-- imposed its transient fail-closed denial (Codex #40 round 3):
+		-- persist_identity writes the CURRENT consent state, so this
+		-- rewrite would durably overwrite a real granted record with a
+		-- denial manufactured from an unreadable file. The imposed state is
+		-- memory-only by design — nothing egresses this session — and the
+		-- heal simply re-runs at the next launch once the marker is
+		-- readable again (until then each boot re-mints a fresh in-memory
+		-- anon; no data flows under the imposed denial, so nothing is
+		-- attributed to the unpersisted id).
 		client:persist_identity()
 	end
 	if imposed_marker_code then
@@ -970,6 +1005,26 @@ function M.new(config)
 			if not client:persist_identity() then
 				client.stats.consent_persist_failed =
 					client.stats.consent_persist_failed + 1
+				-- WITNESS PRESERVATION (Codex #40 round 3): this retained
+				-- receipt is the denial's ONLY durable proof, and it is
+				-- about to dispatch — a successful delivery removes it from
+				-- the outbox, and with the convergence write failed the
+				-- next launch would restore the stale grant with no witness
+				-- left anywhere. Write the write-ahead marker as the
+				-- receipt-independent witness (actor, flavor, and the
+				-- receipt's own decision pair), and arm the same pending
+				-- flags a live denial's failed writes arm: shutdown()
+				-- refuses to finalize while the denial has no durable
+				-- witness, and its retry path re-attempts both writes.
+				local witness_durable = storage.save_consent_denial_marker(
+					normalized, {
+						consent_analytics = client.consent_state,
+						anonymous_id = client.anonymous_id,
+						decided_at = client.consent_decided_at,
+						decision_seq = client.consent_decision_seq,
+					})
+				client.consent_denial_record_pending = true
+				client.consent_denial_marker_pending = not witness_durable
 			end
 			client:diagnose({
 				scope = "consent",
@@ -3926,6 +3981,10 @@ function Client:shutdown(reason)
 				consent_analytics = self.consent_state,
 				anonymous_id = self.anonymous_id,
 				decided_at = self.consent_decided_at,
+				-- The decision's full pair rides every marker write: a
+				-- seq-less marker would lose the same-second tie-break at
+				-- the next boot's stale-marker comparison.
+				decision_seq = self.consent_decision_seq,
 			}) then
 			self.consent_denial_marker_pending = false
 		end

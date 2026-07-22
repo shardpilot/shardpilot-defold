@@ -97,6 +97,19 @@
   newer same-second re-grant, its record carrying the higher seq, stays in
   charge; fresh mints always rise strictly above every retained seq (the
   floor is re-derived from record, marker, and retained receipts at boot).
+  Marker imposition compares the same pair: a stale marker the RECORD
+  strictly supersedes (a later grant landed durably while the grant-side
+  best-effort marker clear failed) is retired at boot, never imposed —
+  while an equal-or-newer marker keeps imposing fail-closed. The
+  unreadable-marker fail-closed state is strictly TRANSIENT: the
+  anonymous-id self-heal rewrite is deferred while it is in effect, so the
+  memory-only imposed denial can never durably overwrite a real granted
+  record (the heal re-runs once the marker is readable). And when the boot
+  belt imposes a denial from a retained receipt but its convergence write
+  fails, the write-ahead marker is written as the receipt-independent
+  witness (carrying the receipt's decision pair) before the receipt — the
+  denial's only durable proof — dispatches and leaves the outbox; the
+  shutdown pending flags arm alongside.
   Teardown: `shutdown()` refuses
   (`consent_pending`) while the latest denial has NO durable witness at
   all — record, marker, and retained receipt (a delivered receipt leaves

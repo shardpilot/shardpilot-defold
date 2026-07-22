@@ -3780,6 +3780,169 @@ local function test_same_second_regrant_outranks_undelivered_denial()
 	storage.reset()
 end
 
+-- Codex #40 round 3: a marker from an earlier denial whose grant-side
+-- retirement failed used to be imposed UNCONDITIONALLY at the next boot,
+-- overriding the newer successfully-persisted grant. The imposition now
+-- compares decision pairs: a marker the record strictly supersedes is
+-- retired, never imposed; the genuine direction (marker pair newer) still
+-- imposes.
+local function test_stale_denial_marker_never_beats_newer_grant()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-stale-marker",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-05T00:00:00Z",
+		consent_decision_seq = 2,
+	}))
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied",
+		anonymous_id = "anon-stale-marker",
+		decided_at = "2026-07-05T00:00:00Z",
+		decision_seq = 1,
+	}))
+	local client = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "granted",
+		"a stale denial marker must never override a newer durable grant")
+	local marker = storage.load_consent_denial_marker(identity_scope)
+	assert_true(type(marker) ~= "table" or next(marker) == nil,
+		"the superseded marker is retired at boot")
+	restore()
+	storage.reset()
+
+	-- The genuine direction stays imposed: the marker pair strictly newer
+	-- than the record's (same second, higher seq).
+	reset()
+	storage.reset()
+	stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-stale-marker",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-05T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied",
+		anonymous_id = "anon-stale-marker",
+		decided_at = "2026-07-05T00:00:00Z",
+		decision_seq = 2,
+	}))
+	local imposed = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(imposed.consent_state, "denied",
+		"a genuinely newer same-second marker still imposes")
+	restore()
+	storage.reset()
+end
+
+-- Codex #40 round 3: the unreadable-marker fail-closed state is memory-only
+-- by design — but the anonymous-id self-heal rewrite used to persist it,
+-- durably overwriting a real granted record off an unreadable file. The
+-- rewrite is now skipped while the unreadable imposition is in effect; the
+-- heal re-runs once the marker is readable again.
+local function test_unreadable_marker_fail_closed_stays_transient()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = string.rep("x", 600),
+		consent_analytics = "granted",
+	}))
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "granted",
+		anonymous_id = "anon-not-a-denial",
+	}))
+	local client = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "denied",
+		"an unreadable/malformed marker fails closed over the granted restore")
+	local tok, terr = client:track("gated_event")
+	assert_equal(tok, false)
+	assert_equal(terr, "consent_denied")
+	local identity_record = nil
+	for path, record in pairs(stores) do
+		if path:sub(-9) == "/identity" then
+			identity_record = record
+		end
+	end
+	assert_true(identity_record ~= nil
+			and identity_record.consent_analytics == "granted",
+		"the transient fail-closed state never rewrites the granted record — not even through the anon self-heal")
+	-- The marker heals: the next launch restores the real grant and
+	-- completes the deferred self-heal.
+	assert_true(storage.clear_consent_denial_marker(identity_scope))
+	reset()
+	local healed = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(healed.consent_state, "granted",
+		"the healed launch restores the real decision — the imposition was transient")
+	restore()
+	storage.reset()
+end
+
+-- Codex #40 round 3: when the belt's convergence write fails, the retained
+-- denial receipt — the decision's only durable proof — still dispatches and
+-- leaves the outbox, so the next launch would restore the stale grant with
+-- no witness anywhere. The failed convergence now writes the write-ahead
+-- marker (with the receipt's decision pair) as the receipt-independent
+-- witness and arms the shutdown pending flags.
+local function test_belt_convergence_failure_writes_marker_witness()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-belt-witness",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-06T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, { {
+		idempotency_key = "belt-witness-denial",
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "anon-belt-witness",
+		kind = "anon",
+		decided_at = "2026-07-06T00:00:01Z",
+		decision_seq = 2,
+		categories = { analytics = false },
+		anonymous_id = "anon-belt-witness",
+	} }) ~= false)
+	-- The identity store is broken at boot: the belt imposes the denial,
+	-- its convergence write fails, and the receipt delivers (202) and
+	-- leaves the outbox.
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:sub(-9) == "/identity" then
+			return false
+		end
+		return real_save(path, record)
+	end
+	local client = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "denied",
+		"the belt imposes the retained denial")
+	local marker = storage.load_consent_denial_marker(identity_scope)
+	assert_true(type(marker) == "table" and marker.consent_analytics == "denied"
+			and marker.decision_seq == 2,
+		"the failed convergence writes the marker witness carrying the receipt's pair")
+	local outbox = storage.load_consent_outbox(identity_scope)
+	assert_equal(#outbox, 0, "the delivered receipt left the durable outbox")
+	local identity_record = nil
+	for path, record in pairs(stores) do
+		if path:sub(-9) == "/identity" then
+			identity_record = record
+		end
+	end
+	assert_true(identity_record ~= nil and identity_record.consent_analytics == "granted",
+		"the stale granted record still sits on disk — the marker is the only witness left")
+	-- Heal and relaunch: the marker imposes the denial and converges.
+	sys.save = real_save
+	reset()
+	local relaunch = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(relaunch.consent_state, "denied",
+		"the marker witness imposes the denial after the receipt is gone")
+	restore()
+	storage.reset()
+end
+
 -- P1 denial marker, teardown leg: shutdown() refuses (consent_pending
 -- family) while the latest denial has NO durable witness anywhere — record
 -- write failed, marker write failed, and the receipt already delivered and
@@ -6920,6 +7083,9 @@ local tests = {
 	test_newer_denial_receipt_blocks_granted_restore,
 	test_same_second_denial_tie_imposes_fail_closed,
 	test_same_second_regrant_outranks_undelivered_denial,
+	test_stale_denial_marker_never_beats_newer_grant,
+	test_unreadable_marker_fail_closed_stays_transient,
+	test_belt_convergence_failure_writes_marker_witness,
 	test_shutdown_refuses_denial_with_no_durable_witness,
 	test_set_anonymous_id_rejected_while_spool_pending_mode_b,
 	test_shutdown_fails_when_remnant_evicted_by_caps,
