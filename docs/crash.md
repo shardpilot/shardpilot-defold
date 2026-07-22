@@ -220,12 +220,16 @@ failure.
 - **Engine-module symbol identity** (ADR-0297 §7c): the engine module —
   recognized across its platform name shapes (`dmengine`, `libdmengine.so`,
   `dmengine.exe`, a pathed variant) — has its `debug_id` synthesized as
-  **`dmengine-<version_sha1>`** from
-  `sys.get_engine_info()` — collision-free across engine versions and matching
+  **`dmengine-<engine sha1>`**, read from the **dump's own
+  `crash.SYSFIELD_ENGINE_HASH`** (the CRASHED engine's build — after an
+  engine update between the crash and this launch, the current runtime's
+  sha1 would be the wrong identity), falling back to
+  `sys.get_engine_info().version_sha1` when the sysfield is absent —
+  collision-free across engine versions and matching
   how Defold publishes per-release engine symbols keyed by sha1, so uploading
   the published engine `.sym` under that same debug id makes engine frames
-  resolve through the standard symbol keying. When the engine info is
-  unavailable, the module falls back to the name key below.
+  resolve through the standard symbol keying. When neither hash source is
+  available, the module falls back to the name key below.
 - **No debug IDs for other modules.** The engine's module list has a name and a
   load address but no debug/build ID for anything but the engine identity
   above, so a non-engine module's name is sent as the stable reference.

@@ -102,8 +102,8 @@ end
 
 -- Read the engine build sha1 from sys.get_engine_info() (the stable Defold
 -- API: returns `version` + `version_sha1`). Nil when the API is unavailable
--- (tests without the stub, exotic hosts) or the field is missing — the caller
--- then falls back to name keying. Never raises.
+-- (tests without the stub, exotic hosts) or the field is missing. Never
+-- raises. This is the FALLBACK identity source only — see engine_dump_sha1.
 local function engine_version_sha1()
 	if type(sys) ~= "table" or type(sys.get_engine_info) ~= "function" then
 		return nil
@@ -119,10 +119,30 @@ local function engine_version_sha1()
 	return sha1
 end
 
+-- The engine identity of the CRASHED process (Codex #41 round 3): the dump
+-- belongs to the PREVIOUS session, and an app/engine update between the
+-- crash and this launch makes the current runtime's sha1 the WRONG identity
+-- (uploaded symbols for the crashed binary would never match). Defold stores
+-- the crashed engine's hash ON the dump (crash.SYSFIELD_ENGINE_HASH), so
+-- that is the authoritative source; the current engine info is only the
+-- fallback for dumps/hosts that do not expose the sysfield — where the two
+-- could differ, a same-version launch is also the overwhelmingly common
+-- case. Never raises.
+local function engine_dump_sha1(crash_module, handle)
+	if crash_module.SYSFIELD_ENGINE_HASH ~= nil then
+		local hash = read_sys_field(crash_module, handle, crash_module.SYSFIELD_ENGINE_HASH)
+		if hash then
+			return hash
+		end
+	end
+	return engine_version_sha1()
+end
+
 -- Build the modules[] from the dump's module list. Each module carries a name +
 -- a base load address. Symbol identity (ADR-0297 §7c): the ENGINE module's
--- debug_id is synthesized as `dmengine-<version_sha1>` from
--- sys.get_engine_info() — collision-free across engine versions and matching
+-- debug_id is synthesized as `dmengine-<engine sha1>` from the CRASHED
+-- process's own hash (engine_dump_sha1 above; current engine info is the
+-- fallback) — collision-free across engine versions and matching
 -- how Defold publishes per-release engine symbols keyed by sha1, so the
 -- CLI/door uploads the published engine `.sym` under the SAME debug_id and
 -- resolution rides the standard identity keying with no side-channel. The
@@ -144,7 +164,7 @@ local function build_modules(crash_module, handle)
 			if type(name) == "string" and name ~= "" and address then
 				local debug_id = name
 				if is_engine_module_name(name) then
-					local sha1 = engine_version_sha1()
+					local sha1 = engine_dump_sha1(crash_module, handle)
 					if sha1 then
 						debug_id = ENGINE_MODULE_NAME .. "-" .. sha1
 					end

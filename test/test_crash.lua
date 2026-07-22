@@ -1242,6 +1242,7 @@ local function fake_crash_module(opts)
 	local module = {
 		SYSFIELD_SYSTEM_NAME = 1,
 		SYSFIELD_SYSTEM_VERSION = 2,
+		SYSFIELD_ENGINE_HASH = 3,
 		load_previous = function()
 			-- Counted so the opt-out tests can assert the one-shot dump was
 			-- left UNREAD (ADR-0297 §7c boot auto-capture).
@@ -1265,6 +1266,8 @@ local function fake_crash_module(opts)
 				return opts.os_name
 			elseif field == 2 then
 				return opts.os_version
+			elseif field == 3 then
+				return opts.engine_hash
 			end
 			return nil
 		end,
@@ -1346,6 +1349,24 @@ local function test_engine_module_debug_id_synthesized()
 	-- Non-engine modules keep the name-keyed honest fallback (the engine
 	-- exposes no debug ids for native-extension modules).
 	assert_contains(body, '"debug_id":"libgame.so"')
+end
+
+local function test_engine_module_debug_id_prefers_dump_engine_hash()
+	reset()
+	-- The dump belongs to the PREVIOUS session: after an engine update the
+	-- current runtime's sha1 is the WRONG identity, so the crashed engine's
+	-- own hash (SYSFIELD_ENGINE_HASH, stored on the dump) wins.
+	local module = fake_crash_module({
+		handle = 7,
+		engine_hash = "0ldc0ffee0ldc0ffee0ldc0ffee0ldc0ffee0ld",
+		modules = { { name = "dmengine", address = 0x4000 } },
+		backtrace = { { address = 0x4abc } },
+	})
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:capture_previous(module))
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"debug_id":"dmengine-0ldc0ffee0ldc0ffee0ldc0ffee0ldc0ffee0ld"')
+	assert_not_contains(requests[1].body, "8f3e0a1b2c4d5e6f708192a3b4c5d6e7f8091a2b")
 end
 
 local function test_engine_module_debug_id_matches_platform_name_shapes()
@@ -5408,6 +5429,7 @@ local tests = {
 	test_capture_previous_no_dump,
 	test_capture_previous_forwards_native_dump,
 	test_engine_module_debug_id_synthesized,
+	test_engine_module_debug_id_prefers_dump_engine_hash,
 	test_engine_module_debug_id_matches_platform_name_shapes,
 	test_engine_module_debug_id_falls_back_without_engine_info,
 	test_init_auto_captures_previous_dump_on_boot,
