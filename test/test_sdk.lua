@@ -3650,6 +3650,136 @@ local function test_newer_denial_receipt_blocks_granted_restore()
 	storage.reset()
 end
 
+-- Godot round-11 parity (P1 tie-break): clock.iso_utc is SECOND-precision,
+-- so a grant→denial inside one second used to leave the belt's
+-- strictly-newer stamp comparison unable to break the tie when the denial's
+-- marker AND record writes both failed — relaunch restored the stale grant
+-- over the denial's only durable evidence, its retained receipt. The
+-- monotonic decision seq breaks the tie fail-closed, and the mint floor
+-- restored from retained receipts keeps a subsequent same-second re-grant
+-- strictly above the denial, so the newest decision stays in charge
+-- through the whole tie chain.
+local function test_same_second_denial_tie_imposes_fail_closed()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local clock = require "shardpilot.clock"
+	local real_iso = clock.iso_utc
+	local frozen = real_iso()
+	clock.iso_utc = function() return frozen end
+	-- Receipts must stay RETAINED (undelivered) — they are the denial's only
+	-- durable witness in this scenario.
+	next_status = 500
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:set_consent(true), "the grant records and persists")
+	-- Same second: the denial's marker AND record writes both fail; only the
+	-- receipt append lands.
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:sub(-9) == "/identity" or path:sub(-15) == "/consent-denial" then
+			return false
+		end
+		return real_save(path, record)
+	end
+	local ok, err = client:set_consent(false)
+	assert_equal(ok, false)
+	assert_equal(err, "consent_persist_failed")
+	sys.save = real_save
+	local identity_path = nil
+	for path in pairs(stores) do
+		if path:sub(-9) == "/identity" then
+			identity_path = path
+		end
+	end
+	assert_equal(stores[identity_path].consent_analytics, "granted",
+		"the stale record still carries the same-second pre-denial grant — the exact tie")
+	assert_equal(stores[identity_path].consent_decided_at, frozen,
+		"the tie is real: both decisions share the second-precision stamp")
+	-- Simulated exit + relaunch over healed storage: the retained receipt's
+	-- higher decision seq must impose the denial over the same-stamp grant.
+	reset()
+	next_status = 500
+	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(relaunch.consent_state, "denied",
+		"the same-second denial must impose fail-closed via its higher seq")
+	local tok, terr = relaunch:track("post_tie_event")
+	assert_equal(tok, false)
+	assert_equal(terr, "consent_denied")
+	assert_equal(stores[identity_path].consent_analytics, "denied",
+		"the belt converges the record with the denial's pair")
+	-- The mint floor restored from the retained receipts: a STILL
+	-- same-second re-grant mints strictly above the denial's seq and
+	-- outranks it at the next boot.
+	assert_true(relaunch:set_consent(true), "the same-second re-grant records")
+	reset()
+	next_status = 500
+	local third = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(third.consent_state, "granted",
+		"the re-grant's higher seq keeps the newest decision in charge")
+	clock.iso_utc = real_iso
+	restore()
+	storage.reset()
+end
+
+-- The counter-directions of the tie-break: a same-stamp denial receipt with
+-- a LOWER seq (an undelivered deny superseded by a same-second re-grant
+-- whose record landed) must NOT flip the grant, and legacy same-stamp data
+-- (no seq anywhere — both sides backfill 0) keeps the pre-seq strict-stamp
+-- no-impose outcome.
+local function test_same_second_regrant_outranks_undelivered_denial()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-tie-example",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-04T00:00:00Z",
+		consent_decision_seq = 2,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, { {
+		idempotency_key = "tie-denial-key",
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "anon-tie-example",
+		kind = "anon",
+		decided_at = "2026-07-04T00:00:00Z",
+		decision_seq = 1,
+		categories = { analytics = false },
+		anonymous_id = "anon-tie-example",
+	} }) ~= false)
+	local client = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "granted",
+		"a same-stamp denial with a LOWER seq must not flip the re-granted record")
+	restore()
+	storage.reset()
+
+	reset()
+	storage.reset()
+	stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-tie-example",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-04T00:00:00Z",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, { {
+		idempotency_key = "tie-legacy-key",
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "anon-tie-example",
+		kind = "anon",
+		decided_at = "2026-07-04T00:00:00Z",
+		categories = { analytics = false },
+		anonymous_id = "anon-tie-example",
+	} }) ~= false)
+	local legacy = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(legacy.consent_state, "granted",
+		"legacy same-stamp data keeps the pre-seq strict-stamp outcome")
+	restore()
+	storage.reset()
+end
+
 -- P1 denial marker, teardown leg: shutdown() refuses (consent_pending
 -- family) while the latest denial has NO durable witness anywhere — record
 -- write failed, marker write failed, and the receipt already delivered and
@@ -6788,6 +6918,8 @@ local tests = {
 	test_denial_marker_preserves_forced_minor_flavor,
 	test_foreign_actor_denial_marker_stays_inert_and_undeleted,
 	test_newer_denial_receipt_blocks_granted_restore,
+	test_same_second_denial_tie_imposes_fail_closed,
+	test_same_second_regrant_outranks_undelivered_denial,
 	test_shutdown_refuses_denial_with_no_durable_witness,
 	test_set_anonymous_id_rejected_while_spool_pending_mode_b,
 	test_shutdown_fails_when_remnant_evicted_by_caps,

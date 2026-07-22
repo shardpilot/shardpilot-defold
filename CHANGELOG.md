@@ -84,10 +84,20 @@
   record is unresolved — and an UNREADABLE marker fails closed over a
   granted restore only (crash-plane opt-out precedent), without rewriting
   the record. Belt: a RETAINED (undelivered) denial receipt for this actor
-  stamped strictly newer than the restored record's decision blocks a
+  whose decision pair is strictly newer than the restored record's blocks a
   granted restore too (the identity record now persists
   `consent_decided_at` for the comparison; a legacy stampless grant fails
-  closed to the retained denial). Teardown: `shutdown()` refuses
+  closed to the retained denial). The comparison orders the PAIR
+  `(decided_at, decision_seq)`: the stamp is second-precision, so a
+  monotonic per-install decision seq — minted with every decision, shared
+  by the record, the marker, and the receipt, retention-only (never on the
+  wire), legacy values backfilling 0 — breaks a same-second grant→denial
+  tie fail-closed (with both the marker and record writes failed, the
+  retained receipt's higher seq imposes the denial), while a genuinely
+  newer same-second re-grant, its record carrying the higher seq, stays in
+  charge; fresh mints always rise strictly above every retained seq (the
+  floor is re-derived from record, marker, and retained receipts at boot).
+  Teardown: `shutdown()` refuses
   (`consent_pending`) while the latest denial has NO durable witness at
   all — record, marker, and retained receipt (a delivered receipt leaves
   the outbox and proves nothing to the next boot) — retrying both writes

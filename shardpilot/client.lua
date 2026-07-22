@@ -147,6 +147,25 @@ end
 -- load), and this acceptance gate keeps new identifiers inside it.
 local max_identifier_bytes = storage.max_identifier_bytes
 
+-- Lexicographic ordering over a decision's (stamp, seq) pair. clock.iso_utc
+-- is SECOND-precision, so two decisions in one second share a stamp; the
+-- monotonic per-install decision seq breaks the tie — a same-second
+-- grant→denial whose record AND marker writes both failed still imposes
+-- fail-closed from its retained receipt, while a legit same-second re-grant
+-- (higher seq on the record) stays in charge. Legacy sides carry seq 0 (the
+-- sanitizer backfill), preserving the pre-seq strict-stamp behavior for
+-- legacy data. A nil base stamp (legacy record) cannot prove it postdates
+-- anything and fails closed to the challenger.
+local function decision_pair_newer(stamp, seq, base_stamp, base_seq)
+	if base_stamp == nil then
+		return true
+	end
+	if stamp ~= base_stamp then
+		return stamp > base_stamp
+	end
+	return (seq or 0) > (base_seq or 0)
+end
+
 local function valid_identity(value)
 	return type(value) == "string" and value ~= "" and #value <= max_identifier_bytes
 end
@@ -482,13 +501,21 @@ function M.new(config)
 		-- the per-receipt credential rules.
 		consent_state = stored.consent_analytics
 	end
-	-- The stamp of the decision the restored state came from (persisted by
-	-- persist_identity since the denial-marker fix; legacy records carry
-	-- none). The belt below compares retained denial receipts against it.
+	-- The (stamp, seq) pair of the decision the restored state came from
+	-- (persisted by persist_identity since the denial-marker fix; legacy
+	-- records carry neither — seq reads 0). The belt below compares retained
+	-- denial receipts against the PAIR: clock.iso_utc is second-precision,
+	-- so the monotonic per-install decision seq is what breaks a
+	-- same-second stamp tie (godot round-11 parity).
 	local consent_decided_at = nil
+	local consent_decision_seq = 0
 	if consent_state ~= "unknown" and type(stored.consent_decided_at) == "string"
 		and stored.consent_decided_at ~= "" then
 		consent_decided_at = stored.consent_decided_at
+		if type(stored.consent_decision_seq) == "number"
+			and stored.consent_decision_seq >= 0 then
+			consent_decision_seq = math.floor(stored.consent_decision_seq)
+		end
 	end
 	-- WRITE-AHEAD DENIAL MARKER: a denied-state set_consent writes this small
 	-- witness BEFORE the identity write and retires it only once the record
@@ -520,6 +547,9 @@ function M.new(config)
 		consent_state = marker.consent_analytics
 		if type(marker.decided_at) == "string" and marker.decided_at ~= "" then
 			consent_decided_at = marker.decided_at
+			consent_decision_seq = (type(marker.decision_seq) == "number"
+				and marker.decision_seq >= 0)
+				and math.floor(marker.decision_seq) or 0
 		end
 		imposed_denial_marker = true
 	elseif (marker_err ~= nil or (marker_present and not marker_valid))
@@ -530,6 +560,7 @@ function M.new(config)
 		-- grant; the next launch re-evaluates against a healed marker.
 		consent_state = "denied"
 		consent_decided_at = nil
+		consent_decision_seq = 0
 		imposed_marker_code = "denial_marker_unreadable"
 	end
 	local client = setmetatable({
@@ -592,6 +623,7 @@ function M.new(config)
 		-- granted restore can be cross-checked against strictly-newer
 		-- retained denial receipts. nil for "unknown" and legacy records.
 		consent_decided_at = consent_decided_at,
+		consent_decision_seq = consent_decision_seq,
 		-- Set while the LATEST decision is a denial whose respective durable
 		-- write is still owed (identity record / write-ahead marker).
 		-- shutdown() retries both and refuses to finalize (consent_pending)
@@ -876,21 +908,41 @@ function M.new(config)
 			})
 		end
 	end
+	-- Monotonic mint floor: a FRESH decision must outrank every retained
+	-- (stamp, seq) pair even when the record write failed — the retained
+	-- receipt then carries the highest seq the install has minted — so the
+	-- floor is the max over the record's seq, the marker's (imposed or
+	-- not; an inert foreign-actor marker still witnesses a mint), and every
+	-- retained receipt's. set_consent mints strictly above it.
+	local consent_seq_floor = consent_decision_seq
+	if marker_present and type(marker.decision_seq) == "number"
+		and marker.decision_seq > consent_seq_floor then
+		consent_seq_floor = math.floor(marker.decision_seq)
+	end
+	for i = 1, #client.consent_outbox do
+		local retained_seq = client.consent_outbox[i].decision_seq
+		if type(retained_seq) == "number" and retained_seq > consent_seq_floor then
+			consent_seq_floor = math.floor(retained_seq)
+		end
+	end
+	client.consent_seq_floor = consent_seq_floor
 	-- BELT against a stale granted record: the write-ahead marker above is
 	-- the primary witness for a denial whose identity write failed, but a
 	-- RETAINED (undelivered) denial receipt is durable evidence too — scoped,
 	-- stamped, and already loaded. A denial-carrying receipt for THIS actor
-	-- whose decided_at is STRICTLY newer than the restored record's decision
-	-- proves the granted restore stale (the denial's record write never
-	-- landed and its marker is gone or was never written — the pre-marker
-	-- releases): boot the receipt's denial instead and converge the record
-	-- best-effort; the receipt itself stays retained and delivers under its
-	-- own rules. The strictness keeps a genuinely newer grant in charge — a
-	-- same-stamp or older denial receipt (a deny-then-grant whose denial
-	-- receipt is still undelivered) never flips it. A legacy granted record
-	-- with NO stamp cannot prove it postdates the receipt, so it fails
-	-- closed to the denial; receipts without a decision-time anon snapshot
-	-- (legacy entries) are skipped — they cannot prove actor scope.
+	-- whose (decided_at, decision_seq) pair is STRICTLY newer than the
+	-- restored record's decision proves the granted restore stale (the
+	-- denial's record write never landed and its marker is gone or was
+	-- never written — the pre-marker releases): boot the receipt's denial
+	-- instead and converge the record best-effort; the receipt itself stays
+	-- retained and delivers under its own rules. The strictness keeps a
+	-- genuinely newer grant in charge — a same-pair or older denial receipt
+	-- (a deny-then-grant whose denial receipt is still undelivered) never
+	-- flips it; the seq half is what breaks a same-second stamp tie (see
+	-- decision_pair_newer). A legacy granted record with NO stamp cannot
+	-- prove it postdates the receipt, so it fails closed to the denial;
+	-- receipts without a decision-time anon snapshot (legacy entries) are
+	-- skipped — they cannot prove actor scope.
 	if client.consent_state == "granted" then
 		local stale_denial = nil
 		for i = 1, #client.consent_outbox do
@@ -899,10 +951,13 @@ function M.new(config)
 				and receipt.categories.analytics == false
 				and receipt.anonymous_id == client.anonymous_id
 				and type(receipt.decided_at) == "string"
-				and (client.consent_decided_at == nil
-					or receipt.decided_at > client.consent_decided_at)
+				and decision_pair_newer(receipt.decided_at,
+					receipt.decision_seq, client.consent_decided_at,
+					client.consent_decision_seq)
 				and (stale_denial == nil
-					or receipt.decided_at > stale_denial.decided_at) then
+					or decision_pair_newer(receipt.decided_at,
+						receipt.decision_seq, stale_denial.decided_at,
+						stale_denial.decision_seq)) then
 				stale_denial = receipt
 			end
 		end
@@ -910,6 +965,7 @@ function M.new(config)
 			client.consent_state = stale_denial.reason == "denied_forced_minor"
 				and "denied_forced_minor" or "denied"
 			client.consent_decided_at = stale_denial.decided_at
+			client.consent_decision_seq = stale_denial.decision_seq or 0
 			consent_state = client.consent_state
 			if not client:persist_identity() then
 				client.stats.consent_persist_failed =
@@ -1157,12 +1213,14 @@ function Client:persist_identity()
 	local record = { anonymous_id = self.anonymous_id }
 	if self.consent_state == "granted" or consent_denied_state(self.consent_state) then
 		record.consent_analytics = self.consent_state
-		-- The decision's own stamp rides the record so a later granted
-		-- restore can be cross-checked against strictly-newer retained
-		-- denial receipts (the boot belt). Absent for legacy records — the
-		-- belt then fails closed to a retained denial.
+		-- The decision's own (stamp, seq) pair rides the record so a later
+		-- granted restore can be cross-checked against strictly-newer
+		-- retained denial receipts (the boot belt); the seq breaks
+		-- same-second stamp ties. Absent for legacy records — the belt then
+		-- fails closed to a retained denial.
 		if type(self.consent_decided_at) == "string" then
 			record.consent_decided_at = self.consent_decided_at
+			record.consent_decision_seq = self.consent_decision_seq or 0
 		end
 	end
 	-- The experiments subject id rides the identity record whenever one is
@@ -1668,10 +1726,16 @@ function Client:set_consent(decision)
 			self.experiments:on_analytics_purge()
 		end
 	end
-	-- One decision, one stamp: the identity record persists it (the boot
-	-- belt's comparison base), the receipt below re-uses it, and a
-	-- denied-state write-ahead marker carries it.
+	-- One decision, one (stamp, seq) pair: the identity record persists it
+	-- (the boot belt's comparison base), the receipt below re-uses it, and
+	-- a denied-state write-ahead marker carries it. The stamp is
+	-- second-precision; the monotonic seq — minted strictly above the boot
+	-- floor and every seq this session already minted — is what orders two
+	-- decisions that share a second (godot round-11 parity).
 	self.consent_decided_at = clock.iso_utc()
+	self.consent_decision_seq = math.max(self.consent_seq_floor or 0,
+		self.consent_decision_seq or 0) + 1
+	self.consent_seq_floor = self.consent_decision_seq
 	local marker_durable = true
 	if not granted then
 		-- WRITE-AHEAD DENIAL MARKER — written BEFORE the identity write so a
@@ -1689,6 +1753,7 @@ function Client:set_consent(decision)
 			consent_analytics = next_state,
 			anonymous_id = self.anonymous_id,
 			decided_at = self.consent_decided_at,
+			decision_seq = self.consent_decision_seq,
 		})
 	end
 	local persisted = self:persist_identity()
@@ -2651,7 +2716,12 @@ function Client:denial_receipt_retained_durably()
 			and receipt.anonymous_id == self.anonymous_id
 			and type(receipt.decided_at) == "string"
 			and (self.consent_decided_at == nil
-				or receipt.decided_at >= self.consent_decided_at) then
+				or decision_pair_newer(receipt.decided_at,
+					receipt.decision_seq, self.consent_decided_at,
+					self.consent_decision_seq)
+				or (receipt.decided_at == self.consent_decided_at
+					and (receipt.decision_seq or 0)
+						== (self.consent_decision_seq or 0))) then
 			return true
 		end
 	end
@@ -2678,11 +2748,14 @@ function Client:send_consent_decision()
 		-- credential and the parked predicate.
 		kind = kind,
 		categories = { analytics = self.consent_state == "granted" },
-		-- The stamp set_consent minted for THIS decision — shared with the
-		-- identity record and any write-ahead denial marker, so the boot
-		-- belt's strictly-newer comparison never trips over two clock reads
-		-- of one decision.
+		-- The (stamp, seq) pair set_consent minted for THIS decision —
+		-- shared with the identity record and any write-ahead denial
+		-- marker, so the boot belt's strictly-newer comparison never trips
+		-- over two clock reads (or two seq mints) of one decision. The seq
+		-- is retention metadata like anonymous_id below: persisted with the
+		-- receipt, never on the wire.
 		decided_at = self.consent_decided_at or clock.iso_utc(),
+		decision_seq = self.consent_decision_seq or 0,
 		idempotency_key = id.uuid_v7(),
 		-- Retention metadata, never sent on the wire: the decision-time
 		-- anonymous id, so a later Mode B launch whose identity changed can

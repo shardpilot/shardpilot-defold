@@ -1134,6 +1134,13 @@ local function sanitize_outbox_entries(entries)
 				actor_identifier = entry.actor_identifier,
 				kind = entry.kind or "anon",
 				decided_at = entry.decided_at,
+				-- Retention-only tie-break metadata (never on the wire):
+				-- legacy or malformed values backfill 0, preserving the
+				-- pre-seq strict-stamp ordering for legacy entries rather
+				-- than dropping a receipt over metadata.
+				decision_seq = (type(entry.decision_seq) == "number"
+					and entry.decision_seq >= 0)
+					and math.floor(entry.decision_seq) or 0,
 				categories = { analytics = entry.categories.analytics },
 				reason = entry.reason,
 				anonymous_id = entry.anonymous_id,
