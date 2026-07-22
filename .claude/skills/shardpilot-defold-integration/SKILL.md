@@ -30,10 +30,11 @@ the deeper reference.
 - **Crash reporting**: a separate `shardpilot.crash` module posting crash
   report JSON to a dedicated crash ingest endpoint, with PII scrubbing,
   write-ahead pending storage, and deterministic non-fatal sampling.
-- **Not provided today**: no automatic capture of live Lua script errors (you
-  wire your own error handler and call `crash.emit_fatal`), no experiment
-  assignment endpoint, no automatic remote-config refresh, no packaged release
-  ZIP assets (source archives only).
+- **Not provided today**: no experiment assignment endpoint, no automatic
+  remote-config refresh, no packaged release ZIP assets (source archives
+  only). (Live Lua script-error capture IS available as the opt-in
+  `script_error_capture_enabled` crash flag, default off — see the crash
+  section.)
 - **Pre-launch**: the production ingest domain is not provisioned yet; use
   local/develop endpoints. The SDK is v0 alpha and the API may change before
   v1.
@@ -302,8 +303,10 @@ crash.init({
   app_version      = "1.2.3",
   -- platform = "windows", -- auto-detected in-engine; REQUIRED explicitly
   --                       -- outside Defold, or init fails platform_required
+  -- script_error_capture_enabled = true, -- opt-in Lua script-error auto-capture (dark by default)
 })
-crash.capture_previous()  -- once, early in init(): forwards last session's native dump, if any
+-- crash.init auto-forwards last session's native dump (ADR-0297 §7c);
+-- set capture_previous_on_boot = false to call crash.capture_previous() manually instead.
 crash.record_breadcrumb("menu.open")
 ```
 
@@ -336,9 +339,18 @@ crash.record_breadcrumb("menu.open")
   `crash.snapshot().persist_failed` counts these.
   `crash.capture_previous()` runs a resend pass; `crash.resend_pending()`
   retries later in-session.
-- **No automatic Lua script-error capture**: wire your own error handler (e.g.
-  Defold's `sys.set_error_handler`) and call `crash.emit_fatal` with an
-  `exception` + pre-symbolicated frames yourself.
+- **Opt-in Lua script-error auto-capture** (`script_error_capture_enabled =
+  true`, default **off**): the SDK installs a `sys.set_error_handler` handler
+  forwarding each unhandled script error as a fatal `lua_error` report
+  (message → reason, traceback → `raw_text`), capped at 10 per session and
+  gated on the opt-out. Defold has ONE process-wide handler slot — opting in
+  replaces a game-installed handler; keep it off and call `crash.emit_fatal`
+  from your own handler if you need both.
+- **Engine-module symbol identity**: the `dmengine` module's `debug_id` is
+  synthesized as `dmengine-<version_sha1>` from `sys.get_engine_info()`, so
+  uploading Defold's published per-release engine symbols under that debug id
+  makes engine frames resolve; other modules stay name-keyed (the engine
+  exposes no debug ids for them).
 
 ## Offline / spool expectations
 
@@ -431,9 +443,11 @@ Stated plainly so integrations do not trip on them:
   embedded runtime, plus Lua 5.4 host-only). No CI job builds the SDK inside
   the Defold engine/bob toolchain — the in-engine build check is a manual
   release step, so validate your integrated game in the engine yourself.
-- **No Lua script-error auto-capture**: the crash module forwards
-  previous-session native dumps and accepts manual `emit`/`emit_fatal`, but
-  live Lua errors are only reported if you wire your own error handler.
+- **Lua script-error auto-capture is OPT-IN and replaces the handler slot**:
+  live Lua errors report only when `script_error_capture_enabled = true`
+  (default off), and opting in installs the SDK's `sys.set_error_handler`
+  handler into Defold's single process-wide slot — keep the flag off and
+  call `crash.emit_fatal` from your own handler if you need both.
 - **Pre-launch platform**: no production ingest domain is provisioned; the
   hosted docs site is not live yet. Use local/develop endpoints and the
   in-repo `docs/` as the reference.

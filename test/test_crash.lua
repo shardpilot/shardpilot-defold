@@ -12,6 +12,18 @@ sys = {
 	get_sys_info = function()
 		return { system_name = "Linux" }
 	end,
+	-- ADR-0297 §7c: the engine build identity dump.lua synthesizes the
+	-- dmengine debug_id from. Overridable per test; reset() restores it.
+	engine_info = { version = "1.9.8", version_sha1 = "8f3e0a1b2c4d5e6f708192a3b4c5d6e7f8091a2b" },
+	get_engine_info = function()
+		return sys.engine_info
+	end,
+	-- The single process-wide Defold error-handler slot (ADR-0297 §7c
+	-- script-error capture installs into it). reset() clears it.
+	error_handler = nil,
+	set_error_handler = function(handler)
+		sys.error_handler = handler
+	end,
 }
 
 local requests = {}
@@ -272,6 +284,8 @@ local function reset()
 	next_status = 202
 	next_response_body = nil
 	next_response_headers = nil
+	sys.error_handler = nil
+	sys.engine_info = { version = "1.9.8", version_sha1 = "8f3e0a1b2c4d5e6f708192a3b4c5d6e7f8091a2b" }
 	-- Every emit persists write-ahead to the pending sidecar, so a test that
 	-- leaves entries behind would leak resends into the next test's
 	-- capture_previous. Start every test from a clean store.
@@ -300,6 +314,10 @@ local function test_config_validation()
 		{ { crash_source = string.rep("a", 64) }, "invalid_crash_source" },
 		{ { diagnostics = 42 }, "invalid_diagnostics" },
 		{ { sampler = 42 }, "invalid_sampler" },
+		{ { capture_previous_on_boot = 1 }, "invalid_capture_previous_on_boot" },
+		{ { capture_previous_on_boot = "false" }, "invalid_capture_previous_on_boot" },
+		{ { script_error_capture_enabled = 1 }, "invalid_script_error_capture_enabled" },
+		{ { script_error_capture_enabled = "yes" }, "invalid_script_error_capture_enabled" },
 	}
 	for _, entry in ipairs(cases) do
 		client, err = crash.new(config(entry[1]))
@@ -1224,7 +1242,11 @@ local function fake_crash_module(opts)
 	local module = {
 		SYSFIELD_SYSTEM_NAME = 1,
 		SYSFIELD_SYSTEM_VERSION = 2,
+		SYSFIELD_ENGINE_HASH = 3,
 		load_previous = function()
+			-- Counted so the opt-out tests can assert the one-shot dump was
+			-- left UNREAD (ADR-0297 §7c boot auto-capture).
+			opts.load_calls = (opts.load_calls or 0) + 1
 			return opts.handle
 		end,
 		release = function()
@@ -1244,6 +1266,8 @@ local function fake_crash_module(opts)
 				return opts.os_name
 			elseif field == 2 then
 				return opts.os_version
+			elseif field == 3 then
+				return opts.engine_hash
 			end
 			return nil
 		end,
@@ -1295,6 +1319,222 @@ local function test_capture_previous_forwards_native_dump()
 	assert_contains(body, '"load_address":"0x1000"')
 	assert_contains(body, '"instruction_addr":"0x1abc"')
 	assert_contains(body, '"instruction_addr":"0x1def"')
+end
+
+-- ---------------------------------------------------------------------------
+-- ADR-0297 §7c: engine-module symbol identity, boot auto-capture, and the
+-- opt-in script-error capture.
+-- ---------------------------------------------------------------------------
+
+local function test_engine_module_debug_id_synthesized()
+	reset()
+	local module = fake_crash_module({
+		handle = 7,
+		signum = 11,
+		modules = {
+			{ name = "dmengine", address = 0x4000 },
+			{ name = "libgame.so", address = 0x1000 },
+		},
+		backtrace = { { address = 0x4abc } },
+	})
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:capture_previous(module))
+	assert_equal(#requests, 1)
+	local body = requests[1].body
+	-- The ENGINE module's identity travels in debug_id (dmengine-<sha1>): the
+	-- CLI/door uploads the published per-release engine .sym under the SAME
+	-- id, so resolution rides the standard keying with no side-channel.
+	assert_contains(body, '"name":"dmengine"')
+	assert_contains(body, '"debug_id":"dmengine-8f3e0a1b2c4d5e6f708192a3b4c5d6e7f8091a2b"')
+	-- Non-engine modules keep the name-keyed honest fallback (the engine
+	-- exposes no debug ids for native-extension modules).
+	assert_contains(body, '"debug_id":"libgame.so"')
+end
+
+local function test_engine_module_debug_id_prefers_dump_engine_hash()
+	reset()
+	-- The dump belongs to the PREVIOUS session: after an engine update the
+	-- current runtime's sha1 is the WRONG identity, so the crashed engine's
+	-- own hash (SYSFIELD_ENGINE_HASH, stored on the dump) wins.
+	local module = fake_crash_module({
+		handle = 7,
+		engine_hash = "0ldc0ffee0ldc0ffee0ldc0ffee0ldc0ffee0ld",
+		modules = { { name = "dmengine", address = 0x4000 } },
+		backtrace = { { address = 0x4abc } },
+	})
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:capture_previous(module))
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"debug_id":"dmengine-0ldc0ffee0ldc0ffee0ldc0ffee0ldc0ffee0ld"')
+	assert_not_contains(requests[1].body, "8f3e0a1b2c4d5e6f708192a3b4c5d6e7f8091a2b")
+end
+
+local function test_engine_module_debug_id_matches_platform_name_shapes()
+	reset()
+	-- Defold's engine binary is listed as [lib]dmengine[.exe|.so] depending
+	-- on platform; every shape must synthesize the sha1 identity while the
+	-- wire keeps the ORIGINAL module name.
+	local module = fake_crash_module({
+		handle = 7,
+		modules = {
+			{ name = "libdmengine.so", address = 0x4000 },
+			{ name = "dmengine.exe", address = 0x8000 },
+			{ name = "/data/app/lib/arm64/libdmengine.so", address = 0xc000 },
+		},
+		backtrace = { { address = 0x4abc } },
+	})
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:capture_previous(module))
+	assert_equal(#requests, 1)
+	local body = requests[1].body
+	assert_contains(body, '"name":"libdmengine.so"')
+	assert_contains(body, '"name":"dmengine.exe"')
+	local _, count = body:gsub('"debug_id":"dmengine%-8f3e0a1b2c4d5e6f708192a3b4c5d6e7f8091a2b"', "")
+	assert_equal(count, 3, "every engine-name shape must synthesize the sha1 identity")
+end
+
+local function test_engine_module_debug_id_falls_back_without_engine_info()
+	reset()
+	-- No engine identity available (an exotic host / API failure): dmengine
+	-- keeps the name-keyed fallback rather than shipping a fabricated id.
+	sys.engine_info = nil
+	local module = fake_crash_module({
+		handle = 7,
+		modules = { { name = "dmengine", address = 0x4000 } },
+		backtrace = { { address = 0x4abc } },
+	})
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:capture_previous(module))
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"debug_id":"dmengine"')
+	assert_not_contains(requests[1].body, '"debug_id":"dmengine-"')
+end
+
+local function test_init_auto_captures_previous_dump_on_boot()
+	reset()
+	local opts = {
+		handle = 7,
+		signum = 11,
+		modules = { { name = "dmengine", address = 0x4000 } },
+		backtrace = { { address = 0x4abc } },
+	}
+	local module = fake_crash_module(opts)
+	rawset(_G, "crash", module)
+	-- crash.init (the boot entry) forwards the previous-session dump itself —
+	-- no manual capture_previous() call anywhere in this test.
+	assert_true(crash.init(config({ sample_every = 1 })))
+	rawset(_G, "crash", nil)
+	assert_equal(opts.load_calls, 1, "boot auto-capture must read the one-shot dump")
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"type":"SIGSEGV"')
+	assert_true(crash.shutdown())
+end
+
+local function test_init_auto_capture_disabled_by_flag()
+	reset()
+	local opts = {
+		handle = 7,
+		modules = { { name = "dmengine", address = 0x4000 } },
+		backtrace = { { address = 0x4abc } },
+	}
+	local module = fake_crash_module(opts)
+	rawset(_G, "crash", module)
+	assert_true(crash.init(config({ sample_every = 1, capture_previous_on_boot = false })))
+	rawset(_G, "crash", nil)
+	assert_equal(opts.load_calls, nil, "the flag must keep the dump untouched for a manual flow")
+	assert_equal(#requests, 0)
+	assert_true(crash.shutdown())
+end
+
+local function test_init_auto_capture_respects_persisted_opt_out()
+	reset()
+	-- Persist the opt-out first (a previous session's set_enabled(false)).
+	local prior = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(prior:set_enabled(false))
+	local opts = {
+		handle = 7,
+		modules = { { name = "dmengine", address = 0x4000 } },
+		backtrace = { { address = 0x4abc } },
+	}
+	local module = fake_crash_module(opts)
+	rawset(_G, "crash", module)
+	assert_true(crash.init(config({ sample_every = 1 })))
+	rawset(_G, "crash", nil)
+	-- Disabled ⇒ the one-shot dump stays UNREAD (a later re-enable can still
+	-- forward it) and nothing is sent.
+	assert_equal(opts.load_calls, nil, "opt-out must leave the one-shot dump unread")
+	assert_equal(#requests, 0)
+	assert_true(crash.shutdown())
+end
+
+local function test_script_error_capture_dark_by_default()
+	reset()
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_equal(sys.error_handler, nil, "the dark default must never touch sys.set_error_handler")
+	assert_true(client ~= nil)
+end
+
+local function test_script_error_capture_reports_fatal()
+	reset()
+	assert(crash.new(config({ sample_every = 1000, script_error_capture_enabled = true })))
+	assert_true(type(sys.error_handler) == "function", "opt-in must install the handler")
+	sys.error_handler("lua", "main/game.script:12: attempt to index nil", "stack traceback:\n  main/game.script:12: in function update")
+	-- Fatal: the 1-in-1000 sampler must not suppress it.
+	assert_equal(#requests, 1)
+	local body = requests[1].body
+	assert_contains(body, '"type":"lua_error"')
+	assert_contains(body, '"reason":"main/game.script:12: attempt to index nil"')
+	assert_contains(body, '"raw_text":"stack traceback:')
+	assert_contains(body, '"script_error_source":"lua"')
+end
+
+local function test_script_error_capture_caps_per_session()
+	reset()
+	assert(crash.new(config({ sample_every = 1, script_error_capture_enabled = true })))
+	for i = 1, 14 do
+		sys.error_handler("lua", "boom " .. i, "stack traceback: loop")
+	end
+	-- The per-session cap (10) bounds a per-frame error loop — fatal reports
+	-- bypass sampling, so the cap is the only brake on this path.
+	assert_equal(#requests, 10)
+end
+
+local function test_script_error_capture_defers_install_while_opted_out()
+	reset()
+	-- Persist the opt-out, then boot with the flag on: the game's handler
+	-- slot must stay untouched (Defold has ONE process-wide slot).
+	local prior = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(prior:set_enabled(false))
+	local client = assert(crash.new(config({ sample_every = 1, script_error_capture_enabled = true })))
+	assert_equal(sys.error_handler, nil, "an opted-out boot must not install the handler")
+	-- Re-enabling is the first enabled instant: the handler installs then.
+	assert_true(client:set_enabled(true))
+	assert_true(type(sys.error_handler) == "function", "re-enable must install the deferred handler")
+	sys.error_handler("lua", "boom after re-enable", "stack traceback: x")
+	assert_equal(#requests, 1)
+end
+
+local function test_script_error_capture_reports_without_traceback()
+	reset()
+	assert(crash.new(config({ sample_every = 1, script_error_capture_enabled = true })))
+	-- Some runtime callbacks pass no traceback: the message doubles as
+	-- raw_text so the report still ships (frames_or_raw_text_required).
+	sys.error_handler("lua", "main/game.script:7: boom", nil)
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"raw_text":"main/game.script:7: boom"')
+	-- Neither message nor traceback: a marker still ships the error.
+	sys.error_handler(nil, nil, nil)
+	assert_equal(#requests, 2)
+	assert_contains(requests[2].body, '"raw_text":"lua script error (no message or traceback)"')
+end
+
+local function test_script_error_capture_respects_opt_out()
+	reset()
+	local client = assert(crash.new(config({ sample_every = 1, script_error_capture_enabled = true })))
+	assert_true(client:set_enabled(false))
+	local ok = client:on_script_error("lua", "boom", "stack traceback: x")
+	assert_equal(ok, true, "the handler must swallow, never throw into the engine")
+	assert_equal(#requests, 0)
 end
 
 local function test_capture_previous_drops_dump_without_modules()
@@ -5188,6 +5428,19 @@ local tests = {
 	test_unauthorized_surfaced,
 	test_capture_previous_no_dump,
 	test_capture_previous_forwards_native_dump,
+	test_engine_module_debug_id_synthesized,
+	test_engine_module_debug_id_prefers_dump_engine_hash,
+	test_engine_module_debug_id_matches_platform_name_shapes,
+	test_engine_module_debug_id_falls_back_without_engine_info,
+	test_init_auto_captures_previous_dump_on_boot,
+	test_init_auto_capture_disabled_by_flag,
+	test_init_auto_capture_respects_persisted_opt_out,
+	test_script_error_capture_dark_by_default,
+	test_script_error_capture_reports_fatal,
+	test_script_error_capture_caps_per_session,
+	test_script_error_capture_defers_install_while_opted_out,
+	test_script_error_capture_reports_without_traceback,
+	test_script_error_capture_respects_opt_out,
 	test_capture_previous_drops_dump_without_modules,
 	test_dump_event_builder_unit,
 	test_singleton_guard_and_flow,

@@ -45,14 +45,15 @@ function init(self)
 	-- key — see docs/crash.md. It is ON by default (independent of the
 	-- analytics consent above) with a persisted per-app opt-out:
 	-- crash.set_enabled(false) stops collection entirely.
+	-- init auto-forwards a previous-session native crash dump (set
+	-- capture_previous_on_boot = false for the manual flow).
 	crash.init({
 		crash_ingest_url = "http://localhost:8080",
 		crash_api_key = "sp_crash_write_placeholder",
 		app_id = "app-example",
 		crash_source = "game-client",
+		-- script_error_capture_enabled = true, -- opt-in Lua error auto-capture
 	})
-	-- Forward a previous-session native crash dump, if any.
-	crash.capture_previous()
 
 	-- Offline durability: snapshot undelivered events to the durable spool
 	-- when the app loses focus or is iconified — on mobile an iconified app

@@ -74,10 +74,82 @@ local function read_sys_field(crash_module, handle, field)
 	return nil
 end
 
+-- The Defold engine module's canonical name. Its symbol identity is
+-- special-cased below (ADR-0297 §7c).
+local ENGINE_MODULE_NAME = "dmengine"
+
+-- is_engine_module_name normalizes a dump module name before the engine
+-- match: Defold's symbol docs list the engine binary as
+-- `[lib]dmengine[.exe|.so]` depending on platform (plus `.dylib` on macOS
+-- builds), and the dump list may carry a path. The wire keeps the ORIGINAL
+-- name; only the debug-id synthesis matches on the normalized basename
+-- (Codex #41 round 1 — an exact "dmengine" match missed `libdmengine.so`
+-- and `dmengine.exe`, silently falling back to name keying).
+local function is_engine_module_name(name)
+	local base = name:match("([^/\\]+)$") or name
+	base = base:lower()
+	if base:sub(1, 3) == "lib" then
+		base = base:sub(4)
+	end
+	for _, suffix in ipairs({ ".exe", ".so", ".dylib" }) do
+		if base:sub(-#suffix) == suffix then
+			base = base:sub(1, #base - #suffix)
+			break
+		end
+	end
+	return base == ENGINE_MODULE_NAME
+end
+
+-- Read the engine build sha1 from sys.get_engine_info() (the stable Defold
+-- API: returns `version` + `version_sha1`). Nil when the API is unavailable
+-- (tests without the stub, exotic hosts) or the field is missing. Never
+-- raises. This is the FALLBACK identity source only — see engine_dump_sha1.
+local function engine_version_sha1()
+	if type(sys) ~= "table" or type(sys.get_engine_info) ~= "function" then
+		return nil
+	end
+	local ok, info = pcall(sys.get_engine_info)
+	if not ok or type(info) ~= "table" then
+		return nil
+	end
+	local sha1 = info.version_sha1
+	if type(sha1) ~= "string" or sha1 == "" then
+		return nil
+	end
+	return sha1
+end
+
+-- The engine identity of the CRASHED process (Codex #41 round 3): the dump
+-- belongs to the PREVIOUS session, and an app/engine update between the
+-- crash and this launch makes the current runtime's sha1 the WRONG identity
+-- (uploaded symbols for the crashed binary would never match). Defold stores
+-- the crashed engine's hash ON the dump (crash.SYSFIELD_ENGINE_HASH), so
+-- that is the authoritative source; the current engine info is only the
+-- fallback for dumps/hosts that do not expose the sysfield — where the two
+-- could differ, a same-version launch is also the overwhelmingly common
+-- case. Never raises.
+local function engine_dump_sha1(crash_module, handle)
+	if crash_module.SYSFIELD_ENGINE_HASH ~= nil then
+		local hash = read_sys_field(crash_module, handle, crash_module.SYSFIELD_ENGINE_HASH)
+		if hash then
+			return hash
+		end
+	end
+	return engine_version_sha1()
+end
+
 -- Build the modules[] from the dump's module list. Each module carries a name +
--- a base load address; the engine does not expose debug ids, so debug_id is set
--- to the module name as a stable reference (the server requires debug_id OR
--- build_id and a load/base address). Modules without a usable address are
+-- a base load address. Symbol identity (ADR-0297 §7c): the ENGINE module's
+-- debug_id is synthesized as `dmengine-<engine sha1>` from the CRASHED
+-- process's own hash (engine_dump_sha1 above; current engine info is the
+-- fallback) — collision-free across engine versions and matching
+-- how Defold publishes per-release engine symbols keyed by sha1, so the
+-- CLI/door uploads the published engine `.sym` under the SAME debug_id and
+-- resolution rides the standard identity keying with no side-channel. The
+-- engine exposes NO debug ids for any OTHER module in the dump list, so
+-- non-engine modules remain NAME-keyed (the server requires debug_id OR
+-- build_id and a load/base address) — an engine-limitation-constrained honest
+-- fallback, stated in docs/crash.md. Modules without a usable address are
 -- dropped.
 local function build_modules(crash_module, handle)
 	local ok, raw = pcall(crash_module.get_modules, handle)
@@ -90,11 +162,16 @@ local function build_modules(crash_module, handle)
 			local address = to_hex_address(entry.address)
 			local name = entry.name
 			if type(name) == "string" and name ~= "" and address then
+				local debug_id = name
+				if is_engine_module_name(name) then
+					local sha1 = engine_dump_sha1(crash_module, handle)
+					if sha1 then
+						debug_id = ENGINE_MODULE_NAME .. "-" .. sha1
+					end
+				end
 				modules[#modules + 1] = {
 					name = name,
-					-- No debug id from the engine: use the module name as a stable
-					-- reference so the server's debug_id-or-build_id rule is met.
-					debug_id = name,
+					debug_id = debug_id,
 					load_address = address,
 				}
 			end

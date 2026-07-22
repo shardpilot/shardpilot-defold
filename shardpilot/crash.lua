@@ -21,6 +21,18 @@ function M.init(config)
 		return false, err
 	end
 	default_client = client
+	-- ADR-0297 §7c boot auto-capture (ON by default; disable with
+	-- `capture_previous_on_boot = false`): forward the previous session's
+	-- native crash dump — and run the serial resend pass over any pending
+	-- backlog — as part of init, so integrators no longer wire the manual
+	-- capture_previous() call. Best-effort and never a reason for init to
+	-- fail; the persisted opt-out still gates it inside capture_previous
+	-- (disabled ⇒ the one-shot dump stays UNREAD for a later re-enable).
+	-- Hosts constructing via crash.new manage their own boot and keep the
+	-- manual call.
+	if client.config.capture_previous_on_boot then
+		pcall(client.capture_previous, client)
+	end
 	return true
 end
 
