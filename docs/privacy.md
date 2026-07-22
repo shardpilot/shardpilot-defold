@@ -42,6 +42,19 @@ explicit **granted** decision opens the event pipeline.
   grant.
 - **Granted** opens the pipeline for FUTURE events only — events and samples
   dropped while consent was unknown are gone by design.
+- **The persisted decision belongs to the actor that made it.** A configured
+  `anonymous_id` override that replaces a DIFFERENT valid persisted
+  anonymous id boots a **fresh identity**: consent starts `unknown`, the
+  previous actor's persisted decision is ignored — never applied to the new
+  actor, which must decide for itself — the offline spool is purged through
+  the standard non-granted init path (a failed purge fails closed under the
+  same owed-wipe rule), and the identity rewrite persists the override with
+  **no consent state carried over**, so the old decision is not re-recorded
+  under the new id. A matching override — or none — restores the persisted
+  decision unchanged. The reset is surfaced via the `diagnostics` hook as
+  `scope = "consent"`, code `identity_override_changed`. Retained consent
+  receipts are unaffected: they document the previous actor's own decisions
+  and keep their normal load/delivery rules.
 - **Denied** drops events at enqueue (`false, "consent_denied"`), clears the
   pending queue, discards in-flight batches on completion instead of retrying
   them, and purges the offline spool (see below).

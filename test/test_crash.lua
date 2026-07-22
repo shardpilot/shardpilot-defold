@@ -4758,6 +4758,72 @@ local function test_pass_stops_on_concurrent_fatal_throttle()
 	storage.reset()
 end
 
+-- Fleet queued-past-gate audit pin (2026-07-21): dispatch_pending's enabled
+-- recheck. A set_enabled(false) landing while a serial resend pass has a
+-- report in flight (the transport is async in the real runtime) must stop
+-- the pass at the NEXT dispatch gate — the egress gate holds at every
+-- dispatch point, not only at pass start. The recheck exists; this pins the
+-- disable landing between item N's settlement and item N+1's dispatch.
+local function test_mid_pass_disable_stops_pass_before_next_dispatch()
+	reset()
+	local restore = install_fake_sys_storage()
+	local scope = { app_id = "midpass-disable-app" }
+
+	-- Seed three pending reports.
+	next_status = 500
+	local seeder = assert(crash.new(config({ app_id = "midpass-disable-app", sample_every = 1 })))
+	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "D1x" } })))
+	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "D2x" } })))
+	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "D3x" } })))
+	assert_equal(#storage.load_pending_crashes(scope), 3)
+
+	reset()
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		held[#held + 1] = callback
+	end
+
+	local client = assert(crash.new(config({ app_id = "midpass-disable-app", sample_every = 1 })))
+	client:resend_pending()
+	assert_equal(#requests, 1, "the pass has D1 in flight")
+	assert_contains(requests[1].body, '"D1x"')
+
+	-- The opt-out lands while D1 is still on the wire.
+	assert_true(client:set_enabled(false))
+
+	-- D1 settles accepted: its own pending copy leaves (it egressed while
+	-- enabled), but the pass must stop BEFORE dispatching D2.
+	held[1](nil, nil, { status = 202, response = '{"crash_id":"x"}' })
+	assert_equal(#requests, 1, "exactly one request egressed — D2 was never dispatched")
+	assert_equal(client.resend_active, false, "the stopped pass released its active flag")
+	local pending = storage.load_pending_crashes(scope)
+	assert_equal(#pending, 2, "D2 and D3 stay durably pending")
+
+	-- Nothing further egresses while disabled.
+	local resend_ok, resend_err = client:resend_pending()
+	assert_equal(resend_ok, false)
+	assert_equal(resend_err, "crash_disabled")
+	assert_equal(#requests, 1, "a disabled client dispatches nothing")
+
+	-- An explicit re-enable delivers the enabled-period remainder (within
+	-- the pending TTL), oldest first.
+	assert_true(client:set_enabled(true))
+	assert_true(client:resend_pending())
+	assert_equal(#requests, 2, "the re-enabled pass resumed with D2")
+	assert_contains(requests[2].body, '"D2x"')
+	held[2](nil, nil, { status = 202, response = '{"crash_id":"x"}' })
+	assert_equal(#requests, 3, "the settled D2 chained D3")
+	assert_contains(requests[3].body, '"D3x"')
+	held[3](nil, nil, { status = 202, response = '{"crash_id":"x"}' })
+	assert_equal(#storage.load_pending_crashes(scope), 0, "everything settled")
+
+	http.request = saved_request
+	restore()
+	storage.reset()
+end
+
 -- ── crash-reporting opt-out ──────────────────────────────────────────────────
 
 -- Crash reporting is ON by default (no first-run decision needed); an
@@ -5217,6 +5283,7 @@ local tests = {
 	test_deferral_stat_clears_with_window,
 	test_resend_skips_tokens_in_flight,
 	test_pass_stops_on_concurrent_fatal_throttle,
+	test_mid_pass_disable_stops_pass_before_next_dispatch,
 	test_crash_enabled_by_default_and_opt_out_blocks_collection,
 	test_crash_settings_absent_record_defaults_on,
 	test_crash_settings_read_error_fails_closed,

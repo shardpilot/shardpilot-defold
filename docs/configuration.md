@@ -47,7 +47,10 @@ Required fields are `ingest_url`, `workspace_id`, `app_id`, `environment_id`,
 and exactly one auth source (`token_provider` OR `api_key`). A UUIDv7 anonymous
 ID is generated and persisted automatically (config `anonymous_id` or
 `set_anonymous_id` override it); `identify(user_id)` upgrades attribution to a
-known user. `get_anonymous_id()` returns the persisted anonymous ID so a host
+known user. A config `anonymous_id` that replaces a DIFFERENT persisted
+identity boots a fresh one: the previous actor's persisted consent decision
+is not carried over (consent starts `unknown`) and their offline spool is
+purged at init — see `docs/privacy.md`. `get_anonymous_id()` returns the persisted anonymous ID so a host
 can hand it to its own backend at token-mint time; the SDK always sends, on the
 wire, the same anonymous ID it returns.
 
@@ -203,11 +206,17 @@ service de-duplicates re-sends; when a `429` `Retry-After` arrives while a
 batch is spooled, the deadline is stored with the record and a relaunch
 inside the window waits out the remainder before re-sending. Under Mode B
 auth, spooled envelopes whose
-`anonymous_id` no longer matches the client's (an init-time `anonymous_id`
-override changed the identity) are dropped from the record at load and
+`anonymous_id` no longer matches the client's (the stored anonymous id was
+replaced at load — the corrupt/oversized-record self-heal) are dropped from
+the record at load and
 surfaced via `diagnostics` (`scope = "spool"`, code `identity_changed`) — the
 minted token binds the current identity, so re-sending them would be rejected;
-Mode A re-sends historic identities unchanged.
+Mode A re-sends historic identities unchanged. A configured `anonymous_id`
+override that replaces a DIFFERENT persisted identity never gets that far:
+it boots a fresh identity in both modes — consent `unknown`, spool purged at
+init, nothing of the previous actor's decision applied (diagnosed
+`scope = "consent"`, code `identity_override_changed`; see
+`docs/privacy.md`).
 
 Durability is strict: on a runtime without the save-file API the spool falls
 back to process memory (in-process retries keep working), but
@@ -253,7 +262,10 @@ spool it reports `{ scope = "spool", status = "dropped", code, count }`; and
 when a consent receipt is dropped (a permanent rejection, an overflow of
 the outbox cap, or the Mode-B-only identity-change drop at load) it reports
 `{ scope = "consent", status = "dropped", code }` (codes `outbox_overflow`
-and `identity_changed` carry a `count`).
+and `identity_changed` carry a `count`); and when a configured
+`anonymous_id` override replaces a different persisted identity, the
+fresh-identity reset is reported as
+`{ scope = "consent", status = "dropped", code = "identity_override_changed" }`.
 Counts are also available on `snapshot()` (`accepted`,
 `rejected`, `duplicates`, `observed`, `suppressed`, `last_event_issue`, plus
 the spool counters `spooled`, `spool_resent`, `spool_evicted`,

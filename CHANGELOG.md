@@ -6,6 +6,132 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **A changed configured `anonymous_id` no longer inherits the previous
+  actor's consent (fresh identity on override mismatch).** A config
+  `anonymous_id` override that replaces a DIFFERENT valid persisted
+  anonymous id used to install the new actor while restoring the old
+  record's consent decision — the fresh actor booted `granted` without ever
+  deciding, loaded the old actor's offline spool, and the boot rewrite
+  durably re-recorded the old decision under the new id. Fleet rule
+  adopted: such an override boots a FRESH identity — consent `unknown`, the
+  persisted decision ignored (never applied to the new actor), the spool
+  purged through the standard non-granted init path (a failed purge fails
+  closed under the owed-wipe rule, refusing `set_consent(true)` with
+  `spool_purge_failed` until the wipe lands), and the override persisted
+  with no consent state carried over. A matching override — or none —
+  restores unchanged. Surfaced via the `diagnostics` hook as
+  `{ scope = "consent", status = "dropped", code = "identity_override_changed" }`.
+  The Mode B in-spool `identity_changed` drop (and the Mode A verbatim
+  re-send) still applies to identity changes inside a restored grant, e.g.
+  the corrupt/oversized-stored-anon self-heal.
+- **The consent-plane deferral resets when an actor change parks the
+  receipt that armed it.** The consent Retry-After/backoff window is
+  plane-wide by design, but when `identify()` switches the vouched actor
+  and thereby PARKS the arming dispatch head, the window used to outlive
+  its owner — holding the next dispatchable head (possibly a fresh denial)
+  for up to the 24h clamp while the parked receipt could not retry at all.
+  An actor change that parks the arming head now clears the deferral and
+  its backoff attempt count; plain same-actor retries, and identity changes
+  that do not park the arming head, keep honoring the window unchanged.
+  Likewise a receipt that parks while its POST is in flight settles
+  retained without arming the window.
+- **Exit summaries survive a full queue: shutdown work rides the durable
+  spool.** Building `perf_summary`/`network_summary` consumes the sampler
+  state, and a full queue at the final flush silently dropped both built
+  summaries (the flush enqueues them before any room is freed) even though
+  the next step delivers or durably spools the queue. A summary refused by
+  a full queue is now retained as an owed snapshot (bounded at one per
+  summary type — no fresh summary is built while one is owed) and
+  re-enqueued once room frees; shutdown's housekeeping passes drain owed
+  summaries after the deferred session end and refuse to finalize over one
+  — like every other owed exit work, a summary is sent, durably spooled, or
+  shutdown stays retryable. A denial still drops owed summaries with the
+  rest of the un-egressed analytics data — and that wipe is where an owed
+  summary counts in `snapshot().dropped`: the queue_full refusal that
+  parked it is retention, not loss, so a summary that later delivers is
+  counted once (published), never double-booked as dropped. The owed
+  snapshot is the BUILT event: actor, anonymous id, session, and
+  timestamps replay verbatim (an `identify()` or anon change between
+  refusal and drain cannot misattribute the old window's samples), Mode
+  B's pending-work refusals (`identify()`'s `events_pending`, the
+  anon-rotation guard) count owed summaries like queued events, and owed
+  entries are pending work for EVERY `flush()` — the flush loop re-drains
+  them into the room it frees and only reports success once nothing stays
+  owed (the documented Mode B flush-then-re-identify recourse cannot hit
+  `events_pending` right after a successful flush), with the update
+  cadence's summary-less flushes delivering already-built owed entries
+  too. `persist()` captures owed summaries as well — enqueued when the
+  queue has room, and otherwise joined to the queue/in-flight remnant in
+  ONE durable write sized against the spool caps as a whole: a partially
+  evicted capture reports `spool_persist_failed` instead of claiming
+  durability over envelopes the append itself pushed out — so a
+  focus-loss snapshot cannot lose a consumed sampler window and cannot
+  overreport what survived it.
+
+- **A denial survives a failed identity write: the write-ahead denial
+  marker.** With a grant persisted on disk, `set_consent(false)` (or
+  `"denied_forced_minor"`) whose identity persist failed used to surface
+  `consent_persist_failed` and leave the OLD granted record authoritative —
+  an app exit before a successful retry made the next `init()` restore
+  `granted` and analytics flowed against an explicit revocation. Every
+  denied-state decision now writes a small per-app write-ahead marker
+  (actor, flavor, decision stamp) BEFORE the identity write; init imposes a
+  present marker over whatever the record restored for ITS OWN actor
+  (`denied_forced_minor` flavor preserved), converges the record, and
+  retires the marker only once the record durably holds the denial. The
+  marker never manufactures a decision for a fresh or overriding actor — a
+  foreign-actor marker stays inert AND stays on disk while its own actor's
+  record is unresolved — and an UNREADABLE marker fails closed over a
+  granted restore only (crash-plane opt-out precedent), without rewriting
+  the record. Belt: a RETAINED (undelivered) denial receipt for this actor
+  whose decision pair is strictly newer than the restored record's blocks a
+  granted restore too (the identity record now persists
+  `consent_decided_at` for the comparison; a legacy stampless grant fails
+  closed to the retained denial). The comparison orders the PAIR
+  `(decided_at, decision_seq)`: the stamp is second-precision, so a
+  monotonic per-install decision seq — minted with every decision, shared
+  by the record, the marker, and the receipt, retention-only (never on the
+  wire), legacy values backfilling 0 — breaks a same-second grant→denial
+  tie fail-closed (with both the marker and record writes failed, the
+  retained receipt's higher seq imposes the denial), while a genuinely
+  newer same-second re-grant, its record carrying the higher seq, stays in
+  charge; fresh mints always rise strictly above every retained seq (the
+  floor is re-derived from record, marker, and retained receipts at boot).
+  Marker imposition compares the same pair: a stale marker the RECORD
+  strictly supersedes (a later grant landed durably while the grant-side
+  best-effort marker clear failed) is retired at boot, never imposed —
+  while an equal-or-newer marker keeps imposing fail-closed. The
+  unreadable-marker fail-closed state is strictly TRANSIENT: the
+  anonymous-id self-heal rewrite is deferred while it is in effect, so the
+  memory-only imposed denial can never durably overwrite a real granted
+  record (the heal re-runs once the marker is readable). And when the boot
+  belt imposes a denial from a retained receipt but its convergence write
+  fails, the write-ahead marker is written as the receipt-independent
+  witness (carrying the receipt's decision pair) before the receipt — the
+  denial's only durable proof — dispatches and leaves the outbox; the
+  shutdown pending flags arm alongside. An IN-FLIGHT denial receipt never
+  counts as the teardown witness (its own acknowledgment is about to
+  consume it — the async ack prunes it from the durable outbox, possibly
+  after a teardown that finalized on its evidence), and the ack path
+  performs the WITNESS HANDOFF: before pruning a denial receipt while the
+  record AND marker writes are both still owed, it retries the marker
+  write with the current decision's pair, so consuming the receipt can
+  never consume the denial's last durable evidence. The experiments
+  consumer is now constructed AFTER the boot belt, so its construction-time
+  cache restore reads the final belt-settled consent state — a stale
+  granted restore no longer arms a live exposure snapshot that the belt's
+  denied flip would leave unreconciled (it arms as re-arm INTENT, like any
+  non-granted restore).
+  Teardown: `shutdown()` refuses
+  (`consent_pending`) while the latest denial has NO durable witness at
+  all — record, marker, and retained receipt (a delivered receipt leaves
+  the outbox and proves nothing to the next boot) — retrying both writes
+  before refusing. Surfaced via diagnostics as `{ scope = "consent",
+  status = "restored", code = "denial_marker_imposed" |
+  "denial_marker_unreadable" | "denial_receipt_newer" }`. Residual,
+  documented: a process KILL before any durable write lands still loses
+  the denial without trace — no client-side ordering can close that
+  window.
 - **Canonical-actor consent-receipt keying (ADR-0222 §1, ADR-0202 2026-07-20
   amendment).** A consent receipt's actor is now chosen by the event plane's
   canonical-actor rule at decision time: the verified `user_id` ONLY when a
