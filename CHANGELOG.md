@@ -6,6 +6,18 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **Crash: boot auto-capture, engine symbol identity, opt-in script-error
+  capture (ADR-0297 §7c).** `crash.init` now forwards the previous-session
+  native dump itself (`capture_previous_on_boot = false` keeps the manual
+  flow; the persisted opt-out still leaves the one-shot dump unread). The
+  `dmengine` module's `debug_id` is synthesized as `dmengine-<version_sha1>`
+  from `sys.get_engine_info()` — matching Defold's published per-release
+  engine symbols — while other modules stay name-keyed. New dark
+  `script_error_capture_enabled` flag (default off) installs a
+  `sys.set_error_handler` handler forwarding unhandled Lua errors as fatal
+  `lua_error` reports (traceback as `raw_text`, 10-per-session cap,
+  opt-out-gated, never throws into the engine).
+
 - **A changed configured `anonymous_id` no longer inherits the previous
   actor's consent (fresh identity on override mismatch).** A config
   `anonymous_id` override that replaces a DIFFERENT valid persisted

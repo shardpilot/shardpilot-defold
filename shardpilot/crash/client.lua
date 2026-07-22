@@ -191,6 +191,23 @@ local function validate_config(config)
 	if config.sampler ~= nil and type(config.sampler) ~= "function" then
 		return nil, "invalid_sampler"
 	end
+	-- ADR-0297 §7c boot auto-capture: ON by default (crash.init forwards the
+	-- previous-session dump itself — the Defold auto-capture model); an
+	-- explicit `capture_previous_on_boot = false` keeps the manual
+	-- capture_previous() flow. Boolean-or-absent, like spool_enabled on the
+	-- analytics client.
+	if config.capture_previous_on_boot ~= nil and type(config.capture_previous_on_boot) ~= "boolean" then
+		return nil, "invalid_capture_previous_on_boot"
+	end
+	-- ADR-0297 §7c script-error auto-capture: DARK by default (the
+	-- experiments_enabled `== true` shape). While off, ZERO handler code
+	-- runs — sys.set_error_handler is never called. Opting in installs the
+	-- SDK's handler; Defold has a single process-wide error-handler slot, so
+	-- hosts that run their own handler should keep this off and call
+	-- emit_fatal themselves (documented in docs/crash.md).
+	if config.script_error_capture_enabled ~= nil and type(config.script_error_capture_enabled) ~= "boolean" then
+		return nil, "invalid_script_error_capture_enabled"
+	end
 	return {
 		crash_ingest_url = trim_slash(config.crash_ingest_url),
 		crash_api_key = config.crash_api_key,
@@ -203,6 +220,8 @@ local function validate_config(config)
 		publish_timeout_seconds = publish_timeout_seconds,
 		diagnostics = config.diagnostics,
 		sampler = config.sampler,
+		capture_previous_on_boot = config.capture_previous_on_boot ~= false,
+		script_error_capture_enabled = config.script_error_capture_enabled == true,
 	}
 end
 
@@ -252,7 +271,7 @@ function M.new(config)
 		-- retained; the result is discarded.
 		storage.load_pending_entries({ app_id = normalized.app_id })
 	end
-	return setmetatable({
+	local client = setmetatable({
 		config = normalized,
 		enabled = enabled,
 		-- Why the client is disabled ("opt_out" | "settings_read_failed"),
@@ -314,8 +333,78 @@ function M.new(config)
 			-- deadline is surfaced here.
 			resend_deferred_until_ms = nil,
 		},
+		-- Script-error reports forwarded this session (ADR-0297 §7c). Bounded
+		-- by script_error_report_cap so a per-frame error loop can never
+		-- flood the ingest door — fatal reports bypass sampling, so the cap
+		-- is the only brake on this path.
+		script_error_reports = 0,
 		initialized = true,
 	}, Client)
+	-- ADR-0297 §7c script-error auto-capture (opt-in, dark by default): the
+	-- handler installs at construction so an error thrown before the host's
+	-- first frame still reports. Install-only-on-opt-in keeps the dark
+	-- posture absolute: with the flag off, sys.set_error_handler is never
+	-- read, let alone called.
+	if normalized.script_error_capture_enabled then
+		client:install_script_error_handler()
+	end
+	return client
+end
+
+-- Maximum script-error reports forwarded per session (ADR-0297 §7c). A Lua
+-- error in a per-frame callback fires the handler every frame; without a cap
+-- the fatal path (never sampled) would flood the pending sidecar and the
+-- ingest door with near-identical reports. The first occurrences carry all
+-- the diagnostic value.
+local script_error_report_cap = 10
+
+-- Install the SDK's process-wide Defold error handler. Best-effort: absent
+-- sys.set_error_handler (headless hosts, tests without the stub) is a quiet
+-- no-op — the flag then arms nothing, which snapshot()/stats do not surface
+-- because there is nothing actionable for game code to do about it.
+function Client:install_script_error_handler()
+	if type(sys) ~= "table" or type(sys.set_error_handler) ~= "function" then
+		return false
+	end
+	local client = self
+	local ok = pcall(sys.set_error_handler, function(source, message, traceback)
+		client:on_script_error(source, message, traceback)
+	end)
+	return ok == true
+end
+
+-- The Defold error-handler callback (sys.set_error_handler wiring). Maps the
+-- (source, message, traceback) triple onto a FATAL lua_error report: the
+-- message is the exception reason, the traceback rides raw_text (scrubbed
+-- server-shape by event prepare like every free-text field), and the source
+-- string lands in context. MUST never throw back into the engine's error
+-- path — everything is pcall-guarded — and respects the same gates as every
+-- collection point: disabled clients collect nothing, and the per-session
+-- cap above bounds a hot error loop.
+function Client:on_script_error(source, message, traceback)
+	local ok = pcall(function()
+		if not self.initialized or not self.enabled then
+			return
+		end
+		if self.script_error_reports >= script_error_report_cap then
+			return
+		end
+		self.script_error_reports = self.script_error_reports + 1
+		local event = {
+			exception = {
+				type = "lua_error",
+				reason = type(message) == "string" and message or nil,
+			},
+		}
+		if type(traceback) == "string" and traceback ~= "" then
+			event.raw_text = traceback
+		end
+		if type(source) == "string" and source ~= "" then
+			event.context = { script_error_source = source }
+		end
+		self:emit_fatal(event)
+	end)
+	return ok == true
 end
 
 -- Record a breadcrumb. Names are scrubbed; an invalid name is dropped.

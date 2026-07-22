@@ -57,7 +57,11 @@ not the platform boundary.
   module to a dedicated crash ingest endpoint with a `crash:write` key — never as
   an analytics event. Stamps a component-slug `source`, scrubs PII, samples
   non-fatal reports while **always** sending fatal ones, and forwards a
-  previous-session native crash dump on next launch. Every dispatched report is
+  previous-session native crash dump on next launch — automatically from
+  `crash.init` (disable with `capture_previous_on_boot = false`), with the
+  engine module's symbol identity synthesized as `dmengine-<version_sha1>`
+  and an opt-in (default-off) Lua script-error auto-capture
+  (`script_error_capture_enabled`). Every dispatched report is
   persisted **write-ahead** to a bounded per-app sidecar and re-sent on a later
   launch until the server acknowledges it — byte-identical, one report at a
   time. Crash reporting is **on by default** with a persisted per-app opt-out

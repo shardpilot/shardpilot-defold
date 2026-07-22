@@ -302,8 +302,10 @@ crash.init({
   app_version      = "1.2.3",
   -- platform = "windows", -- auto-detected in-engine; REQUIRED explicitly
   --                       -- outside Defold, or init fails platform_required
+  -- script_error_capture_enabled = true, -- opt-in Lua script-error auto-capture (dark by default)
 })
-crash.capture_previous()  -- once, early in init(): forwards last session's native dump, if any
+-- crash.init auto-forwards last session's native dump (ADR-0297 §7c);
+-- set capture_previous_on_boot = false to call crash.capture_previous() manually instead.
 crash.record_breadcrumb("menu.open")
 ```
 
@@ -336,9 +338,18 @@ crash.record_breadcrumb("menu.open")
   `crash.snapshot().persist_failed` counts these.
   `crash.capture_previous()` runs a resend pass; `crash.resend_pending()`
   retries later in-session.
-- **No automatic Lua script-error capture**: wire your own error handler (e.g.
-  Defold's `sys.set_error_handler`) and call `crash.emit_fatal` with an
-  `exception` + pre-symbolicated frames yourself.
+- **Opt-in Lua script-error auto-capture** (`script_error_capture_enabled =
+  true`, default **off**): the SDK installs a `sys.set_error_handler` handler
+  forwarding each unhandled script error as a fatal `lua_error` report
+  (message → reason, traceback → `raw_text`), capped at 10 per session and
+  gated on the opt-out. Defold has ONE process-wide handler slot — opting in
+  replaces a game-installed handler; keep it off and call `crash.emit_fatal`
+  from your own handler if you need both.
+- **Engine-module symbol identity**: the `dmengine` module's `debug_id` is
+  synthesized as `dmengine-<version_sha1>` from `sys.get_engine_info()`, so
+  uploading Defold's published per-release engine symbols under that debug id
+  makes engine frames resolve; other modules stay name-keyed (the engine
+  exposes no debug ids for them).
 
 ## Offline / spool expectations
 

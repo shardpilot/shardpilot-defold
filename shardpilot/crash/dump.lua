@@ -74,10 +74,40 @@ local function read_sys_field(crash_module, handle, field)
 	return nil
 end
 
+-- The Defold engine module's name in the dump module list. Its symbol
+-- identity is special-cased below (ADR-0297 §7c).
+local ENGINE_MODULE_NAME = "dmengine"
+
+-- Read the engine build sha1 from sys.get_engine_info() (the stable Defold
+-- API: returns `version` + `version_sha1`). Nil when the API is unavailable
+-- (tests without the stub, exotic hosts) or the field is missing — the caller
+-- then falls back to name keying. Never raises.
+local function engine_version_sha1()
+	if type(sys) ~= "table" or type(sys.get_engine_info) ~= "function" then
+		return nil
+	end
+	local ok, info = pcall(sys.get_engine_info)
+	if not ok or type(info) ~= "table" then
+		return nil
+	end
+	local sha1 = info.version_sha1
+	if type(sha1) ~= "string" or sha1 == "" then
+		return nil
+	end
+	return sha1
+end
+
 -- Build the modules[] from the dump's module list. Each module carries a name +
--- a base load address; the engine does not expose debug ids, so debug_id is set
--- to the module name as a stable reference (the server requires debug_id OR
--- build_id and a load/base address). Modules without a usable address are
+-- a base load address. Symbol identity (ADR-0297 §7c): the ENGINE module's
+-- debug_id is synthesized as `dmengine-<version_sha1>` from
+-- sys.get_engine_info() — collision-free across engine versions and matching
+-- how Defold publishes per-release engine symbols keyed by sha1, so the
+-- CLI/door uploads the published engine `.sym` under the SAME debug_id and
+-- resolution rides the standard identity keying with no side-channel. The
+-- engine exposes NO debug ids for any OTHER module in the dump list, so
+-- non-engine modules remain NAME-keyed (the server requires debug_id OR
+-- build_id and a load/base address) — an engine-limitation-constrained honest
+-- fallback, stated in docs/crash.md. Modules without a usable address are
 -- dropped.
 local function build_modules(crash_module, handle)
 	local ok, raw = pcall(crash_module.get_modules, handle)
@@ -90,11 +120,16 @@ local function build_modules(crash_module, handle)
 			local address = to_hex_address(entry.address)
 			local name = entry.name
 			if type(name) == "string" and name ~= "" and address then
+				local debug_id = name
+				if name == ENGINE_MODULE_NAME then
+					local sha1 = engine_version_sha1()
+					if sha1 then
+						debug_id = ENGINE_MODULE_NAME .. "-" .. sha1
+					end
+				end
 				modules[#modules + 1] = {
 					name = name,
-					-- No debug id from the engine: use the module name as a stable
-					-- reference so the server's debug_id-or-build_id rule is met.
-					debug_id = name,
+					debug_id = debug_id,
 					load_address = address,
 				}
 			end
