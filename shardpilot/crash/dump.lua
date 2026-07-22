@@ -74,9 +74,31 @@ local function read_sys_field(crash_module, handle, field)
 	return nil
 end
 
--- The Defold engine module's name in the dump module list. Its symbol
--- identity is special-cased below (ADR-0297 §7c).
+-- The Defold engine module's canonical name. Its symbol identity is
+-- special-cased below (ADR-0297 §7c).
 local ENGINE_MODULE_NAME = "dmengine"
+
+-- is_engine_module_name normalizes a dump module name before the engine
+-- match: Defold's symbol docs list the engine binary as
+-- `[lib]dmengine[.exe|.so]` depending on platform (plus `.dylib` on macOS
+-- builds), and the dump list may carry a path. The wire keeps the ORIGINAL
+-- name; only the debug-id synthesis matches on the normalized basename
+-- (Codex #41 round 1 — an exact "dmengine" match missed `libdmengine.so`
+-- and `dmengine.exe`, silently falling back to name keying).
+local function is_engine_module_name(name)
+	local base = name:match("([^/\\]+)$") or name
+	base = base:lower()
+	if base:sub(1, 3) == "lib" then
+		base = base:sub(4)
+	end
+	for _, suffix in ipairs({ ".exe", ".so", ".dylib" }) do
+		if base:sub(-#suffix) == suffix then
+			base = base:sub(1, #base - #suffix)
+			break
+		end
+	end
+	return base == ENGINE_MODULE_NAME
+end
 
 -- Read the engine build sha1 from sys.get_engine_info() (the stable Defold
 -- API: returns `version` + `version_sha1`). Nil when the API is unavailable
@@ -121,7 +143,7 @@ local function build_modules(crash_module, handle)
 			local name = entry.name
 			if type(name) == "string" and name ~= "" and address then
 				local debug_id = name
-				if name == ENGINE_MODULE_NAME then
+				if is_engine_module_name(name) then
 					local sha1 = engine_version_sha1()
 					if sha1 then
 						debug_id = ENGINE_MODULE_NAME .. "-" .. sha1

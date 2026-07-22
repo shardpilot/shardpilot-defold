@@ -344,8 +344,12 @@ function M.new(config)
 	-- handler installs at construction so an error thrown before the host's
 	-- first frame still reports. Install-only-on-opt-in keeps the dark
 	-- posture absolute: with the flag off, sys.set_error_handler is never
-	-- read, let alone called.
-	if normalized.script_error_capture_enabled then
+	-- read, let alone called. Install-only-while-ENABLED keeps the opt-out
+	-- honest too (Codex #41 round 1): Defold has ONE process-wide handler
+	-- slot, so an opted-out (or fail-closed) boot must not replace the
+	-- game's handler with an inert ShardPilot one — a later
+	-- set_enabled(true) installs it then.
+	if normalized.script_error_capture_enabled and enabled then
 		client:install_script_error_handler()
 	end
 	return client
@@ -370,6 +374,9 @@ function Client:install_script_error_handler()
 	local ok = pcall(sys.set_error_handler, function(source, message, traceback)
 		client:on_script_error(source, message, traceback)
 	end)
+	if ok then
+		self.script_error_handler_installed = true
+	end
 	return ok == true
 end
 
@@ -398,6 +405,16 @@ function Client:on_script_error(source, message, traceback)
 		}
 		if type(traceback) == "string" and traceback ~= "" then
 			event.raw_text = traceback
+		elseif type(message) == "string" and message ~= "" then
+			-- No traceback (some runtime callbacks pass none): the message
+			-- doubles as raw_text so the report still satisfies the
+			-- frames-or-raw_text contract instead of being silently dropped
+			-- (Codex #41 round 1).
+			event.raw_text = message
+		else
+			-- Neither message nor traceback: still ship a marker rather than
+			-- swallowing the error entirely.
+			event.raw_text = "lua script error (no message or traceback)"
 		end
 		if type(source) == "string" and source ~= "" then
 			event.context = { script_error_source = source }
@@ -455,6 +472,14 @@ function Client:set_enabled(enabled)
 	end
 	self.enabled = enabled
 	self.enabled_reason = (not enabled) and "opt_out" or nil
+	if enabled and self.config.script_error_capture_enabled and not self.script_error_handler_installed then
+		-- The §7c handler defers past a disabled boot (see M.new); a
+		-- re-enable is the first enabled instant, so install here. A runtime
+		-- opt-out AFTER an install cannot restore the game's previous
+		-- handler (the sys API has no read), so the installed handler stays
+		-- and self-gates to a no-op — documented in docs/crash.md.
+		self:install_script_error_handler()
+	end
 	if not enabled then
 		-- Opting out empties the breadcrumb ring: retained entries would
 		-- otherwise attach to the first report after a later re-enable, and a

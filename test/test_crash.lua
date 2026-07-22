@@ -1348,6 +1348,30 @@ local function test_engine_module_debug_id_synthesized()
 	assert_contains(body, '"debug_id":"libgame.so"')
 end
 
+local function test_engine_module_debug_id_matches_platform_name_shapes()
+	reset()
+	-- Defold's engine binary is listed as [lib]dmengine[.exe|.so] depending
+	-- on platform; every shape must synthesize the sha1 identity while the
+	-- wire keeps the ORIGINAL module name.
+	local module = fake_crash_module({
+		handle = 7,
+		modules = {
+			{ name = "libdmengine.so", address = 0x4000 },
+			{ name = "dmengine.exe", address = 0x8000 },
+			{ name = "/data/app/lib/arm64/libdmengine.so", address = 0xc000 },
+		},
+		backtrace = { { address = 0x4abc } },
+	})
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:capture_previous(module))
+	assert_equal(#requests, 1)
+	local body = requests[1].body
+	assert_contains(body, '"name":"libdmengine.so"')
+	assert_contains(body, '"name":"dmengine.exe"')
+	local _, count = body:gsub('"debug_id":"dmengine%-8f3e0a1b2c4d5e6f708192a3b4c5d6e7f8091a2b"', "")
+	assert_equal(count, 3, "every engine-name shape must synthesize the sha1 identity")
+end
+
 local function test_engine_module_debug_id_falls_back_without_engine_info()
 	reset()
 	-- No engine identity available (an exotic host / API failure): dmengine
@@ -1452,6 +1476,35 @@ local function test_script_error_capture_caps_per_session()
 	-- The per-session cap (10) bounds a per-frame error loop — fatal reports
 	-- bypass sampling, so the cap is the only brake on this path.
 	assert_equal(#requests, 10)
+end
+
+local function test_script_error_capture_defers_install_while_opted_out()
+	reset()
+	-- Persist the opt-out, then boot with the flag on: the game's handler
+	-- slot must stay untouched (Defold has ONE process-wide slot).
+	local prior = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(prior:set_enabled(false))
+	local client = assert(crash.new(config({ sample_every = 1, script_error_capture_enabled = true })))
+	assert_equal(sys.error_handler, nil, "an opted-out boot must not install the handler")
+	-- Re-enabling is the first enabled instant: the handler installs then.
+	assert_true(client:set_enabled(true))
+	assert_true(type(sys.error_handler) == "function", "re-enable must install the deferred handler")
+	sys.error_handler("lua", "boom after re-enable", "stack traceback: x")
+	assert_equal(#requests, 1)
+end
+
+local function test_script_error_capture_reports_without_traceback()
+	reset()
+	assert(crash.new(config({ sample_every = 1, script_error_capture_enabled = true })))
+	-- Some runtime callbacks pass no traceback: the message doubles as
+	-- raw_text so the report still ships (frames_or_raw_text_required).
+	sys.error_handler("lua", "main/game.script:7: boom", nil)
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"raw_text":"main/game.script:7: boom"')
+	-- Neither message nor traceback: a marker still ships the error.
+	sys.error_handler(nil, nil, nil)
+	assert_equal(#requests, 2)
+	assert_contains(requests[2].body, '"raw_text":"lua script error (no message or traceback)"')
 end
 
 local function test_script_error_capture_respects_opt_out()
@@ -5355,6 +5408,7 @@ local tests = {
 	test_capture_previous_no_dump,
 	test_capture_previous_forwards_native_dump,
 	test_engine_module_debug_id_synthesized,
+	test_engine_module_debug_id_matches_platform_name_shapes,
 	test_engine_module_debug_id_falls_back_without_engine_info,
 	test_init_auto_captures_previous_dump_on_boot,
 	test_init_auto_capture_disabled_by_flag,
@@ -5362,6 +5416,8 @@ local tests = {
 	test_script_error_capture_dark_by_default,
 	test_script_error_capture_reports_fatal,
 	test_script_error_capture_caps_per_session,
+	test_script_error_capture_defers_install_while_opted_out,
+	test_script_error_capture_reports_without_traceback,
 	test_script_error_capture_respects_opt_out,
 	test_capture_previous_drops_dump_without_modules,
 	test_dump_event_builder_unit,

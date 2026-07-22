@@ -15,8 +15,11 @@
   engine symbols — while other modules stay name-keyed. New dark
   `script_error_capture_enabled` flag (default off) installs a
   `sys.set_error_handler` handler forwarding unhandled Lua errors as fatal
-  `lua_error` reports (traceback as `raw_text`, 10-per-session cap,
-  opt-out-gated, never throws into the engine).
+  `lua_error` reports (traceback — or the message, when a callback passes no
+  traceback — as `raw_text`, 10-per-session cap, never throws into the
+  engine); the install itself is opt-out-honest: an opted-out boot leaves the
+  game's handler slot untouched and the install defers to the re-enabling
+  `set_enabled(true)`.
 
 - **A changed configured `anonymous_id` no longer inherits the previous
   actor's consent (fresh identity on override mismatch).** A config
