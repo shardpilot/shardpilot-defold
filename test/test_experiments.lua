@@ -7425,6 +7425,55 @@ function extra_tests.test_spool_purge_clears_condemnation_debt()
 	storage.reset()
 end
 
+-- Codex #40 round 4 (P2): the consumer used to be constructed BEFORE the
+-- boot belt, so a stale granted record armed a LIVE pending_exposure from
+-- the cached assignment — and when the belt then flipped the boot state to
+-- denied, that denied-boot snapshot was never reconciled: it could emit
+-- after a later re-grant with the denied-boot identity, or hold Mode B
+-- rotation as phantom pending work. Construction now runs after the belt
+-- and reads the FINAL boot consent state: the restored assignment arms as
+-- re-arm INTENT instead, exactly like any non-granted restore.
+-- Global on purpose: the main chunk sits at lua5.4's 200-local limit, and
+-- one more `local function` fails to compile there.
+function test_belt_denial_flip_arms_intent_not_exposure()
+	reset()
+	storage.reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout", { geo = "de" })
+	next_status = 202
+	next_response_body = nil
+	assert_true(client:shutdown())
+	-- A newer denial receipt sits in the durable outbox while the identity
+	-- record still restores granted (its convergence never landed): the
+	-- boot belt flips the relaunch to denied.
+	assert_true(storage.save_consent_outbox(storage_scope, { {
+		idempotency_key = "belt-exp-denial",
+		workspace_id = "workspace-test",
+		app_id = "app-test",
+		environment_id = "develop",
+		actor_identifier = "anon-client",
+		kind = "anon",
+		decided_at = "2099-01-01T00:00:00Z",
+		decision_seq = 99,
+		categories = { analytics = false },
+		anonymous_id = "anon-client",
+	} }) ~= false)
+	local relaunch = assert(sdk.new(config()))
+	assert_equal(relaunch.consent_state, "denied",
+		"the belt flips the stale granted restore to the retained denial")
+	local armed = 0
+	for _ in pairs(relaunch.experiments.pending_exposure) do
+		armed = armed + 1
+	end
+	assert_equal(armed, 0,
+		"no live exposure snapshot arms under the belt-flipped denied boot")
+	assert_true(relaunch.experiments.pending_rearm["exp-checkout"] == true,
+		"the restored assignment arms as re-arm INTENT for a later grant")
+	assert_true(relaunch:shutdown())
+	storage.reset()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -7582,6 +7631,7 @@ local tests = {
 	test_present_null_reason_is_malformed,
 	test_backend_restored_exposure_drains_in_background,
 	test_sync_latch_halts_remaining_cadence_dispatches,
+	test_belt_denial_flip_arms_intent_not_exposure,
 	extra_tests.test_subject_echo_never_installs_as_fact_key,
 	extra_tests.test_sync_remint_stops_stale_cadence_keys,
 	extra_tests.test_restored_client_id_entry_requires_fact_key,

@@ -3878,6 +3878,126 @@ local function test_unreadable_marker_fail_closed_stays_transient()
 	storage.reset()
 end
 
+-- Codex #40 round 4 (P1): a denial receipt whose POST is IN FLIGHT used to
+-- satisfy the shutdown witness check — but its own acknowledgment prunes it
+-- from the durable outbox, possibly after teardown already finalized on its
+-- evidence, leaving the stale granted record alone for the next launch. An
+-- in-flight receipt no longer witnesses; the shutdown refusal holds until a
+-- settled witness (record, marker, or a retained NON-in-flight receipt)
+-- exists.
+local function test_shutdown_refuses_while_witness_receipt_in_flight()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-inflight-witness",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	local client = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "granted")
+	-- Break BOTH denial writes, hold the wire: the receipt appends durably
+	-- and goes IN FLIGHT with no other witness anywhere.
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:sub(-9) == "/identity" or path:sub(-15) == "/consent-denial" then
+			return false
+		end
+		return real_save(path, record)
+	end
+	local held, restore_http = hold_http_requests()
+	local ok, err = client:set_consent(false)
+	assert_equal(ok, false)
+	assert_equal(err, "consent_persist_failed")
+	assert_equal(#held, 1, "the denial receipt is on the wire")
+	-- The in-flight receipt must NOT count as the denial's durable witness:
+	-- shutdown stays refusable until a settled witness exists.
+	local sok, serr = client:shutdown()
+	assert_equal(sok, false,
+		"shutdown must refuse while the only witness is in flight")
+	assert_equal(serr, "consent_pending")
+	-- The ack lands with storage still broken: the receipt leaves the
+	-- outbox, the handoff marker attempt fails, the pendings stay armed —
+	-- shutdown keeps refusing over the witness gap.
+	release_held_request(held)
+	restore_http()
+	local sok2, serr2 = client:shutdown()
+	assert_equal(sok2, false, "no witness landed anywhere — still refused")
+	assert_equal(serr2, "consent_pending")
+	-- Storage heals: the shutdown retry persists the record and finalizes.
+	sys.save = real_save
+	assert_true(client:shutdown(), "the healed retry persists the denial and finalizes")
+	local identity_record = nil
+	for path, record in pairs(stores) do
+		if path:sub(-9) == "/identity" then
+			identity_record = record
+		end
+	end
+	assert_true(identity_record ~= nil and identity_record.consent_analytics == "denied",
+		"the denial is durable at teardown")
+	restore()
+	storage.reset()
+end
+
+-- Codex #40 round 4 (P1, the handoff half): when the ack prunes a denial
+-- receipt while the record AND marker writes are still owed, the prune
+-- consumes the only durable evidence — so the ack path now retries the
+-- marker write (the CURRENT decision's pair) before removing the receipt.
+local function test_ack_prune_hands_witness_to_marker()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	-- NB the harness clock starts near the epoch, so the live-minted
+	-- denial's stamp must be able to EXCEED the seeded record stamp — a
+	-- 2026 seed here would make the round-3 stale-marker guard (correctly)
+	-- retire the handed-off marker as record-superseded.
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-handoff-witness",
+		consent_analytics = "granted",
+		consent_decided_at = "1970-01-01T00:00:01Z",
+		consent_decision_seq = 1,
+	}))
+	local client = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:sub(-9) == "/identity" or path:sub(-15) == "/consent-denial" then
+			return false
+		end
+		return real_save(path, record)
+	end
+	local held, restore_http = hold_http_requests()
+	local ok, err = client:set_consent(false)
+	assert_equal(ok, false)
+	assert_equal(err, "consent_persist_failed")
+	-- The marker path heals while the POST is on the wire (the identity
+	-- store stays broken): the ack's handoff must land the marker before
+	-- consuming the receipt.
+	sys.save = function(path, record)
+		if path:sub(-9) == "/identity" then
+			return false
+		end
+		return real_save(path, record)
+	end
+	release_held_request(held)
+	restore_http()
+	local marker = storage.load_consent_denial_marker(identity_scope)
+	assert_true(type(marker) == "table" and marker.consent_analytics == "denied",
+		"the ack handoff writes the marker before pruning the receipt")
+	assert_equal(#storage.load_consent_outbox(identity_scope), 0,
+		"the acknowledged receipt left the durable outbox")
+	-- Simulated process death (no shutdown); full heal; relaunch: the
+	-- marker — the handed-off witness — imposes the denial over the stale
+	-- granted record.
+	sys.save = real_save
+	reset()
+	local relaunch = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(relaunch.consent_state, "denied",
+		"the handed-off marker imposes the denial after the receipt is gone")
+	restore()
+	storage.reset()
+end
+
 -- Codex #40 round 3: when the belt's convergence write fails, the retained
 -- denial receipt — the decision's only durable proof — still dispatches and
 -- leaves the outbox, so the next launch would restore the stale grant with
@@ -7086,6 +7206,8 @@ local tests = {
 	test_stale_denial_marker_never_beats_newer_grant,
 	test_unreadable_marker_fail_closed_stays_transient,
 	test_belt_convergence_failure_writes_marker_witness,
+	test_shutdown_refuses_while_witness_receipt_in_flight,
+	test_ack_prune_hands_witness_to_marker,
 	test_shutdown_refuses_denial_with_no_durable_witness,
 	test_set_anonymous_id_rejected_while_spool_pending_mode_b,
 	test_shutdown_fails_when_remnant_evicted_by_caps,

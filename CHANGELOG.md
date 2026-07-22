@@ -109,7 +109,19 @@
   fails, the write-ahead marker is written as the receipt-independent
   witness (carrying the receipt's decision pair) before the receipt — the
   denial's only durable proof — dispatches and leaves the outbox; the
-  shutdown pending flags arm alongside.
+  shutdown pending flags arm alongside. An IN-FLIGHT denial receipt never
+  counts as the teardown witness (its own acknowledgment is about to
+  consume it — the async ack prunes it from the durable outbox, possibly
+  after a teardown that finalized on its evidence), and the ack path
+  performs the WITNESS HANDOFF: before pruning a denial receipt while the
+  record AND marker writes are both still owed, it retries the marker
+  write with the current decision's pair, so consuming the receipt can
+  never consume the denial's last durable evidence. The experiments
+  consumer is now constructed AFTER the boot belt, so its construction-time
+  cache restore reads the final belt-settled consent state — a stale
+  granted restore no longer arms a live exposure snapshot that the belt's
+  denied flip would leave unreconciled (it arms as re-arm INTENT, like any
+  non-granted restore).
   Teardown: `shutdown()` refuses
   (`consent_pending`) while the latest denial has NO durable witness at
   all — record, marker, and retained receipt (a delivered receipt leaves

@@ -789,97 +789,6 @@ function M.new(config)
 			return client.anonymous_id
 		end)
 	end
-	-- Experiment-assignment consumer (dark unless `experiments_enabled`).
-	-- Constructed only when the flag is on — while off there is no subject-id
-	-- mint, no fetch, no revalidation, no exposure and no new persistence
-	-- keys. The subject id is SDK-managed: it is loaded from the identity
-	-- record above (never from config — no host override path exists),
-	-- minted lazily by the consumer at first need, and persisted through
-	-- persist_identity. Experiment facts are enqueued through the normal
-	-- analytics pipeline with the envelope identity rules the facts contract
-	-- requires (no user_id; the standard anonymous_id — never the
-	-- experiments subject id).
-	if normalized.experiments_enabled then
-		client.experiments = experiments_mod.new(normalized, {
-			subject_id = function()
-				if not experiments_mod.valid_subject_id(client.experiments_client_id) then
-					-- No USABLE captured subject — nil, or a stored value
-					-- that fails the wire grammar. Either way a sibling
-					-- client in this process may have minted (or healed)
-					-- AND persisted a valid subject since this client
-					-- captured its copy: re-read the identity record at
-					-- mint-decision time and adopt it — one install
-					-- converges on ONE subject id (and one cache scope)
-					-- instead of the second client re-minting over the
-					-- sibling's. Gating on VALIDITY, not nilness, matters:
-					-- a captured corrupt string must not block the reload
-					-- while the consumer treats it as absent and mints. A
-					-- raw field copy (the consumer validates the grammar);
-					-- a sibling whose mint could not persist stays
-					-- process-local by the documented failed-persist rule,
-					-- so there is nothing on disk to adopt in that case.
-					local persisted = storage.load(normalized) or {}
-					-- Adopt only a VALID sibling value: copying a corrupt
-					-- or oversized field would poison this client's
-					-- identity writes the same way the init-time load
-					-- guard prevents.
-					if experiments_mod.valid_subject_id(persisted.experiments_client_id) then
-						client.experiments_client_id = persisted.experiments_client_id
-					end
-				end
-				return client.experiments_client_id
-			end,
-			store_subject_id = function(value)
-				client.experiments_client_id = value
-				return client:persist_identity()
-			end,
-			consent = function()
-				return client.consent_state
-			end,
-			analytics_session = function()
-				return client.session_id
-			end,
-			analytics_anonymous_id = function()
-				return client.anonymous_id
-			end,
-			emit = function(event_name, props, event_id, overrides)
-				-- `overrides` is the ARM-TIME identity of an owed fact
-				-- (an exposure drained late must ride the session, the
-				-- anonymous id, and the timestamp of the moment its
-				-- treatment applied — not the current ones); absent
-				-- fields mean "current".
-				overrides = overrides or {}
-				return client:enqueue_event(event_name, props, nil, {
-					event_id = event_id,
-					omit_user_id = true,
-					session_id = overrides.session_id,
-					anonymous_id = overrides.anonymous_id,
-					event_ts = overrides.event_ts,
-					retryable = overrides.retryable,
-				})
-			end,
-			purge_facts = function()
-				-- The real-subjects sentinel withdrew the assignments AND
-				-- their subject-fact keys: experiment facts already
-				-- accepted into the analytics pipeline carry those keys
-				-- verbatim and must not egress on a later flush.
-				return client:purge_experiment_facts()
-			end,
-			capture_fact = function(event_name, props, event_id, overrides)
-				-- Drop-time durable capture: a durable entry delete with
-				-- an exposure still owed must not let a process kill lose
-				-- the fact — the spool copy replays it at the next launch.
-				return client:capture_experiment_fact(
-					event_name, props, event_id, overrides)
-			end,
-			spool_condemned_pending = function()
-				-- Condemned facts still on the durable spool (a removal
-				-- write that could not land): the condemnation marker
-				-- must not retire over them.
-				return client.condemned_spool_pending == true
-			end,
-		})
-	end
 	-- Durable consent-receipt outbox: reload the receipts a previous launch
 	-- could not deliver. Deliberately UNCONDITIONAL on the consent state — the
 	-- exact opposite of the event spool below: a receipt documents an explicit
@@ -1032,6 +941,105 @@ function M.new(config)
 				code = "denial_receipt_newer",
 			})
 		end
+	end
+	-- Experiment-assignment consumer (dark unless `experiments_enabled`).
+	-- Constructed AFTER the consent-outbox load and the boot BELT above
+	-- (Codex #40 round 4): the construction-time cache restore decides
+	-- between arming a LIVE exposure snapshot and a re-arm INTENT by
+	-- reading deps.consent(), so it must see the FINAL belt-settled boot
+	-- state - constructed before the belt, a stale granted restore armed
+	-- an exposure the belt's denied flip never reconciled (a denied-boot
+	-- identity that could emit after a later re-grant, or hold Mode B
+	-- rotation as phantom pending work).
+	-- Constructed only when the flag is on — while off there is no subject-id
+	-- mint, no fetch, no revalidation, no exposure and no new persistence
+	-- keys. The subject id is SDK-managed: it is loaded from the identity
+	-- record above (never from config — no host override path exists),
+	-- minted lazily by the consumer at first need, and persisted through
+	-- persist_identity. Experiment facts are enqueued through the normal
+	-- analytics pipeline with the envelope identity rules the facts contract
+	-- requires (no user_id; the standard anonymous_id — never the
+	-- experiments subject id).
+	if normalized.experiments_enabled then
+		client.experiments = experiments_mod.new(normalized, {
+			subject_id = function()
+				if not experiments_mod.valid_subject_id(client.experiments_client_id) then
+					-- No USABLE captured subject — nil, or a stored value
+					-- that fails the wire grammar. Either way a sibling
+					-- client in this process may have minted (or healed)
+					-- AND persisted a valid subject since this client
+					-- captured its copy: re-read the identity record at
+					-- mint-decision time and adopt it — one install
+					-- converges on ONE subject id (and one cache scope)
+					-- instead of the second client re-minting over the
+					-- sibling's. Gating on VALIDITY, not nilness, matters:
+					-- a captured corrupt string must not block the reload
+					-- while the consumer treats it as absent and mints. A
+					-- raw field copy (the consumer validates the grammar);
+					-- a sibling whose mint could not persist stays
+					-- process-local by the documented failed-persist rule,
+					-- so there is nothing on disk to adopt in that case.
+					local persisted = storage.load(normalized) or {}
+					-- Adopt only a VALID sibling value: copying a corrupt
+					-- or oversized field would poison this client's
+					-- identity writes the same way the init-time load
+					-- guard prevents.
+					if experiments_mod.valid_subject_id(persisted.experiments_client_id) then
+						client.experiments_client_id = persisted.experiments_client_id
+					end
+				end
+				return client.experiments_client_id
+			end,
+			store_subject_id = function(value)
+				client.experiments_client_id = value
+				return client:persist_identity()
+			end,
+			consent = function()
+				return client.consent_state
+			end,
+			analytics_session = function()
+				return client.session_id
+			end,
+			analytics_anonymous_id = function()
+				return client.anonymous_id
+			end,
+			emit = function(event_name, props, event_id, overrides)
+				-- `overrides` is the ARM-TIME identity of an owed fact
+				-- (an exposure drained late must ride the session, the
+				-- anonymous id, and the timestamp of the moment its
+				-- treatment applied — not the current ones); absent
+				-- fields mean "current".
+				overrides = overrides or {}
+				return client:enqueue_event(event_name, props, nil, {
+					event_id = event_id,
+					omit_user_id = true,
+					session_id = overrides.session_id,
+					anonymous_id = overrides.anonymous_id,
+					event_ts = overrides.event_ts,
+					retryable = overrides.retryable,
+				})
+			end,
+			purge_facts = function()
+				-- The real-subjects sentinel withdrew the assignments AND
+				-- their subject-fact keys: experiment facts already
+				-- accepted into the analytics pipeline carry those keys
+				-- verbatim and must not egress on a later flush.
+				return client:purge_experiment_facts()
+			end,
+			capture_fact = function(event_name, props, event_id, overrides)
+				-- Drop-time durable capture: a durable entry delete with
+				-- an exposure still owed must not let a process kill lose
+				-- the fact — the spool copy replays it at the next launch.
+				return client:capture_experiment_fact(
+					event_name, props, event_id, overrides)
+			end,
+			spool_condemned_pending = function()
+				-- Condemned facts still on the durable spool (a removal
+				-- write that could not land): the condemnation marker
+				-- must not retire over them.
+				return client.condemned_spool_pending == true
+			end,
+		})
 	end
 	-- Offline event spool: re-load the envelopes a previous launch could not
 	-- deliver so they re-send (chunked to batch_size) before fresh events. The
@@ -2769,6 +2777,15 @@ function Client:denial_receipt_retained_durably()
 		if type(receipt.categories) == "table"
 			and receipt.categories.analytics == false
 			and receipt.anonymous_id == self.anonymous_id
+			-- An IN-FLIGHT receipt cannot witness across a teardown (Codex
+			-- #40 round 4): its durability is about to be CONSUMED by its
+			-- own acknowledgment — the async ack callback prunes it from
+			-- the durable outbox, possibly after shutdown() already
+			-- finalized on its evidence, leaving the stale pre-denial
+			-- record as the only thing the next launch reads. The ack-side
+			-- witness HANDOFF (the marker write at the prune) covers the
+			-- receipt once it settles; until then it proves nothing here.
+			and receipt.idempotency_key ~= self.consent_in_flight_key
 			and type(receipt.decided_at) == "string"
 			and (self.consent_decided_at == nil
 				or decision_pair_newer(receipt.decided_at,
@@ -2959,6 +2976,31 @@ function Client:try_send_consent_outbox()
 				self.consent_retry_after_ms = nil
 				self.consent_backoff_attempt = 0
 				self.consent_deferral_armed_key = nil
+				-- WITNESS HANDOFF (Codex #40 round 4): the prune below
+				-- removes this receipt from the durable outbox — and while
+				-- the standing denial's identity record AND marker writes
+				-- are both still owed, a retained denial receipt may be the
+				-- ONLY durable evidence a relaunch would read. Before
+				-- consuming it, retry the write-ahead marker with the
+				-- CURRENT decision's pair (storage may have healed since
+				-- set_consent's attempt failed). Best-effort: a still-failed
+				-- write keeps marker_pending armed, so shutdown() keeps
+				-- refusing over the witness gap and its own retry path
+				-- re-attempts both writes.
+				if self.consent_denial_record_pending
+					and self.consent_denial_marker_pending
+					and consent_denied_state(self.consent_state)
+					and type(payload.categories) == "table"
+					and payload.categories.analytics == false then
+					if storage.save_consent_denial_marker(self.config, {
+						consent_analytics = self.consent_state,
+						anonymous_id = self.anonymous_id,
+						decided_at = self.consent_decided_at,
+						decision_seq = self.consent_decision_seq,
+					}) then
+						self.consent_denial_marker_pending = false
+					end
+				end
 				self:remove_consent_receipt(payload.idempotency_key)
 				-- Chain the next retained receipt immediately (bounded by the
 				-- outbox cap) so one healthy dispatch point drains the whole
