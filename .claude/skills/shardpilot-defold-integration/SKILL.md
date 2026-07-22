@@ -30,10 +30,11 @@ the deeper reference.
 - **Crash reporting**: a separate `shardpilot.crash` module posting crash
   report JSON to a dedicated crash ingest endpoint, with PII scrubbing,
   write-ahead pending storage, and deterministic non-fatal sampling.
-- **Not provided today**: no automatic capture of live Lua script errors (you
-  wire your own error handler and call `crash.emit_fatal`), no experiment
-  assignment endpoint, no automatic remote-config refresh, no packaged release
-  ZIP assets (source archives only).
+- **Not provided today**: no experiment assignment endpoint, no automatic
+  remote-config refresh, no packaged release ZIP assets (source archives
+  only). (Live Lua script-error capture IS available as the opt-in
+  `script_error_capture_enabled` crash flag, default off — see the crash
+  section.)
 - **Pre-launch**: the production ingest domain is not provisioned yet; use
   local/develop endpoints. The SDK is v0 alpha and the API may change before
   v1.
@@ -442,9 +443,11 @@ Stated plainly so integrations do not trip on them:
   embedded runtime, plus Lua 5.4 host-only). No CI job builds the SDK inside
   the Defold engine/bob toolchain — the in-engine build check is a manual
   release step, so validate your integrated game in the engine yourself.
-- **No Lua script-error auto-capture**: the crash module forwards
-  previous-session native dumps and accepts manual `emit`/`emit_fatal`, but
-  live Lua errors are only reported if you wire your own error handler.
+- **Lua script-error auto-capture is OPT-IN and replaces the handler slot**:
+  live Lua errors report only when `script_error_capture_enabled = true`
+  (default off), and opting in installs the SDK's `sys.set_error_handler`
+  handler into Defold's single process-wide slot — keep the flag off and
+  call `crash.emit_fatal` from your own handler if you need both.
 - **Pre-launch platform**: no production ingest domain is provisioned; the
   hosted docs site is not live yet. Use local/develop endpoints and the
   in-repo `docs/` as the reference.
