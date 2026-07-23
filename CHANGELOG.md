@@ -6,6 +6,26 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **Remote config: dark opt-in targeting-attribute pass-through (ADR-0310).**
+  `remote_config_attributes_enabled = true` (default `false` — while off the
+  fetch URL is byte-identical to today's attribute-less path and the new
+  setter is inert; the flag without `remote_config_url` is rejected with
+  `remote_config_attributes_requires_remote_config_url`) plus
+  `set_remote_config_attributes(attributes)` (client method and facade;
+  `nil`/empty clears) makes each `fetch_remote_config` carry the stored
+  attribute set as sorted, injectively percent-escaped query parameters so
+  server-side delivery rules can target this client. The vocabulary, bounds,
+  and normalization are the experiment consumer's, verbatim (allowlist +
+  `custom_attribute_<name>`, ≤512-byte values, 64-attribute cap,
+  out-of-vocabulary names dropped client-side, never sent). PRIVACY CONTRACT:
+  attributes ride ONLY while the consent state read at dispatch time is
+  granted — unknown consent and both denied states (forced-minor included)
+  keep the fetch attribute-less (config delivery stays consent-neutral,
+  serving the untargeted defaults), and a consent downgrade strips attributes
+  from the very next fetch. Targeting is 100% server-evaluated; the durable
+  last-known-good cache stays one scope-keyed record whose scope deliberately
+  excludes the attribute set — a cached body may reflect the previously sent
+  attributes until the next successful fetch (documented v1 limit).
 - **Crash: boot auto-capture, engine symbol identity, opt-in script-error
   capture (ADR-0297 §7c).** `crash.init` now forwards the previous-session
   native dump itself (`capture_previous_on_boot = false` keeps the manual

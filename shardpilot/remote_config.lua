@@ -37,8 +37,25 @@
 -- is never sent, its values never served) and is overwritten by the next
 -- successful fetch. There is no experiment assignment, no exposure events,
 -- and no automatic refresh here by design — the game triggers every fetch.
+--
+-- Targeting attributes (dark opt-in, ADR-0310): with
+-- `remote_config_attributes_enabled = true` the attribute set stored via
+-- set_attributes rides each fetch as query parameters, so server-side
+-- delivery rules can target this client. PRIVACY CONTRACT (non-negotiable):
+-- attributes are personal-data-shaped egress, so they ride ONLY while the
+-- opt-in is on AND the consent state read at dispatch time is "granted" —
+-- configuration delivery itself stays consent-neutral (the fetch still
+-- happens), but an unknown or denied state (the forced-minor denial
+-- included) keeps the URL byte-identical to the attribute-less path and
+-- serves whatever the server publishes for an untargeted client. The
+-- vocabulary, bounds, and normalization are the experiment consumer's,
+-- verbatim (shardpilot/experiments.lua normalize_attributes). Targeting is
+-- 100% server-evaluated, and the cache scope deliberately excludes the
+-- attribute set: a cached body may reflect the previously sent attributes
+-- until the next successful fetch (documented v1 limit).
 
 local clock = require "shardpilot.clock"
+local experiments = require "shardpilot.experiments"
 local storage = require "shardpilot.storage"
 
 local M = {}
@@ -62,11 +79,26 @@ local function escape_segment(value)
 	end))
 end
 
-function M.build_url(base_url, workspace_id, environment_id, client_id)
-	return trim_slash(base_url) .. config_route_prefix
+-- `attributes` (optional) is an ordered array of { name, value } pairs —
+-- already normalized by the experiment vocabulary discipline — appended as a
+-- query string. Both sides ride through the same injective escaper as the
+-- path segments, so a value containing "&", "=", or "#" cannot restructure
+-- the query. Absent/empty leaves the URL byte-identical to the
+-- attribute-less path.
+function M.build_url(base_url, workspace_id, environment_id, client_id, attributes)
+	local url = trim_slash(base_url) .. config_route_prefix
 		.. escape_segment(workspace_id) .. "/"
 		.. escape_segment(environment_id) .. "/"
 		.. escape_segment(client_id)
+	if type(attributes) == "table" and #attributes > 0 then
+		local parts = {}
+		for i = 1, #attributes do
+			parts[#parts + 1] = escape_segment(attributes[i].name)
+				.. "=" .. escape_segment(attributes[i].value)
+		end
+		url = url .. "?" .. table.concat(parts, "&")
+	end
+	return url
 end
 
 -- Scope components are escaped like URL segments — the identifiers are only
@@ -372,10 +404,23 @@ RemoteConfig.__index = RemoteConfig
 -- it is read at every fetch (and cache read) rather than captured once, so a
 -- later set_anonymous_id naturally invalidates the cache through the scope
 -- check instead of silently fetching configuration for a stale client id.
-function M.new(config, identity)
+-- `consent` (optional) is a function returning the client's current consent
+-- state, read the same live way — it gates ONLY the ADR-0310 attribute
+-- pass-through, never the fetch itself.
+function M.new(config, identity, consent)
 	local rc = setmetatable({
 		config = config,
 		identity = identity,
+		-- Function returning the client's CURRENT consent state string, read
+		-- at every dispatch (never captured) so the attribute gate below
+		-- always sees the live decision. Optional: absent reads as unknown,
+		-- which fails the gate closed — a directly constructed instance can
+		-- never leak attributes by accident.
+		consent = consent,
+		-- The raw attribute set stored by set_attributes (nil = none).
+		-- Normalized per fetch, not at store time, so the vocabulary
+		-- discipline applied is always this build's.
+		attributes = nil,
 		values = nil,
 		version = nil,
 		-- The in-process cache record (`{scope, etag, body, fetched_at_ms}`).
@@ -617,6 +662,47 @@ end
 -- Fetch the configuration. `callback(result)` receives
 -- { ok, from_cache, error?, values?, version? }; it is optional and — like
 -- every http.request callback — fires asynchronously on the real runtime.
+-- Replace the targeting attribute set enabled fetches send (ADR-0310).
+-- `nil` or an empty table clears it. The table is copied shallowly, so a
+-- caller mutating its table after the call cannot change what later fetches
+-- send. Storing is unconditional — the opt-in and consent gates apply at
+-- dispatch (attribute_pairs_for), so the setter is inert while the config
+-- flag is off.
+function RemoteConfig:set_attributes(attributes)
+	if type(attributes) ~= "table" or next(attributes) == nil then
+		self.attributes = nil
+		return
+	end
+	local copy = {}
+	for name, value in pairs(attributes) do
+		copy[name] = value
+	end
+	self.attributes = copy
+end
+
+-- The ordered, normalized attribute pairs the CURRENT fetch may carry, or
+-- nil. Three gates, all required (the ADR-0310 privacy contract): the dark
+-- `remote_config_attributes_enabled` opt-in, a stored attribute set, and a
+-- "granted" consent state read at dispatch time. Unknown consent and both
+-- denied states (forced-minor included) keep the fetch attribute-less —
+-- the fetch itself still happens, config delivery stays consent-neutral.
+-- Normalization (vocabulary allowlist + custom_attribute_*, value bounds,
+-- sort, 64-pair cap) is the experiment consumer's, verbatim; a set that
+-- normalizes to nothing rides as no query at all.
+local function attribute_pairs_for(rc)
+	if not rc.config.remote_config_attributes_enabled or rc.attributes == nil then
+		return nil
+	end
+	if type(rc.consent) ~= "function" or rc.consent() ~= "granted" then
+		return nil
+	end
+	local pairs_out = experiments.normalize_attributes(rc.attributes)
+	if #pairs_out == 0 then
+		return nil
+	end
+	return pairs_out
+end
+
 -- A successful result (fresh OR cached) also updates the getter snapshot;
 -- a failed one leaves it untouched. Returns true when the request was
 -- dispatched, or (false, error_code) — with the callback already invoked —
@@ -670,7 +756,8 @@ function RemoteConfig:fetch(callback)
 		self.config.remote_config_url,
 		self.config.workspace_id,
 		self.config.environment_id,
-		client_id)
+		client_id,
+		attribute_pairs_for(self))
 	local options = {
 		timeout = self.config.publish_timeout_seconds,
 	}

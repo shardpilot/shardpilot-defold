@@ -192,6 +192,7 @@ README, `docs/`, and the skill above are the reference.
 |---|---|---|
 | `ingest_url` | — (required) | `https://…`, or `http://` only for `localhost`/`127.0.0.1`/`::1`; no query/fragment/path |
 | `remote_config_url` | `nil` (disabled) | Remote-config base URL (same shape rules as `ingest_url`); a **separate** service from the ingest endpoint. Requires `api_key` — see [Remote config](#remote-config) |
+| `remote_config_attributes_enabled` | `false` (dark) | ADR-0310 opt-in: fetches carry the attributes stored via `set_remote_config_attributes` as query parameters — only while consent is **granted** (unknown/denied fetch attribute-less). Requires `remote_config_url` — see [Remote config](#remote-config) |
 | `workspace_id` | — (required) | Tenant key |
 | `app_id` | — (required) | Product key |
 | `environment_id` | — (required) | Environment scope (e.g. `local` / `develop` / `stage` / `prod`); any non-empty string is accepted |
@@ -450,6 +451,25 @@ way.
 - The fetch is **not consent-gated**: config delivery carries no analytics
   payload — the client id in the URL only scopes which config to serve
   (consistent across our SDKs). See [`docs/privacy.md`](docs/privacy.md).
+- **Targeting attributes (dark opt-in, ADR-0310) are the one
+  granted-consent-only exception.** With
+  `remote_config_attributes_enabled = true`, attributes stored via
+  `shardpilot.set_remote_config_attributes({ geo = "US", … })` ride each
+  fetch as sorted, percent-escaped query parameters so **server-side**
+  delivery rules can target this client (`nil`/empty clears the set; the
+  setter is inert while the flag is off). The vocabulary and bounds are the
+  experiment consumer's, verbatim: `geo`, `app_version`, `device_type`,
+  `install_date`, `user_segment`, plus `custom_attribute_<name>`
+  (≤512-byte values, 64-attribute cap; out-of-vocabulary names are dropped
+  client-side, never sent). Attributes ride **only while consent is
+  granted**: unknown consent or either denied state (forced-minor included)
+  keeps the URL byte-identical to the attribute-less path — the fetch still
+  happens and serves the untargeted defaults, so config delivery stays
+  consent-neutral while "no grant = zero attribute bytes" holds. The SDK
+  still evaluates no rules client-side, and the durable cache stays one
+  record per (workspace, environment, client, url) scope, targeted or not —
+  a cached body may reflect the previously sent attribute set until the
+  next successful fetch (documented v1 limit).
 
 ## Crash wire contract
 
