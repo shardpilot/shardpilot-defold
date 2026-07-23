@@ -313,6 +313,20 @@ local function validate_config(config)
 	if experiments_enabled and not has_remote_config then
 		return nil, "experiments_requires_remote_config_url"
 	end
+	-- Remote-config targeting attributes (dark by default, ADR-0310):
+	-- `remote_config_attributes_enabled = true` opts fetches into carrying
+	-- the set stored via set_remote_config_attributes as query parameters —
+	-- and even then only while consent is granted (the privacy gate lives in
+	-- shardpilot/remote_config.lua). Without the base URL there is no fetch
+	-- for attributes to ride, so the opt-in is a configuration error.
+	if config.remote_config_attributes_enabled ~= nil
+		and type(config.remote_config_attributes_enabled) ~= "boolean" then
+		return nil, "invalid_remote_config_attributes_enabled"
+	end
+	local remote_config_attributes_enabled = config.remote_config_attributes_enabled == true
+	if remote_config_attributes_enabled and not has_remote_config then
+		return nil, "remote_config_attributes_requires_remote_config_url"
+	end
 	-- Dual-mode auth. EITHER a Mode B async `token_provider` (a
 	-- per-tenant ingest JWT minted by the host) OR a Mode A `api_key` (the
 	-- non-secret publishable `sp_ingest_...` key, safe to embed client-side)
@@ -443,6 +457,7 @@ local function validate_config(config)
 		token_provider = config.token_provider,
 		api_key = has_api_key and config.api_key or nil,
 		experiments_enabled = experiments_enabled,
+		remote_config_attributes_enabled = remote_config_attributes_enabled,
 		diagnostics = config.diagnostics,
 		batch_size = batch_size,
 		buffer_size = buffer_size,
@@ -787,6 +802,11 @@ function M.new(config)
 	if normalized.remote_config_url then
 		client.remote_config = remote_config_mod.new(normalized, function()
 			return client.anonymous_id
+		end, function()
+			-- Read live at every dispatch: the ADR-0310 attribute gate must
+			-- see the consent state of the fetch's moment, so a downgrade
+			-- strips attributes from the very next fetch.
+			return client.consent_state
 		end)
 	end
 	-- Durable consent-receipt outbox: reload the receipts a previous launch
@@ -1563,6 +1583,18 @@ function Client:remote_config_values()
 		return nil
 	end
 	return self.remote_config:get_values()
+end
+
+-- Replace the ADR-0310 targeting attribute set enabled fetches send
+-- (`nil`/empty clears). Inert without `remote_config_attributes_enabled`,
+-- and even then attributes ride only while consent is granted — an unknown
+-- or denied state fetches attribute-less. See shardpilot/remote_config.lua.
+function Client:set_remote_config_attributes(attributes)
+	if not self.remote_config then
+		return false, "remote_config_not_configured"
+	end
+	self.remote_config:set_attributes(attributes)
+	return true
 end
 
 function Client:remote_config_version()

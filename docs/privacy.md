@@ -350,7 +350,20 @@ offline launch still gets the previously fetched values. This cache:
   analytics payload (the anonymous client id in the URL only scopes which
   configuration to serve, e.g. for per-client rollout percentages), so a
   denied analytics consent does not block it or clear the cache — consistent
-  across our SDKs; and
+  across our SDKs;
+- carries **targeting attributes only under an explicit grant** (the one
+  personal-data-shaped exception, dark by default): with the ADR-0310 opt-in
+  (`remote_config_attributes_enabled = true`) the attributes the game stores
+  via `set_remote_config_attributes` ride the fetch as query parameters so
+  server-side delivery rules can target this client — and they ride ONLY
+  while the consent state read at dispatch time is granted. Unknown consent
+  and both denied states (the forced-minor denial included) keep the fetch
+  attribute-less — byte-identical to the no-opt-in URL — and serve the
+  untargeted defaults, so "no grant = zero attribute bytes egressed" holds
+  while configuration delivery itself stays consent-neutral. The cache scope
+  deliberately excludes the attribute set (one record per scope, targeted or
+  not): a cached body may reflect the previously sent attributes until the
+  next successful fetch; and
 - is **never served after an unauthorized fetch outcome**: a `401`/`403`
   fails closed instead of serving the cached snapshot, so a revoked key
   cannot keep supplying configuration.

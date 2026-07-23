@@ -288,6 +288,19 @@ available; the last-known-good snapshot survives restarts and offline
 launches. `remote_config_version()` reads the response wrapper's `version`
 metadata.
 
+Targeting attributes are a dark opt-in (ADR-0310) and — unlike the fetch —
+granted-consent-only: `remote_config_attributes_enabled = true` plus
+`shardpilot.set_remote_config_attributes({ geo = "US", … })` makes fetches
+carry the experiment attribute vocabulary (`geo`, `app_version`,
+`device_type`, `install_date`, `user_segment`, `custom_attribute_<name>`;
+≤512-byte values, 64-attribute cap, sorted; out-of-vocabulary names dropped,
+never sent) as query parameters for server-side delivery rules. Attributes
+ride ONLY while consent is granted — unknown or denied consent (forced-minor
+included) fetches attribute-less and serves the untargeted defaults. Default
+`false`: the fetch URL stays byte-identical to the attribute-less path and
+the setter is inert. The flag requires `remote_config_url`
+(`remote_config_attributes_requires_remote_config_url` otherwise).
+
 ## Crash reporting
 
 Crash reporting is a **separate module with separate init and credentials** —

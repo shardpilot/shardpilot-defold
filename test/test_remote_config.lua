@@ -1758,6 +1758,154 @@ local function test_denied_consent_does_not_gate_the_fetch()
 	assert_equal(result.values.a, 1)
 end
 
+-- ── targeting attributes (ADR-0310, dark opt-in) ──────────────────────────────
+
+local attributeless_fetch_url =
+	"http://localhost:18081/config/v1/workspace-test/develop/anon-client"
+
+local function test_build_url_appends_escaped_attribute_query()
+	assert_equal(
+		remote_config.build_url("http://localhost:18081", "ws", "env", "anon", {
+			{ name = "geo", value = "U S" },
+			{ name = "custom_attribute_x", value = "a&b=c" },
+		}),
+		"http://localhost:18081/config/v1/ws/env/anon?geo=U%20S&custom_attribute_x=a%26b%3Dc",
+		"both query sides must ride the injective escaper")
+	-- Absent and empty attribute lists leave the URL byte-identical to the
+	-- attribute-less path — the dark posture's whole claim.
+	assert_equal(
+		remote_config.build_url("http://localhost:18081", "ws", "env", "anon"),
+		"http://localhost:18081/config/v1/ws/env/anon")
+	assert_equal(
+		remote_config.build_url("http://localhost:18081", "ws", "env", "anon", {}),
+		"http://localhost:18081/config/v1/ws/env/anon")
+end
+
+local function test_attributes_config_validation()
+	reset()
+	local client, err = sdk.new(config({ remote_config_attributes_enabled = 42 }))
+	assert_equal(client, nil)
+	assert_equal(err, "invalid_remote_config_attributes_enabled")
+
+	client, err = sdk.new(config({ remote_config_attributes_enabled = "yes" }))
+	assert_equal(client, nil)
+	assert_equal(err, "invalid_remote_config_attributes_enabled")
+
+	-- Without the base URL there is no fetch for attributes to ride.
+	local no_base = config({ remote_config_attributes_enabled = true })
+	no_base.remote_config_url = nil
+	client, err = sdk.new(no_base)
+	assert_equal(client, nil)
+	assert_equal(err, "remote_config_attributes_requires_remote_config_url")
+end
+
+local function test_attributes_never_ride_while_the_opt_in_is_off()
+	reset()
+	next_status = 202
+	next_response_body = '{"accepted":1}'
+	local client = assert(sdk.new(config()))
+	client:set_consent(true)
+	assert_true(client:set_remote_config_attributes({ geo = "US" }))
+
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	local result = fetch(client)
+	assert_true(result.ok, result.error)
+	assert_equal(last_request().url, attributeless_fetch_url,
+		"the default-off flag must keep the fetch URL byte-identical")
+end
+
+local function test_opted_in_attributes_stay_off_the_wire_without_a_grant()
+	reset()
+	local client = assert(sdk.new(config({ remote_config_attributes_enabled = true })))
+	assert_true(client:set_remote_config_attributes({ geo = "US" }))
+
+	-- Unknown consent: the fetch happens (config delivery is consent-
+	-- neutral) but carries zero attribute bytes.
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	local result = fetch(client)
+	assert_true(result.ok, result.error)
+	assert_equal(last_request().url, attributeless_fetch_url,
+		"unknown consent must fetch attribute-less")
+
+	-- Both denied states, the forced-minor denial included.
+	for _, decision in ipairs({ false, "denied_forced_minor" }) do
+		next_status = 202
+		next_response_body = '{"accepted":1}'
+		client:set_consent(decision)
+		next_status = 200
+		next_response_body = values_body({ a = 1 })
+		result = fetch(client)
+		assert_true(result.ok, result.error)
+		assert_equal(last_request().url, attributeless_fetch_url,
+			"denied consent (" .. tostring(decision) .. ") must fetch attribute-less")
+	end
+end
+
+local function test_opted_in_granted_fetch_carries_the_normalized_attributes()
+	reset()
+	next_status = 202
+	next_response_body = '{"accepted":1}'
+	local client = assert(sdk.new(config({ remote_config_attributes_enabled = true })))
+	client:set_consent(true)
+	assert_true(client:set_remote_config_attributes({
+		geo = "US",
+		app_version = "1.2.3",
+		custom_attribute_vip = "yes",
+		invented_name = "dropped",
+	}))
+
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	local result = fetch(client)
+	assert_true(result.ok, result.error)
+	assert_equal(
+		last_request().url,
+		attributeless_fetch_url .. "?app_version=1.2.3&custom_attribute_vip=yes&geo=US",
+		"a granted opted-in fetch must carry the sorted vocabulary; out-of-vocabulary names never ride")
+
+	-- nil clears the set: the next fetch is attribute-less again.
+	assert_true(client:set_remote_config_attributes(nil))
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	fetch(client)
+	assert_equal(last_request().url, attributeless_fetch_url,
+		"a cleared attribute set must leave no query behind")
+end
+
+local function test_consent_downgrade_strips_attributes_from_the_next_fetch()
+	reset()
+	next_status = 202
+	next_response_body = '{"accepted":1}'
+	local client = assert(sdk.new(config({ remote_config_attributes_enabled = true })))
+	client:set_consent(true)
+	assert_true(client:set_remote_config_attributes({ geo = "US" }))
+
+	next_status = 200
+	next_response_body = values_body({ a = 1 }, 7)
+	next_response_headers = { etag = '"v7"' }
+	fetch(client)
+	assert_equal(last_request().url, attributeless_fetch_url .. "?geo=US")
+
+	-- The downgrade is read at dispatch time: the very next fetch is
+	-- attribute-less, while ETag revalidation (unrelated to consent)
+	-- keeps riding.
+	next_status = 202
+	next_response_body = '{"accepted":1}'
+	next_response_headers = nil
+	client:set_consent(false)
+	next_status = 304
+	next_response_body = nil
+	local result = fetch(client)
+	assert_true(result.ok, result.error)
+	assert_equal(result.from_cache, true)
+	assert_equal(last_request().url, attributeless_fetch_url,
+		"a consent downgrade must strip attributes from the very next fetch")
+	assert_equal(last_request().headers["If-None-Match"], '"v7"',
+		"revalidation is consent-neutral and must keep riding")
+end
+
 -- ── degraded runtimes ─────────────────────────────────────────────────────────
 
 local function test_missing_transport_serves_cache_and_reports()
@@ -1918,6 +2066,12 @@ local tests = {
 	test_typed_getters_serve_defaults_on_miss_and_type_mismatch,
 	test_getters_without_remote_config_serve_defaults,
 	test_denied_consent_does_not_gate_the_fetch,
+	test_build_url_appends_escaped_attribute_query,
+	test_attributes_config_validation,
+	test_attributes_never_ride_while_the_opt_in_is_off,
+	test_opted_in_attributes_stay_off_the_wire_without_a_grant,
+	test_opted_in_granted_fetch_carries_the_normalized_attributes,
+	test_consent_downgrade_strips_attributes_from_the_next_fetch,
 	test_missing_transport_serves_cache_and_reports,
 	test_missing_json_decoder_fails_the_fetch,
 	test_cache_persist_failure_is_best_effort_and_diagnosed,

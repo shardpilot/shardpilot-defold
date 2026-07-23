@@ -102,6 +102,13 @@ function M.fetch_remote_config(callback)
 	return client:fetch_remote_config(callback)
 end
 
+-- Targeting attributes for the ADR-0310 opt-in ride with_default: storing a
+-- set is an action with a real failure mode ("not_initialized" /
+-- "remote_config_not_configured"), not a value read.
+function M.set_remote_config_attributes(attributes)
+	return with_default("set_remote_config_attributes", attributes)
+end
+
 function M.remote_config_value(key)
 	local client = default()
 	if not client then
