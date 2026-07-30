@@ -285,10 +285,13 @@ which is not consent-gated — see [`privacy.md`](privacy.md).
 
 **Targeting attributes** use the fixed server vocabulary: `geo`,
 `app_version`, `device_type`, `install_date`, `user_segment`, and
-`custom_attribute_<name>` (suffix 1–64 characters). Values are trimmed and
-bounded to 512 bytes, at most 64 attributes ride one fetch, and names outside
-the vocabulary are dropped client-side and never sent. Matching is 100%
-server-evaluated; the SDK evaluates no rules and never re-buckets locally.
+`custom_attribute_<name>`, where the suffix is **1–64 bytes** — measured in
+bytes, not code points, so a multibyte suffix can pass a character count and
+still be over the limit. An over-limit or out-of-vocabulary name is dropped
+client-side and never sent, silently; keep custom attribute names ASCII.
+Values are trimmed and bounded to 512 bytes and at most 64 attributes ride one
+fetch. Matching is 100% server-evaluated; the SDK evaluates no rules and never
+re-buckets locally.
 
 **Caching and kill latency.** An assignment is cached in memory and in one
 durable per-app record, so a later launch serves the last-known-good variant
@@ -301,10 +304,30 @@ indefinitely.
 **Durable caching is best effort.** The record has a fixed size cap and evicts
 the oldest-fetched assignments to stay under it, and on a host with no working
 save-file backend it degrades to process-local memory. An evicted or
-unpersisted assignment keeps serving for the rest of the process, then is
-simply refetched on the next launch — absence is always a refetch, never a
-wrong serve. Do not rely on "cached once, offline forever" for a game that
-holds many experiments at once.
+unpersisted assignment keeps serving for the rest of the process, and its loss
+is never a wrong serve — but **your code has to recover it.** The revalidation
+cadence only refreshes experiments already in the cache and cannot rediscover
+a missing key, so a launch that starts without the record stays on the control
+path until you call `fetch_experiment_assignment` for that experiment. Fetch
+the experiments you care about at startup instead of relying on "cached once,
+offline forever".
+
+**The subject id is best effort too, and stickiness follows it.** With no
+working save-file backend, or on a failed durable write (diagnosed, not
+fatal), the minted `spcid_` id stays memory-only — the next launch mints a new
+one, and the server, which buckets on that id, may place the player in a
+different variant. There is no host setter to pin it. Long-run stickiness is
+only as good as the identity record's durability on your target platform.
+
+**Variant payloads are copied with a depth limit of 16 nested tables.** The
+same bounded copy runs on install and on every `experiment_payload` read, and
+a subtree at or beyond that depth is dropped (`nil`) rather than rejected — a
+payload nested 16+ deep arrives silently truncated. Keep variant payloads
+shallow; they are configuration, not a document tree.
+
+**`Retry-After` is honored in its delta-seconds form only.** An HTTP-date
+`Retry-After` is not parsed and is ignored; the client falls back to its own
+jittered backoff.
 
 **Serving a cached assignment through a failure is attribute-fenced.** On a
 transient failure the cached variant is only returned when the failing fetch

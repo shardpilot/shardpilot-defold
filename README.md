@@ -592,6 +592,14 @@ identity record: there is deliberately no config field and no setter for it,
 it is distinct from the anonymous ID, and it egresses **only** as this fetch's
 `subject_key` — never in an analytics event, prop, or envelope identity.
 
+Its persistence is **best effort, and that has a stickiness consequence.** On
+a host with no working save-file backend, or when the durable write simply
+fails (diagnosed, not fatal), the minted id stays memory-only — so the next
+launch mints a *new* subject, and the server, bucketing on that id, may put
+the player in a different variant. Long-run stickiness is only as good as the
+identity record's durability on the platform you ship to. This is also why
+the id is never host-settable: there is no supported way to pin it yourself.
+
 ### Fetch semantics
 
 - **Assigned** — the variant is served (`assigned = true`) and cached in
@@ -602,9 +610,19 @@ it is distinct from the anonymous ID, and it egresses **only** as this fetch's
   **best effort**: the record has a fixed size cap and evicts the
   oldest-fetched assignments to stay under it, and on a host without a
   working save-file backend it degrades to process-local memory. An evicted
-  or unpersisted assignment keeps serving for the rest of the process and is
-  simply refetched next launch — absence is always a refetch, never a wrong
-  serve.
+  or unpersisted assignment keeps serving for the rest of the process, and
+  the loss is never a wrong serve — but **recovering it is your call, not the
+  SDK's.** The revalidation cadence only refreshes experiments already in the
+  cache; it cannot rediscover a key that is missing, so a launch that starts
+  without the record stays on the control path until your code calls
+  `fetch_experiment_assignment` for that key. Fetch the experiments you care
+  about at startup rather than assuming the cache repopulates itself.
+- **Variant payloads are copied with a depth limit of 16 nested tables.**
+  Both the install and `experiment_payload` use the same bounded copy, and a
+  subtree at or below that depth is dropped (`nil`) rather than rejected — so
+  a payload nested 16+ deep reaches your game silently truncated. Keep
+  variant payloads shallow; they are meant to be configuration, not a
+  document tree.
 - **Not assigned** — `ok = true, assigned = false` with a closed `reason`
   vocabulary: absent (a deterministic traffic-gate miss),
   `"targeting_unmatched"`, or `"kill_switch"` (an operator kill). All three
@@ -627,8 +645,10 @@ it is distinct from the anonymous ID, and it egresses **only** as this fetch's
 - **Transient** (`429`, `5xx`, `408`, offline, timeout, malformed body) — the
   cached assignment is served with `from_cache = true` and `error` carrying
   the reason (`transient_429`, `transient_<5xx>`, `transient_408`, `http_0`,
-  `malformed_response`); `Retry-After` is honored on `429` and `5xx`, and the
-  revalidation cadence backs off. **Serving stale is attribute-fenced:** the
+  `malformed_response`); `Retry-After` is honored on `429` and `5xx` — **in
+  its delta-seconds form only.** A `Retry-After` sent as an HTTP-date is not
+  parsed and is ignored, and the client falls back to its own jittered
+  backoff. **Serving stale is attribute-fenced:** the
   cached assignment comes back only when the failing fetch asked with the
   same normalized targeting attributes it was evaluated under. Fetch the same
   experiment with a different `geo` (or any other changed attribute) and a
@@ -670,10 +690,13 @@ game has to handle specially.
   `fetch_remote_config`, which is not consent-gated.
 - **Targeting attributes** ride the fixed server vocabulary — `geo`,
   `app_version`, `device_type`, `install_date`, `user_segment`, plus
-  `custom_attribute_<name>` (suffix 1–64 chars). Values are trimmed and
-  bounded to 512 bytes, at most 64 attributes ride one fetch, and names
-  outside the vocabulary are dropped client-side and never sent. Matching is
-  **100% server-evaluated**; the SDK evaluates no rules.
+  `custom_attribute_<name>` where the suffix is **1–64 bytes** (measured in
+  bytes, not code points — a multibyte suffix that looks short enough can
+  still be over the limit, and an over-limit name is dropped silently; keep
+  custom attribute names ASCII). Values are trimmed and bounded to 512 bytes,
+  at most 64 attributes ride one fetch, and names outside the vocabulary are
+  dropped client-side and never sent. Matching is **100% server-evaluated**;
+  the SDK evaluates no rules.
 - **Exposure and outcome facts** ride the normal analytics pipeline (queue →
   batch → spool → consent gates). At most one `experiment_exposure` is emitted
   automatically per (experiment, version, subject) per session when the
