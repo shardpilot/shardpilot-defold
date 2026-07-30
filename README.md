@@ -776,8 +776,16 @@ game has to handle specially.
   moment and stays eligible for delivery; overflow removes only the in-memory
   copy, and nothing is lost. An owed snapshot that never reached the spool is
   gone — not retried, not spooled — and a long block can then undercount the
-  experiment population. So read `owed_overflow` as "check whether this one
-  was durably captured", not as a guaranteed measurement loss.
+  experiment population.
+
+  You cannot tell the two apart from the diagnostic. The callback receives
+  only `scope`, `status` and `code` — no experiment key, no event id, no
+  capture state — and there is no public spool introspection. So
+  `owed_overflow` is an **uncorrelated warning**: it tells you that some owed
+  exposure for some experiment was evicted, and nothing more. Treat it
+  conservatively — as a signal that the analytics queue has been blocked long
+  enough to start shedding measurement, and a reason to look at queue health,
+  not as a per-experiment loss you can attribute or reconcile.
 
 ## Crash wire contract
 
