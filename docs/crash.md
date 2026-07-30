@@ -360,7 +360,8 @@ Details worth knowing:
   client is unverified and is never used as the actor key. There is deliberately
   no option to send one.
 - **A malformed value drops the field, not the report.** Free text, an email, an
-  IP, a JWT, a raw `user_`/`player_`/`device_`-prefixed id, or anything over 512
+  IP, a JWT, any `user_`/`player_`/`customer_`/`device_`-prefixed id (with or
+  without digits — `user_alice` as well as `user_4242`), or anything over 512
   bytes is discarded and the crash still ships. A getter that throws is caught
   for the same reason: it is your code running while the process is already
   dying.

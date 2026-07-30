@@ -1517,9 +1517,19 @@ end
 -- Expose the CURRENT session id so the host can correlate other telemetry (a
 -- crash report, a support ticket) with the analytics session it happened in.
 -- Returns nil when no session is open — a `backend`-source client never opens
--- one, and a client opens its first session lazily — so callers must tolerate
--- nil rather than assume a string.
+-- one, a client opens its first session lazily, and a session that has ENDED is
+-- no longer current — so callers must tolerate nil rather than assume a string.
+--
+-- Gating on session_active is load-bearing, not defensive: session_end clears the
+-- flag but deliberately retains self.session_id, so returning the raw field would
+-- keep handing out a CLOSED session's id. Wired into crash config, that would
+-- attribute a crash between session_end and the next session_start to a session
+-- that was already over.
 function Client:get_session_id()
+	if not self.session_active then
+		return nil
+	end
+
 	return self.session_id
 end
 

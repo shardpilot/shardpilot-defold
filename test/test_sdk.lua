@@ -494,6 +494,30 @@ local function test_id_generator_seeds_without_caller()
 	assert_not_equal(first, second)
 end
 
+local function test_get_session_id_returns_nil_when_no_session_is_open()
+	-- The getter is wired into crash config, so its contract matters: a crash
+	-- emitted between session_end and the next session_start must not be
+	-- attributed to the session that already closed. session_end clears
+	-- session_active but deliberately RETAINS session_id, so the getter has to
+	-- gate on the flag rather than return the raw field.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config()))
+
+	assert_equal(client:get_session_id(), nil, "no session has been opened yet")
+
+	assert_true(client:session_start())
+	local open_id = client:get_session_id()
+	assert_true(type(open_id) == "string" and #open_id > 0, "an open session must expose its id")
+	assert_equal(open_id, client.session_id)
+
+	assert_true(client:session_end("complete"))
+	assert_equal(client:get_session_id(), nil, "a CLOSED session must not be reported as current")
+
+	assert_true(client:session_start())
+	assert_true(type(client:get_session_id()) == "string", "a renewed session exposes its id again")
+end
+
 local function test_session_start_renews_session_and_resets_sequence()
 	reset()
 	seed_granted_consent()
@@ -7108,6 +7132,7 @@ local tests = {
 	test_platform_maps_html5_to_web,
 	test_app_first_payload,
 	test_screen_view_does_not_mutate_caller_props,
+	test_get_session_id_returns_nil_when_no_session_is_open,
 	test_session_start_renews_session_and_resets_sequence,
 	test_session_start_rolls_back_on_enqueue_failure,
 	test_session_start_rolls_back_on_invalid_props,

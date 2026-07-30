@@ -122,14 +122,22 @@ local max_actor_identifier_bytes = 512
 -- of record; losing it because an identity provider returned something malformed
 -- would trade a diagnostic away for a correlation key.
 --
--- The content rules come from the STRUCTURED tier, not the free-text tier. That is
--- load-bearing and not a style choice: the free-text tier additionally blanks any
--- single opaque run of >= 40 chars, so it keeps a 36-char UUID but silently blanks
--- a 64-char hex digest or a long base64url token. Routing actor keys through it
--- would make crash-to-actor linkage depend on which id FORMAT a game happens to
--- use — a worse failure than not linking at all, because it is invisible. The
--- structured tier still removes the material that actually matters here: a
--- digit-bearing raw actor id (user_4242), an embedded email, an IP, a real JWT.
+-- The content rules come from the CODE-SYMBOL tier. Both neighbouring tiers are
+-- wrong here, in opposite directions:
+--
+--   * the FREE-TEXT tier additionally blanks any single opaque run of >= 40 chars,
+--     so it keeps a 36-char UUID but silently blanks a 64-char hex digest or a long
+--     base64url token — which would make crash-to-actor linkage depend on which id
+--     FORMAT a game happens to use, an invisible failure;
+--   * the plain STRUCTURED tier deliberately drops the whole-value bare-raw-id rule
+--     so an operator-scope slug like "user_app" survives, which means a DIGIT-FREE
+--     raw identifier (user_alice, player_bob, customer_acme) passes straight
+--     through — exactly the material this field must never carry.
+--
+-- The symbol tier is the structured tier PLUS that whole-value bare-id rule, so it
+-- drops every disallowed-prefix identifier while still keeping a long opaque
+-- pseudonymous id. Measured: user_alice / player_bob / customer_acme / device_laptop
+-- are dropped; UUIDv7, 64-char hex, and base64url are kept verbatim.
 local function normalize_actor_identifier(value)
 	if type(value) ~= "string" then
 		return ""
@@ -150,7 +158,7 @@ local function normalize_actor_identifier(value)
 	if sanitize.contains_jwt(trimmed) then
 		return ""
 	end
-	return sanitize.sanitize_structured(trimmed)
+	return sanitize.sanitize_symbol(trimmed)
 end
 
 M.normalize_actor_identifier = normalize_actor_identifier
@@ -1451,13 +1459,26 @@ function M.prepare(client, event, trusted_frame_functions, options)
 	-- mis-key BOTH — a compliance fault, not a reporting inaccuracy. With no
 	-- capture-time snapshot to restore, the only correct value is no value: the
 	-- report ships device-scoped and anonymous, exactly as it does today.
-	if not options.skip_identity_stamp then
-		if not non_empty(event.anonymous_id) then
-			event.anonymous_id = resolve_configured_identity(client.config.anonymous_id)
-		end
-		if not non_empty(event.session_id) then
-			event.session_id = resolve_configured_identity(client.config.session_id)
-		end
+	-- UNCONDITIONALLY derived from the trusted config — never a per-event value.
+	-- These are SDK-owned fields, and the assignment overwrites whatever the caller
+	-- put there. A per-event override would let a report carry an actor key when no
+	-- identity is configured at all, or point a crash at a different subject than
+	-- the one the client is reporting for; since the service hashes this field into
+	-- the key it uses for diagnostics consent and for erasure, either case mis-keys
+	-- both. This mirrors app.id, which is likewise stamped from config over any
+	-- caller value, and it is why the caller-map identity wall can stay name-keyed:
+	-- there is no path — map or top-level — by which caller input reaches this field.
+	if options.skip_identity_stamp then
+		-- The previous-session dump-forward path. That report describes a process
+		-- that died in an EARLIER launch, so the id resolvable now belongs to
+		-- whoever is present at THIS launch — after a rotation, a different
+		-- subject. With no capture-time snapshot to restore, the only correct
+		-- value is no value.
+		event.anonymous_id = ""
+		event.session_id = ""
+	else
+		event.anonymous_id = resolve_configured_identity(client.config.anonymous_id)
+		event.session_id = resolve_configured_identity(client.config.session_id)
 	end
 
 	-- Attach the breadcrumb ring snapshot when the caller supplied none — unless

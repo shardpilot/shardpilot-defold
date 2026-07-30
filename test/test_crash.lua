@@ -711,6 +711,35 @@ local function test_pii_scrubbed_from_wire()
 	assert_contains(body, '"function":"game.tick"')
 end
 
+local function test_caller_cannot_supply_its_own_actor_key()
+	-- The actor key is SDK-owned: it is stamped from the trusted config over
+	-- whatever the caller put on the event. A per-event override would let a
+	-- report carry a key when no identity is configured, or point a crash at a
+	-- different subject — mis-keying consent and erasure either way.
+	reset()
+	local unconfigured = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(unconfigured:emit(presymbolicated_event({
+		anonymous_id = "0198f2c1-4b3a-7c2d-8e9f-callersupplied",
+		session_id = "0198f2c1-4b3a-7c2d-8e9f-callersession",
+	})))
+	assert_equal(#requests, 1)
+	assert_not_contains(requests[1].body, "callersupplied")
+	assert_not_contains(requests[1].body, "callersession")
+	assert_not_contains(requests[1].body, "anonymous_id")
+
+	-- And a caller value cannot displace a CONFIGURED identity either.
+	reset()
+	local configured = assert(crash.new(config({
+		sample_every = 1,
+		anonymous_id = "0198f2c1-4b3a-7c2d-8e9f-configured00",
+	})))
+	assert_true(configured:emit(presymbolicated_event({
+		anonymous_id = "0198f2c1-4b3a-7c2d-8e9f-callersupplied",
+	})))
+	assert_contains(requests[1].body, '"anonymous_id":"0198f2c1-4b3a-7c2d-8e9f-configured00"')
+	assert_not_contains(requests[1].body, "callersupplied")
+end
+
 local function test_actor_key_stamped_from_configured_provider()
 	reset()
 	-- The provider form: resolved at EMIT time, so a rotation between two crashes
@@ -796,6 +825,11 @@ local function test_actor_key_accepts_every_realistic_id_format()
 	-- and the material that must never reach the wire
 	for _, bad in ipairs({
 		"user_4242", "player_77", "device_abc123",
+		-- DIGIT-FREE bare raw ids. These are the ones the plain structured tier
+		-- lets through (it drops the whole-value bare-id rule so an operator slug
+		-- like "user_app" survives), which is why the actor key uses the symbol
+		-- tier instead.
+		"user_alice", "player_bob", "customer_acme", "device_laptop",
 		"player@example.com", "198.51.100.23",
 		"header.eyJzdWIiOiJ0ZXN0In0.signature",
 		"not an id at all", "-leading-dash", string.rep("a", 513),
@@ -5575,6 +5609,7 @@ local tests = {
 	test_actor_key_accepts_every_realistic_id_format,
 	test_caller_context_identity_wall_still_holds,
 	test_configured_actor_key_shape_is_validated,
+	test_caller_cannot_supply_its_own_actor_key,
 	test_previous_session_dump_never_borrows_the_live_identity,
 	test_context_session_id_pii_rejects_event,
 	test_sanitizer_unit_rules,

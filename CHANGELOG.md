@@ -19,9 +19,12 @@
     record. A raw **account** id is never sent — crash ingest is API-key
     authenticated, so a client-asserted account id is unverified and is never
     used as the actor key.
-  - A malformed value (free text, email, IP, JWT, a raw
-    `user_`/`player_`/`device_` id, or over 512 bytes) drops the FIELD, never
-    the report; a getter that throws is caught for the same reason.
+  - A malformed value (free text, email, IP, JWT, any
+    `user_`/`player_`/`customer_`/`device_`-prefixed id — digit-free ones like
+    `user_alice` included — or over 512 bytes) drops the FIELD, never the
+    report; a getter that throws is caught for the same reason.
+  - The key is stamped from config and is NOT a per-event override: a caller
+    cannot put its own `anonymous_id` on an event.
   - A **previous-session** dump forwarded on the next launch carries no actor
     key: the id available then belongs to whoever is playing now, and stamping
     it would mis-key both consent and deletion.
