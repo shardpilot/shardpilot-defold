@@ -157,10 +157,12 @@ the `api_key` authenticates only the remote-config fetch.
   of the same build had the flag on, turning it back off does not strand what
   that run left behind: `init()` still reads the small clear marker and
   filters any matching experiment facts out of the offline spool, so a
-  rollback launch cannot replay withdrawn assignment data. A build that has
-  never had the flag on has no such state and this path does nothing — but a
-  storage or privacy audit should not read "zero paths" as "no experiment
-  state is ever touched while off".
+  rollback launch cannot replay withdrawn assignment data. The
+  assignment-cache record written by that earlier run also stays on disk. A
+  build that has never had the flag on has no such state and this path does
+  nothing — but for a storage or privacy audit the rule is: the flag gates
+  the *creation* of the experiment records, not their continued existence or
+  the reading of the clear marker.
 
 **Enabling it requires two more fields.** The assignment endpoint is served by
 the same host as the remote-config fetch and authenticates with the same
@@ -201,16 +203,27 @@ The public calls, verified against `shardpilot/sdk.lua`:
   `callback(result)`, where `result` is
   `{ ok, from_cache, assigned?, variant_key?, variant_payload?, version?,
   reason?, error? }`. Never treat a synchronous `true` as a resolved
-  assignment; branch on `result`.
+  assignment; branch on `result`. **One case produces no callback at all:** a
+  request still in flight when `shutdown()` succeeds is cancelled and never
+  calls back, by design — so do not park state that only a callback can
+  release across a shutdown.
   Pre-dispatch failure codes: `not_initialized`, `shutdown`,
   `experiments_not_configured`, `experiment_key_required`, `consent_unknown`,
   `consent_denied`, `http_unavailable`, `json_unavailable`. Values that reach
   you as `result.error`: `unauthorized`, `not_found`, `bad_request`,
-  `malformed_response`, `stale_subject`, `superseded`, and the transient
-  family — `http_0` (no connection), `transient_408`, `transient_429`,
-  `transient_<5xx>` — with `http_<status>` reserved for anything else the
-  client cannot classify. Branch throttling and server-error retries on
-  `transient_429` / `transient_<5xx>`, not on `http_<status>`.
+  `malformed_response`, `stale_subject`, `superseded`, the consent trio
+  below, and the transient family — `http_0` (no connection),
+  `transient_408`, `transient_429`, `transient_<5xx>` — with `http_<status>`
+  reserved for anything else the client cannot classify. Branch throttling
+  and server-error retries on `transient_429` / `transient_<5xx>`, not on
+  `http_<status>`.
+- **Consent can close the plane mid-flight**, so `consent_unknown` and
+  `consent_denied` are not only pre-dispatch refusals: a downgrade while the
+  request is in flight resolves the callback with them, and a deny→re-grant
+  that raced the response resolves it with `consent_changed`. All three mean
+  no variant is served, and all three arrive as `result.error`. An
+  integration classifying callback outcomes must handle them there, not only
+  on the synchronous return.
 - **`experiment_variant(experiment_key)`** — the cached variant key (a string)
   or `nil`. Never touches the network, never fails.
 - **`experiment_payload(experiment_key)`** — a copy of the cached variant

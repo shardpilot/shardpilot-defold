@@ -534,7 +534,9 @@ remote-config and assignment fetches. Feature-detect the surface before
 -- DISPATCH status, not the answer: `true` means the request went out and the
 -- result will arrive through the callback; `false, err` means the call was
 -- refused before dispatch (and the callback still reports that refusal).
--- Always read the assignment off the callback.
+-- Read the assignment off the callback -- with one exception: shutdown()
+-- cancels the callbacks of requests still in flight, so do not park state
+-- that only a callback can release across a shutdown.
 shardpilot.fetch_experiment_assignment("menu_layout", function(result)
   -- result = { ok, from_cache, assigned?, variant_key?, variant_payload?,
   --            version?, reason?, error? }
@@ -563,7 +565,7 @@ shardpilot.track_outcome("menu_layout", "purchase_value", 4.99)
 
 | Call | Returns | Failure codes you can branch on |
 |---|---|---|
-| `fetch_experiment_assignment(key, [attributes], callback)` | `true` = dispatched, or `false, err` = refused before dispatch; the assignment always arrives through `callback` | pre-dispatch: `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `consent_unknown`, `consent_denied`, `http_unavailable`, `json_unavailable`. In the callback's `result.error`: `unauthorized`, `not_found`, `bad_request`, `malformed_response`, `stale_subject`, `superseded`, `http_0`, `transient_408`, `transient_429`, `transient_<5xx>`, and `http_<status>` for anything unclassified |
+| `fetch_experiment_assignment(key, [attributes], callback)` | `true` = dispatched, or `false, err` = refused before dispatch; the assignment arrives through `callback` unless `shutdown()` cancels it first | pre-dispatch: `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `consent_unknown`, `consent_denied`, `http_unavailable`, `json_unavailable`. In the callback's `result.error`: `unauthorized`, `not_found`, `bad_request`, `malformed_response`, `stale_subject`, `superseded`, `consent_unknown`, `consent_denied`, `consent_changed`, `http_0`, `transient_408`, `transient_429`, `transient_<5xx>`, and `http_<status>` for anything unclassified |
 | `experiment_variant(key)` | variant key `string`, or `nil` | — (never fails) |
 | `experiment_payload(key)` | the variant payload (a copy), or `nil` | — (never fails) |
 | `track_exposure(key)` | `ok, err` | `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `no_assignment`, `consent_unknown`, `consent_denied`, `exposure_no_subject_fact_key`, `queue_full` |
@@ -572,6 +574,15 @@ shardpilot.track_outcome("menu_layout", "purchase_value", 4.99)
 `queue_full` is the one worth retrying: the in-memory event queue is at
 `buffer_size`, so flush (or wait for the next batch) and call again rather
 than dropping the exposure or outcome.
+
+Two callback rules worth internalizing. **Consent can close the plane while a
+request is in flight** — a downgrade mid-flight resolves the callback with
+`consent_unknown` / `consent_denied`, and a deny→re-grant that raced the
+response resolves it with `consent_changed`; all three mean no variant, and
+all three reach you through `result.error`, not the synchronous return.
+**`shutdown()` cancels in-flight callbacks** — a request dispatched before a
+successful shutdown never calls back at all, by design, so never leave state
+parked that only a callback can release.
 
 The fetch is
 `GET {remote_config_url}/api/v1/runtime/experiments/assignment?app_key=&environment_key=&experiment_key=&subject_key=`
@@ -888,9 +899,13 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   source file added solely by filename — keep the boundary by convention.
 - **No durable I/O beyond the enumerated records** (identity, event spool,
   consent-receipt outbox, consent denial marker, crash-retry sidecar,
-  crash-reporting settings, remote-config cache, and — only while
-  `experiments_enabled` is on — the experiment-assignment cache and its
-  clear marker).
+  crash-reporting settings, remote-config cache, the experiment-assignment
+  cache, and the experiment clear marker). The last two are **created** only
+  by a run with `experiments_enabled` on — but once created they persist, and
+  a later run with the flag **off** still reads the clear marker to filter
+  withdrawn experiment facts out of the spool. For a storage or privacy
+  audit: the flag gates creation, not the existence or the reading of these
+  records.
   `io.*`, `os.execute`, and browser/local storage are forbidden in source;
   `sys.save`/`sys.load`/`sys.get_save_file` are confined to
   `shardpilot/storage.lua`, which writes only the identity record, the bounded
