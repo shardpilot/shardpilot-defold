@@ -768,10 +768,16 @@ game has to handle specially.
   analytics queue is blocked, each fresh application of the same experiment
   (a session renewal, an assignment-version change) parks another owed
   snapshot. Past eight, the OLDEST is dropped and the SDK emits
-  `exposure_skipped` / `owed_overflow`. That exposure is gone — not retried,
-  not spooled — so a long block can undercount the experiment population.
-  Watch for `owed_overflow` in diagnostics: it is the signal that the
-  measurement, not just the delivery, has been affected.
+  `exposure_skipped` / `owed_overflow`.
+
+  Whether that loses the exposure depends on whether it had already been
+  captured durably. An owed snapshot that previously survived an
+  authoritative per-key drop was written into the analytics spool at that
+  moment and stays eligible for delivery; overflow removes only the in-memory
+  copy, and nothing is lost. An owed snapshot that never reached the spool is
+  gone — not retried, not spooled — and a long block can then undercount the
+  experiment population. So read `owed_overflow` as "check whether this one
+  was durably captured", not as a guaranteed measurement loss.
 
 ## Crash wire contract
 
