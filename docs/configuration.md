@@ -247,9 +247,15 @@ again — the exposure or outcome is otherwise silently lost.
 be emitted when the assignment carries the server-supplied opaque key it is
 allowed to be attributed by; the SDK-minted subject id must never reach the
 analytics plane. An assignment served without one — a synthetic-unit answer,
-for example — is applied normally but emits **no** exposure at all, reported
-as `exposure_no_subject_fact_key` and surfaced through `diagnostics`. Do not
+for example — is applied normally but emits **no** exposure at all. Do not
 assume every applied treatment is measured.
+
+Watch the right name for it. The *automatic* skip surfaces **only** through
+your `diagnostics` hook, as `status = "exposure_skipped"` with
+`code = "no_subject_fact_key"`. The similar-looking
+`exposure_no_subject_fact_key` is a different thing: the `err` returned from
+an explicit `track_exposure` / `track_outcome` call. An integration watching
+only the public-call error will not see the automatic gaps at all.
 
 Treat `nil` from the getters as the control experience — that is what your
 game sees before the first fetch resolves, when the subject is not assigned,

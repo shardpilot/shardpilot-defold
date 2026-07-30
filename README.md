@@ -608,8 +608,13 @@ it is distinct from the anonymous ID, and it egresses **only** as this fetch's
 - **Not assigned** — `ok = true, assigned = false` with a closed `reason`
   vocabulary: absent (a deterministic traffic-gate miss),
   `"targeting_unmatched"`, or `"kill_switch"` (an operator kill). All three
-  drop the cached assignment; a kill additionally guarantees no exposure is
-  emitted for it.
+  drop the cached assignment, and a kill additionally stops any *future*
+  exposure for it. It does **not** retroactively suppress a treatment that
+  already ran: an exposure still owed at kill time — the variant was applied
+  but the fact had not left yet, e.g. the queue was full — is deliberately
+  retained and emitted afterwards, because an application that happened is a
+  fact about the past. A `experiment_exposure` arriving shortly after a kill
+  is therefore expected behavior, not a client violating the kill.
 - **`401`/`403` fail closed** — the fetch reports `unauthorized`, **nothing is
   served** for that outcome, the getters go `nil`, and revalidation stops
   until re-`init()` or a later authorized fetch. The durable record is kept —
@@ -678,10 +683,15 @@ game has to handle specially.
   outcomes. **"At most one", not "exactly one":** a fact only emits when the
   assignment carries the server-supplied opaque key the fact is allowed to be
   attributed by. An assignment served without one — a synthetic-unit answer,
-  for instance — is applied normally but emits **no** exposure at all
-  (`exposure_no_subject_fact_key`, surfaced through `diagnostics`), because
-  the SDK-minted subject id must never reach the analytics plane. Do not
-  assume every applied treatment produces a measured exposure.
+  for instance — is applied normally but emits **no** exposure at all,
+  because the SDK-minted subject id must never reach the analytics plane. Do
+  not assume every applied treatment produces a measured exposure. **Watch
+  the right name:** the *automatic* skip is reported only to your
+  `diagnostics` hook, as `status = "exposure_skipped"` with
+  `code = "no_subject_fact_key"`. `exposure_no_subject_fact_key` is the
+  distinct `err` returned from an explicit `track_exposure` /
+  `track_outcome` call. Monitoring only the latter misses every automatic
+  measurement gap.
   **Honest caveat:** the platform currently rejects these fact names
   from game-embedded publishable keys by design, so an emitted exposure is
   expected to come back as a per-event reject — surfaced through your
