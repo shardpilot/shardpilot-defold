@@ -303,6 +303,15 @@ per-app spool and re-sends them on a later launch. Enabled by default
   client keeps running. It reports `false, "spool_persist_failed"` when the
   snapshot could not be durably and fully captured (same strictness as
   `shutdown()`).
+- **With experiments enabled, two more lifecycle failures exist.**
+  `persist()` and `shutdown()` both report `false, "experiments_pending"`
+  when an assignment-cache write is still owed after a storage failure, or
+  when an owed exposure fact could not be captured — an app death right then
+  would lose it, so the call refuses to claim safety. `shutdown()` can also
+  report `false, "queue_full"`. Both are **retryable**: `flush()` and call
+  again, exactly as with `spool_persist_failed`. A host that enables
+  experiments should branch on these alongside the spool codes rather than
+  treating any non-`true` return as fatal.
 - Permanent `4xx` rejects are **never** spooled — they would fail forever.
 
 **Resend.** On the next `init`/`new`, spooled envelopes are re-sent through
@@ -539,7 +548,10 @@ remote-config and assignment fetches. Feature-detect the surface before
 -- that only a callback can release across a shutdown.
 shardpilot.fetch_experiment_assignment("menu_layout", function(result)
   -- result = { ok, from_cache, assigned?, variant_key?, variant_payload?,
-  --            version?, reason?, error? }
+  --            version?, boundary?, reason?, error? }
+  -- `boundary` is a copy of the server's boundary table, passed through on a
+  -- 200 for host introspection (e.g. `assignment_unit`, `production_rollout`).
+  -- Read it if you want it; the SDK itself only acts on `assignment_unit`.
   if result.ok and result.assigned then
     apply_layout(result.variant_key, result.variant_payload)
   end
@@ -745,7 +757,9 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   to the bounded offline spool
   ([above](#offline-durability-event-spool)) — set `spool_enabled = false` for
   a fully memory-only event path.
-- **Durable storage is six small bounded records** per configured app: the
+- **Durable storage is nine small bounded records** per configured app — the
+  last three only ever created by the features that own them (a consent
+  denial, and a run with `experiments_enabled` on): the
   identity record (anonymous ID + consent decision), the offline event spool
   (only envelopes already bound for the wire; cleared on acknowledgment and on
   consent denial), the consent-receipt outbox (undelivered `/v1/consent`
@@ -759,9 +773,16 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   previous-session dump forward alike — written before its send attempt and
   removed as soon as the server acknowledges or terminally rejects it, the
   crash-reporting settings record (the persisted `crash.set_enabled` opt-out
-  boolean, nothing else), and the
+  boolean, nothing else), the
   remote-config cache (the last served config body + ETag, no analytics
-  payload; overwritten by the next successful fetch). The identity
+  payload; overwritten by the next successful fetch), the small write-ahead
+  consent denial marker (written before a denial is applied so the denial
+  survives a crash mid-purge; no analytics payload), and — created only by a
+  run with `experiments_enabled` on — the experiment-assignment cache (the
+  last-known-good variant per experiment, scope-stamped and size-capped) plus
+  its clear marker (a timestamp used to filter withdrawn experiment facts out
+  of the spool; still **read** on a later launch with the flag off, see
+  [Experiments](#experiments)). The identity
   record is written through
   `sys.get_save_file("shardpilot.<workspace_id>.<app_id>", "identity")` with
   `sys.save`/`sys.load`. The per-app namespace prevents two games on one device

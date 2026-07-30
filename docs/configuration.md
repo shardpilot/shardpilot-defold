@@ -202,7 +202,10 @@ The public calls, verified against `shardpilot/sdk.lua`:
   dispatch. Either way the assignment — or the failure — arrives through
   `callback(result)`, where `result` is
   `{ ok, from_cache, assigned?, variant_key?, variant_payload?, version?,
-  reason?, error? }`. Never treat a synchronous `true` as a resolved
+  boundary?, reason?, error? }` — `boundary` being a copy of the server's
+  boundary table, passed through on a `200` for host introspection (it
+  carries e.g. `assignment_unit` and `production_rollout`; the SDK itself
+  acts only on `assignment_unit`). Never treat a synchronous `true` as a resolved
   assignment; branch on `result`. **One case produces no callback at all:** a
   request still in flight when `shutdown()` succeeds is cancelled and never
   calls back, by design — so do not park state that only a callback can
