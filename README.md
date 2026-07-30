@@ -765,7 +765,11 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 - **Durable storage is nine small bounded records** per configured app — the
   last three only ever created by the features that own them (a consent
   denial, and a run with `experiments_enabled` on): the
-  identity record (anonymous ID + consent decision), the offline event spool
+  identity record (anonymous ID + consent decision — plus, once a run with
+  `experiments_enabled` has minted one, the SDK-minted experiment subject id,
+  which every later identity rewrite carries forward **even on launches with
+  the flag off**; so clearing only the two experiment records below does not
+  remove every persisted experiment identifier), the offline event spool
   (only envelopes already bound for the wire; cleared on acknowledgment and on
   consent denial), the consent-receipt outbox (undelivered `/v1/consent`
   receipts only — at most 32, denial-preferring eviction: the oldest pure

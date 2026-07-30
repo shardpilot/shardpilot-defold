@@ -8,7 +8,9 @@ described below (disable with `spool_enabled = false` for a fully
 memory-only event path).
 
 Durable storage is namespaced per configured app. The identity record —
-the generated UUIDv7 anonymous ID and the analytics consent decision — is
+the generated UUIDv7 anonymous ID and the analytics consent decision, plus,
+once a run with `experiments_enabled` has minted one, the SDK-minted
+experiment subject id (`spcid_…`) — is
 written through
 `sys.get_save_file("shardpilot.<workspace_id>.<app_id>", "identity")`
 (segments sanitized) with `sys.save`/`sys.load`. The per-app namespace keeps
@@ -178,10 +180,19 @@ consent rules), but it means an at-rest review must account for them.
   and a short non-secret fingerprint of the API key (a hash — the key itself
   is never written to disk).
 
+- **The identity record also holds a copy of the subject id.** Once minted it
+  is stored as `experiments_client_id` in the identity record described at the
+  top of this document, and every later identity rewrite carries it forward —
+  **including on launches with `experiments_enabled` off.** This matters for
+  an erasure review: deleting the two experiment records above does *not*
+  remove every persisted experiment identifier, because this copy is what
+  makes the subject sticky across launches in the first place.
+
 The subject id is SDK-minted, never host-settable, and egresses only as the
 assignment fetch's `subject_key`; it is never attached to an analytics event.
 Erasing this at-rest state is a matter of clearing the app's saved data — the
-SDK exposes no separate purge for it.
+SDK exposes no separate purge for it, and clearing only the experiment records
+leaves the identity record's copy behind.
 - All persistence goes through Defold `sys.save` only; on HTML5 builds Defold
   backs `sys.save` with browser storage, still limited to those records.
 
