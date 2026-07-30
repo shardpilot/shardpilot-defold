@@ -7261,6 +7261,49 @@ local tests = {
 	test_schema_revision_override_and_disable,
 	test_schema_revision_mismatch_409_is_terminal,
 	test_supports_capability_discovery,
+	-- Declared inline rather than as `local function`: Lua 5.4 caps a chunk at
+	-- 200 locals and this file is at the ceiling, so a new top-level local per
+	-- test breaks the 5.4 job while 5.1/LuaJIT still pass.
+	function()
+	-- The getter is wired into crash config, so its contract matters: a crash
+	-- emitted between session_end and the next session_start must not be
+	-- attributed to the session that already closed. session_end clears
+	-- session_active but deliberately RETAINS session_id, so the getter has to
+	-- gate on the flag rather than return the raw field.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config()))
+
+	assert_equal(client:get_session_id(), nil, "no session has been opened yet")
+
+	assert_true(client:session_start())
+	local open_id = client:get_session_id()
+	assert_true(type(open_id) == "string" and #open_id > 0, "an open session must expose its id")
+	assert_equal(open_id, client.session_id)
+
+	assert_true(client:session_end("complete"))
+	assert_equal(client:get_session_id(), nil, "a CLOSED session must not be reported as current")
+
+	assert_true(client:session_start())
+	assert_true(type(client:get_session_id()) == "string", "a renewed session exposes its id again")
+	end,
+	function()
+	-- The module-level getter is a VALUE read, so "no client" must read as nil,
+	-- not as the false/"not_initialized" pair a command returns. A caller using
+	-- the documented `if id ~= nil then ... end` would otherwise treat false as a
+	-- present id and pass a boolean downstream.
+	reset()
+	sdk.shutdown()
+	assert_equal(sdk.get_session_id(), nil, "no default client must read as nil")
+
+	seed_granted_consent()
+	assert_true(sdk.init(config()))
+	assert_equal(sdk.get_session_id(), nil, "initialized but no session open is still nil")
+	assert_true(sdk.session_start())
+	assert_true(type(sdk.get_session_id()) == "string", "an open session exposes its id")
+	sdk.shutdown()
+	assert_equal(sdk.get_session_id(), nil, "after shutdown it is nil again")
+	end,
 }
 
 for _, test in ipairs(tests) do

@@ -711,6 +711,157 @@ local function test_pii_scrubbed_from_wire()
 	assert_contains(body, '"function":"game.tick"')
 end
 
+local function test_caller_cannot_supply_its_own_actor_key()
+	-- The actor key is SDK-owned: it is stamped from the trusted config over
+	-- whatever the caller put on the event. A per-event override would let a
+	-- report carry a key when no identity is configured, or point a crash at a
+	-- different subject — mis-keying consent and erasure either way.
+	reset()
+	local unconfigured = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(unconfigured:emit(presymbolicated_event({
+		anonymous_id = "0198f2c1-4b3a-7c2d-8e9f-callersupplied",
+		session_id = "0198f2c1-4b3a-7c2d-8e9f-callersession",
+	})))
+	assert_equal(#requests, 1)
+	assert_not_contains(requests[1].body, "callersupplied")
+	assert_not_contains(requests[1].body, "callersession")
+	assert_not_contains(requests[1].body, "anonymous_id")
+
+	-- And a caller value cannot displace a CONFIGURED identity either.
+	reset()
+	local configured = assert(crash.new(config({
+		sample_every = 1,
+		anonymous_id = "0198f2c1-4b3a-7c2d-8e9f-configured00",
+	})))
+	assert_true(configured:emit(presymbolicated_event({
+		anonymous_id = "0198f2c1-4b3a-7c2d-8e9f-callersupplied",
+	})))
+	assert_contains(requests[1].body, '"anonymous_id":"0198f2c1-4b3a-7c2d-8e9f-configured00"')
+	assert_not_contains(requests[1].body, "callersupplied")
+end
+
+local function test_actor_key_stamped_from_configured_provider()
+	reset()
+	-- The provider form: resolved at EMIT time, so a rotation between two crashes
+	-- is picked up instead of being frozen at construction.
+	local current = "0198f2c1-4b3a-7c2d-8e9f-a1b2c3d4e5f6"
+	local client = assert(crash.new(config({
+		sample_every = 1,
+		anonymous_id = function() return current end,
+		session_id = function() return "0198f2c1-4b3a-7c2d-8e9f-000000000001" end,
+	})))
+
+	assert_true(client:emit(presymbolicated_event()))
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"anonymous_id":"0198f2c1-4b3a-7c2d-8e9f-a1b2c3d4e5f6"')
+	assert_contains(requests[1].body, '"session_id":"0198f2c1-4b3a-7c2d-8e9f-000000000001"')
+
+	reset()
+	current = "0198f2c1-4b3a-7c2d-8e9f-ffffffffffff"
+	assert_true(client:emit(presymbolicated_event()))
+	assert_contains(requests[1].body, '"anonymous_id":"0198f2c1-4b3a-7c2d-8e9f-ffffffffffff"')
+	assert_not_contains(requests[1].body, "a1b2c3d4e5f6")
+end
+
+local function test_actor_key_static_string_form()
+	reset()
+	local client = assert(crash.new(config({ sample_every = 1, anonymous_id = "install-abc123" })))
+	assert_true(client:emit(presymbolicated_event()))
+	assert_contains(requests[1].body, '"anonymous_id":"install-abc123"')
+end
+
+local function test_no_actor_key_configured_omits_the_field()
+	-- The dark-default guarantee: a client that does not opt in must send the same
+	-- bytes it sent before the field existed — absent, not an empty string.
+	reset()
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:emit(presymbolicated_event()))
+	assert_equal(#requests, 1)
+	assert_not_contains(requests[1].body, "anonymous_id")
+	assert_not_contains(requests[1].body, '"session_id"')
+end
+
+local function test_bad_actor_key_drops_the_field_not_the_report()
+	reset()
+	local client = assert(crash.new(config({ sample_every = 1, anonymous_id = "user_4242" })))
+	assert_true(client:emit(presymbolicated_event()))
+	assert_equal(#requests, 1)
+	local body = requests[1].body
+	assert_not_contains(body, "user_4242")
+	assert_not_contains(body, "anonymous_id")
+	-- The crash itself still shipped.
+	assert_contains(body, '"crash_id"')
+	assert_contains(body, '"exception"')
+end
+
+local function test_throwing_identity_provider_never_costs_the_crash()
+	-- The provider is HOST code running while the process is already dying.
+	reset()
+	local client = assert(crash.new(config({
+		sample_every = 1,
+		anonymous_id = function() error("identity backend is down") end,
+	})))
+	assert_true(client:emit(presymbolicated_event()))
+	assert_equal(#requests, 1)
+	assert_not_contains(requests[1].body, "anonymous_id")
+	assert_contains(requests[1].body, '"crash_id"')
+end
+
+local function test_actor_key_accepts_every_realistic_id_format()
+	-- A scrub tier that blanks one of these would make crash-to-actor linkage
+	-- depend on which id FORMAT the game happens to use. The free-text tier does
+	-- exactly that above 40 chars, which is why the actor key uses the structured
+	-- tier instead.
+	local formats = {
+		"0198f2c1-4b3a-7c2d-8e9f-a1b2c3d4e5f6",
+		"0198f2c14b3a7c2d8e9fa1b2c3d4e5f6",
+		"3f786850e387550fdab836ed7e6dc881de23001b3f786850e387550fdab836ed",
+		"aGVsbG93b3JsZGhlbGxvd29ybGRoZWxsb3dvcmxkMTIzNA",
+		"anon-123",
+	}
+	for _, value in ipairs(formats) do
+		assert_equal(event_mod.normalize_actor_identifier(value), value)
+	end
+	-- and the material that must never reach the wire
+	for _, bad in ipairs({
+		"user_4242", "player_77", "device_abc123",
+		-- DIGIT-FREE bare raw ids. These are the ones the plain structured tier
+		-- lets through (it drops the whole-value bare-id rule so an operator slug
+		-- like "user_app" survives), which is why the actor key uses the symbol
+		-- tier instead.
+		"user_alice", "player_bob", "customer_acme", "device_laptop",
+		"player@example.com", "198.51.100.23",
+		"header.eyJzdWIiOiJ0ZXN0In0.signature",
+		"not an id at all", "-leading-dash", string.rep("a", 513),
+	}) do
+		assert_equal(event_mod.normalize_actor_identifier(bad), "")
+	end
+	assert_equal(event_mod.normalize_actor_identifier(string.rep("a", 512)), string.rep("a", 512))
+end
+
+local function test_caller_context_identity_wall_still_holds()
+	-- Adding an SDK-owned top-level field must NOT open a caller-side path: the
+	-- name-keyed wall over device/context/metadata is unchanged.
+	reset()
+	local client = assert(crash.new(config({ sample_every = 1 })))
+	assert_true(client:emit(presymbolicated_event({
+		context = { anonymous_id = "0198f2c1-4b3a-7c2d-8e9f-a1b2c3d4e5f6", build_channel = "beta" },
+		metadata = { userId = "0198f2c1-4b3a-7c2d-8e9f-999999999999" },
+	})))
+	assert_equal(#requests, 1)
+	local body = requests[1].body
+	assert_not_contains(body, "a1b2c3d4e5f6")
+	assert_not_contains(body, "999999999999")
+	assert_contains(body, '"build_channel":"beta"')
+end
+
+local function test_configured_actor_key_shape_is_validated()
+	local _, err = crash.new(config({ anonymous_id = 42 }))
+	assert_equal(err, "invalid_anonymous_id")
+	local _, session_err = crash.new(config({ session_id = {} }))
+	assert_equal(session_err, "invalid_session_id")
+end
+
 local function test_context_session_id_pii_rejects_event()
 	reset()
 	local client = assert(crash.new(config({ sample_every = 1 })))
@@ -1283,6 +1434,42 @@ local function test_capture_previous_no_dump()
 	assert_equal(ok, true)
 	assert_equal(sent, false, "no dump means nothing is sent")
 	assert_equal(#requests, 0)
+end
+
+local function test_previous_session_dump_never_borrows_the_live_identity()
+	-- A dump describes a process that died in an EARLIER launch. The id
+	-- resolvable NOW belongs to whoever is present at THIS launch, and the
+	-- service keys diagnostics consent and erasure off this field — so stamping
+	-- it would mis-key both. With no capture-time snapshot to restore, the
+	-- correct value is no value.
+	reset()
+	local module = fake_crash_module({
+		handle = 7,
+		signum = 11,
+		os_name = "Android",
+		os_version = "14",
+		modules = { { name = "libgame.so", address = 0x1000 } },
+		backtrace = { { address = 0x1abc } },
+	})
+	local client = assert(crash.new(config({
+		sample_every = 1,
+		anonymous_id = "0198f2c1-4b3a-7c2d-8e9f-relaunchsubject",
+	})))
+	local ok, sent = client:capture_previous(module)
+	assert_equal(ok, true)
+	assert_equal(sent, true)
+	assert_equal(#requests, 1)
+	local body = requests[1].body
+	assert_not_contains(body, "relaunchsubject")
+	assert_not_contains(body, "anonymous_id")
+	-- The dump itself still forwards intact.
+	assert_contains(body, '"type":"SIGSEGV"')
+
+	-- A LIVE crash from the same client still carries the key: the suppression
+	-- is scoped to the previous-session path, not a global disable.
+	reset()
+	assert_true(client:emit(presymbolicated_event()))
+	assert_contains(requests[1].body, '"anonymous_id":"0198f2c1-4b3a-7c2d-8e9f-relaunchsubject"')
 end
 
 local function test_capture_previous_forwards_native_dump()
@@ -5414,6 +5601,16 @@ local tests = {
 	test_custom_sampler_does_not_affect_fatal,
 	test_sampler_mutation_does_not_reach_wire,
 	test_pii_scrubbed_from_wire,
+	test_actor_key_stamped_from_configured_provider,
+	test_actor_key_static_string_form,
+	test_no_actor_key_configured_omits_the_field,
+	test_bad_actor_key_drops_the_field_not_the_report,
+	test_throwing_identity_provider_never_costs_the_crash,
+	test_actor_key_accepts_every_realistic_id_format,
+	test_caller_context_identity_wall_still_holds,
+	test_configured_actor_key_shape_is_validated,
+	test_caller_cannot_supply_its_own_actor_key,
+	test_previous_session_dump_never_borrows_the_live_identity,
 	test_context_session_id_pii_rejects_event,
 	test_sanitizer_unit_rules,
 	test_breadcrumbs_attached_and_bounded,

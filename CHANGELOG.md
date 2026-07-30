@@ -6,6 +6,32 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **Crash reports can now be attributed to a player.** New optional
+  `anonymous_id` / `session_id` crash config, each a `function` resolved per
+  report or a fixed string. Pass `shardpilot.get_anonymous_id` to track the
+  analytics id (rotations included) in one line. Without it, reports are
+  byte-identical to before — no actor field at all.
+  - Why it matters: with no actor key a crash cannot be counted against an
+    active-player denominator (so "share of players who never crashed" is not
+    computable), cannot be matched to that player's diagnostics opt-out, and
+    cannot be reached by a per-player deletion request.
+  - The value is hashed server-side; the raw id is not stored on the crash
+    record. A raw **account** id is never sent — crash ingest is API-key
+    authenticated, so a client-asserted account id is unverified and is never
+    used as the actor key.
+  - A malformed value (free text, email, IP, JWT, any
+    `user_`/`player_`/`customer_`/`device_`-prefixed id — digit-free ones like
+    `user_alice` included — or over 512 bytes) drops the FIELD, never the
+    report; a getter that throws is caught for the same reason.
+  - The key is stamped from config and is NOT a per-event override: a caller
+    cannot put its own `anonymous_id` on an event.
+  - A **previous-session** dump forwarded on the next launch carries no actor
+    key: the id available then belongs to whoever is playing now, and stamping
+    it would mis-key both consent and deletion.
+- New `shardpilot.get_session_id()` on the analytics client — the current
+  session id, or `nil` when no session is open — so the host can correlate other
+  telemetry with the analytics session.
+
 - **Remote config: dark opt-in targeting-attribute pass-through (ADR-0310).**
   `remote_config_attributes_enabled = true` (default `false` — while off the
   fetch URL is byte-identical to today's attribute-less path and the new

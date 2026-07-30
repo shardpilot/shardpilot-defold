@@ -112,6 +112,76 @@ function M.normalize_crash_id(value)
 	return trimmed
 end
 
+-- The byte bound on a raw actor identifier. It matches the bound the ingest
+-- service enforces (and the other engine SDKs apply): an over-long value is
+-- dropped here rather than rejected there, where it would cost the whole report.
+local max_actor_identifier_bytes = 512
+
+-- Normalize an SDK-owned actor key for the wire. Returns "" when the value is
+-- unusable, which DROPS THE FIELD ONLY — never the report. A crash is the payload
+-- of record; losing it because an identity provider returned something malformed
+-- would trade a diagnostic away for a correlation key.
+--
+-- The content rules come from the CODE-SYMBOL tier. Both neighbouring tiers are
+-- wrong here, in opposite directions:
+--
+--   * the FREE-TEXT tier additionally blanks any single opaque run of >= 40 chars,
+--     so it keeps a 36-char UUID but silently blanks a 64-char hex digest or a long
+--     base64url token — which would make crash-to-actor linkage depend on which id
+--     FORMAT a game happens to use, an invisible failure;
+--   * the plain STRUCTURED tier deliberately drops the whole-value bare-raw-id rule
+--     so an operator-scope slug like "user_app" survives, which means a DIGIT-FREE
+--     raw identifier (user_alice, player_bob, customer_acme) passes straight
+--     through — exactly the material this field must never carry.
+--
+-- The symbol tier is the structured tier PLUS that whole-value bare-id rule, so it
+-- drops every disallowed-prefix identifier while still keeping a long opaque
+-- pseudonymous id. Measured: user_alice / player_bob / customer_acme / device_laptop
+-- are dropped; UUIDv7, 64-char hex, and base64url are kept verbatim.
+local function normalize_actor_identifier(value)
+	if type(value) ~= "string" then
+		return ""
+	end
+	local trimmed = trim(value)
+	if trimmed == "" or #trimmed > max_actor_identifier_bytes then
+		return ""
+	end
+	-- Shape: an actor key is a TOKEN, not free text. Same character rule as a safe
+	-- crash_id, at the larger identifier bound.
+	if not trimmed:match("^[A-Za-z0-9][A-Za-z0-9._:-]*$") then
+		return ""
+	end
+	-- An actor key is only ever an opaque token, so it can afford the LOOSE JWT
+	-- bar that the structured tier omits (that tier has to keep dotted code
+	-- symbols alive; this field has none to protect). Without this, a caller who
+	-- wired an auth token into the identity provider would ship it.
+	if sanitize.contains_jwt(trimmed) then
+		return ""
+	end
+	return sanitize.sanitize_symbol(trimmed)
+end
+
+M.normalize_actor_identifier = normalize_actor_identifier
+
+-- Resolve a configured actor key. The config value is either a plain string or a
+-- provider function; a provider is called under pcall because it is HOST code
+-- running on the crash path — a game whose identity getter throws while the
+-- process is already dying must still get its crash report out, just without the
+-- correlation key. A provider that errors, or returns a non-string, yields "".
+local function resolve_configured_identity(configured)
+	if type(configured) == "string" then
+		return configured
+	end
+	if type(configured) ~= "function" then
+		return ""
+	end
+	local ok, value = pcall(configured)
+	if not ok or type(value) ~= "string" then
+		return ""
+	end
+	return value
+end
+
 -- Identity keys that must never be carried in the free-form caller context map:
 -- they are raw actor correlation keys, not crash diagnostics. Listed in the
 -- canonical snake_case form; matching is done after normalizing each candidate
@@ -188,6 +258,13 @@ local function clone_event(event)
 		platform = event.platform,
 		source = event.source,
 		raw_text = event.raw_text,
+		-- SDK-owned actor keys. They are top-level fields stamped from the trusted
+		-- client config, NOT caller free-text: the identity wall at
+		-- strip_identity_keys still removes these same names from the caller's
+		-- device/context/metadata maps, and that wall is unchanged. This allowlist
+		-- is applied on EVERY emit, so a field absent here is dropped with no error.
+		anonymous_id = event.anonymous_id,
+		session_id = event.session_id,
 	}
 	out.app = {}
 	if type(event.app) == "table" then
@@ -883,6 +960,14 @@ function M.sanitize_event(event, trusted_frame_functions, fatal)
 	-- id embedded in the trace.
 	event.raw_text = sanitize.sanitize_raw_text(event.raw_text)
 
+	-- The SDK-owned actor keys. Note the deliberate asymmetry with the caller's
+	-- context.session_id immediately below: that one REJECTS the whole event,
+	-- because a raw identifier in a caller's free-form map is a mistake worth
+	-- surfacing loudly. These are stamped by the SDK from a configured provider,
+	-- so a bad value costs the field and the crash still ships.
+	event.anonymous_id = normalize_actor_identifier(event.anonymous_id)
+	event.session_id = normalize_actor_identifier(event.session_id)
+
 	-- A context.session_id carrying disallowed identifier material poisons the
 	-- whole event: reject rather than ship.
 	if type(event.context) == "table" then
@@ -1123,6 +1208,10 @@ local function compact_event(event)
 	event.source = blank_to_nil(event.source)
 	event.platform = blank_to_nil(event.platform)
 	event.raw_text = blank_to_nil(event.raw_text)
+	-- Absent, not empty: a client that sets no identity must produce the same
+	-- bytes it produced before this field existed.
+	event.anonymous_id = blank_to_nil(event.anonymous_id)
+	event.session_id = blank_to_nil(event.session_id)
 	if type(event.app) == "table" then
 		event.app.id = blank_to_nil(event.app.id)
 		event.app.version = blank_to_nil(event.app.version)
@@ -1300,6 +1389,9 @@ end
 -- current breadcrumb ring: a previous-session dump carries no breadcrumbs of
 -- its own, and the current ring belongs to THIS session — attaching it would
 -- misattribute live breadcrumbs to the dead session's crash.
+-- `options.skip_identity_stamp` suppresses stamping the configured actor keys,
+-- for the same path and the same reason: the live id belongs to THIS launch's
+-- subject, and the service keys consent + erasure off that field.
 function M.prepare(client, event, trusted_frame_functions, options)
 	local cloned, clone_err = clone_event(event)
 	if not cloned then
@@ -1352,6 +1444,41 @@ function M.prepare(client, event, trusted_frame_functions, options)
 	end
 	if event.crash_id == "" then
 		event.crash_id = id.uuid_v7()
+	end
+
+	-- Actor keys, resolved from the trusted config at EMIT time (an id can rotate
+	-- mid-session, so a value captured at construction would attribute the crash
+	-- to whoever was present at init).
+	--
+	-- `options.skip_identity_stamp` is set by the previous-session dump-forward
+	-- path and is LOAD-BEARING, not an optimization. That report describes a
+	-- process that died in an EARLIER launch; the id resolvable now belongs to
+	-- whoever is present at THIS launch, which after a rotation or a host override
+	-- is a different subject. Since the service hashes this field into the key it
+	-- uses for diagnostics consent and for erasure, borrowing the live id would
+	-- mis-key BOTH — a compliance fault, not a reporting inaccuracy. With no
+	-- capture-time snapshot to restore, the only correct value is no value: the
+	-- report ships device-scoped and anonymous, exactly as it does today.
+	-- UNCONDITIONALLY derived from the trusted config — never a per-event value.
+	-- These are SDK-owned fields, and the assignment overwrites whatever the caller
+	-- put there. A per-event override would let a report carry an actor key when no
+	-- identity is configured at all, or point a crash at a different subject than
+	-- the one the client is reporting for; since the service hashes this field into
+	-- the key it uses for diagnostics consent and for erasure, either case mis-keys
+	-- both. This mirrors app.id, which is likewise stamped from config over any
+	-- caller value, and it is why the caller-map identity wall can stay name-keyed:
+	-- there is no path — map or top-level — by which caller input reaches this field.
+	if options.skip_identity_stamp then
+		-- The previous-session dump-forward path. That report describes a process
+		-- that died in an EARLIER launch, so the id resolvable now belongs to
+		-- whoever is present at THIS launch — after a rotation, a different
+		-- subject. With no capture-time snapshot to restore, the only correct
+		-- value is no value.
+		event.anonymous_id = ""
+		event.session_id = ""
+	else
+		event.anonymous_id = resolve_configured_identity(client.config.anonymous_id)
+		event.session_id = resolve_configured_identity(client.config.session_id)
 	end
 
 	-- Attach the breadcrumb ring snapshot when the caller supplied none — unless
