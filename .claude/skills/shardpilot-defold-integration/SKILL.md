@@ -25,13 +25,20 @@ the deeper reference.
   undelivered events on a later launch; consent receipts have their own
   durable outbox.
 - **Remote config**: explicit `GET`-based fetch with an ETag-revalidated
-  durable last-known-good cache and typed getters. No experiments/assignment
-  API, no automatic refresh.
+  durable last-known-good cache and typed getters. No automatic refresh —
+  every fetch is an explicit call.
+- **Experiments (off by default)**: a server-evaluated variant assignment
+  consumer behind `experiments_enabled = true`, which also requires
+  `remote_config_url` AND `api_key`. It requires analytics consent `granted`,
+  and fails closed (no variant served, getters `nil`) until experiments are
+  enabled server-side for the app — so a build with the flag on simply runs
+  the control experience. See the README's "Experiments" section and
+  `docs/configuration.md`.
 - **Crash reporting**: a separate `shardpilot.crash` module posting crash
   report JSON to a dedicated crash ingest endpoint, with PII scrubbing,
   write-ahead pending storage, and deterministic non-fatal sampling.
-- **Not provided today**: no experiment assignment endpoint, no automatic
-  remote-config refresh, no packaged release ZIP assets (source archives
+- **Not provided today**: no automatic remote-config refresh, no packaged
+  release ZIP assets (source archives
   only). (Live Lua script-error capture IS available as the opt-in
   `script_error_capture_enabled` crash flag, default off — see the crash
   section.)
@@ -41,7 +48,7 @@ the deeper reference.
 
 ## Install
 
-Version pin (CI-checked): this skill matches shardpilot-defold `v0.9.1`.
+Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.0`.
 
 Two supported paths:
 
@@ -54,10 +61,10 @@ Two supported paths:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.9.1.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.0.zip
 ```
 
-The `v0.9.1` tag is published and that source-archive URL resolves; it is the
+The `v0.10.0` tag is published and that source-archive URL resolves; it is the
 same pin the README's Installation section carries. Note there is no packaged
 ZIP asset attached to any GitHub Release — the tag source archive is the only
 hosted dependency URL. Pin a tag rather than tracking `main` so your build

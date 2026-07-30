@@ -8,6 +8,9 @@ ShardPilot Defold SDK v0 is configured with a Lua table:
   -- Optional: enables remote config (a SEPARATE service from the ingest
   -- endpoint; requires api_key — see "Remote config" below).
   -- remote_config_url = "https://config.shardpilot.com",
+  -- Optional: enables experiments (default false = off). Requires BOTH
+  -- remote_config_url and api_key — see "Experiments" below.
+  -- experiments_enabled = true,
   workspace_id = "workspace",
   app_id = "app",
   environment_id = "production",
@@ -138,6 +141,111 @@ the `api_key` authenticates only the remote-config fetch.
   consent is granted — unknown or denied consent (forced-minor included)
   keeps the fetch attribute-less and serves the untargeted defaults; see
   `docs/privacy.md`. Targeting is 100% server-evaluated.
+
+## Experiments
+
+- **`experiments_enabled`** (default `false` = off, boolean). Opts into the
+  experiment-assignment consumer. While it is off — the default — **zero**
+  experiment code paths execute: no subject id is minted, no assignment is
+  fetched, no revalidation timer runs, no exposure is emitted, and no
+  experiment record is written to disk; `fetch_experiment_assignment`,
+  `track_exposure`, and `track_outcome` answer
+  `false, "experiments_not_configured"` and `experiment_variant` /
+  `experiment_payload` return `nil`. A non-boolean value is rejected with
+  `invalid_experiments_enabled`.
+
+**Enabling it requires two more fields.** The assignment endpoint is served by
+the same host as the remote-config fetch and authenticates with the same
+publishable key, so `experiments_enabled = true` is only a valid configuration
+alongside `remote_config_url` **and** `api_key`:
+
+| Setting this… | …also requires | Otherwise `init()` returns |
+|---|---|---|
+| `experiments_enabled = true` | `remote_config_url` | `false, "experiments_requires_remote_config_url"` |
+| `remote_config_url` | `api_key` | `false, "remote_config_api_key_required"` |
+
+```lua
+{
+  ingest_url = "https://…",
+  remote_config_url = "https://…", -- required by experiments_enabled
+  api_key = "sp_ingest_…",         -- required by remote_config_url
+  workspace_id = "workspace",
+  app_id = "app",
+  environment_id = "production",
+  experiments_enabled = true,
+}
+```
+
+In Mode B this is the same documented exception to "configure exactly one"
+that remote config already uses: `token_provider` stays the ingest `Bearer`
+and the `api_key` authenticates the remote-config and assignment fetches.
+Feature-detect the surface before `init()` with
+`shardpilot.supports("experiments_assignment")`.
+
+The public calls, verified against `shardpilot/sdk.lua`:
+
+- **`fetch_experiment_assignment(experiment_key, [attributes], callback)`** —
+  fetches the server-evaluated assignment. `attributes` is optional:
+  `(experiment_key, callback)` is accepted. Returns `ok, err` synchronously and
+  reports the same outcome through `callback(result)`, where `result` is
+  `{ ok, from_cache, assigned?, variant_key?, variant_payload?, version?,
+  reason?, error? }`. Failure codes: `not_initialized`, `shutdown`,
+  `experiments_not_configured`, `experiment_key_required`, `consent_unknown`,
+  `consent_denied`, `http_unavailable`, `json_unavailable`, plus the
+  per-response values `unauthorized`, `not_found`, `bad_request`,
+  `malformed_response`, and `http_<status>`.
+- **`experiment_variant(experiment_key)`** — the cached variant key (a string)
+  or `nil`. Never touches the network, never fails.
+- **`experiment_payload(experiment_key)`** — a copy of the cached variant
+  payload, or `nil`. Never touches the network, never fails.
+- **`track_exposure(experiment_key)`** — emits one extra exposure fact for the
+  live assignment (the automatic once-per-session exposure needs no call).
+  Returns `ok, err`; failure codes `not_initialized`, `shutdown`,
+  `experiments_not_configured`, `experiment_key_required`, `no_assignment`,
+  `consent_unknown`, `consent_denied`, `exposure_no_subject_fact_key`.
+- **`track_outcome(experiment_key, outcome_key, outcome_value)`** — records a
+  host-defined outcome as its own fact. `outcome_key` must be a non-empty
+  string (`invalid_outcome_key`) and `outcome_value` must be a **number**
+  (`invalid_outcome_value`); the `track_exposure` failure codes apply too.
+
+Treat `nil` from the getters as the control experience — that is what your
+game sees before the first fetch resolves, when the subject is not assigned,
+and in every fail-closed state below.
+
+**Experiments must also be enabled server-side for your app.** Until they
+are, the assignment endpoint answers `403` and this client treats it like any
+other unauthorized answer — it **fails closed**: the fetch reports
+`error = "unauthorized"`, **no variant is served** (not even a previously
+cached one), the getters return `nil`, and in-memory serving plus the
+revalidation cadence stop until you re-`init()` or a later fetch is
+authorized. The durable cache record is kept, not destroyed. So shipping a
+build with the flag on is safe on its own: with nothing enabled server-side
+your game runs the control path.
+
+**Consent: granted-only.** Assignment fetches, cached serving, revalidation,
+and the subject-id mint all require analytics consent `granted`. Under
+`unknown` or either denial flavor (forced-minor included) the consumer
+produces zero experiment traffic on both planes, refuses fetches with
+`consent_unknown` / `consent_denied`, and the getters serve `nil`; the durable
+record is retained but not served through a downgrade, and a later re-grant
+serves it again. This is deliberately stricter than `fetch_remote_config`,
+which is not consent-gated — see [`privacy.md`](privacy.md).
+
+**Targeting attributes** use the fixed server vocabulary: `geo`,
+`app_version`, `device_type`, `install_date`, `user_segment`, and
+`custom_attribute_<name>` (suffix 1–64 characters). Values are trimmed and
+bounded to 512 bytes, at most 64 attributes ride one fetch, and names outside
+the vocabulary are dropped client-side and never sent. Matching is 100%
+server-evaluated; the SDK evaluates no rules and never re-buckets locally.
+
+**Caching and kill latency.** An assignment is cached in memory and in one
+durable per-app record, so a later launch serves the last-known-good variant
+offline. Cached assignments are re-fetched about every 300 seconds (±10%
+jitter) while the SDK runs, consent is granted, and at least one assignment is
+cached — this cadence is the SDK's share of the operator kill-switch reach.
+Stated honestly: an offline client keeps its last-known-good variant
+indefinitely. Full fetch semantics (the not-assigned reasons, `404`, and the
+transient/`Retry-After` rules) are in the README's "Experiments" section.
 
 ## Schema-revision declaration
 

@@ -6,6 +6,8 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+## v0.10.0 — 2026-07-30 — early alpha
+
 - **Crash reports can now be attributed to a player.** New optional
   `anonymous_id` / `session_id` crash config, each a `function` resolved per
   report or a fixed string. Pass `shardpilot.get_anonymous_id` to track the
@@ -419,6 +421,14 @@
   resolution plus build-time compilation only — it does not start the
   engine or exercise runtime behavior, which remains covered by the
   interpreter test legs.
+
+- **Experiments are documented for integrators.** The README gained an
+  "Experiments" section and `docs/configuration.md` an "Experiments" knob
+  section covering `experiments_enabled` (default `false`), the
+  `remote_config_url` + `api_key` configuration that enabling it also
+  requires, the five public calls, the granted-consent-only rule, and the
+  fail-closed behavior while the server has not enabled experiments for the
+  app.
 
 ## v0.9.1 — 2026-07-19 — early alpha
 
