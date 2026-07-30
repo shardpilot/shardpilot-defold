@@ -191,6 +191,26 @@ local function validate_config(config)
 	if config.sampler ~= nil and type(config.sampler) ~= "function" then
 		return nil, "invalid_sampler"
 	end
+	-- The pseudonymous actor key this client reports crashes for. A FUNCTION is
+	-- the normal form and is resolved at EMIT time, not captured here: the id can
+	-- rotate during a session (a host override, a reset), and a value captured at
+	-- construction would keep attributing crashes to the subject who happened to
+	-- be present at init. A plain STRING is the standalone-host form for a game
+	-- whose id is fixed for the process lifetime. Absent means the crash carries
+	-- no actor key at all, which is the pre-existing behaviour.
+	if config.anonymous_id ~= nil
+		and type(config.anonymous_id) ~= "function"
+		and type(config.anonymous_id) ~= "string" then
+		return nil, "invalid_anonymous_id"
+	end
+	-- The session the crash happened in. Same function-or-string shape and the
+	-- same resolve-at-emit-time reason: sessions turn over far faster than the
+	-- client lives.
+	if config.session_id ~= nil
+		and type(config.session_id) ~= "function"
+		and type(config.session_id) ~= "string" then
+		return nil, "invalid_session_id"
+	end
 	-- ADR-0297 §7c boot auto-capture: ON by default (crash.init forwards the
 	-- previous-session dump itself — the Defold auto-capture model); an
 	-- explicit `capture_previous_on_boot = false` keeps the manual
@@ -220,6 +240,8 @@ local function validate_config(config)
 		publish_timeout_seconds = publish_timeout_seconds,
 		diagnostics = config.diagnostics,
 		sampler = config.sampler,
+		anonymous_id = config.anonymous_id,
+		session_id = config.session_id,
 		capture_previous_on_boot = config.capture_previous_on_boot ~= false,
 		script_error_capture_enabled = config.script_error_capture_enabled == true,
 	}
@@ -822,7 +844,7 @@ function Client:capture_previous(crash_module)
 	-- async, so dispatching the dump directly here would race the pass and
 	-- escape the one-at-a-time backpressure discipline.
 	local ok, err = self:emit_internal(event, true, true,
-		{ skip_breadcrumb_ring = true, defer_dispatch = true })
+		{ skip_breadcrumb_ring = true, defer_dispatch = true, skip_identity_stamp = true })
 	if not ok then
 		self:resend_pending()
 		return false, err

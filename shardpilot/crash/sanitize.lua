@@ -530,6 +530,19 @@ function M.contains_disallowed_content(value)
 	return contains_disallowed_content(value)
 end
 
+-- The LOOSE JWT bar (>= 4 chars per dot-separated segment), exported for callers
+-- that scrub an OPAQUE TOKEN rather than a diagnostic field. The structured tier
+-- deliberately uses the >= 16 high-confidence bar instead, so a legitimate dotted
+-- code symbol ("java.lang.RuntimeException") survives — but a field that is only
+-- ever an opaque id has no dotted symbols to protect, so it can afford the strict
+-- bar and should refuse anything JWT-shaped.
+function M.contains_jwt(value)
+	if type(value) ~= "string" then
+		return false
+	end
+	return contains_jwt(value)
+end
+
 -- Scrub a caller-populated string under the FULL rules. Returns "" when the
 -- value is empty or carries disallowed content (the caller drops empties). A
 -- user-home path has its username segment redacted in place first, so a useful

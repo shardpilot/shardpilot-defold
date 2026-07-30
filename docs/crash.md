@@ -47,6 +47,8 @@ crash.init({
 | `publish_timeout_seconds` | no | Per-request timeout (default 30). |
 | `sampler` | no | A custom `function(event) -> boolean` for non-fatal reports. A fatal report bypasses it. |
 | `diagnostics` | no | A hook invoked with `{ scope, status, code, retryable, response }` when a report is rejected or unauthorized. |
+| `anonymous_id` | no | The pseudonymous actor key a report is attributed to — a `function` resolved per report (pass `shardpilot.get_anonymous_id` to track the analytics id, including later rotations) or a fixed string. Absent means reports carry no actor key, as before. See [Attributing crashes to a player](#attributing-crashes-to-a-player). |
+| `session_id` | no | The session a crash happened in; same `function`-or-string shape. `shardpilot.get_session_id` returns `nil` until a session opens, which is handled. |
 | `capture_previous_on_boot` | no | **Default `true`** (ADR-0297 §7c): `crash.init` itself forwards the previous-session native dump and runs one resend pass — no manual `capture_previous()` call needed. Set `false` to keep the manual flow (e.g. to defer the network work past your loading screen). Instance clients built with `crash.new` are unaffected either way — they always use the manual call. |
 | `script_error_capture_enabled` | no | **Default `false` (dark)** — opt-in Lua script-error auto-capture (ADR-0297 §7c). When `true`, the SDK installs a [`sys.set_error_handler`](https://defold.com/ref/stable/sys/#sys.set_error_handler) handler — at construction while crash reporting is enabled, or at the `set_enabled(true)` that re-enables it (an opted-out or fail-closed boot leaves the game's handler slot untouched; a runtime opt-out after install leaves the SDK's handler in place as a guaranteed no-op, since the sys API cannot restore a previous handler) — that forwards each unhandled script error as a **fatal** `lua_error` report (message → `exception.reason`, traceback → `raw_text`, source → context), capped at **10 reports per session** so a per-frame error loop cannot flood the ingest door. Defold has a **single** process-wide error-handler slot: opting in replaces any handler the game installed (and a later `sys.set_error_handler` by game code replaces the SDK's). Keep this off and call `emit_fatal` from your own handler if you need both. |
 
@@ -318,6 +320,56 @@ the body.
   consuming the dump and the write-ahead persist landing loses that report —
   the dump is one-shot by engine design.
 
+## Attributing crashes to a player
+
+By default a crash report says *what* broke but not *who* it happened to. That
+is enough to group and rank crashes, but not enough to answer the question a
+reliability dashboard exists to answer — **what share of players never crashed** —
+because that needs the crashed players to be identifiable within the active
+population. It also means a crash cannot be matched to that player's diagnostics
+opt-out, and cannot be removed by a per-player deletion request.
+
+Pass `anonymous_id` to give reports an actor key. If you already use the
+analytics SDK, wire the two together in one line — the getter is read at report
+time, so a later `set_anonymous_id` is picked up automatically:
+
+```lua
+local shardpilot = require "shardpilot.sdk"
+local crash = require "shardpilot.crash"
+
+crash.init({
+    crash_ingest_url = "https://crash.example.com",
+    crash_api_key = "<crash:write key>",
+    app_id = "your-app-id",
+    anonymous_id = shardpilot.get_anonymous_id,  -- resolved per report
+    session_id = shardpilot.get_session_id,      -- optional; nil until a session opens
+})
+```
+
+Use the **same** id your analytics client uses, or crashes and players will not
+join. A plain string works too, for a host that has one fixed id:
+`anonymous_id = "install-abc123"`.
+
+Details worth knowing:
+
+- **The value is hashed server-side.** The raw id is not stored on the crash
+  record; it is turned into a keyed digest that is also what diagnostics consent
+  and deletion requests key on.
+- **A raw account id is never sent.** Crash ingest authenticates with an API
+  key, so there is no verified signed-in subject — an account id asserted by the
+  client is unverified and is never used as the actor key. There is deliberately
+  no option to send one.
+- **A malformed value drops the field, not the report.** Free text, an email, an
+  IP, a JWT, a raw `user_`/`player_`/`device_`-prefixed id, or anything over 512
+  bytes is discarded and the crash still ships. A getter that throws is caught
+  for the same reason: it is your code running while the process is already
+  dying.
+- **A previous-session crash carries no actor key.** The dump forwarded on the
+  next launch describes a process that died earlier; the id available now belongs
+  to whoever is playing now, which after a rotation is a different person.
+  Stamping it would mis-key both consent and deletion, so that report stays
+  device-scoped and anonymous.
+
 ## Privacy
 
 Every caller-populated string is PII-scrubbed before the wire (matching the Go
@@ -343,8 +395,20 @@ nothing rawer, no credentials), local to the device, bounded in count and
 size, discarded after about seven days, and removed as soon as the report is
 accepted or terminally rejected — plus the one-boolean settings record
 described under *Opting out* (the persisted `crash_enabled` decision, nothing
-else). Crash reports carry **no actor identity** —
-`session_id` / `anonymous_id` / `user_id` / `device_id`-style keys are
-stripped from context and metadata maps before the wire — so the persisted
-copy carries none either. While crash reporting is disabled no report is
-collected at all, and an unreadable opt-out record disables it fail-closed.
+else).
+
+Crash reports carry an actor identity **only when you configure one** (see
+*Attributing crashes to a player* below). Two rules are unchanged and remain
+absolute: `session_id` / `anonymous_id` / `user_id` / `device_id`-style keys are
+still stripped from the `device`, `context`, and `metadata` maps you supply — a
+raw identifier can never reach the wire through a free-form map — and a raw
+**account** id is never sent at all. When you configure no identity, the report
+is exactly what it was before: device-scoped and anonymous, with no actor field.
+
+What the configured key is: a pseudonymous per-install id, hashed server-side
+into a keyed digest. The raw value is not stored on the crash record. The
+pending-crash sidecar holds the already-scrubbed wire body, so it carries the
+same field and nothing rawer.
+
+While crash reporting is disabled no report is collected at all, and an
+unreadable opt-out record disables it fail-closed.

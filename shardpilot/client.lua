@@ -1514,6 +1514,15 @@ function Client:get_anonymous_id()
 	return self.anonymous_id
 end
 
+-- Expose the CURRENT session id so the host can correlate other telemetry (a
+-- crash report, a support ticket) with the analytics session it happened in.
+-- Returns nil when no session is open — a `backend`-source client never opens
+-- one, and a client opens its first session lazily — so callers must tolerate
+-- nil rather than assume a string.
+function Client:get_session_id()
+	return self.session_id
+end
+
 -- ── remote config ─────────────────────────────────────────────────────────────
 --
 -- Thin delegates over the remote-config client (shardpilot/remote_config.lua),
