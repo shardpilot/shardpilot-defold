@@ -518,6 +518,24 @@ local function test_get_session_id_returns_nil_when_no_session_is_open()
 	assert_true(type(client:get_session_id()) == "string", "a renewed session exposes its id again")
 end
 
+local function test_module_get_session_id_returns_nil_without_a_default_client()
+	-- The module-level getter is a VALUE read, so "no client" must read as nil,
+	-- not as the false/"not_initialized" pair a command returns. A caller using
+	-- the documented `if id ~= nil then ... end` would otherwise treat false as a
+	-- present id and pass a boolean downstream.
+	reset()
+	sdk.shutdown()
+	assert_equal(sdk.get_session_id(), nil, "no default client must read as nil")
+
+	seed_granted_consent()
+	assert_true(sdk.init(config()))
+	assert_equal(sdk.get_session_id(), nil, "initialized but no session open is still nil")
+	assert_true(sdk.session_start())
+	assert_true(type(sdk.get_session_id()) == "string", "an open session exposes its id")
+	sdk.shutdown()
+	assert_equal(sdk.get_session_id(), nil, "after shutdown it is nil again")
+end
+
 local function test_session_start_renews_session_and_resets_sequence()
 	reset()
 	seed_granted_consent()
@@ -7133,6 +7151,7 @@ local tests = {
 	test_app_first_payload,
 	test_screen_view_does_not_mutate_caller_props,
 	test_get_session_id_returns_nil_when_no_session_is_open,
+	test_module_get_session_id_returns_nil_without_a_default_client,
 	test_session_start_renews_session_and_resets_sequence,
 	test_session_start_rolls_back_on_enqueue_failure,
 	test_session_start_rolls_back_on_invalid_props,

@@ -73,8 +73,23 @@ function M.set_anonymous_id(anonymous_id)
 	return with_default("set_anonymous_id", anonymous_id)
 end
 
+-- A VALUE read, not a command: with_default answers `false, "not_initialized"`
+-- when there is no default client, which is the right shape for an action that
+-- could not be performed but the wrong shape for a getter whose contract is a
+-- nullable value. A caller writing the documented `if id ~= nil then …` would
+-- treat that `false` as a present id and pass a boolean downstream.
+local function value_from_default(method)
+	local client = default()
+	if not client then
+		return nil
+	end
+	return client[method](client)
+end
+
+-- The current analytics session id, or nil when none is open — including before
+-- init() and after shutdown(), not only between session_end and session_start.
 function M.get_session_id()
-	return with_default("get_session_id")
+	return value_from_default("get_session_id")
 end
 
 function M.get_anonymous_id()
