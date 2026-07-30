@@ -4,6 +4,13 @@ The ShardPilot Defold SDK is published as the latest release git tag plus a
 GitHub Release (currently `v0.10.0` for both). This is an early alpha
 pre-release: the API is unstable and may change before v1.
 
+**Tag lag is normal, and the version above leads the tag.** In-tree version
+claims move in the version-bump commit; the tag and GitHub Release are cut
+from that commit's merge, afterwards. So between the merge and the tagging
+step the version named here is **pending**, not published, and its archive URL
+404s — `v0.9.1` is the last one that definitely resolves. `git tag -l` on a
+fresh fetch is the authority on what is actually published, not this line.
+
 Release ordering: merge the version-bump commit — it moves every in-tree
 version claim together, which `./scripts/check_versions.sh` enforces — then
 immediately tag that merge commit as `v<version>` and publish the GitHub
