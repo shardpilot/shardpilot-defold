@@ -764,6 +764,15 @@ game has to handle specially.
   `diagnostics` hook and otherwise tolerated silently — until that producer
   lane opens.
 
+  There is also a **cap on owed exposures: eight per experiment.** While the
+  analytics queue is blocked, each fresh application of the same experiment
+  (a session renewal, an assignment-version change) parks another owed
+  snapshot. Past eight, the OLDEST is dropped and the SDK emits
+  `exposure_skipped` / `owed_overflow`. That exposure is gone — not retried,
+  not spooled — so a long block can undercount the experiment population.
+  Watch for `owed_overflow` in diagnostics: it is the signal that the
+  measurement, not just the delivery, has been affected.
+
 ## Crash wire contract
 
 Crashes use a **separate** module and endpoint. The crash client

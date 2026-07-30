@@ -233,7 +233,12 @@ The public calls, verified against `shardpilot/sdk.lua`:
   payload, or `nil`. Never touches the network, never fails.
 - **`track_exposure(experiment_key)`** — emits one extra exposure fact for the
   live assignment (the automatic at-most-once-per-session exposure needs no
-  call). Returns `ok, err`; failure codes `not_initialized`, `shutdown`,
+  call). "At most once per session" describes the DEDUPLICATED fact: revoking
+  consent mid-session clears the exposure bookkeeping and re-arms live
+  assignments, so a re-grant in the same session sends the automatic exposure
+  again under the same deterministic event id. Treat the second send and its
+  duplicate diagnostic as the consent cycle working, not as an SDK violation.
+  Returns `ok, err`; failure codes `not_initialized`, `shutdown`,
   `experiments_not_configured`, `experiment_key_required`, `no_assignment`,
   `consent_unknown`, `consent_denied`, `exposure_no_subject_fact_key`,
   `queue_full`.
