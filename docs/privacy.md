@@ -165,8 +165,11 @@ consent rules), but it means an at-rest review must account for them.
 - **Experiment-assignment cache** — one size-capped record per app, holding
   per cached experiment: the **SDK-minted subject id** (`spcid_…`), the
   server-minted `assignment_key` and, for client-id-unit assignments, the
-  server-minted `subject_fact_key`, the `variant_key`, the **variant
-  payload** as the server sent it, the `version`, the `assignment_unit`, the
+  server-minted `subject_fact_key`, the `variant_key`, the SDK's
+  **depth-bounded copy of the variant payload** — structurally identical to
+  what the server sent down to 16 levels of nesting, below which subtrees are
+  truncated and never reach disk, so an at-rest audit should not expect a
+  deeper subtree to be present — the `version`, the `assignment_unit`, the
   fetch timestamp, and — this is the part worth reviewing — the **normalized
   targeting attributes the assignment was evaluated under**. Those attributes
   are whatever the host passed to `fetch_experiment_assignment`: `geo`,
