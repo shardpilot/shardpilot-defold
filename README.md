@@ -18,7 +18,10 @@ not the platform boundary.
   local/develop endpoints for evaluation.
 - **Version `0.10.0`.** `game.project`, `shardpilot/version.lua`, and the top
   [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.10.0`; the `v0.10.0` tag
-  is published per [docs/release.md](docs/release.md).
+  is cut from the merge of this version bump, not before it, per
+  [docs/release.md](docs/release.md). If you are reading this inside that
+  window the tag may not resolve yet — `v0.9.1` is the last tag that
+  definitely does.
 
 ## What it does
 
@@ -99,7 +102,10 @@ dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/ta
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
-the tag source archive above is the only hosted dependency URL.
+the tag source archive above is the only hosted dependency URL. The tag is
+created from the merge of the matching version-bump commit, so immediately
+after that merge lands there is a short window in which this URL 404s; if it
+does, pin the previous tag until the new one is published.
 
 Then require the module:
 
