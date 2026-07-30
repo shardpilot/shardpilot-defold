@@ -323,6 +323,15 @@ per-app spool and re-sends them on a later launch. Enabled by default
   `flush()` and call again. Branch on the code the method you called actually
   emits — a host that treats any non-`true` return as fatal will tear down
   over recoverable debt.
+
+  The table describes `persist()` **only when the spool is enabled**. With
+  `spool_enabled = false`, `persist()` returns `false, "spool_disabled"`
+  before it looks at experiment debt at all, so neither row can be returned —
+  a host waiting for `experiments_pending` there would wait forever. The
+  assignment-cache sync still runs first in that mode, so a spool-less
+  configuration converges its cache; it is only the *reporting* that stops at
+  `spool_disabled`. `shutdown()` is unaffected and keeps reporting both
+  codes.
 - Permanent `4xx` rejects are **never** spooled — they would fail forever.
 
 **Resend.** On the next `init`/`new`, spooled envelopes are re-sent through
@@ -727,7 +736,17 @@ game has to handle specially.
   assigned variant is first applied, with a deterministic `event_id` so
   retries collapse as duplicates server-side; `track_exposure` is the explicit
   re-arm on top of that, and `track_outcome` records host-defined numeric
-  outcomes. **"At most one", not "exactly one":** a fact only emits when the
+  outcomes.
+
+  Read "at most one" as **at most one deduplicated fact**, not at most one
+  network send. Revoking consent mid-session clears the emitted-exposure
+  bookkeeping and re-arms every live assignment — it has to, because the facts
+  it was tracking were purged — so a later re-grant in the same session emits
+  the exposure again. The replacement carries the same deterministic
+  `event_id`, so the counted fact stays single, but the client really does
+  send it more than once and your diagnostics will show the extra send
+  collapsing as a duplicate. That is the deny-then-grant cycle working, not a
+  double count. **"At most one", not "exactly one":** a fact only emits when the
   assignment carries the server-supplied opaque key the fact is allowed to be
   attributed by. An assignment served without one — a synthetic-unit answer,
   for instance — is applied normally but emits **no** exposure at all,
