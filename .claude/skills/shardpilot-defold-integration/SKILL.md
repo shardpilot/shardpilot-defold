@@ -145,7 +145,11 @@ init; `shardpilot.identify(user_id)` upgrades attribution. Identifiers are
 capped at 512 bytes — oversized values are **rejected**
 (`invalid_user_id` / `invalid_anonymous_id`), never truncated. The optional
 `diagnostics` hook is the SDK's push-side observability surface: it receives
-issue tables with `scope = "event" | "batch" | "consent" | "spool"`.
+issue tables with `scope = "event" | "batch" | "consent" | "spool"`, plus
+`"experiments"` once `experiments_enabled` is on — that scope carries the
+skipped-exposure and failed-cache-persist conditions, so an integration that
+switches exhaustively on the list must include it or discard exactly the
+diagnostics that reveal a measurement gap.
 
 ## The consent-first contract (as implemented here)
 
@@ -211,14 +215,21 @@ bugs.
 - **Feature detection.** `shardpilot.supports(capability)` works before
   `init()` and returns `false` for unknown names on older and newer SDKs
   alike. Keys today: `"consent_receipt_outbox"`,
-  `"consent_state_denied_forced_minor"`, `"schema_revision_declaration"`.
-  Gate new call shapes on it:
+  `"consent_state_denied_forced_minor"`, `"schema_revision_declaration"`,
+  `"experiments_assignment"`. Gate new call shapes on it — including the
+  experiment surface, whose config field an older SDK would silently ignore:
 
 ```lua
 if shardpilot.supports("consent_state_denied_forced_minor") then
   shardpilot.set_consent("denied_forced_minor")
 else
   shardpilot.set_consent(false)
+end
+
+-- Same guard before the experiment surface: an older pinned SDK ignores
+-- experiments_enabled silently and has none of these five calls.
+if shardpilot.supports("experiments_assignment") then
+  shardpilot.fetch_experiment_assignment("menu_layout", function(result) end)
 end
 ```
 

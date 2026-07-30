@@ -246,6 +246,17 @@ The public calls, verified against `shardpilot/sdk.lua`:
 at `buffer_size`, so flush (or wait for the next batch to drain) and call
 again — the exposure or outcome is otherwise silently lost.
 
+**`ok` means enqueued locally, NOT accepted by the platform.** Both fact calls
+return success once the event is on the queue. With the documented Mode A
+setup — a game-embedded publishable key — the platform currently **rejects**
+the `experiment_exposure` and experiment-outcome fact names by design, so the
+event is expected to come back as a per-event reject, surfaced through your
+`diagnostics` hook and otherwise tolerated silently. Until that producer lane
+opens, plan for experiments to run with **no accepted exposure or outcome
+data** from a publishable-key build: treat a `true` return as "the SDK did its
+part", not as a recorded measurement, and watch `diagnostics` to see what is
+actually landing.
+
 **Automatic exposure is "at most once", not "exactly once".** A fact can only
 be emitted when the assignment carries the server-supplied opaque key it is
 allowed to be attributed by; the SDK-minted subject id must never reach the

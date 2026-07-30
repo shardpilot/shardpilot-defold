@@ -303,15 +303,20 @@ per-app spool and re-sends them on a later launch. Enabled by default
   client keeps running. It reports `false, "spool_persist_failed"` when the
   snapshot could not be durably and fully captured (same strictness as
   `shutdown()`).
-- **With experiments enabled, two more lifecycle failures exist.**
-  `persist()` and `shutdown()` both report `false, "experiments_pending"`
-  when an assignment-cache write is still owed after a storage failure, or
-  when an owed exposure fact could not be captured — an app death right then
-  would lose it, so the call refuses to claim safety. `shutdown()` can also
-  report `false, "queue_full"`. Both are **retryable**: `flush()` and call
-  again, exactly as with `spool_persist_failed`. A host that enables
-  experiments should branch on these alongside the spool codes rather than
-  treating any non-`true` return as fatal.
+- **With experiments enabled, two more lifecycle failures exist — and the two
+  methods report the same debt differently.** Both refuse to claim safety
+  while something owed has not been captured, but the code depends on which
+  debt and which call:
+
+  | Owed debt | `persist()` reports | `shutdown()` reports |
+  |---|---|---|
+  | assignment-cache write still failing | `experiments_pending` | `experiments_pending` |
+  | exposure fact not captured (queue full) | `experiments_pending` | `queue_full` |
+
+  Both codes are **retryable**, exactly like `spool_persist_failed`:
+  `flush()` and call again. Branch on the code the method you called actually
+  emits — a host that treats any non-`true` return as fatal will tear down
+  over recoverable debt.
 - Permanent `4xx` rejects are **never** spooled — they would fail forever.
 
 **Resend.** On the next `init`/`new`, spooled envelopes are re-sent through
@@ -778,11 +783,17 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   payload; overwritten by the next successful fetch), the small write-ahead
   consent denial marker (written before a denial is applied so the denial
   survives a crash mid-purge; no analytics payload), and — created only by a
-  run with `experiments_enabled` on — the experiment-assignment cache (the
-  last-known-good variant per experiment, scope-stamped and size-capped) plus
-  its clear marker (a timestamp used to filter withdrawn experiment facts out
-  of the spool; still **read** on a later launch with the flag off, see
-  [Experiments](#experiments)). The identity
+  run with `experiments_enabled` on — the experiment-assignment cache and its
+  clear marker. Those last two are the SDK's most identifier-bearing storage
+  and are retained across a consent downgrade and across a later launch with
+  the flag off: the cache holds the SDK-minted subject id, the server-minted
+  assignment and subject-fact keys, the variant payload, **and the normalized
+  targeting attributes the assignment was evaluated under** — so
+  user-specific values your game passes to `fetch_experiment_assignment` are
+  written to disk; the clear marker holds a timestamp plus the record scope
+  (workspace, environment, subject id, base URL, and a non-secret hash
+  fingerprint of the API key — never the key). See
+  [docs/privacy.md](docs/privacy.md) for the full at-rest inventory. The identity
   record is written through
   `sys.get_save_file("shardpilot.<workspace_id>.<app_id>", "identity")` with
   `sys.save`/`sys.load`. The per-app namespace prevents two games on one device

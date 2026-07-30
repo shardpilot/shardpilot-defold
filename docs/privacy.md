@@ -148,13 +148,40 @@ sends nothing until an explicit `set_enabled` decision is persisted again.
   below), the small write-ahead consent denial marker (written before a
   denial is applied so the denial survives a crash mid-purge; no analytics
   payload), and — created only by a run with `experiments_enabled` on — the
-  experiment-assignment cache (the last-known-good variant per experiment,
-  scope-stamped and size-capped) plus its clear marker (a timestamp used to
-  filter withdrawn experiment facts out of the spool; still read on a later
-  launch with the flag off). The last three exist only once the feature that
-  owns them has run: a build that has never denied consent and never enabled
-  experiments carries six. No cookies and no other browser or tracking
-  storage.
+  experiment-assignment cache and its clear marker, both detailed below. The
+  last three exist only once the feature that owns them has run: a build that
+  has never denied consent and never enabled experiments carries six. No
+  cookies and no other browser or tracking storage.
+
+### What the experiment records hold (experiments-enabled builds only)
+
+These two records are the most identifier-bearing storage the SDK writes, and
+both are **retained across a consent downgrade and across a later launch with
+`experiments_enabled` off** — retention is deliberate (see the experiments
+consent rules), but it means an at-rest review must account for them.
+
+- **Experiment-assignment cache** — one size-capped record per app, holding
+  per cached experiment: the **SDK-minted subject id** (`spcid_…`), the
+  server-minted `assignment_key` and, for client-id-unit assignments, the
+  server-minted `subject_fact_key`, the `variant_key`, the **variant
+  payload** as the server sent it, the `version`, the `assignment_unit`, the
+  fetch timestamp, and — this is the part worth reviewing — the **normalized
+  targeting attributes the assignment was evaluated under**. Those attributes
+  are whatever the host passed to `fetch_experiment_assignment`: `geo`,
+  `app_version`, `device_type`, `install_date`, `user_segment`, and any
+  `custom_attribute_<name>` values. **If your game passes user-specific
+  targeting values, those values are written to disk here.** The SDK neither
+  invents nor infers any of them.
+- **Experiment clear marker** — not merely a timestamp: it stores a timestamp
+  **and the record scope**. That scope is a derived string over the workspace
+  id, environment id, the SDK-minted subject id, the remote-config base URL,
+  and a short non-secret fingerprint of the API key (a hash — the key itself
+  is never written to disk).
+
+The subject id is SDK-minted, never host-settable, and egresses only as the
+assignment fetch's `subject_key`; it is never attached to an analytics event.
+Erasing this at-rest state is a matter of clearing the app's saved data — the
+SDK exposes no separate purge for it.
 - All persistence goes through Defold `sys.save` only; on HTML5 builds Defold
   backs `sys.save` with browser storage, still limited to those records.
 
