@@ -1339,6 +1339,19 @@ local function test_track_outcome_stamps_cached_assignment()
 	assert_equal(err, "invalid_outcome_key")
 	ok, err = client:track_outcome("exp-checkout", "score", "twelve")
 	assert_equal(err, "invalid_outcome_value")
+
+	-- Non-finite numbers are rejected BEFORE enqueue. They are Lua numbers
+	-- but have no JSON representation, so one accepted here would poison the
+	-- whole batch it lands in (a terminal encode failure drops the batch,
+	-- unrelated events included, and permanent failures are never spooled).
+	local before = #queued_events(client, "experiment_outcome")
+	for _, bad in ipairs({ 0 / 0, math.huge, -math.huge }) do
+		ok, err = client:track_outcome("exp-checkout", "score", bad)
+		assert_equal(ok, false)
+		assert_equal(err, "invalid_outcome_value")
+	end
+	assert_equal(#queued_events(client, "experiment_outcome"), before,
+		"a non-finite outcome value must not enqueue a fact")
 end
 
 -- ── ordering, teardown, facade ────────────────────────────────────────────────

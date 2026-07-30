@@ -422,6 +422,15 @@
   engine or exercise runtime behavior, which remains covered by the
   interpreter test legs.
 
+- **`track_outcome` rejects non-finite outcome values.** `outcome_value` now
+  requires a **finite** number: `NaN` and `±inf` are Lua numbers that satisfied
+  the old `type(...) == "number"` check but have no JSON representation, so
+  one accepted value poisoned the entire batch it rode in — a terminal encode
+  failure drops that batch, unrelated events included, and permanent failures
+  are never spooled. They are refused at the call now
+  (`invalid_outcome_value`), before anything is enqueued. Same finite
+  discipline the experiment version field already used.
+
 - **Experiments are documented for integrators.** The README gained an
   "Experiments" section and `docs/configuration.md` an "Experiments" knob
   section covering `experiments_enabled` (default `false`), the

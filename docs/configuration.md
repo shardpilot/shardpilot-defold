@@ -239,8 +239,11 @@ The public calls, verified against `shardpilot/sdk.lua`:
   `queue_full`.
 - **`track_outcome(experiment_key, outcome_key, outcome_value)`** — records a
   host-defined outcome as its own fact. `outcome_key` must be a non-empty
-  string (`invalid_outcome_key`) and `outcome_value` must be a **number**
-  (`invalid_outcome_value`); the `track_exposure` failure codes apply too.
+  string (`invalid_outcome_key`) and `outcome_value` must be a **finite
+  number** (`invalid_outcome_value`) — `NaN` and `±inf` are Lua numbers but
+  have no JSON representation, so they are refused here rather than being
+  allowed to break the batch they would ride in. The `track_exposure` failure
+  codes apply too.
 
 `queue_full` is the retryable one in that list: the in-memory event queue is
 at `buffer_size`, so flush (or wait for the next batch to drain) and call

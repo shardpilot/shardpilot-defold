@@ -575,7 +575,8 @@ local payload = shardpilot.experiment_payload("menu_layout") -- variant payload 
 -- at-most-once-per-session exposure needs no call). Returns ok, err.
 shardpilot.track_exposure("menu_layout")
 
--- Record a host-defined outcome. `outcome_value` must be a NUMBER.
+-- Record a host-defined outcome. `outcome_value` must be a FINITE number
+-- (NaN and infinities are rejected -- JSON cannot carry them).
 -- Returns ok, err.
 shardpilot.track_outcome("menu_layout", "purchase_value", 4.99)
 ```
@@ -586,7 +587,7 @@ shardpilot.track_outcome("menu_layout", "purchase_value", 4.99)
 | `experiment_variant(key)` | variant key `string`, or `nil` | — (never fails) |
 | `experiment_payload(key)` | the variant payload (a copy), or `nil` | — (never fails) |
 | `track_exposure(key)` | `ok, err` | `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `no_assignment`, `consent_unknown`, `consent_denied`, `exposure_no_subject_fact_key`, `queue_full` |
-| `track_outcome(key, outcome_key, outcome_value)` | `ok, err` | the `track_exposure` codes plus `invalid_outcome_key` (non-empty string required) and `invalid_outcome_value` (number required) |
+| `track_outcome(key, outcome_key, outcome_value)` | `ok, err` | the `track_exposure` codes plus `invalid_outcome_key` (non-empty string required) and `invalid_outcome_value` (a **finite** number required — `NaN` and `±inf` are rejected) |
 
 `queue_full` is the one worth retrying: the in-memory event queue is at
 `buffer_size`, so flush (or wait for the next batch) and call again rather

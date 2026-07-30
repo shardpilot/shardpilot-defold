@@ -3176,7 +3176,16 @@ function Experiments:track_outcome(experiment_key, outcome_key, outcome_value)
 	if type(outcome_key) ~= "string" or outcome_key == "" then
 		return false, "invalid_outcome_key"
 	end
-	if type(outcome_value) ~= "number" then
+	-- FINITE numbers only. NaN and ±inf are Lua numbers but have no JSON
+	-- representation, so accepting one here poisons the whole batch it lands
+	-- in: the encoder either fails (terminal json_encode_failed, and the
+	-- batch — including unrelated events — is dropped, never spooled) or
+	-- emits a non-JSON token the server rejects. The same positive,
+	-- finite-number discipline valid_wire_version applies to the version
+	-- field; NaN fails every comparison, so the ordering test catches it.
+	if type(outcome_value) ~= "number"
+		or outcome_value ~= outcome_value
+		or outcome_value <= -math.huge or outcome_value >= math.huge then
 		return false, "invalid_outcome_value"
 	end
 	local entry = self.entries[experiment_key]
