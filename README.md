@@ -489,6 +489,13 @@ record is written. The public calls answer `false, "experiments_not_configured"`
 and the getters return `nil`, so game code that already calls them keeps
 running its control experience unchanged.
 
+One deliberate exception, and it only applies to a build that had experiments
+**on** in an earlier run: turning the flag back off does not strand whatever
+that run left behind. `init()` still reads the small clear marker and filters
+any matching experiment facts out of the offline spool, so a
+rollback launch cannot replay withdrawn assignment data. A build that has
+never had the flag on has no such state, and this path does nothing.
+
 **Enabling experiments takes three config fields, not one.** Setting the flag
 by itself is rejected at `init()`:
 
@@ -523,8 +530,11 @@ remote-config and assignment fetches. Feature-detect the surface before
 
 ```lua
 -- Fetch the server-evaluated assignment. `attributes` is optional —
--- (experiment_key, callback) is accepted too. Returns ok, err synchronously
--- AND reports the same outcome through the callback.
+-- (experiment_key, callback) is accepted too. The synchronous return is
+-- DISPATCH status, not the answer: `true` means the request went out and the
+-- result will arrive through the callback; `false, err` means the call was
+-- refused before dispatch (and the callback still reports that refusal).
+-- Always read the assignment off the callback.
 shardpilot.fetch_experiment_assignment("menu_layout", function(result)
   -- result = { ok, from_cache, assigned?, variant_key?, variant_payload?,
   --            version?, reason?, error? }
@@ -543,7 +553,7 @@ local variant = shardpilot.experiment_variant("menu_layout") -- variant key stri
 local payload = shardpilot.experiment_payload("menu_layout") -- variant payload copy, or nil
 
 -- Emit one extra exposure fact for the live assignment (the automatic
--- once-per-session exposure needs no call). Returns ok, err.
+-- at-most-once-per-session exposure needs no call). Returns ok, err.
 shardpilot.track_exposure("menu_layout")
 
 -- Record a host-defined outcome. `outcome_value` must be a NUMBER.
@@ -553,11 +563,15 @@ shardpilot.track_outcome("menu_layout", "purchase_value", 4.99)
 
 | Call | Returns | Failure codes you can branch on |
 |---|---|---|
-| `fetch_experiment_assignment(key, [attributes], callback)` | `ok, err` plus a result table through `callback` | `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `consent_unknown`, `consent_denied`, `http_unavailable`, `json_unavailable`, and the per-response `error` values below |
+| `fetch_experiment_assignment(key, [attributes], callback)` | `true` = dispatched, or `false, err` = refused before dispatch; the assignment always arrives through `callback` | pre-dispatch: `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `consent_unknown`, `consent_denied`, `http_unavailable`, `json_unavailable`. In the callback's `result.error`: `unauthorized`, `not_found`, `bad_request`, `malformed_response`, `stale_subject`, `superseded`, `http_0`, `transient_408`, `transient_429`, `transient_<5xx>`, and `http_<status>` for anything unclassified |
 | `experiment_variant(key)` | variant key `string`, or `nil` | — (never fails) |
 | `experiment_payload(key)` | the variant payload (a copy), or `nil` | — (never fails) |
-| `track_exposure(key)` | `ok, err` | `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `no_assignment`, `consent_unknown`, `consent_denied`, `exposure_no_subject_fact_key` |
+| `track_exposure(key)` | `ok, err` | `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `no_assignment`, `consent_unknown`, `consent_denied`, `exposure_no_subject_fact_key`, `queue_full` |
 | `track_outcome(key, outcome_key, outcome_value)` | `ok, err` | the `track_exposure` codes plus `invalid_outcome_key` (non-empty string required) and `invalid_outcome_value` (number required) |
+
+`queue_full` is the one worth retrying: the in-memory event queue is at
+`buffer_size`, so flush (or wait for the next batch) and call again rather
+than dropping the exposure or outcome.
 
 The fetch is
 `GET {remote_config_url}/api/v1/runtime/experiments/assignment?app_key=&environment_key=&experiment_key=&subject_key=`
@@ -573,7 +587,13 @@ it is distinct from the anonymous ID, and it egresses **only** as this fetch's
   memory plus one durable per-app record, so a later launch serves the
   last-known-good variant offline. Stickiness is entirely the server's
   deterministic hash; this client **never re-buckets locally** — the cache is
-  a latency/offline device, not an assignment authority.
+  a latency/offline device, not an assignment authority. The durable half is
+  **best effort**: the record has a fixed size cap and evicts the
+  oldest-fetched assignments to stay under it, and on a host without a
+  working save-file backend it degrades to process-local memory. An evicted
+  or unpersisted assignment keeps serving for the rest of the process and is
+  simply refetched next launch — absence is always a refetch, never a wrong
+  serve.
 - **Not assigned** — `ok = true, assigned = false` with a closed `reason`
   vocabulary: absent (a deterministic traffic-gate miss),
   `"targeting_unmatched"`, or `"kill_switch"` (an operator kill). All three
@@ -581,13 +601,24 @@ it is distinct from the anonymous ID, and it egresses **only** as this fetch's
   emitted for it.
 - **`401`/`403` fail closed** — the fetch reports `unauthorized`, **nothing is
   served** for that outcome, the getters go `nil`, and revalidation stops
-  until re-`init()` or a later authorized fetch. The durable record is kept.
+  until re-`init()` or a later authorized fetch. The durable record is kept —
+  with one exception: a `403` whose body reports that real-subject assignment
+  was switched off also drops the stored record, so a withdrawn assignment
+  cannot outlive the switch. Both flavors report the same `unauthorized`, so
+  game code has nothing extra to branch on.
 - **`404`** — permanent for that experiment key: treated as not-assigned,
   never served stale, and the revalidation cadence stops asking for it.
-- **Transient** (`429`, `5xx`, offline, timeout, malformed body) — the cached
-  assignment is served with `from_cache = true` and `error` carrying the
-  reason; `Retry-After` is honored on `429` and `5xx`, and the revalidation
-  cadence backs off.
+- **Transient** (`429`, `5xx`, `408`, offline, timeout, malformed body) — the
+  cached assignment is served with `from_cache = true` and `error` carrying
+  the reason (`transient_429`, `transient_<5xx>`, `transient_408`, `http_0`,
+  `malformed_response`); `Retry-After` is honored on `429` and `5xx`, and the
+  revalidation cadence backs off. **Serving stale is attribute-fenced:** the
+  cached assignment comes back only when the failing fetch asked with the
+  same normalized targeting attributes it was evaluated under. Fetch the same
+  experiment with a different `geo` (or any other changed attribute) and a
+  transient failure returns `ok = false, from_cache = false` instead — a
+  variant chosen for one targeting context is never handed back as the answer
+  to another.
 
 Cached assignments are re-fetched roughly every **300 s (±10% jitter)** while
 the SDK is running, consent is granted, and at least one assignment is cached
@@ -628,12 +659,19 @@ game has to handle specially.
   outside the vocabulary are dropped client-side and never sent. Matching is
   **100% server-evaluated**; the SDK evaluates no rules.
 - **Exposure and outcome facts** ride the normal analytics pipeline (queue →
-  batch → spool → consent gates). One `experiment_exposure` is emitted
+  batch → spool → consent gates). At most one `experiment_exposure` is emitted
   automatically per (experiment, version, subject) per session when the
   assigned variant is first applied, with a deterministic `event_id` so
   retries collapse as duplicates server-side; `track_exposure` is the explicit
   re-arm on top of that, and `track_outcome` records host-defined numeric
-  outcomes. **Honest caveat:** the platform currently rejects these fact names
+  outcomes. **"At most one", not "exactly one":** a fact only emits when the
+  assignment carries the server-supplied opaque key the fact is allowed to be
+  attributed by. An assignment served without one — a synthetic-unit answer,
+  for instance — is applied normally but emits **no** exposure at all
+  (`exposure_no_subject_fact_key`, surfaced through `diagnostics`), because
+  the SDK-minted subject id must never reach the analytics plane. Do not
+  assume every applied treatment produces a measured exposure.
+  **Honest caveat:** the platform currently rejects these fact names
   from game-embedded publishable keys by design, so an emitted exposure is
   expected to come back as a per-event reject — surfaced through your
   `diagnostics` hook and otherwise tolerated silently — until that producer

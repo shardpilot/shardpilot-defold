@@ -428,7 +428,17 @@
   `remote_config_url` + `api_key` configuration that enabling it also
   requires, the five public calls, the granted-consent-only rule, and the
   fail-closed behavior while the server has not enabled experiments for the
-  app.
+  app. The honest edges are documented alongside them: the fetch's
+  synchronous return is dispatch status, not the assignment (read the
+  callback); the transient error family is `transient_<status>`, not
+  `http_<status>`; `queue_full` is a retryable refusal from the explicit fact
+  calls; automatic exposure is at-most-once and is skipped for an assignment
+  with no server-supplied attribution key; durable caching is best effort
+  (size-capped, oldest-evicted, memory-only without a save-file backend);
+  serving a cached assignment through a failure is fenced by the targeting
+  attributes it was evaluated under; the real-subjects `403` also drops the
+  stored record; and disabling the flag after an enabled run still runs the
+  spool rollback filter.
 
 ## v0.9.1 — 2026-07-19 — early alpha
 
