@@ -16,9 +16,12 @@ not the platform boundary.
   surface may change before v1 with no backward-compatibility guarantee.
 - **Pre-launch.** The production ingest domain is **not provisioned** yet — use
   local/develop endpoints for evaluation.
-- **Version `0.9.1`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.9.1`; the `v0.9.1` tag
-  is published per [docs/release.md](docs/release.md).
+- **Version `0.10.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.10.0`; the `v0.10.0` tag
+  is cut from the merge of this version bump, not before it, per
+  [docs/release.md](docs/release.md). If you are reading this inside that
+  window the tag may not resolve yet — `v0.9.1` is the last tag that
+  definitely does.
 
 ## What it does
 
@@ -47,10 +50,10 @@ not the platform boundary.
   so a receipt survives process death and offline commits. See
   [Privacy & consent](#privacy--consent).
 - **Capability discovery.** `shardpilot.supports(capability)` feature-detects
-  SDK abilities before `init()` — `"consent_receipt_outbox"` and
-  `"consent_state_denied_forced_minor"` today; unknown names return `false`
-  on older and newer SDKs alike, so integrations can gate new call shapes
-  safely.
+  SDK abilities before `init()` — `"consent_receipt_outbox"`,
+  `"consent_state_denied_forced_minor"`, `"schema_revision_declaration"`, and
+  `"experiments_assignment"` today; unknown names return `false` on older and
+  newer SDKs alike, so integrations can gate new call shapes safely.
 - Samples basic runtime signals via `update(dt)`, `observe_ping_ms(ms)`, and
   `observe_disconnect(reason)`.
 - Reports **crashes** through a separate `require "shardpilot.crash"`
@@ -74,6 +77,11 @@ not the platform boundary.
   snapshot across restarts and offline launches, and failing closed on
   `401`/`403`. Every fetch is an explicit game-triggered call. See
   [Remote config](#remote-config).
+- Serves **experiments** — server-evaluated variant assignments with a durable
+  last-known-good cache, periodic revalidation, and exposure/outcome facts.
+  **Off by default** behind `experiments_enabled`, requires analytics consent
+  `granted`, and fails closed (no variant served) until experiments are
+  enabled server-side for your app. See [Experiments](#experiments).
 
 ## Installation
 
@@ -86,15 +94,18 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — the latest tag is `v0.9.1`:
+published tag's source archive — the latest tag is `v0.10.0`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.9.1.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.0.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
-the tag source archive above is the only hosted dependency URL.
+the tag source archive above is the only hosted dependency URL. The tag is
+created from the merge of the matching version-bump commit, so immediately
+after that merge lands there is a short window in which this URL 404s; if it
+does, pin the previous tag until the new one is published.
 
 Then require the module:
 
@@ -193,6 +204,7 @@ README, `docs/`, and the skill above are the reference.
 | `ingest_url` | — (required) | `https://…`, or `http://` only for `localhost`/`127.0.0.1`/`::1`; no query/fragment/path |
 | `remote_config_url` | `nil` (disabled) | Remote-config base URL (same shape rules as `ingest_url`); a **separate** service from the ingest endpoint. Requires `api_key` — see [Remote config](#remote-config) |
 | `remote_config_attributes_enabled` | `false` (dark) | ADR-0310 opt-in: fetches carry the attributes stored via `set_remote_config_attributes` as query parameters — only while consent is **granted** (unknown/denied fetch attribute-less). Requires `remote_config_url` — see [Remote config](#remote-config) |
+| `experiments_enabled` | `false` (off) | Opts into the experiment-assignment consumer. Requires **both** `remote_config_url` and `api_key` — see [Experiments](#experiments) |
 | `workspace_id` | — (required) | Tenant key |
 | `app_id` | — (required) | Product key |
 | `environment_id` | — (required) | Environment scope (e.g. `local` / `develop` / `stage` / `prod`); any non-empty string is accepted |
@@ -297,6 +309,36 @@ per-app spool and re-sends them on a later launch. Enabled by default
   client keeps running. It reports `false, "spool_persist_failed"` when the
   snapshot could not be durably and fully captured (same strictness as
   `shutdown()`).
+- **With experiments enabled, two more lifecycle failures exist — and the two
+  methods report the same debt differently.** Both refuse to claim safety
+  while something owed has not been captured, but the code depends on which
+  debt and which call:
+
+  | Owed debt | `persist()` reports | `shutdown()` reports |
+  |---|---|---|
+  | assignment-cache write still failing | `experiments_pending` | `experiments_pending` |
+  | exposure fact not captured (queue full) | `experiments_pending` | `queue_full` |
+
+  Both codes are **retryable**, exactly like `spool_persist_failed`:
+  `flush()` and call again. Branch on the code the method you called actually
+  emits — a host that treats any non-`true` return as fatal will tear down
+  over recoverable debt.
+
+  The table describes `persist()` **only when the spool is enabled**. With
+  `spool_enabled = false`, `persist()` returns `false, "spool_disabled"`
+  before it looks at experiment debt at all, so neither row can be returned —
+  a host waiting for `experiments_pending` there would wait forever. The
+  assignment-cache sync still runs first in that mode, so a spool-less
+  configuration converges its cache; it is only the *reporting* that stops at
+  `spool_disabled`. `shutdown()` is unaffected and keeps reporting both
+  codes.
+
+  Exposure debt also holds the **Mode B anonymous-id rotation**:
+  `set_anonymous_id` refuses with `events_pending` while an experiment
+  exposure is still owed, alongside the queue and spool conditions it already
+  checked. Flushing the ordinary queue is not always enough — an exposure can
+  stay owed behind earlier queue pressure — so a host that rotates identity
+  must drain and retry rather than assume one flush cleared the way.
 - Permanent `4xx` rejects are **never** spooled — they would fail forever.
 
 **Resend.** On the next `init`/`new`, spooled envelopes are re-sent through
@@ -438,8 +480,10 @@ way.
   process lifetime, like the identity record).
 - **Not guaranteed / not provided:** the SDK never fetches on its own — there
   is no automatic or interval refresh, no `Cache-Control` interpretation, and
-  no push; every fetch is an explicit call. There is no experiment
-  assignment, no exposure events, and no client-side stats. A config body
+  no push; every fetch is an explicit call. Remote config carries no
+  experiment assignment and emits no exposure events — that is a separate,
+  default-off plane with its own endpoint and its own consent rule; see
+  [Experiments](#experiments). A config body
   large enough to approach the documented 512 KB `sys.save` cap — or any
   body whose durable write fails — is still served and stays the in-process
   offline fallback, but is not persisted (surfaced via `diagnostics`), and
@@ -471,6 +515,260 @@ way.
   a cached body may reflect the previously sent attribute set until the
   next successful fetch (documented v1 limit).
 
+## Experiments
+
+**Off by default.** The experiment-assignment consumer is dark behind
+`experiments_enabled = true`. While the flag is off — the default — no
+experiment code path executes at all: no subject id is minted, no request is
+made, no revalidation timer runs, no exposure is emitted, and no new durable
+record is written. The public calls answer `false, "experiments_not_configured"`
+and the getters return `nil`, so game code that already calls them keeps
+running its control experience unchanged.
+
+One deliberate exception, and it only applies to a build that had experiments
+**on** in an earlier run: turning the flag back off does not strand whatever
+that run left behind. `init()` still reads the small clear marker and filters
+any matching experiment facts out of the offline spool, so a
+rollback launch cannot replay withdrawn assignment data. A build that has
+never had the flag on has no such state, and this path does nothing.
+
+**Enabling experiments takes three config fields, not one.** Setting the flag
+by itself is rejected at `init()`:
+
+| Setting this… | …also requires | Otherwise `init()` returns |
+|---|---|---|
+| `experiments_enabled = true` | `remote_config_url` | `false, "experiments_requires_remote_config_url"` |
+| `remote_config_url` | `api_key` | `false, "remote_config_api_key_required"` |
+
+The assignment endpoint is served by the **same host** as the remote-config
+fetch and authenticates with the **same publishable `api_key`**, so a valid
+experiments configuration always carries all three fields together:
+
+```lua
+shardpilot.init({
+  ingest_url = "https://…",
+  remote_config_url = "https://…", -- required by experiments_enabled
+  api_key = "sp_ingest_…",         -- required by remote_config_url
+  workspace_id = "workspace-example",
+  app_id = "app-example",
+  environment_id = "develop",
+  experiments_enabled = true,
+})
+```
+
+In Mode B, `token_provider` and `api_key` are configured *together* (the
+documented exception to "exactly one" — see [Authentication](#authentication)):
+the token stays the ingest `Bearer`, the `api_key` authenticates the
+remote-config and assignment fetches. Feature-detect the surface before
+`init()` with `shardpilot.supports("experiments_assignment")`.
+
+### API
+
+```lua
+-- Fetch the server-evaluated assignment. `attributes` is optional —
+-- (experiment_key, callback) is accepted too. The synchronous return is
+-- DISPATCH status, not the answer: `true` means the request went out and the
+-- result will arrive through the callback; `false, err` means the call was
+-- refused before dispatch (and the callback still reports that refusal).
+-- Read the assignment off the callback -- with one exception: shutdown()
+-- cancels the callbacks of requests still in flight, so do not park state
+-- that only a callback can release across a shutdown.
+shardpilot.fetch_experiment_assignment("menu_layout", function(result)
+  -- result = { ok, from_cache, assigned?, variant_key?, variant_payload?,
+  --            version?, boundary?, reason?, error? }
+  -- `boundary` is a copy of the server's boundary table, passed through on a
+  -- 200 for host introspection (e.g. `assignment_unit`, `production_rollout`).
+  -- Read it if you want it; the SDK itself only acts on `assignment_unit`.
+  if result.ok and result.assigned then
+    apply_layout(result.variant_key, result.variant_payload)
+  end
+end)
+
+-- With optional targeting attributes (server-evaluated; see below):
+shardpilot.fetch_experiment_assignment("menu_layout", { geo = "US" }, function(result) end)
+
+-- Cached getters: never touch the network, never fail, never re-bucket.
+-- Both return nil when there is no assignment to serve — treat nil as the
+-- control experience.
+local variant = shardpilot.experiment_variant("menu_layout") -- variant key string, or nil
+local payload = shardpilot.experiment_payload("menu_layout") -- variant payload copy, or nil
+
+-- Emit one extra exposure fact for the live assignment (the automatic
+-- at-most-once-per-session exposure needs no call). Returns ok, err.
+shardpilot.track_exposure("menu_layout")
+
+-- Record a host-defined outcome. `outcome_value` must be a FINITE number
+-- (NaN and infinities are rejected -- JSON cannot carry them).
+-- Returns ok, err.
+shardpilot.track_outcome("menu_layout", "purchase_value", 4.99)
+```
+
+| Call | Returns | Failure codes you can branch on |
+|---|---|---|
+| `fetch_experiment_assignment(key, [attributes], callback)` | `true` = dispatched, or `false, err` = refused before dispatch; the assignment arrives through `callback` unless `shutdown()` cancels it first | pre-dispatch: `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `consent_unknown`, `consent_denied`, `http_unavailable`, `json_unavailable`. In the callback's `result.error`: `unauthorized`, `not_found`, `bad_request`, `malformed_response`, `stale_subject`, `superseded`, `consent_unknown`, `consent_denied`, `consent_changed`, `http_0`, `transient_408`, `transient_429`, `transient_<5xx>`, and `http_<status>` for anything unclassified |
+| `experiment_variant(key)` | variant key `string`, or `nil` | — (never fails) |
+| `experiment_payload(key)` | the variant payload (a copy), or `nil` | — (never fails) |
+| `track_exposure(key)` | `ok, err` | `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `no_assignment`, `consent_unknown`, `consent_denied`, `exposure_no_subject_fact_key`, `queue_full` |
+| `track_outcome(key, outcome_key, outcome_value)` | `ok, err` | the `track_exposure` codes plus `invalid_outcome_key` (non-empty string required) and `invalid_outcome_value` (a **finite** number required — `NaN` and `±inf` are rejected) |
+
+`queue_full` is the one worth retrying: the in-memory event queue is at
+`buffer_size`, so flush (or wait for the next batch) and call again rather
+than dropping the exposure or outcome.
+
+Two callback rules worth internalizing. **Consent can close the plane while a
+request is in flight** — a downgrade mid-flight resolves the callback with
+`consent_unknown` / `consent_denied`, and a deny→re-grant that raced the
+response resolves it with `consent_changed`; all three mean no variant, and
+all three reach you through `result.error`, not the synchronous return.
+**`shutdown()` cancels in-flight callbacks** — a request dispatched before a
+successful shutdown never calls back at all, by design, so never leave state
+parked that only a callback can release.
+
+The fetch is
+`GET {remote_config_url}/api/v1/runtime/experiments/assignment?app_key=&environment_key=&experiment_key=&subject_key=`
+with the publishable `api_key` as the `Bearer`. The subject is an
+**SDK-minted, SDK-managed** id (`spcid_` + 32 hex) persisted in the durable
+identity record: there is deliberately no config field and no setter for it,
+it is distinct from the anonymous ID, and it egresses **only** as this fetch's
+`subject_key` — never in an analytics event, prop, or envelope identity.
+
+Its persistence is **best effort, and that has a stickiness consequence.** On
+a host with no working save-file backend, or when the durable write simply
+fails (diagnosed, not fatal), the minted id stays memory-only — so the next
+launch mints a *new* subject, and the server, bucketing on that id, may put
+the player in a different variant. Long-run stickiness is only as good as the
+identity record's durability on the platform you ship to. This is also why
+the id is never host-settable: there is no supported way to pin it yourself.
+
+### Fetch semantics
+
+- **Assigned** — the variant is served (`assigned = true`) and cached in
+  memory plus one durable per-app record, so a later launch serves the
+  last-known-good variant offline. Stickiness is entirely the server's
+  deterministic hash; this client **never re-buckets locally** — the cache is
+  a latency/offline device, not an assignment authority. The durable half is
+  **best effort**: the record has a fixed size cap and evicts the
+  oldest-fetched assignments to stay under it, and on a host without a
+  working save-file backend it degrades to process-local memory. An evicted
+  or unpersisted assignment keeps serving for the rest of the process, and
+  the loss is never a wrong serve — but **recovering it is your call, not the
+  SDK's.** The revalidation cadence only refreshes experiments already in the
+  cache; it cannot rediscover a key that is missing, so a launch that starts
+  without the record stays on the control path until your code calls
+  `fetch_experiment_assignment` for that key. Fetch the experiments you care
+  about at startup rather than assuming the cache repopulates itself.
+- **Variant payloads are copied with a depth limit of 16 nested tables.**
+  Both the install and `experiment_payload` use the same bounded copy, and a
+  subtree at or below that depth is dropped (`nil`) rather than rejected — so
+  a payload nested 16+ deep reaches your game silently truncated. Keep
+  variant payloads shallow; they are meant to be configuration, not a
+  document tree.
+- **Not assigned** — `ok = true, assigned = false` with a closed `reason`
+  vocabulary: absent (a deterministic traffic-gate miss),
+  `"targeting_unmatched"`, or `"kill_switch"` (an operator kill). All three
+  drop the cached assignment, and a kill additionally stops any *future*
+  exposure for it. It does **not** retroactively suppress a treatment that
+  already ran: an exposure still owed at kill time — the variant was applied
+  but the fact had not left yet, e.g. the queue was full — is deliberately
+  retained and emitted afterwards, because an application that happened is a
+  fact about the past. A `experiment_exposure` arriving shortly after a kill
+  is therefore expected behavior, not a client violating the kill.
+- **`401`/`403` fail closed** — the fetch reports `unauthorized`, **nothing is
+  served** for that outcome, the getters go `nil`, and revalidation stops
+  until re-`init()` or a later authorized fetch. The durable record is kept —
+  with one exception: a `403` whose body reports that real-subject assignment
+  was switched off also drops the stored record, so a withdrawn assignment
+  cannot outlive the switch. Both flavors report the same `unauthorized`, so
+  game code has nothing extra to branch on.
+- **`404`** — permanent for that experiment key: treated as not-assigned,
+  never served stale, and the revalidation cadence stops asking for it.
+- **Transient** (`429`, `5xx`, `408`, offline, timeout, malformed body) — the
+  cached assignment is served with `from_cache = true` and `error` carrying
+  the reason (`transient_429`, `transient_<5xx>`, `transient_408`, `http_0`,
+  `malformed_response`); `Retry-After` is honored on `429` and `5xx` — **in
+  its delta-seconds form only.** A `Retry-After` sent as an HTTP-date is not
+  parsed and is ignored, and the client falls back to its own jittered
+  backoff. **Serving stale is attribute-fenced:** the
+  cached assignment comes back only when the failing fetch asked with the
+  same normalized targeting attributes it was evaluated under. Fetch the same
+  experiment with a different `geo` (or any other changed attribute) and a
+  transient failure returns `ok = false, from_cache = false` instead — a
+  variant chosen for one targeting context is never handed back as the answer
+  to another.
+
+Cached assignments are re-fetched roughly every **300 s (±10% jitter)** while
+the SDK is running, consent is granted, and at least one assignment is cached
+— that cadence is the SDK's share of the kill-switch reach. Stated honestly:
+**an offline client keeps its last-known-good variant indefinitely.**
+
+### Before the server enables experiments for your app
+
+Experiments must be enabled **server-side for your app** as well. Until that
+happens, the assignment endpoint answers `403`, and this client treats it
+exactly like any other unauthorized answer — it **fails closed**:
+
+- the fetch reports `ok = false, error = "unauthorized"`;
+- **no variant is served** — not even a previously cached one;
+- `experiment_variant` / `experiment_payload` return `nil`, so your game runs
+  its control experience;
+- in-memory serving and the revalidation cadence stop until you re-`init()` or
+  a later fetch is authorized.
+
+So turning `experiments_enabled` on in a build is safe on its own: with
+nothing enabled server-side you get the control path, not an error state your
+game has to handle specially.
+
+### Consent, targeting, and facts
+
+- **Granted-only plane.** Every assignment fetch, cached serve, revalidation
+  tick, and subject-id mint requires analytics consent `granted`. Under
+  `unknown` or either denial flavor (forced-minor included) the consumer
+  produces **zero** experiment traffic, refuses fetches with
+  `consent_unknown` / `consent_denied`, and the getters serve `nil`. The
+  durable cache record is retained but not served through a downgrade, and a
+  later re-grant serves it again. This is deliberately **stricter** than
+  `fetch_remote_config`, which is not consent-gated.
+- **Targeting attributes** ride the fixed server vocabulary — `geo`,
+  `app_version`, `device_type`, `install_date`, `user_segment`, plus
+  `custom_attribute_<name>` where the suffix is **1–64 bytes** (measured in
+  bytes, not code points — a multibyte suffix that looks short enough can
+  still be over the limit, and an over-limit name is dropped silently; keep
+  custom attribute names ASCII). Values are trimmed and bounded to 512 bytes,
+  at most 64 attributes ride one fetch, and names outside the vocabulary are
+  dropped client-side and never sent. Matching is **100% server-evaluated**;
+  the SDK evaluates no rules.
+- **Exposure and outcome facts** ride the normal analytics pipeline (queue →
+  batch → spool → consent gates). When the assigned variant is first applied
+  the SDK emits an `experiment_exposure` for you; `track_exposure` emits an
+  extra one on demand, and `track_outcome` records host-defined numeric
+  outcomes.
+
+  **Treat exposure delivery as best-effort, and the `diagnostics` hook as the
+  place you learn otherwise.** Facts carry a deterministic `event_id`, so the
+  server counts a repeated send once — but the client may send more than once
+  (a consent denial and re-grant in the same session re-arms live
+  assignments), and under sustained queue pressure the SDK sheds owed
+  exposures rather than growing without bound. Neither is visible in the
+  return codes; both surface on the hook as `status = "exposure_skipped"` with
+  a `code` naming the reason. Watch it if the measured population matters to
+  you.
+
+  Two specific gaps worth knowing by name, because neither is an error from
+  your point of view:
+
+  - An applied treatment emits **no** exposure at all when the assignment
+    carries no server-supplied attribution key — a synthetic-unit answer, for
+    instance. The variant still applies; only the measurement is skipped,
+    because the SDK-minted subject id must never reach the analytics plane.
+    Reported as `code = "no_subject_fact_key"` on the hook. The distinct
+    `exposure_no_subject_fact_key` value is the `err` returned from an
+    explicit `track_exposure` / `track_outcome` call — monitoring only that
+    one misses every automatic skip.
+  - The platform currently rejects these fact names from game-embedded
+    publishable keys by design, so an emitted exposure is expected to come
+    back as a per-event reject until that producer lane opens. Surfaced
+    through the same hook and otherwise tolerated silently.
+
 ## Crash wire contract
 
 Crashes use a **separate** module and endpoint. The crash client
@@ -495,8 +793,14 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   to the bounded offline spool
   ([above](#offline-durability-event-spool)) — set `spool_enabled = false` for
   a fully memory-only event path.
-- **Durable storage is six small bounded records** per configured app: the
-  identity record (anonymous ID + consent decision), the offline event spool
+- **Durable storage is nine small bounded records** per configured app — the
+  last three only ever created by the features that own them (a consent
+  denial, and a run with `experiments_enabled` on): the
+  identity record (anonymous ID + consent decision — plus, once a run with
+  `experiments_enabled` has minted one, the SDK-minted experiment subject id,
+  which every later identity rewrite carries forward **even on launches with
+  the flag off**; so clearing only the two experiment records below does not
+  remove every persisted experiment identifier), the offline event spool
   (only envelopes already bound for the wire; cleared on acknowledgment and on
   consent denial), the consent-receipt outbox (undelivered `/v1/consent`
   receipts only — at most 32, denial-preferring eviction: the oldest pure
@@ -509,9 +813,22 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   previous-session dump forward alike — written before its send attempt and
   removed as soon as the server acknowledges or terminally rejects it, the
   crash-reporting settings record (the persisted `crash.set_enabled` opt-out
-  boolean, nothing else), and the
+  boolean, nothing else), the
   remote-config cache (the last served config body + ETag, no analytics
-  payload; overwritten by the next successful fetch). The identity
+  payload; overwritten by the next successful fetch), the small write-ahead
+  consent denial marker (written before a denial is applied so the denial
+  survives a crash mid-purge; no analytics payload), and — created only by a
+  run with `experiments_enabled` on — the experiment-assignment cache and its
+  clear marker. Those last two are the SDK's most identifier-bearing storage
+  and are retained across a consent downgrade and across a later launch with
+  the flag off: the cache holds the SDK-minted subject id, the server-minted
+  assignment and subject-fact keys, the variant payload, **and the normalized
+  targeting attributes the assignment was evaluated under** — so
+  user-specific values your game passes to `fetch_experiment_assignment` are
+  written to disk; the clear marker holds a timestamp plus the record scope
+  (workspace, environment, subject id, base URL, and a non-secret hash
+  fingerprint of the API key — never the key). See
+  [docs/privacy.md](docs/privacy.md) for the full at-rest inventory. The identity
   record is written through
   `sys.get_save_file("shardpilot.<workspace_id>.<app_id>", "identity")` with
   `sys.save`/`sys.load`. The per-app namespace prevents two games on one device
@@ -657,6 +974,7 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 | `shardpilot/queue.lua` | Bounded in-memory event queue |
 | `shardpilot/transport.lua` | Batch/consent dispatch (`/v1/events:batch`, `/v1/consent`) |
 | `shardpilot/remote_config.lua` | Remote-config fetch (`GET /config/v1/...`), ETag cache, typed getters |
+| `shardpilot/experiments.lua` | Experiment-assignment consumer (off by default): assignment fetch, durable cache, revalidation, exposure/outcome facts |
 | `shardpilot/storage.lua` | The **only** module allowed to call `sys.save`/`sys.load` |
 | `shardpilot/clock.lua` · `id.lua` · `platform.lua` · `sampling.lua` | Time, UUIDv7, platform detect, runtime sampling |
 | `shardpilot/version.lua` | Version string constant |
@@ -669,7 +987,7 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 | `shardpilot/crash/dump.lua` | Previous-session native dump → crash event |
 | `game.project` | Defold library metadata (`[library] include_dirs = shardpilot`) |
 | `examples/minimal/` | Copy-pasteable usage example |
-| `test/` | Lua test harness (`test_sdk.lua`, `test_crash.lua`, `test_remote_config.lua`) + Defold collection/script |
+| `test/` | Lua test harness (`test_sdk.lua`, `test_crash.lua`, `test_remote_config.lua`, `test_experiments.lua`) + Defold collection/script |
 | `docs/` | configuration · events · crash · privacy · release |
 | `scripts/` | `check_library.sh` (content guard), `package_release.sh` |
 
@@ -679,15 +997,23 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   SDK source. The guard greps file *contents* (`grep -RInE`) for these patterns,
   so it flags native references inside tracked files but does not catch a native
   source file added solely by filename — keep the boundary by convention.
-- **No durable I/O beyond the six records** (identity, event spool,
-  consent-receipt outbox, crash-retry sidecar, crash-reporting settings,
-  remote-config cache).
+- **No durable I/O beyond the enumerated records** (identity, event spool,
+  consent-receipt outbox, consent denial marker, crash-retry sidecar,
+  crash-reporting settings, remote-config cache, the experiment-assignment
+  cache, and the experiment clear marker). The last two are **created** only
+  by a run with `experiments_enabled` on — but once created they persist, and
+  a later run with the flag **off** still reads the clear marker to filter
+  withdrawn experiment facts out of the spool. For a storage or privacy
+  audit: the flag gates creation, not the existence or the reading of these
+  records.
   `io.*`, `os.execute`, and browser/local storage are forbidden in source;
   `sys.save`/`sys.load`/`sys.get_save_file` are confined to
   `shardpilot/storage.lua`, which writes only the identity record, the bounded
-  offline event spool, the bounded consent-receipt outbox, the bounded, TTL'd
-  crash-retry sidecar, the one-boolean crash-reporting settings record, and
-  the single bounded remote-config cache record.
+  offline event spool, the bounded consent-receipt outbox, the small
+  write-ahead consent denial marker, the bounded, TTL'd
+  crash-retry sidecar, the one-boolean crash-reporting settings record, the
+  single bounded remote-config cache record, and the experiment-assignment
+  cache record plus its clear marker.
 - **No raw/provider/token/billing surface.** Terms like `raw_payload`, `prompt`,
   `access_token`, `github_token`, `billing` must not appear in SDK or example
   source.

@@ -25,13 +25,20 @@ the deeper reference.
   undelivered events on a later launch; consent receipts have their own
   durable outbox.
 - **Remote config**: explicit `GET`-based fetch with an ETag-revalidated
-  durable last-known-good cache and typed getters. No experiments/assignment
-  API, no automatic refresh.
+  durable last-known-good cache and typed getters. No automatic refresh —
+  every fetch is an explicit call.
+- **Experiments (off by default)**: a server-evaluated variant assignment
+  consumer behind `experiments_enabled = true`, which also requires
+  `remote_config_url` AND `api_key`. It requires analytics consent `granted`,
+  and fails closed (no variant served, getters `nil`) until experiments are
+  enabled server-side for the app — so a build with the flag on simply runs
+  the control experience. See the README's "Experiments" section and
+  `docs/configuration.md`.
 - **Crash reporting**: a separate `shardpilot.crash` module posting crash
   report JSON to a dedicated crash ingest endpoint, with PII scrubbing,
   write-ahead pending storage, and deterministic non-fatal sampling.
-- **Not provided today**: no experiment assignment endpoint, no automatic
-  remote-config refresh, no packaged release ZIP assets (source archives
+- **Not provided today**: no automatic remote-config refresh, no packaged
+  release ZIP assets (source archives
   only). (Live Lua script-error capture IS available as the opt-in
   `script_error_capture_enabled` crash flag, default off — see the crash
   section.)
@@ -41,7 +48,7 @@ the deeper reference.
 
 ## Install
 
-Version pin (CI-checked): this skill matches shardpilot-defold `v0.9.1`.
+Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.0`.
 
 Two supported paths:
 
@@ -54,14 +61,17 @@ Two supported paths:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.9.1.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.0.zip
 ```
 
-The `v0.9.1` tag is published and that source-archive URL resolves; it is the
-same pin the README's Installation section carries. Note there is no packaged
-ZIP asset attached to any GitHub Release — the tag source archive is the only
-hosted dependency URL. Pin a tag rather than tracking `main` so your build
-does not shift under you between releases.
+`v0.10.0` is the version this skill matches, and it is the same pin the
+README's Installation section carries. The tag itself is cut from the merge of
+the matching version-bump commit, never before it, so there is a short window
+right after that merge in which the URL above does not resolve yet — if it
+404s, pin the previous tag (`v0.9.1`) until `v0.10.0` is published. Note there
+is no packaged ZIP asset attached to any GitHub Release — the tag source
+archive is the only hosted dependency URL. Pin a tag rather than tracking
+`main` so your build does not shift under you between releases.
 
 Then:
 
@@ -138,7 +148,11 @@ init; `shardpilot.identify(user_id)` upgrades attribution. Identifiers are
 capped at 512 bytes — oversized values are **rejected**
 (`invalid_user_id` / `invalid_anonymous_id`), never truncated. The optional
 `diagnostics` hook is the SDK's push-side observability surface: it receives
-issue tables with `scope = "event" | "batch" | "consent" | "spool"`.
+issue tables with `scope = "event" | "batch" | "consent" | "spool"`, plus
+`"experiments"` once `experiments_enabled` is on — that scope carries the
+skipped-exposure and failed-cache-persist conditions, so an integration that
+switches exhaustively on the list must include it or discard exactly the
+diagnostics that reveal a measurement gap.
 
 ## The consent-first contract (as implemented here)
 
@@ -204,14 +218,21 @@ bugs.
 - **Feature detection.** `shardpilot.supports(capability)` works before
   `init()` and returns `false` for unknown names on older and newer SDKs
   alike. Keys today: `"consent_receipt_outbox"`,
-  `"consent_state_denied_forced_minor"`, `"schema_revision_declaration"`.
-  Gate new call shapes on it:
+  `"consent_state_denied_forced_minor"`, `"schema_revision_declaration"`,
+  `"experiments_assignment"`. Gate new call shapes on it — including the
+  experiment surface, whose config field an older SDK would silently ignore:
 
 ```lua
 if shardpilot.supports("consent_state_denied_forced_minor") then
   shardpilot.set_consent("denied_forced_minor")
 else
   shardpilot.set_consent(false)
+end
+
+-- Same guard before the experiment surface: an older pinned SDK ignores
+-- experiments_enabled silently and has none of these five calls.
+if shardpilot.supports("experiments_assignment") then
+  shardpilot.fetch_experiment_assignment("menu_layout", function(result) end)
 end
 ```
 

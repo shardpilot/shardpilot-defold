@@ -6,6 +6,8 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+## v0.10.0 — 2026-07-30 — early alpha
+
 - **Crash reports can now be attributed to a player.** New optional
   `anonymous_id` / `session_id` crash config, each a `function` resolved per
   report or a fixed string. Pass `shardpilot.get_anonymous_id` to track the
@@ -419,6 +421,33 @@
   resolution plus build-time compilation only — it does not start the
   engine or exercise runtime behavior, which remains covered by the
   interpreter test legs.
+
+- **`track_outcome` rejects non-finite outcome values.** `outcome_value` now
+  requires a **finite** number: `NaN` and `±inf` are Lua numbers that satisfied
+  the old `type(...) == "number"` check but have no JSON representation, so
+  one accepted value poisoned the entire batch it rode in — a terminal encode
+  failure drops that batch, unrelated events included, and permanent failures
+  are never spooled. They are refused at the call now
+  (`invalid_outcome_value`), before anything is enqueued. Same finite
+  discipline the experiment version field already used.
+
+- **Experiments are documented for integrators.** The README gained an
+  "Experiments" section and `docs/configuration.md` an "Experiments" knob
+  section covering `experiments_enabled` (default `false`), the
+  `remote_config_url` + `api_key` configuration that enabling it also
+  requires, the five public calls, the granted-consent-only rule, and the
+  fail-closed behavior while the server has not enabled experiments for the
+  app. The honest edges are documented alongside them: the fetch's
+  synchronous return is dispatch status, not the assignment (read the
+  callback); the transient error family is `transient_<status>`, not
+  `http_<status>`; `queue_full` is a retryable refusal from the explicit fact
+  calls; automatic exposure is at-most-once and is skipped for an assignment
+  with no server-supplied attribution key; durable caching is best effort
+  (size-capped, oldest-evicted, memory-only without a save-file backend);
+  serving a cached assignment through a failure is fenced by the targeting
+  attributes it was evaluated under; the real-subjects `403` also drops the
+  stored record; and disabling the flag after an enabled run still runs the
+  spool rollback filter.
 
 ## v0.9.1 — 2026-07-19 — early alpha
 
