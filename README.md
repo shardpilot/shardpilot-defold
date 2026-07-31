@@ -332,6 +332,13 @@ per-app spool and re-sends them on a later launch. Enabled by default
   configuration converges its cache; it is only the *reporting* that stops at
   `spool_disabled`. `shutdown()` is unaffected and keeps reporting both
   codes.
+
+  Exposure debt also holds the **Mode B anonymous-id rotation**:
+  `set_anonymous_id` refuses with `events_pending` while an experiment
+  exposure is still owed, alongside the queue and spool conditions it already
+  checked. Flushing the ordinary queue is not always enough — an exposure can
+  stay owed behind earlier queue pressure — so a host that rotates identity
+  must drain and retry rather than assume one flush cleared the way.
 - Permanent `4xx` rejects are **never** spooled — they would fail forever.
 
 **Resend.** On the next `init`/`new`, spooled envelopes are re-sent through
@@ -731,61 +738,36 @@ game has to handle specially.
   dropped client-side and never sent. Matching is **100% server-evaluated**;
   the SDK evaluates no rules.
 - **Exposure and outcome facts** ride the normal analytics pipeline (queue →
-  batch → spool → consent gates). At most one `experiment_exposure` is emitted
-  automatically per (experiment, version, subject) per session when the
-  assigned variant is first applied, with a deterministic `event_id` so
-  retries collapse as duplicates server-side; `track_exposure` is the explicit
-  re-arm on top of that, and `track_outcome` records host-defined numeric
+  batch → spool → consent gates). When the assigned variant is first applied
+  the SDK emits an `experiment_exposure` for you; `track_exposure` emits an
+  extra one on demand, and `track_outcome` records host-defined numeric
   outcomes.
 
-  Read "at most one" as **at most one deduplicated fact**, not at most one
-  network send. Revoking consent mid-session clears the emitted-exposure
-  bookkeeping and re-arms every live assignment — it has to, because the facts
-  it was tracking were purged — so a later re-grant in the same session emits
-  the exposure again. The replacement carries the same deterministic
-  `event_id`, so the counted fact stays single, but the client really does
-  send it more than once and your diagnostics will show the extra send
-  collapsing as a duplicate. That is the deny-then-grant cycle working, not a
-  double count. **"At most one", not "exactly one":** a fact only emits when the
-  assignment carries the server-supplied opaque key the fact is allowed to be
-  attributed by. An assignment served without one — a synthetic-unit answer,
-  for instance — is applied normally but emits **no** exposure at all,
-  because the SDK-minted subject id must never reach the analytics plane. Do
-  not assume every applied treatment produces a measured exposure. **Watch
-  the right name:** the *automatic* skip is reported only to your
-  `diagnostics` hook, as `status = "exposure_skipped"` with
-  `code = "no_subject_fact_key"`. `exposure_no_subject_fact_key` is the
-  distinct `err` returned from an explicit `track_exposure` /
-  `track_outcome` call. Monitoring only the latter misses every automatic
-  measurement gap.
-  **Honest caveat:** the platform currently rejects these fact names
-  from game-embedded publishable keys by design, so an emitted exposure is
-  expected to come back as a per-event reject — surfaced through your
-  `diagnostics` hook and otherwise tolerated silently — until that producer
-  lane opens.
+  **Treat exposure delivery as best-effort, and the `diagnostics` hook as the
+  place you learn otherwise.** Facts carry a deterministic `event_id`, so the
+  server counts a repeated send once — but the client may send more than once
+  (a consent denial and re-grant in the same session re-arms live
+  assignments), and under sustained queue pressure the SDK sheds owed
+  exposures rather than growing without bound. Neither is visible in the
+  return codes; both surface on the hook as `status = "exposure_skipped"` with
+  a `code` naming the reason. Watch it if the measured population matters to
+  you.
 
-  There is also a **cap on owed exposures: eight per experiment.** While the
-  analytics queue is blocked, each fresh application of the same experiment
-  (a session renewal, an assignment-version change) parks another owed
-  snapshot. Past eight, the OLDEST is dropped and the SDK emits
-  `exposure_skipped` / `owed_overflow`.
+  Two specific gaps worth knowing by name, because neither is an error from
+  your point of view:
 
-  Whether that loses the exposure depends on whether it had already been
-  captured durably. An owed snapshot that previously survived an
-  authoritative per-key drop was written into the analytics spool at that
-  moment and stays eligible for delivery; overflow removes only the in-memory
-  copy, and nothing is lost. An owed snapshot that never reached the spool is
-  gone — not retried, not spooled — and a long block can then undercount the
-  experiment population.
-
-  You cannot tell the two apart from the diagnostic. The callback receives
-  only `scope`, `status` and `code` — no experiment key, no event id, no
-  capture state — and there is no public spool introspection. So
-  `owed_overflow` is an **uncorrelated warning**: it tells you that some owed
-  exposure for some experiment was evicted, and nothing more. Treat it
-  conservatively — as a signal that the analytics queue has been blocked long
-  enough to start shedding measurement, and a reason to look at queue health,
-  not as a per-experiment loss you can attribute or reconcile.
+  - An applied treatment emits **no** exposure at all when the assignment
+    carries no server-supplied attribution key — a synthetic-unit answer, for
+    instance. The variant still applies; only the measurement is skipped,
+    because the SDK-minted subject id must never reach the analytics plane.
+    Reported as `code = "no_subject_fact_key"` on the hook. The distinct
+    `exposure_no_subject_fact_key` value is the `err` returned from an
+    explicit `track_exposure` / `track_outcome` call — monitoring only that
+    one misses every automatic skip.
+  - The platform currently rejects these fact names from game-embedded
+    publishable keys by design, so an emitted exposure is expected to come
+    back as a per-event reject until that producer lane opens. Surfaced
+    through the same hook and otherwise tolerated silently.
 
 ## Crash wire contract
 
