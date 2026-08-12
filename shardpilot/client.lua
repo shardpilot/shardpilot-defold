@@ -2381,15 +2381,11 @@ function Client:refresh_token()
 			return
 		end
 		if callback_error or type(new_token) ~= "string" or new_token == "" then
-			self.token = nil
-			self.token_expires_at_ms = nil
-			self.stats.last_error = "token_unavailable"
+			self:fail_token_settlement()
 			return
 		end
 		if new_expires_at ~= nil and type(new_expires_at) ~= "number" then
-			self.token = nil
-			self.token_expires_at_ms = nil
-			self.stats.last_error = "token_unavailable"
+			self:fail_token_settlement()
 			return
 		end
 		self.token = new_token
@@ -2414,9 +2410,7 @@ function Client:refresh_token()
 	end)
 	if not ok then
 		self.token_request_in_flight = false
-		self.token = nil
-		self.token_expires_at_ms = nil
-		self.stats.last_error = "token_unavailable"
+		self:fail_token_settlement()
 		return false
 	end
 	return self.token ~= nil
@@ -2626,6 +2620,30 @@ local function backoff_delay_seconds(attempt)
 		ceiling = backoff_cap_seconds
 	end
 	return backoff_base_seconds + math.random() * (ceiling - backoff_base_seconds)
+end
+
+-- A mint that settled BADLY — the provider reported an error, handed back an
+-- empty or non-string token or a bad expiry, or threw outright.
+--
+-- The successful path re-arms the wake its start consumed; this path has to as
+-- well, and for the same reason: the update() that STARTED the mint spent the
+-- retained 401 batch's one-shot nudge, and that batch has no deadline and is no
+-- longer in the queue. Without an arm here a provider that recovers a moment
+-- later is not tried until the whole flush interval elapses — fifteen seconds
+-- under the new default, on a credential failure.
+--
+-- Armed on the BACKOFF rather than nudged to the next tick, which is the
+-- difference between this and the success path. A failing provider fails
+-- repeatedly, and a bare nudge would mint again every single frame — the same
+-- unbounded loop the second-401 rule exists to stop, reached through the other
+-- door.
+function Client:fail_token_settlement()
+	self.token = nil
+	self.token_expires_at_ms = nil
+	self.stats.last_error = "token_unavailable"
+	if self:has_retained_publish_work() then
+		self:defer_backoff()
+	end
 end
 
 function Client:defer_backoff()
@@ -4078,6 +4096,19 @@ function Client:start_publish_batch(automatic)
 		-- default that is a fifteen-second stall on a token refresh that
 		-- completed immediately.
 		if encoding_refused and retain then
+			-- The nudge alone does not deliver the promised retry when an
+			-- EXPLICIT flush bypassed a client-owned backoff to get here: that
+			-- deadline is still armed, so start_publish_batch refuses the
+			-- automatic flush this nudge triggers and the uncompressed retry
+			-- waits out the remainder of a window approaching 60s. The
+			-- deadline belongs to an attempt that has now been superseded.
+			--
+			-- The server's own deadline survives, exactly as it does when a
+			-- bypassed attempt drops its batch: Retry-After outlives the
+			-- attempt that happened to receive it, and only OUR politeness is
+			-- discarded here.
+			self.publish_retry_after_ms = self.publish_server_retry_after_ms
+			self.publish_backoff_attempt = 0
 			-- Bounded by construction: compression_refused latches above, so
 			-- the retry is uncompressed and cannot be refused the same way.
 			self.flush_elapsed_seconds = self.config.flush_interval_seconds

@@ -2333,6 +2333,64 @@ local function test_retry_wake_republishes_without_a_flush_tick()
 	next_response_headers = nil
 	assert_equal(theirs:flush(), false, "the server's instruction binds an explicit flush too")
 	assert_equal(#requests, 1, "no publish inside a server-sent window")
+
+	-- THIRD subject, same function and the same ceiling reason: a mint that
+	-- settles BADLY must re-arm the retained work, paced.
+	--
+	-- The update() that starts the mint spends the retained 401 batch's
+	-- one-shot nudge, and that batch has no deadline and has left the queue.
+	-- So a provider that errors leaves it with no wake at all until the flush
+	-- interval — fifteen seconds, on a credential failure. And the arm has to
+	-- be the BACKOFF, not another nudge: a failing provider fails repeatedly,
+	-- and a bare nudge mints again every frame.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local mint_calls = 0
+	local settle = nil
+	local minted = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		token_provider = function(callback)
+			mint_calls = mint_calls + 1
+			if mint_calls == 1 then
+				-- The first mint succeeds SYNCHRONOUSLY so a batch can be
+				-- published and 401'd, which is what retains it.
+				callback("token-1", nil, nil)
+			else
+				-- The RE-mint is asynchronous and will fail. Asynchronous is
+				-- the only shape that shows the defect: a synchronous callback
+				-- runs while its caller is on its way to publish anyway.
+				settle = callback
+			end
+		end,
+	})))
+	assert_true(minted:identify("user-example"))
+	assert_true(minted:track("mint_failure_event"))
+
+	next_status = 401
+	assert_equal(minted:flush(), false)
+	assert_true(minted.in_flight_batch ~= nil and #minted.in_flight_batch > 0,
+		"a Mode B 401 retains the batch for a fresh token")
+	assert_equal(minted:publish_deferred(), false,
+		"the 401 deliberately arms nothing so a fresh token can be tried at once")
+
+	-- The tick that starts the re-mint spends the batch's one-shot nudge.
+	minted:update(0)
+	assert_true(settle ~= nil, "the retry asked the provider for a fresh token")
+	local deliver = settle
+	settle = nil
+	local mints_at_settle = mint_calls
+	deliver(nil, nil, "provider unavailable")
+
+	assert_equal(minted:snapshot().last_error, "token_unavailable")
+	assert_true(minted:publish_deferred(),
+		"a failed settlement must arm the retained batch rather than leave it wakeless")
+
+	-- Paced, not per-frame: inside the window nothing mints again.
+	minted:update(0)
+	minted:update(0)
+	assert_equal(mint_calls, mints_at_settle,
+		"a failing provider must not be re-minted on every frame")
 	storage.reset()
 end
 
@@ -7685,6 +7743,41 @@ end
 	assert_true(#batches >= 2, "the refused batch must be retried, not dropped")
 	assert_equal(batches[2].headers["Content-Encoding"], nil,
 		"the retry must be uncompressed")
+
+	-- And the same rescue must survive an EXPLICIT flush that bypassed a
+	-- client-owned backoff to make the refused attempt.
+	--
+	-- The nudge alone does not deliver it: that backoff's deadline is still
+	-- armed, so start_publish_batch refuses the automatic flush the nudge
+	-- triggers, and the uncompressed retry waits out the remainder of a window
+	-- approaching 60s — a transport detail becoming a minute of data loss on
+	-- exactly the deployments the fallback exists to protect.
+	reset()
+	seed_granted_consent()
+	assert_true(sdk.init(config({ batch_size = 100, flush_interval_seconds = 9999 })))
+	fill_batch(60)
+
+	next_status = 500
+	next_response_body = nil
+	sdk.flush()
+	-- The hint-less 500 armed our own backoff. Not asserted through the
+	-- client — the singleton does not expose it — but pinned by the next two
+	-- steps: the explicit flush gets through it, and the tick after must too.
+	next_status = 400
+	next_response_body = '{"error":{"code":"validation_error","message":"request validation failed",'
+		.. '"details":[{"field":"content-encoding","code":"unsupported_content_encoding",'
+		.. '"message":"content encoding deflate is not supported"}]}}'
+	local before_refusal = #batch_requests()
+	sdk.flush()
+	assert_true(#batch_requests() > before_refusal,
+		"an explicit flush is not bound by our own backoff")
+
+	next_status = 202
+	next_response_body = nil
+	local before_retry = #batch_requests()
+	sdk.update(0)
+	assert_true(#batch_requests() > before_retry,
+		"the uncompressed retry must go out on the next tick, not wait out a superseded backoff")
 
 	local before = #batches
 	fill_batch(60)
