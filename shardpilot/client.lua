@@ -257,9 +257,21 @@ local function defer_publish(client, seconds, from_server)
 		seconds = max_publish_defer_seconds
 	end
 	local deadline = clock.unix_ms() + math.floor(seconds * 1000)
+	-- The SERVER-owned deadline is tracked SEPARATELY from the effective one,
+	-- because the two can disagree in either direction and one deadline plus
+	-- an ownership flag cannot say "the server asked for one second while our
+	-- own backoff wants two". Recording ownership only when the server's
+	-- deadline was the LONGER one left a Retry-After: 1 arriving inside a 2s
+	-- client window marked client-owned, so the very next explicit flush()
+	-- bypassed a server instruction outright.
+	if from_server == true then
+		if not client.publish_server_retry_after_ms
+			or deadline > client.publish_server_retry_after_ms then
+			client.publish_server_retry_after_ms = deadline
+		end
+	end
 	if not client.publish_retry_after_ms or deadline > client.publish_retry_after_ms then
 		client.publish_retry_after_ms = deadline
-		client.publish_retry_after_from_server = from_server == true
 	end
 end
 
@@ -679,7 +691,7 @@ function M.new(config)
 		publish_retry_after_ms = nil,
 		-- Whether the live publish deadline came from a server Retry-After
 		-- (binds an explicit flush) or from our own backoff (does not).
-		publish_retry_after_from_server = false,
+		publish_server_retry_after_ms = nil,
 		publish_backoff_attempt = 0,
 		user_id = valid_identity(config.user_id) and config.user_id or nil,
 		anonymous_id = anonymous_id,
@@ -1312,6 +1324,17 @@ function M.new(config)
 				end
 				chunk[#chunk + 1] = spooled[i]
 			end
+			if client.publish_retry_after_ms == nil then
+				-- Undelivered work with NO persisted deadline is due NOW, not
+				-- at the first flush tick. Only a SERVER-sent Retry-After is
+				-- persisted, so the common restart — a transport failure, our
+				-- own backoff, an app killed mid-outage — reloads with no
+				-- deadline at all, and the resend then waited out the whole
+				-- cadence: fifteen seconds by default, on recovery work that
+				-- is ready. One tick, like the other nudges; a failure on that
+				-- attempt arms a real window.
+				client.flush_elapsed_seconds = normalized.flush_interval_seconds
+			end
 		end
 	end
 	-- The retained receipts (reloaded above, before the spool) get their
@@ -1844,6 +1867,7 @@ function Client:set_consent(decision)
 		-- granted batch queued before the old deadline would be blocked until it
 		-- expires — up to a 24h Retry-After — even though that batch is gone.
 		self.publish_retry_after_ms = nil
+		self.publish_server_retry_after_ms = nil
 		self.publish_backoff_attempt = 0
 		-- Sampled-but-not-yet-summarized runtime signals are in-memory
 		-- analytics data too: drop them with the queue, or the first flush
@@ -2594,6 +2618,17 @@ function Client:publish_deferred()
 	return self.publish_retry_after_ms ~= nil and clock.unix_ms() < self.publish_retry_after_ms
 end
 
+-- Whether the SERVER has asked us to wait, as opposed to our own backoff.
+-- This is the half an explicit flush() must honour: a host calling flush() has
+-- said what it wants and outranks our politeness, but it does not outrank the
+-- endpoint's own instruction. Held apart from publish_retry_after_ms so a
+-- short server hint inside a longer client window keeps its own expiry — see
+-- defer_publish.
+function Client:publish_server_deferred()
+	return self.publish_server_retry_after_ms ~= nil
+		and clock.unix_ms() < self.publish_server_retry_after_ms
+end
+
 -- Whether a retained batch's backpressure deadline has passed and it is owed
 -- a retry NOW.
 --
@@ -2625,6 +2660,15 @@ function Client:publish_retry_due()
 	-- pump the consent outbox and the summary enqueue each frame.
 	if self:publish_deferred() then
 		return false
+	end
+	-- Spool chunks count. A batch restored from a previous launch sits in
+	-- spool_batches with in_flight_batch still nil until flush() picks a
+	-- chunk, so keying this on in_flight_batch alone meant a persisted
+	-- Retry-After could expire with nothing to notice: with an empty queue the
+	-- resend then waited for the flush tick, up to fifteen seconds later than
+	-- the server asked for.
+	if #self.spool_batches > 0 then
+		return true
 	end
 	return self.in_flight_batch ~= nil and #self.in_flight_batch > 0
 end
@@ -3323,6 +3367,7 @@ function Client:purge_experiment_facts()
 				-- rule: leaving it would block the next granted batch for a
 				-- window the server set for discarded work.
 				self.publish_retry_after_ms = nil
+				self.publish_server_retry_after_ms = nil
 				self.publish_backoff_attempt = 0
 				self.spool_retry_after_ms = nil
 			end
@@ -3847,7 +3892,7 @@ function Client:start_publish_batch(automatic)
 	-- failure armed no deadline at all and an immediate caller retry went
 	-- straight out. Now that it arms one, the two cases have to be told
 	-- apart rather than collapsed in either direction.
-	if self:publish_deferred() and (automatic or self.publish_retry_after_from_server) then
+	if self:publish_deferred() and (automatic or self:publish_server_deferred()) then
 		return false, false, false
 	end
 	local events = self.in_flight_batch
@@ -3877,6 +3922,7 @@ function Client:start_publish_batch(automatic)
 			-- The server accepted a batch, so any stored backpressure window
 			-- is over too: the next durable write drops it from the record.
 			self.publish_retry_after_ms = nil
+			self.publish_server_retry_after_ms = nil
 			self.publish_backoff_attempt = 0
 			self.spool_retry_after_ms = nil
 			-- A 202 is NOT full per-event success: parse the body so observed /
@@ -3950,6 +3996,7 @@ function Client:start_publish_batch(automatic)
 				-- any deadline a previous attempt of this batch armed is
 				-- stale now (the consent-purge rule).
 				self.publish_retry_after_ms = nil
+				self.publish_server_retry_after_ms = nil
 				self.publish_backoff_attempt = 0
 				self.spool_retry_after_ms = nil
 			end
@@ -3970,13 +4017,35 @@ function Client:start_publish_batch(automatic)
 		elseif retain and is_retryable_publish_failure(err, unauthorized, retryable, mode_b) then
 			self:defer_backoff()
 		end
+		-- Go out on the NEXT TICK rather than waiting out the flush cadence.
+		-- Neither of these shapes armed a deferral, and for the same reason:
+		-- the work is ready now and there is nothing to wait for. An encoding
+		-- refusal is not a retryable-transport failure, so neither the
+		-- Retry-After arm nor the backoff arm above ran, and the batch itself
+		-- is correct — only its framing was wrong. A Mode B 401 deliberately
+		-- arms nothing so a freshly minted token can be tried at once.
+		--
+		-- Without the nudge such a batch has no wake source at all: it has
+		-- already left the queue, so the batch-size trigger cannot fire for it
+		-- either, and retry_due keys off an armed deadline. Under the 15s
+		-- default that is a fifteen-second stall on a token refresh that
+		-- completed immediately.
 		if encoding_refused and retain then
-			-- Go out on the next tick rather than waiting out the flush
-			-- cadence: no deferral was armed (an encoding refusal is not a
-			-- retryable-transport failure, so neither the Retry-After arm nor
-			-- the backoff arm above ran), and the batch itself is correct —
-			-- only its framing was wrong.
+			-- Bounded by construction: compression_refused latches above, so
+			-- the retry is uncompressed and cannot be refused the same way.
 			self.flush_elapsed_seconds = self.config.flush_interval_seconds
+		elseif retain and unauthorized then
+			if events.auth_retried then
+				-- A SECOND 401 for the same batch means the freshly minted
+				-- token did not help, so this is not a stale-token race any
+				-- more. Pace it like any other retryable failure: without
+				-- this, an endpoint answering 401 forever is retried — and a
+				-- token minted — on every single frame.
+				self:defer_backoff()
+			else
+				events.auth_retried = true
+				self.flush_elapsed_seconds = self.config.flush_interval_seconds
+			end
 		end
 		if retain then
 			-- Durably spool a transiently failed batch (appended once — the
@@ -3998,6 +4067,19 @@ function Client:start_publish_batch(automatic)
 		if not retain and self.in_flight_batch == events then
 			self.stats.dropped = self.stats.dropped + batch_count
 			self.in_flight_batch = nil
+			-- The batch is gone, so any deadline armed for it is stale — the
+			-- same rule the consent-purge path applies. This became reachable
+			-- when an explicit flush() gained the right to BYPASS our own
+			-- backoff: that attempt can now run inside a live client window
+			-- and come back terminal, and leaving its deadline standing would
+			-- block the next automatic publish for the rest of a window that
+			-- belongs to discarded work — up to the 60s backoff cap.
+			--
+			-- A server-owned deadline is NOT cleared here: Retry-After is the
+			-- endpoint asking for quiet, and that instruction outlives the
+			-- batch that happened to receive it.
+			self.publish_retry_after_ms = self.publish_server_retry_after_ms
+			self.publish_backoff_attempt = 0
 			-- A terminally rejected batch also leaves the spool, or it would
 			-- be re-sent (and re-rejected) on every later launch. Surfaced via
 			-- diagnostics so the drop of durable entries is observable.

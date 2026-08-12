@@ -26,7 +26,10 @@ ShardPilot Defold SDK v0 is configured with a Lua table:
   -- api_key = "sp_ingest_...",
   batch_size = 25,
   buffer_size = 1000,
-  flush_interval_seconds = 1,
+  -- flush_interval_seconds defaults to 15. It is the longest a PARTIAL batch
+  -- waits before publishing, not a heartbeat: update(dt) publishes nothing
+  -- when the queue is empty. Set it explicitly only if you want a different
+  -- cadence -- pinning it to 1 here is what stopped batching from happening.
   publish_timeout_seconds = 2,
   -- Offline event spool (durable, per app). See "Offline event spool" below.
   spool_enabled = true,

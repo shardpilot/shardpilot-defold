@@ -2312,7 +2312,7 @@ local function test_retry_wake_republishes_without_a_flush_tick()
 	assert_true(mine:track("client_backoff_event"))
 	assert_equal(mine:flush(), false)
 	assert_true(mine:publish_deferred(), "the client armed its own window")
-	assert_equal(mine.publish_retry_after_from_server, false)
+	assert_equal(mine:publish_server_deferred(), false, "nobody but us asked for this wait")
 	next_status = 202
 	assert_true(mine:flush(), "an explicit flush is not bound by our own backoff")
 	assert_equal(#requests, 2)
@@ -2328,7 +2328,7 @@ local function test_retry_wake_republishes_without_a_flush_tick()
 	assert_true(theirs:track("server_hinted_event"))
 	assert_equal(theirs:flush(), false)
 	assert_true(theirs:publish_deferred(), "the server armed the window")
-	assert_equal(theirs.publish_retry_after_from_server, true)
+	assert_true(theirs:publish_server_deferred(), "the server asked for this wait")
 	next_status = 202
 	next_response_headers = nil
 	assert_equal(theirs:flush(), false, "the server's instruction binds an explicit flush too")
@@ -7708,6 +7708,195 @@ end
 	local bad_client, bad_err = sdk.new(config({ request_compression_enabled = "yes" }))
 	assert_equal(bad_client, nil)
 	assert_equal(bad_err, "invalid_request_compression_enabled")
+end)()
+
+-- === Codex round: retry ownership and wake sources ========================
+--
+-- Same immediately-invoked-function trick as the block above: the main chunk
+-- is at Lua's 200-local ceiling, and the limit is per FUNCTION (a `do` block
+-- does not open one).
+;(function()
+	-- A SHORT server hint arriving inside a LONGER client window.
+	--
+	-- Ownership used to be recorded only when the server's deadline was the
+	-- one that won, so a Retry-After: 1 landing inside a 2s client backoff
+	-- left the window marked client-owned — and the next explicit flush()
+	-- bypassed a server instruction outright. The two deadlines are held
+	-- apart now, so the shorter server hint keeps its own expiry.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+
+	next_status = 500
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("overlap_event"))
+	assert_equal(client:flush(), false)
+	assert_true(client:publish_deferred(), "our own backoff armed a window")
+	assert_equal(client:publish_server_deferred(), false, "nothing server-owned yet")
+	-- Pin the client window at a minute so the arithmetic below is about the
+	-- two deadlines rather than about backoff jitter, which is uniform over
+	-- the ceiling and could land either side of the server's second.
+	client.publish_retry_after_ms = math.floor(socket.now * 1000) + 60000
+	local client_deadline = client.publish_retry_after_ms
+
+	-- Now an explicit flush inside that window (allowed: our own backoff does
+	-- not bind a caller) comes back with a much SHORTER server hint.
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "1" }
+	assert_equal(client:flush(), false)
+	next_response_headers = nil
+	assert_true(client:publish_server_deferred(),
+		"a server hint inside a client window is still the server asking")
+	assert_equal(client.publish_retry_after_ms, client_deadline,
+		"the longer window still paces the automatic retries")
+
+	-- The instruction binds the caller for as long as the SERVER asked, and
+	-- no longer: our own backoff outlives it and still does not bind. This is
+	-- the pair of assertions a single deadline plus a flag cannot satisfy at
+	-- once — marking the whole minute server-owned would fail the second.
+	next_status = 202
+	assert_equal(client:flush(), false, "an explicit flush waits out the server's second")
+	socket.now = socket.now + 2
+	assert_equal(client:publish_server_deferred(), false, "the server's second is up")
+	assert_true(client:publish_deferred(), "our own window has not expired")
+	assert_true(client:flush(), "past the server's hint, the caller is free again")
+
+	-- A bypassed client window whose batch is then DROPPED must not keep
+	-- blocking the automatic path. This became reachable only when an
+	-- explicit flush gained the right to bypass our own backoff: that attempt
+	-- can now run inside a live window and come back terminal.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 500
+	local dropper = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(dropper:identify("user-example"))
+	assert_true(dropper:track("doomed_event"))
+	assert_equal(dropper:flush(), false)
+	assert_true(dropper:publish_deferred(), "the client armed its own window")
+
+	next_status = 400
+	assert_equal(dropper:flush(), false, "the bypassing flush gets a terminal answer")
+	assert_equal(dropper.in_flight_batch, nil, "a terminal 400 drops the batch")
+	assert_equal(dropper:publish_deferred(), false,
+		"the deadline belonged to discarded work and must not block the next batch")
+
+	next_status = 202
+	assert_true(dropper:track("next_event"))
+	assert_true(dropper:flush(), "the next batch publishes immediately")
+
+	-- A retained Mode B 401 has NO wake source of its own: it arms no
+	-- deadline (a freshly minted token is tried at once), and the batch has
+	-- already left the queue so the batch-size trigger cannot fire for it.
+	-- Under the 15s default that was a fifteen-second stall on a token
+	-- refresh that completed immediately. flush_interval_seconds is 9999
+	-- here, so ONLY the nudge can produce the second request.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 401
+	local minted = 0
+	local reauth = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		token_provider = function(callback)
+			minted = minted + 1
+			callback("token-" .. minted, nil, nil)
+		end,
+	})))
+	assert_true(reauth:identify("user-example"))
+	assert_true(reauth:track("stale_token_event"))
+	assert_equal(reauth:flush(), false)
+	assert_equal(#requests, 1)
+	assert_true(reauth.in_flight_batch ~= nil, "a Mode B 401 retains the batch")
+	assert_equal(reauth:publish_deferred(), false, "a 401 arms no window: the retry is immediate")
+
+	next_status = 202
+	reauth:update(0)
+	assert_equal(#requests, 2, "the retained 401 batch goes out on the next tick, not the flush tick")
+	assert_true(minted >= 2, "the retry mints a fresh token")
+
+	-- ...and exactly ONE immediate retry per batch, not a standing due state:
+	-- a server answering 401 forever must not mint a token every frame. The
+	-- second 401 for the same batch means the fresh token did not help, so it
+	-- paces like any other retryable failure.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 401
+	local looping = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		token_provider = function(callback) callback("token-loop", nil, nil) end,
+	})))
+	assert_true(looping:identify("user-example"))
+	assert_true(looping:track("always_401"))
+	assert_equal(looping:flush(), false)
+	local after_flush = #requests
+	looping:update(0)
+	local after_nudge = #requests
+	assert_equal(after_nudge, after_flush + 1, "the nudge is worth one attempt")
+	assert_true(looping:publish_deferred(), "the second 401 falls back to the backoff schedule")
+	looping:update(0)
+	looping:update(0)
+	looping:update(0)
+	assert_equal(#requests, after_nudge, "and only one: the armed window holds the rest")
+
+	-- A spool restored at startup whose persisted SERVER deadline is still
+	-- live, and then expires. Only a Retry-After is persisted, so this is the
+	-- shape where the reload really does restore a deadline — and the wake
+	-- still had nothing to notice it with, because in_flight_batch stays nil
+	-- until a publish actually selects a chunk.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "30" }
+	local hinted = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_enabled = true })))
+	assert_true(hinted:identify("user-example"))
+	assert_true(hinted:track("hinted_spool_event"))
+	assert_equal(hinted:flush(), false, "the 429 spools the batch with its deadline")
+	next_response_headers = nil
+	hinted:shutdown()
+
+	reset()
+	next_status = 202
+	local resumed = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_enabled = true })))
+	assert_true(resumed:spool_pending(), "the relaunch reloaded the spooled chunk")
+	assert_true(resumed:publish_deferred(), "and the server's window with it")
+	assert_equal(resumed.in_flight_batch, nil, "nothing is selected until a publish runs")
+	resumed:update(0)
+	assert_equal(#requests, 0, "the live server window holds the resend")
+	socket.now = socket.now + 31
+	assert_equal(resumed:publish_deferred(), false, "the persisted window is up")
+	resumed:update(0)
+	assert_true(#requests > 0,
+		"the expired persisted deadline wakes the spool resend, with no chunk selected yet")
+	resumed:shutdown()
+
+	-- A spool restored at startup whose persisted deadline has expired: the
+	-- chunk sits in spool_batches with in_flight_batch still nil, so keying
+	-- the wake on in_flight_batch alone meant nothing noticed the expiry.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 500
+	local seeder = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_enabled = true })))
+	assert_true(seeder:identify("user-example"))
+	assert_true(seeder:track("spooled_event"))
+	assert_equal(seeder:flush(), false, "the failure spools the batch")
+	seeder:shutdown()
+
+	reset()
+	next_status = 202
+	local relaunched = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_enabled = true })))
+	assert_true(relaunched:spool_pending(), "the relaunch reloaded the spooled chunk")
+	assert_equal(relaunched.in_flight_batch, nil, "nothing is selected until a publish runs")
+	socket.now = socket.now + 3600
+	relaunched:update(0)
+	assert_true(#requests > 0,
+		"an expired persisted deadline wakes the spool resend without a flush tick")
+	relaunched:shutdown()
+	storage.reset()
 end)()
 
 print("shardpilot defold lua tests passed")
