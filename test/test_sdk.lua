@@ -4619,6 +4619,59 @@ local function test_persisted_retry_after_defers_startup_resend()
 	assert_true(third:flush())
 	assert_equal(#requests, 1)
 	assert_contains(requests[1].body, '"event_name":"expired_deadline_event"')
+
+	-- A shorter server Retry-After arriving while a LONGER client backoff is
+	-- already armed must persist the SERVER's own deadline, not the effective
+	-- wait. The two diverge exactly there: defer_publish keeps the later of
+	-- the pair as the effective window, so persisting that stores a deadline
+	-- the server never asked for — and the loader restores whatever it finds
+	-- as SERVER-owned, which is the one kind an explicit flush may not
+	-- bypass. A relaunch would then hold explicit flushes off for the
+	-- remainder of OUR backoff, on the server's authority (Codex on #46).
+	--
+	-- Folded in here rather than given its own function because the file is
+	-- at Lua's 200-local ceiling for a main chunk, and this is the same
+	-- subject: what the spool record's deadline means.
+	reset()
+	storage.reset()
+	next_status = 500
+	local backed_off = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(backed_off:identify("user-example"))
+	assert_true(backed_off:track("backoff_then_hint_event"))
+	assert_equal(backed_off:flush(), false)
+	assert_true(backed_off.publish_retry_after_ms ~= nil, "a hint-less failure arms a client backoff")
+
+	-- Stretch OUR backoff well past anything the server is about to ask for.
+	local client_deadline = math.floor(socket.now * 1000) + 60000
+	backed_off.publish_retry_after_ms = client_deadline
+
+	-- An explicit flush bypasses a client-owned window; this one comes back
+	-- with a much shorter server instruction.
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "2" }
+	assert_equal(backed_off:flush(), false)
+	next_response_headers = nil
+
+	assert_true(backed_off.publish_server_retry_after_ms ~= nil, "the server hint is recorded")
+	assert_true(backed_off.publish_retry_after_ms >= client_deadline,
+		"the effective wait is still the longer client backoff")
+	assert_equal(backed_off.spool_retry_after_ms, backed_off.publish_server_retry_after_ms,
+		"the record must carry the SERVER deadline, not the effective one")
+	local overlapped = stored_spool_record(stores)
+	assert_true(overlapped ~= nil)
+	assert_true(overlapped.retry_after_until_ms < client_deadline,
+		"persisting the effective deadline relaunches a client backoff as a server instruction")
+
+	-- The relaunch is where that costs something: the restored deadline is
+	-- server-owned by construction, so it holds explicit flushes off for
+	-- exactly as long as the SERVER asked, and no longer.
+	reset()
+	local relaunched = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_equal(#relaunched.spool_batches, 1)
+	assert_true(relaunched.publish_server_retry_after_ms ~= nil,
+		"the stored deadline restores as server-owned")
+	assert_true(relaunched.publish_server_retry_after_ms < client_deadline,
+		"the relaunch inherited our own backoff window as a server instruction")
 	restore()
 	storage.reset()
 end

@@ -1147,7 +1147,12 @@ function M.new(config)
 			local remaining_ms = stored_deadline - clock.unix_ms()
 			if remaining_ms > 0 then
 				defer_publish(client, remaining_ms / 1000, true)
-				client.spool_retry_after_ms = client.publish_retry_after_ms
+				-- The server-owned deadline, for the same reason the write
+				-- side persists that one: this record only ever carries a
+				-- server Retry-After, and re-persisting the effective value
+				-- would let a client backoff armed later in this session
+				-- inherit the server's authority at the next relaunch.
+				client.spool_retry_after_ms = client.publish_server_retry_after_ms
 			end
 		end
 		local mismatched = 0
@@ -4046,7 +4051,16 @@ function Client:start_publish_batch(automatic)
 			-- A server-requested delay survives a relaunch: remember the
 			-- (clamped) deadline so the spool write below stores it and a
 			-- startup resend waits out the remaining window.
-			self.spool_retry_after_ms = self.publish_retry_after_ms
+			--
+			-- The SERVER-specific deadline, not the effective one. They differ
+			-- exactly when a longer client-owned backoff is already armed:
+			-- defer_publish keeps the later of the two as the effective wait,
+			-- so persisting that stores a window the server never asked for —
+			-- and the loader restores it as server-owned, which is the one
+			-- kind of deadline an explicit flush may not bypass. A relaunch
+			-- would then block explicit flushes for the remainder of OUR
+			-- backoff, on the server's authority.
+			self.spool_retry_after_ms = self.publish_server_retry_after_ms
 		elseif retain and is_retryable_publish_failure(err, unauthorized, retryable, mode_b) then
 			self:defer_backoff()
 		end
