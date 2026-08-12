@@ -137,7 +137,26 @@ auth credential. `init` returns `true`, or `false, err` with a specific code
 heartbeat: an empty queue publishes nothing, a full `batch_size` publishes
 immediately, `flush()` on demand, and retry pacing runs on its own clock),
 `publish_timeout_seconds = 2`, `spool_enabled = true`,
-`spool_max_events = 500`, `spool_max_bytes = 262144` (max 393216).
+`spool_max_events = 500`, `spool_max_bytes = 262144` (max 393216),
+`request_compression_enabled = true`.
+
+**Batch bodies over 1 KiB are compressed**, with `Content-Encoding: deflate`
+(RFC 1950 zlib) rather than gzip: the engine's `zlib` module produces that
+framing and nothing else, and framing gzip by hand would mean a pure-Lua CRC32
+over every batch on the flush path — a frame hitch traded for the bytes this
+buys. Three things follow when you integrate:
+
+- **The ingest body cap applies to the UNCOMPRESSED body.** Compression buys
+  throughput, not headroom — keep sizing against `batch_size` as before.
+- **You do not need to coordinate the rollout.** A deployment that cannot read
+  the coding answers `400` with detail code `unsupported_content_encoding`; the
+  client stops compressing for the session and re-sends the same batch
+  uncompressed on the next tick, so the events land.
+- **Engine builds without `zlib` simply do not compress.** The module is
+  feature-detected; its absence is an ordinary uncompressed publish, never an
+  error.
+
+Set `request_compression_enabled = false` to opt out.
 
 Wire the frame loop and teardown:
 

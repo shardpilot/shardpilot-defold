@@ -6,6 +6,37 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **Analytics batch bodies over 1 KiB are now compressed** with
+  `Content-Encoding: deflate`, controlled by the new
+  `request_compression_enabled` config (default `true`). A batch body is the
+  same envelope keys repeated per event, so it compresses hard. Sub-threshold
+  bodies are sent as-is, because zlib framing costs 6 bytes before the deflate
+  stream's own overhead and makes a single-event batch bigger rather than
+  smaller; so is any body compression fails to shrink.
+
+  **`deflate`, not `gzip`, and deliberately.** The engine's `zlib` module
+  produces RFC 1950 zlib framing and nothing else. Framing gzip by hand needs a
+  CRC32 over the whole uncompressed batch — zlib's own trailer is Adler-32, a
+  different checksum, so there is nothing to borrow — which means a pure-Lua
+  CRC32 over tens of kilobytes on the flush path: a frame hitch traded for the
+  bytes this change exists to save. The ingest server reads RFC 1950 on the
+  `deflate` coding for exactly this reason.
+
+  The ingest body cap still applies to the **uncompressed** body, so
+  compression buys throughput and not headroom.
+
+  A deployment that cannot read the coding never costs events: it answers `400`
+  with detail code `unsupported_content_encoding`, and the client stops
+  compressing for the session and **keeps** the batch, re-sending it
+  uncompressed on the next tick. An encoding refusal is the one ordinary 400
+  this SDK does not treat as terminal, because the next attempt sends different
+  bytes. The match is on that detail code and never on the bare 400 — an
+  unrelated validation failure must neither change the transport nor start
+  retaining batches the server rejected permanently.
+
+  Engine versions without the `zlib` module simply do not compress: the module
+  is feature-detected and its absence is an ordinary uncompressed publish.
+
 ## v0.10.0 — 2026-07-30 — early alpha
 
 - **Crash reports can now be attributed to a player.** New optional

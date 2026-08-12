@@ -7418,4 +7418,296 @@ for _, test in ipairs(tests) do
 	test()
 end
 
+
+-- === A6 request compression ===============================================
+--
+-- Wrapped in an immediately-invoked FUNCTION on purpose. Lua caps a chunk at
+-- 200 locals, this file is close to it, and the limit is per FUNCTION — a
+-- plain do-block does not open a new one, so it does not help. Both of those
+-- were learned the compiler's way.
+--
+-- What these tests DO cover: the transport plumbing — when a body is
+-- compressed, what header it carries, that the compressed bytes go out
+-- verbatim, and what happens when the server refuses the coding.
+--
+-- What they CANNOT cover, stated plainly rather than implied away: whether the
+-- ENGINE's zlib.deflate actually emits RFC 1950 framing. That is an engine
+-- fact, this SDK only forwards the bytes, and no interpreter in CI has the
+-- module. The SERVER end of the same contract IS verified — analytics-service
+-- reads Go's zlib writer output and refuses a raw RFC 1951 body — so the
+-- unproven link is exactly one: the engine's own framing. It needs an
+-- on-device capture and is owed as an acceptance artifact.
+--
+-- The stub below therefore returns an OPAQUE shrunk string. Making it emit
+-- real zlib would prove nothing extra: the production path does not do the
+-- framing, it forwards it.
+;(function()
+	local function install_zlib_stub(behaviour)
+		local saved = rawget(_G, "zlib")
+		local calls = {}
+		_G.zlib = {
+			deflate = function(body)
+				calls[#calls + 1] = body
+				if behaviour == "raise" then
+					error("zlib boom")
+				elseif behaviour == "grow" then
+					return body .. string.rep("x", 64)
+				elseif behaviour == "empty" then
+					return ""
+				elseif behaviour == "wrong_type" then
+					return 42
+				end
+				-- Default: a deterministic, opaque, SHRUNK stand-in.
+				return "Z<" .. #body .. ">" .. body:sub(1, 8)
+			end,
+		}
+		return calls, function()
+			_G.zlib = saved
+		end
+	end
+
+	-- Only the batch route matters here. A seeded consent grant dispatches a
+	-- receipt to /v1/consent on init, so `requests` is not batches alone —
+	-- indexing it directly made the first version of these assertions count
+	-- the receipt as a publish.
+	local function batch_requests()
+		local out = {}
+		for _, request in ipairs(requests) do
+			if request.url:find("/v1/events:batch", 1, true) then
+				out[#out + 1] = request
+			end
+		end
+		return out
+	end
+
+	-- shutdown() publishes a final small batch of its own, so "how many
+	-- publishes happened" is not the contract. The contract is: compress iff
+	-- the body was worth compressing. assert_no_compression checks that no
+	-- batch carried the coding at all.
+	local function assert_no_compression(label)
+		local batches = batch_requests()
+		assert_true(#batches >= 1, label .. ": expected at least one publish")
+		for i, request in ipairs(batches) do
+			assert_equal(request.headers["Content-Encoding"], nil,
+				label .. ": batch " .. tostring(i) .. " was compressed")
+		end
+		return batches
+	end
+
+	local function fill_batch(count)
+		for i = 1, count do
+			assert_true(sdk.track("level_complete", {
+				level_id = "world-3-stage-" .. tostring(i % 12),
+				duration_ms = 41200 + i,
+				attempts = 1 + (i % 4),
+				score = 18400 + i * 7,
+				difficulty = "normal",
+				input_device = "gamepad",
+			}), "track " .. tostring(i))
+		end
+	end
+
+	-- A full batch goes out compressed, and the wire body is EXACTLY what the
+	-- compressor returned: the transport forwards, it does not re-frame.
+	reset()
+	local calls, restore = install_zlib_stub()
+	seed_granted_consent()
+	assert_true(sdk.init(config({ batch_size = 100 })))
+	fill_batch(60)
+	assert_true(sdk.flush())
+	sdk.shutdown()
+	restore()
+
+	local batches = batch_requests()
+	assert_true(#batches >= 1, "expected at least one publish")
+	assert_equal(batches[1].headers["Content-Encoding"], "deflate",
+		"a full batch must be sent compressed")
+	assert_equal(#calls, 1, "the engine compressor must have been called for exactly the over-threshold batch")
+	assert_true(#calls[1] >= 1024,
+		"fixture must exceed the threshold for this test to mean anything")
+	assert_true(#batches[1].body < #calls[1],
+		"the compressed body must be smaller than the payload")
+	assert_equal(batches[1].body, "Z<" .. #calls[1] .. ">" .. calls[1]:sub(1, 8),
+		"the wire body must be the compressor's output verbatim")
+	-- Every OTHER batch (shutdown's small final one) stayed uncompressed
+	-- because it sat under the threshold — the rule is about the body, not
+	-- about which publish it is.
+	for i = 2, #batches do
+		assert_equal(batches[i].headers["Content-Encoding"], nil,
+			"batch " .. tostring(i) .. " was under the threshold and must not be compressed")
+		assert_true(#batches[i].body < 1024, "batch " .. tostring(i) .. " must be sub-threshold")
+	end
+
+	-- Sub-threshold bodies: zlib framing costs 6 bytes before the deflate
+	-- stream's own overhead, so a single-event batch comes out larger.
+	reset()
+	calls, restore = install_zlib_stub()
+	seed_granted_consent()
+	assert_true(sdk.init(config()))
+	assert_true(sdk.track("session_start"))
+	assert_true(sdk.flush())
+	sdk.shutdown()
+	restore()
+
+	batches = assert_no_compression("sub-threshold")
+	assert_equal(#calls, 0, "the compressor must not even be called under the threshold")
+	assert_true(#batches[1].body < 1024,
+		"fixture must sit under the threshold for this test to mean anything")
+
+	-- The opt-out.
+	reset()
+	calls, restore = install_zlib_stub()
+	seed_granted_consent()
+	assert_true(sdk.init(config({ batch_size = 100, request_compression_enabled = false })))
+	fill_batch(60)
+	assert_true(sdk.flush())
+	sdk.shutdown()
+	restore()
+
+	batches = assert_no_compression("opt-out")
+	assert_equal(#calls, 0, "the opt-out must not call the compressor at all")
+	assert_true(#batches[1].body >= 1024,
+		"fixture must exceed the threshold or the opt-out is untested")
+
+	-- No engine module: an ordinary uncompressed publish, never an error. A
+	-- missing compressor is a missed optimisation, not a dropped batch. This
+	-- is also the state every other test in this file runs in.
+	reset()
+	local saved_zlib = rawget(_G, "zlib")
+	_G.zlib = nil
+	seed_granted_consent()
+	assert_true(sdk.init(config({ batch_size = 100 })))
+	fill_batch(60)
+	assert_true(sdk.flush())
+	sdk.shutdown()
+	_G.zlib = saved_zlib
+
+	batches = assert_no_compression("no engine module")
+	assert_true(#batches[1].body >= 1024)
+
+	-- A compressor that raises, returns a non-string, returns nothing, or
+	-- returns something no smaller than the input: all fall back to the plain
+	-- body. The last is not theoretical — a high-entropy body comes back
+	-- larger, and sending it would spend CPU to make the request worse.
+	for _, behaviour in ipairs({ "raise", "grow", "empty", "wrong_type" }) do
+		reset()
+		local _, restore_stub = install_zlib_stub(behaviour)
+		seed_granted_consent()
+		assert_true(sdk.init(config({ batch_size = 100 })))
+		fill_batch(60)
+		assert_true(sdk.flush(), "flush must succeed with a " .. behaviour .. " compressor")
+		sdk.shutdown()
+		restore_stub()
+
+		batches = assert_no_compression(behaviour)
+		assert_true(#batches[1].body >= 1024, behaviour .. ": fixture must exceed the threshold")
+	end
+
+	-- The ordering safety net, and the reason compression can be on by
+	-- default. A deployment predating the coding answers 400 with a distinct
+	-- detail code. That arrives as an ORDINARY 400 — terminal by default,
+	-- which would DROP the batch — so it must be kept and re-sent
+	-- uncompressed, or a transport detail becomes total data loss.
+	reset()
+	local _, restore_refusal = install_zlib_stub()
+	seed_granted_consent()
+	assert_true(sdk.init(config({ batch_size = 100 })))
+	fill_batch(60)
+
+	next_status = 400
+	next_response_body = '{"error":{"code":"validation_error","message":"request validation failed",'
+		.. '"details":[{"field":"content-encoding","code":"unsupported_content_encoding",'
+		.. '"message":"content encoding deflate is not supported"}]}}'
+	-- flush() reports the publish outcome, and this one is a rejection; the
+	-- assertion that matters is what happens to the BATCH, below.
+	sdk.flush()
+	batches = batch_requests()
+	assert_equal(#batches, 1, "expected exactly the refused publish so far")
+	assert_equal(batches[1].headers["Content-Encoding"], "deflate")
+
+	next_status = 202
+	next_response_body = nil
+	sdk.update(0)
+	batches = batch_requests()
+	assert_true(#batches >= 2, "the refused batch must be retried, not dropped")
+	assert_equal(batches[2].headers["Content-Encoding"], nil,
+		"the retry must be uncompressed")
+
+	local before = #batches
+	fill_batch(60)
+	assert_true(sdk.flush())
+	batches = batch_requests()
+	assert_true(#batches > before, "the second batch must publish")
+	for i = before + 1, #batches do
+		assert_equal(batches[i].headers["Content-Encoding"], nil,
+			"compression was not latched off: batch " .. tostring(i))
+	end
+	sdk.shutdown()
+	restore_refusal()
+
+	-- The CONTROL, and the reason the fallback matches DETAIL CODES rather
+	-- than the bare 400. A status-only match would switch this client's
+	-- transport off for the session in response to an unrelated defect — and
+	-- would start RETAINING batches the server rejected permanently, which is
+	-- its own bug: they would be re-sent and re-rejected on every later
+	-- launch.
+	reset()
+	local _, restore_control = install_zlib_stub()
+	seed_granted_consent()
+	assert_true(sdk.init(config({ batch_size = 100 })))
+	fill_batch(60)
+
+	next_status = 400
+	next_response_body = '{"error":{"code":"validation_error","message":"request validation failed",'
+		.. '"details":[{"field":"events.0.event_name","code":"unknown_event",'
+		.. '"message":"event name is not in the tracking plan"}]}}'
+	sdk.flush()
+	batches = batch_requests()
+	assert_equal(#batches, 1, "expected exactly the rejected publish so far")
+
+	next_status = 202
+	next_response_body = nil
+	fill_batch(60)
+	assert_true(sdk.flush())
+	batches = batch_requests()
+	assert_true(#batches >= 2, "the next batch must publish")
+	for i = 2, #batches do
+		assert_equal(batches[i].headers["Content-Encoding"], "deflate",
+			"an unrelated 400 disabled compression: batch " .. tostring(i))
+	end
+	sdk.shutdown()
+	restore_control()
+
+	-- The module's own predicates, including every shape that must NOT trip
+	-- the refusal match.
+	local compression = require "shardpilot.compression"
+	assert_equal(compression.is_encoding_refusal("unsupported_content_encoding"), true)
+	assert_equal(compression.is_encoding_refusal("invalid_content_encoding"), true)
+	assert_equal(compression.is_encoding_refusal("unknown_field,unsupported_content_encoding"), true)
+	assert_equal(compression.is_encoding_refusal("unknown_event"), false)
+	assert_equal(compression.is_encoding_refusal("request_too_large"), false)
+	assert_equal(compression.is_encoding_refusal(""), false)
+	assert_equal(compression.is_encoding_refusal(nil), false)
+	assert_equal(compression.is_encoding_refusal(42), false)
+
+	saved_zlib = rawget(_G, "zlib")
+	_G.zlib = nil
+	assert_equal(compression.available(), false, "no module means no compressor")
+	assert_equal(compression.compress(string.rep("a", 4096)), nil)
+	_G.zlib = { deflate = "not a function" }
+	assert_equal(compression.available(), false, "a non-callable deflate is not a compressor")
+	_G.zlib = { deflate = function(body) return "z" .. body:sub(1, 4) end }
+	assert_equal(compression.available(), true)
+	assert_equal(compression.compress(string.rep("a", 1023)), nil, "under the threshold")
+	assert_true(compression.compress(string.rep("a", 1024)) ~= nil, "at the threshold")
+	assert_equal(compression.compress(nil), nil)
+	assert_equal(compression.compress(42), nil)
+	_G.zlib = saved_zlib
+
+	-- A non-boolean flag fails config validation rather than being coerced.
+	local bad_client, bad_err = sdk.new(config({ request_compression_enabled = "yes" }))
+	assert_equal(bad_client, nil)
+	assert_equal(bad_err, "invalid_request_compression_enabled")
+end)()
+
 print("shardpilot defold lua tests passed")

@@ -1,4 +1,5 @@
 local schema_revision = require "shardpilot.schema_revision"
+local compression = require "shardpilot.compression"
 
 local M = {}
 
@@ -30,7 +31,7 @@ local function retry_after_seconds(response)
 	return math.floor(seconds)
 end
 
-local function dispatch(config, token, route, payload, callback)
+local function dispatch(config, token, route, payload, callback, compress)
 	if not http or not http.request then
 		callback(false, "http_unavailable", false, true)
 		return false
@@ -55,6 +56,21 @@ local function dispatch(config, token, route, payload, callback)
 		["Content-Type"] = "application/json",
 		["Authorization"] = "Bearer " .. token,
 	}
+	-- Request-body compression. The body is replaced with the compressed bytes
+	-- and the coding declared; `compressed` is reported back on EVERY callback
+	-- arm so the client knows whether an encoding refusal it is looking at
+	-- could even have been caused by this request. A compression module that
+	-- declines — no engine compressor, a sub-threshold body, a body that did
+	-- not shrink — leaves this an ordinary uncompressed publish.
+	local compressed = false
+	if compress then
+		local compressed_body = compression.compress(encoded)
+		if compressed_body then
+			encoded = compressed_body
+			compressed = true
+			headers[compression.HEADER] = compression.CODING
+		end
+	end
 	-- Schema-revision handshake (GAP-036): declare the schema-set revision
 	-- the SDK was built against, on the events-batch route ONLY. `dispatch`
 	-- is shared with the consent route, and the handshake is defined for
@@ -75,19 +91,19 @@ local function dispatch(config, token, route, payload, callback)
 	http.request(trim_slash(config.ingest_url) .. route, "POST", function(_, _, response)
 		local status = response and response.status or 0
 		if status == 401 then
-			callback(false, "unauthorized", true, true, response)
+			callback(false, "unauthorized", true, true, response, nil, compressed)
 			return
 		end
 		if status >= 200 and status < 300 then
-			callback(true, nil, false, false, response)
+			callback(true, nil, false, false, response, nil, compressed)
 			return
 		end
 		if status == 0 then
-			callback(false, "http_0", false, true, response)
+			callback(false, "http_0", false, true, response, nil, compressed)
 			return
 		end
 		if status == 429 then
-			callback(false, "transient_429", false, true, response, retry_after_seconds(response))
+			callback(false, "transient_429", false, true, response, retry_after_seconds(response), compressed)
 			return
 		end
 		if status >= 500 then
@@ -96,16 +112,16 @@ local function dispatch(config, token, route, payload, callback)
 			-- with `Retry-After: 5`, and the client's deferral must pace
 			-- recovery on the server's hint instead of its own jittered
 			-- backoff.
-			callback(false, "transient_" .. tostring(status), false, true, response, retry_after_seconds(response))
+			callback(false, "transient_" .. tostring(status), false, true, response, retry_after_seconds(response), compressed)
 			return
 		end
-		callback(false, "http_" .. tostring(status), false, false, response)
+		callback(false, "http_" .. tostring(status), false, false, response, nil, compressed)
 	end, headers, encoded, options)
 	return true
 end
 
-function M.publish(config, token, payload, callback)
-	return dispatch(config, token, "/v1/events:batch", payload, callback)
+function M.publish(config, token, payload, callback, compress)
+	return dispatch(config, token, "/v1/events:batch", payload, callback, compress)
 end
 
 function M.send_consent(config, token, payload, callback)

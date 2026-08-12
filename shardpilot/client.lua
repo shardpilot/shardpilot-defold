@@ -1,5 +1,6 @@
 local envelope = require "shardpilot.envelope"
 local clock = require "shardpilot.clock"
+local compression = require "shardpilot.compression"
 local experiments_mod = require "shardpilot.experiments"
 local id = require "shardpilot.id"
 local platform = require "shardpilot.platform"
@@ -461,6 +462,10 @@ local function validate_config(config)
 		and type(config.consent_kind_emission_enabled) ~= "boolean" then
 		return nil, "invalid_consent_kind_emission_enabled"
 	end
+	if config.request_compression_enabled ~= nil
+		and type(config.request_compression_enabled) ~= "boolean" then
+		return nil, "invalid_request_compression_enabled"
+	end
 	local out = {
 		ingest_url = trim_slash(config.ingest_url),
 		remote_config_url = has_remote_config and trim_slash(config.remote_config_url) or nil,
@@ -472,6 +477,7 @@ local function validate_config(config)
 		source = source,
 		schema_revision = declared_schema_revision,
 		consent_kind_emission_enabled = config.consent_kind_emission_enabled ~= false,
+		request_compression_enabled = config.request_compression_enabled ~= false,
 		platform = config.platform or platform.detect(),
 		transport = config.transport,
 		token_provider = config.token_provider,
@@ -2532,6 +2538,11 @@ function Client:apply_error_envelope(err, response)
 		message = error_obj.message,
 		detail_codes = detail_codes,
 	})
+	-- Returned so the caller can tell an ENCODING refusal from every other
+	-- 400 without re-decoding the body. Matching on codes rather than on the
+	-- bare status is the whole point: an ordinary validation failure must not
+	-- change this client's transport.
+	return detail_codes and table.concat(detail_codes, ",") or nil
 end
 
 -- Exponential-backoff-with-jitter fallback used when a retryable transport /
@@ -3845,7 +3856,8 @@ function Client:start_publish_batch(automatic)
 	local completed = false
 	local succeeded = false
 	local batch_count = #events
-	local dispatched = transport.publish(self.config, self.token, events.payload, function(ok, err, unauthorized, retryable, response, retry_after)
+	local compress = self.config.request_compression_enabled and not self.compression_refused
+	local dispatched = transport.publish(self.config, self.token, events.payload, function(ok, err, unauthorized, retryable, response, retry_after, compressed)
 		completed = true
 		succeeded = ok == true
 		self.publish_in_flight = false
@@ -3857,6 +3869,9 @@ function Client:start_publish_batch(automatic)
 		local purge_awaited = self.experiment_purge_awaited
 		self.experiment_purge_awaited = false
 		if ok then
+			if compressed then
+				self.compression_proven = true
+			end
 			self.stats.published = self.stats.published + batch_count
 			-- A successful publish clears any backpressure deferral/backoff.
 			-- The server accepted a batch, so any stored backpressure window
@@ -3886,7 +3901,20 @@ function Client:start_publish_batch(automatic)
 		self.stats.last_error = err
 		-- Surface the server error envelope (error.code + detail codes) on a
 		-- non-2xx instead of leaving only the bare transport status.
-		self:apply_error_envelope(err, response)
+		local detail_codes = self:apply_error_envelope(err, response)
+		-- The ingest deployment cannot read this request's content coding.
+		-- Stop compressing for the rest of the session and KEEP the batch: an
+		-- encoding refusal arrives as an ordinary 400 — terminal by default,
+		-- which would DROP the batch — but the next attempt sends different
+		-- bytes, so it is retryable in the one way that matters. Without this,
+		-- an SDK upgrade pointed at a server predating the coding would drop
+		-- every batch permanently: a transport detail turned into total data
+		-- loss.
+		local encoding_refused = compressed == true
+			and compression.is_encoding_refusal(detail_codes)
+		if encoding_refused then
+			self.compression_refused = true
+		end
 		-- Backpressure: honor a 429 Retry-After (whole seconds) by deferring the
 		-- next publish attempt at least that long. Absent a header, fall back to
 		-- exponential backoff with jitter on a transient transport/backpressure
@@ -3899,7 +3927,7 @@ function Client:start_publish_batch(automatic)
 		-- publish was in flight must drop the batch instead of republishing it. A
 		-- Mode A 401 is non-retryable, so the batch is dropped here too. Compute
 		-- this FIRST so the deferral below is only set for a batch we keep.
-		local retain = is_retryable_publish_failure(err, unauthorized, retryable, mode_b)
+		local retain = (is_retryable_publish_failure(err, unauthorized, retryable, mode_b) or encoding_refused)
 			and not consent_denied_state(self.consent_state)
 		if retain and purge_awaited then
 			-- The failed batch is retained for retry, but a sentinel purge
@@ -3942,6 +3970,14 @@ function Client:start_publish_batch(automatic)
 		elseif retain and is_retryable_publish_failure(err, unauthorized, retryable, mode_b) then
 			self:defer_backoff()
 		end
+		if encoding_refused and retain then
+			-- Go out on the next tick rather than waiting out the flush
+			-- cadence: no deferral was armed (an encoding refusal is not a
+			-- retryable-transport failure, so neither the Retry-After arm nor
+			-- the backoff arm above ran), and the batch itself is correct —
+			-- only its framing was wrong.
+			self.flush_elapsed_seconds = self.config.flush_interval_seconds
+		end
 		if retain then
 			-- Durably spool a transiently failed batch (appended once — the
 			-- event_id index de-duplicates repeats) so an app kill before the
@@ -3975,7 +4011,7 @@ function Client:start_publish_batch(automatic)
 				})
 			end
 		end
-	end)
+	end, compress)
 	if not dispatched and self.publish_in_flight then
 		self.publish_in_flight = false
 	end
