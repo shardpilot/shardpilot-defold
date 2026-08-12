@@ -2391,6 +2391,56 @@ local function test_retry_wake_republishes_without_a_flush_tick()
 	minted:update(0)
 	assert_equal(mint_calls, mints_at_settle,
 		"a failing provider must not be re-minted on every frame")
+
+	-- FOURTH subject: the plane the third one could not see.
+	--
+	-- A mint is started for EITHER plane, and a user_verified receipt's
+	-- dispatch is one of the callers — it needs the token to vouch for the
+	-- actor. But the failed settlement armed the backoff only behind
+	-- has_retained_publish_work(), which counts event batches and spool
+	-- chunks. With no event work in flight the mint was the receipt's alone,
+	-- so a failing provider armed NOTHING: consent_retry_after_ms stayed nil,
+	-- consent_retry_due() cannot fire without it, and the receipt waited out
+	-- the whole flush interval — fifteen seconds under the new default, on
+	-- the one plane whose timing must never inherit the batching cadence.
+	reset()
+	storage.reset()
+	local consent_mints = 0
+	local consent_settle = nil
+	local receipt_only = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		token_provider = function(callback)
+			consent_mints = consent_mints + 1
+			consent_settle = callback
+		end,
+	})))
+	-- identify() + a token_provider is what makes the receipt user_verified,
+	-- and that kind is carried by the minted token alone.
+	assert_true(receipt_only:identify("user-example"))
+	assert_true(receipt_only:set_consent(true))
+	receipt_only:flush()
+
+	assert_true(consent_settle ~= nil, "the receipt's dispatch asked the provider for a token")
+	assert_equal(receipt_only:has_retained_publish_work(), false,
+		"the premise: no event batch and no spool chunk, so this mint is the receipt's alone")
+	assert_true(receipt_only.consent_outbox ~= nil and #receipt_only.consent_outbox > 0,
+		"the premise: the receipt is still undelivered")
+
+	local deliver_consent = consent_settle
+	consent_settle = nil
+	local consent_mints_at_settle = consent_mints
+	deliver_consent(nil, nil, "provider unavailable")
+
+	assert_true(receipt_only:consent_send_deferred(),
+		"a failed mint must arm the CONSENT clock too, or the receipt has no wake at all "
+			.. "and waits out the flush interval")
+
+	-- Paced on this plane as well: the consent clock is what stops the
+	-- failing provider being asked again every frame.
+	receipt_only:update(0)
+	receipt_only:update(0)
+	assert_equal(consent_mints, consent_mints_at_settle,
+		"a failing provider must not be re-minted on every frame for a receipt either")
 	storage.reset()
 end
 

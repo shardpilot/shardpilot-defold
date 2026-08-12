@@ -2637,12 +2637,25 @@ end
 -- repeatedly, and a bare nudge would mint again every single frame — the same
 -- unbounded loop the second-401 rule exists to stop, reached through the other
 -- door.
+--
+-- BOTH planes, because a mint is started for either of them and this one
+-- function is where both learn it failed. has_retained_publish_work() counts
+-- event batches and spool chunks only, so a mint begun solely to vouch for a
+-- consent receipt — the user_verified receipt whose dispatch calls
+-- can_publish() — armed nothing at all: consent_retry_after_ms stayed nil,
+-- consent_retry_due() cannot fire without it, and the receipt waited out the
+-- full flush interval. Not an elseif: when both planes are holding work they
+-- were both waiting on this token, and they keep separate deadlines and
+-- separate attempt counters.
 function Client:fail_token_settlement()
 	self.token = nil
 	self.token_expires_at_ms = nil
 	self.stats.last_error = "token_unavailable"
 	if self:has_retained_publish_work() then
 		self:defer_backoff()
+	end
+	if self.consent_outbox ~= nil and #self.consent_outbox > 0 then
+		self:defer_consent_backoff()
 	end
 end
 
