@@ -230,7 +230,11 @@ end
 -- a month; a missing value leaves the deadline untouched.
 local max_publish_defer_seconds = 86400
 
-local function defer_publish(client, seconds)
+-- from_server marks a deadline the SERVER asked for (a Retry-After header, or
+-- one persisted from a previous run) as opposed to our own client-side
+-- backoff. The two are gated differently for an explicit flush: see
+-- start_publish_batch.
+local function defer_publish(client, seconds, from_server)
 	if type(seconds) ~= "number" or seconds <= 0 then
 		return
 	end
@@ -240,6 +244,7 @@ local function defer_publish(client, seconds)
 	local deadline = clock.unix_ms() + math.floor(seconds * 1000)
 	if not client.publish_retry_after_ms or deadline > client.publish_retry_after_ms then
 		client.publish_retry_after_ms = deadline
+		client.publish_retry_after_from_server = from_server == true
 	end
 end
 
@@ -651,6 +656,9 @@ function M.new(config)
 		condemned_spool_pending = false,
 		publish_in_flight = false,
 		publish_retry_after_ms = nil,
+		-- Whether the live publish deadline came from a server Retry-After
+		-- (binds an explicit flush) or from our own backoff (does not).
+		publish_retry_after_from_server = false,
 		publish_backoff_attempt = 0,
 		user_id = valid_identity(config.user_id) and config.user_id or nil,
 		anonymous_id = anonymous_id,
@@ -1105,7 +1113,7 @@ function M.new(config)
 		if #spooled > 0 and type(stored_deadline) == "number" then
 			local remaining_ms = stored_deadline - clock.unix_ms()
 			if remaining_ms > 0 then
-				defer_publish(client, remaining_ms / 1000)
+				defer_publish(client, remaining_ms / 1000, true)
 				client.spool_retry_after_ms = client.publish_retry_after_ms
 			end
 		end
@@ -2153,7 +2161,15 @@ function Client:update(dt)
 	end
 	if queue.size(self.queue) >= self.config.batch_size or self.flush_elapsed_seconds >= self.config.flush_interval_seconds then
 		self.flush_elapsed_seconds = 0
-		self:flush({ include_summaries = false })
+		self:flush({ include_summaries = false, automatic = true })
+	elseif self:retry_due() then
+		-- Retained work whose deadline has passed is due on the RETRY clock,
+		-- not the batching one. flush() resets flush_elapsed_seconds as it
+		-- always does; that costs nothing here, because the only state that
+		-- reaches this branch is one where a retained batch or an undelivered
+		-- receipt is already holding the pipeline and fresh queued events
+		-- could not have published on this tick either.
+		self:flush({ include_summaries = false, automatic = true })
 	end
 end
 
@@ -2511,16 +2527,25 @@ end
 local backoff_base_seconds = 1
 local backoff_cap_seconds = 60
 
--- The wait for the given consecutive-failure attempt: nil for the first
--- failure (retry on the next dispatch without a wait), then full jitter in
+-- The wait for the given consecutive-failure attempt: full jitter in
 -- [base, ceiling] with the ceiling doubling per attempt up to the cap —
 -- never below the base so we always wait. Shared by the publish and
 -- consent-receipt retry paths.
+--
+-- The FIRST failure shares the second's window rather than returning nil.
+-- Nil meant "arm no deadline", which handed the retry to the next flush
+-- tick — indistinguishable from immediate while that tick was one second, and
+-- a fifteen-second stall at the interval A6 moves this SDK to. Giving it
+-- exactly the base reproduces the timing the old default actually
+-- delivered while owing nothing to the batching cadence.
 local function backoff_delay_seconds(attempt)
-	if attempt < 2 then
+	if attempt < 1 then
 		return nil
 	end
 	local exp = attempt - 2
+	if exp < 0 then
+		exp = 0
+	end
 	if exp > 16 then
 		exp = 16
 	end
@@ -2541,6 +2566,59 @@ end
 
 function Client:publish_deferred()
 	return self.publish_retry_after_ms ~= nil and clock.unix_ms() < self.publish_retry_after_ms
+end
+
+-- Whether a retained batch's backpressure deadline has passed and it is owed
+-- a retry NOW.
+--
+-- This client has no timer of its own: update(dt) is the only thing that
+-- publishes, and it used to publish only on a full batch or an elapsed flush
+-- interval. So an armed deadline never actually decided when a retry
+-- happened — the next flush tick did, and the deadline merely had to be
+-- earlier than it. At a one-second cadence the difference was invisible; at
+-- fifteen it means a server saying Retry-After: 2 is answered somewhere in
+-- the next fifteen seconds, and the client-side backoff schedule stops
+-- describing anything at all.
+--
+-- publish_in_flight is excluded so a dispatch already on the wire does not
+-- make this true every frame.
+function Client:retry_due()
+	return self:publish_retry_due() or self:consent_retry_due()
+end
+
+function Client:publish_retry_due()
+	if self.publish_retry_after_ms == nil or self.publish_in_flight then
+		return false
+	end
+	-- EFFICIENCY, not correctness, and worth saying so: start_publish_batch
+	-- refuses an automatic dispatch inside the window anyway, so dropping
+	-- this check changes no observable publish behaviour — a mutation that
+	-- removes it survives the suite, deliberately reported rather than
+	-- papered over with a contrived assertion. What it saves is calling
+	-- flush() on every single frame for the whole window, which would also
+	-- pump the consent outbox and the summary enqueue each frame.
+	if self:publish_deferred() then
+		return false
+	end
+	return self.in_flight_batch ~= nil and #self.in_flight_batch > 0
+end
+
+-- The consent plane has the same problem and needs the same wake.
+--
+-- Receipts keep their own schedule (the server's Retry-After, else the shared
+-- backoff), but flush() is what pumps the outbox and update() is what calls
+-- flush(). So a receipt deferred one second on a client whose events plane is
+-- perfectly healthy had no wake source at all except the flush tick — its
+-- retry silently inherited the batching cadence, which is the one thing a
+-- consent receipt's timing should never depend on.
+function Client:consent_retry_due()
+	if self.consent_retry_after_ms == nil or self.consent_send_in_flight then
+		return false
+	end
+	if self:consent_send_deferred() then
+		return false
+	end
+	return self.consent_outbox ~= nil and #self.consent_outbox > 0
 end
 
 -- ── consent-receipt outbox ────────────────────────────────────────────────────
@@ -2968,6 +3046,14 @@ function Client:try_send_consent_outbox()
 	if not payload then
 		return true
 	end
+	-- NO explicit-flush carve-out here, unlike the events plane. The events
+	-- gate is pacing — this SDK's politeness toward an endpoint that just
+	-- failed — and a caller's intent may override it. This gate is ORDERING:
+	-- an undispatched grant receipt must hold the event legs, or a post-grant
+	-- event overtakes the grant on the wire and a strict-consent workspace
+	-- suppresses it terminally. Correctness does not yield to caller intent,
+	-- and the suite pins it either way (see the "dispatch-based, not
+	-- window-based" case).
 	if self.consent_send_in_flight or self:consent_send_deferred() then
 		return false
 	end
@@ -3712,14 +3798,30 @@ function Client:persist()
 	return true
 end
 
-function Client:start_publish_batch()
+function Client:start_publish_batch(automatic)
 	if self.publish_in_flight or not self.in_flight_batch or #self.in_flight_batch == 0 then
 		return true, false, true
 	end
 	-- Backpressure: a 429 Retry-After (or backoff) deferral is still in effect.
 	-- Hold the batch (it stays retained in in_flight_batch) and report
 	-- not-dispatched so flush returns without republishing before the deadline.
-	if self:publish_deferred() then
+	--
+	-- WHOSE deadline it is decides whether an explicit flush honours it.
+	--
+	-- A SERVER-sent Retry-After binds everyone: the server told us to wait,
+	-- and a caller's intent does not override that
+	-- (test_retry_after_defers_next_publish pins exactly this).
+	--
+	-- Our OWN backoff does not bind an explicit caller. It is this client's
+	-- politeness toward an endpoint that just failed, and it paces the
+	-- AUTOMATIC retries update() drives; a host calling flush() or shutdown()
+	-- has said what it wants. The suite is full of hosts doing precisely that
+	-- — "must keep the singleton alive for a host retry loop" — and until A6
+	-- the distinction never had to be drawn, because the first hint-less
+	-- failure armed no deadline at all and an immediate caller retry went
+	-- straight out. Now that it arms one, the two cases have to be told
+	-- apart rather than collapsed in either direction.
+	if self:publish_deferred() and (automatic or self.publish_retry_after_from_server) then
 		return false, false, false
 	end
 	local events = self.in_flight_batch
@@ -3817,7 +3919,7 @@ function Client:start_publish_batch()
 		-- blocks a later granted batch for the whole Retry-After/backoff window
 		-- (up to the 24h clamp). A 401 is never deferred (handled above).
 		elseif retain and retry_after and retry_after > 0 then
-			defer_publish(self, retry_after)
+			defer_publish(self, retry_after, true)
 			-- A server-requested delay survives a relaunch: remember the
 			-- (clamped) deadline so the spool write below stores it and a
 			-- startup resend waits out the remaining window.
@@ -3973,7 +4075,7 @@ function Client:flush(options)
 		if not token_ready and not self:can_publish() then
 			return false
 		end
-		local dispatched, completed, succeeded = self:start_publish_batch()
+		local dispatched, completed, succeeded = self:start_publish_batch(options.automatic == true)
 		if not dispatched or (completed and not succeeded) then
 			return false
 		end

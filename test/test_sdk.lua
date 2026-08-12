@@ -856,7 +856,15 @@ local function test_consent_send_failure_is_quiet()
 	-- was dropped): the next dispatch point retries it until acknowledged.
 	assert_equal(#client.consent_outbox, 1, "a transient receipt failure must retain the receipt")
 	next_status = 202
-	client:update(client.config.flush_interval_seconds)
+	-- The failure armed the receipt's own backoff deadline (A6: the first
+	-- hint-less failure paces on the retry clock now, where it used to arm
+	-- nothing and let the next flush tick decide). Advance the harness clock
+	-- past that window, then tick: the receipt must go out on the RETRY wake,
+	-- which is a different code path from the flush-cadence one — this tick
+	-- deliberately passes a dt of ZERO so the flush-interval branch cannot
+	-- fire and take the credit.
+	socket.now = socket.now + 2
+	client:update(0)
 	assert_equal(#requests, 2)
 	assert_equal(requests[2].url, "http://localhost:8080/v1/consent")
 	assert_equal(#client.consent_outbox, 0, "the acknowledged receipt must leave the outbox")
@@ -2037,7 +2045,17 @@ local function test_flush_sends_consent_receipt_before_event_batch()
 	-- One flush drives both planes: the retained receipt re-sends first, the
 	-- event batch second — and the batch is dispatched in the SAME cycle (no
 	-- ack-gating deferral to a later flush).
+	--
+	-- The clock advance is A6's, and it is a real behaviour change rather
+	-- than test scaffolding. The receipt's FIRST failure now arms its own
+	-- retry window where it armed none, and an undispatched grant holds the
+	-- event legs by design (ordering, not pacing — see
+	-- try_send_consent_outbox). So a post-grant event is held for that
+	-- window. That is the trade this makes deliberately: one second, against
+	-- the fifteen it would be if the receipt's retry still rode the flush
+	-- tick.
 	next_status = 202
+	socket.now = socket.now + 2
 	assert_true(client:flush())
 	assert_equal(#requests, 3)
 	assert_true(requests[2].url:find("/v1/consent", 1, true) ~= nil, "the retained receipt is dispatched first")
@@ -2211,8 +2229,8 @@ local function test_successful_publish_clears_deferral()
 	storage.reset()
 end
 
--- L1 §6: sustained transient failures with no Retry-After header back off; the
--- first failure retries promptly, repeats wait.
+-- L1 §6: transient failures with no Retry-After header back off on the
+-- CLIENT'S OWN clock, first failure included.
 local function test_backoff_on_sustained_transient_failures()
 	reset()
 	storage.reset()
@@ -2222,12 +2240,18 @@ local function test_backoff_on_sustained_transient_failures()
 	assert_true(client:identify("user-example"))
 	assert_true(client:track("transient_event"))
 
-	-- first transient failure: no deferral, retries on the next flush
+	-- First transient failure: defers on the retry clock. It used to defer
+	-- NOTHING and retry "on the next flush", which sounded immediate only
+	-- because the flush interval was one second — at fifteen the same code
+	-- path is a fifteen-second stall, and this test would still have passed.
+	-- The deadline is asserted here so the schedule is what decides.
 	assert_equal(client:flush(), false)
 	assert_equal(client.publish_backoff_attempt, 1)
-	assert_true(not client:publish_deferred(), "first failure does not defer")
+	assert_true(client:publish_deferred(), "the first failure defers on the retry clock")
 
-	-- second consecutive failure: backs off
+	-- An EXPLICIT flush is not bound by the client's own backoff (only by a
+	-- server-sent Retry-After), so the caller's retry goes out and advances
+	-- the streak.
 	assert_equal(client:flush(), false)
 	assert_equal(client.publish_backoff_attempt, 2)
 	assert_true(client:publish_deferred(), "sustained failure backs off")
@@ -2237,6 +2261,78 @@ local function test_backoff_on_sustained_transient_failures()
 	next_status = 202
 	assert_true(client:flush())
 	assert_equal(client.publish_backoff_attempt, 0)
+	storage.reset()
+end
+
+-- A6: the retained batch's retry is driven by the RETRY clock, through a wake
+-- in update(), not by the flush cadence.
+--
+-- This client has no timer of its own — update(dt) is the only thing that
+-- publishes — so before this an armed deadline never actually decided when a
+-- retry happened; the next flush tick did, and the deadline merely had to be
+-- earlier than it. The flush interval here is 9999s and the tick is driven
+-- with dt = 0, so the cadence branch CANNOT fire: anything that goes out is
+-- the wake's doing.
+local function test_retry_wake_republishes_without_a_flush_tick()
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 500
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track("woken_event"))
+
+	assert_equal(client:flush(), false)
+	assert_equal(#requests, 1)
+	assert_equal(#client.in_flight_batch, 1, "the batch is retained")
+	assert_true(client:publish_deferred(), "the first failure arms the retry clock")
+
+	-- Inside the window: the wake must NOT fire.
+	next_status = 202
+	client:update(0)
+	assert_equal(#requests, 1, "an open window holds the retry")
+
+	-- Past it: the wake republishes, with no flush tick anywhere in sight.
+	socket.now = socket.now + 2
+	client:update(0)
+	assert_equal(#requests, 2, "the elapsed deadline is picked up by the retry wake")
+	assert_equal(client.in_flight_batch, nil)
+
+	-- SAME test function, second subject: WHOSE deadline it is decides
+	-- whether an explicit flush honours it. Folded in here rather than split
+	-- out because this file is at Lua's 200-local ceiling for the main chunk.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+
+	-- Client-side backoff: an explicit flush goes out.
+	next_status = 500
+	local mine = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(mine:identify("user-example"))
+	assert_true(mine:track("client_backoff_event"))
+	assert_equal(mine:flush(), false)
+	assert_true(mine:publish_deferred(), "the client armed its own window")
+	assert_equal(mine.publish_retry_after_from_server, false)
+	next_status = 202
+	assert_true(mine:flush(), "an explicit flush is not bound by our own backoff")
+	assert_equal(#requests, 2)
+
+	-- Server-sent Retry-After: an explicit flush waits.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "120" }
+	local theirs = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(theirs:identify("user-example"))
+	assert_true(theirs:track("server_hinted_event"))
+	assert_equal(theirs:flush(), false)
+	assert_true(theirs:publish_deferred(), "the server armed the window")
+	assert_equal(theirs.publish_retry_after_from_server, true)
+	next_status = 202
+	next_response_headers = nil
+	assert_equal(theirs:flush(), false, "the server's instruction binds an explicit flush too")
+	assert_equal(#requests, 1, "no publish inside a server-sent window")
 	storage.reset()
 end
 
@@ -4798,11 +4894,16 @@ local function test_consent_receipt_survives_restart_and_retries_until_acked()
 		"the receipt re-sends verbatim")
 	assert_equal(#second.consent_outbox, 1, "a failed re-send stays retained")
 	assert_equal(second.consent_backoff_attempt, 1)
-	assert_true(not second:consent_send_deferred(), "the first failure retries without a wait")
+	-- The first failure arms the receipt's own window now (A6). It armed
+	-- nothing before, which meant the retry happened whenever the next
+	-- dispatch point came round — the flush tick, in practice — so the
+	-- receipt's schedule described nothing.
+	assert_true(second:consent_send_deferred(), "the first failure defers on the receipt's own clock")
 
 	-- a second consecutive failure (network error this time) backs off
 	next_status = 0
-	second:update(second.config.flush_interval_seconds)
+	socket.now = socket.now + 2
+	second:update(0)
 	assert_equal(#requests, 2)
 	assert_equal(second:snapshot().last_consent_error, "http_0")
 	assert_equal(second.consent_backoff_attempt, 2)
@@ -5266,9 +5367,13 @@ local function test_outbox_load_drops_run_before_cap_enforcement()
 	assert_equal(#record.receipts, 1, "the persisted record keeps only the grant")
 	assert_equal(record.receipts[1].idempotency_key, "receipt-deliverable-grant")
 
-	-- The surviving grant actually delivers once the endpoint recovers.
+	-- The surviving grant actually delivers once the endpoint recovers. The
+	-- clock advance waits out the receipt's own retry window, which its first
+	-- failure now arms (A6); the consent gate is ordering, not pacing, so an
+	-- explicit flush honours it.
 	reset()
 	next_status = 202
+	socket.now = socket.now + 2
 	assert_true(client:flush())
 	assert_equal(#requests, 1)
 	assert_contains(requests[1].body,
@@ -6612,10 +6717,12 @@ local function test_set_consent_surfaces_receipt_persist_failure()
 	assert_equal(#record.receipts, 1, "the retained receipt is durable after the retry")
 
 	-- and a delivery that acks synchronously needs no durability error even
-	-- while outbox writes fail
+	-- while outbox writes fail. The clock advance waits out the receipt
+	-- window an earlier failure in this fixture armed (A6).
 	reset()
 	outbox_writes_fail = true
 	next_status = 202
+	socket.now = socket.now + 2
 	assert_true(client:set_consent(true),
 		"a synchronously acknowledged receipt has nothing left to lose")
 	restore()
@@ -7171,6 +7278,7 @@ local tests = {
 	test_restart_dispatches_retained_grant_before_first_batch,
 	test_successful_publish_clears_deferral,
 	test_backoff_on_sustained_transient_failures,
+	test_retry_wake_republishes_without_a_flush_tick,
 	test_error_envelope_is_surfaced,
 	test_diagnostics_hook_errors_are_swallowed,
 	test_invalid_diagnostics_rejected,
