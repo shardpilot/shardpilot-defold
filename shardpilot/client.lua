@@ -2389,6 +2389,23 @@ function Client:refresh_token()
 		end
 		self.token = new_token
 		self.token_expires_at_ms = new_expires_at
+		-- A settled mint re-arms the wake it may have consumed. An
+		-- ASYNCHRONOUS provider is where this matters: the retained 401
+		-- batch's one-shot nudge is spent by the update() that STARTS the
+		-- mint — that tick zeroes the elapsed counter, can_publish returns
+		-- false while the mint is in flight, and nothing publishes — so
+		-- without it the batch waits out the WHOLE flush interval after the
+		-- token finally arrives. The stall the nudge removes, moved behind
+		-- the mint. A synchronous provider never shows it, which is why the
+		-- first version of that test could not have caught it.
+		--
+		-- It is NOT conditioned on the settle being asynchronous. A guard for
+		-- that could not fail any test: a synchronous callback runs while its
+		-- caller is on its way to publish anyway, and the arm is a no-op
+		-- unless retained work exists, in which case one extra tick is
+		-- already gated by publish_deferred. An untestable condition is a
+		-- place for the two paths to drift, not protection.
+		self:wake_retained_publish_work()
 	end)
 	if not ok then
 		self.token_request_in_flight = false
@@ -2667,10 +2684,26 @@ function Client:publish_retry_due()
 	-- Retry-After could expire with nothing to notice: with an empty queue the
 	-- resend then waited for the flush tick, up to fifteen seconds later than
 	-- the server asked for.
+	return self:has_retained_publish_work()
+end
+
+-- Undelivered work this client is holding for a retry: a retained in-flight
+-- batch, or chunks restored from a previous launch. Neither is in the queue any
+-- more, so the batch-size trigger cannot fire for either.
+function Client:has_retained_publish_work()
 	if #self.spool_batches > 0 then
 		return true
 	end
 	return self.in_flight_batch ~= nil and #self.in_flight_batch > 0
+end
+
+-- Make the next update() tick publish, for retained work that has no deadline
+-- of its own. One tick, not a standing state: the tick zeroes the counter.
+function Client:wake_retained_publish_work()
+	if self:has_retained_publish_work() or
+		(self.consent_outbox ~= nil and #self.consent_outbox > 0) then
+		self.flush_elapsed_seconds = self.config.flush_interval_seconds
+	end
 end
 
 -- The consent plane has the same problem and needs the same wake.

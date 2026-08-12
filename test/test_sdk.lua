@@ -7841,6 +7841,52 @@ end)()
 	looping:update(0)
 	assert_equal(#requests, after_nudge, "and only one: the armed window holds the rest")
 
+	-- ...and the same batch under an ASYNCHRONOUS token_provider, which is the
+	-- shape the synchronous test above cannot reach.
+	--
+	-- The nudge is consumed by the update() that STARTS the mint: that tick
+	-- zeroes the elapsed counter, can_publish returns false while the mint is
+	-- in flight, and nothing publishes. So the retry has to be re-armed when
+	-- the mint settles, or the batch waits out the whole interval after the
+	-- token finally arrives.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 401
+	local deferred_callback = nil
+	local async = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		token_provider = function(callback)
+			deferred_callback = callback
+		end,
+	})))
+	assert_true(async:identify("user-example"))
+	assert_true(async:track("async_stale_token_event"))
+
+	-- The mint runs at the DISPATCH point, so the first flush only starts it.
+	assert_equal(async:flush(), false)
+	assert_equal(#requests, 0, "nothing goes out until a token exists")
+	assert_true(deferred_callback ~= nil, "the provider was asked for a token")
+	deferred_callback("token-async-1", nil, nil)
+	deferred_callback = nil
+
+	-- Now the publish happens, and answers 401.
+	assert_equal(async:flush(), false)
+	assert_equal(#requests, 1)
+	assert_true(async.in_flight_batch ~= nil, "a Mode B 401 retains the batch")
+
+	-- The tick that starts the re-mint publishes nothing and spends the nudge.
+	next_status = 202
+	async:update(0)
+	assert_equal(#requests, 1, "the mint is in flight: nothing published, and the nudge is spent")
+	assert_true(deferred_callback ~= nil, "the retry asked for a fresh token")
+
+	-- The token arrives out of band. THIS is what has to re-arm the wake.
+	deferred_callback("token-async-2", nil, nil)
+	async:update(0)
+	assert_equal(#requests, 2,
+		"the retained batch goes out on the tick after the async mint settled, not the flush tick")
+
 	-- A spool restored at startup whose persisted SERVER deadline is still
 	-- live, and then expires. Only a Retry-After is persisted, so this is the
 	-- shape where the reload really does restore a deadline — and the wake
