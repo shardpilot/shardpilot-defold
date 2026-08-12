@@ -218,7 +218,7 @@ README, `docs/`, and the skill above are the reference.
 | `user_id` | `nil` | Initial known-user attribution |
 | `batch_size` | `25` | Flush trigger, 1–100 |
 | `buffer_size` | `1000` | Max queued events (≥1); cross-SDK canonical default |
-| `flush_interval_seconds` | `1` | Time-based flush trigger (>0) |
+| `flush_interval_seconds` | `15` (was `1`) | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value. |
 | `publish_timeout_seconds` | `2` | Per-request timeout (>0) |
 | `token_refresh_lead_ms` | `60000` | Refresh lead before token expiry (≥0) |
 | `spool_enabled` | `true` | Durable offline event spool ([details](#offline-durability-event-spool)); `false` also clears a previously persisted record at init |

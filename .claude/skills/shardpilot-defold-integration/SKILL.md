@@ -132,7 +132,10 @@ Required: `ingest_url`, `workspace_id`, `app_id`, `environment_id`, and one
 auth credential. `init` returns `true`, or `false, err` with a specific code
 (`ingest_url_required`, `invalid_ingest_url`, `auth_required`,
 `auth_mode_conflict`, `remote_config_api_key_required`, …). Useful defaults:
-`batch_size = 25` (1–100), `buffer_size = 1000`, `flush_interval_seconds = 1`,
+`batch_size = 25` (1–100), `buffer_size = 1000`,
+`flush_interval_seconds = 15` (how long a PARTIAL batch waits — not a
+heartbeat: an empty queue publishes nothing, a full `batch_size` publishes
+immediately, `flush()` on demand, and retry pacing runs on its own clock),
 `publish_timeout_seconds = 2`, `spool_enabled = true`,
 `spool_max_events = 500`, `spool_max_bytes = 262144` (max 393216).
 

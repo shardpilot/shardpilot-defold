@@ -228,6 +228,20 @@ end
 -- Defer the next publish attempt by at least the given whole seconds. Clamped
 -- to a sane upper bound so a hostile/garbage header cannot park the client for
 -- a month; a missing value leaves the deadline untouched.
+-- How long a PARTIAL batch waits before it publishes. It was 1 second.
+--
+-- NOT a heartbeat: update(dt) publishes nothing when the queue is empty, so a
+-- game that tracks nothing makes no requests at either value. The cost of 1s
+-- was the opposite shape — a title emitting an event every few seconds never
+-- reached batch_size, so the tick fired on a batch of one and every event
+-- became its own request. Batching was configured and not happening.
+--
+-- 15s is the low end of the cross-SDK 15-30s band. A full batch_size still
+-- publishes immediately, flush() publishes on demand, and retry pacing runs
+-- on its own clock (see backoff_delay_seconds and Client:retry_due), so
+-- lengthening this cannot slow a recovery.
+local default_flush_interval_seconds = 15
+
 local max_publish_defer_seconds = 86400
 
 -- from_server marks a deadline the SERVER asked for (a Retry-After header, or
@@ -380,7 +394,8 @@ local function validate_config(config)
 		return nil, buffer_size_err
 	end
 	local flush_interval_seconds, flush_interval_err =
-		normalize_positive_number(config.flush_interval_seconds, 1, "invalid_flush_interval_seconds")
+		normalize_positive_number(config.flush_interval_seconds, default_flush_interval_seconds,
+			"invalid_flush_interval_seconds")
 	if not flush_interval_seconds then
 		return nil, flush_interval_err
 	end
