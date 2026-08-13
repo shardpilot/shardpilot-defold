@@ -8696,6 +8696,80 @@ end)()
 	minting:shutdown()
 	storage.reset()
 
+	-- ── A mint started for an ordinary QUEUE, not for retained work ────────
+	--
+	-- Every mint case above starts from work that has already left the queue.
+	-- The commonest shape has not: a cadence or explicit flush over a partial
+	-- queue calls can_publish() BEFORE draining, so the mint settles with
+	-- in_flight_batch nil and spool_batches empty. The retained predicate sees
+	-- nothing to wake, the flush that started the mint already zeroed the
+	-- cadence, and a below-batch_size queue cannot trigger another — so the
+	-- event that caused the mint waits out the whole interval.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local queue_mint = nil
+	local queue_mint_calls = 0
+	local queue_minting = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		batch_size = 20,
+		token_provider = function(callback)
+			queue_mint_calls = queue_mint_calls + 1
+			queue_mint = callback
+		end,
+	})))
+	assert_true(queue_minting:identify("user-example"))
+	assert_true(queue_minting:track("partial_queue_event"))
+	assert_equal(queue_minting:flush(), false, "the flush starts the mint and drains nothing")
+	assert_equal(queue_mint_calls, 1, "the provider was asked for a token")
+	assert_equal(queue_minting.in_flight_batch, nil, "the queue is not drained until a token exists")
+	assert_equal(#queue_minting.spool_batches, 0, "and nothing is spooled")
+	assert_equal(queue_minting.flush_elapsed_seconds, 0, "while that flush zeroed the cadence")
+
+	next_status = 202
+	queue_mint("token-queue-1", nil, nil)
+	queue_minting:update(0)
+	assert_equal(#requests, 1,
+		"a settled mint must wake the QUEUED event that started it, not only retained work")
+	queue_minting:shutdown()
+	storage.reset()
+
+	-- The failure half of the same blind spot: no deadline was armed either,
+	-- so a provider that recovers a moment later is not asked again until the
+	-- cadence comes round.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local failed_mint = nil
+	local failed_mint_calls = 0
+	local failing = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		batch_size = 20,
+		token_provider = function(callback)
+			failed_mint_calls = failed_mint_calls + 1
+			failed_mint = callback
+		end,
+	})))
+	assert_true(failing:identify("user-example"))
+	assert_true(failing:track("failed_mint_queue_event"))
+	assert_equal(failing:flush(), false, "the flush starts the mint")
+	assert_equal(failed_mint_calls, 1)
+	assert_equal(failing:publish_deferred(), false, "no window yet")
+
+	failed_mint(nil, nil, "provider exploded")
+	assert_true(failing:publish_deferred(),
+		"a failed mint over a queued event must arm the publish clock, or nothing paces the retry")
+
+	-- And the armed window must be one something actually watches: a deadline
+	-- no predicate reads is the same stall wearing a deadline.
+	socket.now = socket.now + 5
+	assert_equal(failing:publish_deferred(), false, "the window is up")
+	failing:update(0)
+	assert_equal(failed_mint_calls, 2,
+		"the expired window must drive the retry, or the queued event waits out the interval anyway")
+	failing:shutdown()
+	storage.reset()
+
 	-- ── ...but only for the receipts that are actually waiting on it ───────
 	--
 	-- The consent plane needs the qualification the events plane does not: a

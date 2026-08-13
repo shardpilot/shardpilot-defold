@@ -2425,7 +2425,7 @@ function Client:refresh_token()
 			-- nothing failed, and the next tick mints fresh under the new
 			-- epoch. It cannot spin, because reaching this branch requires an
 			-- identify() to have landed mid-mint (Codex on #46).
-			self:wake_retained_publish_work()
+			self:wake_pending_publish_work()
 			return
 		end
 		if callback_error or type(new_token) ~= "string" or new_token == "" then
@@ -2454,7 +2454,7 @@ function Client:refresh_token()
 		-- unless retained work exists, in which case one extra tick is
 		-- already gated by publish_deferred. An untestable condition is a
 		-- place for the two paths to drift, not protection.
-		self:wake_retained_publish_work()
+		self:wake_pending_publish_work()
 	end)
 	if not ok then
 		self.token_request_in_flight = false
@@ -2714,7 +2714,13 @@ function Client:fail_token_settlement()
 	self.token = nil
 	self.token_expires_at_ms = nil
 	self.stats.last_error = "token_unavailable"
-	if self:has_retained_publish_work() then
+	-- PENDING, not retained: a mint started for an ordinary partial queue has
+	-- not drained it yet (can_publish runs before the drain), so the retained
+	-- predicate is false and this armed nothing at all — while the flush that
+	-- started the mint had already zeroed the cadence and a below-batch_size
+	-- queue cannot trigger another. A failing provider was retried no sooner
+	-- than the full interval (Codex on #46).
+	if self:has_pending_publish_work() then
 		self:defer_backoff()
 	end
 	local awaiting = self:receipt_awaiting_token()
@@ -2850,7 +2856,7 @@ function Client:publish_retry_due()
 	-- deferred-storage work again for the whole latency of the provider. No
 	-- HTTP request is on the wire, so publish_in_flight above cannot see it.
 	-- Nothing is stranded by waiting: every settlement path re-arms this work
-	-- — success and stale-epoch through wake_retained_publish_work, failure
+	-- — success and stale-epoch through wake_pending_publish_work, failure
 	-- through fail_token_settlement's backoff (Codex on #46).
 	if self.token_request_in_flight then
 		return false
@@ -2878,7 +2884,13 @@ function Client:publish_retry_due()
 	-- Retry-After could expire with nothing to notice: with an empty queue the
 	-- resend then waited for the flush tick, up to fifteen seconds later than
 	-- the server asked for.
-	return self:has_retained_publish_work()
+	--
+	-- Queued events count too, which is why this is the PENDING predicate and
+	-- not the retained one: a deadline armed for a mint that failed over a
+	-- partial queue would otherwise be a deadline nothing watches — armed,
+	-- expired, and never acted on, because a below-batch_size queue cannot
+	-- trigger a flush by itself either.
+	return self:has_pending_publish_work()
 end
 
 -- Undelivered work this client is holding for a retry: a retained in-flight
@@ -2891,10 +2903,29 @@ function Client:has_retained_publish_work()
 	return self.in_flight_batch ~= nil and #self.in_flight_batch > 0
 end
 
--- Make the next update() tick publish, for retained work that has no deadline
--- of its own. One tick, not a standing state: the tick zeroes the counter.
-function Client:wake_retained_publish_work()
-	if self:has_retained_publish_work() or
+-- Publish work a token mint would carry: retained work, plus events still IN
+-- the queue.
+--
+-- The queue half is what has_retained_publish_work() deliberately excludes,
+-- and excluding it here was wrong for exactly one reason: a mint is started
+-- from can_publish(), which flush() calls BEFORE it drains the queue. So a
+-- mint begun for an ordinary partial queue settles with in_flight_batch still
+-- nil and spool_batches still empty — the retained predicate sees nothing,
+-- while the events that started the whole thing sit in the queue. A
+-- below-batch_size queue cannot trigger a flush by itself, and the flush that
+-- started the mint already zeroed the cadence, so nothing moved for the full
+-- interval (Codex on #46).
+function Client:has_pending_publish_work()
+	if self:has_retained_publish_work() then
+		return true
+	end
+	return queue.size(self.queue) > 0
+end
+
+-- Make the next update() tick publish, for work that has no deadline of its
+-- own. One tick, not a standing state: the tick zeroes the counter.
+function Client:wake_pending_publish_work()
+	if self:has_pending_publish_work() or
 		(self.consent_outbox ~= nil and #self.consent_outbox > 0) then
 		self.flush_elapsed_seconds = self.config.flush_interval_seconds
 	end
@@ -3529,7 +3560,7 @@ function Client:try_send_consent_outbox()
 						self.consent_deferral_armed_key = payload.idempotency_key
 					else
 						self.consent_auth_retried_key = payload.idempotency_key
-						self:wake_retained_publish_work()
+						self:wake_pending_publish_work()
 					end
 				elseif retry_after and retry_after == 0 then
 					-- An explicit "retry now" from the server. Falling through
@@ -3550,7 +3581,7 @@ function Client:try_send_consent_outbox()
 						self.consent_deferral_armed_key = payload.idempotency_key
 					else
 						self.consent_zero_retried_key = payload.idempotency_key
-						self:wake_retained_publish_work()
+						self:wake_pending_publish_work()
 					end
 				elseif retry_after and retry_after > 0 then
 					self:defer_consent(retry_after)
