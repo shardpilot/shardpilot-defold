@@ -8425,4 +8425,301 @@ end)()
 	storage.reset()
 end)()
 
+-- === Codex round: wakes that fire on work nothing can dispatch =============
+--
+-- Every case here is the same defect: a wake stays due while the thing it
+-- would wake CANNOT go out, so update() calls flush() on every frame and each
+-- one re-pumps the consent outbox and the deferred-storage work. Request count
+-- is blind to all of it — flush() runs, the dispatch is refused, and no extra
+-- request appears — so the witness throughout is flush_elapsed_seconds, which
+-- flush() zeroes: three ticks of 0.1 leave it at 0.3 with the gate and at
+-- exactly 0 without.
+--
+-- Same immediately-invoked-function trick as the blocks above: the main chunk
+-- is at Lua's 200-local ceiling, and the limit is per FUNCTION.
+;(function()
+	-- ── A publish retry behind a DEFERRED GRANT ────────────────────────────
+	--
+	-- An undispatched grant receipt holds the event leg by design (ordering,
+	-- not pacing), and flush() returns at that gate before it ever reaches the
+	-- publish loop. So a retained batch whose own deadline has expired keeps
+	-- the wake due with nothing able to answer it — for the length of a
+	-- CONSENT window, where a server Retry-After runs to 24 hours.
+	--
+	-- Built through a relaunch because that is the shape that actually
+	-- reaches it: the gate blocks publishing while a grant is undispatched, so
+	-- within one launch a batch can never become retained BEHIND one. A spool
+	-- restored from a previous launch is retained publish work that arrives
+	-- already past the gate.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "3" }
+	local seeder = assert(sdk.new(config_mode_a({
+		flush_interval_seconds = 9999, spool_enabled = true,
+	})))
+	assert_true(seeder:track("gated_event"))
+	assert_equal(seeder:flush(), false, "the failure spools the batch with the server's window")
+	next_response_headers = nil
+	seeder:shutdown()
+
+	-- A grant receipt is durably retained from that same launch.
+	assert_true(storage.save_consent_outbox(identity_scope, { {
+		idempotency_key = "gate-grant-key",
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "anon-gate-example",
+		kind = "anon",
+		decided_at = "2026-07-02T00:00:00.000Z",
+		categories = { analytics = true },
+		anonymous_id = "anon-gate-example",
+	} }) ~= false)
+
+	-- The relaunch dispatches the retained grant during init, so the server
+	-- has to be failing BEFORE the client is built or the receipt is
+	-- acknowledged and pruned before the test starts.
+	reset()
+	next_status = 503
+	local gated = assert(sdk.new(config_mode_a({
+		flush_interval_seconds = 9999, spool_enabled = true,
+	})))
+	assert_equal(#requests, 1, "the retained grant dispatches at startup and fails")
+	assert_true(gated:spool_pending(), "the relaunch reloaded the spooled chunk")
+	assert_true(gated:publish_deferred(), "and the persisted server window with it")
+
+	-- Past both the persisted publish window and the grant's first backoff.
+	socket.now = socket.now + 10
+	assert_equal(gated:publish_deferred(), false, "the publish deadline has expired")
+	assert_equal(gated:consent_send_deferred(), false, "and so has the grant's first backoff")
+
+	-- The grant's next attempt fails too, arming the window that now holds
+	-- the event leg while the publish retry sits due behind it.
+	local gated_flushed, gated_reason = gated:flush()
+	assert_equal(gated_flushed, false)
+	assert_equal(gated_reason, "consent_receipt_pending")
+	assert_equal(#requests, 2, "the grant went out again; the batch is held behind it")
+	assert_true(gated:consent_send_deferred(), "the failed grant armed the consent window")
+	assert_true(gated:grant_receipt_pending_dispatch(), "and the receipt is still undispatched")
+
+	-- Pin the consent window at a minute. The fake clock advances 0.1s on
+	-- every read, so a jittered second-scale backoff can expire part-way
+	-- through the ticks below and re-dispatch the grant — which would make
+	-- this a test of the harness rather than of the gate.
+	gated.consent_retry_after_ms = math.floor(socket.now * 1000) + 60000
+
+	local gated_before = #requests
+	gated:update(0.1)
+	gated:update(0.1)
+	gated:update(0.1)
+	assert_equal(#requests, gated_before, "nothing can go out while the grant holds the leg")
+	assert_true(gated.flush_elapsed_seconds > 0.29,
+		"the publish wake must stay quiet behind a deferred grant, or flush() runs every frame for the length of a consent window")
+	gated:shutdown()
+	storage.reset()
+
+	-- ── A retry wake while the MINT it needs is in flight ──────────────────
+	--
+	-- An expired backoff that starts an asynchronous token_provider puts no
+	-- HTTP request on the wire, so publish_in_flight cannot see it: the
+	-- deadline stays expired and the wake stays due for the whole latency of
+	-- the provider.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local pending_mint = nil
+	local minting = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		token_provider = function(callback) pending_mint = callback end,
+	})))
+	assert_true(minting:identify("user-example"))
+	assert_true(minting:track("mint_spin_event"))
+	assert_equal(minting:flush(), false, "the first flush only starts the mint")
+	assert_true(pending_mint ~= nil, "the provider was asked for a token")
+	pending_mint("token-spin-1", math.floor(socket.now * 1000) + 1000, nil)
+	pending_mint = nil
+
+	next_status = 500
+	assert_equal(minting:flush(), false)
+	assert_equal(#requests, 1, "the batch went out and failed")
+	assert_true(minting.in_flight_batch ~= nil, "and is retained")
+
+	-- Past both our own backoff and the token's expiry, so the retry that is
+	-- now due has to mint before it can publish.
+	socket.now = socket.now + 120
+	assert_equal(minting:publish_deferred(), false, "the backoff window is up")
+
+	next_status = 202
+	minting:update(0)
+	assert_equal(#requests, 1, "the mint is in flight, so nothing published")
+	assert_true(minting.token_request_in_flight, "and it has not settled")
+	minting:update(0.1)
+	minting:update(0.1)
+	minting:update(0.1)
+	assert_equal(#requests, 1, "still nothing: there is no token to publish with")
+	assert_true(minting.flush_elapsed_seconds > 0.29,
+		"the retry wake must stay quiet while the mint it is waiting on is in flight")
+
+	-- Nothing is stranded by that silence: the settlement is the wake.
+	pending_mint("token-spin-2", nil, nil)
+	minting:update(0)
+	assert_equal(#requests, 2, "the settled mint wakes the retained batch")
+	minting:shutdown()
+	storage.reset()
+
+	-- ── ...but only for the receipts that are actually waiting on it ───────
+	--
+	-- The consent plane needs the qualification the events plane does not: a
+	-- mint in flight means there is no usable token AT ALL, and every publish
+	-- needs one — but a historic-anon receipt rides the publishable key and
+	-- is not waiting on any mint, so suppressing its wake would strand it for
+	-- the flush cadence. Asserted at the predicate rather than driven end to
+	-- end: this is a statement about WHICH receipt blocks, and the dual
+	-- credential configuration is the only place the two answers differ.
+	reset()
+	storage.reset()
+	local dual = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		remote_config_url = "http://localhost:9090",
+		api_key = "sp_ingest_publishable_key",
+		token_provider = function(callback) callback("token-dual", nil, nil) end,
+	})))
+	local function receipt(key, actor)
+		return {
+			idempotency_key = key,
+			workspace_id = "workspace-example",
+			app_id = "app-example",
+			environment_id = "develop",
+			actor_identifier = actor,
+			kind = "anon",
+			decided_at = "2026-07-02T00:00:00.000Z",
+			categories = { analytics = true },
+			anonymous_id = actor,
+		}
+	end
+	local historic = receipt("historic-anon-key", "anon-from-a-previous-launch")
+	local current = receipt("current-anon-key", dual.anonymous_id)
+	assert_equal(dual:receipt_dispatch_needs_token(historic), false,
+		"a historic-anon receipt rides the publishable key and waits on no mint")
+	assert_true(dual:receipt_dispatch_needs_token(current),
+		"a receipt keyed to THIS session's anon rides the minted token")
+
+	dual.consent_retry_after_ms = math.floor(socket.now * 1000) - 1000
+	dual.token_request_in_flight = true
+	dual.consent_outbox = { historic }
+	assert_true(dual:consent_retry_due(),
+		"a mint in flight must not silence a receipt the publishable key can carry")
+	dual.consent_outbox = { current }
+	assert_equal(dual:consent_retry_due(), false,
+		"but the receipt that IS waiting on that mint has nothing to wake for")
+	dual.token_request_in_flight = false
+	dual.consent_outbox = {}
+	storage.reset()
+
+	-- ── An explicit caller's bypass, carried across an asynchronous mint ───
+	--
+	-- flush() outranks our own backoff but cannot outrank a token it does not
+	-- have yet: with an async provider the caller's attempt ends inside
+	-- can_publish(), and what eventually publishes is the AUTOMATIC flush the
+	-- settlement wake drives — refused by the very window the caller was
+	-- entitled to bypass.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local bypass_mint = nil
+	local bypass = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		token_provider = function(callback) bypass_mint = callback end,
+	})))
+	assert_true(bypass:identify("user-example"))
+	assert_true(bypass:track("bypass_event"))
+	assert_equal(bypass:flush(), false, "the first flush only starts the mint")
+	bypass_mint("token-bypass-1", math.floor(socket.now * 1000) + 1000, nil)
+	bypass_mint = nil
+
+	next_status = 500
+	assert_equal(bypass:flush(), false)
+	assert_equal(#requests, 1, "the batch went out and failed")
+	assert_true(bypass.in_flight_batch ~= nil, "and is retained")
+
+	-- Past the token's expiry, then pin OUR OWN window at a minute so the
+	-- assertion below is about the bypass rather than about backoff jitter.
+	socket.now = socket.now + 120
+	bypass.publish_retry_after_ms = math.floor(socket.now * 1000) + 60000
+	assert_true(bypass:publish_deferred(), "our own window is live")
+	assert_equal(bypass:publish_server_deferred(), false, "and it is ours, not the server's")
+
+	next_status = 202
+	assert_equal(bypass:flush(), false, "the explicit attempt ends at the mint")
+	assert_equal(#requests, 1, "nothing published yet")
+	assert_true(bypass_mint ~= nil, "the explicit flush asked for a token")
+
+	bypass_mint("token-bypass-2", nil, nil)
+	assert_true(bypass:publish_deferred(), "the caller's window is still live when the token lands")
+	bypass:update(0)
+	assert_equal(#requests, 2,
+		"the caller's bypass must survive the mint, or the retry they asked for waits out a 60s window")
+	bypass:shutdown()
+	storage.reset()
+
+	-- ── Retry-After: 0 through a bypassed window, and its bound ────────────
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local zero = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_true(zero:track("zero_event"))
+	next_status = 500
+	assert_equal(zero:flush(), false)
+	assert_true(zero.in_flight_batch ~= nil, "the batch is retained")
+	zero.publish_retry_after_ms = math.floor(socket.now * 1000) + 60000
+	assert_true(zero:publish_deferred(), "our own window is live")
+	assert_equal(zero:publish_server_deferred(), false, "and it is ours")
+
+	-- The explicit flush bypasses that window, and the server says "retry now".
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "0" }
+	assert_equal(zero:flush(), false)
+	next_response_headers = nil
+	assert_equal(#requests, 2, "the bypassing attempt went out")
+	assert_equal(zero:publish_deferred(), false,
+		"a superseded client window must not outlive the server's own 'retry now'")
+	assert_equal(zero.flush_elapsed_seconds, zero.config.flush_interval_seconds,
+		"and the next tick is armed to answer it")
+
+	-- The second zero for the same batch is where "retry now" stops being
+	-- free: honouring it again costs a request per frame.
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "0" }
+	zero:update(0)
+	next_response_headers = nil
+	assert_equal(#requests, 3, "the immediate retry really goes out")
+	assert_true(zero:publish_deferred(),
+		"a SECOND zero for the same batch paces on the backoff instead")
+	zero:update(0.1)
+	zero:update(0.1)
+	assert_equal(#requests, 3, "and that window holds the rest")
+	zero:shutdown()
+	storage.reset()
+
+	-- The same bound one plane over, on the consent outbox.
+	reset()
+	storage.reset()
+	local czero = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "0" }
+	assert_true(czero:set_consent(true))
+	assert_equal(#requests, 1, "the grant went out and was told to retry now")
+	assert_equal(czero:consent_send_deferred(), false,
+		"no window: the server asked for an immediate retry")
+	czero:update(0)
+	next_response_headers = nil
+	assert_equal(#requests, 2, "and the next tick answers it")
+	assert_true(czero:consent_send_deferred(),
+		"a SECOND zero for the same receipt paces on the consent backoff")
+	czero:shutdown()
+	storage.reset()
+end)()
+
 print("shardpilot defold lua tests passed")

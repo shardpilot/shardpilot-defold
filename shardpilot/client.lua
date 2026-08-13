@@ -693,6 +693,14 @@ function M.new(config)
 		-- (binds an explicit flush) or from our own backoff (does not).
 		publish_server_retry_after_ms = nil,
 		publish_backoff_attempt = 0,
+		-- An explicit flush() that was stopped by an asynchronous token mint
+		-- before it could exercise its right to bypass our own backoff. The
+		-- continuation is an AUTOMATIC flush (the settlement wake drives it),
+		-- so without carrying the caller's intent across the mint it would be
+		-- refused by the very deadline the caller outranked. Consumed by the
+		-- next dispatch attempt; a SERVER deadline is never bypassable and is
+		-- deliberately not recorded here.
+		publish_bypass_owed = false,
 		user_id = valid_identity(config.user_id) and config.user_id or nil,
 		anonymous_id = anonymous_id,
 		consent_state = consent_state,
@@ -737,6 +745,10 @@ function M.new(config)
 		-- The receipt that has already spent its one free re-mint on a 401.
 		-- A second 401 for the same key paces on the backoff instead.
 		consent_auth_retried_key = nil,
+		-- The receipt that has already spent its one free immediate retry on a
+		-- server Retry-After: 0. A second zero for the same key paces on the
+		-- backoff, or the server buys a POST per frame by repeating itself.
+		consent_zero_retried_key = nil,
 		spool_record = {},
 		spool_index = {},
 		spool_batches = {},
@@ -2731,12 +2743,25 @@ function Client:receipt_awaiting_token()
 		local receipt = self.consent_outbox[i]
 		if not self:receipt_parked(receipt)
 			and self:receipt_credential_available(receipt)
-			and (receipt.kind == "user_verified"
-				or receipt.actor_identifier == self.anonymous_id) then
+			and self:receipt_dispatch_needs_token(receipt) then
 			return receipt
 		end
 	end
 	return nil
+end
+
+-- Whether this receipt's dispatch would carry the MINTED TOKEN rather than
+-- the publishable key. Lifted out of the two callers above and below so the
+-- credential choice is stated ONCE and mirrors the dispatch site
+-- (try_send_consent_outbox) verbatim rather than being re-derived at each
+-- place that has to predict it — two spellings of the same rule is exactly
+-- how the arm and the wake would come to disagree.
+function Client:receipt_dispatch_needs_token(receipt)
+	local vouched_by_token = self.config.token_provider ~= nil
+		and (receipt.kind == "user_verified"
+			or receipt.actor_identifier == self.anonymous_id)
+	local used_publishable_key = not vouched_by_token and self.config.api_key ~= nil
+	return not used_publishable_key
 end
 
 function Client:defer_backoff()
@@ -2760,6 +2785,29 @@ end
 function Client:publish_server_deferred()
 	return self.publish_server_retry_after_ms ~= nil
 		and clock.unix_ms() < self.publish_server_retry_after_ms
+end
+
+-- An explicit flush() outranks our own backoff, but it cannot outrank a token
+-- it does not have yet: with an ASYNCHRONOUS token_provider the caller's
+-- attempt ends inside can_publish(), and what eventually publishes is an
+-- AUTOMATIC flush driven by the settlement wake. start_publish_batch would
+-- refuse that continuation against the very deadline the caller was entitled
+-- to bypass, so the retry the host asked for waits out the remainder of a
+-- window approaching 60s. Remember the owed bypass and let the continuation
+-- carry the caller's intent.
+--
+-- Narrow on purpose: only for an explicit flush, only when an async mint is
+-- what stopped it (a provider that throws settles synchronously and arms its
+-- own backoff — there is no continuation to owe anything to), and only when
+-- there is a CLIENT-owned window to bypass. A server deadline is never
+-- bypassable, so it is never recorded here.
+function Client:owe_publish_bypass(automatic)
+	if automatic or not self.token_request_in_flight then
+		return
+	end
+	if self:publish_deferred() and not self:publish_server_deferred() then
+		self.publish_bypass_owed = true
+	end
 end
 
 -- Whether a retained batch's backpressure deadline has passed and it is owed
@@ -2792,6 +2840,28 @@ function Client:publish_retry_due()
 	-- flush() on every single frame for the whole window, which would also
 	-- pump the consent outbox and the summary enqueue each frame.
 	if self:publish_deferred() then
+		return false
+	end
+	-- A mint already in flight blocks this retry as surely as a live window:
+	-- can_publish() cannot hand out a token it is still waiting for, so every
+	-- tick would call flush(), be refused, and pump the consent outbox and
+	-- deferred-storage work again for the whole latency of the provider. No
+	-- HTTP request is on the wire, so publish_in_flight above cannot see it.
+	-- Nothing is stranded by waiting: every settlement path re-arms this work
+	-- — success and stale-epoch through wake_retained_publish_work, failure
+	-- through fail_token_settlement's backoff (Codex on #46).
+	if self.token_request_in_flight then
+		return false
+	end
+	-- A GRANT receipt inside its own window holds the event leg, and flush()
+	-- returns at that gate before reaching the publish loop. Neither the
+	-- deadline nor the retained batch changes, so this wake would fire on
+	-- every frame for the length of a CONSENT window — where a server
+	-- Retry-After runs to 24 hours, not 60 seconds. The receipt's own clock
+	-- is the wake that ends this: consent_retry_due() fires when its window
+	-- expires, the grant is handed over, the gate releases by key identity,
+	-- and the same flush() goes on to publish this batch (Codex on #46).
+	if self:grant_receipt_pending_dispatch() and self:consent_send_deferred() then
 		return false
 	end
 	-- Spool chunks count. A batch restored from a previous launch sits in
@@ -2846,7 +2916,21 @@ function Client:consent_retry_due()
 	if self:consent_send_deferred() then
 		return false
 	end
-	return self:next_dispatchable_receipt() ~= nil
+	local receipt = self:next_dispatchable_receipt()
+	if receipt == nil then
+		return false
+	end
+	-- A mint in flight blocks this receipt only if THIS receipt is the kind
+	-- that rides the minted token. Delivery is serial and FIFO, so the head
+	-- dispatchable receipt is the one that would go — and a historic-anon
+	-- receipt riding the publishable key is not waiting on any mint, so
+	-- suppressing its wake would strand it for the flush cadence. The
+	-- events-plane test needs no such qualification: a mint in flight means
+	-- there is no usable token at all, and every publish needs one.
+	if self.token_request_in_flight and self:receipt_dispatch_needs_token(receipt) then
+		return false
+	end
+	return true
 end
 
 -- ── consent-receipt outbox ────────────────────────────────────────────────────
@@ -3342,6 +3426,7 @@ function Client:try_send_consent_outbox()
 				self.consent_backoff_attempt = 0
 				self.consent_deferral_armed_key = nil
 				self.consent_auth_retried_key = nil
+				self.consent_zero_retried_key = nil
 				-- WITNESS HANDOFF (Codex #40 round 4): the prune below
 				-- removes this receipt from the durable outbox — and while
 				-- the standing denial's identity record AND marker writes
@@ -3428,7 +3513,23 @@ function Client:try_send_consent_outbox()
 					-- An explicit "retry now" from the server. Falling through
 					-- to the backoff turned the server's own zero into a
 					-- one-second wait.
-					self:wake_retained_publish_work()
+					--
+					-- Bounded like the events plane's zero and like this
+					-- plane's own 401: a SECOND zero for the same receipt
+					-- means "retry now" is not working, and honouring it again
+					-- costs a /v1/consent POST every frame. No superseded
+					-- deadline to clear here, unlike the events plane — this
+					-- plane has no explicit-flush carve-out at all
+					-- (try_send_consent_outbox), so a live consent window
+					-- would have refused this dispatch outright and there is
+					-- no bypass that could have got past one.
+					if self.consent_zero_retried_key == payload.idempotency_key then
+						self:defer_consent_backoff()
+						self.consent_deferral_armed_key = payload.idempotency_key
+					else
+						self.consent_zero_retried_key = payload.idempotency_key
+						self:wake_retained_publish_work()
+					end
 				elseif retry_after and retry_after > 0 then
 					self:defer_consent(retry_after)
 					self.consent_deferral_armed_key = payload.idempotency_key
@@ -4077,7 +4178,17 @@ function Client:start_publish_batch(automatic)
 	-- failure armed no deadline at all and an immediate caller retry went
 	-- straight out. Now that it arms one, the two cases have to be told
 	-- apart rather than collapsed in either direction.
-	if self:publish_deferred() and (automatic or self:publish_server_deferred()) then
+	--
+	-- A bypass OWED to an explicit caller whose attempt was stopped by an
+	-- asynchronous mint counts as that caller's own attempt: the continuation
+	-- is nominally automatic, but it exists only because the host called
+	-- flush(). Consumed here whether or not a deadline is live — the attempt
+	-- the caller asked for is happening now, and a bypass left standing would
+	-- outrank some unrelated future window.
+	local bypass_owed = self.publish_bypass_owed
+	self.publish_bypass_owed = false
+	if self:publish_deferred()
+		and ((automatic and not bypass_owed) or self:publish_server_deferred()) then
 		return false, false, false
 	end
 	local events = self.in_flight_batch
@@ -4200,7 +4311,32 @@ function Client:start_publish_batch(automatic)
 			-- one-second wait — a regression this PR would have introduced,
 			-- since the first failure used to arm nothing at all (Codex on
 			-- #46).
-			self.flush_elapsed_seconds = self.config.flush_interval_seconds
+			if events.zero_retried then
+				-- A SECOND zero for the same batch means "retry now" is not
+				-- working: the server is answering immediately and failing
+				-- immediately, and honouring it again buys a request PER
+				-- FRAME for as long as it keeps saying so. Pace it like any
+				-- other retryable failure — the same bound, and for the same
+				-- reason, as a second 401 falling back to the backoff. Not
+				-- from the review: the unbounded loop is in the zero handling
+				-- this PR itself added, and it surfaced while fixing the
+				-- superseded-deadline half below.
+				self:defer_backoff()
+			else
+				events.zero_retried = true
+				-- The wake is worthless while a superseded CLIENT deadline is
+				-- still armed: an explicit flush() may have bypassed a live
+				-- backoff to make this very attempt, and start_publish_batch
+				-- refuses the automatic retry the wake triggers — so the
+				-- server's own "retry now" waits out the remainder of a window
+				-- approaching 60s. Cleared exactly as the 401 and
+				-- encoding-refusal paths below clear it; the SERVER's deadline
+				-- survives, because Retry-After outlives the attempt that
+				-- received it (Codex on #46).
+				self.publish_retry_after_ms = self.publish_server_retry_after_ms
+				self.publish_backoff_attempt = 0
+				self.flush_elapsed_seconds = self.config.flush_interval_seconds
+			end
 		elseif retain and retry_after and retry_after > 0 then
 			defer_publish(self, retry_after, true)
 			-- A server-requested delay survives a relaunch: remember the
@@ -4413,6 +4549,7 @@ function Client:flush(options)
 				end
 			end
 			if not self:can_publish() then
+				self:owe_publish_bypass(options.automatic == true)
 				return false
 			end
 			token_ready = true
@@ -4432,6 +4569,7 @@ function Client:flush(options)
 			end
 		end
 		if not token_ready and not self:can_publish() then
+			self:owe_publish_bypass(options.automatic == true)
 			return false
 		end
 		local dispatched, completed, succeeded = self:start_publish_batch(options.automatic == true)
