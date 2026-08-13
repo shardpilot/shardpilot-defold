@@ -734,6 +734,9 @@ function M.new(config)
 		-- head — possibly a fresh decision — for up to the 24h clamp; the
 		-- identity change resets it (see identify).
 		consent_deferral_armed_key = nil,
+		-- The receipt that has already spent its one free re-mint on a 401.
+		-- A second 401 for the same key paces on the backoff instead.
+		consent_auth_retried_key = nil,
 		spool_record = {},
 		spool_index = {},
 		spool_batches = {},
@@ -2209,7 +2212,18 @@ function Client:update(dt)
 		-- granted and an assignment is cached.
 		self.experiments:tick(dt)
 	end
-	if queue.size(self.queue) >= self.config.batch_size or self.flush_elapsed_seconds >= self.config.flush_interval_seconds then
+	-- The full-queue trigger is suppressed while a RETAINED batch is inside
+	-- its own backoff. The retained batch is dispatched first, so the queue
+	-- behind it cannot drain, and start_publish_batch(automatic) refuses every
+	-- attempt inside the window: neither side of the condition changes, and
+	-- flush() runs on every frame for the length of a window approaching 60s,
+	-- repeating the consent-outbox and deferred-storage work each tick. The
+	-- retry clock below is what publishes this batch when its window ends —
+	-- the same reason publish_retry_due() does not fire inside it (Codex on
+	-- #46).
+	local retained_publish_deferred = self.in_flight_batch ~= nil and self:publish_deferred()
+	if (queue.size(self.queue) >= self.config.batch_size and not retained_publish_deferred)
+		or self.flush_elapsed_seconds >= self.config.flush_interval_seconds then
 		self.flush_elapsed_seconds = 0
 		self:flush({ include_summaries = false, automatic = true })
 	elseif self:retry_due() then
@@ -2378,6 +2392,19 @@ function Client:refresh_token()
 	local ok, err = pcall(self.config.token_provider, function(new_token, new_expires_at, callback_error)
 		self.token_request_in_flight = false
 		if epoch ~= self.token_epoch then
+			-- DISCARDED, not failed: identify() moved the identity while this
+			-- mint was in flight, so the token vouches for the previous actor
+			-- and must not be installed. The retained work it was started for
+			-- is still retained, though, and the dispatch point that started
+			-- the mint already spent its one-shot nudge — so returning here
+			-- left it with no token, no deadline and no wake until the whole
+			-- flush interval elapsed.
+			--
+			-- A nudge rather than a backoff, unlike a failed settlement:
+			-- nothing failed, and the next tick mints fresh under the new
+			-- epoch. It cannot spin, because reaching this branch requires an
+			-- identify() to have landed mid-mint (Codex on #46).
+			self:wake_retained_publish_work()
 			return
 		end
 		if callback_error or type(new_token) ~= "string" or new_token == "" then
@@ -2539,7 +2566,14 @@ function Client:apply_error_envelope(err, response)
 	local detail_codes = nil
 	if type(error_obj.details) == "table" then
 		for _, detail in ipairs(error_obj.details) do
-			if type(detail) == "table" and detail.code then
+			-- STRING codes only. A truthy non-string code — a boolean, a
+			-- nested object from a mangling proxy — used to be collected and
+			-- then reached table.concat below, which RAISES inside the HTTP
+			-- callback and aborts flush() before the failure can be
+			-- classified, retained or dropped. The body is attacker- and
+			-- middlebox-controlled, so a malformed envelope must degrade to
+			-- "no codes matched", never to a throw (Codex on #46).
+			if type(detail) == "table" and type(detail.code) == "string" then
 				detail_codes = detail_codes or {}
 				detail_codes[#detail_codes + 1] = detail.code
 			end
@@ -2662,8 +2696,15 @@ function Client:fail_token_settlement()
 	if self:has_retained_publish_work() then
 		self:defer_backoff()
 	end
-	if self:receipt_awaiting_token() ~= nil then
+	local awaiting = self:receipt_awaiting_token()
+	if awaiting ~= nil then
 		self:defer_consent_backoff()
+		-- The window BELONGS to that receipt. Without recording whose it is,
+		-- the actor-change cleanup cannot tell that its owner parked when
+		-- identify() switches actors, and a freshly queued receipt for the
+		-- new actor inherits a backoff it never earned — up to the 60s cap
+		-- after repeated failures (Codex on #46).
+		self.consent_deferral_armed_key = awaiting.idempotency_key
 	end
 end
 
@@ -3293,6 +3334,7 @@ function Client:try_send_consent_outbox()
 				self.consent_retry_after_ms = nil
 				self.consent_backoff_attempt = 0
 				self.consent_deferral_armed_key = nil
+				self.consent_auth_retried_key = nil
 				-- WITNESS HANDOFF (Codex #40 round 4): the prune below
 				-- removes this receipt from the durable outbox — and while
 				-- the standing denial's identity record AND marker writes
@@ -3343,22 +3385,48 @@ function Client:try_send_consent_outbox()
 				-- re-mints and retries immediately); transport transients
 				-- honor a Retry-After or back off so a dead endpoint is not
 				-- hammered every tick.
-				if not unauthorized then
-					-- The receipt may have PARKED while its POST was in
-					-- flight (identify() switched the vouched actor before
-					-- the response landed): it settles retained but WITHOUT
-					-- arming the plane deferral — the wait belongs to ITS
-					-- retry sequence, and this receipt will not retry until
-					-- a session vouches for its actor again; a fresh head
-					-- behind it must not inherit the window.
-					if self:receipt_parked(payload) then
-						return
-					end
-					if retry_after and retry_after > 0 then
-						self:defer_consent(retry_after)
-					else
+				-- The receipt may have PARKED while its POST was in
+				-- flight (identify() switched the vouched actor before
+				-- the response landed): it settles retained but WITHOUT
+				-- arming the plane deferral — the wait belongs to ITS
+				-- retry sequence, and this receipt will not retry until
+				-- a session vouches for its actor again; a fresh head
+				-- behind it must not inherit the window.
+				if self:receipt_parked(payload) then
+					return
+				end
+				if unauthorized then
+					-- A minted-token 401. The comment above promises an
+					-- immediate re-mint, and nothing delivered it: the
+					-- receipt was retained and the token cleared, but no
+					-- deadline was armed and no nudge given, so the retry
+					-- inherited the batching cadence — fifteen seconds under
+					-- the new default, on the plane whose timing must never
+					-- depend on it.
+					--
+					-- Exactly the shape the event plane already handles, and
+					-- bounded the same way: the FIRST 401 gets a one-shot
+					-- wake, and a second for the same receipt means the fresh
+					-- token did not help, so it paces on the backoff. Without
+					-- that bound an endpoint answering 401 forever mints a
+					-- token every frame (Codex on #46).
+					if self.consent_auth_retried_key == payload.idempotency_key then
 						self:defer_consent_backoff()
+						self.consent_deferral_armed_key = payload.idempotency_key
+					else
+						self.consent_auth_retried_key = payload.idempotency_key
+						self:wake_retained_publish_work()
 					end
+				elseif retry_after and retry_after == 0 then
+					-- An explicit "retry now" from the server. Falling through
+					-- to the backoff turned the server's own zero into a
+					-- one-second wait.
+					self:wake_retained_publish_work()
+				elseif retry_after and retry_after > 0 then
+					self:defer_consent(retry_after)
+					self.consent_deferral_armed_key = payload.idempotency_key
+				else
+					self:defer_consent_backoff()
 					self.consent_deferral_armed_key = payload.idempotency_key
 				end
 				return
@@ -4118,6 +4186,14 @@ function Client:start_publish_batch(automatic)
 		-- about to be dropped (denied meanwhile) would leave a stale deadline that
 		-- blocks a later granted batch for the whole Retry-After/backoff window
 		-- (up to the 24h clamp). A 401 is never deferred (handled above).
+		elseif retain and retry_after and retry_after == 0 then
+			-- Retry-After: 0 is an explicit "retry NOW", and the transport
+			-- accepts it as a valid non-negative delay. Falling through to
+			-- the backoff below turned the server's own zero into a
+			-- one-second wait — a regression this PR would have introduced,
+			-- since the first failure used to arm nothing at all (Codex on
+			-- #46).
+			self.flush_elapsed_seconds = self.config.flush_interval_seconds
 		elseif retain and retry_after and retry_after > 0 then
 			defer_publish(self, retry_after, true)
 			-- A server-requested delay survives a relaunch: remember the

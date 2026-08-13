@@ -2516,6 +2516,164 @@ local function test_retry_wake_republishes_without_a_flush_tick()
 	assert_equal(parked:consent_send_deferred(), false, "the premise: the window has expired")
 	assert_equal(parked:consent_retry_due(), false,
 		"an expired window with nothing dispatchable behind it is a wake with no work")
+
+	-- And the window the failed mint armed BELONGS to the receipt that was
+	-- waiting on it. Without the key recorded, the actor-change cleanup
+	-- cannot tell that this window's owner parked, and a receipt queued for
+	-- the new actor inherits a backoff it never earned.
+	reset()
+	storage.reset()
+	parked_mints = 0
+	parked = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		token_provider = function(callback)
+			parked_mints = parked_mints + 1
+			callback(nil, nil, "provider unavailable")
+		end,
+	})))
+	assert_true(parked:identify("user-owner"))
+	assert_true(parked:set_consent(true))
+	assert_true(parked:consent_send_deferred(), "the failed mint armed the receipt's window")
+	assert_equal(parked.consent_deferral_armed_key,
+		parked.consent_outbox[1].idempotency_key,
+		"the armed window must name the receipt that is waiting on the mint")
+
+	-- A mint DISCARDED for a stale identity epoch still owes the work it left
+	-- behind a wake. identify() moved the actor while the mint was in flight,
+	-- so the token must not be installed — but the dispatch point that
+	-- started it already spent the one-shot nudge, and returning at the guard
+	-- left the retained batch with no token, no deadline and no wake.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	parked_settle = nil
+	parked_mints = 0
+	parked = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		token_provider = function(callback)
+			parked_mints = parked_mints + 1
+			if parked_mints == 1 then
+				callback("token-stale-1", nil, nil)
+			else
+				parked_settle = callback
+			end
+		end,
+	})))
+	-- ANONYMOUS work, deliberately: identify() refuses a switch that would
+	-- strand a USER-keyed batch ("events_pending"), so anon-snapshotted work
+	-- is the shape that can actually reach the stale-epoch guard.
+	next_status = 401
+	assert_true(parked:track("stale_epoch_event"))
+	assert_equal(parked:flush(), false)
+	assert_true(parked.in_flight_batch ~= nil and #parked.in_flight_batch > 0,
+		"the premise: the 401 retains the anon batch")
+	parked:update(0)
+	assert_true(parked_settle ~= nil, "the premise: the re-mint is in flight")
+	parked.flush_elapsed_seconds = 0
+	assert_true(parked:identify("user-after"), "identity moves while the mint is in flight")
+	parked_settle("token-for-the-previous-actor", nil, nil)
+	assert_equal(parked.flush_elapsed_seconds, parked.config.flush_interval_seconds,
+		"a discarded stale settlement must re-arm the work it left behind, "
+			.. "or it waits out the whole flush interval with no token and no deadline")
+
+	-- A malformed error envelope must not THROW inside the HTTP callback. A
+	-- truthy non-string detail code reached table.concat, which raises and
+	-- aborts flush() before the failure can be classified, retained or
+	-- dropped — on a body the caller does not control.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 400
+	next_response_body = '{"error":{"code":"validation_error","message":"bad",'
+		.. '"details":[{"code":true},{"code":"unknown_event"}]}}'
+	parked = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(parked:identify("user-example"))
+	assert_true(parked:track("malformed_envelope_event"))
+	assert_equal(parked:flush(), false,
+		"a malformed detail code must classify as an ordinary failure, never throw")
+	next_response_body = nil
+
+	-- A minted-token consent 401 gets the wake the dispatch comment already
+	-- promised. It retained the receipt and cleared the token but armed
+	-- nothing, so the "immediate re-mint" waited out the batching cadence —
+	-- fifteen seconds under the new default. Bounded like the event plane's:
+	-- the SECOND 401 for the same receipt paces on the backoff, or an
+	-- endpoint answering 401 forever mints a token every frame.
+	reset()
+	storage.reset()
+	next_status = 401
+	parked = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(parked:identify("user-401"))
+	assert_true(parked:set_consent(true))
+	assert_true(parked.consent_outbox ~= nil and #parked.consent_outbox > 0,
+		"the premise: the 401 retains the receipt")
+	assert_equal(parked:consent_send_deferred(), false,
+		"the first 401 is a stale-token race: it re-mints at once rather than backing off")
+	assert_equal(parked.flush_elapsed_seconds, parked.config.flush_interval_seconds,
+		"and it must be WOKEN to do so, not left to the flush cadence")
+	parked:update(0)
+	assert_true(parked:consent_send_deferred(),
+		"a second 401 for the same receipt means the fresh token did not help: pace it")
+
+	-- Retry-After: 0 is an explicit "retry now". The transport accepts it as
+	-- a valid non-negative delay, and both planes used to fall through to the
+	-- one-second first-failure backoff this PR introduced.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "0" }
+	parked = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(parked:identify("user-zero"))
+	assert_true(parked:track("retry_after_zero_event"))
+	assert_equal(parked:flush(), false)
+	next_response_headers = nil
+	assert_equal(parked:publish_deferred(), false,
+		"a server saying 'retry now' must not be answered with our own backoff")
+	assert_equal(parked.flush_elapsed_seconds, parked.config.flush_interval_seconds,
+		"and the retry must be woken for the next tick")
+
+	-- The same zero on the CONSENT plane, which is its own branch.
+	reset()
+	storage.reset()
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "0" }
+	parked = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(parked:identify("user-zero-consent"))
+	assert_true(parked:set_consent(true))
+	next_response_headers = nil
+	assert_true(parked.consent_outbox ~= nil and #parked.consent_outbox > 0,
+		"the premise: the 429 retains the receipt")
+	assert_equal(parked:consent_send_deferred(), false,
+		"a server saying 'retry now' must not be answered with the receipt's own backoff")
+	assert_equal(parked.flush_elapsed_seconds, parked.config.flush_interval_seconds,
+		"and the receipt's retry must be woken for the next tick")
+
+	-- A retained batch inside its own backoff must not re-trigger the
+	-- full-queue flush every frame. The retained batch is dispatched first so
+	-- the queue cannot drain, and the automatic flush is refused inside the
+	-- window: neither side changes, and flush() ran on every tick for a
+	-- window approaching 60 seconds. flush() zeroes the elapsed clock, so the
+	-- clock itself is the witness — under the defect it never accumulates.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 503
+	parked = assert(sdk.new(config({ flush_interval_seconds = 9999, batch_size = 2 })))
+	assert_true(parked:identify("user-spin"))
+	assert_true(parked:track("spin_first_event"))
+	assert_equal(parked:flush(), false)
+	assert_true(parked.in_flight_batch ~= nil, "the premise: the 503 retains the batch")
+	assert_true(parked:publish_deferred(), "the premise: and arms its own window")
+	assert_true(parked:track("spin_queued_1"))
+	assert_true(parked:track("spin_queued_2"))
+	parked.flush_elapsed_seconds = 0
+	parked:update(0.1)
+	parked:update(0.1)
+	parked:update(0.1)
+	assert_true(parked.flush_elapsed_seconds > 0.25,
+		"the full queue behind a deferred retained batch must not flush every frame: "
+			.. "elapsed = " .. tostring(parked.flush_elapsed_seconds))
 	storage.reset()
 end
 
