@@ -218,8 +218,9 @@ README, `docs/`, and the skill above are the reference.
 | `user_id` | `nil` | Initial known-user attribution |
 | `batch_size` | `25` | Flush trigger, 1–100 |
 | `buffer_size` | `1000` | Max queued events (≥1); cross-SDK canonical default |
-| `flush_interval_seconds` | `1` | Time-based flush trigger (>0) |
+| `flush_interval_seconds` | `15` (was `1`) | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value. |
 | `publish_timeout_seconds` | `2` | Per-request timeout (>0) |
+| `request_compression_enabled` | `true` | Compress analytics batch bodies over 1 KiB with `Content-Encoding: deflate` (RFC 1950 zlib — see [Request compression](#request-compression)). Sub-threshold bodies go uncompressed: zlib framing makes a single-event batch bigger, not smaller. No-op on engine versions without the `zlib` module. |
 | `token_refresh_lead_ms` | `60000` | Refresh lead before token expiry (≥0) |
 | `spool_enabled` | `true` | Durable offline event spool ([details](#offline-durability-event-spool)); `false` also clears a previously persisted record at init |
 | `spool_max_events` | `500` | Max spooled entries (≥1); oldest evicted first |
@@ -415,6 +416,43 @@ end)
 Events persisted this way are removed from the spool as soon as their normal
 delivery is acknowledged, so the snapshot costs nothing when the app keeps
 running.
+
+
+## Request compression
+
+Analytics batch bodies over 1 KiB are compressed with
+`Content-Encoding: deflate`. A batch body is the same envelope keys repeated
+per event — close to the best case deflate has — so a full batch comes down to
+a few percent of its size. Bodies under the threshold are sent as-is, because
+zlib framing costs 6 bytes before the deflate stream's own overhead and makes a
+single-event batch bigger rather than smaller.
+
+**Why `deflate` and not `gzip`, when the other ShardPilot SDKs send gzip.** The
+engine's `zlib` module produces RFC 1950 zlib framing and nothing else. Framing
+gzip by hand needs a CRC32 over the whole uncompressed batch, and there is
+nothing to borrow — zlib's own trailer is Adler-32, a different checksum — so
+it would mean a pure-Lua CRC32 over tens of kilobytes on the flush path: a
+frame hitch traded for the bytes this feature exists to save. The ingest server
+reads RFC 1950 on the `deflate` coding for exactly this reason. It is the same
+lane, the same body cap, and the same refusal codes as the gzip SDKs.
+
+Three things worth knowing:
+
+- **The ingest body cap applies to the UNCOMPRESSED body.** Compression buys
+  throughput, not headroom — keep sizing against `batch_size` as before.
+- **A deployment that cannot read the coding never costs you events.** It
+  answers `400` with detail code `unsupported_content_encoding`; the client
+  stops compressing for the rest of the session and **keeps** the batch,
+  re-sending it uncompressed on the next tick. An encoding refusal is the one
+  ordinary 400 this SDK does not treat as terminal, because the next attempt
+  sends different bytes. The match is on that detail code and never on the bare
+  400 — an unrelated validation failure must not change your transport, nor
+  start retaining batches the server rejected permanently.
+- **Engine versions without `zlib` simply do not compress.** The module is
+  feature-detected; its absence is an ordinary uncompressed publish, never an
+  error.
+
+Set `request_compression_enabled = false` to opt out entirely.
 
 ## Remote config
 

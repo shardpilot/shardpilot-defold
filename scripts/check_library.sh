@@ -22,6 +22,7 @@ required_files=(
   shardpilot/storage.lua
   shardpilot/version.lua
   shardpilot/schema_revision.lua
+  shardpilot/compression.lua
   shardpilot/crash.lua
   shardpilot/crash/client.lua
   shardpilot/crash/event.lua

@@ -6,6 +6,68 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **Retry wakes now cover every shape of retained work, and a server's
+  `Retry-After` keeps its own expiry.** Four fixes to the retry pacing
+  separated from `flush_interval_seconds` earlier in this release, all found by
+  review of that change:
+
+  - A retained **Mode B 401** arms no deadline on purpose — a freshly minted
+    token should be tried at once — but the batch has already left the queue,
+    so nothing woke it and it waited out the whole cadence. It now retries on
+    the next `update(dt)`. A SECOND 401 for the same batch means the fresh
+    token did not help, so that one paces on the ordinary backoff instead of
+    minting a token every frame.
+  - A **spool restored at startup** sits in the resend queue with no batch
+    selected until a publish runs, so neither an expired persisted
+    `Retry-After` nor the common no-deadline restart had anything to wake it.
+    Both do now.
+  - A **server-sent `Retry-After` is tracked separately** from our own
+    backoff. Ownership used to be recorded only when the server's deadline was
+    the longer of the two, so a `Retry-After: 1` arriving inside a two-second
+    client window was marked client-owned — and the next explicit `flush()`
+    bypassed a server instruction outright. An explicit flush now waits out
+    exactly the server's window and no more.
+  - A **client window whose batch is then dropped** no longer blocks the next
+    automatic publish. This became reachable only when an explicit `flush()`
+    gained the right to bypass our own backoff: that attempt can run inside a
+    live window and come back terminal, leaving a deadline that belonged to
+    discarded work — up to the 60s backoff cap.
+
+  `docs/configuration.md`'s copyable configuration no longer pins
+  `flush_interval_seconds = 1`, which would have kept the old
+  one-request-per-event behaviour for anyone starting from it.
+
+- **Analytics batch bodies over 1 KiB are now compressed** with
+  `Content-Encoding: deflate`, controlled by the new
+  `request_compression_enabled` config (default `true`). A batch body is the
+  same envelope keys repeated per event, so it compresses hard. Sub-threshold
+  bodies are sent as-is, because zlib framing costs 6 bytes before the deflate
+  stream's own overhead and makes a single-event batch bigger rather than
+  smaller; so is any body compression fails to shrink.
+
+  **`deflate`, not `gzip`, and deliberately.** The engine's `zlib` module
+  produces RFC 1950 zlib framing and nothing else. Framing gzip by hand needs a
+  CRC32 over the whole uncompressed batch — zlib's own trailer is Adler-32, a
+  different checksum, so there is nothing to borrow — which means a pure-Lua
+  CRC32 over tens of kilobytes on the flush path: a frame hitch traded for the
+  bytes this change exists to save. The ingest server reads RFC 1950 on the
+  `deflate` coding for exactly this reason.
+
+  The ingest body cap still applies to the **uncompressed** body, so
+  compression buys throughput and not headroom.
+
+  A deployment that cannot read the coding never costs events: it answers `400`
+  with detail code `unsupported_content_encoding`, and the client stops
+  compressing for the session and **keeps** the batch, re-sending it
+  uncompressed on the next tick. An encoding refusal is the one ordinary 400
+  this SDK does not treat as terminal, because the next attempt sends different
+  bytes. The match is on that detail code and never on the bare 400 — an
+  unrelated validation failure must neither change the transport nor start
+  retaining batches the server rejected permanently.
+
+  Engine versions without the `zlib` module simply do not compress: the module
+  is feature-detected and its absence is an ordinary uncompressed publish.
+
 ## v0.10.0 — 2026-07-30 — early alpha
 
 - **Crash reports can now be attributed to a player.** New optional
