@@ -2237,10 +2237,12 @@ function Client:update(dt)
 	-- suppression: an undispatched GRANT receipt blocks every event leg by
 	-- design (ordering, not pacing), so while that receipt sits inside its own
 	-- window the queue cannot drain either — and a server Retry-After there
-	-- can run to 24 hours, not 60 seconds.
+	-- can run to 24 hours, not 60 seconds. An earlier receipt ON THE WIRE
+	-- holds it back the same way for a whole round trip, so the test is
+	-- whether the outbox can dispatch at all, not whether a window is armed.
 	local retained_publish_deferred =
 		(self.in_flight_batch ~= nil and self:publish_deferred())
-		or (self:grant_receipt_pending_dispatch() and self:consent_send_deferred())
+		or (self:grant_receipt_pending_dispatch() and self:consent_dispatch_blocked())
 	if (queue.size(self.queue) >= self.config.batch_size and not retained_publish_deferred)
 		or self.flush_elapsed_seconds >= self.config.flush_interval_seconds then
 		self.flush_elapsed_seconds = 0
@@ -2861,7 +2863,13 @@ function Client:publish_retry_due()
 	-- is the wake that ends this: consent_retry_due() fires when its window
 	-- expires, the grant is handed over, the gate releases by key identity,
 	-- and the same flush() goes on to publish this batch (Codex on #46).
-	if self:grant_receipt_pending_dispatch() and self:consent_send_deferred() then
+	--
+	-- BLOCKED, not merely deferred: an earlier receipt already on the wire
+	-- holds the grant back exactly as an armed window does, and that state
+	-- lasts a whole request round trip. Not suppressed when the outbox can
+	-- actually dispatch — then this wake is what pumps it, and the grant goes
+	-- out on the very flush this predicate triggers.
+	if self:grant_receipt_pending_dispatch() and self:consent_dispatch_blocked() then
 		return false
 	end
 	-- Spool chunks count. A batch restored from a previous launch sits in
@@ -3043,6 +3051,20 @@ end
 
 function Client:consent_send_deferred()
 	return self.consent_retry_after_ms ~= nil and clock.unix_ms() < self.consent_retry_after_ms
+end
+
+-- Whether the outbox can hand ANYTHING to the transport on this tick: the
+-- exact condition try_send_consent_outbox() refuses on, named once because
+-- three separate places now have to predict it.
+--
+-- Delivery is serial, so a receipt already on the wire blocks the rest of the
+-- trail just as firmly as an armed window does — and an undispatched GRANT
+-- behind it goes on holding every event leg meanwhile. The wakes that would
+-- otherwise fire into that state have to test BOTH halves; testing only the
+-- window is what left the in-flight case spinning after the deferred one was
+-- fixed (Codex on #46).
+function Client:consent_dispatch_blocked()
+	return self.consent_send_in_flight or self:consent_send_deferred()
 end
 
 -- A user_verified-keyed receipt PARKS while the current session cannot
@@ -3366,7 +3388,7 @@ function Client:try_send_consent_outbox()
 	-- suppresses it terminally. Correctness does not yield to caller intent,
 	-- and the suite pins it either way (see the "dispatch-based, not
 	-- window-based" case).
-	if self.consent_send_in_flight or self:consent_send_deferred() then
+	if self:consent_dispatch_blocked() then
 		return false
 	end
 	local credential

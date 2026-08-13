@@ -8520,6 +8520,133 @@ end)()
 	gated:shutdown()
 	storage.reset()
 
+	-- ── ...and behind an IN-FLIGHT consent head ────────────────────────────
+	--
+	-- The case above only covers a grant held by its own WINDOW. Delivery is
+	-- serial, so an earlier receipt already on the wire holds the grant back
+	-- just as firmly — and with it every event leg — for a whole request round
+	-- trip, with no window armed anywhere. Both wakes have to test whether the
+	-- outbox can dispatch AT ALL, which is the condition
+	-- try_send_consent_outbox() itself refuses on.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+
+	next_status = 503
+	next_response_headers = { ["retry-after"] = "3" }
+	local head_seeder = assert(sdk.new(config_mode_a({
+		flush_interval_seconds = 9999, spool_enabled = true,
+	})))
+	assert_true(head_seeder:track("head_gated_event"))
+	assert_equal(head_seeder:flush(), false, "the failure spools the batch with the server's window")
+	next_response_headers = nil
+	head_seeder:shutdown()
+
+	-- Two receipts: the head dispatches and stays on the wire, the GRANT
+	-- behind it cannot be handed over and goes on holding the event leg.
+	-- Both keyed to historic anons, so the retained-denial convergence at load
+	-- (which requires the receipt's anon to be the current one) stays out of
+	-- this.
+	assert_true(storage.save_consent_outbox(identity_scope, {
+		{
+			idempotency_key = "head-denial-key",
+			workspace_id = "workspace-example",
+			app_id = "app-example",
+			environment_id = "develop",
+			actor_identifier = "anon-head-denial",
+			kind = "anon",
+			decided_at = "2026-07-01T00:00:00.000Z",
+			categories = { analytics = false },
+			anonymous_id = "anon-head-denial",
+		},
+		{
+			idempotency_key = "queued-grant-key",
+			workspace_id = "workspace-example",
+			app_id = "app-example",
+			environment_id = "develop",
+			actor_identifier = "anon-head-grant",
+			kind = "anon",
+			decided_at = "2026-07-02T00:00:00.000Z",
+			categories = { analytics = true },
+			anonymous_id = "anon-head-grant",
+		},
+	}) ~= false)
+
+	reset()
+	local head_held, head_restore = hold_http_requests()
+	local headed = assert(sdk.new(config_mode_a({
+		flush_interval_seconds = 9999, spool_enabled = true,
+	})))
+	assert_equal(#head_held, 1, "the head receipt is on the wire with its callback held")
+	assert_true(headed.consent_send_in_flight, "so the outbox can hand nothing else over")
+	assert_equal(headed:consent_send_deferred(), false, "and no window is armed anywhere")
+	assert_true(headed:grant_receipt_pending_dispatch(),
+		"while the grant queued behind it still holds the event leg")
+	assert_true(headed:spool_pending(), "and the relaunch reloaded the spooled chunk")
+	socket.now = socket.now + 10
+	assert_equal(headed:publish_deferred(), false, "the persisted publish window has expired")
+
+	local headed_before = #requests
+	headed:update(0.1)
+	headed:update(0.1)
+	headed:update(0.1)
+	assert_equal(#requests, headed_before, "nothing can go out behind the in-flight head")
+	assert_true(headed.flush_elapsed_seconds > 0.29,
+		"the publish wake must stay quiet while an IN-FLIGHT receipt holds the grant, not only while the grant is deferred")
+	head_restore()
+	storage.reset()
+
+	-- The full-queue trigger has the identical hole — it is the trigger that
+	-- was fixed for the DEFERRED grant one round earlier, tested separately
+	-- here so a mutation of either clause has its own witness.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	assert_true(storage.save_consent_outbox(identity_scope, {
+		{
+			idempotency_key = "head-grant-key",
+			workspace_id = "workspace-example",
+			app_id = "app-example",
+			environment_id = "develop",
+			actor_identifier = "anon-first-grant",
+			kind = "anon",
+			decided_at = "2026-07-01T00:00:00.000Z",
+			categories = { analytics = true },
+			anonymous_id = "anon-first-grant",
+		},
+		{
+			idempotency_key = "second-grant-key",
+			workspace_id = "workspace-example",
+			app_id = "app-example",
+			environment_id = "develop",
+			actor_identifier = "anon-second-grant",
+			kind = "anon",
+			decided_at = "2026-07-02T00:00:00.000Z",
+			categories = { analytics = true },
+			anonymous_id = "anon-second-grant",
+		},
+	}) ~= false)
+
+	local queue_held, queue_restore = hold_http_requests()
+	local queued = assert(sdk.new(config_mode_a({
+		flush_interval_seconds = 9999, batch_size = 2,
+	})))
+	assert_equal(#queue_held, 1, "the head grant is on the wire with its callback held")
+	assert_true(queued:grant_receipt_pending_dispatch(),
+		"the second grant is released by key identity only for the one in flight")
+	assert_true(queued:track("queued_one"))
+	assert_true(queued:track("queued_two"))
+
+	local queued_before = #requests
+	queued:update(0.1)
+	queued:update(0.1)
+	queued:update(0.1)
+	assert_equal(#requests, queued_before, "a full queue still cannot drain past the grant")
+	assert_true(queued.flush_elapsed_seconds > 0.29,
+		"the full-queue trigger must be suppressed behind an in-flight consent head too")
+	queue_restore()
+	storage.reset()
+
 	-- ── A retry wake while the MINT it needs is in flight ──────────────────
 	--
 	-- An expired backoff that starts an asynchronous token_provider puts no
