@@ -9131,6 +9131,187 @@ end)()
 	preflight:shutdown()
 	storage.reset()
 
+	-- ── ...and when a CHAINED handoff swallows the continuation ────────────
+	--
+	-- The settlement wake arms one flush. If a second dispatchable grant is
+	-- still pending, that flush returns at the ordering gate, and the consent
+	-- callbacks chain the remaining receipt without ever waking the events
+	-- plane. The caller's window then silences the only predicates left —
+	-- which is the bug: a deadline an owed bypass already overrides must not
+	-- suppress the wake that would deliver it.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local function verified_grant(key, stamp)
+		return {
+			idempotency_key = key,
+			workspace_id = "workspace-example",
+			app_id = "app-example",
+			environment_id = "develop",
+			actor_identifier = "user-a",
+			kind = "user_verified",
+			decided_at = stamp,
+			categories = { analytics = true },
+			anonymous_id = "anon-chained",
+		}
+	end
+	assert_true(storage.save_consent_outbox(identity_scope, {
+		verified_grant("chained-grant-one", "2026-07-02T00:00:00.000Z"),
+		verified_grant("chained-grant-two", "2026-07-03T00:00:00.000Z"),
+	}) ~= false)
+
+	local chain_mint = nil
+	local chained = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		batch_size = 20,
+		token_provider = function(callback) chain_mint = callback end,
+	})))
+	assert_true(chained:track("chained_event"))
+	assert_equal(chained:flush(), false, "the first flush starts the mint")
+	chain_mint("token-chained", math.floor(socket.now * 1000) + 3600000, nil)
+	chain_mint = nil
+
+	next_status = 500
+	assert_equal(chained:flush(), false)
+	assert_true(chained.in_flight_batch ~= nil, "the batch is retained")
+	socket.now = socket.now + 7200
+	chained.publish_retry_after_ms = math.floor(socket.now * 1000) + 60000
+	assert_equal(chained:publish_server_deferred(), false, "the window is ours to bypass")
+
+	-- Hold every callback from here, so the first grant genuinely stays on the
+	-- wire and the gate really does stop the continuation.
+	local chain_held, chain_restore = hold_http_requests()
+	assert_true(chained:identify("user-a"))
+	assert_true(chained.token_request_in_flight, "the consent dispatch started the mint")
+
+	local chain_flushed, chain_reason = chained:flush()
+	assert_equal(chain_flushed, false)
+	assert_equal(chain_reason, "consent_receipt_pending", "the explicit attempt ends at the gate")
+
+	chain_mint("token-chained-2", math.floor(socket.now * 1000) + 3600000, nil)
+	local before_chain = #requests
+	chained:update(0)
+	assert_equal(#requests, before_chain + 1, "the settlement flush hands off the FIRST grant only")
+	assert_true(chained:grant_receipt_pending_dispatch(), "the second grant still holds the event leg")
+
+	-- The chain delivers the rest with no help from update().
+	chain_held[#chain_held](nil, nil, { status = 202, response = "{}" })
+	assert_equal(#requests, before_chain + 2, "the callback chained the second grant")
+	chain_held[#chain_held](nil, nil, { status = 202, response = "{}" })
+	assert_equal(#chained.consent_outbox, 0, "the outbox is drained")
+	assert_true(chained:publish_deferred(), "and the caller's window is still live")
+
+	chained:update(0.1)
+	assert_equal(#requests, before_chain + 3,
+		"the retained batch must still go out: a window the owed bypass overrides cannot silence its own wake")
+	chain_restore()
+	storage.reset()
+
+	-- ── An owed bypass dies with the mint it was owed through ──────────────
+	--
+	-- The bypass was recorded against the window live when the caller was
+	-- turned away. A backoff armed by a FAILED mint is fresh pacing toward a
+	-- provider that just broke, and the caller never overrode that — leaving
+	-- the bypass set lets the next cadence flush call itself the continuation
+	-- and hit the failing provider on the batching clock.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local dead_mint = nil
+	local dead_calls = 0
+	local dead = assert(sdk.new(config({
+		flush_interval_seconds = 1,
+		batch_size = 20,
+		token_provider = function(callback)
+			dead_calls = dead_calls + 1
+			dead_mint = callback
+		end,
+	})))
+	-- Tracked BEFORE any identify, so the batch is anon-keyed and identify()
+	-- below is not refused for stranding user-keyed work.
+	assert_true(dead:track("dead_mint_event"))
+	assert_equal(dead:flush(), false)
+	dead_mint("token-dead", math.floor(socket.now * 1000) + 3600000, nil)
+	dead_mint = nil
+
+	next_status = 500
+	assert_equal(dead:flush(), false)
+	assert_true(dead.in_flight_batch ~= nil, "the batch is retained")
+	socket.now = socket.now + 7200
+	dead.publish_retry_after_ms = math.floor(socket.now * 1000) + 60000
+
+	-- Signing in invalidates the stale token, so the next attempt has no
+	-- credential at all and really is stopped by the mint. A token merely PAST
+	-- its expiry does not stop it: refresh_token() returns true whenever one is
+	-- installed, and the publish rides the old credential.
+	assert_true(dead:identify("user-a"))
+	assert_equal(dead.token, nil, "the stale token is gone")
+
+	-- The caller's explicit attempt is stopped by a mint...
+	assert_equal(dead:flush(), false)
+	assert_true(dead.publish_bypass_owed, "the caller is owed a bypass")
+	-- ...and that mint fails.
+	dead_mint(nil, nil, "provider exploded")
+	assert_equal(dead.publish_bypass_owed, false,
+		"the bypass dies with the mint it was owed through")
+
+	local dead_before = dead_calls
+	for _ = 1, 3 do
+		dead:update(2)
+		if dead_mint ~= nil then
+			dead_mint(nil, nil, "provider exploded again")
+			dead_mint = nil
+		end
+	end
+	assert_equal(dead_calls, dead_before,
+		"a stale bypass must not let cadence ticks skip the backoff armed by the failed mint")
+	dead:shutdown()
+	storage.reset()
+
+	-- ── The full-queue trigger must NOT learn about the owed bypass ────────
+	--
+	-- Pinning a deliberate asymmetry, because making these two symmetric is
+	-- the obvious tidy-up and it is a regression. An owed bypass is set
+	-- precisely WHILE a mint is in flight, so a full-queue trigger that
+	-- honoured it would fire every frame until the mint settles — the spin
+	-- the gate exists to stop. The retry clock can honour it safely only
+	-- because it suppresses itself on token_request_in_flight.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local asym_mint = nil
+	local asym = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		batch_size = 2,
+		token_provider = function(callback) asym_mint = callback end,
+	})))
+	assert_true(asym:track("asym_first"))
+	assert_equal(asym:flush(), false)
+	asym_mint("token-asym", math.floor(socket.now * 1000) + 3600000, nil)
+	asym_mint = nil
+
+	next_status = 500
+	assert_equal(asym:flush(), false)
+	assert_true(asym.in_flight_batch ~= nil, "a retained batch holds the pipeline")
+	socket.now = socket.now + 7200
+	asym.publish_retry_after_ms = math.floor(socket.now * 1000) + 60000
+
+	-- A full queue behind it, and a caller stopped by a mint.
+	assert_true(asym:track("asym_queued_one"))
+	assert_true(asym:track("asym_queued_two"))
+	assert_true(asym:identify("user-a"))
+	assert_equal(asym:flush(), false)
+	assert_true(asym.publish_bypass_owed, "the caller is owed a bypass")
+	assert_true(asym.token_request_in_flight, "and the mint that stopped them is still in flight")
+
+	asym:update(0.1)
+	asym:update(0.1)
+	asym:update(0.1)
+	assert_true(asym.flush_elapsed_seconds > 0.29,
+		"the full-queue trigger must stay on the bare window: honouring the owed bypass here spins every frame until the mint settles")
+	asym:shutdown()
+	storage.reset()
+
 	-- ── Retry-After: 0 through a bypassed window, and its bound ────────────
 	reset()
 	storage.reset()

@@ -2248,6 +2248,14 @@ function Client:update(dt)
 	-- start_publish_batch could enforce the deadline. That is worse than a
 	-- spin: the 1–60s pacing exists precisely to keep a failing provider from
 	-- being hammered, and the queue-only deadline walked straight around it.
+	-- The BARE deadline here, deliberately, where the retry clock below asks
+	-- the dispatch question instead. The two are not the same question and
+	-- making them symmetric is a regression: an owed bypass is set precisely
+	-- WHILE a mint is in flight, so honouring it here would fire this trigger
+	-- every frame until the mint settles — the spin this gate exists to stop.
+	-- The retry clock can honour it safely because it suppresses itself on
+	-- token_request_in_flight a few lines further down; this trigger has no
+	-- such guard, and does not need one while it asks only about the window.
 	local publish_work_deferred =
 		(self:has_pending_publish_work() and self:publish_deferred())
 		or (self:grant_receipt_pending_dispatch() and self:consent_dispatch_blocked())
@@ -2758,6 +2766,14 @@ function Client:fail_token_settlement()
 	self.token = nil
 	self.token_expires_at_ms = nil
 	self.stats.last_error = "token_unavailable"
+	-- The owed bypass dies with the mint it was owed through. It was recorded
+	-- against the window that was live when the caller was turned away; the
+	-- backoff armed just below is FRESH pacing toward a provider that has now
+	-- failed, and the caller never overrode that. Leaving it set would let the
+	-- next cadence flush call itself the caller's continuation and skip the
+	-- new deadline — hitting the failing provider on the batching clock, which
+	-- is the pacing this path exists to impose (Codex on #46).
+	self.publish_bypass_owed = false
 	-- PENDING, not retained: a mint started for an ordinary partial queue has
 	-- not drained it yet (can_publish runs before the drain), so the retained
 	-- predicate is false and this armed nothing at all — while the flush that
@@ -2914,7 +2930,14 @@ function Client:publish_retry_due()
 	-- papered over with a contrived assertion. What it saves is calling
 	-- flush() on every single frame for the whole window, which would also
 	-- pump the consent outbox and the summary enqueue each frame.
-	if self:publish_deferred() then
+	--
+	-- The DISPATCH question, not the bare deadline: a window an owed bypass
+	-- already overrides must not silence the wake that would deliver it. An
+	-- explicit caller stopped by a mint has no wake of its own — the
+	-- settlement arms one, but a consent handoff can swallow that flush, and
+	-- then the only thing left is this predicate suppressing itself against a
+	-- deadline the caller outranks (Codex on #46).
+	if self:publish_dispatch_deferred(true) then
 		return false
 	end
 	-- A mint already in flight blocks this retry as surely as a live window:
