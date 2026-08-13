@@ -2674,6 +2674,49 @@ local function test_retry_wake_republishes_without_a_flush_tick()
 	assert_true(parked.flush_elapsed_seconds > 0.25,
 		"the full queue behind a deferred retained batch must not flush every frame: "
 			.. "elapsed = " .. tostring(parked.flush_elapsed_seconds))
+
+	-- The CONSENT plane holds the queue the same way: an undispatched grant
+	-- blocks every event leg by design, so while that receipt sits inside its
+	-- own window the queue cannot drain either — and a server Retry-After
+	-- there runs to 24 hours, not 60 seconds.
+	reset()
+	storage.reset()
+	next_status = 503
+	parked = assert(sdk.new(config({ flush_interval_seconds = 9999, batch_size = 2 })))
+	assert_true(parked:identify("user-grant-spin"))
+	assert_true(parked:set_consent(true))
+	assert_true(parked:consent_send_deferred(), "the premise: the grant receipt is inside its window")
+	assert_true(parked:grant_receipt_pending_dispatch(),
+		"the premise: and an undispatched grant holds the event legs")
+	assert_true(parked:track("grant_spin_queued_1"))
+	assert_true(parked:track("grant_spin_queued_2"))
+	parked.flush_elapsed_seconds = 0
+	parked:update(0.1)
+	parked:update(0.1)
+	parked:update(0.1)
+	assert_true(parked.flush_elapsed_seconds > 0.25,
+		"the full queue behind a deferred GRANT must not flush every frame either: "
+			.. "elapsed = " .. tostring(parked.flush_elapsed_seconds))
+
+	-- A first 401 taken on an explicit flush that BYPASSED a live client
+	-- backoff must not have its wake blocked by that superseded deadline.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	next_status = 503
+	parked = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(parked:identify("user-bypass"))
+	assert_true(parked:track("bypass_401_event"))
+	assert_equal(parked:flush(), false, "a transient failure arms OUR backoff")
+	assert_true(parked:publish_deferred(), "the premise: a client-owned window is live")
+	assert_equal(parked:publish_server_deferred(), false, "the premise: and it is ours, not the server's")
+	next_status = 401
+	assert_equal(parked:flush(), false, "an explicit flush bypasses our own backoff and takes the 401")
+	assert_equal(parked:publish_deferred(), false,
+		"the superseded client deadline must be cleared, or the promised immediate "
+			.. "authenticated retry waits out a window approaching 60 seconds")
+	assert_equal(parked.flush_elapsed_seconds, parked.config.flush_interval_seconds,
+		"and the retry is woken for the next tick")
 	storage.reset()
 end
 
@@ -8113,6 +8156,14 @@ end
 	assert_equal(compression.is_encoding_refusal("unsupported_content_encoding"), true)
 	assert_equal(compression.is_encoding_refusal("invalid_content_encoding"), true)
 	assert_equal(compression.is_encoding_refusal("unknown_field,unsupported_content_encoding"), true)
+	-- WHOLE TOKENS. A substring match treats any code that merely CONTAINS a
+	-- refusal code as the refusal itself, and the cost runs both ways: a
+	-- terminally rejected batch is retained and retried, and compression
+	-- latches off for the session. Exactness is the entire reason this
+	-- discriminates on codes rather than on the bare 400.
+	assert_equal(compression.is_encoding_refusal("not_invalid_content_encoding"), false)
+	assert_equal(compression.is_encoding_refusal("unsupported_content_encoding_policy"), false)
+	assert_equal(compression.is_encoding_refusal("a,unsupported_content_encoding,b"), true)
 	assert_equal(compression.is_encoding_refusal("unknown_event"), false)
 	assert_equal(compression.is_encoding_refusal("request_too_large"), false)
 	assert_equal(compression.is_encoding_refusal(""), false)

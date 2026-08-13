@@ -2221,7 +2221,14 @@ function Client:update(dt)
 	-- retry clock below is what publishes this batch when its window ends —
 	-- the same reason publish_retry_due() does not fire inside it (Codex on
 	-- #46).
-	local retained_publish_deferred = self.in_flight_batch ~= nil and self:publish_deferred()
+	-- The consent plane holds the queue the same way and needs the same
+	-- suppression: an undispatched GRANT receipt blocks every event leg by
+	-- design (ordering, not pacing), so while that receipt sits inside its own
+	-- window the queue cannot drain either — and a server Retry-After there
+	-- can run to 24 hours, not 60 seconds.
+	local retained_publish_deferred =
+		(self.in_flight_batch ~= nil and self:publish_deferred())
+		or (self:grant_receipt_pending_dispatch() and self:consent_send_deferred())
 	if (queue.size(self.queue) >= self.config.batch_size and not retained_publish_deferred)
 		or self.flush_elapsed_seconds >= self.config.flush_interval_seconds then
 		self.flush_elapsed_seconds = 0
@@ -4252,6 +4259,17 @@ function Client:start_publish_batch(automatic)
 				self:defer_backoff()
 			else
 				events.auth_retried = true
+				-- The wake is worthless while a superseded CLIENT deadline is
+				-- still armed: an explicit flush() may have bypassed a live
+				-- backoff to make this very attempt, and start_publish_batch()
+				-- refuses the automatic retry the wake triggers — so the
+				-- "immediate authenticated retry" waits out the remainder of a
+				-- window approaching 60s. Cleared exactly as the
+				-- compression-refusal path above clears it, and for the same
+				-- reason; the SERVER's deadline survives, because Retry-After
+				-- outlives the attempt that received it (Codex on #46).
+				self.publish_retry_after_ms = self.publish_server_retry_after_ms
+				self.publish_backoff_attempt = 0
 				self.flush_elapsed_seconds = self.config.flush_interval_seconds
 			end
 		end

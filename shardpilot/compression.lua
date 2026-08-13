@@ -78,12 +78,24 @@ end
 -- `detail_codes` is the comma-joined detail-code list the transport lifts out
 -- of the ingest error envelope; nil or empty means the body carried no
 -- envelope and the answer is no.
+--
+-- WHOLE TOKENS, not substrings. A plain find() over the joined list matches
+-- any code that merely CONTAINS one of these — `not_invalid_content_encoding`,
+-- `unsupported_content_encoding_policy` — and the consequences run both ways:
+-- a terminally rejected batch is retained and retried, and compression is
+-- latched off for the session. The whole point of discriminating on codes
+-- rather than the bare 400 is exactness, so the match has to be exact
+-- (Codex on #46).
 function M.is_encoding_refusal(detail_codes)
 	if type(detail_codes) ~= "string" or detail_codes == "" then
 		return false
 	end
-	return detail_codes:find(M.UNSUPPORTED_CODING_DETAIL, 1, true) ~= nil
-		or detail_codes:find(M.INVALID_CODING_DETAIL, 1, true) ~= nil
+	for code in detail_codes:gmatch("[^,]+") do
+		if code == M.UNSUPPORTED_CODING_DETAIL or code == M.INVALID_CODING_DETAIL then
+			return true
+		end
+	end
+	return false
 end
 
 return M
