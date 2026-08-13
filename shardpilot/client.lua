@@ -2647,6 +2647,14 @@ end
 -- full flush interval. Not an elseif: when both planes are holding work they
 -- were both waiting on this token, and they keep separate deadlines and
 -- separate attempt counters.
+--
+-- The consent arm asks whether a receipt was WAITING ON THIS MINT, not
+-- whether the outbox is nonempty. Those differ, and the difference is worse
+-- than the stall it was fixing: a mint started for EVENT work, with an outbox
+-- holding only parked receipts or receipts the publishable key carries, armed
+-- a consent deadline nothing was blocked on. Nothing clears it when it
+-- expires with nothing dispatchable, so the wake fires forever and update()
+-- calls flush() every frame (Codex on #46).
 function Client:fail_token_settlement()
 	self.token = nil
 	self.token_expires_at_ms = nil
@@ -2654,9 +2662,33 @@ function Client:fail_token_settlement()
 	if self:has_retained_publish_work() then
 		self:defer_backoff()
 	end
-	if self.consent_outbox ~= nil and #self.consent_outbox > 0 then
+	if self:receipt_awaiting_token() ~= nil then
 		self:defer_consent_backoff()
 	end
+end
+
+-- The oldest receipt whose dispatch would carry the MINTED TOKEN — the only
+-- receipts a failed mint actually delays.
+--
+-- Mirrors the credential choice at the dispatch site: a user_verified receipt
+-- is token-only, and an anon receipt keyed to THIS session's anonymous id
+-- takes the token whenever a provider is configured. A historic-anon receipt
+-- rides the publishable key and is not waiting on any mint; a parked receipt
+-- is not dispatchable at all.
+function Client:receipt_awaiting_token()
+	if self.config.token_provider == nil or self.consent_outbox == nil then
+		return nil
+	end
+	for i = 1, #self.consent_outbox do
+		local receipt = self.consent_outbox[i]
+		if not self:receipt_parked(receipt)
+			and self:receipt_credential_available(receipt)
+			and (receipt.kind == "user_verified"
+				or receipt.actor_identifier == self.anonymous_id) then
+			return receipt
+		end
+	end
+	return nil
 end
 
 function Client:defer_backoff()
@@ -2750,6 +2782,15 @@ end
 -- perfectly healthy had no wake source at all except the flush tick — its
 -- retry silently inherited the batching cadence, which is the one thing a
 -- consent receipt's timing should never depend on.
+--
+-- DISPATCHABLE, not merely nonempty. An expired deadline over an outbox that
+-- holds nothing sendable — every receipt parked, or waiting for a credential
+-- this session has no configuration for — is a wake with no work behind it:
+-- try_send_consent_outbox() finds nothing, so nothing clears the deadline,
+-- and the wake fires on every single frame for the life of the process. The
+-- deadline is left armed rather than cleared on purpose: a receipt that
+-- becomes dispatchable later (the actor signs back in) then finds an already
+-- expired window and goes at once.
 function Client:consent_retry_due()
 	if self.consent_retry_after_ms == nil or self.consent_send_in_flight then
 		return false
@@ -2757,7 +2798,7 @@ function Client:consent_retry_due()
 	if self:consent_send_deferred() then
 		return false
 	end
-	return self.consent_outbox ~= nil and #self.consent_outbox > 0
+	return self:next_dispatchable_receipt() ~= nil
 end
 
 -- ── consent-receipt outbox ────────────────────────────────────────────────────

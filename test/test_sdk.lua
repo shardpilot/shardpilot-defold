@@ -2441,6 +2441,81 @@ local function test_retry_wake_republishes_without_a_flush_tick()
 	receipt_only:update(0)
 	assert_equal(consent_mints, consent_mints_at_settle,
 		"a failing provider must not be re-minted on every frame for a receipt either")
+
+	-- FIFTH subject, and it is the fourth one's own regression: arming the
+	-- consent clock for a NONEMPTY outbox rather than for work that was
+	-- waiting on this mint.
+	--
+	-- A mint started for EVENT work, over an outbox holding only a PARKED
+	-- receipt, armed a consent deadline nothing was blocked on. Nothing clears
+	-- it when it expires with nothing dispatchable, so the wake fires forever
+	-- and update() calls flush() every frame — permanently, which is worse
+	-- than the fifteen-second stall the arm was added to remove.
+	reset()
+	storage.reset()
+	local parked_mints = 0
+	local parked_settle = nil
+	local parked = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		token_provider = function(callback)
+			parked_mints = parked_mints + 1
+			if parked_mints == 1 then
+				-- The receipt's own mint fails, so it stays undispatched.
+				callback(nil, nil, "provider unavailable")
+			elseif parked_mints == 2 then
+				-- The event publish gets a token, so it can reach its 401.
+				callback("token-parked", nil, nil)
+			else
+				parked_settle = callback
+			end
+		end,
+	})))
+	-- The receipt is keyed to user-a; signing in as user-b PARKS it, because
+	-- the minted token vouches for the current user and no other. A parked
+	-- grant does not hold the event legs (grant_receipt_pending_dispatch
+	-- skips parked receipts), so the events plane below runs normally.
+	assert_true(parked:identify("user-a"))
+	assert_true(parked:set_consent(true))
+	assert_true(parked:identify("user-b"))
+	assert_true(parked.consent_outbox ~= nil and #parked.consent_outbox > 0,
+		"the premise: the outbox still holds the undispatched receipt")
+	assert_equal(parked:next_dispatchable_receipt(), nil,
+		"the premise: and nothing in it is dispatchable for this session")
+
+	-- Wait out the windows the receipt's own failed mint armed: what is under
+	-- test is what the NEXT failure arms.
+	parked.consent_retry_after_ms = nil
+	parked.publish_retry_after_ms = nil
+
+	next_status = 401
+	assert_true(parked:track("parked_outbox_event"))
+	assert_equal(parked:flush(), false)
+	assert_true(parked.in_flight_batch ~= nil and #parked.in_flight_batch > 0,
+		"the premise: the 401 retains an EVENT batch, so the re-mint is the events plane's")
+	parked:update(0)
+	assert_true(parked_settle ~= nil, "the retry asked the provider for a fresh token")
+	local deliver_parked = parked_settle
+	parked_settle = nil
+	deliver_parked(nil, nil, "provider unavailable")
+
+	assert_true(parked:publish_deferred(),
+		"the events plane armed, which is the half that WAS waiting on this mint")
+	assert_equal(parked:consent_send_deferred(), false,
+		"no receipt was waiting on this mint, so the consent clock must not be armed")
+	assert_equal(parked:consent_retry_due(), false,
+		"and an expired deadline over an undispatchable outbox must never come due, "
+			.. "or the wake fires on every frame for the life of the process")
+
+	-- The second half of the fix, pinned on its own rather than through the
+	-- first: whatever armed the deadline, an expired window over an outbox
+	-- with nothing dispatchable must not come due. Nothing clears such a
+	-- deadline — try_send_consent_outbox finds nothing to send — so a wake
+	-- keyed on "the outbox is nonempty" calls flush() every frame for the
+	-- life of the process.
+	parked.consent_retry_after_ms = (require "shardpilot.clock").unix_ms() - 1
+	assert_equal(parked:consent_send_deferred(), false, "the premise: the window has expired")
+	assert_equal(parked:consent_retry_due(), false,
+		"an expired window with nothing dispatchable behind it is a wake with no work")
 	storage.reset()
 end
 
