@@ -2860,6 +2860,22 @@ end
 -- own backoff — there is no continuation to owe anything to), and only when
 -- there is a CLIENT-owned window to bypass. A server deadline is never
 -- bypassable, so it is never recorded here.
+-- Whether the publish deadline refuses THIS attempt. The rule
+-- start_publish_batch enforces, named so flush() can ask it before spending a
+-- token mint on an attempt that is going to be refused.
+--
+-- Reads publish_bypass_owed without consuming it: the consumption belongs to
+-- the dispatch attempt itself, and asking twice must give the same answer.
+function Client:publish_dispatch_deferred(automatic)
+	if not self:publish_deferred() then
+		return false
+	end
+	if self:publish_server_deferred() then
+		return true
+	end
+	return automatic and not self.publish_bypass_owed
+end
+
 function Client:owe_publish_bypass(automatic)
 	if automatic or not self.token_request_in_flight then
 		return
@@ -4289,10 +4305,9 @@ function Client:start_publish_batch(automatic)
 	-- flush(). Consumed here whether or not a deadline is live — the attempt
 	-- the caller asked for is happening now, and a bypass left standing would
 	-- outrank some unrelated future window.
-	local bypass_owed = self.publish_bypass_owed
+	local refused = self:publish_dispatch_deferred(automatic)
 	self.publish_bypass_owed = false
-	if self:publish_deferred()
-		and ((automatic and not bypass_owed) or self:publish_server_deferred()) then
+	if refused then
 		return false, false, false
 	end
 	local events = self.in_flight_batch
@@ -4624,7 +4639,31 @@ function Client:flush(options)
 	if self:grant_receipt_pending_dispatch()
 		and (self.in_flight_batch ~= nil or queue.size(self.queue) > 0 or self:spool_pending()
 			or #self.owed_summaries > 0) then
+		-- The consent preflight above can itself have started the mint (a
+		-- token-vouched grant calls can_publish()), and this return happens
+		-- before the publish loop's own bypass hooks ever run. An explicit
+		-- caller whose attempt ends here is owed the same bypass as one whose
+		-- attempt ends at the events-side mint: the continuation that finally
+		-- publishes is the automatic flush the settlement wake drives, and it
+		-- would be refused against the deadline the caller outranked.
+		self:owe_publish_bypass(options.automatic == true)
 		return false, "consent_receipt_pending"
+	end
+
+	-- The publish deadline is enforced HERE, before a token is acquired.
+	-- can_publish() runs first inside the loop, so a cadence tick landing
+	-- inside a live window would mint — calling the HOST's token_provider —
+	-- purely for start_publish_batch to refuse the dispatch a few lines later.
+	-- At the 15s default inside a 60s backoff that is four provider calls
+	-- where the pacing promises one, and the retry the window is pacing still
+	-- ends up riding the batching clock.
+	--
+	-- Gated on there being pending work so this cannot change the empty-client
+	-- result: with nothing to publish the loop returns success before reaching
+	-- can_publish() anyway. Placed AFTER the consent dispatch and the gate, so
+	-- an events-plane window never holds up the consent plane.
+	if self:has_pending_publish_work() and self:publish_dispatch_deferred(options.automatic == true) then
+		return false
 	end
 
 	while true do

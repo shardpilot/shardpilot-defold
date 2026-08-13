@@ -8809,6 +8809,59 @@ end)()
 	hammering:shutdown()
 	storage.reset()
 
+	-- ── The CADENCE arm mints inside a live window ─────────────────────────
+	--
+	-- The suppression above guards the full-queue arm only. A backoff longer
+	-- than the flush interval — a 60s ladder, or a server Retry-After — is
+	-- crossed by cadence ticks, and each one calls can_publish() before
+	-- start_publish_batch can enforce the deadline. The dispatch is duly
+	-- refused; the HOST's token_provider has already been called.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local cadence_mint = nil
+	local cadence_calls = 0
+	local cadence = assert(sdk.new(config({
+		flush_interval_seconds = 1,
+		batch_size = 20,
+		token_provider = function(callback)
+			cadence_calls = cadence_calls + 1
+			cadence_mint = callback
+		end,
+	})))
+	assert_true(cadence:identify("user-example"))
+	assert_true(cadence:track("cadence_event"))
+	assert_equal(cadence:flush(), false, "the first flush starts the mint")
+	cadence_mint("token-cadence", math.floor(socket.now * 1000) + 3600000, nil)
+	cadence_mint = nil
+
+	next_status = 500
+	assert_equal(cadence:flush(), false)
+	assert_equal(#requests, 1, "the batch went out and failed")
+	assert_true(cadence.in_flight_batch ~= nil, "and is retained")
+
+	-- Past the token's life, then pin OUR window well beyond the cadence.
+	socket.now = socket.now + 7200
+	cadence.publish_retry_after_ms = math.floor(socket.now * 1000) + 60000
+	assert_true(cadence:publish_deferred(), "a window far longer than the interval")
+	assert_equal(cadence:publish_server_deferred(), false, "and it is ours")
+
+	local calls_before_cadence = cadence_calls
+	for _ = 1, 3 do
+		cadence:update(2)
+		-- A real provider settles between ticks; without this the in-flight
+		-- flag alone would hide the repetition.
+		if cadence_mint ~= nil then
+			cadence_mint("token-cadence-again", math.floor(socket.now * 1000) + 3600000, nil)
+			cadence_mint = nil
+		end
+	end
+	assert_equal(cadence_calls, calls_before_cadence,
+		"cadence ticks inside a live publish window must not mint: the deadline has to be enforced before the token, not after")
+	assert_true(cadence:publish_deferred(), "the window is still live throughout")
+	cadence:shutdown()
+	storage.reset()
+
 	-- ── A token that is stale the moment it arrives ────────────────────────
 	--
 	-- A numerically valid expires_at already inside token_refresh_lead_ms
@@ -9011,6 +9064,71 @@ end)()
 	assert_equal(#requests, 2,
 		"the caller's bypass must survive the mint, or the retry they asked for waits out a 60s window")
 	bypass:shutdown()
+	storage.reset()
+
+	-- ── ...and when the CONSENT preflight is what starts the mint ──────────
+	--
+	-- flush() dispatches the outbox before it publishes, so a token-vouched
+	-- grant can start the mint and the ordering gate then returns — above and
+	-- before either events-side bypass hook. The caller's explicit intent has
+	-- to survive that return path too, or the continuation hands off the grant
+	-- and then refuses the retained batch against the caller's own window.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	assert_true(storage.save_consent_outbox(identity_scope, { {
+		idempotency_key = "preflight-grant-key",
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		actor_identifier = "user-a",
+		kind = "user_verified",
+		decided_at = "2026-07-02T00:00:00.000Z",
+		categories = { analytics = true },
+		anonymous_id = "anon-preflight",
+	} }) ~= false)
+
+	local pre_mint = nil
+	local preflight = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		batch_size = 20,
+		token_provider = function(callback) pre_mint = callback end,
+	})))
+	assert_equal(#requests, 0, "the verified receipt is PARKED until its actor signs in")
+	assert_true(preflight:track("preflight_event"))
+	assert_equal(preflight:flush(), false, "the first flush starts the mint")
+	pre_mint("token-preflight", math.floor(socket.now * 1000) + 3600000, nil)
+	pre_mint = nil
+
+	next_status = 500
+	assert_equal(preflight:flush(), false)
+	assert_equal(#requests, 1, "the batch went out and failed")
+	assert_true(preflight.in_flight_batch ~= nil, "and is retained")
+
+	-- Stale the token, then pin the caller-bypassable window at a minute.
+	socket.now = socket.now + 7200
+	preflight.publish_retry_after_ms = math.floor(socket.now * 1000) + 60000
+	assert_equal(preflight:publish_server_deferred(), false, "the window is ours to bypass")
+
+	-- Signing in unparks the grant and invalidates the stale token, so the
+	-- receipt's own dispatch is what asks for the next one.
+	assert_true(preflight:identify("user-a"))
+	assert_true(preflight.token_request_in_flight, "the CONSENT dispatch started the mint")
+	assert_equal(#preflight.consent_outbox, 1, "and the grant is still undispatched")
+
+	next_status = 202
+	local pre_flushed, pre_reason = preflight:flush()
+	assert_equal(pre_flushed, false)
+	assert_equal(pre_reason, "consent_receipt_pending",
+		"the explicit attempt ends at the ordering gate, above the publish loop")
+	assert_equal(#requests, 1, "nothing went out: the mint is still in flight")
+
+	pre_mint("token-preflight-2", math.floor(socket.now * 1000) + 3600000, nil)
+	assert_true(preflight:publish_deferred(), "the caller's window is still live")
+	preflight:update(0)
+	assert_equal(#requests, 3,
+		"the grant AND the retained batch go out: an explicit bypass must survive a mint the consent preflight started")
+	preflight:shutdown()
 	storage.reset()
 
 	-- ── Retry-After: 0 through a bypassed window, and its bound ────────────
