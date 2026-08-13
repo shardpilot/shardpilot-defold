@@ -8770,6 +8770,110 @@ end)()
 	failing:shutdown()
 	storage.reset()
 
+	-- The full-queue trigger is blind to a QUEUE-ONLY deadline unless it asks
+	-- about pending work rather than a retained batch — and the queue-only
+	-- deadline is exactly what the failed-mint arm above now creates. Worse
+	-- than a spin: each flush calls the HOST's token_provider again before
+	-- start_publish_batch can enforce the window, so the 1–60s pacing that
+	-- exists to protect a failing provider is walked straight around.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local hammer_mint = nil
+	local hammer_calls = 0
+	local hammering = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		batch_size = 2,
+		token_provider = function(callback)
+			hammer_calls = hammer_calls + 1
+			hammer_mint = callback
+		end,
+	})))
+	assert_true(hammering:identify("user-example"))
+	assert_true(hammering:track("hammer_one"))
+	assert_true(hammering:track("hammer_two"))
+	assert_equal(hammering:flush(), false, "the flush starts the mint over a FULL queue")
+	assert_equal(hammer_calls, 1)
+	assert_equal(hammering.in_flight_batch, nil, "nothing retained: the drain never happened")
+
+	hammer_mint(nil, nil, "provider exploded")
+	assert_true(hammering:publish_deferred(), "the failed mint armed the queue-only window")
+	assert_true(hammering:has_pending_publish_work(), "and the queue that armed it is still pending")
+
+	hammering:update(0.1)
+	hammering:update(0.1)
+	hammering:update(0.1)
+	assert_equal(hammer_calls, 1,
+		"the full-queue trigger must respect a queue-only window, or a failing provider is called once per frame")
+	assert_true(hammering.flush_elapsed_seconds > 0.29, "and flush() is not run every frame either")
+	hammering:shutdown()
+	storage.reset()
+
+	-- ── A token that is stale the moment it arrives ────────────────────────
+	--
+	-- A numerically valid expires_at already inside token_refresh_lead_ms
+	-- passes the type check, installs, and is then declared stale by the very
+	-- next can_publish(). Arming the settlement wake for it makes the next
+	-- update() mint again, settle, wake, mint — the HOST's provider called
+	-- once per frame for as long as pending work exists.
+	--
+	-- The token is still installed and still used: refresh_token() returns
+	-- true whenever one is present, so the publish rides the old credential
+	-- while the refresh runs. Only the wake is withheld.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local stale_mint = nil
+	local stale_calls = 0
+	local stale = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		batch_size = 20,
+		token_provider = function(callback)
+			stale_calls = stale_calls + 1
+			stale_mint = callback
+		end,
+	})))
+	assert_true(stale:identify("user-example"))
+	assert_true(stale:track("stale_token_event"))
+	assert_equal(stale:flush(), false, "the flush starts the mint")
+	assert_equal(stale_calls, 1)
+
+	-- Inside the 60s default lead, so stale on arrival — and still valid
+	-- enough that the type guard has nothing to say about it.
+	local born_stale_expiry = math.floor(socket.now * 1000) + 1000
+	assert_true(stale:expiry_already_stale(born_stale_expiry), "the premise: stale on arrival")
+	stale_mint("token-born-stale", born_stale_expiry, nil)
+	assert_equal(stale.token, "token-born-stale", "it is still installed and still usable")
+
+	stale:update(0.1)
+	stale:update(0.1)
+	stale:update(0.1)
+	assert_equal(stale_calls, 1,
+		"a token that is stale on arrival must not arm the wake, or the host provider is minted once per frame")
+
+	-- The contract that keeps this from being an over-fix: a token with a
+	-- healthy expiry still arms the wake.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local fresh_mint = nil
+	local fresh = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		batch_size = 20,
+		token_provider = function(callback) fresh_mint = callback end,
+	})))
+	assert_true(fresh:identify("user-example"))
+	assert_true(fresh:track("fresh_token_event"))
+	assert_equal(fresh:flush(), false)
+	local healthy_expiry = math.floor(socket.now * 1000) + 3600000
+	assert_equal(fresh:expiry_already_stale(healthy_expiry), false, "an hour is well outside the lead")
+	next_status = 202
+	fresh_mint("token-fresh", healthy_expiry, nil)
+	fresh:update(0)
+	assert_equal(#requests, 1, "a usable token still wakes the queued event that started the mint")
+	fresh:shutdown()
+	storage.reset()
+
 	-- ── ...but only for the receipts that are actually waiting on it ───────
 	--
 	-- The consent plane needs the qualification the events plane does not: a
@@ -8817,6 +8921,50 @@ end)()
 		"but the receipt that IS waiting on that mint has nothing to wake for")
 	dual.token_request_in_flight = false
 	dual.consent_outbox = {}
+	storage.reset()
+
+	-- ── A failed mint must not pace a receipt that was not waiting on it ───
+	--
+	-- A receipt already ON THE WIRE got its credential before this mint was
+	-- even started: its own outcome paces it. Arming a consent window in its
+	-- name double-counts the ladder, and if that in-flight request comes back
+	-- terminal its receipt is dropped without clearing the window — leaving
+	-- the next receipt in the trail blocked by a backoff it never earned.
+	reset()
+	storage.reset()
+	local vouch_mint = nil
+	local vouch_calls = 0
+	local vouch_held, vouch_restore = hold_http_requests()
+	local vouching = assert(sdk.new(config({
+		flush_interval_seconds = 9999,
+		batch_size = 20,
+		token_provider = function(callback)
+			vouch_calls = vouch_calls + 1
+			vouch_mint = callback
+		end,
+	})))
+	assert_true(vouching:identify("user-a"))
+	assert_true(vouching:set_consent(true))
+	assert_equal(vouch_calls, 1, "a user_verified receipt needs the minted token")
+	vouch_mint("token-vouch", math.floor(socket.now * 1000) + 3600000, nil)
+	vouch_mint = nil
+	vouching:update(0)
+	assert_equal(#vouch_held, 1, "the grant receipt is on the wire with its callback held")
+	assert_true(vouching.consent_send_in_flight, "so the consent plane is blocked, not waiting")
+
+	-- Event work now needs a fresh token, and that mint fails.
+	assert_true(vouching:track("vouch_event"))
+	socket.now = socket.now + 7200
+	assert_equal(vouching:flush(), false)
+	assert_equal(vouch_calls, 2, "the stale token triggered a re-mint")
+	assert_true(vouch_mint ~= nil)
+	vouch_mint(nil, nil, "provider exploded")
+
+	assert_true(vouching:publish_deferred(),
+		"the events plane WAS waiting on that mint, so it is paced")
+	assert_equal(vouching:consent_send_deferred(), false,
+		"the receipt already on the wire was not, so it must not inherit a window")
+	vouch_restore()
 	storage.reset()
 
 	-- ── An explicit caller's bypass, carried across an asynchronous mint ───

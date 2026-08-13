@@ -2240,10 +2240,18 @@ function Client:update(dt)
 	-- can run to 24 hours, not 60 seconds. An earlier receipt ON THE WIRE
 	-- holds it back the same way for a whole round trip, so the test is
 	-- whether the outbox can dispatch at all, not whether a window is armed.
-	local retained_publish_deferred =
-		(self.in_flight_batch ~= nil and self:publish_deferred())
+	--
+	-- PENDING work, not only a retained batch. A failed mint over a full queue
+	-- arms the publish clock with nothing retained — the drain never happened —
+	-- and the queue that armed it is still full, so this trigger fired every
+	-- frame and each flush called the HOST's token_provider again before
+	-- start_publish_batch could enforce the deadline. That is worse than a
+	-- spin: the 1–60s pacing exists precisely to keep a failing provider from
+	-- being hammered, and the queue-only deadline walked straight around it.
+	local publish_work_deferred =
+		(self:has_pending_publish_work() and self:publish_deferred())
 		or (self:grant_receipt_pending_dispatch() and self:consent_dispatch_blocked())
-	if (queue.size(self.queue) >= self.config.batch_size and not retained_publish_deferred)
+	if (queue.size(self.queue) >= self.config.batch_size and not publish_work_deferred)
 		or self.flush_elapsed_seconds >= self.config.flush_interval_seconds then
 		self.flush_elapsed_seconds = 0
 		self:flush({ include_summaries = false, automatic = true })
@@ -2436,6 +2444,7 @@ function Client:refresh_token()
 			self:fail_token_settlement()
 			return
 		end
+		local born_stale = self:expiry_already_stale(new_expires_at)
 		self.token = new_token
 		self.token_expires_at_ms = new_expires_at
 		-- A settled mint re-arms the wake it may have consumed. An
@@ -2454,7 +2463,31 @@ function Client:refresh_token()
 		-- unless retained work exists, in which case one extra tick is
 		-- already gated by publish_deferred. An untestable condition is a
 		-- place for the two paths to drift, not protection.
-		self:wake_pending_publish_work()
+		--
+		-- It IS conditioned on the token being usable past this tick. A
+		-- numerically valid expiry already inside the refresh lead installs a
+		-- token can_publish() declares stale the very next time it looks, so
+		-- the wake sends the next update() straight back into refresh_token()
+		-- — which mints, settles, wakes, and mints again: the HOST's provider
+		-- called once per frame, for as long as pending work exists.
+		--
+		-- The token is still INSTALLED and still used, which is why this
+		-- withholds the wake rather than routing to fail_token_settlement:
+		-- refresh_token() returns true whenever a token is present, so the
+		-- publish goes out on the old credential while the refresh runs, and
+		-- test_token_expiry_refresh — older than this PR — pins exactly that
+		-- contract. Discarding the token would break a provider whose tokens
+		-- are simply shorter-lived than the configured lead.
+		--
+		-- What remains is pre-existing and NOT repaired here: with a lead
+		-- longer than the provider's whole token lifetime, every publish
+		-- attempt asks for a new token. The wake made that once per FRAME;
+		-- without it, it is once per flush, which is what this SDK did before
+		-- this PR. Narrowing the lead to fit a short-lived token is a
+		-- configuration question, not a wake one (Codex on #46).
+		if not born_stale then
+			self:wake_pending_publish_work()
+		end
 	end)
 	if not ok then
 		self.token_request_in_flight = false
@@ -2464,6 +2497,17 @@ function Client:refresh_token()
 	return self.token ~= nil
 end
 
+-- Whether an expiry is at or inside the refresh lead — i.e. a token carrying
+-- it is due for replacement RIGHT NOW. The rule can_publish() uses to decide
+-- it needs a token, stated once so the mint settlement can ask the same
+-- question of a token it is about to install.
+function Client:expiry_already_stale(expires_at_ms)
+	if expires_at_ms == nil then
+		return false
+	end
+	return clock.unix_ms() >= expires_at_ms - self.config.token_refresh_lead_ms
+end
+
 function Client:can_publish()
 	if not valid_identity(self.user_id) and not valid_identity(self.anonymous_id) then
 		self.stats.last_error = "identity_required"
@@ -2471,7 +2515,7 @@ function Client:can_publish()
 	end
 	local needs_token = not self.token
 	if self.token and self.token_expires_at_ms then
-		needs_token = clock.unix_ms() >= self.token_expires_at_ms - self.config.token_refresh_lead_ms
+		needs_token = self:expiry_already_stale(self.token_expires_at_ms)
 	end
 	if needs_token and not self:refresh_token() then
 		return false
@@ -2723,7 +2767,14 @@ function Client:fail_token_settlement()
 	if self:has_pending_publish_work() then
 		self:defer_backoff()
 	end
-	local awaiting = self:receipt_awaiting_token()
+	-- Only when the plane could actually have been waiting on this mint. A
+	-- receipt already ON THE WIRE got its credential before the mint failed —
+	-- its own outcome paces it — and a plane already inside a window is paced
+	-- already; arming again would double-count the backoff ladder. Worse, the
+	-- in-flight receipt can come back TERMINAL, and the terminal branch drops
+	-- it without clearing a deadline that was armed in its name, so the next
+	-- receipt in the trail inherits a window it never earned (Codex on #46).
+	local awaiting = not self:consent_dispatch_blocked() and self:receipt_awaiting_token() or nil
 	if awaiting ~= nil then
 		self:defer_consent_backoff()
 		-- The window BELONGS to that receipt. Without recording whose it is,
