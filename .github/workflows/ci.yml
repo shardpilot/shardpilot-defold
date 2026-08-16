@@ -100,3 +100,27 @@ jobs:
 
       - name: Lua experiments tests
         run: ${{ matrix.interpreter }} test/test_experiments.lua
+
+      # A5: allocation bytes per track(), the metric that matters on a game
+      # client — a per-frame allocation is somebody's GC pause, and it is the
+      # one cost an engine integration cannot hide on a background thread.
+      #
+      # Across the WHOLE matrix, because luajit is what Defold actually ships:
+      # the reference interpreter's byte counts are indicative, LuaJIT's are the
+      # ones a studio would feel. Running both is the comparison.
+      #
+      # The harness gates itself — every event must enqueue and none may drop —
+      # because its first version measured a full queue taking the drop path and
+      # printed a table in which allocation FELL as the props got richer.
+      - name: Track() allocation benchmark
+        run: ${{ matrix.interpreter }} test/bench_sdk.lua | tee bench-${{ matrix.interpreter }}.txt
+
+      - name: Publish benchmark results
+        run: |
+          {
+            echo "### track() allocation — ${{ matrix.interpreter }}"
+            echo
+            echo '```'
+            cat bench-${{ matrix.interpreter }}.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
