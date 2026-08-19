@@ -331,7 +331,7 @@ available; the last-known-good snapshot survives restarts and offline
 launches. `remote_config_version()` reads the response wrapper's `version`
 metadata.
 
-Targeting attributes are a dark opt-in (ADR-0310) and — unlike the fetch —
+Targeting attributes are a dark opt-in and — unlike the fetch —
 granted-consent-only: `remote_config_attributes_enabled = true` plus
 `shardpilot.set_remote_config_attributes({ geo = "US", … })` makes fetches
 carry the experiment attribute vocabulary (`geo`, `app_version`,
@@ -361,7 +361,7 @@ crash.init({
   --                       -- outside Defold, or init fails platform_required
   -- script_error_capture_enabled = true, -- opt-in Lua script-error auto-capture (dark by default)
 })
--- crash.init auto-forwards last session's native dump (ADR-0297 §7c);
+-- crash.init auto-forwards last session's native dump;
 -- set capture_previous_on_boot = false to call crash.capture_previous() manually instead.
 crash.record_breadcrumb("menu.open")
 ```

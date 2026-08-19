@@ -49,8 +49,8 @@ crash.init({
 | `diagnostics` | no | A hook invoked with `{ scope, status, code, retryable, response }` when a report is rejected or unauthorized. |
 | `anonymous_id` | no | The pseudonymous actor key a report is attributed to — a `function` resolved per report (pass `shardpilot.get_anonymous_id` to track the analytics id, including later rotations) or a fixed string. Absent means reports carry no actor key, as before. See [Attributing crashes to a player](#attributing-crashes-to-a-player). |
 | `session_id` | no | The session a crash happened in; same `function`-or-string shape. `shardpilot.get_session_id` returns `nil` until a session opens, which is handled. |
-| `capture_previous_on_boot` | no | **Default `true`** (ADR-0297 §7c): `crash.init` itself forwards the previous-session native dump and runs one resend pass — no manual `capture_previous()` call needed. Set `false` to keep the manual flow (e.g. to defer the network work past your loading screen). Instance clients built with `crash.new` are unaffected either way — they always use the manual call. |
-| `script_error_capture_enabled` | no | **Default `false` (dark)** — opt-in Lua script-error auto-capture (ADR-0297 §7c). When `true`, the SDK installs a [`sys.set_error_handler`](https://defold.com/ref/stable/sys/#sys.set_error_handler) handler — at construction while crash reporting is enabled, or at the `set_enabled(true)` that re-enables it (an opted-out or fail-closed boot leaves the game's handler slot untouched; a runtime opt-out after install leaves the SDK's handler in place as a guaranteed no-op, since the sys API cannot restore a previous handler) — that forwards each unhandled script error as a **fatal** `lua_error` report (message → `exception.reason`, traceback → `raw_text`, source → context), capped at **10 reports per session** so a per-frame error loop cannot flood the ingest door. Defold has a **single** process-wide error-handler slot: opting in replaces any handler the game installed (and a later `sys.set_error_handler` by game code replaces the SDK's). Keep this off and call `emit_fatal` from your own handler if you need both. |
+| `capture_previous_on_boot` | no | **Default `true`**: `crash.init` itself forwards the previous-session native dump and runs one resend pass — no manual `capture_previous()` call needed. Set `false` to keep the manual flow (e.g. to defer the network work past your loading screen). Instance clients built with `crash.new` are unaffected either way — they always use the manual call. |
+| `script_error_capture_enabled` | no | **Default `false` (dark)** — opt-in Lua script-error auto-capture. When `true`, the SDK installs a [`sys.set_error_handler`](https://defold.com/ref/stable/sys/#sys.set_error_handler) handler — at construction while crash reporting is enabled, or at the `set_enabled(true)` that re-enables it (an opted-out or fail-closed boot leaves the game's handler slot untouched; a runtime opt-out after install leaves the SDK's handler in place as a guaranteed no-op, since the sys API cannot restore a previous handler) — that forwards each unhandled script error as a **fatal** `lua_error` report (message → `exception.reason`, traceback → `raw_text`, source → context), capped at **10 reports per session** so a per-frame error loop cannot flood the ingest door. Defold has a **single** process-wide error-handler slot: opting in replaces any handler the game installed (and a later `sys.set_error_handler` by game code replaces the SDK's). Keep this off and call `emit_fatal` from your own handler if you need both. |
 
 ### The `source` component slug
 
@@ -177,7 +177,7 @@ disk through its built-in [`crash`](https://defold.com/ref/stable/crash/)
 module, which the **next launch** reads.
 
 The Defold auto-capture model is therefore **load-on-next-launch**, and it is
-**automatic from `crash.init`** (ADR-0297 §7c): init forwards a prior-session
+**automatic from `crash.init`**: init forwards a prior-session
 native crash itself, so plain boot wiring is just
 
 ```lua
@@ -219,7 +219,7 @@ failure.
   separate module list; frames carry an address but no module reference. The
   server resolves each address against the module map (recording
   `module_missing` where it cannot disambiguate).
-- **Engine-module symbol identity** (ADR-0297 §7c): the engine module —
+- **Engine-module symbol identity**: the engine module —
   recognized across its platform name shapes (`dmengine`, `libdmengine.so`,
   `dmengine.exe`, a pathed variant) — has its `debug_id` synthesized as
   **`dmengine-<engine sha1>`**, read from the **dump's own
@@ -247,7 +247,7 @@ failure.
 
 ## Opt-in script-error auto-capture
 
-`script_error_capture_enabled = true` (default **false** — dark, ADR-0297
+`script_error_capture_enabled = true` (default **false** — dark,
 §7c) installs a [`sys.set_error_handler`](https://defold.com/ref/stable/sys/#sys.set_error_handler)
 handler at client construction while crash reporting is ENABLED (an opted-out
 boot defers the install to the `set_enabled(true)` that re-enables reporting,

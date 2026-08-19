@@ -203,7 +203,7 @@ README, `docs/`, and the skill above are the reference.
 |---|---|---|
 | `ingest_url` | — (required) | `https://…`, or `http://` only for `localhost`/`127.0.0.1`/`::1`; no query/fragment/path |
 | `remote_config_url` | `nil` (disabled) | Remote-config base URL (same shape rules as `ingest_url`); a **separate** service from the ingest endpoint. Requires `api_key` — see [Remote config](#remote-config) |
-| `remote_config_attributes_enabled` | `false` (dark) | ADR-0310 opt-in: fetches carry the attributes stored via `set_remote_config_attributes` as query parameters — only while consent is **granted** (unknown/denied fetch attribute-less). Requires `remote_config_url` — see [Remote config](#remote-config) |
+| `remote_config_attributes_enabled` | `false` (dark) | Opt-in: fetches carry the attributes stored via `set_remote_config_attributes` as query parameters — only while consent is **granted** (unknown/denied fetch attribute-less). Requires `remote_config_url` — see [Remote config](#remote-config) |
 | `experiments_enabled` | `false` (off) | Opts into the experiment-assignment consumer. Requires **both** `remote_config_url` and `api_key` — see [Experiments](#experiments) |
 | `workspace_id` | — (required) | Tenant key |
 | `app_id` | — (required) | Product key |
@@ -533,7 +533,7 @@ way.
 - The fetch is **not consent-gated**: config delivery carries no analytics
   payload — the client id in the URL only scopes which config to serve
   (consistent across our SDKs). See [`docs/privacy.md`](docs/privacy.md).
-- **Targeting attributes (dark opt-in, ADR-0310) are the one
+- **Targeting attributes (dark opt-in) are the one
   granted-consent-only exception.** With
   `remote_config_attributes_enabled = true`, attributes stored via
   `shardpilot.set_remote_config_attributes({ geo = "US", … })` ride each

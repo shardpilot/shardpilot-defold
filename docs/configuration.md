@@ -131,7 +131,7 @@ the `api_key` authenticates only the remote-config fetch.
   fallback, the `401`/`403` fail-closed rule, and the cache's scope check —
   are in the README's "Remote config" section.
 - **`remote_config_attributes_enabled`** (default `false` = dark, boolean).
-  ADR-0310 opt-in: fetches carry the targeting attributes stored via
+  Opt-in: fetches carry the targeting attributes stored via
   `set_remote_config_attributes(attributes)` as query parameters, so
   server-side delivery rules can target this client (`nil`/empty clears; the
   setter is inert while the flag is off, and the flag without
@@ -370,7 +370,7 @@ transient/`Retry-After` rules) are in the README's "Experiments" section.
 - **`schema_revision`** (default: the SDK's built-in revision; string or
   `false`). Every `POST {ingest_url}/v1/events:batch` request declares, in
   the `X-ShardPilot-Schema-Revision` request header, the revision of the
-  analytics-service envelope-schema set this SDK build was provisioned
+  ingest envelope-schema set this SDK build was provisioned
   against (`shardpilot/schema_revision.lua` — a public content digest of
   the service's embedded schema files, not a secret; it is re-synced when
   the service's schema set changes). The ingest service uses the

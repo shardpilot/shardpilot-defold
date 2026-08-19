@@ -6,6 +6,27 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **Documentation-only: internal ShardPilot material removed from the
+  published tree, and a gate added so it does not come back.** No API, wire
+  format or behaviour change.
+
+  This repository is public and the documented dependency URL is its whole
+  tag archive, so every consuming project downloads every tracked file. Two
+  internal agent skills under `.claude/skills/` were among them, describing
+  ShardPilot's own review process and backend stack; they are gone. An
+  internal project codename in `docs/events.md`, internal decision-record
+  ids across the README, this changelog and `docs/`, and internal service
+  names have been removed — the engineering content each one annotated
+  stays, restated so a reader outside ShardPilot can act on it.
+
+  Two things this deliberately does NOT claim. It does not unpublish the
+  history: removing a line at HEAD leaves every commit that carried it, and
+  this repository has been public throughout. And it does not cover Lua
+  source: `scripts/check_public_surface.sh` gates the non-source surface at
+  zero and separately REPORTS the remaining hits in `*.lua` on every run,
+  because those belong to another workstream. A green run means lane A is
+  clean, and the report line is what lane B still owes.
+
 - **Retry wakes now cover every shape of retained work, and a server's
   `Retry-After` keeps its own expiry.** Four fixes to the retry pacing
   separated from `flush_interval_seconds` earlier in this release, all found by
@@ -96,7 +117,7 @@
   session id, or `nil` when no session is open — so the host can correlate other
   telemetry with the analytics session.
 
-- **Remote config: dark opt-in targeting-attribute pass-through (ADR-0310).**
+- **Remote config: dark opt-in targeting-attribute pass-through.**
   `remote_config_attributes_enabled = true` (default `false` — while off the
   fetch URL is byte-identical to today's attribute-less path and the new
   setter is inert; the flag without `remote_config_url` is rejected with
@@ -117,7 +138,7 @@
   excludes the attribute set — a cached body may reflect the previously sent
   attributes until the next successful fetch (documented v1 limit).
 - **Crash: boot auto-capture, engine symbol identity, opt-in script-error
-  capture (ADR-0297 §7c).** `crash.init` now forwards the previous-session
+  capture.** `crash.init` now forwards the previous-session
   native dump itself (`capture_previous_on_boot = false` keeps the manual
   flow; the persisted opt-out still leaves the one-shot dump unread). The
   `dmengine` module's `debug_id` is synthesized as `dmengine-<engine sha1>`
@@ -258,8 +279,7 @@
   documented: a process KILL before any durable write lands still loses
   the denial without trace — no client-side ordering can close that
   window.
-- **Canonical-actor consent-receipt keying (ADR-0222 §1, ADR-0202 2026-07-20
-  amendment).** A consent receipt's actor is now chosen by the event plane's
+- **Canonical-actor consent-receipt keying.** A consent receipt's actor is now chosen by the event plane's
   canonical-actor rule at decision time: the verified `user_id` ONLY when a
   Mode B `token_provider` backs the session and the host has identified
   (`kind = "user_verified"`); the SDK-managed `anonymous_id` with
@@ -375,11 +395,11 @@
   login, its durable once-per-decision ledger, and an explicit host API for
   discarding parked receipts are deliberately deferred pending
   godot-package ratification.
-- **Experiment-assignment consumer (ADR-0259 SDK leg), dark behind
+- **Experiment-assignment consumer, dark behind
   `experiments_enabled` (default `false`).** New module
   `shardpilot/experiments.lua`: fetches the server-evaluated assignment from
   `GET {remote_config_url}/api/v1/runtime/experiments/assignment`
-  (control-plane host, publishable-key bearer — the same credential as the
+  (the remote-config host, publishable-key bearer — the same credential as the
   remote-config fetch), serves the assigned variant through
   `shardpilot.fetch_experiment_assignment(experiment_key, [attributes],
   callback)` / `experiment_variant(key)` / `experiment_payload(key)`, and
@@ -455,9 +475,9 @@
   subject-fact key VERBATIM as the `assignment_key` prop for
   client_id-unit assignments (the raw subject id is structurally rejected
   there) and omit `user_id` per the facts contract, keeping the standard
-  `anonymous_id` as the envelope identity. NOTE: the analytics service
+  `anonymous_id` as the envelope identity. NOTE: the ingest service
   currently rejects these event names from game-embedded publishable keys
-  by design; until the platform's producer-lane decision lands, an emitted
+  by design; until the lane is enabled for the workspace, an emitted
   exposure is expected to come back as a per-event reject, surfaced through
   diagnostics and tolerated silently otherwise — that server-side block is
   load-bearing and stays authoritative.
@@ -539,10 +559,10 @@
 ## v0.9.0 — 2026-07-18 — early alpha
 
 - **Batch ingest now declares the SDK's schema-set revision** (GAP-036,
-  client half of the analytics-service schema-revision handshake). Every
+  client half of the ingest schema-revision handshake). Every
   `POST {ingest_url}/v1/events:batch` request carries an
   `X-ShardPilot-Schema-Revision` request header with the revision of the
-  analytics-service envelope-schema set this SDK build was provisioned
+  ingest envelope-schema set this SDK build was provisioned
   against (new module `shardpilot/schema_revision.lua`; the value is a
   public content digest of the service's embedded schema files — not a
   secret — and is re-synced whenever the service's schema set changes).
@@ -574,7 +594,7 @@
   strict-consent audit follow-up). The transport parsed the `Retry-After`
   header on every response but passed it to the client only in the 429
   branch; a retryable 5xx fell back to the client's own full-jitter
-  exponential backoff. The analytics service's strict-consent
+  exponential backoff. The ingest service's strict-consent
   mode-unknown/consent-store-outage lane (GAP-041) answers a whole-batch
   `503` with `Retry-After: 5`, so post-outage recovery is now paced by the
   server's hint — the deferral (and its persisted spool deadline, 24h

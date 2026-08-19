@@ -81,7 +81,7 @@ consent-receipt outbox** (see below) until the server acknowledges it:
 receipts survive process death, re-send on later launches, and retry with
 backoff until delivered, in decision order.
 
-**The receipt's actor is the canonical actor** (ADR-0222), chosen at
+**The receipt's actor is the canonical actor**, chosen at
 decision time exactly like the event plane binds identity: the verified
 `user_id` (`kind = "user_verified"`) only when a Mode B `token_provider`
 backs the session and the host has called `identify()`; the SDK-managed
@@ -402,7 +402,7 @@ offline launch still gets the previously fetched values. This cache:
   denied analytics consent does not block it or clear the cache — consistent
   across our SDKs;
 - carries **targeting attributes only under an explicit grant** (the one
-  personal-data-shaped exception, dark by default): with the ADR-0310 opt-in
+  personal-data-shaped exception, dark by default): with the targeting opt-in
   (`remote_config_attributes_enabled = true`) the attributes the game stores
   via `set_remote_config_attributes` ride the fetch as query parameters so
   server-side delivery rules can target this client — and they ride ONLY
