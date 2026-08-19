@@ -19,6 +19,11 @@
   names have been removed — the engineering content each one annotated
   stays, restated so a reader outside ShardPilot can act on it.
 
+  Also removed: internal ticket identifiers and an internal server-side
+  configuration variable that an adversarial review of the first draft found
+  the first pattern list could not match, and two bare section citations the
+  same draft's citation strip left dangling in `docs/crash.md`.
+
   Two things this deliberately does NOT claim. It does not unpublish the
   history: removing a line at HEAD leaves every commit that carried it, and
   this repository has been public throughout. And it does not cover Lua
@@ -310,8 +315,8 @@
   `invalid_consent_kind_emission_enabled` otherwise) suppresses the WIRE
   field only, as the escape hatch for a deployment whose ingest service
   still strict-decodes the pre-amendment schema
-  (`INGEST_CONSENT_KIND_MODE=off` 400-rejects a kind-bearing body as an
-  unknown field) — the kind is still chosen, persisted, and used for
+  (a deployment that has not taken the amendment 400-rejects a kind-bearing
+  body as an unknown field) — the kind is still chosen, persisted, and used for
   dispatch-credential selection. The outbox load sanitizer holds records to
   the same closed set: entries with a non-allowlisted kind drop fail-safe,
   and legacy pre-kind entries are kept with kind backfilled to `"anon"`
@@ -534,7 +539,7 @@
 ## v0.9.1 — 2026-07-19 — early alpha
 
 - **Host-supplied identifiers are clamped to 512 bytes at acceptance**
-  (GAP-075 code follow-up to the save-file-limit caveats documented in #30).
+  (code follow-up to the save-file-limit caveats documented in #30).
   `identify(user_id)` and `set_anonymous_id(id)` reject identifiers over 512
   bytes exactly like empty/non-string input (`invalid_user_id` /
   `invalid_anonymous_id`, previous identity retained), and an out-of-bounds
@@ -558,8 +563,8 @@
 
 ## v0.9.0 — 2026-07-18 — early alpha
 
-- **Batch ingest now declares the SDK's schema-set revision** (GAP-036,
-  client half of the ingest schema-revision handshake). Every
+- **Batch ingest now declares the SDK's schema-set revision** — the client
+  half of the ingest schema-revision handshake. Every
   `POST {ingest_url}/v1/events:batch` request carries an
   `X-ShardPilot-Schema-Revision` request header with the revision of the
   ingest envelope-schema set this SDK build was provisioned
@@ -595,7 +600,7 @@
   header on every response but passed it to the client only in the 429
   branch; a retryable 5xx fell back to the client's own full-jitter
   exponential backoff. The ingest service's strict-consent
-  mode-unknown/consent-store-outage lane (GAP-041) answers a whole-batch
+  mode-unknown/consent-store-outage lane answers a whole-batch
   `503` with `Retry-After: 5`, so post-outage recovery is now paced by the
   server's hint — the deferral (and its persisted spool deadline, 24h
   clamp) works exactly as it already did for 429, on both the events plane
@@ -606,7 +611,7 @@
   strictly before the event batch at every dispatch point
   (init/update/flush/shutdown); this ordering is now documented as
   load-bearing and pinned by a regression test. On a strict-enforce
-  workspace (GAP-041) it shrinks the window in which a post-grant batch
+  workspace it shrinks the window in which a post-grant batch
   reaches the server before the grant's `/v1/consent` row exists and is
   terminally suppressed. Sequencing only — the batch never waits on the
   receipt's acknowledgment.
@@ -627,7 +632,7 @@
 ## v0.8.0 — 2026-07-13 — early alpha
 
 - **`buffer_size` default raised from `200` to `1000`** — the cross-SDK
-  canonical in-memory queue capacity (architecture-audit finding SP-059).
+  canonical in-memory queue capacity.
   The Go, Unity, and Unreal SDKs and the platform docs all default the
   bounded event queue to 1000; the Defold SDK now matches, so a burst that
   used to drop at 200 queued events is retained like on every other

@@ -484,8 +484,7 @@ unknown states alike, because a receipt documents the decision itself. See
   `"user_verified"`, chosen by the canonical-actor rule described in
   `docs/privacy.md` — next to `actor_identifier`. `false` is the escape
   hatch for a deployment whose ingest service still runs the pre-amendment
-  strict decoder (`INGEST_CONSENT_KIND_MODE=off` rejects a kind-bearing
-  body `400` as an unknown field, a terminal outcome that would drop the
+  strict decoder (which rejects a kind-bearing body `400` as an unknown field, a terminal outcome that would drop the
   receipt, denials included): it suppresses the **wire field only** — the
   kind is still chosen at decision time, persisted with the receipt, and
   used to select the dispatch credential (anon-keyed receipts under the

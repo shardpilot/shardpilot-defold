@@ -247,8 +247,8 @@ failure.
 
 ## Opt-in script-error auto-capture
 
-`script_error_capture_enabled = true` (default **false** — dark,
-§7c) installs a [`sys.set_error_handler`](https://defold.com/ref/stable/sys/#sys.set_error_handler)
+`script_error_capture_enabled = true` (default **false** — dark) installs a
+[`sys.set_error_handler`](https://defold.com/ref/stable/sys/#sys.set_error_handler)
 handler at client construction while crash reporting is ENABLED (an opted-out
 boot defers the install to the `set_enabled(true)` that re-enables reporting,
 so the game's single handler slot is never replaced for an opted-out player;
@@ -267,7 +267,8 @@ handler's `source` string as a context entry. The handler:
 
 Defold exposes **one** process-wide error-handler slot, so opting in replaces
 any handler the game installed. If you need your own handler, keep this flag
-off and call `emit_fatal` from it yourself (the pre-§7c documented flow).
+off and call `emit_fatal` from it yourself — the flow documented before
+script-error auto-capture existed.
 
 ## Durability: the pending-crash sidecar
 
