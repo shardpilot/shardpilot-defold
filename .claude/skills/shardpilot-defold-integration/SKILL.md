@@ -165,13 +165,17 @@ auth credential. `init` returns `true`, or `false, err` with a specific code
 `batch_size = 25` (1–100), `buffer_size = 1000`,
 `flush_interval_seconds = 15` *(unreleased — the default is 1 at `v0.10.1`)* (how long a PARTIAL batch waits — not a
 heartbeat: an empty queue publishes nothing, a full `batch_size` publishes
-immediately, `flush()` on demand, and retry pacing runs on its own clock
+immediately, `flush()` on demand *(retry pacing on its own clock is unreleased —
+`Client:retry_due` is absent at `v0.10.1`)*, and retry pacing runs on its own clock
 *(unreleased — at `v0.10.1` there is no `retry_due`, so a retryable failure
 waits for the flush tick)*),
 `publish_timeout_seconds = 2`, `spool_enabled = true`,
 `spool_max_events = 500`, `spool_max_bytes = 262144` (max 393216),
 `request_compression_enabled = true`. *(unreleased — `v0.10.1` has no
 compression module; the tag always sends uncompressed.)*
+
+*(This whole subsection is unreleased: `v0.10.1` has no `shardpilot/compression.lua`,
+so at the pin every body is sent uncompressed.)*
 
 **Batch bodies over 1 KiB are compressed**, with `Content-Encoding: deflate`
 (RFC 1950 zlib) rather than gzip: the engine's `zlib` module produces that

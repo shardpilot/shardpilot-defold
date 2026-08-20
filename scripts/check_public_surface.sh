@@ -208,7 +208,7 @@ scan_tree() {
     # by magic rather than by extension, because the extension is the part an
     # author controls.
     case "$(od -An -tx1 -N4 "$root/$f" 2>/dev/null | tr -d ' \n')" in
-      1f8b*|504b0304|504b0506|fd377a58|425a68*|28b52ffd|25504446|4d5a*|7f454c46)
+      1f8b*|504b0304|504b0506|fd377a58|425a68*|28b52ffd|25504446|4d5a*|7f454c46|377abcaf|52617221)
         echo "REFUSING: '$f' begins with container magic (archive, PDF or executable)," >&2
         echo "  and this gate reads files as text. Its real contents are not scanned by" >&2
         echo "  any pass here, so a clean result would say nothing about what it carries." >&2
