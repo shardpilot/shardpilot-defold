@@ -26,12 +26,11 @@ version-bump merge, so it still declares `M.VERSION = "0.10.0"`. That was
 deliberate: the tag's whole purpose was to carry a removal and be verifiable
 as carrying only that, which putting a version bump in it would have defeated.
 
-**An off-main tag is not covered by CI, and this is the only control there is.**
-The surface gate runs on `push`, which for a tag means it runs AFTER the tag
-exists — and a tag archive is fetchable the moment it is pushed. So a tag cut
-from anywhere other than a merge on `main` (as `v0.10.1` was, deliberately, to
-carry only a removal) is published before anything has checked it. CI cannot
-close that: by the time a workflow can react, the artifact is already served.
+**Check an off-main tag before you push it.** A tag archive is fetchable the
+moment the tag exists, and a `push`-triggered workflow necessarily runs after
+that point — so the check that counts is the one you run first. This applies to
+any tag cut from somewhere other than a merge on `main`, as `v0.10.1` was,
+deliberately, to carry only a removal.
 
 Run `./scripts/check_public_surface.sh` from a checkout OF THE TAGGED TREE
 before pushing the tag. From a detached worktree at the tag:
