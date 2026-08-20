@@ -111,12 +111,14 @@ normally created from the merge of the matching version-bump commit, so
 immediately after that merge lands there is a short window in which the URL
 404s.
 
-**If it 404s, wait — do not pin an earlier tag.** `v0.10.1` is the first tag
-that does not carry the two internal agent skills; `v0.10.0` and everything
-before it distribute all eight of those files through this same dependency URL.
-This paragraph used to say "pin the previous tag until the new one is
-published", which after `v0.10.1` pointed at exactly the artifact being
-withdrawn.
+**If it 404s, wait — do not pin an earlier tag.** `v0.10.1` is the deletion-only
+patch that removes the two internal agent skills. Measured across every tag:
+`v0.8.0`, `v0.8.1`, `v0.9.0`, `v0.9.1` and `v0.10.0` carry all eight of those
+files through this same dependency URL, and `v0.6.0` and `v0.7.0` carry two of
+them. `v0.5.0` and earlier predate the files entirely — but they also predate
+most of what this README documents. This paragraph used to say "pin the previous
+tag until the new one is published", which after `v0.10.1` pointed at exactly
+the artifact being withdrawn.
 
 **What `v0.10.1` does and does not contain.** It is `v0.10.0` plus eight file
 deletions and nothing else — that is what makes it verifiable as carrying only

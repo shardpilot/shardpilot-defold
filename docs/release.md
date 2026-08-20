@@ -15,7 +15,9 @@ published, not this line.
 tag that "definitely resolves" as a fallback, and after `v0.10.1` that advice
 pointed at an artifact carrying the internal material `v0.10.1` exists to stop
 distributing — a runbook sending a reader back to the thing being withdrawn.
-Every tag before `v0.10.1` contains it. If the pending tag 404s, WAIT for it.
+Measured across every tag: `v0.8.0`, `v0.8.1`, `v0.9.0`, `v0.9.1` and `v0.10.0`
+carry all eight of those files, `v0.6.0` and `v0.7.0` carry two, and `v0.5.0`
+and earlier predate them. If the pending tag 404s, WAIT for it.
 
 **`v0.10.1` itself is an exception to the ordering below**, and it is worth
 knowing so its tree does not look like a mistake. It was cut as a
