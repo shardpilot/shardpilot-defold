@@ -52,12 +52,15 @@ Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.1`.
 
 ⚠ **This skill is written against `main`, which is AHEAD of that tag**, because
 `v0.10.1` is a deletion-only patch on top of `v0.10.0` and carries no source
-change. Two things documented below are NOT in it, and are marked *(unreleased)*
-where they appear:
+change. THREE things documented below are NOT in it, and are marked
+*(unreleased)* where they appear:
 
 * `request_compression_enabled` and the whole request-compression path — the
   tag has no `shardpilot/compression.lua` at all;
-* `flush_interval_seconds` defaulting to 15 — at the tag the default is **1**.
+* `flush_interval_seconds` defaulting to 15 — at the tag the default is **1**;
+* retry pacing on its own clock — `Client:retry_due` does not exist at the tag
+  (0 occurrences against 10 on `main`), so a retryable failure there waits for
+  the flush tick instead of its own backoff deadline.
 
 Everything else describes the pinned release. A tag cut from the fully cleaned,
 current tree is the real fix and is sequenced after the source scrub.
@@ -162,7 +165,9 @@ auth credential. `init` returns `true`, or `false, err` with a specific code
 `batch_size = 25` (1–100), `buffer_size = 1000`,
 `flush_interval_seconds = 15` *(unreleased — the default is 1 at `v0.10.1`)* (how long a PARTIAL batch waits — not a
 heartbeat: an empty queue publishes nothing, a full `batch_size` publishes
-immediately, `flush()` on demand, and retry pacing runs on its own clock),
+immediately, `flush()` on demand, and retry pacing runs on its own clock
+*(unreleased — at `v0.10.1` there is no `retry_due`, so a retryable failure
+waits for the flush tick)*),
 `publish_timeout_seconds = 2`, `spool_enabled = true`,
 `spool_max_events = 500`, `spool_max_bytes = 262144` (max 393216),
 `request_compression_enabled = true`. *(unreleased — `v0.10.1` has no

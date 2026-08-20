@@ -274,9 +274,15 @@ scan_tree() {
       # a target naming a roster entry is the same disclosure as one naming a
       # shape — checking only $PATTERNS here left the roster half blind to an
       # entire file type.
+      # Flattened AND rejoined, exactly as tracked paths and file contents
+      # are: a target wraps at its separator too, and a target is the only
+      # content a symlink publishes.
       link_flat="$(readlink "$root/$f" | tr -s '[:space:]' ' ')"
+      link_join="$(printf '%s' "$link_flat" | sed -E 's/([-_/]) /\1/g')"
       hits="$( { printf '%s\n' "$link_flat" | grep -nE -- "$PATTERNS" || true
-                 printf '%s\n' "$link_flat" | grep -niE -- "$ROSTER_RE" || true; } )"
+                 printf '%s\n' "$link_flat" | grep -niE -- "$ROSTER_RE" || true
+                 printf '%s\n' "$link_join" | grep -nE -- "$PATTERNS" || true
+                 printf '%s\n' "$link_join" | grep -niE -- "$ROSTER_RE" || true; } | sort -u )"
       [ -n "$hits" ] && scan_lane_a="${scan_lane_a}${f}:symlink-target:$(readlink "$root/$f")"$'\n'
       scan_files=$((scan_files + 1))
       # A symlink IS gated by lane A — its target is reported into
