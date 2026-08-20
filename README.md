@@ -120,6 +120,15 @@ most of what this README documents. This paragraph used to say "pin the previous
 tag until the new one is published", which after `v0.10.1` pointed at exactly
 the artifact being withdrawn.
 
+**Three behaviours documented below are NOT in `v0.10.1`**, because it is a
+deletion-only patch and carries no source change. Measured at the tag:
+`flush_interval_seconds` defaults to **1**, not 15; there is no
+`shardpilot/compression.lua` at all, so `request_compression_enabled` and the
+whole request-compression section do not exist; and `Client:retry_due` is
+absent (0 occurrences against 10 on `main`), so a retryable failure waits for
+the flush tick rather than its own backoff deadline. Each is marked
+*(unreleased)* where it appears.
+
 **What `v0.10.1` does and does not contain.** It is `v0.10.0` plus eight file
 deletions and nothing else — that is what makes it verifiable as carrying only
 the removal, and it is why its tree still declares `M.VERSION = "0.10.0"`. It
@@ -239,9 +248,9 @@ README, `docs/`, and the skill above are the reference.
 | `user_id` | `nil` | Initial known-user attribution |
 | `batch_size` | `25` | Flush trigger, 1–100 |
 | `buffer_size` | `1000` | Max queued events (≥1); cross-SDK canonical default |
-| `flush_interval_seconds` | `15` (was `1`) | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value. |
+| `flush_interval_seconds` | `15` (was `1`) *(unreleased — 1 at `v0.10.1`)* | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value. |
 | `publish_timeout_seconds` | `2` | Per-request timeout (>0) |
-| `request_compression_enabled` | `true` | Compress analytics batch bodies over 1 KiB with `Content-Encoding: deflate` (RFC 1950 zlib — see [Request compression](#request-compression)). Sub-threshold bodies go uncompressed: zlib framing makes a single-event batch bigger, not smaller. No-op on engine versions without the `zlib` module. |
+| `request_compression_enabled` | `true` *(unreleased — absent at `v0.10.1`)* | Compress analytics batch bodies over 1 KiB with `Content-Encoding: deflate` (RFC 1950 zlib — see [Request compression](#request-compression)). Sub-threshold bodies go uncompressed: zlib framing makes a single-event batch bigger, not smaller. No-op on engine versions without the `zlib` module. |
 | `token_refresh_lead_ms` | `60000` | Refresh lead before token expiry (≥0) |
 | `spool_enabled` | `true` | Durable offline event spool ([details](#offline-durability-event-spool)); `false` also clears a previously persisted record at init |
 | `spool_max_events` | `500` | Max spooled entries (≥1); oldest evicted first |
@@ -440,6 +449,9 @@ running.
 
 
 ## Request compression
+
+*(This whole section is unreleased: `v0.10.1` has no `shardpilot/compression.lua`,
+so at the pinned tag every body is sent uncompressed.)*
 
 Analytics batch bodies over 1 KiB are compressed with
 `Content-Encoding: deflate`. A batch body is the same envelope keys repeated
