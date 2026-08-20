@@ -68,7 +68,10 @@ dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/ta
 README's Installation section carries. The tag itself is cut from the merge of
 the matching version-bump commit, never before it, so there is a short window
 right after that merge in which the URL above does not resolve yet — if it
-404s, pin the previous tag (`v0.9.1`) until `v0.10.1` is published. Note there
+404s, WAIT for `v0.10.1` rather than pinning an earlier tag. `v0.10.0` and
+every tag before it still contain internal material that `v0.10.1` exists to
+stop distributing, so falling back would download exactly what the patch
+removed. Note there
 is no packaged ZIP asset attached to any GitHub Release — the tag source
 archive is the only hosted dependency URL. Pin a tag rather than tracking
 `main` so your build does not shift under you between releases.

@@ -5,6 +5,13 @@ on:
   push:
     branches:
       - main
+    # ⚠ TAGS TOO. A tag push creates the public archive this gate protects, and
+    # `v0.10.1` was cut off-main as a deletion-only patch — so a
+    # branches-only trigger would never have scanned the tree that actually
+    # publishes. A gate that runs on the branch and not on the artifact is
+    # guarding the wrong thing.
+    tags:
+      - 'v*'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

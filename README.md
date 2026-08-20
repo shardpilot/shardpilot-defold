@@ -18,10 +18,14 @@ not the platform boundary.
   workspace, or at a local stack you run yourself.
 - **Version `0.10.1`.** `game.project`, `shardpilot/version.lua`, and the top
   [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.10.1`; the `v0.10.1` tag
-  is cut from the merge of this version bump, not before it, per
-  [docs/release.md](docs/release.md). If you are reading this inside that
-  window the tag may not resolve yet — `v0.10.0` is the last tag that
-  definitely does.
+  ALREADY EXISTS, and it is an exception to the normal ordering.
+  The usual rule — cut the tag from the version-bump merge, per
+  [docs/release.md](docs/release.md) — did not apply: it was cut as a
+  deletion-only patch directly on top of `v0.10.0` so that the diff between
+  the two tags would be nothing but the removal, and its tree therefore still
+  declares `0.10.0`. This commit is what brings the declaration into line.
+  Nothing reads that constant at runtime. The next release returns to the
+  normal ordering.
 
 ## What it does
 
