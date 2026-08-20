@@ -8,8 +8,21 @@ pre-release: the API is unstable and may change before v1.
 claims move in the version-bump commit; the tag and GitHub Release are cut
 from that commit's merge, afterwards. So between the merge and the tagging
 step the version named here is **pending**, not published, and its archive URL
-404s — `v0.9.1` is the last one that definitely resolves. `git tag -l` on a
-fresh fetch is the authority on what is actually published, not this line.
+404s. `git tag -l` on a fresh fetch is the authority on what is actually
+published, not this line.
+
+**Do not fall back to an earlier tag.** This paragraph used to name the last
+tag that "definitely resolves" as a fallback, and after `v0.10.1` that advice
+pointed at an artifact carrying the internal material `v0.10.1` exists to stop
+distributing — a runbook sending a reader back to the thing being withdrawn.
+Every tag before `v0.10.1` contains it. If the pending tag 404s, WAIT for it.
+
+**`v0.10.1` itself is an exception to the ordering below**, and it is worth
+knowing so its tree does not look like a mistake. It was cut as a
+deletion-only patch directly on top of `v0.10.0` rather than from a
+version-bump merge, so it still declares `M.VERSION = "0.10.0"`. That was
+deliberate: the tag's whole purpose was to carry a removal and be verifiable
+as carrying only that, which putting a version bump in it would have defeated.
 
 Release ordering: merge the version-bump commit — it moves every in-tree
 version claim together, which `./scripts/check_versions.sh` enforces — then

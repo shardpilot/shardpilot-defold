@@ -23,8 +23,16 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      # ⚠ fetch-depth: 0. The surface gate's roster rule asks whether each
+      # literal internal name already appears in this repository's PUBLISHED
+      # history, and actions/checkout defaults to a ONE-COMMIT clone. On that
+      # clone every literal reads as novel, so the gate refuses with exit 2 and
+      # blames the roster for a property of the checkout. Verified by cloning
+      # this branch with --depth 1 and running the gate: exit 2.
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Shell syntax
         run: bash -n scripts/*.sh
