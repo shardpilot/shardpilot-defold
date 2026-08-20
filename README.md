@@ -248,7 +248,7 @@ README, `docs/`, and the skill above are the reference.
 | `user_id` | `nil` | Initial known-user attribution |
 | `batch_size` | `25` | Flush trigger, 1–100 |
 | `buffer_size` | `1000` | Max queued events (≥1); cross-SDK canonical default |
-| `flush_interval_seconds` | `15` (was `1`) *(unreleased — 1 at `v0.10.1`)* | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value. |
+| `flush_interval_seconds` | `15` (was `1`) *(unreleased — 1 at `v0.10.1`)* | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value *(the own-clock pacing is unreleased — `Client:retry_due` is absent at `v0.10.1`, where a retryable failure waits for the flush tick)*. |
 | `publish_timeout_seconds` | `2` | Per-request timeout (>0) |
 | `request_compression_enabled` | `true` *(unreleased — absent at `v0.10.1`)* | Compress analytics batch bodies over 1 KiB with `Content-Encoding: deflate` (RFC 1950 zlib — see [Request compression](#request-compression)). Sub-threshold bodies go uncompressed: zlib framing makes a single-event batch bigger, not smaller. No-op on engine versions without the `zlib` module. |
 | `token_refresh_lead_ms` | `60000` | Refresh lead before token expiry (≥0) |
