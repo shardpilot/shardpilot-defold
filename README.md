@@ -94,7 +94,7 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — the latest tag is `v0.10.0`:
+published tag's source archive — the latest tag is `v0.10.1`:
 
 ```ini
 [project]
