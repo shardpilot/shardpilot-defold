@@ -50,6 +50,18 @@ the deeper reference.
 
 Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.1`.
 
+⚠ **This skill is written against `main`, which is AHEAD of that tag**, because
+`v0.10.1` is a deletion-only patch on top of `v0.10.0` and carries no source
+change. Two things documented below are NOT in it, and are marked *(unreleased)*
+where they appear:
+
+* `request_compression_enabled` and the whole request-compression path — the
+  tag has no `shardpilot/compression.lua` at all;
+* `flush_interval_seconds` defaulting to 15 — at the tag the default is **1**.
+
+Everything else describes the pinned release. A tag cut from the fully cleaned,
+current tree is the real fix and is sequenced after the source scrub.
+
 Two supported paths:
 
 1. **Vendor the `shardpilot/` directory** into your project. Copy the whole
@@ -81,7 +93,7 @@ Ordinary tags DO come from the merge of the matching version-bump commit, never
 before it, so for those there is a short window right after the merge in which
 the URL above does not resolve yet — if it 404s, WAIT for the tag rather than
 pinning an earlier one. `v0.10.0` and
-every tag before it still contain internal material that `v0.10.1` exists to
+the other affected tags still contain internal material that `v0.10.1` exists to
 stop distributing, so falling back would download exactly what the patch
 removed. Note there
 is no packaged ZIP asset attached to any GitHub Release — the tag source
@@ -148,12 +160,13 @@ auth credential. `init` returns `true`, or `false, err` with a specific code
 (`ingest_url_required`, `invalid_ingest_url`, `auth_required`,
 `auth_mode_conflict`, `remote_config_api_key_required`, …). Useful defaults:
 `batch_size = 25` (1–100), `buffer_size = 1000`,
-`flush_interval_seconds = 15` (how long a PARTIAL batch waits — not a
+`flush_interval_seconds = 15` *(unreleased — the default is 1 at `v0.10.1`)* (how long a PARTIAL batch waits — not a
 heartbeat: an empty queue publishes nothing, a full `batch_size` publishes
 immediately, `flush()` on demand, and retry pacing runs on its own clock),
 `publish_timeout_seconds = 2`, `spool_enabled = true`,
 `spool_max_events = 500`, `spool_max_bytes = 262144` (max 393216),
-`request_compression_enabled = true`.
+`request_compression_enabled = true`. *(unreleased — `v0.10.1` has no
+compression module; the tag always sends uncompressed.)*
 
 **Batch bodies over 1 KiB are compressed**, with `Content-Encoding: deflate`
 (RFC 1950 zlib) rather than gzip: the engine's `zlib` module produces that
@@ -171,7 +184,8 @@ buys. Three things follow when you integrate:
   feature-detected; its absence is an ordinary uncompressed publish, never an
   error.
 
-Set `request_compression_enabled = false` to opt out.
+Set `request_compression_enabled = false` to opt out. *(unreleased — absent at
+`v0.10.1`.)*
 
 Wire the frame loop and teardown:
 

@@ -117,9 +117,12 @@
   scripts and the README; nothing requires it at runtime and it does not reach
   the wire.
 
-  **Forward-only.** `v0.10.0` and every earlier tag remain reachable and still
-  contain these files. This stops new installs that follow the documentation;
-  it recalls nothing.
+  **Forward-only.** The affected tags remain reachable, and this stops new
+  installs that follow the documentation — it recalls nothing. Measured across
+  every tag: `v0.8.0`, `v0.8.1`, `v0.9.0`, `v0.9.1` and `v0.10.0` carry all
+  eight files; `v0.6.0` and `v0.7.0` carry two; `v0.5.0` and earlier predate
+  them and carry none. (An earlier revision of this entry said every earlier
+  tag contained them, which was not measured and was not true.)
 
 ## v0.10.0 — 2026-07-30 — early alpha
 
