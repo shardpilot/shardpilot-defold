@@ -26,6 +26,24 @@ version-bump merge, so it still declares `M.VERSION = "0.10.0"`. That was
 deliberate: the tag's whole purpose was to carry a removal and be verifiable
 as carrying only that, which putting a version bump in it would have defeated.
 
+**An off-main tag is not covered by CI, and this is the only control there is.**
+The surface gate runs on `push`, which for a tag means it runs AFTER the tag
+exists — and a tag archive is fetchable the moment it is pushed. So a tag cut
+from anywhere other than a merge on `main` (as `v0.10.1` was, deliberately, to
+carry only a removal) is published before anything has checked it. CI cannot
+close that: by the time a workflow can react, the artifact is already served.
+
+Run `./scripts/check_public_surface.sh` from a checkout OF THE TAGGED TREE
+before pushing the tag. From a detached worktree at the tag:
+
+```bash
+git worktree add /tmp/tagcheck <the-commit-to-tag>
+cd /tmp/tagcheck && ./scripts/check_public_surface.sh   # must exit 0
+```
+
+This is a procedure, not a gate, and it is written down here because that is
+the honest description of it — the run before the push is the whole control.
+
 Release ordering: merge the version-bump commit — it moves every in-tree
 version claim together, which `./scripts/check_versions.sh` enforces — then
 immediately tag that merge commit as `v<version>` and publish the GitHub
