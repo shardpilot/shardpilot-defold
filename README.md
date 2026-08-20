@@ -14,13 +14,13 @@ not the platform boundary.
 
 - **v0 alpha, pre-1.0, API unstable.** This is public-preview source only. The
   surface may change before v1 with no backward-compatibility guarantee.
-- **Pre-launch.** The production ingest domain is **not provisioned** yet — use
-  local/develop endpoints for evaluation.
-- **Version `0.10.0`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.10.0`; the `v0.10.0` tag
+- Point `ingest_url` at the ShardPilot ingest endpoint issued for your
+  workspace, or at a local stack you run yourself.
+- **Version `0.10.1`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.10.1`; the `v0.10.1` tag
   is cut from the merge of this version bump, not before it, per
   [docs/release.md](docs/release.md). If you are reading this inside that
-  window the tag may not resolve yet — `v0.9.1` is the last tag that
+  window the tag may not resolve yet — `v0.10.0` is the last tag that
   definitely does.
 
 ## What it does
@@ -98,7 +98,7 @@ published tag's source archive — the latest tag is `v0.10.0`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.1.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —

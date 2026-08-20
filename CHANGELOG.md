@@ -94,6 +94,29 @@
   Engine versions without the `zlib` module simply do not compress: the module
   is feature-detected and its absence is an ordinary uncompressed publish.
 
+## v0.10.1 — 2026-08-20 — early alpha
+
+- **Removed two internal agent skills from the published artifact.** They were
+  reachable through this repository's own documented install path — the
+  dependency URL for `v0.10.0` delivered twelve of their files — so this was
+  internal material being handed out rather than merely stored. One described
+  an internal review process; the other published the backend stack with
+  versions, the tenant-isolation mechanism in operational detail with a named
+  runtime role, an inventory of internal repositories with their build
+  commands, and statements about where automated coverage does not reach.
+
+  The `v0.10.1` tag was cut as a DELETION-ONLY patch directly on top of
+  `v0.10.0`: eight files, 1375 deletions, no addition, no modification, no Lua
+  source touched. That is why its tree still declares `M.VERSION = "0.10.0"` —
+  the tag carries nothing but the removal, and this release commit is what
+  catches the declaration up. The constant is read only by the version-check
+  scripts and the README; nothing requires it at runtime and it does not reach
+  the wire.
+
+  **Forward-only.** `v0.10.0` and every earlier tag remain reachable and still
+  contain these files. This stops new installs that follow the documentation;
+  it recalls nothing.
+
 ## v0.10.0 — 2026-07-30 — early alpha
 
 - **Crash reports can now be attributed to a player.** New optional

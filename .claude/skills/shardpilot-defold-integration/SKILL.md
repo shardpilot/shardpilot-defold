@@ -48,7 +48,7 @@ the deeper reference.
 
 ## Install
 
-Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.0`.
+Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.1`.
 
 Two supported paths:
 
@@ -61,14 +61,14 @@ Two supported paths:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.1.zip
 ```
 
-`v0.10.0` is the version this skill matches, and it is the same pin the
+`v0.10.1` is the version this skill matches, and it is the same pin the
 README's Installation section carries. The tag itself is cut from the merge of
 the matching version-bump commit, never before it, so there is a short window
 right after that merge in which the URL above does not resolve yet — if it
-404s, pin the previous tag (`v0.9.1`) until `v0.10.0` is published. Note there
+404s, pin the previous tag (`v0.9.1`) until `v0.10.1` is published. Note there
 is no packaged ZIP asset attached to any GitHub Release — the tag source
 archive is the only hosted dependency URL. Pin a tag rather than tracking
 `main` so your build does not shift under you between releases.
