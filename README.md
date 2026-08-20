@@ -106,10 +106,25 @@ dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/ta
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
-the tag source archive above is the only hosted dependency URL. The tag is
-created from the merge of the matching version-bump commit, so immediately
-after that merge lands there is a short window in which this URL 404s; if it
-does, pin the previous tag until the new one is published.
+the tag source archive above is the only hosted dependency URL. Tags are
+normally created from the merge of the matching version-bump commit, so
+immediately after that merge lands there is a short window in which the URL
+404s.
+
+**If it 404s, wait — do not pin an earlier tag.** `v0.10.1` is the first tag
+that does not carry the two internal agent skills; `v0.10.0` and everything
+before it distribute all eight of those files through this same dependency URL.
+This paragraph used to say "pin the previous tag until the new one is
+published", which after `v0.10.1` pointed at exactly the artifact being
+withdrawn.
+
+**What `v0.10.1` does and does not contain.** It is `v0.10.0` plus eight file
+deletions and nothing else — that is what makes it verifiable as carrying only
+the removal, and it is why its tree still declares `M.VERSION = "0.10.0"`. It
+therefore does NOT include the other internal identifiers removed on `main`
+after it was cut. Those go out in the next tag, which is cut from the fully
+cleaned tree; until then this pin is the correct one because it is the only tag
+that stops the actively-distributed disclosure.
 
 Then require the module:
 
