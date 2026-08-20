@@ -98,8 +98,12 @@
 
 - **Removed two internal agent skills from the published artifact.** They were
   reachable through this repository's own documented install path — the
-  dependency URL for `v0.10.0` delivered twelve of their files — so this was
-  internal material being handed out rather than merely stored. One described
+  dependency URL for `v0.10.0` delivered all eight of their files — so this was
+  internal material being handed out rather than merely stored. (An earlier
+  draft of this entry said twelve, which counted the four directory entries the
+  ZIP carries alongside the files. Measured from the published archive: sixteen
+  `.claude` entries, seven of them directories, nine files, eight of which
+  belong to the two removed skills.) One described
   an internal review process; the other published the backend stack with
   versions, the tenant-isolation mechanism in operational detail with a named
   runtime role, an inventory of internal repositories with their build

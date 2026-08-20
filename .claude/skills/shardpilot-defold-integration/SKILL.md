@@ -65,10 +65,22 @@ dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/ta
 ```
 
 `v0.10.1` is the version this skill matches, and it is the same pin the
-README's Installation section carries. The tag itself is cut from the merge of
-the matching version-bump commit, never before it, so there is a short window
-right after that merge in which the URL above does not resolve yet — if it
-404s, WAIT for `v0.10.1` rather than pinning an earlier tag. `v0.10.0` and
+README's Installation section carries.
+
+Its provenance is EXCEPTIONAL, and worth knowing because it explains something
+that otherwise looks like a mistake: `v0.10.1` was not cut from a version-bump
+merge the way every other tag here is. It is a deletion-only patch applied
+directly on top of `v0.10.0` — eight files removed, nothing added, nothing
+modified, no Lua source touched — so its tree still declares
+`M.VERSION = "0.10.0"`. That is deliberate. The constant is read by the
+version-check scripts and the README and reaches nothing at runtime, and moving
+it would have meant putting content into a tag whose entire purpose was to
+carry a removal and be verifiable as carrying only that.
+
+Ordinary tags DO come from the merge of the matching version-bump commit, never
+before it, so for those there is a short window right after the merge in which
+the URL above does not resolve yet — if it 404s, WAIT for the tag rather than
+pinning an earlier one. `v0.10.0` and
 every tag before it still contain internal material that `v0.10.1` exists to
 stop distributing, so falling back would download exactly what the patch
 removed. Note there
