@@ -186,7 +186,7 @@ fi
 if awk '
     !started && /^[[:space:]]*(#|$)/ { next }
     { started = 1 }
-    started && ($0 ~ /^[[:space:]]*#/ || $0 ~ /;[[:space:]]*#/) { print NR ": " $0; found = 1 }
+    started && ($0 ~ /^[[:space:]]*#/ || $0 ~ /[[:space:]]#/) { print NR ": " $0; found = 1 }
     END { exit !found }
   ' "$CORPUS"; then
   echo "REFUSING: $CORPUS has comments below its header (listed above)." >&2
@@ -437,12 +437,17 @@ scan_tree() {
 # gated at PR time in this repository. Its coverage is the org-wide
 # publication check, which reads the class library rather than a roster and
 # therefore needs no literal in a public file.
+# Both halves of the gate, excluded from every presence search as one list.
+# The rule asks whether a literal survives ELSEWHERE in the tree; a file that
+# exists to hold those literals cannot be part of the answer.
+GATE_EXCLUDES=":(exclude)scripts/check_public_surface.sh :(exclude)scripts/gate-corpus.sh"
+
 roster_is_present_in_the_tree() {
   local lit novel=0 found
   found="$(mktemp)"
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    git grep -l -F -- "$lit" -- . ':(exclude)scripts/check_public_surface.sh' > "$found" 2>/dev/null || :
+    git grep -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
     if [ ! -s "$found" ]; then
       printf 'ROSTER VIOLATION: %s appears nowhere in this tree except this file.\n' "$lit" >&2
       novel=$((novel + 1))
@@ -461,7 +466,7 @@ EOF
   # the fixtures.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    git grep -l -F -- "$lit" -- . ':(exclude)scripts/check_public_surface.sh' > "$found" 2>/dev/null || :
+    git grep -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
     if [ ! -s "$found" ]; then
       printf 'PROSE VIOLATION: %s is written in this file and appears nowhere else in this tree.\n' "$lit" >&2
       novel=$((novel + 1))
@@ -624,7 +629,7 @@ fi
 echo
 echo "LANE B (REPORTED, NOT GATED) — Lua source: ${scan_lane_b_files} file(s) WITH A MATCH, ${scan_lane_b_lines} matching line(s). Not a count of Lua files scanned: a clean one is not counted here."
 if [ "$scan_lane_b_files" -eq 0 ]; then
-  echo "  LANE B IS EMPTY. The debt this lane tracked is paid: fold *.go into lane A"
+  echo "  LANE B IS EMPTY. The debt this lane tracked is paid: fold *.lua into lane A"
   echo "  and delete this section, so the scope note stops describing a gap that"
   echo "  no longer exists."
 else
