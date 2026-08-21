@@ -209,11 +209,15 @@ fi
 # comment, then a function declaration (bash emits neither a definition under
 # xtrace nor a name under `compgen -v`), then an assignment repeated so its
 # first value is overwritten before the self-test ever reads it, then a comment
-# after a `;`. They are one thing — text in a file no pass reads — so the rule
-# states what a line MAY be instead of what it may not.
+# after a `;`, then a parameter expansion whose payload never reaches a value,
+# then an indexed array whose second element nothing expands. They are one
+# thing — text in a file no pass reads — so the rule states what a line MAY be
+# instead of what it may not, down to the characters admissible outside a
+# quoted literal: name characters, `=`, `'`, and `$` only where it opens `$'…'`.
+# A construct nobody has thought of yet needs a character to be written in.
 if ! corpus_grammar="$(awk -v expected="$corpus_expected" '
   BEGIN {
-    sq = sprintf("%c", 39); dq = sprintf("%c", 34); q = ""
+    sq = sprintf("%c", 39); dl = sprintf("%c", 36); q = ""
     n = split(expected, a, /[ \t\n]+/)
     for (i = 1; i <= n; i++) if (a[i] != "") ok[a[i]] = 1
   }
@@ -222,18 +226,20 @@ if ! corpus_grammar="$(awk -v expected="$corpus_expected" '
     while (i <= length(s)) {
       c = substr(s, i, 1)
       if (q == "") {
-        if (c == sq || c == dq) q = c
-        else if (c == "\\") i++
-        else if (c == "#" || c == ";")
-          print NR ": " c " outside a quoted value -- " $0
+        if (c == sq) q = sq
+        else if (c == dl && substr(s, i + 1, 1) == sq) { q = sq; i++ }
+        else if (c !~ /[A-Za-z0-9_=]/) {
+          if (!hit) print NR ": " c " outside a quoted value -- " $0
+          hit = 1
+        }
       } else if (c == q) q = ""
-      else if (q == dq && c == "\\") i++
       i++
     }
   }
   !started && /^[[:space:]]*(#|$)/ { next }
   { started = 1 }
   {
+    hit = 0
     if (q == "" && $0 ~ /^[[:space:]]*$/) next
     if (q == "") {
       if ($0 !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
@@ -761,7 +767,7 @@ if [ "$scan_lane_b_files" -eq 0 ]; then
   echo "  no longer exists."
 else
   echo "  These comments ship inside the library every consuming project pulls in. They are owed work, not"
-  echo "  accepted risk, and they are not gated HERE because this repository's Go"
+  echo "  accepted risk, and they are not gated HERE because this repository's Lua"
   echo "  sources are owned by the SDK wire-freeze workstream. The count is lines"
   echo "  MATCHING THE PATTERNS ABOVE — not a total of internal material, which the"
   echo "  scope note above says these shapes cannot bound."
