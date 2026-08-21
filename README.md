@@ -14,8 +14,10 @@ not the platform boundary.
 
 - **v0 alpha, pre-1.0, API unstable.** This is public-preview source only. The
   surface may change before v1 with no backward-compatibility guarantee.
-- Point `ingest_url` at the ShardPilot ingest endpoint issued for your
-  workspace, or at a local stack you run yourself.
+- Point `ingest_url` at a ShardPilot ingest endpoint you have been given, or at
+  a local stack you run yourself. Which endpoints are available today is stated
+  under Configuration below and in [`docs/configuration.md`](docs/configuration.md);
+  read that before configuring a hosted deployment.
 - **Version `0.10.1`.** `game.project`, `shardpilot/version.lua`, and the top
   [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.10.1`; the `v0.10.1` tag
   ALREADY EXISTS, and it is an exception to the normal ordering.
