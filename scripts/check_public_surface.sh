@@ -559,7 +559,8 @@ scan_tree() {
     # by magic rather than by extension, because the extension is the part an
     # author controls.
     #
-    # ⚠ AND AN ASCII RASTER CARRIES NO NUL AT ALL. Netpbm's P1 through P6 hold
+    # ⚠ AND AN ASCII RASTER CARRIES NO NUL AT ALL. XPM is printable C source
+    # from its `/* X` header to its pixel array; Netpbm's P1 through P6 hold
     # their pixels as decimal text, so neither the NUL refusal nor a
     # compression signature sees them while the picture renders whatever it
     # renders. Two printable magic bytes, on the same footing as `MZ`.
@@ -574,7 +575,7 @@ scan_tree() {
     # explicit exception, not discovering the hole afterwards.
     case "$(od -An -tx1 -N4 "$blob" 2>/dev/null | tr -d ' \n')" in
       4d5a*|89504e47|ffd8ff*|47494638|52494646|424d*|49492a00|4d4d002a|\
-      5031*|5032*|5033*|5034*|5035*|5036*)
+      5031*|5032*|5033*|5034*|5035*|5036*|2f2a2058)
         echo "REFUSING: '$f' begins with container magic (archive, PDF, executable" >&2
         echo "  or raster image)," >&2
         echo "  and this gate reads files as text. No pass here opens a container, so" >&2
@@ -749,6 +750,12 @@ scan_tree() {
 # gated at PR time in this repository. Its coverage is the org-wide
 # publication check, which reads the class library rather than a roster and
 # therefore needs no literal in a public file.
+# ⚠ EVERY PRESENCE SEARCH ASKS THE INDEX (`--cached`), because everything else
+# here does. Asked of the working tree it answered about files a commit would
+# not contain: staging the removal of the last real occurrences of a roster
+# name while leaving the old copies on disk left the search satisfied and the
+# corpus about to become that name's sole publisher.
+#
 # Both halves of the gate, excluded from every presence search as one list.
 # The rule asks whether a literal survives ELSEWHERE in the tree; a file that
 # exists to hold those literals cannot be part of the answer.
@@ -759,7 +766,7 @@ roster_is_present_in_the_tree() {
   found="$(mktemp)"
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    git grep -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
+    git grep --cached -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
     if [ ! -s "$found" ]; then
       printf 'ROSTER VIOLATION: %s appears nowhere in this tree except this file.\n' "$lit" >&2
       novel=$((novel + 1))
@@ -794,8 +801,11 @@ EOF
   # a quantifier or an escape. The disguises are REDUCED first, because each
   # spelling of the same trick got past the previous version: parentheses with
   # nothing to branch between are grouping and come off, and a one-character
-  # class is one character. Both reductions were written after a costume got
-  # through, which is why the rule below does not rely on this one alone.
+  # class is one character, and a backslash before an ordinary character is
+  # no-op syntax that grep discards — `private\-daemon` is the same name and
+  # was approved for carrying a backslash. Each reduction was written after a
+  # costume got through, which is why the rule below does not rely on this
+  # one alone.
   #
   # Names belong in the roster, which is checked against the tree.
   while IFS= read -r lit; do
@@ -807,6 +817,7 @@ $(printf '%s' "$PATTERNS" | awk '
   function check(a,   r) {
     if (a == "") return
     r = a
+    gsub(/\\([^bBwWsSdD<>])/, "\\1", r)
     if (index(r, "|") == 0) gsub(/[()]/, "", r)
     gsub(/\[.\]/, "c", r)
     if (r ~ /[][{}+*?\\|]/) return
@@ -833,18 +844,20 @@ EOF
   # tree, exactly as a roster entry must. `[p]rivate-daemon` reduces to a
   # hyphenated run whatever regex syntax surrounds it, so this holds where a
   # structural test can be dressed around. Character classes are removed first
-  # so a class's own contents are not read as a name. Measured when written:
+  # so a class's own contents are not read as a name, and a backslash before an
+  # ordinary character is dropped for the same reason the structural test drops
+  # it. Measured when written:
   # both pattern lists contain zero such runs, so this costs nothing today and
   # refuses the day one appears.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    git grep -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
+    git grep --cached -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
     if [ ! -s "$found" ]; then
       printf 'PROSE VIOLATION: the pattern list carries the literal %s, which is nowhere else in this tree.\n' "$lit" >&2
       novel=$((novel + 1))
     fi
   done <<EOF
-$(printf '%s' "$PATTERNS" | sed 's/\[[^]]*\]//g' \
+$(printf '%s' "$PATTERNS" | sed -e 's/\[[^]]*\]//g' -e 's/\\\([^bBwWsSdD<>]\)/\1/g' \
   | grep -oE '[A-Za-z][A-Za-z0-9]*(-[A-Za-z0-9]+)+' | sort -u)
 EOF
 
@@ -856,7 +869,7 @@ EOF
   # nowhere else in the tree was demonstrated to pass everything else.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    git grep -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
+    git grep --cached -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
     if [ ! -s "$found" ]; then
       printf 'PROSE VIOLATION: %s is written in this file and appears nowhere else in this tree.\n' "$lit" >&2
       novel=$((novel + 1))
