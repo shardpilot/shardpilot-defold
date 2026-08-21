@@ -26,7 +26,8 @@ ShardPilot Defold SDK v0 is configured with a Lua table:
   -- api_key = "sp_ingest_...",
   batch_size = 25,
   buffer_size = 1000,
-  -- flush_interval_seconds defaults to 15. It is the longest a PARTIAL batch
+  -- flush_interval_seconds defaults to 15 on main; at the pinned tag v0.10.1 the
+  -- default is 1, because that tag carries no source change. It is the longest a PARTIAL batch
   -- waits before publishing, not a heartbeat: update(dt) publishes nothing
   -- when the queue is empty. Set it explicitly only if you want a different
   -- cadence -- pinning it to 1 here is what stopped batching from happening.
@@ -131,7 +132,7 @@ the `api_key` authenticates only the remote-config fetch.
   fallback, the `401`/`403` fail-closed rule, and the cache's scope check —
   are in the README's "Remote config" section.
 - **`remote_config_attributes_enabled`** (default `false` = dark, boolean).
-  ADR-0310 opt-in: fetches carry the targeting attributes stored via
+  Opt-in: fetches carry the targeting attributes stored via
   `set_remote_config_attributes(attributes)` as query parameters, so
   server-side delivery rules can target this client (`nil`/empty clears; the
   setter is inert while the flag is off, and the flag without
@@ -370,7 +371,7 @@ transient/`Retry-After` rules) are in the README's "Experiments" section.
 - **`schema_revision`** (default: the SDK's built-in revision; string or
   `false`). Every `POST {ingest_url}/v1/events:batch` request declares, in
   the `X-ShardPilot-Schema-Revision` request header, the revision of the
-  analytics-service envelope-schema set this SDK build was provisioned
+  ingest envelope-schema set this SDK build was provisioned
   against (`shardpilot/schema_revision.lua` — a public content digest of
   the service's embedded schema files, not a secret; it is re-synced when
   the service's schema set changes). The ingest service uses the
@@ -484,8 +485,7 @@ unknown states alike, because a receipt documents the decision itself. See
   `"user_verified"`, chosen by the canonical-actor rule described in
   `docs/privacy.md` — next to `actor_identifier`. `false` is the escape
   hatch for a deployment whose ingest service still runs the pre-amendment
-  strict decoder (`INGEST_CONSENT_KIND_MODE=off` rejects a kind-bearing
-  body `400` as an unknown field, a terminal outcome that would drop the
+  strict decoder (which rejects a kind-bearing body `400` as an unknown field, a terminal outcome that would drop the
   receipt, denials included): it suppresses the **wire field only** — the
   kind is still chosen at decision time, persisted with the receipt, and
   used to select the dispatch credential (anon-keyed receipts under the

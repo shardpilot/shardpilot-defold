@@ -14,14 +14,20 @@ not the platform boundary.
 
 - **v0 alpha, pre-1.0, API unstable.** This is public-preview source only. The
   surface may change before v1 with no backward-compatibility guarantee.
-- **Pre-launch.** The production ingest domain is **not provisioned** yet — use
-  local/develop endpoints for evaluation.
-- **Version `0.10.0`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.10.0`; the `v0.10.0` tag
-  is cut from the merge of this version bump, not before it, per
-  [docs/release.md](docs/release.md). If you are reading this inside that
-  window the tag may not resolve yet — `v0.9.1` is the last tag that
-  definitely does.
+- Point `ingest_url` at a ShardPilot ingest endpoint you have been given, or at
+  a local stack you run yourself. Which endpoints are available today is stated
+  under Configuration below and in [`docs/configuration.md`](docs/configuration.md);
+  read that before configuring a hosted deployment.
+- **Version `0.10.1`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.10.1`; the `v0.10.1` tag
+  ALREADY EXISTS, and it is an exception to the normal ordering.
+  The usual rule — cut the tag from the version-bump merge, per
+  [docs/release.md](docs/release.md) — did not apply: it was cut as a
+  deletion-only patch directly on top of `v0.10.0` so that the diff between
+  the two tags would be nothing but the removal, and its tree therefore still
+  declares `0.10.0`. This commit is what brings the declaration into line.
+  Nothing reads that constant at runtime. The next release returns to the
+  normal ordering.
 
 ## What it does
 
@@ -94,18 +100,44 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — the latest tag is `v0.10.0`:
+published tag's source archive — the latest tag is `v0.10.1`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.1.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
-the tag source archive above is the only hosted dependency URL. The tag is
-created from the merge of the matching version-bump commit, so immediately
-after that merge lands there is a short window in which this URL 404s; if it
-does, pin the previous tag until the new one is published.
+the tag source archive above is the only hosted dependency URL. Tags are
+normally created from the merge of the matching version-bump commit, so
+immediately after that merge lands there is a short window in which the URL
+404s.
+
+**If it 404s, wait — do not pin an earlier tag.** `v0.10.1` is the deletion-only
+patch that removes the two internal agent skills. Measured across every tag:
+`v0.8.0`, `v0.8.1`, `v0.9.0`, `v0.9.1` and `v0.10.0` carry all eight of those
+files through this same dependency URL, and `v0.6.0` and `v0.7.0` carry two of
+them. `v0.5.0` and earlier predate the files entirely — but they also predate
+most of what this README documents. This paragraph used to say "pin the previous
+tag until the new one is published", which after `v0.10.1` pointed at exactly
+the artifact being withdrawn.
+
+**Three behaviours documented below are NOT in `v0.10.1`**, because it is a
+deletion-only patch and carries no source change. Measured at the tag:
+`flush_interval_seconds` defaults to **1**, not 15; there is no
+`shardpilot/compression.lua` at all, so `request_compression_enabled` and the
+whole request-compression section do not exist; and `Client:retry_due` is
+absent (0 occurrences against 10 on `main`), so a retryable failure waits for
+the flush tick rather than its own backoff deadline. Each is marked
+*(unreleased)* where it appears.
+
+**What `v0.10.1` does and does not contain.** It is `v0.10.0` plus eight file
+deletions and nothing else — that is what makes it verifiable as carrying only
+the removal, and it is why its tree still declares `M.VERSION = "0.10.0"`. It
+therefore does NOT include the other internal identifiers removed on `main`
+after it was cut. Those go out in the next tag, which is cut from the fully
+cleaned tree; until then this pin is the correct one because it is the only tag
+that stops the actively-distributed disclosure.
 
 Then require the module:
 
@@ -203,7 +235,7 @@ README, `docs/`, and the skill above are the reference.
 |---|---|---|
 | `ingest_url` | — (required) | `https://…`, or `http://` only for `localhost`/`127.0.0.1`/`::1`; no query/fragment/path |
 | `remote_config_url` | `nil` (disabled) | Remote-config base URL (same shape rules as `ingest_url`); a **separate** service from the ingest endpoint. Requires `api_key` — see [Remote config](#remote-config) |
-| `remote_config_attributes_enabled` | `false` (dark) | ADR-0310 opt-in: fetches carry the attributes stored via `set_remote_config_attributes` as query parameters — only while consent is **granted** (unknown/denied fetch attribute-less). Requires `remote_config_url` — see [Remote config](#remote-config) |
+| `remote_config_attributes_enabled` | `false` (dark) | Opt-in: fetches carry the attributes stored via `set_remote_config_attributes` as query parameters — only while consent is **granted** (unknown/denied fetch attribute-less). Requires `remote_config_url` — see [Remote config](#remote-config) |
 | `experiments_enabled` | `false` (off) | Opts into the experiment-assignment consumer. Requires **both** `remote_config_url` and `api_key` — see [Experiments](#experiments) |
 | `workspace_id` | — (required) | Tenant key |
 | `app_id` | — (required) | Product key |
@@ -218,9 +250,9 @@ README, `docs/`, and the skill above are the reference.
 | `user_id` | `nil` | Initial known-user attribution |
 | `batch_size` | `25` | Flush trigger, 1–100 |
 | `buffer_size` | `1000` | Max queued events (≥1); cross-SDK canonical default |
-| `flush_interval_seconds` | `15` (was `1`) | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value. |
+| `flush_interval_seconds` | `15` (was `1`) *(unreleased — 1 at `v0.10.1`)* | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value *(the own-clock pacing is unreleased — `Client:retry_due` is absent at `v0.10.1`, where a retryable failure waits for the flush tick)*. |
 | `publish_timeout_seconds` | `2` | Per-request timeout (>0) |
-| `request_compression_enabled` | `true` | Compress analytics batch bodies over 1 KiB with `Content-Encoding: deflate` (RFC 1950 zlib — see [Request compression](#request-compression)). Sub-threshold bodies go uncompressed: zlib framing makes a single-event batch bigger, not smaller. No-op on engine versions without the `zlib` module. |
+| `request_compression_enabled` | `true` *(unreleased — absent at `v0.10.1`)* | Compress analytics batch bodies over 1 KiB with `Content-Encoding: deflate` (RFC 1950 zlib — see [Request compression](#request-compression)). Sub-threshold bodies go uncompressed: zlib framing makes a single-event batch bigger, not smaller. No-op on engine versions without the `zlib` module. |
 | `token_refresh_lead_ms` | `60000` | Refresh lead before token expiry (≥0) |
 | `spool_enabled` | `true` | Durable offline event spool ([details](#offline-durability-event-spool)); `false` also clears a previously persisted record at init |
 | `spool_max_events` | `500` | Max spooled entries (≥1); oldest evicted first |
@@ -420,6 +452,9 @@ running.
 
 ## Request compression
 
+*(This whole section is unreleased: `v0.10.1` has no `shardpilot/compression.lua`,
+so at the pinned tag every body is sent uncompressed.)*
+
 Analytics batch bodies over 1 KiB are compressed with
 `Content-Encoding: deflate`. A batch body is the same envelope keys repeated
 per event — close to the best case deflate has — so a full batch comes down to
@@ -533,7 +568,7 @@ way.
 - The fetch is **not consent-gated**: config delivery carries no analytics
   payload — the client id in the URL only scopes which config to serve
   (consistent across our SDKs). See [`docs/privacy.md`](docs/privacy.md).
-- **Targeting attributes (dark opt-in, ADR-0310) are the one
+- **Targeting attributes (dark opt-in) are the one
   granted-consent-only exception.** With
   `remote_config_attributes_enabled = true`, attributes stored via
   `shardpilot.set_remote_config_attributes({ geo = "US", … })` ride each

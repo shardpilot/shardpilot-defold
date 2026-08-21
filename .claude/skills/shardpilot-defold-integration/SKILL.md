@@ -48,7 +48,22 @@ the deeper reference.
 
 ## Install
 
-Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.0`.
+Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.1`.
+
+⚠ **This skill is written against `main`, which is AHEAD of that tag**, because
+`v0.10.1` is a deletion-only patch on top of `v0.10.0` and carries no source
+change. THREE things documented below are NOT in it, and are marked
+*(unreleased)* where they appear:
+
+* `request_compression_enabled` and the whole request-compression path — the
+  tag has no `shardpilot/compression.lua` at all;
+* `flush_interval_seconds` defaulting to 15 — at the tag the default is **1**;
+* retry pacing on its own clock — `Client:retry_due` does not exist at the tag
+  (0 occurrences against 10 on `main`), so a retryable failure there waits for
+  the flush tick instead of its own backoff deadline.
+
+Everything else describes the pinned release. A tag cut from the fully cleaned,
+current tree is the real fix and is sequenced after the source scrub.
 
 Two supported paths:
 
@@ -61,14 +76,29 @@ Two supported paths:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.1.zip
 ```
 
-`v0.10.0` is the version this skill matches, and it is the same pin the
-README's Installation section carries. The tag itself is cut from the merge of
-the matching version-bump commit, never before it, so there is a short window
-right after that merge in which the URL above does not resolve yet — if it
-404s, pin the previous tag (`v0.9.1`) until `v0.10.0` is published. Note there
+`v0.10.1` is the version this skill matches, and it is the same pin the
+README's Installation section carries.
+
+Its provenance is EXCEPTIONAL, and worth knowing because it explains something
+that otherwise looks like a mistake: `v0.10.1` was not cut from a version-bump
+merge the way every other tag here is. It is a deletion-only patch applied
+directly on top of `v0.10.0` — eight files removed, nothing added, nothing
+modified, no Lua source touched — so its tree still declares
+`M.VERSION = "0.10.0"`. That is deliberate. The constant is read by the
+version-check scripts and the README and reaches nothing at runtime, and moving
+it would have meant putting content into a tag whose entire purpose was to
+carry a removal and be verifiable as carrying only that.
+
+Ordinary tags DO come from the merge of the matching version-bump commit, never
+before it, so for those there is a short window right after the merge in which
+the URL above does not resolve yet — if it 404s, WAIT for the tag rather than
+pinning an earlier one. `v0.10.0` and
+the other affected tags still contain internal material that `v0.10.1` exists to
+stop distributing, so falling back would download exactly what the patch
+removed. Note there
 is no packaged ZIP asset attached to any GitHub Release — the tag source
 archive is the only hosted dependency URL. Pin a tag rather than tracking
 `main` so your build does not shift under you between releases.
@@ -133,12 +163,19 @@ auth credential. `init` returns `true`, or `false, err` with a specific code
 (`ingest_url_required`, `invalid_ingest_url`, `auth_required`,
 `auth_mode_conflict`, `remote_config_api_key_required`, …). Useful defaults:
 `batch_size = 25` (1–100), `buffer_size = 1000`,
-`flush_interval_seconds = 15` (how long a PARTIAL batch waits — not a
+`flush_interval_seconds = 15` *(unreleased — the default is 1 at `v0.10.1`)* (how long a PARTIAL batch waits — not a
 heartbeat: an empty queue publishes nothing, a full `batch_size` publishes
-immediately, `flush()` on demand, and retry pacing runs on its own clock),
+immediately, `flush()` on demand *(retry pacing on its own clock is unreleased —
+`Client:retry_due` is absent at `v0.10.1`)*, and retry pacing runs on its own clock
+*(unreleased — at `v0.10.1` there is no `retry_due`, so a retryable failure
+waits for the flush tick)*),
 `publish_timeout_seconds = 2`, `spool_enabled = true`,
 `spool_max_events = 500`, `spool_max_bytes = 262144` (max 393216),
-`request_compression_enabled = true`.
+`request_compression_enabled = true`. *(unreleased — `v0.10.1` has no
+compression module; the tag always sends uncompressed.)*
+
+*(This whole subsection is unreleased: `v0.10.1` has no `shardpilot/compression.lua`,
+so at the pin every body is sent uncompressed.)*
 
 **Batch bodies over 1 KiB are compressed**, with `Content-Encoding: deflate`
 (RFC 1950 zlib) rather than gzip: the engine's `zlib` module produces that
@@ -156,7 +193,8 @@ buys. Three things follow when you integrate:
   feature-detected; its absence is an ordinary uncompressed publish, never an
   error.
 
-Set `request_compression_enabled = false` to opt out.
+Set `request_compression_enabled = false` to opt out. *(unreleased — absent at
+`v0.10.1`.)*
 
 Wire the frame loop and teardown:
 
@@ -331,7 +369,7 @@ available; the last-known-good snapshot survives restarts and offline
 launches. `remote_config_version()` reads the response wrapper's `version`
 metadata.
 
-Targeting attributes are a dark opt-in (ADR-0310) and — unlike the fetch —
+Targeting attributes are a dark opt-in and — unlike the fetch —
 granted-consent-only: `remote_config_attributes_enabled = true` plus
 `shardpilot.set_remote_config_attributes({ geo = "US", … })` makes fetches
 carry the experiment attribute vocabulary (`geo`, `app_version`,
@@ -361,7 +399,7 @@ crash.init({
   --                       -- outside Defold, or init fails platform_required
   -- script_error_capture_enabled = true, -- opt-in Lua script-error auto-capture (dark by default)
 })
--- crash.init auto-forwards last session's native dump (ADR-0297 §7c);
+-- crash.init auto-forwards last session's native dump;
 -- set capture_previous_on_boot = false to call crash.capture_previous() manually instead.
 crash.record_breadcrumb("menu.open")
 ```

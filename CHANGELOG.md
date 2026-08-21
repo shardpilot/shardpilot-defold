@@ -6,6 +6,32 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **Documentation-only: internal ShardPilot material removed from the
+  published tree, and a gate added so it does not come back.** No API, wire
+  format or behaviour change.
+
+  This repository is public and the documented dependency URL is its whole
+  tag archive, so every consuming project downloads every tracked file. Two
+  internal agent skills under `.claude/skills/` were among them, describing
+  ShardPilot's own review process and backend stack; they are gone. An
+  internal project codename in `docs/events.md`, internal decision-record
+  ids across the README, this changelog and `docs/`, and internal service
+  names have been removed — the engineering content each one annotated
+  stays, restated so a reader outside ShardPilot can act on it.
+
+  Also removed: internal ticket identifiers and an internal server-side
+  configuration variable that an adversarial review of the first draft found
+  the first pattern list could not match, and two bare section citations the
+  same draft's citation strip left dangling in `docs/crash.md`.
+
+  Two things this deliberately does NOT claim. It does not unpublish the
+  history: removing a line at HEAD leaves every commit that carried it, and
+  this repository has been public throughout. And it does not cover Lua
+  source: `scripts/check_public_surface.sh` gates the non-source surface at
+  zero and separately REPORTS the remaining hits in `*.lua` on every run,
+  because those belong to another workstream. A green run means lane A is
+  clean, and the report line is what lane B still owes.
+
 - **Retry wakes now cover every shape of retained work, and a server's
   `Retry-After` keeps its own expiry.** Four fixes to the retry pacing
   separated from `flush_interval_seconds` earlier in this release, all found by
@@ -68,6 +94,36 @@
   Engine versions without the `zlib` module simply do not compress: the module
   is feature-detected and its absence is an ordinary uncompressed publish.
 
+## v0.10.1 — 2026-08-20 — early alpha
+
+- **Removed two internal agent skills from the published artifact.** They were
+  reachable through this repository's own documented install path — the
+  dependency URL for `v0.10.0` delivered all eight of their files — so this was
+  internal material being handed out rather than merely stored. (An earlier
+  draft of this entry said twelve, which counted the four directory entries the
+  ZIP carries alongside the files. Measured from the published archive: sixteen
+  `.claude` entries, seven of them directories, nine files, eight of which
+  belong to the two removed skills.) One described
+  an internal review process; the other published the backend stack with
+  versions, the tenant-isolation mechanism in operational detail with a named
+  runtime role, an inventory of internal repositories with their build
+  commands, and statements about where automated coverage does not reach.
+
+  The `v0.10.1` tag was cut as a DELETION-ONLY patch directly on top of
+  `v0.10.0`: eight files, 1375 deletions, no addition, no modification, no Lua
+  source touched. That is why its tree still declares `M.VERSION = "0.10.0"` —
+  the tag carries nothing but the removal, and this release commit is what
+  catches the declaration up. The constant is read only by the version-check
+  scripts and the README; nothing requires it at runtime and it does not reach
+  the wire.
+
+  **Forward-only.** The affected tags remain reachable, and this stops new
+  installs that follow the documentation — it recalls nothing. Measured across
+  every tag: `v0.8.0`, `v0.8.1`, `v0.9.0`, `v0.9.1` and `v0.10.0` carry all
+  eight files; `v0.6.0` and `v0.7.0` carry two; `v0.5.0` and earlier predate
+  them and carry none. (An earlier revision of this entry said every earlier
+  tag contained them, which was not measured and was not true.)
+
 ## v0.10.0 — 2026-07-30 — early alpha
 
 - **Crash reports can now be attributed to a player.** New optional
@@ -96,7 +152,7 @@
   session id, or `nil` when no session is open — so the host can correlate other
   telemetry with the analytics session.
 
-- **Remote config: dark opt-in targeting-attribute pass-through (ADR-0310).**
+- **Remote config: dark opt-in targeting-attribute pass-through.**
   `remote_config_attributes_enabled = true` (default `false` — while off the
   fetch URL is byte-identical to today's attribute-less path and the new
   setter is inert; the flag without `remote_config_url` is rejected with
@@ -117,7 +173,7 @@
   excludes the attribute set — a cached body may reflect the previously sent
   attributes until the next successful fetch (documented v1 limit).
 - **Crash: boot auto-capture, engine symbol identity, opt-in script-error
-  capture (ADR-0297 §7c).** `crash.init` now forwards the previous-session
+  capture.** `crash.init` now forwards the previous-session
   native dump itself (`capture_previous_on_boot = false` keeps the manual
   flow; the persisted opt-out still leaves the one-shot dump unread). The
   `dmengine` module's `debug_id` is synthesized as `dmengine-<engine sha1>`
@@ -258,8 +314,7 @@
   documented: a process KILL before any durable write lands still loses
   the denial without trace — no client-side ordering can close that
   window.
-- **Canonical-actor consent-receipt keying (ADR-0222 §1, ADR-0202 2026-07-20
-  amendment).** A consent receipt's actor is now chosen by the event plane's
+- **Canonical-actor consent-receipt keying.** A consent receipt's actor is now chosen by the event plane's
   canonical-actor rule at decision time: the verified `user_id` ONLY when a
   Mode B `token_provider` backs the session and the host has identified
   (`kind = "user_verified"`); the SDK-managed `anonymous_id` with
@@ -290,8 +345,8 @@
   `invalid_consent_kind_emission_enabled` otherwise) suppresses the WIRE
   field only, as the escape hatch for a deployment whose ingest service
   still strict-decodes the pre-amendment schema
-  (`INGEST_CONSENT_KIND_MODE=off` 400-rejects a kind-bearing body as an
-  unknown field) — the kind is still chosen, persisted, and used for
+  (a deployment that has not taken the amendment 400-rejects a kind-bearing
+  body as an unknown field) — the kind is still chosen, persisted, and used for
   dispatch-credential selection. The outbox load sanitizer holds records to
   the same closed set: entries with a non-allowlisted kind drop fail-safe,
   and legacy pre-kind entries are kept with kind backfilled to `"anon"`
@@ -375,11 +430,11 @@
   login, its durable once-per-decision ledger, and an explicit host API for
   discarding parked receipts are deliberately deferred pending
   godot-package ratification.
-- **Experiment-assignment consumer (ADR-0259 SDK leg), dark behind
+- **Experiment-assignment consumer, dark behind
   `experiments_enabled` (default `false`).** New module
   `shardpilot/experiments.lua`: fetches the server-evaluated assignment from
   `GET {remote_config_url}/api/v1/runtime/experiments/assignment`
-  (control-plane host, publishable-key bearer — the same credential as the
+  (the remote-config host, publishable-key bearer — the same credential as the
   remote-config fetch), serves the assigned variant through
   `shardpilot.fetch_experiment_assignment(experiment_key, [attributes],
   callback)` / `experiment_variant(key)` / `experiment_payload(key)`, and
@@ -455,9 +510,9 @@
   subject-fact key VERBATIM as the `assignment_key` prop for
   client_id-unit assignments (the raw subject id is structurally rejected
   there) and omit `user_id` per the facts contract, keeping the standard
-  `anonymous_id` as the envelope identity. NOTE: the analytics service
+  `anonymous_id` as the envelope identity. NOTE: the ingest service
   currently rejects these event names from game-embedded publishable keys
-  by design; until the platform's producer-lane decision lands, an emitted
+  by design; until the lane is enabled for the workspace, an emitted
   exposure is expected to come back as a per-event reject, surfaced through
   diagnostics and tolerated silently otherwise — that server-side block is
   load-bearing and stays authoritative.
@@ -514,7 +569,7 @@
 ## v0.9.1 — 2026-07-19 — early alpha
 
 - **Host-supplied identifiers are clamped to 512 bytes at acceptance**
-  (GAP-075 code follow-up to the save-file-limit caveats documented in #30).
+  (code follow-up to the save-file-limit caveats documented in #30).
   `identify(user_id)` and `set_anonymous_id(id)` reject identifiers over 512
   bytes exactly like empty/non-string input (`invalid_user_id` /
   `invalid_anonymous_id`, previous identity retained), and an out-of-bounds
@@ -538,11 +593,11 @@
 
 ## v0.9.0 — 2026-07-18 — early alpha
 
-- **Batch ingest now declares the SDK's schema-set revision** (GAP-036,
-  client half of the analytics-service schema-revision handshake). Every
+- **Batch ingest now declares the SDK's schema-set revision** — the client
+  half of the ingest schema-revision handshake. Every
   `POST {ingest_url}/v1/events:batch` request carries an
   `X-ShardPilot-Schema-Revision` request header with the revision of the
-  analytics-service envelope-schema set this SDK build was provisioned
+  ingest envelope-schema set this SDK build was provisioned
   against (new module `shardpilot/schema_revision.lua`; the value is a
   public content digest of the service's embedded schema files — not a
   secret — and is re-synced whenever the service's schema set changes).
@@ -574,8 +629,8 @@
   strict-consent audit follow-up). The transport parsed the `Retry-After`
   header on every response but passed it to the client only in the 429
   branch; a retryable 5xx fell back to the client's own full-jitter
-  exponential backoff. The analytics service's strict-consent
-  mode-unknown/consent-store-outage lane (GAP-041) answers a whole-batch
+  exponential backoff. The ingest service's strict-consent
+  mode-unknown/consent-store-outage lane answers a whole-batch
   `503` with `Retry-After: 5`, so post-outage recovery is now paced by the
   server's hint — the deferral (and its persisted spool deadline, 24h
   clamp) works exactly as it already did for 429, on both the events plane
@@ -586,7 +641,7 @@
   strictly before the event batch at every dispatch point
   (init/update/flush/shutdown); this ordering is now documented as
   load-bearing and pinned by a regression test. On a strict-enforce
-  workspace (GAP-041) it shrinks the window in which a post-grant batch
+  workspace it shrinks the window in which a post-grant batch
   reaches the server before the grant's `/v1/consent` row exists and is
   terminally suppressed. Sequencing only — the batch never waits on the
   receipt's acknowledgment.
@@ -607,7 +662,7 @@
 ## v0.8.0 — 2026-07-13 — early alpha
 
 - **`buffer_size` default raised from `200` to `1000`** — the cross-SDK
-  canonical in-memory queue capacity (architecture-audit finding SP-059).
+  canonical in-memory queue capacity.
   The Go, Unity, and Unreal SDKs and the platform docs all default the
   bounded event queue to 1000; the Defold SDK now matches, so a burst that
   used to drop at 200 queued events is retained like on every other

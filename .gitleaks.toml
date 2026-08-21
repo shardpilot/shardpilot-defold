@@ -1,0 +1,24 @@
+# gitleaks configuration for shardpilot-defold.
+#
+# ⚠ NO `paths` CLAUSE, DELIBERATELY. Measured against gitleaks v8.30.1 by
+# planting a realistic AWS key into an allowlisted file: an allowlist carrying
+# `paths` excuses the WHOLE FILE even with `condition = "AND"` (planted key
+# missed), while a `regexes`-only allowlist catches it. Since the files needing
+# exceptions are TEST files — where a careless credential is most likely to be
+# pasted — a path exception is the worst possible blind spot.
+#
+# Exceptions therefore name the LITERAL and nothing else.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """
+Two fixtures in the unit-test suite. `sp_ingest_abc123` is a placeholder
+publishable key used to construct a client in a test; `receipt-historic-anon-N`
+is an idempotency key — a request-deduplication token, not a credential.
+Neither authenticates anything.
+"""
+regexes = [
+  '''sp_ingest_abc123''',
+  '''receipt-historic-anon-\d+''',
+]
