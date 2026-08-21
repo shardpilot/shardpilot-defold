@@ -142,8 +142,13 @@ jobs:
   # reliance on 5.1-only quirks — it is NOT a runtime the SDK targets.
   lua-tests:
     runs-on: ubuntu-latest
+      # ⚠ THE MATRIX AXIS IS PART OF THE GROUP. Without it every leg of the
+      # matrix shares one group, and `cancel-in-progress` has the legs cancel
+      # each other as they start — leaving one runtime tested and the others
+      # reported as nothing at all. A gate that silently drops legs is the
+      # failure this whole change is about.
     concurrency:
-      group: ${{ github.workflow }}-${{ github.job }}-${{ github.ref }}
+      group: ${{ github.workflow }}-${{ github.job }}-${{ matrix.interpreter }}-${{ github.ref }}
       cancel-in-progress: true
     timeout-minutes: 10
     strategy:
