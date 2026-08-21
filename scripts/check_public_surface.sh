@@ -168,6 +168,22 @@ cd "$(dirname "$0")/.."
 # The by-construction material — patterns, roster, fixture corpora — lives in
 # its own file so that THIS file can be scanned end to end with no exemptions.
 # See scripts/gate-corpus.sh for why that separation exists.
+# Every temporary file this gate makes, removed on every exit path. They were
+# created in four places and removed in one, so a successful run left five
+# behind — including copies of staged repository content.
+GATE_TMPFILES=""
+# ⚠ IT SETS A VARIABLE RATHER THAN PRINTING ONE. Called as `$(gate_tmp)` the
+# function would run in a subshell, so every path it recorded would be
+# discarded with that subshell and this trap would remove an empty list — a
+# cleanup that reads as working and frees nothing. It was written that way
+# first, and the file count is what showed it.
+gate_tmp() {
+  GATE_TMP="$(mktemp)" || return 1
+  GATE_TMPFILES="$GATE_TMPFILES $GATE_TMP"
+}
+# shellcheck disable=SC2064
+trap 'rm -f $GATE_TMPFILES' EXIT
+
 CORPUS_PATH="$(dirname "$SELF")/gate-corpus.sh"
 if [ ! -f "$CORPUS_PATH" ]; then
   echo "REFUSING: $CORPUS_PATH is missing." >&2
@@ -185,8 +201,16 @@ fi
 # add` it before this gate reflects the change. That is the same discipline as
 # running CI after committing rather than before, and it is what makes a green
 # run a statement about the commit rather than about the desk it was run on.
-CORPUS="$(mktemp)"
+gate_tmp; CORPUS="$GATE_TMP"
 CORPUS_REL="scripts/$(basename "$CORPUS_PATH")"
+SELF_REL="scripts/$(basename "$SELF")"
+gate_tmp; SELF_BLOB="$GATE_TMP"
+if ! (cd "$(dirname "$SELF")/.." && git cat-file blob ":$SELF_REL") > "$SELF_BLOB" 2>/dev/null; then
+  echo "REFUSING: the staged blob for $SELF_REL could not be read." >&2
+  echo "  The audits below read this script for literals it alone would" >&2
+  echo "  publish, and a commit carries the staged copy, not this one." >&2
+  exit 2
+fi
 if ! (cd "$(dirname "$CORPUS_PATH")/.." && git cat-file blob ":$CORPUS_REL") > "$CORPUS" 2>/dev/null; then
   echo "REFUSING: the staged blob for $CORPUS_REL could not be read." >&2
   echo "  A commit would carry that blob, so it is the one worth validating;" >&2
@@ -483,8 +507,8 @@ scan_tree() {
   # way through enumeration — hands over a short list that the zero-files
   # refusal below cannot see. Measured: a producer emitting one path then
   # exiting 1 yields one scanned file and a green run.
-  list="$(mktemp)"
-  blob="$(mktemp)"
+  gate_tmp; list="$GATE_TMP"
+  gate_tmp; blob="$GATE_TMP"
   if ! (cd "$root" && git ls-files -z) > "$list"; then
     rm -f "$list"
     echo "REFUSING: git ls-files failed in '$root'." >&2
@@ -628,6 +652,37 @@ scan_tree() {
       echo "  Store it as UTF-8, or extend this gate to decode deliberately." >&2
       exit 2
     fi
+    # ⚠ A CHARACTER REFERENCE RENDERS AS SOMETHING THIS NEVER SEES. A ticket id
+    # whose hyphen is written as a numeric reference is not that token in bytes
+    # and is exactly that token on the page, so a
+    # byte-oriented pass reports clean over a document that discloses. Refused
+    # rather than decoded, and on the same footing as the containers: measured
+    # today, both trees contain ZERO character references of any kind, numeric
+    # or named, so a decoder would be untested code guarding nothing. The day a
+    # document needs one — an ampersand entity in prose about HTML, say — this
+    # becomes a decision rather than a discovery. Note this comment cannot
+    # give an example: writing one made the gate refuse itself, correctly.
+    if grep -qaE '&#[0-9]+;|&#[xX][0-9A-Fa-f]+;|&[A-Za-z][A-Za-z0-9]{1,31};' "$blob" 2>/dev/null; then
+      echo "REFUSING: '$f' contains a character reference." >&2
+      echo "  It renders as a character this gate never reads, so a clean result" >&2
+      echo "  would be about the bytes rather than about the page. Write the" >&2
+      echo "  character itself, or extend this gate to decode deliberately." >&2
+      exit 2
+    fi
+    # ⚠ AND AN ENCODING THE PATTERNS CANNOT MATCH IS AN UNREAD FILE. A document
+    # in EBCDIC or another non-ASCII-compatible encoding carries no NUL and no
+    # container signature, so every pass above admits it and every pattern
+    # below misses it — a clean line about a file nothing here could read.
+    # Refused rather than transcoded, on the same footing: both trees are UTF-8
+    # today, accents included, so a transcoder would be untested code guarding
+    # nothing.
+    if ! iconv -f UTF-8 -t UTF-8 < "$blob" >/dev/null 2>&1; then
+      echo "REFUSING: '$f' is not valid UTF-8." >&2
+      echo "  The classes below are ASCII-oriented, so an encoding they cannot" >&2
+      echo "  read would report clean whatever it says. Store it as UTF-8, or" >&2
+      echo "  extend this gate to transcode deliberately." >&2
+      exit 2
+    fi
     # -a remains for a file with high-bit bytes and no NUL, which GNU grep also
     # calls binary. It is defence behind the refusal above, not the front line.
     # -a treats a NUL-bearing file as text: GNU grep >= 3.5 otherwise prints
@@ -763,7 +818,7 @@ GATE_EXCLUDES=":(exclude)scripts/check_public_surface.sh :(exclude)scripts/gate-
 
 roster_is_present_in_the_tree() {
   local lit novel=0 found
-  found="$(mktemp)"
+  gate_tmp; found="$GATE_TMP"
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
     git grep --cached -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
@@ -802,10 +857,12 @@ EOF
   # spelling of the same trick got past the previous version: parentheses with
   # nothing to branch between are grouping and come off, and a one-character
   # class is one character, and a backslash before an ordinary character is
-  # no-op syntax that grep discards — `private\-daemon` is the same name and
-  # was approved for carrying a backslash. Each reduction was written after a
-  # costume got through, which is why the rule below does not rely on this
-  # one alone.
+  # no-op syntax that grep discards, and an exact-count quantifier of one
+  # quantifies nothing — each was approved as proof of shape while grep
+  # reconstructed the plain name. Each reduction was written after a costume
+  # got through, which is why the rule below does not rely on this one alone,
+  # and why a single-word name is the case to watch: the hyphenated-run rule
+  # cannot see one, so only this test stands between it and the tree.
   #
   # Names belong in the roster, which is checked against the tree.
   while IFS= read -r lit; do
@@ -818,6 +875,7 @@ $(printf '%s' "$PATTERNS" | awk '
     if (a == "") return
     r = a
     gsub(/\\([^bBwWsSdD<>])/, "\\1", r)
+    gsub(/\{1\}|\{1,1\}/, "", r)
     if (index(r, "|") == 0) gsub(/[()]/, "", r)
     gsub(/\[.\]/, "c", r)
     if (r ~ /[][{}+*?\\|]/) return
@@ -839,6 +897,11 @@ $(printf '%s' "$PATTERNS" | awk '
   }')
 EOF
 
+  # ⚠ READ FROM THE INDEX, both of them. These audits look for literals this
+  # gate alone would publish, so they must read the copy a commit carries: a
+  # novel repository name staged here and removed from the working copy was
+  # invisible to them while the scan read the staged blob.
+  #
   # ⚠ AND THE SAME QUESTION ASKED OF THE CHARACTERS, NOT THE STRUCTURE. Every
   # hyphenated literal run in the pattern list must exist elsewhere in this
   # tree, exactly as a roster entry must. `[p]rivate-daemon` reduces to a
@@ -875,7 +938,7 @@ EOF
       novel=$((novel + 1))
     fi
   done <<EOF
-$( { grep -hoE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*' "$SELF" "$CORPUS"
+$( { grep -hoE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*' "$SELF_BLOB" "$CORPUS"
      printf '%s\n' "$corpus_values" | grep -oE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*'; } | sort -u )
 EOF
 
@@ -895,7 +958,7 @@ EOF
     printf 'PROSE VIOLATION: %s is a live identifier written where nothing scans.\n' "$lit" >&2
     novel=$((novel + 1))
   done <<EOF
-$( { grep -hoE -- "$AUDIT_CLASSES" "$SELF" "$CORPUS"
+$( { grep -hoE -- "$AUDIT_CLASSES" "$SELF_BLOB" "$CORPUS"
      printf '%s\n' "$corpus_values" | grep -oE -- "$AUDIT_CLASSES"; } | sort -u )
 EOF
 
@@ -1044,7 +1107,11 @@ EOF
   # subshell ends the whole run before its status can be read, which killed
   # this gate with no output at all the first time it was written.
   nul_status=0
-  ( scan_tree "$nul_tmp" ) >/dev/null 2>&1 || nul_status=$?
+  # Its own accumulator and its own trap: the subshell cannot add to the
+  # parent's list, and clearing the inherited copy keeps its trap from removing
+  # files the parent still needs.
+  ( GATE_TMPFILES=""; trap 'rm -f $GATE_TMPFILES' EXIT
+    scan_tree "$nul_tmp" ) >/dev/null 2>&1 || nul_status=$?
   [ "$nul_status" -eq 2 ] || {
     echo "SELFTEST: a NUL-bearing tracked file was not refused" >&2; fixture_fail=1; }
   rm -rf "$nul_tmp"
