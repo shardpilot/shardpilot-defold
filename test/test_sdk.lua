@@ -7827,6 +7827,23 @@ local tests = {
 	assert_equal(rok, false)
 	assert_equal(rerr, "consent_evidence_unreadable",
 		"and rotation stays refused while the frozen record is unaccounted")
+	-- FACT B, observed on its own: once frozen, writes go to the SUCCESSOR and
+	-- the base is never touched again. That is what preserves the bytes, and it
+	-- is a different fact from "the base is unaccounted" -- the successor stays
+	-- a perfectly writable live trail.
+	local base_before
+	for path, record in pairs(stores) do
+		if path:sub(-15) == "/consent-outbox" then
+			base_before = record
+		end
+	end
+	assert_true(storage.save_consent_outbox(identity_scope, {}) ~= nil,
+		"the live successor is writable while the base is frozen")
+	for path, record in pairs(stores) do
+		if path:sub(-15) == "/consent-outbox" then
+			assert_true(record == base_before, "and the frozen base is byte-for-byte untouched")
+		end
+	end
 	restore()
 	storage.reset()
 
@@ -7869,6 +7886,11 @@ local tests = {
 		end
 	end
 	assert_true(not successor_written, "the freeze really did fail to write")
+	-- FACT A on its own, with NO successor on disk: an owed freeze is by itself
+	-- evidence that the base holds something unaccounted. Observed here, before
+	-- the decision below pays the debt.
+	assert_true(storage.holds_frozen_consent_outbox(identity_scope),
+		"an owed freeze alone reports the base as unaccounted")
 	assert_equal(unwritable.stats.consent_denial_possibly_undelivered, 1,
 		"and the alarm rises anyway -- it reports the condition, not the retention")
 	-- AND THE BASE STAYS PROTECTED, which is what the owed-freeze state is FOR.
@@ -7892,6 +7914,21 @@ local tests = {
 	end
 	assert_equal(damaged_after, "this-entry-is-not-a-table",
 		"and it is STILL there -- an owed freeze keeps the base unwritable")
+	-- FACT A, observed with no successor on disk at all: an owed freeze is by
+	-- itself evidence that the base holds something unaccounted.
+	-- FACT D, observed on its own: the debt RETRIES. Storage recovers, and the
+	-- next write completes the freeze instead of refusing until relaunch --
+	-- otherwise a fresh offline denial could never be retained again this
+	-- session, which is a dead end wearing fail-closed's clothes.
+	local successor_after_retry = nil
+	assert_true(storage.save_consent_outbox(identity_scope, {}) ~= nil,
+		"a write after recovery completes the owed freeze instead of refusing")
+	for path in pairs(stores2) do
+		if path:find("frozen%-successor$") then
+			successor_after_retry = path
+		end
+	end
+	assert_true(successor_after_retry ~= nil, "and the successor now exists")
 	restore2()
 	storage.reset()
 
@@ -7958,16 +7995,20 @@ local tests = {
 		end
 	end
 	assert_true(outbox_path ~= nil, "the outbox key was created")
-	-- A readable base beside a successor that is present and NOT a table.
-	stores4[outbox_path] = { receipts = {} }
-	stores4[outbox_path .. "-frozen-successor"] = "not a record at all"
+	-- BOTH records damaged: the base is what a freeze already happened over, and
+	-- the successor has since become unreadable too. This is the bounded case
+	-- the design declared, and the property that matters is not what a
+	-- predicate reports -- it is that the FREEZE, the only write that can reach
+	-- the successor, refuses rather than recycling a key it cannot see.
+	stores4[outbox_path] = "the damaged base"
+	stores4[outbox_path .. "-frozen-successor"] = "and a damaged successor"
 	storage.reset()
-	assert_true(storage.holds_frozen_consent_outbox(identity_scope),
-		"a present-but-unreadable successor still counts as frozen")
-	assert_true(not storage.save_consent_outbox(identity_scope, {}),
-		"and no key may be written while a second record is unaccounted")
-	assert_equal(stores4[outbox_path .. "-frozen-successor"], "not a record at all",
-		"the damaged successor is left exactly as it was")
+	assert_true(not storage.freeze_consent_outbox(identity_scope, {}),
+		"a freeze refuses while the successor cannot be read")
+	assert_equal(stores4[outbox_path .. "-frozen-successor"], "and a damaged successor",
+		"and the second record is left exactly as it was")
+	assert_equal(stores4[outbox_path], "the damaged base",
+		"as is the first -- neither is recycled on an ambiguous read")
 	restore4()
 	storage.reset()
 	end,

@@ -1203,13 +1203,24 @@ local CONSENT_OUTBOX_FORWARD_KEY = "consent-outbox-frozen-successor"
 -- touched, and a later decision would overwrite the very evidence the freeze
 -- existed to keep. Memory-only on purpose: it re-derives from disk next launch,
 -- where the base still reads unreadable and the freeze is attempted again.
+-- THREE DISTINCT FACTS, THREE NAMES. They were one boolean, and it was asked
+-- three different questions: is the base unaccounted, may the base be written,
+-- may ANY key be written. The answers differ -- a frozen base is permanently
+-- unaccounted while its successor is a perfectly writable live trail -- and
+-- merging them made the outbox unprunable, wedged shutdown on consent_pending,
+-- and re-sent settled receipts on every relaunch. Kept apart deliberately, and
+-- each is observable on its own.
+
+-- In-process record that a freeze was needed and could not be written. Not a
+-- refusal: a refusal with no path back is a dead end, not fail-closed. Every
+-- later write ATTEMPTS the freeze again, so recovery within the session clears
+-- it. Memory-only, re-derived next launch from the base still reading damaged.
 local outbox_freeze_owed = {}
 
--- THREE states, not two. "Present but unreadable" is NOT "absent": reporting it
--- as absent hands the base back as the live key and lets a freeze write the
--- base's salvage OVER the successor -- destroying the second record, which may
--- be the one holding an undelivered denial. Two damaged records is the bounded
--- case this design declared; the answer there is to refuse, not to recycle.
+-- The successor's three states. "Present but unreadable" is NOT "absent":
+-- reported as absent it hands the base back as live and lets a freeze write the
+-- base's salvage over the second record, which may be the one holding an
+-- undelivered denial.
 local function successor_state(ns)
 	local path = save_path(ns, CONSENT_OUTBOX_FORWARD_KEY)
 	if not path then
@@ -1217,54 +1228,92 @@ local function successor_state(ns)
 	end
 	local ok, record = pcall(sys.load, path)
 	if ok and type(record) == "table" then
-		if next(record) == nil then
-			return "absent"
+		-- MARKED EXPLICITLY, never inferred from being non-empty. A frozen
+		-- trail whose every receipt has since been delivered is LEGITIMATELY
+		-- empty, and reading that as "no successor" would hand the base back as
+		-- live and lose the freeze exactly when the successor is healthiest.
+		if record.frozen == true then
+			return "held"
 		end
-		return "held"
-	end
-	if ok and record == nil then
-		-- The backend answered cleanly with nothing: no successor exists.
 		return "absent"
 	end
-	-- A failed successor read means "second record damaged" ONLY if the backend
-	-- is otherwise answering. When the BASE read fails too, the store itself is
-	-- unavailable -- a plain-Lua host, a revoked backend, a globally throwing
-	-- sys.load -- and calling that a damaged successor would refuse writes on
-	-- every such host for no gain. The base being unreadable already fails the
-	-- client closed; that is the guard for this case.
-	local base = save_path(ns, CONSENT_OUTBOX_KEY)
-	if base then
-		local base_ok, base_record = pcall(sys.load, base)
-		if not (base_ok and type(base_record) == "table") then
-			return "absent"
-		end
+	if ok and record == nil then
+		return "absent"
 	end
+	-- The read FAILED, which is not the same as the key being empty. Whether
+	-- that means "this record is damaged" or "the store cannot be read at all"
+	-- is genuinely undecidable from here, and the two want opposite answers.
+	--
+	-- So this function does not decide it. It reports "unreadable" -- the
+	-- honest answer -- and the two CALLERS resolve it differently, because the
+	-- risk is not symmetric between them:
+	--   * ordinary writes go to the live key and cannot destroy a successor
+	--     they are not aimed at, so they tolerate the ambiguity (see
+	--     outbox_writable);
+	--   * the FREEZE is the only write that can overwrite the successor, so it
+	--     refuses on anything short of a definite absence and takes the debt.
 	return "unreadable"
 end
 
-local function outbox_frozen(ns)
-	local state = successor_state(ns)
-	return state == "held" or state == "unreadable"
+-- FACT A -- the base holds a record this build could not read. Persistent by
+-- nature: nothing reads those bytes back, so only a fresh decision supersedes
+-- it. Drives the alarm, the withheld grant and the refused rotation.
+local function base_unaccounted(ns)
+	-- Evidence about the BASE, and nothing else. A successor MARKED frozen says
+	-- the base was frozen; an owed freeze says we found it damaged and could not
+	-- record that yet. A successor we merely failed to READ says nothing about
+	-- the base at all -- treating it as evidence made every host with an
+	-- unreadable store withhold consent it had no reason to withhold.
+	return successor_state(ns) == "held" or outbox_freeze_owed[ns] == true
 end
 
--- The key reads should use right now. An unreadable successor still counts as
--- frozen for reading -- the base is not coming back -- and writing is refused
--- separately below.
+-- FACT B -- which key may be written. Expressed as a CHOICE rather than a
+-- boolean, because "the base is unaccounted" and "the base must not be written"
+-- are the same fact seen twice, and a second boolean would drift from the first.
 local function outbox_live_key(ns)
-	if outbox_frozen(ns) then
+	if base_unaccounted(ns) then
 		return CONSENT_OUTBOX_FORWARD_KEY
 	end
 	return CONSENT_OUTBOX_KEY
 end
 
--- False while no key may safely be written: the successor is itself damaged, or
--- a freeze is owed because its write failed. Refusing is the whole point --
--- every writable key in that state is somebody's evidence.
+-- FACT C -- whether any key may be written AT ALL. Distinct from A: a frozen
+-- base is permanently unaccounted while its successor stays a writable live
+-- trail, and conflating the two is what made the outbox unprunable. False only
+-- when the successor is itself damaged, i.e. both records are unaccounted --
+-- the bounded case this design declared, where refusing is the point.
 local function outbox_writable(ns)
-	return successor_state(ns) ~= "unreadable" and not outbox_freeze_owed[ns]
+	-- Deliberately permissive on "unreadable". An ordinary write goes to the
+	-- LIVE key: when nothing is frozen that is the base, which is already the
+	-- damaged record the client fails closed on, and refusing here would break
+	-- every host whose store cannot be read at all -- a plain-Lua host, a
+	-- globally throwing sys.load -- while protecting nothing. The successor is
+	-- protected where it can actually be destroyed: in the freeze.
+	return true
 end
 
 local function write_consent_outbox(ns, receipts)
+	if outbox_freeze_owed[ns] then
+		-- RETRY, do not refuse. The freeze could not be written when the damage
+		-- was found; storage may have recovered since, and refusing every write
+		-- until relaunch would mean a fresh offline denial cannot be retained
+		-- even after the store comes back -- a dead end wearing fail-closed's
+		-- clothes. The retry IS this write, aimed at the successor.
+		local forward = save_path(ns, CONSENT_OUTBOX_FORWARD_KEY)
+		if not forward then
+			return false
+		end
+		local kept = sanitize_outbox_entries(receipts)
+		local ok, saved = pcall(sys.save, forward, { frozen = true, receipts = kept })
+		if not (ok and saved == true) then
+			-- Still owed. The base is unprotected and must not be written, and
+			-- the successor does not exist: nothing may be written safely.
+			return false
+		end
+		outbox_freeze_owed[ns] = nil
+		consent_outbox_memory[ns] = { receipts = kept }
+		return true
+	end
 	if not outbox_writable(ns) then
 		return false
 	end
@@ -1333,11 +1382,21 @@ end
 -- forward key. The base key is never touched again by this store.
 function M.freeze_consent_outbox(scope, carried)
 	local ns = spool_namespace(scope)
-	if outbox_frozen(ns) then
+	if base_unaccounted(ns) then
 		return true
 	end
 	local path = save_path(ns, CONSENT_OUTBOX_FORWARD_KEY)
 	if not path then
+		return false
+	end
+	-- THE FREEZE IS THE ONLY WRITE THAT CAN DESTROY THE SUCCESSOR, so it
+	-- refuses on anything short of a DEFINITE absence. A read that failed might
+	-- be a broken store or might be a second damaged record holding an
+	-- undelivered denial; overwriting on that ambiguity is exactly how the
+	-- second record gets lost. Take the debt instead -- it retries on the next
+	-- write, when the store may answer.
+	if successor_state(ns) == "unreadable" then
+		outbox_freeze_owed[ns] = true
 		return false
 	end
 	-- RE-READ BEFORE FREEZING. The caller's read failed, but a transient
@@ -1366,7 +1425,7 @@ function M.freeze_consent_outbox(scope, carried)
 			end
 		end
 	end
-	local ok, saved = pcall(sys.save, path, { receipts = sanitize_outbox_entries(carried) })
+	local ok, saved = pcall(sys.save, path, { frozen = true, receipts = sanitize_outbox_entries(carried) })
 	if not (ok and saved == true) then
 		-- The freeze is OWED. Nothing durable now says the base must not be
 		-- written, so remember it in-process: without this a later decision
@@ -1385,7 +1444,7 @@ function M.holds_frozen_consent_outbox(scope)
 	local ns = spool_namespace(scope)
 	-- An OWED freeze counts: the base is still unaccounted, and the fact that
 	-- we could not record that durably makes the condition MORE true, not less.
-	return outbox_frozen(ns) or outbox_freeze_owed[ns] == true
+	return base_unaccounted(ns)
 end
 
 function M.load_consent_outbox(scope)
