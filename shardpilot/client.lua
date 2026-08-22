@@ -895,6 +895,17 @@ function M.new(config)
 	-- first — the spool load/purge decision must read the FINAL state.
 	local outbox_err
 	client.consent_outbox, outbox_err = storage.load_consent_outbox(normalized)
+	-- TWO different facts, and only one is about the restored state. PRESERVING
+	-- THE EVIDENCE is unconditional: a trail that could not be read must not be
+	-- replaced by its salvageable subset whatever the record says, because a
+	-- denied or unknown restore still dispatches the salvageable receipts and
+	-- their acknowledgment rewrites the mirror over an entry that may be an
+	-- undelivered denial. WITHHOLDING A GRANT is what stays conditional on
+	-- there being a grant. (Ported from the godot review before this repo's own
+	-- round could re-find it.)
+	if outbox_err ~= nil then
+		client.consent_outbox_unreadable = true
+	end
 	if outbox_err ~= nil and client.consent_state == "granted" then
 		-- FAIL CLOSED on the granted restore, exactly as the unreadable
 		-- marker arm does above and for the same reason. This trail is an
@@ -912,14 +923,13 @@ function M.new(config)
 		client.consent_restored_decided_at = client.consent_decided_at
 		client.consent_restored_decision_seq = client.consent_decision_seq
 		client.consent_unreadable_imposed = true
-		-- SEPARATE from the shared imposition flag on purpose. The shadow in
+		-- The hold above is SEPARATE from this shared imposition flag on purpose. The shadow in
 		-- persist_identity must cover BOTH arms — a manufactured denial must
 		-- never be written down whichever file could not be read — but the
 		-- outbox WRITE HOLD must key on THIS outbox failing and nothing else.
 		-- Keyed on the shared flag it held a perfectly readable outbox hostage
 		-- to an unreadable MARKER: an acknowledged receipt left the write owed
 		-- and shutdown() then answered consent_pending forever.
-		client.consent_outbox_unreadable = true
 		client.consent_state = "denied"
 		client.consent_decided_at = nil
 		client.consent_decision_seq = 0

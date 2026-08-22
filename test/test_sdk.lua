@@ -7976,6 +7976,34 @@ local tests = {
 	restore6()
 	storage.reset()
 
+	-- PRESERVING THE EVIDENCE IS NOT CONDITIONAL ON HAVING A GRANT TO WITHHOLD.
+	-- A denied restore imposes nothing -- there is no grant to hold back -- but
+	-- it still dispatches the salvageable receipts, and their acknowledgment
+	-- would rewrite the mirror over an entry that may be an undelivered denial.
+	reset()
+	storage.reset()
+	local stores7, restore7 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-denied-restore",
+		consent_analytics = "denied",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	storage.save_consent_outbox(identity_scope, {})
+	for path, record in pairs(stores7) do
+		if path:sub(-15) == "/consent-outbox" then
+			record.receipts = { "this-entry-is-not-a-table" }
+		end
+	end
+	storage.reset()
+	local denied_restore = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(denied_restore.consent_state, "denied",
+		"the denied restore stands; nothing is imposed over it")
+	assert_equal(denied_restore:persist_consent_outbox(), false,
+		"but the damaged trail is still held -- evidence outlives the state that read it")
+	restore7()
+	storage.reset()
+
 	-- SALVAGEABLE EVIDENCE STILL WINS. A damaged trail that ALSO holds a
 	-- readable, strictly-newer denial receipt must not simply be refused for
 	-- the session: that receipt is concrete, and concrete evidence outranks
