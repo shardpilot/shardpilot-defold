@@ -1394,9 +1394,29 @@ function M.resolve_consent_outbox(scope)
 	local live_key = frozen and CONSENT_OUTBOX_FORWARD_KEY or CONSENT_OUTBOX_KEY
 	local live_record = frozen and succ_record or base_record
 
+	-- THE MARKED SHADOW IS EVIDENCE ABOUT THE SUCCESSOR KEY, AND WHAT THE BASE
+	-- READ RETURNED HAS NO BEARING ON IT. Gating this on `live_record == nil`
+	-- meant a base that came back as a malformed TABLE -- non-nil, and so
+	-- "present" -- skipped the shadow entirely: the resolution resurrected a
+	-- base this process had already frozen, and the ensuing freeze saved its
+	-- salvage over the forward key, deleting receipts that existed only in the
+	-- successor we ourselves wrote. The marker is consulted first now, on its
+	-- own terms.
+	local shadow = consent_outbox_memory[ns]
+	if successor_is_marked(shadow) and (successor == "absent" or successor == "unknown") then
+		-- This process WROTE a successor. A read saying the key is absent, or
+		-- saying nothing at all, cannot outweigh that -- it is the one claim
+		-- about this key we hold first-hand.
+		successor = "held"
+		frozen = true
+		live_key = CONSENT_OUTBOX_FORWARD_KEY
+		if succ_record == nil then
+			live_record = shadow
+		end
+	end
+
 	local shadow_answered = false
-	if live_record == nil and type(consent_outbox_memory[ns]) == "table" then
-		local shadow = consent_outbox_memory[ns]
+	if live_record == nil and type(shadow) == "table" then
 		-- THE SHADOW CARRIES ITS OWN SUBJECT, AND IT ALWAYS DID. The marker
 		-- travels with the successor's content by the same rule that keeps it
 		-- on disk, so a marked shadow is the SUCCESSOR's -- and substituting it
@@ -1407,11 +1427,6 @@ function M.resolve_consent_outbox(scope)
 		-- successor sat untouched and the receipts just written were ignored on
 		-- the following launch. The fact was in the data; the reader was not
 		-- asking for it.
-		if successor_is_marked(shadow) then
-			successor = "held"
-			frozen = true
-			live_key = CONSENT_OUTBOX_FORWARD_KEY
-		end
 		shadow_answered = true
 		-- A shadow written by a successful save THIS session answers for a read
 		-- that failed: the process knows what it wrote. Carried over from the
@@ -1465,7 +1480,6 @@ function M.resolve_consent_outbox(scope)
 	-- answering for one key while failing on the other is what separates a
 	-- damaged record from an unreadable store, and a predicate holding one key
 	-- cannot see that.
-	local cause = nil
 	-- WHAT AN OPERATOR SHOULD GO AND LOOK AT: the FILE, or the DEVICE. One
 	-- rule, and the rule is about who failed to produce something usable --
 	-- "store" ONLY when the store answered for neither key, "record" whenever
@@ -1483,15 +1497,27 @@ function M.resolve_consent_outbox(scope)
 	-- It stays nil for a frozen base whose successor reads clean. Why that base
 	-- became unreadable is historical, this run did not see it, and guessing
 	-- would be the one thing this diagnostic must not do.
-	if base_state == "damaged" then
-		cause = (base_answered or succ_answered) and "record" or "store"
-	elseif successor == "damaged" or dropped > 0 or live_shape_foreign then
-		cause = "record"
-	end
+	-- DERIVED ON DEMAND FROM STORED OBSERVATIONS, NOT STAMPED ONCE. Stamped, it
+	-- went stale at FIVE later mutation sites -- confirm_successor's two
+	-- branches, the freeze's declined and successful paths, and a successful
+	-- write -- every one of which changes an input to this rule and none of
+	-- which recomputed it. The visible failure was a recheck that PROVED the
+	-- store responds still reporting `cause = "store"`, sending an operator to
+	-- inspect a device that is working.
+	--
+	-- The three fields below are raw OBSERVATIONS, not conclusions, and an
+	-- observation changes only where a read happens. There are three such
+	-- places -- here, `confirm_successor`, and the freeze's base re-read -- so
+	-- the set that must be maintained is small, enumerable, and named.
+	local base_damaged = base_state == "damaged"
+	local record_damaged = dropped > 0 or live_shape_foreign
+	local answered = base_answered or succ_answered
 
 	local resolution = {
 		live_key = live_key,
-		cause = cause,
+		base_damaged = base_damaged,
+		record_damaged = record_damaged,
+		answered = answered,
 		base = base,
 		successor = successor,
 		receipts = receipts,
@@ -1536,13 +1562,21 @@ local function write_consent_outbox(ns, receipts, scope)
 		-- RETRY. The freeze could not be written when the damage was found;
 		-- the store may answer now, and refusing until relaunch would mean a
 		-- fresh offline denial cannot be retained even after recovery.
-		local settled, _recovered, persisted = M.freeze_consent_outbox(scope, receipts)
+		local settled, _recovered, wrote = M.freeze_consent_outbox(scope, receipts)
 		if r.freeze_owed then
 			-- Still owed: the base is unprotected and must not be written, and
 			-- the successor does not exist. Nothing may be written safely.
 			return false
 		end
-		if settled and persisted then
+		if wrote == "displaced" then
+			-- THE FREEZE WROTE, BUT NOT OURS. Preserving the salvage is
+			-- unconditional and it happened; the caller's receipts did not fit
+			-- under the cap. Reporting success here is the fail-open the
+			-- survival guard exists to stop, and writing again would only
+			-- repeat the same eviction. Refused, with the evidence safe.
+			return false
+		end
+		if settled and wrote == "persisted" then
 			-- THE RETRY WAS THIS WRITE, and what it wrote is not necessarily
 			-- what was handed in: the freeze merges the base's salvage into the
 			-- carried list. `r.receipts` is what landed. freeze_consent_outbox saved exactly
@@ -1621,6 +1655,8 @@ local function write_consent_outbox(ns, receipts, scope)
 		-- We wrote the base, so the base is now exactly what we wrote.
 		r.base = "readable"
 		r.unaccounted = false
+		r.base_damaged = false
+		r.record_damaged = false
 	end
 	-- Writing the SUCCESSOR changes nothing about the base: it stays frozen and
 	-- unaccounted, which is the whole reason the successor exists.
@@ -1711,6 +1747,10 @@ local function confirm_successor(ns, r)
 		-- marker says who wrote the key, not that the payload survived.
 		r.writable = dropped == 0 and not foreign
 		r.freeze_owed = false
+		-- OBSERVATIONS, REFRESHED WHERE THEY WERE MADE. This branch just read
+		-- the store successfully, which is what `answered` records.
+		r.answered = true
+		r.record_damaged = dropped > 0 or foreign
 		return "held"
 	end
 	if state == "damaged" or state == "readable" then
@@ -1721,6 +1761,11 @@ local function confirm_successor(ns, r)
 		r.unaccounted = true
 		r.writable = false
 		r.freeze_owed = false
+		-- The recheck PROVED the store responds -- it just handed back a record
+		-- we cannot use. Leaving `answered` as the initial both-reads-threw
+		-- observation is what published `cause = "store"` after a successful
+		-- read, sending an operator to the wrong failure domain.
+		r.answered = true
 		return "damaged"
 	end
 	return "absent"
@@ -1728,20 +1773,29 @@ end
 
 function M.freeze_consent_outbox(scope, carried)
 	local ns = spool_namespace(scope)
+	-- CAPTURED BEFORE THE MERGE REWRITES `carried`. What the caller handed in
+	-- is the thing the survival guard below is about, and after the base's
+	-- salvage is merged in there is no way to tell the two apart.
+	local pending = carried
 	local r = resolution_for(ns, scope)
-	-- THIRD RETURN: did THIS CALL persist the receipts it was handed. Settling
-	-- and writing are different facts and only one path does both -- every
-	-- other way out of this function settles without saving a thing. They rode
-	-- one boolean until a caller read "settled" as "written" and cleared a
-	-- dirty flag over a receipt that existed only in memory.
+	-- THIRD RETURN, AND IT IS NOT A BOOLEAN, because it is asked TWO questions.
+	-- "persisted": this call saved, and every receipt it was handed survived.
+	-- "displaced": it saved, and the cap dropped at least one of them to make
+	-- room for salvage -- the evidence is safe and the caller's is not.
+	-- "none": it wrote nothing at all (adopted, declined, refused, or failed).
+	--
+	-- A boolean here collapsed "wrote, but not yours" into "wrote nothing", and
+	-- the caller cannot tell a case it must REFUSE from one it must retry by
+	-- writing. Settling and writing were already two facts on one channel once
+	-- in this file; this is the same mistake one level down.
 	if r.live_key == CONSENT_OUTBOX_FORWARD_KEY then
-		return true, nil, false
+		return true, nil, "none"
 	end
 	if r.successor == "damaged" then
 		-- Both records unaccounted. Refusing is the point; recycling a key we
 		-- cannot see is how the second witness gets destroyed.
 		r.freeze_owed = true
-		return false, nil, false
+		return false, nil, "none"
 	end
 	-- RE-READ BEFORE FREEZING. Freezing is irreversible, so it may not rest on
 	-- one failed read: a transient failure that now parses whole must not cost
@@ -1765,16 +1819,22 @@ function M.freeze_consent_outbox(scope, carried)
 			-- of one recovered read would resurrect a frozen base while a marked
 			-- successor sits beside it, ignoring the live trail entirely.
 			if confirm_successor(ns, r) ~= "absent" then
-				return true, nil, false
+				return true, nil, "none"
 			end
 			r.receipts = kept
 			r.base = "readable"
 			r.unaccounted = false
+			-- The base re-read WHOLE. The damage observation that summoned this
+			-- freeze is no longer true of the world, and a diagnosis derived
+			-- from it would keep naming a file that is fine.
+			r.base_damaged = false
+			r.record_damaged = false
+			r.answered = true
 			-- AND CLEAR THE DEBT. Leaving it set makes every later write fail
 			-- forever -- a dead end wearing fail-closed's clothes, which is the
 			-- exact shape the retry exists to avoid.
 			r.freeze_owed = false
-			return false, kept, false
+			return false, kept, "none"
 		end
 		-- MERGE, NOT PICK-THE-LONGER -- the second instance of the defect fixed
 		-- one round ago on the adoption path, and the census that found it also
@@ -1796,20 +1856,38 @@ function M.freeze_consent_outbox(scope, carried)
 	-- also failed, which says nothing about the forward key -- and this is the
 	-- last point before the save that would overwrite it.
 	if confirm_successor(ns, r) ~= "absent" then
-		return true, nil, false
+		return true, nil, "none"
 	end
 	local path = save_path(ns, CONSENT_OUTBOX_FORWARD_KEY)
 	if not path then
 		r.freeze_owed = true
-		return false, nil, false
+		return false, nil, "none"
 	end
 	local kept = apply_outbox_cap(sanitize_outbox_entries(carried))
+	-- DID THE CALLER'S OWN RECEIPTS SURVIVE THIS CAP. Second site of the guard
+	-- added on the merge path, and it was left unguarded because the finding
+	-- that prompted the guard pointed at the other one. Preserving the salvage
+	-- is unconditional and still happens; what may NOT happen is telling the
+	-- caller its receipts are durable when the cap dropped one -- the client
+	-- clears its dirty flag on that, and analytics opens on a grant that was
+	-- never dispatched.
+	local carried_survived = true
+	do
+		local present = {}
+		for i = 1, #kept do present[kept[i].idempotency_key] = true end
+		local incoming = sanitize_outbox_entries(pending)
+		for i = 1, #incoming do
+			if present[incoming[i].idempotency_key] == nil then
+				carried_survived = false
+			end
+		end
+	end
 	local ok, saved = pcall(sys.save, path, { frozen = true, receipts = kept })
 	if not (ok and saved == true) then
 		-- OWED, not forgotten, and not a refusal either: the next write retries
 		-- it. A refusal with no path back is a dead end, not fail-closed.
 		r.freeze_owed = true
-		return false, nil, false
+		return false, nil, "none"
 	end
 	consent_outbox_memory[ns] = { frozen = true, receipts = kept }
 	r.live_key = CONSENT_OUTBOX_FORWARD_KEY
@@ -1818,7 +1896,12 @@ function M.freeze_consent_outbox(scope, carried)
 	r.unaccounted = true
 	r.receipts = kept
 	r.freeze_owed = false
-	return true, nil, true
+	r.base_damaged = true
+	r.record_damaged = false
+	r.answered = true
+	-- Wrote, but say WHOSE: `persisted` is about the receipts this call was
+	-- handed, and the cap may have dropped one to make room for salvage.
+	return true, nil, carried_survived and "persisted" or "displaced"
 end
 
 -- Whether any key may safely be written. DISTINCT from the trail being
@@ -1865,8 +1948,24 @@ function M.consent_outbox_writable(scope)
 end
 
 -- Diagnostic only: "record" | "store" | nil. See the resolution.
+-- WHAT AN OPERATOR SHOULD GO AND LOOK AT: the FILE, or the DEVICE. Computed
+-- from the resolution's stored observations every time it is asked, so it
+-- cannot disagree with a resolution some later branch has moved on.
 function M.consent_outbox_unaccounted_cause(scope)
-	return resolution_for(spool_namespace(scope), scope).cause
+	local r = resolution_for(spool_namespace(scope), scope)
+	if r.base_damaged then
+		-- The store answering for EITHER key proves the device works, so the
+		-- unusable thing is the record. Answering for neither is the only
+		-- observation that supports blaming the store.
+		return r.answered and "record" or "store"
+	end
+	if r.successor == "damaged" or r.record_damaged then
+		return "record"
+	end
+	-- nil covers exactly one live situation: a frozen base whose successor
+	-- reads clean. Why that base became unreadable is historical, this run did
+	-- not see it, and guessing is the one thing this must not do.
+	return nil
 end
 
 function M.save_consent_outbox(scope, receipts)

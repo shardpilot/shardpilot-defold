@@ -8432,6 +8432,168 @@ local tests = {
 	assert_equal(#select(1, storage.load_consent_outbox(identity_scope)), 2,
 		"and it too hands out a COPY -- the branch is different, the hazard is the same")
 	restore8(); storage.reset()
+
+	-- R. THE FREEZE'S OWN CAP IS THE SECOND SITE OF THE SURVIVAL GUARD. The
+	--    first was added on the merge path because that is where the report
+	--    pointed; this one writes the salvage and can drop the caller's grant
+	--    to make room, then return through the early `persisted` path that
+	--    never reaches the check.
+	reset(); storage.reset()
+	local stores9, restore9 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base9 = select(1, outbox_paths(stores9))
+	local salvage = {}
+	for i = 1, 32 do salvage[i] = denial("salv-" .. i, "anon-r") end
+	salvage[33] = "an entry this build cannot read"
+	stores9[base9] = { receipts = salvage }
+	storage.reset()
+	local real_save9 = sys.save
+	sys.save = function(path, record)
+		if path:find("frozen%-successor$") then return false end
+		return real_save9(path, record)
+	end
+	local r9 = storage.resolve_consent_outbox(identity_scope)
+	assert_equal(storage.freeze_consent_outbox(identity_scope, {}), false)
+	assert_equal(r9.freeze_owed, true, "the debt stands, and the base still holds 32 salvageable")
+	sys.save = real_save9
+	local grant9 = denial("the-grant", "anon-r")
+	grant9.categories = { analytics = true }
+	assert_equal(storage.save_consent_outbox(identity_scope, { grant9 }), nil,
+		"the write is REFUSED: the freeze saved the salvage and the cap dropped the caller's grant")
+	local live9 = stores9[base9 .. "-frozen-successor"]
+	assert_equal(#live9.receipts, 32, "the salvage is preserved -- that part is unconditional")
+	local has_grant = false
+	for i = 1, #live9.receipts do
+		if live9.receipts[i].idempotency_key == "the-grant" then has_grant = true end
+	end
+	assert_true(not has_grant, "and the grant really did not land, which is why success would be a lie")
+	restore9(); storage.reset()
+
+	-- S. A DIAGNOSIS DERIVED, SO IT CANNOT GO STALE. Both reads throw, so the
+	--    run can only blame the store. The freeze's rechecks then read the base
+	--    successfully and find an unmarked record on the forward key -- which
+	--    PROVES the store responds. A stamped cause still said "store" and sent
+	--    an operator to inspect a working device.
+	reset(); storage.reset()
+	local stores10, restore10 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base10 = select(1, outbox_paths(stores10))
+	stores10[base10 .. "-frozen-successor"] = { receipts = { denial("not-ours", "anon-s") } }
+	storage.reset()
+	local threw10 = 0
+	local real_load10 = sys.load
+	sys.load = function(path)
+		if threw10 < 2 and path:find("consent%-outbox") then
+			threw10 = threw10 + 1
+			error("neither key replies on the first pass")
+		end
+		return real_load10(path)
+	end
+	local r10 = storage.resolve_consent_outbox(identity_scope)
+	assert_equal(threw10, 2, "the fixture really threw for both keys")
+	assert_equal(storage.consent_outbox_unaccounted_cause(identity_scope), "store",
+		"with neither key answering, the store is the only thing this run can blame")
+	assert_true(storage.freeze_consent_outbox(identity_scope, {}))
+	sys.load = real_load10
+	assert_equal(r10.successor, "damaged", "the recheck found an unmarked record on the forward key")
+	assert_equal(storage.consent_outbox_unaccounted_cause(identity_scope), "record",
+		"and the diagnosis follows it: the store demonstrably answered, so the RECORD is the problem")
+	restore10(); storage.reset()
+
+	-- T. A MARKED SHADOW IS EVIDENCE ABOUT THE SUCCESSOR KEY, and what the base
+	--    read returned has no bearing on it. Gated on `live_record == nil`, a
+	--    base that comes back as a malformed TABLE is non-nil, so the shadow
+	--    was skipped and the resolution resurrected a base this process had
+	--    already frozen.
+	reset(); storage.reset()
+	local stores11, restore11 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base11 = select(1, outbox_paths(stores11))
+	-- A readable TABLE this build cannot make sense of: non-nil, and foreign.
+	stores11[base11] = { something_else = "a record shape this build does not know" }
+	storage.reset()
+	storage.resolve_consent_outbox(identity_scope)
+	assert_true(storage.freeze_consent_outbox(identity_scope, { denial("frozen-era", "anon-t") }),
+		"this process freezes the malformed base, so its shadow is the SUCCESSOR's")
+	-- A later session in the same process: the successor read comes back ABSENT
+	-- (transient), while the malformed base still reads as a table.
+	storage.begin_consent_outbox_session(identity_scope)
+	local hidden = stores11[base11 .. "-frozen-successor"]
+	stores11[base11 .. "-frozen-successor"] = nil
+	local r11 = storage.resolve_consent_outbox(identity_scope)
+	assert_equal(r11.live_key, "consent-outbox-frozen-successor",
+		"the marker decides which key is live -- a non-nil base record does not outvote it")
+	assert_equal(r11.unaccounted, true, "and the frozen base stays unaccounted")
+	stores11[base11 .. "-frozen-successor"] = hidden
+	assert_true(storage.save_consent_outbox(identity_scope, { denial("after", "anon-t") }) ~= nil)
+	assert_equal(stores11[base11].something_else, "a record shape this build does not know",
+		"the write went to the successor: the frozen bytes are untouched")
+	restore11(); storage.reset()
+
+	-- U. THE DECLINED FREEZE CLEARS THE DAMAGE IT WAS SUMMONED BY. Both reads
+	--    throw, so the run blames the store; the base then re-reads WHOLE and
+	--    the freeze declines. Nothing is unaccounted any more, and a diagnosis
+	--    still naming a failure is a diagnosis about a world that moved on.
+	reset(); storage.reset()
+	local stores12, restore12 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, { denial("intact", "anon-u") }))
+	storage.reset()
+	local threw12 = 0
+	local real_load12 = sys.load
+	sys.load = function(path)
+		if threw12 < 2 and path:find("consent%-outbox") then
+			threw12 = threw12 + 1
+			error("neither key replies on the first pass")
+		end
+		return real_load12(path)
+	end
+	local r12 = storage.resolve_consent_outbox(identity_scope)
+	assert_equal(threw12, 2, "the fixture really threw for both keys")
+	assert_equal(storage.consent_outbox_unaccounted_cause(identity_scope), "store",
+		"with neither key answering, the store is all this run can blame")
+	local froze12, recovered12 = storage.freeze_consent_outbox(identity_scope, {})
+	sys.load = real_load12
+	assert_equal(froze12, false, "the base re-read whole, so the freeze declines")
+	assert_true(recovered12 ~= nil and #recovered12 == 1, "and hands back what it read")
+	assert_equal(r12.unaccounted, false, "nothing is unaccounted")
+	assert_equal(storage.consent_outbox_unaccounted_cause(identity_scope), nil,
+		"so there is nothing to diagnose -- the observation that summoned the freeze is no longer true")
+	restore12(); storage.reset()
+
+	-- V. AND SO DOES THE ADOPTED HELD SUCCESSOR, in the other direction. The
+	--    recheck reads successfully -- which proves the store answers -- and
+	--    finds a marked successor whose PAYLOAD is damaged. Both observations
+	--    are new, and both belong to this run.
+	reset(); storage.reset()
+	local stores13, restore13 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base13 = select(1, outbox_paths(stores13))
+	stores13[base13 .. "-frozen-successor"] = { frozen = true, receipts = {
+		denial("readable-one", "anon-v"),
+		"an entry this build cannot read",
+	} }
+	storage.reset()
+	local threw13 = 0
+	local real_load13 = sys.load
+	sys.load = function(path)
+		if threw13 < 2 and path:find("consent%-outbox") then
+			threw13 = threw13 + 1
+			error("neither key replies on the first pass")
+		end
+		return real_load13(path)
+	end
+	local r13 = storage.resolve_consent_outbox(identity_scope)
+	assert_equal(threw13, 2, "the fixture really threw for both keys")
+	assert_equal(storage.consent_outbox_unaccounted_cause(identity_scope), "store",
+		"the first pass can only blame the store")
+	assert_true(storage.freeze_consent_outbox(identity_scope, {}))
+	sys.load = real_load13
+	assert_equal(r13.successor, "held", "the recheck adopts the marked successor")
+	assert_equal(storage.consent_outbox_writable(identity_scope), false,
+		"whose payload is damaged, so it is not writable")
+	assert_equal(storage.consent_outbox_unaccounted_cause(identity_scope), "record",
+		"and the diagnosis is the RECORD: that read succeeded, so the device is fine")
+	restore13(); storage.reset()
 	end,
 	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
 	--
@@ -8743,7 +8905,12 @@ local tests = {
 		assert_equal(r.successor, c[5], label .. ": successor")
 		assert_equal(r.unaccounted, c[6], label .. ": unaccounted")
 		assert_equal(r.writable, c[7], label .. ": writable")
-		assert_equal(r.cause, c[8], label .. ": cause")
+		-- THROUGH THE ACCESSOR the client actually calls, not a stored field:
+		-- `cause` is derived from the resolution's observations now, precisely
+		-- so it cannot go stale at a later mutation site, and asserting a field
+		-- would be asserting the thing that no longer exists.
+		assert_equal(storage.consent_outbox_unaccounted_cause(identity_scope), c[8],
+			label .. ": cause")
 	end
 
 	-- A STORE THAT DOES NOT REPLY AT ALL is the one shape the table above cannot
@@ -8763,7 +8930,8 @@ local tests = {
 	sys.load = real_load
 	assert_equal(silent.successor, "unknown", "a silent store leaves the successor unknown")
 	assert_equal(silent.live_key, BASE, "and does not pretend a freeze happened")
-	assert_equal(silent.cause, "store", "and names the store, not a record")
+	assert_equal(storage.consent_outbox_unaccounted_cause(identity_scope), "store",
+		"and names the store, not a record")
 	assert_equal(silent.writable, true, "writes are not refused on a silent store")
 	assert_equal(silent.unaccounted, true, "but the base is unaccounted, so it fails closed")
 
