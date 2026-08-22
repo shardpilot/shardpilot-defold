@@ -853,7 +853,24 @@ function M.new(config)
 		-- they are, and what was salvageable rides forward into a successor key
 		-- that is equally durable -- so preserving the evidence costs nothing
 		-- in the ability to record new decisions.
-		local _, recovered = storage.freeze_consent_outbox(normalized, client.consent_outbox)
+		local froze, recovered = storage.freeze_consent_outbox(normalized, client.consent_outbox)
+		if froze and recovered == nil then
+			-- ADOPTED, NOT WRITTEN. The freeze can settle by finding a marked
+			-- successor already on disk -- a previously frozen install whose
+			-- reads failed transiently -- and then it saved nothing, so it has
+			-- no `recovered` list to hand back. The RESOLUTION has the live
+			-- receipts; this mirror still holds the empty result of the read
+			-- that failed. Leave them divergent and the live trail is neither
+			-- dispatched nor carried into the next persistence, so the first
+			-- fresh decision rewrites the successor with only its own receipt
+			-- and deletes an undelivered denial -- by the shortest path yet.
+			--
+			-- Read back through the resolution rather than widening the return:
+			-- `recovered` means "the base re-read whole, the trail is fine",
+			-- and this case is the opposite -- the base stays unaccounted and
+			-- the alarm below must still fire. Two facts, so not one channel.
+			client.consent_outbox = storage.load_consent_outbox(normalized)
+		end
 		if recovered ~= nil then
 			-- The freeze declined because the record re-read whole: the failure
 			-- was transient. Take what it recovered, or this session keeps the

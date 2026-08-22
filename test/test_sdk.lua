@@ -8000,6 +8000,53 @@ local tests = {
 		"it landed on the SUCCESSOR, marked -- the damaged base was never rewritten")
 	assert_equal(stores3[base3], "garbage", "the frozen bytes are exactly as they were")
 	restore3(); storage.reset()
+
+	-- F. THE RESOLUTION AND THE CLIENT MIRROR MUST NOT DIVERGE. When the freeze
+	--    settles by ADOPTING a successor already on disk it saved nothing, so
+	--    it has no recovered list to hand back -- and the mirror kept the empty
+	--    result of the read that failed. The live receipts were then neither
+	--    dispatched nor carried forward, and the first fresh decision rewrote
+	--    the successor with only its own receipt: the shortest path yet to
+	--    deleting an undelivered denial.
+	reset(); storage.reset()
+	local stores4, restore4 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-f", consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z", consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base4 = select(1, outbox_paths(stores4))
+	stores4[base4 .. "-frozen-successor"] =
+		{ frozen = true, receipts = { denial("adopted-denial", "anon-f") } }
+	storage.reset()
+	-- EXACTLY the two resolve reads throw. The freeze's base re-read must
+	-- SUCCEED -- that is the branch this test is about -- and the successor
+	-- confirmation after it must succeed too, or the adoption never happens.
+	local threw4 = 0
+	local real_load4 = sys.load
+	sys.load = function(path)
+		if threw4 < 2 and path:find("consent%-outbox") then
+			threw4 = threw4 + 1
+			error("only the first pass fails")
+		end
+		return real_load4(path)
+	end
+	-- THE TRANSPORT MUST FAIL, or this test cannot see its subject: with a
+	-- working transport the adopted denial is DISPATCHED on boot and pruned,
+	-- so the mirror reads 0 whether the adoption happened or not -- the same
+	-- number the bug produces, for the opposite reason.
+	next_status = 500
+	local client4 = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	sys.load = real_load4
+	assert_equal(threw4, 2, "the fixture really threw for both keys on the first pass")
+	assert_equal(#client4.consent_outbox, 1,
+		"the client mirror carries the adopted trail, not the empty failed read")
+	assert_equal(client4.consent_outbox[1].idempotency_key, "adopted-denial",
+		"and it is the undelivered denial that was on disk")
+	local live4 = stores4[base4 .. "-frozen-successor"]
+	assert_true(type(live4) == "table" and #live4.receipts == 1,
+		"and an undispatched denial is still on disk, not overwritten by the empty mirror")
+	restore4(); storage.reset()
 	end,
 	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
 	--
