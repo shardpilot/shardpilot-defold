@@ -875,14 +875,36 @@ function M.new(config)
 		-- key, which is durable across restarts. This preserves the record
 		-- without costing the ability to write new decisions -- and it does not
 		-- deliver the frozen denial, which is a separate piece of work.
-		storage.freeze_consent_outbox(normalized, client.consent_outbox)
+		local _, recovered = storage.freeze_consent_outbox(normalized, client.consent_outbox)
+		if recovered ~= nil then
+			-- The freeze declined because the record re-read whole: the earlier
+			-- failure was transient. Take what it recovered -- otherwise this
+			-- session keeps the EMPTY set the failed read produced, and the
+			-- first decision writes that over an intact trail. Nothing is
+			-- unaccounted, so the hold lifts with it.
+			client.consent_outbox = recovered
+			client.consent_outbox_unreadable = false
+			outbox_err = nil
+		end
+	end
+	-- A FROZEN RECORD IS UNREADABLE EVIDENCE, on this launch and every one
+	-- after. Once frozen, the loader reads a clean successor and returns no
+	-- error -- so without this the withholding would apply only on the launch
+	-- that saw the corruption, and every launch after would restore the grant
+	-- and permit rotation with the possible denial still unaccounted. Before
+	-- the freeze existed, each launch re-read the damaged record and withheld;
+	-- preserving the evidence must not be what stops us acting on it.
+	local outbox_unaccounted = outbox_err ~= nil
+		or storage.holds_frozen_consent_outbox(normalized)
+	if outbox_unaccounted then
+		client.consent_outbox_unreadable = true
 	end
 	-- THE ALARM RISES FROM THE CONDITION, NOT FROM THE RETENTION SUCCEEDING.
 	-- outbox_err already established that a denial may be undelivered; whether
 	-- the freeze could be written is a separate fact, and keying the alarm on it
 	-- would make the alarm vanish precisely during a storage failure -- the case
 	-- where it matters most.
-	if outbox_err ~= nil or storage.holds_frozen_consent_outbox(normalized) then
+	if outbox_unaccounted then
 		client.stats.consent_denial_possibly_undelivered = 1
 		client:diagnose({
 			scope = "consent",
@@ -890,7 +912,7 @@ function M.new(config)
 			code = "consent_denial_possibly_undelivered",
 		})
 	end
-	if outbox_err ~= nil and client.consent_state == "granted" then
+	if outbox_unaccounted and client.consent_state == "granted" then
 		-- FAIL CLOSED on the granted restore, exactly as the unreadable
 		-- marker arm does above and for the same reason. This trail is an
 		-- accepted denial witness — shutdown() finalizes on a retained

@@ -7816,6 +7816,17 @@ local tests = {
 	local second = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(second.stats.consent_denial_possibly_undelivered, 1,
 		"the condition survives a launch where nothing is wrong -- it is not an event")
+	-- AND IT STILL WITHHOLDS. Preserving the evidence must not be what stops us
+	-- acting on it: after the freeze the loader reads a clean successor and
+	-- reports no error, so without treating the frozen record as unreadable
+	-- evidence this launch would restore the grant and permit rotation with the
+	-- possible denial still unaccounted -- weaker than before the freeze existed.
+	assert_equal(second.consent_state, "denied",
+		"a frozen record withholds the granted restore on EVERY later launch")
+	local rok, rerr = second:set_anonymous_id("anon-rotated-after-freeze")
+	assert_equal(rok, false)
+	assert_equal(rerr, "consent_evidence_unreadable",
+		"and rotation stays refused while the frozen record is unaccounted")
 	restore()
 	storage.reset()
 
@@ -7848,10 +7859,39 @@ local tests = {
 	end
 	local unwritable = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	sys.save = real_save
-	assert_true(not storage.holds_frozen_consent_outbox(identity_scope),
-		"the freeze really did fail to write")
+	-- Asserted against the STORE, not against holds_frozen_consent_outbox: that
+	-- predicate now reports the base as unaccounted whether or not the freeze
+	-- could be written -- which is the point of this leg.
+	local successor_written = false
+	for path in pairs(stores2) do
+		if path:find("frozen%-successor$") then
+			successor_written = true
+		end
+	end
+	assert_true(not successor_written, "the freeze really did fail to write")
 	assert_equal(unwritable.stats.consent_denial_possibly_undelivered, 1,
 		"and the alarm rises anyway -- it reports the condition, not the retention")
+	-- AND THE BASE STAYS PROTECTED, which is what the owed-freeze state is FOR.
+	-- Nothing durable records that the base must not be written, so an explicit
+	-- decision -- which clears the client's hold -- would otherwise let the now
+	-- recovered store overwrite the damaged record with the salvaged subset:
+	-- the evidence lost to the very write the freeze existed to prevent.
+	local damaged_before
+	for path, record in pairs(stores2) do
+		if path:sub(-15) == "/consent-outbox" then
+			damaged_before = record.receipts and record.receipts[1]
+		end
+	end
+	assert_equal(damaged_before, "this-entry-is-not-a-table", "the damaged base is on disk")
+	assert_true(unwritable:set_consent(false), "an explicit decision is still accepted")
+	local damaged_after
+	for path, record in pairs(stores2) do
+		if path:sub(-15) == "/consent-outbox" then
+			damaged_after = record.receipts and record.receipts[1]
+		end
+	end
+	assert_equal(damaged_after, "this-entry-is-not-a-table",
+		"and it is STILL there -- an owed freeze keeps the base unwritable")
 	restore2()
 	storage.reset()
 
@@ -7883,12 +7923,52 @@ local tests = {
 	assert_true(failed_once, "the fixture really did fail the first read")
 	assert_true(not storage.holds_frozen_consent_outbox(identity_scope),
 		"a record that re-reads whole is not frozen")
+	assert_equal(transient.consent_state, "granted",
+		"and a transient failure does not withhold anything")
+	assert_true(not transient.consent_outbox_unreadable,
+		"the recovered read lifts the write hold with it -- otherwise the first "
+			.. "decision writes the failed read's empty set over an intact trail")
 	reset()
 	storage.reset()
 	local recovered = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(recovered.stats.consent_denial_possibly_undelivered, 0,
 		"and the alarm does not latch -- the next launch is clean")
 	restore3()
+	storage.reset()
+
+	-- AN UNREADABLE SUCCESSOR IS OCCUPIED, NOT ABSENT. Reporting it as absent
+	-- hands the base back as the live key and lets a freeze write the base's
+	-- salvage OVER the successor -- destroying the second record, which may be
+	-- the one holding an undelivered denial. Two damaged records is the bounded
+	-- case this design declared; the answer there is refusal, not recycling.
+	reset()
+	storage.reset()
+	local stores4, restore4 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-both-damaged",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local outbox_path
+	for path in pairs(stores4) do
+		if path:sub(-15) == "/consent-outbox" then
+			outbox_path = path
+		end
+	end
+	assert_true(outbox_path ~= nil, "the outbox key was created")
+	-- A readable base beside a successor that is present and NOT a table.
+	stores4[outbox_path] = { receipts = {} }
+	stores4[outbox_path .. "-frozen-successor"] = "not a record at all"
+	storage.reset()
+	assert_true(storage.holds_frozen_consent_outbox(identity_scope),
+		"a present-but-unreadable successor still counts as frozen")
+	assert_true(not storage.save_consent_outbox(identity_scope, {}),
+		"and no key may be written while a second record is unaccounted")
+	assert_equal(stores4[outbox_path .. "-frozen-successor"], "not a record at all",
+		"the damaged successor is left exactly as it was")
+	restore4()
 	storage.reset()
 	end,
 	-- Declared inline rather than as `local function`: Lua caps a chunk at
