@@ -372,6 +372,19 @@ per-app spool and re-sends them on a later launch. Enabled by default
   checked. Flushing the ordinary queue is not always enough — an exposure can
   stay owed behind earlier queue pressure — so a host that rotates identity
   must drain and retry rather than assume one flush cleared the way.
+
+  One rotation refusal does **not** clear by draining:
+  `set_anonymous_id` returns `false, "consent_evidence_unreadable"` when the
+  retained consent-receipt trail on disk exists and could not be read, so a
+  stored grant is being withheld for this session. That trail may hold a
+  refusal by the CURRENT anonymous id, and rotating would carry the withheld
+  grant onto a new one — where a healed trail's old-id receipts are treated
+  as another actor's and dropped, reopening analytics against a refusal that
+  was never resolved. Recovery is a **fresh decision**: call `set_consent`
+  with the choice the user makes now, which supersedes whatever could not be
+  read and releases the rotation. Flushing, waiting and retrying will not
+  clear it — nothing is pending to drain. Re-asserting the id already in
+  force is a no-op and is never refused.
 - Permanent `4xx` rejects are **never** spooled — they would fail forever.
 
 **Resend.** On the next `init`/`new`, spooled envelopes are re-sent through

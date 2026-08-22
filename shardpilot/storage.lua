@@ -1107,12 +1107,37 @@ local valid_receipt_kinds = { anon = true, user_verified = true }
 -- Anything else — a corrupt file, a truncated entry, a garbled field — is
 -- dropped rather than sent or crashed on: one bad record on disk must never
 -- block (or ride along with) the deliverable rest.
+-- Returns the salvageable entries AND how many were refused. The count is
+-- the caller's only way to tell a trail that was fully understood from one
+-- that lost something: every rejection here is a SHAPE failure, so a nonzero
+-- count means the file held a receipt this build cannot read -- and a receipt
+-- it cannot read may be a denial. The could-never-send drop is deliberately
+-- NOT here (it lives in the client, on a receipt this store understood
+-- perfectly), so the count never conflates policy with corruption.
 local function sanitize_outbox_entries(entries)
 	local out = {}
-	if type(entries) ~= "table" then
-		return out
+	if entries == nil then
+		-- No receipts key at all: what an absent file loads as. Honestly
+		-- empty, nothing lost.
+		return out, 0
 	end
-	for i = 1, #entries do
+	if type(entries) ~= "table" then
+		-- Present and not a list: at least one receipt is unaccounted for.
+		return out, 1
+	end
+	local dropped = 0
+	-- `#entries` is the ARRAY PREFIX ONLY, and the loop below never leaves it.
+	-- A table with a HOLE ({[1]=a, [3]=b}) or with non-array keys hides
+	-- receipts behind that prefix: they would never be visited, never counted,
+	-- and the loader would report a fully understood trail while a denial sat
+	-- unread. Walk every key first and charge anything outside the prefix.
+	local prefix = #entries
+	for key in pairs(entries) do
+		if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > prefix then
+			dropped = dropped + 1
+		end
+	end
+	for i = 1, prefix do
 		local entry = entries[i]
 		if type(entry) == "table"
 			and valid_receipt_field(entry.idempotency_key)
@@ -1145,9 +1170,11 @@ local function sanitize_outbox_entries(entries)
 				reason = entry.reason,
 				anonymous_id = entry.anonymous_id,
 			}
+		else
+			dropped = dropped + 1
 		end
 	end
-	return out
+	return out, dropped
 end
 
 -- A receipt counts as a pure grant for eviction purposes when its category
@@ -1187,25 +1214,71 @@ end
 -- Load the retained consent receipts for this app (oldest first, possibly
 -- empty). The outbox shares the identity record's per-app namespace scheme
 -- (plus the raw-scope hash, like the spool and the pending-crash sidecar).
--- A failed or garbled read degrades to the salvageable subset — or a clean
--- empty outbox — instead of erroring into game code; this never throws.
+-- Never throws into game code.
+--
+-- THREE-VALUED, like load_consent_denial_marker and for the same reason.
+-- This outbox is an accepted DENIAL WITNESS -- a retained receipt is proof
+-- of a refusal, and shutdown() will finalize on it alone when the record and
+-- the marker both failed to write. For a witness, "empty" is not the absence
+-- of an answer, it is the CLAIM that nothing was ever refused, and a read
+-- that failed cannot support that claim. Returns:
+--   * entries, nil -- understood. An empty list here is honestly empty.
+--   * entries, "consent_outbox_read_failed" -- the trail exists and could
+--     not be fully understood: the durable read threw or produced a
+--     non-table with no in-process shadow to answer instead, OR the file
+--     parsed but held a receipt this build refused. The entries returned are
+--     the salvageable subset and are still usable; what the caller must not
+--     do is read the list as complete.
+--
+-- The old contract collapsed both into a bare empty list, so a first launch
+-- and a destroyed denial trail were the same value. The cache/spool loaders
+-- deliberately KEEP that degrade-to-empty behaviour: losing a cached event
+-- costs an event, while losing a denial costs a refusal the user made.
 function M.load_consent_outbox(scope)
 	local ns = spool_namespace(scope)
 	local record = nil
+	local read_failed = false
 	local path = save_path(ns, "consent-outbox")
 	if path then
 		local ok, loaded = pcall(sys.load, path)
 		if ok and type(loaded) == "table" then
 			record = loaded
+		elseif not ok or loaded ~= nil then
+			-- Threw, or answered with something that is not a record. Note
+			-- `ok and loaded == nil` is NOT this case: that is the backend
+			-- answering cleanly with nothing, which is an absent file.
+			read_failed = true
 		end
 	end
 	if record == nil then
-		record = consent_outbox_memory[ns]
+		local shadow = consent_outbox_memory[ns]
+		if type(shadow) == "table" then
+			-- A shadow written by a successful save THIS session answers for
+			-- the trail, exactly as the marker loader lets one do: the
+			-- process knows what it wrote even when the file will not read.
+			record = shadow
+			read_failed = false
+		end
 	end
 	if type(record) ~= "table" then
-		return {}
+		if read_failed then
+			return {}, "consent_outbox_read_failed"
+		end
+		return {}, nil
 	end
-	return sanitize_outbox_entries(record.receipts)
+	if record.receipts == nil and next(record) ~= nil then
+		-- An ABSENT file loads as an empty table here, which is why a missing
+		-- receipts key normally means "honestly empty". A NONEMPTY record
+		-- without the one payload key it is supposed to carry is not an absent
+		-- file: it is a record this build cannot make sense of, and what it
+		-- held may have been a denial.
+		return {}, "consent_outbox_read_failed"
+	end
+	local entries, dropped = sanitize_outbox_entries(record.receipts)
+	if read_failed or dropped > 0 then
+		return entries, "consent_outbox_read_failed"
+	end
+	return entries, nil
 end
 
 -- Replace the persisted outbox with `receipts` (oldest first), enforcing the
