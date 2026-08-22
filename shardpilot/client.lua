@@ -828,6 +828,75 @@ function M.new(config)
 	client.experiments_client_id = experiments_mod.valid_subject_id(
 			stored.experiments_client_id)
 		and stored.experiments_client_id or nil
+	-- LOADED BEFORE THE IDENTITY CONSOLIDATION BELOW, not after. The self-heal
+	-- rewrite in that block persists the identity, and persist_identity refuses
+	-- only when it can SEE an imposition -- which did not exist yet while this
+	-- load sat after it. On the one path where the stored anon is unusable and
+	-- only the outbox is unreadable, the record therefore reached disk as
+	-- (generated id, restored grant) before anything could stop it, and a
+	-- healed trail's denial for the previous actor then read as foreign.
+	-- Nothing between here and there touches the outbox file, so moving the
+	-- read earlier costs nothing and gives the guard something to guard.
+	-- Durable consent-receipt outbox: reload the receipts a previous launch
+	-- could not deliver. Deliberately UNCONDITIONAL on the consent state — the
+	-- exact opposite of the event spool below: a receipt documents an explicit
+	-- decision, so delivering it is permitted (and is the record's whole legal
+	-- point) precisely when the analytics pipeline is closed. It still costs a
+	-- fresh consent-first install nothing: an empty outbox returns before any
+	-- token is minted, so an undecided client stays fully dark. Loaded BEFORE
+	-- the spool so the belt cross-check below settles the boot consent state
+	-- first — the spool load/purge decision must read the FINAL state.
+	local outbox_err
+	client.consent_outbox, outbox_err = storage.load_consent_outbox(normalized)
+	-- TWO different facts, and only one is about the restored state. PRESERVING
+	-- THE EVIDENCE is unconditional: a trail that could not be read must not be
+	-- replaced by its salvageable subset whatever the record says, because a
+	-- denied or unknown restore still dispatches the salvageable receipts and
+	-- their acknowledgment rewrites the mirror over an entry that may be an
+	-- undelivered denial. WITHHOLDING A GRANT is what stays conditional on
+	-- there being a grant. (Ported from the godot review before this repo's own
+	-- round could re-find it.)
+	if outbox_err ~= nil then
+		client.consent_outbox_unreadable = true
+	end
+	if outbox_err ~= nil and client.consent_state == "granted" then
+		-- FAIL CLOSED on the granted restore, exactly as the unreadable
+		-- marker arm does above and for the same reason. This trail is an
+		-- accepted denial witness — shutdown() finalizes on a retained
+		-- receipt alone when the record and the marker both failed to
+		-- write — so a read that lost part of it cannot be read as "nothing
+		-- was ever refused". The salvageable entries stay loaded: they are
+		-- still deliverable, and the belt below still runs on them.
+		--
+		-- Memory-only, like the marker arm: the record is NOT rewritten (see
+		-- persist_identity, which shadows on consent_unreadable_imposed), the
+		-- file is not retired, and the next launch re-evaluates against a
+		-- trail that may by then read cleanly.
+		client.consent_restored_state = client.consent_state
+		client.consent_restored_decided_at = client.consent_decided_at
+		client.consent_restored_decision_seq = client.consent_decision_seq
+		client.consent_unreadable_imposed = true
+		-- The hold above is SEPARATE from this shared imposition flag on purpose. The shadow in
+		-- persist_identity must cover BOTH arms — a manufactured denial must
+		-- never be written down whichever file could not be read — but the
+		-- outbox WRITE HOLD must key on THIS outbox failing and nothing else.
+		-- Keyed on the shared flag it held a perfectly readable outbox hostage
+		-- to an unreadable MARKER: an acknowledged receipt left the write owed
+		-- and shutdown() then answered consent_pending forever.
+		client.consent_state = "denied"
+		client.consent_decided_at = nil
+		client.consent_decision_seq = 0
+		consent_state = client.consent_state
+		-- Surfaced under its own code, not the marker's: the marker decided
+		-- nothing here, and a diagnosis that misnames its cause sends the
+		-- integrator to the wrong file.
+		client:diagnose({
+			scope = "consent",
+			status = "restored",
+			code = "consent_outbox_unreadable",
+		})
+	end
+
 	if imposed_denial_marker then
 		-- CONSOLIDATION: the marker imposed this boot's denied state; converge
 		-- the identity record (which also carries any anonymous-id rewrite)
@@ -891,65 +960,6 @@ function M.new(config)
 			-- strips attributes from the very next fetch.
 			return client.consent_state
 		end)
-	end
-	-- Durable consent-receipt outbox: reload the receipts a previous launch
-	-- could not deliver. Deliberately UNCONDITIONAL on the consent state — the
-	-- exact opposite of the event spool below: a receipt documents an explicit
-	-- decision, so delivering it is permitted (and is the record's whole legal
-	-- point) precisely when the analytics pipeline is closed. It still costs a
-	-- fresh consent-first install nothing: an empty outbox returns before any
-	-- token is minted, so an undecided client stays fully dark. Loaded BEFORE
-	-- the spool so the belt cross-check below settles the boot consent state
-	-- first — the spool load/purge decision must read the FINAL state.
-	local outbox_err
-	client.consent_outbox, outbox_err = storage.load_consent_outbox(normalized)
-	-- TWO different facts, and only one is about the restored state. PRESERVING
-	-- THE EVIDENCE is unconditional: a trail that could not be read must not be
-	-- replaced by its salvageable subset whatever the record says, because a
-	-- denied or unknown restore still dispatches the salvageable receipts and
-	-- their acknowledgment rewrites the mirror over an entry that may be an
-	-- undelivered denial. WITHHOLDING A GRANT is what stays conditional on
-	-- there being a grant. (Ported from the godot review before this repo's own
-	-- round could re-find it.)
-	if outbox_err ~= nil then
-		client.consent_outbox_unreadable = true
-	end
-	if outbox_err ~= nil and client.consent_state == "granted" then
-		-- FAIL CLOSED on the granted restore, exactly as the unreadable
-		-- marker arm does above and for the same reason. This trail is an
-		-- accepted denial witness — shutdown() finalizes on a retained
-		-- receipt alone when the record and the marker both failed to
-		-- write — so a read that lost part of it cannot be read as "nothing
-		-- was ever refused". The salvageable entries stay loaded: they are
-		-- still deliverable, and the belt below still runs on them.
-		--
-		-- Memory-only, like the marker arm: the record is NOT rewritten (see
-		-- persist_identity, which shadows on consent_unreadable_imposed), the
-		-- file is not retired, and the next launch re-evaluates against a
-		-- trail that may by then read cleanly.
-		client.consent_restored_state = client.consent_state
-		client.consent_restored_decided_at = client.consent_decided_at
-		client.consent_restored_decision_seq = client.consent_decision_seq
-		client.consent_unreadable_imposed = true
-		-- The hold above is SEPARATE from this shared imposition flag on purpose. The shadow in
-		-- persist_identity must cover BOTH arms — a manufactured denial must
-		-- never be written down whichever file could not be read — but the
-		-- outbox WRITE HOLD must key on THIS outbox failing and nothing else.
-		-- Keyed on the shared flag it held a perfectly readable outbox hostage
-		-- to an unreadable MARKER: an acknowledged receipt left the write owed
-		-- and shutdown() then answered consent_pending forever.
-		client.consent_state = "denied"
-		client.consent_decided_at = nil
-		client.consent_decision_seq = 0
-		consent_state = client.consent_state
-		-- Surfaced under its own code, not the marker's: the marker decided
-		-- nothing here, and a diagnosis that misnames its cause sends the
-		-- integrator to the wrong file.
-		client:diagnose({
-			scope = "consent",
-			status = "restored",
-			code = "consent_outbox_unreadable",
-		})
 	end
 	if normalized.token_provider and not normalized.api_key
 		and #client.consent_outbox > 0 then

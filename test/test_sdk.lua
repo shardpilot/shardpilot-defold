@@ -8036,6 +8036,20 @@ local tests = {
 		"and the unreadable trail withholds the inherited grant")
 	assert_equal(regen:persist_identity(), false,
 		"no identity write may bind the shadowed grant to an actor that never made it")
+	-- AND THE BOOT'S OWN SELF-HEAL MUST NOT HAVE FIRED EITHER. That rewrite runs
+	-- during construction, so it is not enough for an explicit call to be
+	-- refused -- the guard has to EXIST by then, which is why the outbox is read
+	-- before the identity consolidation rather than after it. If the ordering
+	-- regresses, the record reaches disk as (generated id, restored grant) here,
+	-- before anything can refuse it.
+	local healed_record = nil
+	for path, record in pairs(stores8) do
+		if path:sub(-9) == "/identity" then
+			healed_record = record
+		end
+	end
+	assert_true(healed_record ~= nil and #tostring(healed_record.anonymous_id) == 600,
+		"the boot self-heal did not rewrite the record under the generated id")
 	restore8()
 	storage.reset()
 
