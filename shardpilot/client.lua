@@ -527,6 +527,12 @@ function M.new(config)
 	-- the identity rewrite below would durably re-record the old actor's
 	-- decision under the new id. A MATCHING override restores unchanged.
 	local override_replaced_actor = false
+	-- Whether THIS boot minted the anon because neither the override nor the
+	-- stored id was usable. Ordinarily harmless — the fresh id inherits this
+	-- install's record, as the comment above says. It stops being harmless the
+	-- moment an unreadable-evidence imposition is also in force: see
+	-- persist_identity.
+	local anonymous_id_regenerated = false
 	if valid_identity(config.anonymous_id) then
 		anonymous_id = config.anonymous_id
 		override_replaced_actor = valid_identity(stored.anonymous_id)
@@ -535,6 +541,7 @@ function M.new(config)
 		anonymous_id = stored.anonymous_id
 	else
 		anonymous_id = id.uuid_v7()
+		anonymous_id_regenerated = true
 	end
 	local consent_state = "unknown"
 	if not override_replaced_actor
@@ -727,6 +734,7 @@ function M.new(config)
 		-- can never be written down; the arms that supersede it -- the
 		-- belt's concrete denial, an explicit fresh decision -- clear it.
 		consent_unreadable_imposed = restored_state ~= nil,
+		anonymous_id_regenerated = anonymous_id_regenerated,
 		consent_restored_state = restored_state,
 		consent_restored_decided_at = restored_decided_at,
 		consent_restored_decision_seq = restored_decision_seq,
@@ -1464,6 +1472,23 @@ function M.new(config)
 end
 
 function Client:persist_identity()
+	if self.consent_unreadable_imposed and self.anonymous_id_regenerated then
+		-- REFUSE THE WHOLE WRITE, not just the consent fields. Shadowing the
+		-- decision is not enough here: this boot minted a NEW anon because the
+		-- stored one was missing or corrupt, so the record would go to disk as
+		-- (new actor, restored grant) — binding a decision to an actor that
+		-- never made it. When the evidence heals, its denial belongs to the
+		-- OLD actor, reads as foreign against the new id, and analytics reopen
+		-- against a refusal that was never resolved.
+		--
+		-- The set_anonymous_id guard cannot cover this: the replacement is
+		-- automatic at boot, and the write arrives later through something
+		-- unrelated (an experiments subject-id persist, an owed-write retry).
+		-- Marked owed; it lands once a fresh decision supersedes the unknown
+		-- trail and the imposition ends.
+		self.stats.consent_persist_failed = self.stats.consent_persist_failed + 1
+		return false
+	end
 	local record = { anonymous_id = self.anonymous_id }
 	local state = self.consent_state
 	local decided_at = self.consent_decided_at

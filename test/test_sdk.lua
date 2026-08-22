@@ -8004,6 +8004,41 @@ local tests = {
 	restore7()
 	storage.reset()
 
+	-- A REGENERATED ACTOR MUST NOT INHERIT THE SHADOWED GRANT. When the stored
+	-- anon is missing or corrupt this boot mints a new one, which ordinarily
+	-- just inherits this install's record. Combined with an imposition it stops
+	-- being harmless: shadowing only the consent fields would write (new actor,
+	-- restored grant), and the healed evidence's denial -- which belongs to the
+	-- OLD actor -- then reads as foreign and analytics reopen. The whole write
+	-- is refused, not just its consent half.
+	reset()
+	storage.reset()
+	local stores8, restore8 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		-- Oversized: valid_identity caps the byte length, so this fails the
+		-- check and the boot mints a fresh id.
+		anonymous_id = string.rep("x", 600),
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	for path, record in pairs(stores8) do
+		if path:sub(-15) == "/consent-outbox" then
+			record.receipts = { "this-entry-is-not-a-table" }
+		end
+	end
+	storage.reset()
+	local regen = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_true(regen.anonymous_id_regenerated,
+		"the corrupt stored anon really was replaced this boot")
+	assert_equal(regen.consent_state, "denied",
+		"and the unreadable trail withholds the inherited grant")
+	assert_equal(regen:persist_identity(), false,
+		"no identity write may bind the shadowed grant to an actor that never made it")
+	restore8()
+	storage.reset()
+
 	-- SALVAGEABLE EVIDENCE STILL WINS. A damaged trail that ALSO holds a
 	-- readable, strictly-newer denial receipt must not simply be refused for
 	-- the session: that receipt is concrete, and concrete evidence outranks
