@@ -1407,12 +1407,22 @@ local function write_consent_outbox(ns, receipts, scope)
 		-- RETRY. The freeze could not be written when the damage was found;
 		-- the store may answer now, and refusing until relaunch would mean a
 		-- fresh offline denial cannot be retained even after recovery.
-		M.freeze_consent_outbox(scope, receipts)
+		local froze = M.freeze_consent_outbox(scope, receipts)
 		if r.freeze_owed then
 			-- Still owed: the base is unprotected and must not be written, and
 			-- the successor does not exist. Nothing may be written safely.
 			return false
 		end
+		if froze then
+			-- THE RETRY WAS THIS WRITE. freeze_consent_outbox saved exactly
+			-- these receipts to the successor and updated the resolution;
+			-- writing them again buys nothing and can lose -- a transient
+			-- rejection of the duplicate would report failure for data that is
+			-- already durable, arming an owed write that is not owed.
+			return true
+		end
+		-- Not frozen and no longer owed means the BASE recovered and the freeze
+		-- declined. Nothing has been written yet; fall through and write it.
 	end
 	if not r.writable then
 		-- Both records unaccounted: no key may be written without destroying
@@ -1541,9 +1551,36 @@ function M.freeze_consent_outbox(scope, carried)
 			-- Understood after all. Repair the resolution too -- declining the
 			-- freeze is not the same as leaving the session believing the
 			-- failed read.
+			--
+			-- RE-CHECK THE SUCCESSOR, not only the base. When BOTH initial reads
+			-- threw, the successor was labelled "unknown" -- nothing observed
+			-- said whether one exists -- so restoring the base on the strength
+			-- of one recovered read would resurrect a frozen base while a marked
+			-- successor sits beside it, ignoring the live trail entirely.
+			local succ_state, succ_record = read_outbox_key(ns, CONSENT_OUTBOX_FORWARD_KEY)
+			if succ_state == "damaged"
+				or (succ_state == "readable" and not successor_is_marked(succ_record)) then
+				r.successor = "damaged"
+				r.live_key = CONSENT_OUTBOX_FORWARD_KEY
+				r.writable = false
+				r.freeze_owed = false
+				return true, nil
+			end
+			if succ_state == "readable" and successor_is_marked(succ_record) then
+				r.successor = "held"
+				r.live_key = CONSENT_OUTBOX_FORWARD_KEY
+				r.writable = true
+				r.freeze_owed = false
+				r.receipts = sanitize_outbox_entries(succ_record.receipts)
+				return true, nil
+			end
 			r.receipts = kept
 			r.base = "readable"
 			r.unaccounted = false
+			-- AND CLEAR THE DEBT. Leaving it set makes every later write fail
+			-- forever -- a dead end wearing fail-closed's clothes, which is the
+			-- exact shape the retry exists to avoid.
+			r.freeze_owed = false
 			return false, kept
 		end
 		if #kept > #sanitize_outbox_entries(carried) then
@@ -1571,6 +1608,16 @@ function M.freeze_consent_outbox(scope, carried)
 	r.receipts = kept
 	r.freeze_owed = false
 	return true, nil
+end
+
+-- Whether any key may safely be written. DISTINCT from the trail being
+-- unaccounted: a frozen base is unaccounted permanently while its successor is
+-- a perfectly writable live trail, and conflating the two makes the outbox
+-- unprunable -- settled receipts never leave, shutdown wedges on
+-- consent_pending, and every relaunch re-sends them.
+function M.consent_outbox_writable(scope)
+	local r = resolution_for(spool_namespace(scope), scope)
+	return r.writable and not r.freeze_owed
 end
 
 -- Diagnostic only: "record" | "store" | nil. See the resolution.

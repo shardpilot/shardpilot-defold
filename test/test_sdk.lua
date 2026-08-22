@@ -7777,6 +7777,104 @@ local tests = {
 	test_unreadable_marker_fail_closed_stays_transient,
 	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
 	--
+	-- THE RECOVERY PATHS. Each of these is a way the freeze can END without
+	-- having frozen, and each one left a trap in the first draft.
+	function()
+	local function outbox_paths(stores)
+		local base, fwd
+		for path in pairs(stores) do
+			if path:find("frozen%-successor$") then fwd = path
+			elseif path:sub(-15) == "/consent-outbox" then base = path end
+		end
+		return base, fwd
+	end
+
+	-- A. THE DEBT IS CLEARED WHEN THE BASE RECOVERS. The freeze failed to write,
+	--    so a debt was owed; the base then read whole, so there is nothing to
+	--    freeze. Leaving the debt set would make every later write fail
+	--    forever -- the dead end the retry exists to avoid.
+	reset(); storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-debt", consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z", consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base_path = select(1, outbox_paths(stores))
+	local intact = stores[base_path]
+	stores[base_path] = "garbage"
+	storage.reset()
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:find("frozen%-successor$") then return false end
+		return real_save(path, record)
+	end
+	assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	sys.save = real_save
+	assert_true(select(2, outbox_paths(stores)) == nil, "the freeze really failed to write")
+	-- The base recovers.
+	stores[base_path] = intact
+	-- The write carries a receipt, so what lands DIFFERS from what was there.
+	-- Saving an empty list over an empty list cannot tell a real write from a
+	-- retry that merely claims one.
+	assert_true(storage.save_consent_outbox(identity_scope, {
+		{
+			idempotency_key = "key-after-recovery",
+			workspace_id = "ws", app_id = "app", environment_id = "env",
+			actor_identifier = "anon-debt",
+			decided_at = "2026-07-09T00:00:00Z",
+			categories = { analytics = false },
+			anonymous_id = "anon-debt",
+		},
+	}) ~= nil, "a write after the base recovers succeeds -- the debt is cleared, not carried")
+	-- AND THE DATA ACTUALLY LANDED. A declined freeze writes nothing, so a
+	-- retry that reports success without falling through to the write would
+	-- leave the store holding the old content while the caller believes it
+	-- persisted -- worse than a refusal, which at least tells the truth.
+	local after = stores[base_path]
+	assert_true(type(after) == "table" and after.receipts ~= nil
+			and #after.receipts == 1,
+		"and the store holds what was written, not the pre-recovery content")
+	restore(); storage.reset()
+
+	-- B. THE RECOVERY RE-CHECKS THE SUCCESSOR, not only the base. When both
+	--    reads threw, the successor was "unknown" -- nothing observed said one
+	--    exists -- so restoring the base on one recovered read would resurrect
+	--    a frozen base while a marked successor sits beside it.
+	reset(); storage.reset()
+	local stores2, restore2 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-succ", consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z", consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local b2 = select(1, outbox_paths(stores2))
+	stores2[b2 .. "-frozen-successor"] = { frozen = true, receipts = {} }
+	storage.reset()
+	-- BOTH reads must throw, or the resolution labels the successor "held" on
+	-- its own and the recovery path is never reached -- the fixture would pass
+	-- without touching the code it exists to check.
+	local threw = 0
+	local real_load = sys.load
+	sys.load = function(path)
+		if threw < 2 and path:find("consent%-outbox") then
+			threw = threw + 1
+			error("both throw")
+		end
+		return real_load(path)
+	end
+	local r = storage.resolve_consent_outbox(identity_scope)
+	sys.load = real_load
+	assert_equal(threw, 2, "the fixture really did throw for BOTH keys")
+	assert_equal(r.successor, "unknown", "so the successor is unknown, not held")
+	local froze2 = storage.freeze_consent_outbox(identity_scope, {})
+	assert_true(froze2, "the recovery finds the marked successor and keeps it")
+	assert_equal(r.live_key, "consent-outbox-frozen-successor",
+		"the live key is the successor, not the resurrected base")
+	restore2(); storage.reset()
+	end,
+	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
+	--
 	-- THE FREEZE'S BEHAVIOUR, one assertion per fact the resolution separates.
 	function()
 	local function seed_damaged(stores)
@@ -8202,14 +8300,16 @@ local tests = {
 	local partial = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(partial.consent_state, "denied",
 		"a trail holding an unreadable ENTRY fails closed too")
-	-- THE DAMAGED FILE IS NOT REPLACED BY ITS SALVAGEABLE SUBSET. The mirror
-	-- holds what could be read; writing that over the trail would leave a
-	-- CLEAN file and the next launch would restore the grant -- the evidence
-	-- destroyed by an ordinary dispatch acknowledgment rather than by anything
-	-- resembling a decision. The write is refused and marked owed.
-	assert_equal(partial:persist_consent_outbox(), false,
-		"the outbox rewrite is held while the trail is unreadable")
-	assert_true(partial.consent_outbox_dirty, "and the held write is recorded as owed")
+	-- THE DAMAGED FILE IS NOT REPLACED BY ITS SALVAGEABLE SUBSET. That property
+	-- is unchanged; the MECHANISM is not a refused write any more but a
+	-- REDIRECTED one -- the base is frozen and writes land on the successor.
+	-- Asserting the refusal would assert the mechanism, and the mechanism had
+	-- to change: holding every write left settled receipts unprunable, wedged
+	-- shutdown on consent_pending and re-sent them on each relaunch.
+	assert_true(partial:persist_consent_outbox(),
+		"the live successor is writable -- the trail must stay prunable")
+	assert_true(not partial.consent_outbox_dirty,
+		"so nothing is left owed")
 	local on_disk = nil
 	for path, record in pairs(stores2) do
 		if path:sub(-15) == "/consent-outbox" then
@@ -8346,8 +8446,19 @@ local tests = {
 	local denied_restore = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(denied_restore.consent_state, "denied",
 		"the denied restore stands; nothing is imposed over it")
-	assert_equal(denied_restore:persist_consent_outbox(), false,
-		"but the damaged trail is still held -- evidence outlives the state that read it")
+	-- The property is that the DAMAGED BASE survives, not that writes are
+	-- refused: the base is frozen and writes land on the successor, which must
+	-- stay writable or settled receipts can never be pruned.
+	assert_true(denied_restore:persist_consent_outbox(),
+		"the successor is writable even with no grant to withhold")
+	local base_still = nil
+	for path, record in pairs(stores7) do
+		if path:sub(-15) == "/consent-outbox" then
+			base_still = record.receipts and record.receipts[1]
+		end
+	end
+	assert_equal(base_still, "this-entry-is-not-a-table",
+		"and the damaged base is untouched -- evidence outlives the state that read it")
 	restore7()
 	storage.reset()
 

@@ -871,7 +871,12 @@ function M.new(config)
 	-- undelivered denial. WITHHOLDING A GRANT is what stays conditional on
 	-- there being a grant. (Ported from the godot review before this repo's own
 	-- round could re-find it.)
-	if outbox_err ~= nil then
+	-- THE WRITE HOLD IS ITS OWN FACT. It is not "the trail is unaccounted": a
+	-- frozen base is unaccounted permanently while its successor is a perfectly
+	-- writable live trail, and keying the hold on the unaccounted fact leaves
+	-- settled receipts unprunable, wedges shutdown on consent_pending, and
+	-- re-sends them on every relaunch.
+	if not storage.consent_outbox_writable(normalized) then
 		client.consent_outbox_unreadable = true
 	end
 	-- ON EVERY LAUNCH, not only the one that found the damage: once the base is
