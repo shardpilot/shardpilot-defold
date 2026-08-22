@@ -3036,9 +3036,16 @@ local function test_spool_corrupted_record_starts_clean()
 	-- The denial marker's shadow is seeded as affirmatively ABSENT the same
 	-- way (a successful clear this session): an UNREADABLE marker with no
 	-- shadow fails closed over a granted restore by design, which is not
-	-- what this spool-corruption test is about.
+	-- what this spool-corruption test is about. The consent OUTBOX gets the
+	-- identical treatment for the identical reason -- it is the third denial
+	-- witness and fails closed on an unreadable read the same way, so it is
+	-- seeded as affirmatively EMPTY rather than left unreadable. Neither line
+	-- weakens those guards; both keep this test about the spool. The guards
+	-- themselves are asserted directly by the unreadable-consent-outbox test
+	-- (declared inline in the registry at the foot of this file).
 	seed_granted_consent()
 	assert_true(storage.clear_consent_denial_marker(identity_scope))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	assert_equal(#client.spool_batches, 0, "a throwing sys.load must start a clean spool")
 	assert_true(client:identify("user-example"))
@@ -4357,6 +4364,7 @@ local function test_unreadable_marker_fail_closed_stays_transient()
 	restore()
 	storage.reset()
 end
+
 
 -- Codex #40 round 4 (P1): a denial receipt whose POST is IN FLIGHT used to
 -- satisfy the shutdown witness check — but its own acknowledgment prunes it
@@ -7750,6 +7758,353 @@ local tests = {
 	test_same_second_regrant_outranks_undelivered_denial,
 	test_stale_denial_marker_never_beats_newer_grant,
 	test_unreadable_marker_fail_closed_stays_transient,
+	-- Declared inline rather than as `local function`: Lua caps a chunk at
+	-- 200 locals and this file sits at the ceiling, so one more top-level
+	-- local breaks the 5.4 job while 5.1/LuaJIT still pass. The limit is per
+	-- FUNCTION, so this is a function and not a do-block.
+	-- The consent receipt outbox is the THIRD accepted denial witness -- shutdown
+	-- finalizes on a retained receipt alone when the record and the marker both
+	-- failed to write -- but its loader collapsed every failure into a bare empty
+	-- list. An unreadable trail therefore read as "nothing was ever refused" and a
+	-- granted record restored unconditionally. It now fails closed like the marker
+	-- arm, for the session only, on BOTH shapes: a read that throws, and a file
+	-- that parses while holding a receipt this build cannot understand.
+	function()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-outbox-unreadable",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	-- WHOLE-TRAIL: the outbox read throws while every other file reads fine.
+	local real_load = sys.load
+	sys.load = function(path)
+		if path:sub(-15) == "/consent-outbox" then
+			error("corrupt consent outbox")
+		end
+		return real_load(path)
+	end
+	local client = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "denied",
+		"an unreadable receipt trail fails closed over the granted restore")
+	local tok, terr = client:track("gated_event")
+	assert_equal(tok, false)
+	assert_equal(terr, "consent_denied")
+	-- ROTATION IS REFUSED while the evidence is unreadable. The unread trail
+	-- may hold a denial for the CURRENT anon; carrying the restored grant onto
+	-- a new one would make that denial foreign when the file heals -- the
+	-- marker reads as another actor's and the belt skips it on the anon
+	-- mismatch -- so analytics would reopen under B despite A's refusal.
+	local rok, rerr = client:set_anonymous_id("anon-rotated-while-imposed")
+	assert_equal(rok, false)
+	assert_equal(rerr, "consent_evidence_unreadable",
+		"identity rotation cannot launder a denial the trail may still hold")
+	-- MEMORY ONLY. persist_identity is the single place consent reaches disk,
+	-- so the shadow is asserted at its own boundary: without it this call
+	-- stamps the manufactured denial durably and the grant never returns.
+	-- (That every write funnels through here is what makes one guard enough;
+	-- the rotation refusal above is the belt on the one caller that could
+	-- also carry the grant onto a different actor.)
+	assert_true(client:persist_identity())
+	local identity_record = nil
+	for path, record in pairs(stores) do
+		if path:sub(-9) == "/identity" then
+			identity_record = record
+		end
+	end
+	assert_true(identity_record ~= nil
+			and identity_record.consent_analytics == "granted",
+		"a maintenance identity write must not make the session refusal durable")
+	-- A fresh decision ends the imposition and persists ITSELF, not the
+	-- shadowed grant.
+	assert_true(client:set_consent(false))
+	for path, record in pairs(stores) do
+		if path:sub(-9) == "/identity" then
+			identity_record = record
+		end
+	end
+	assert_true(identity_record ~= nil
+			and identity_record.consent_analytics == "denied",
+		"an explicit decision persists as itself once the imposition ends")
+	sys.load = real_load
+	restore()
+	storage.reset()
+
+	-- PARTIAL: the trail parses and holds one receipt this build refuses.
+	-- The whole-record guard cannot see this, and the salvageable subset is
+	-- not a complete trail.
+	reset()
+	storage.reset()
+	local stores2, restore2 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-outbox-partial",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	for path, record in pairs(stores2) do
+		if path:sub(-15) == "/consent-outbox" then
+			record.receipts = { "this-entry-is-not-a-table" }
+		end
+	end
+	storage.reset()
+	local partial = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(partial.consent_state, "denied",
+		"a trail holding an unreadable ENTRY fails closed too")
+	-- THE DAMAGED FILE IS NOT REPLACED BY ITS SALVAGEABLE SUBSET. The mirror
+	-- holds what could be read; writing that over the trail would leave a
+	-- CLEAN file and the next launch would restore the grant -- the evidence
+	-- destroyed by an ordinary dispatch acknowledgment rather than by anything
+	-- resembling a decision. The write is refused and marked owed.
+	assert_equal(partial:persist_consent_outbox(), false,
+		"the outbox rewrite is held while the trail is unreadable")
+	assert_true(partial.consent_outbox_dirty, "and the held write is recorded as owed")
+	local on_disk = nil
+	for path, record in pairs(stores2) do
+		if path:sub(-15) == "/consent-outbox" then
+			on_disk = record
+		end
+	end
+	assert_true(on_disk ~= nil and on_disk.receipts[1] == "this-entry-is-not-a-table",
+		"the damaged entry is still on disk, unreplaced")
+	restore2()
+	storage.reset()
+
+	-- A HOLE IS NOT THE END OF THE TABLE. `#entries` measures the array prefix
+	-- only, so a receipt sitting past a hole (or under a non-array key) is
+	-- never visited by the shape loop and would never be counted -- the loader
+	-- would report a fully understood trail while a denial sat unread behind
+	-- the gap.
+	reset()
+	storage.reset()
+	local stores4, restore4 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-outbox-hole",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	for path, record in pairs(stores4) do
+		if path:sub(-15) == "/consent-outbox" then
+			-- Index 2 is absent: #receipts is 1, and index 3 lives past it.
+			record.receipts = {
+				[1] = {
+					idempotency_key = "key-visible",
+					workspace_id = "ws",
+					app_id = "app",
+					environment_id = "env",
+					actor_identifier = "anon-outbox-hole",
+					decided_at = "2026-07-08T00:00:00Z",
+					decision_seq = 2,
+					categories = { analytics = true },
+					anonymous_id = "anon-outbox-hole",
+				},
+				[3] = "a receipt the prefix loop never reaches",
+			}
+		end
+	end
+	storage.reset()
+	local holed = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(holed.consent_state, "denied",
+		"a receipt hidden past a hole still makes the trail unreadable")
+	-- A no-op id assignment rotates nothing and can launder nothing: refusing
+	-- it would make a safe re-sync read as a failure.
+	assert_true(holed:set_anonymous_id(holed.anonymous_id),
+		"re-asserting the CURRENT id is a no-op, not a rotation")
+	restore4()
+	storage.reset()
+
+	-- A NONEMPTY RECORD WITH NO receipts KEY IS NOT AN ABSENT FILE. An absent
+	-- file loads as an empty table here, which is why a missing key normally
+	-- means honestly empty; a record carrying something else entirely is a
+	-- record this build cannot make sense of.
+	reset()
+	storage.reset()
+	local stores5, restore5 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-outbox-nokey",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	for path, record in pairs(stores5) do
+		if path:sub(-15) == "/consent-outbox" then
+			record.receipts = nil
+			record.something_else = "a record shape this build does not know"
+		end
+	end
+	storage.reset()
+	local nokey = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(nokey.consent_state, "denied",
+		"a nonempty record without receipts is unreadable, not empty")
+	restore5()
+	storage.reset()
+
+	-- THE WRITE HOLD IS THE OUTBOX'S OWN FACT, NOT THE SHARED IMPOSITION. An
+	-- unreadable MARKER imposes the same session denial, but it says nothing
+	-- about the outbox -- which here read perfectly. Holding the outbox write
+	-- on the shared flag left an acknowledged receipt's rewrite owed forever
+	-- and wedged shutdown() on consent_pending.
+	reset()
+	storage.reset()
+	local stores6, restore6 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-marker-only",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	-- Present but not a valid denial: the marker's own unreadable arm.
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "granted",
+		anonymous_id = "anon-not-a-denial",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local marker_only = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(marker_only.consent_state, "denied",
+		"the unreadable marker still imposes its session denial")
+	assert_true(marker_only:persist_consent_outbox(),
+		"but a READABLE outbox is not held hostage to it")
+	assert_true(not marker_only.consent_outbox_dirty,
+		"and its write is not left owed")
+	restore6()
+	storage.reset()
+
+	-- PRESERVING THE EVIDENCE IS NOT CONDITIONAL ON HAVING A GRANT TO WITHHOLD.
+	-- A denied restore imposes nothing -- there is no grant to hold back -- but
+	-- it still dispatches the salvageable receipts, and their acknowledgment
+	-- would rewrite the mirror over an entry that may be an undelivered denial.
+	reset()
+	storage.reset()
+	local stores7, restore7 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-denied-restore",
+		consent_analytics = "denied",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	storage.save_consent_outbox(identity_scope, {})
+	for path, record in pairs(stores7) do
+		if path:sub(-15) == "/consent-outbox" then
+			record.receipts = { "this-entry-is-not-a-table" }
+		end
+	end
+	storage.reset()
+	local denied_restore = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(denied_restore.consent_state, "denied",
+		"the denied restore stands; nothing is imposed over it")
+	assert_equal(denied_restore:persist_consent_outbox(), false,
+		"but the damaged trail is still held -- evidence outlives the state that read it")
+	restore7()
+	storage.reset()
+
+	-- A REGENERATED ACTOR MUST NOT INHERIT THE SHADOWED GRANT. When the stored
+	-- anon is missing or corrupt this boot mints a new one, which ordinarily
+	-- just inherits this install's record. Combined with an imposition it stops
+	-- being harmless: shadowing only the consent fields would write (new actor,
+	-- restored grant), and the healed evidence's denial -- which belongs to the
+	-- OLD actor -- then reads as foreign and analytics reopen. The whole write
+	-- is refused, not just its consent half.
+	reset()
+	storage.reset()
+	local stores8, restore8 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		-- Oversized: valid_identity caps the byte length, so this fails the
+		-- check and the boot mints a fresh id.
+		anonymous_id = string.rep("x", 600),
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	for path, record in pairs(stores8) do
+		if path:sub(-15) == "/consent-outbox" then
+			record.receipts = { "this-entry-is-not-a-table" }
+		end
+	end
+	storage.reset()
+	local regen = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_true(regen.anonymous_id_regenerated,
+		"the corrupt stored anon really was replaced this boot")
+	assert_equal(regen.consent_state, "denied",
+		"and the unreadable trail withholds the inherited grant")
+	assert_equal(regen:persist_identity(), false,
+		"no identity write may bind the shadowed grant to an actor that never made it")
+	-- AND THE BOOT'S OWN SELF-HEAL MUST NOT HAVE FIRED EITHER. That rewrite runs
+	-- during construction, so it is not enough for an explicit call to be
+	-- refused -- the guard has to EXIST by then, which is why the outbox is read
+	-- before the identity consolidation rather than after it. If the ordering
+	-- regresses, the record reaches disk as (generated id, restored grant) here,
+	-- before anything can refuse it.
+	local healed_record = nil
+	for path, record in pairs(stores8) do
+		if path:sub(-9) == "/identity" then
+			healed_record = record
+		end
+	end
+	assert_true(healed_record ~= nil and #tostring(healed_record.anonymous_id) == 600,
+		"the boot self-heal did not rewrite the record under the generated id")
+	restore8()
+	storage.reset()
+
+	-- SALVAGEABLE EVIDENCE STILL WINS. A damaged trail that ALSO holds a
+	-- readable, strictly-newer denial receipt must not simply be refused for
+	-- the session: that receipt is concrete, and concrete evidence outranks
+	-- an unknown -- including by being written down, which the imposition
+	-- alone must never be. If the belt compared against the IMPOSED state it
+	-- would never run (that state is no longer "granted") and the stale grant
+	-- would survive on disk for the next launch to restore.
+	reset()
+	storage.reset()
+	local stores3, restore3 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-outbox-belt",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	for path, record in pairs(stores3) do
+		if path:sub(-15) == "/consent-outbox" then
+			record.receipts = {
+				"this-entry-is-not-a-table",
+				{
+					idempotency_key = "key-belt-denial",
+					workspace_id = "ws",
+					app_id = "app",
+					environment_id = "env",
+					actor_identifier = "anon-outbox-belt",
+					decided_at = "2026-07-08T00:00:00Z",
+					decision_seq = 2,
+					categories = { analytics = false },
+					anonymous_id = "anon-outbox-belt",
+				},
+			}
+		end
+	end
+	storage.reset()
+	local belt = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(belt.consent_state, "denied",
+		"the damaged trail refuses either way -- this leg is about what gets WRITTEN")
+	local belt_record = nil
+	for path, record in pairs(stores3) do
+		if path:sub(-9) == "/identity" then
+			belt_record = record
+		end
+	end
+	assert_true(belt_record ~= nil
+			and belt_record.consent_analytics == "denied"
+			and belt_record.consent_decided_at == "2026-07-08T00:00:00Z",
+		"the readable newer denial supersedes the imposition and IS persisted")
+	restore3()
+	storage.reset()
+	end,
 	test_belt_convergence_failure_writes_marker_witness,
 	test_shutdown_refuses_while_witness_receipt_in_flight,
 	test_ack_prune_hands_witness_to_marker,

@@ -527,6 +527,12 @@ function M.new(config)
 	-- the identity rewrite below would durably re-record the old actor's
 	-- decision under the new id. A MATCHING override restores unchanged.
 	local override_replaced_actor = false
+	-- Whether THIS boot minted the anon because neither the override nor the
+	-- stored id was usable. Ordinarily harmless — the fresh id inherits this
+	-- install's record, as the comment above says. It stops being harmless the
+	-- moment an unreadable-evidence imposition is also in force: see
+	-- persist_identity.
+	local anonymous_id_regenerated = false
 	if valid_identity(config.anonymous_id) then
 		anonymous_id = config.anonymous_id
 		override_replaced_actor = valid_identity(stored.anonymous_id)
@@ -535,6 +541,7 @@ function M.new(config)
 		anonymous_id = stored.anonymous_id
 	else
 		anonymous_id = id.uuid_v7()
+		anonymous_id_regenerated = true
 	end
 	local consent_state = "unknown"
 	if not override_replaced_actor
@@ -593,6 +600,13 @@ function M.new(config)
 		and valid_identity(marker.anonymous_id)
 	local imposed_denial_marker = false
 	local imposed_marker_code = nil
+	-- What the RECORD said before an unreadable-evidence arm overrode it.
+	-- Captured, not recomputed: once consent_state is overwritten the real
+	-- decision is gone, and persist_identity needs it to avoid writing a
+	-- manufactured denial over a genuine grant.
+	local restored_state = nil
+	local restored_decided_at = nil
+	local restored_decision_seq = 0
 	if marker_valid and marker.anonymous_id == anonymous_id then
 		-- STALE-MARKER GUARD (Codex #40 round 3): a marker whose decision
 		-- pair the RECORD strictly supersedes is RETIRED, never imposed —
@@ -634,6 +648,9 @@ function M.new(config)
 		-- already safe, and the record stays UNTOUCHED (no consolidation
 		-- write) — a transient read failure must not durably flip a real
 		-- grant; the next launch re-evaluates against a healed marker.
+		restored_state = consent_state
+		restored_decided_at = consent_decided_at
+		restored_decision_seq = consent_decision_seq
 		consent_state = "denied"
 		consent_decided_at = nil
 		consent_decision_seq = 0
@@ -711,6 +728,16 @@ function M.new(config)
 		-- retained denial receipts. nil for "unknown" and legacy records.
 		consent_decided_at = consent_decided_at,
 		consent_decision_seq = consent_decision_seq,
+		-- Set while a fail-closed state was imposed from evidence that could
+		-- not name what it lost (an unreadable marker, an unreadable receipt
+		-- trail). persist_identity consults this so a memory-only refusal
+		-- can never be written down; the arms that supersede it -- the
+		-- belt's concrete denial, an explicit fresh decision -- clear it.
+		consent_unreadable_imposed = restored_state ~= nil,
+		anonymous_id_regenerated = anonymous_id_regenerated,
+		consent_restored_state = restored_state,
+		consent_restored_decided_at = restored_decided_at,
+		consent_restored_decision_seq = restored_decision_seq,
 		-- Set while the LATEST decision is a denial whose respective durable
 		-- write is still owed (identity record / write-ahead marker).
 		-- shutdown() retries both and refuses to finalize (consent_pending)
@@ -801,6 +828,75 @@ function M.new(config)
 	client.experiments_client_id = experiments_mod.valid_subject_id(
 			stored.experiments_client_id)
 		and stored.experiments_client_id or nil
+	-- LOADED BEFORE THE IDENTITY CONSOLIDATION BELOW, not after. The self-heal
+	-- rewrite in that block persists the identity, and persist_identity refuses
+	-- only when it can SEE an imposition -- which did not exist yet while this
+	-- load sat after it. On the one path where the stored anon is unusable and
+	-- only the outbox is unreadable, the record therefore reached disk as
+	-- (generated id, restored grant) before anything could stop it, and a
+	-- healed trail's denial for the previous actor then read as foreign.
+	-- Nothing between here and there touches the outbox file, so moving the
+	-- read earlier costs nothing and gives the guard something to guard.
+	-- Durable consent-receipt outbox: reload the receipts a previous launch
+	-- could not deliver. Deliberately UNCONDITIONAL on the consent state — the
+	-- exact opposite of the event spool below: a receipt documents an explicit
+	-- decision, so delivering it is permitted (and is the record's whole legal
+	-- point) precisely when the analytics pipeline is closed. It still costs a
+	-- fresh consent-first install nothing: an empty outbox returns before any
+	-- token is minted, so an undecided client stays fully dark. Loaded BEFORE
+	-- the spool so the belt cross-check below settles the boot consent state
+	-- first — the spool load/purge decision must read the FINAL state.
+	local outbox_err
+	client.consent_outbox, outbox_err = storage.load_consent_outbox(normalized)
+	-- TWO different facts, and only one is about the restored state. PRESERVING
+	-- THE EVIDENCE is unconditional: a trail that could not be read must not be
+	-- replaced by its salvageable subset whatever the record says, because a
+	-- denied or unknown restore still dispatches the salvageable receipts and
+	-- their acknowledgment rewrites the mirror over an entry that may be an
+	-- undelivered denial. WITHHOLDING A GRANT is what stays conditional on
+	-- there being a grant. (Ported from the godot review before this repo's own
+	-- round could re-find it.)
+	if outbox_err ~= nil then
+		client.consent_outbox_unreadable = true
+	end
+	if outbox_err ~= nil and client.consent_state == "granted" then
+		-- FAIL CLOSED on the granted restore, exactly as the unreadable
+		-- marker arm does above and for the same reason. This trail is an
+		-- accepted denial witness — shutdown() finalizes on a retained
+		-- receipt alone when the record and the marker both failed to
+		-- write — so a read that lost part of it cannot be read as "nothing
+		-- was ever refused". The salvageable entries stay loaded: they are
+		-- still deliverable, and the belt below still runs on them.
+		--
+		-- Memory-only, like the marker arm: the record is NOT rewritten (see
+		-- persist_identity, which shadows on consent_unreadable_imposed), the
+		-- file is not retired, and the next launch re-evaluates against a
+		-- trail that may by then read cleanly.
+		client.consent_restored_state = client.consent_state
+		client.consent_restored_decided_at = client.consent_decided_at
+		client.consent_restored_decision_seq = client.consent_decision_seq
+		client.consent_unreadable_imposed = true
+		-- The hold above is SEPARATE from this shared imposition flag on purpose. The shadow in
+		-- persist_identity must cover BOTH arms — a manufactured denial must
+		-- never be written down whichever file could not be read — but the
+		-- outbox WRITE HOLD must key on THIS outbox failing and nothing else.
+		-- Keyed on the shared flag it held a perfectly readable outbox hostage
+		-- to an unreadable MARKER: an acknowledged receipt left the write owed
+		-- and shutdown() then answered consent_pending forever.
+		client.consent_state = "denied"
+		client.consent_decided_at = nil
+		client.consent_decision_seq = 0
+		consent_state = client.consent_state
+		-- Surfaced under its own code, not the marker's: the marker decided
+		-- nothing here, and a diagnosis that misnames its cause sends the
+		-- integrator to the wrong file.
+		client:diagnose({
+			scope = "consent",
+			status = "restored",
+			code = "consent_outbox_unreadable",
+		})
+	end
+
 	if imposed_denial_marker then
 		-- CONSOLIDATION: the marker imposed this boot's denied state; converge
 		-- the identity record (which also carries any anonymous-id rewrite)
@@ -865,16 +961,6 @@ function M.new(config)
 			return client.consent_state
 		end)
 	end
-	-- Durable consent-receipt outbox: reload the receipts a previous launch
-	-- could not deliver. Deliberately UNCONDITIONAL on the consent state — the
-	-- exact opposite of the event spool below: a receipt documents an explicit
-	-- decision, so delivering it is permitted (and is the record's whole legal
-	-- point) precisely when the analytics pipeline is closed. It still costs a
-	-- fresh consent-first install nothing: an empty outbox returns before any
-	-- token is minted, so an undecided client stays fully dark. Loaded BEFORE
-	-- the spool so the belt cross-check below settles the boot consent state
-	-- first — the spool load/purge decision must read the FINAL state.
-	client.consent_outbox = storage.load_consent_outbox(normalized)
 	if normalized.token_provider and not normalized.api_key
 		and #client.consent_outbox > 0 then
 		-- The narrow could-never-send anti-wedge drop, scoped to the ONE
@@ -963,7 +1049,22 @@ function M.new(config)
 	-- prove it postdates the receipt, so it fails closed to the denial;
 	-- receipts without a decision-time anon snapshot (legacy entries) are
 	-- skipped — they cannot prove actor scope.
-	if client.consent_state == "granted" then
+	-- The belt runs against the RESTORED record even when an unreadable-
+	-- evidence arm has already imposed a denial over it. Comparing against
+	-- the imposed state would skip the belt entirely (it is no longer
+	-- "granted") and lose the salvageable half of a damaged trail: a receipt
+	-- that IS readable and IS strictly newer is concrete evidence, and
+	-- concrete evidence should win over an unknown — including by being
+	-- written down, which the imposition alone must never be.
+	local belt_state = client.consent_state
+	local belt_decided_at = client.consent_decided_at
+	local belt_decision_seq = client.consent_decision_seq
+	if client.consent_unreadable_imposed then
+		belt_state = client.consent_restored_state
+		belt_decided_at = client.consent_restored_decided_at
+		belt_decision_seq = client.consent_restored_decision_seq
+	end
+	if belt_state == "granted" then
 		local stale_denial = nil
 		for i = 1, #client.consent_outbox do
 			local receipt = client.consent_outbox[i]
@@ -972,8 +1073,8 @@ function M.new(config)
 				and receipt.anonymous_id == client.anonymous_id
 				and type(receipt.decided_at) == "string"
 				and decision_pair_newer(receipt.decided_at,
-					receipt.decision_seq, client.consent_decided_at,
-					client.consent_decision_seq)
+					receipt.decision_seq, belt_decided_at,
+					belt_decision_seq)
 				and (stale_denial == nil
 					or decision_pair_newer(receipt.decided_at,
 						receipt.decision_seq, stale_denial.decided_at,
@@ -982,6 +1083,22 @@ function M.new(config)
 			end
 		end
 		if stale_denial then
+			-- Concrete receipt evidence SUPERSEDES the unknown-evidence
+			-- imposition, so the shadow ends here: from now on identity
+			-- writes persist this denial, which is exactly what should be
+			-- written down.
+			client.consent_unreadable_imposed = false
+			-- consent_outbox_unreadable is deliberately NOT cleared here. The
+			-- belt learned one thing — this readable receipt outranks the
+			-- restored record — and nothing about the entries it could NOT
+			-- read. An unreadable entry AFTER this denial is itself a later
+			-- decision and may be a grant, so replacing the damaged file with
+			-- the sanitized subset would discard a choice the user may have
+			-- made. The denial persists; the trail stays protected until a
+			-- fresh decision supersedes what could not be read.
+			client.consent_restored_state = nil
+			client.consent_restored_decided_at = nil
+			client.consent_restored_decision_seq = 0
 			client.consent_state = stale_denial.reason == "denied_forced_minor"
 				and "denied_forced_minor" or "denied"
 			client.consent_decided_at = stale_denial.decided_at
@@ -1365,17 +1482,50 @@ function M.new(config)
 end
 
 function Client:persist_identity()
+	if self.consent_unreadable_imposed and self.anonymous_id_regenerated then
+		-- REFUSE THE WHOLE WRITE, not just the consent fields. Shadowing the
+		-- decision is not enough here: this boot minted a NEW anon because the
+		-- stored one was missing or corrupt, so the record would go to disk as
+		-- (new actor, restored grant) — binding a decision to an actor that
+		-- never made it. When the evidence heals, its denial belongs to the
+		-- OLD actor, reads as foreign against the new id, and analytics reopen
+		-- against a refusal that was never resolved.
+		--
+		-- The set_anonymous_id guard cannot cover this: the replacement is
+		-- automatic at boot, and the write arrives later through something
+		-- unrelated (an experiments subject-id persist, an owed-write retry).
+		-- Marked owed; it lands once a fresh decision supersedes the unknown
+		-- trail and the imposition ends.
+		self.stats.consent_persist_failed = self.stats.consent_persist_failed + 1
+		return false
+	end
 	local record = { anonymous_id = self.anonymous_id }
-	if self.consent_state == "granted" or consent_denied_state(self.consent_state) then
-		record.consent_analytics = self.consent_state
+	local state = self.consent_state
+	local decided_at = self.consent_decided_at
+	local decision_seq = self.consent_decision_seq
+	if self.consent_unreadable_imposed then
+		-- A fail-closed state imposed from unreadable evidence is MEMORY
+		-- ONLY. Every identity write goes through here — the anonymous-id
+		-- rotation, the experiments subject-id store, the boot self-heal —
+		-- and any one of them would otherwise stamp a manufactured denial
+		-- over a real granted record, making a session refusal permanent and
+		-- losing the grant even after the file heals. Shadowing at the one
+		-- place that serializes consent covers every caller, present and
+		-- future, instead of asking each to remember.
+		state = self.consent_restored_state
+		decided_at = self.consent_restored_decided_at
+		decision_seq = self.consent_restored_decision_seq
+	end
+	if state == "granted" or consent_denied_state(state) then
+		record.consent_analytics = state
 		-- The decision's own (stamp, seq) pair rides the record so a later
 		-- granted restore can be cross-checked against strictly-newer
 		-- retained denial receipts (the boot belt); the seq breaks
 		-- same-second stamp ties. Absent for legacy records — the belt then
 		-- fails closed to a retained denial.
-		if type(self.consent_decided_at) == "string" then
-			record.consent_decided_at = self.consent_decided_at
-			record.consent_decision_seq = self.consent_decision_seq or 0
+		if type(decided_at) == "string" then
+			record.consent_decided_at = decided_at
+			record.consent_decision_seq = decision_seq or 0
 		end
 	end
 	-- The experiments subject id rides the identity record whenever one is
@@ -1512,6 +1662,20 @@ end
 function Client:set_anonymous_id(anonymous_id)
 	if not valid_identity(anonymous_id) then
 		return false, "invalid_anonymous_id"
+	end
+	if self.consent_unreadable_imposed and anonymous_id ~= self.anonymous_id then
+		-- REFUSE a real ROTATION while the trail cannot be read. Re-asserting
+		-- the id already in force moves no actor and can launder nothing, and
+		-- hosts that routinely re-sync their stored id must not read a safe
+		-- no-op as a failure. The unreadable evidence may
+		-- hold a denial for the CURRENT anon; rotating carries the restored
+		-- grant onto a new anon, and when the evidence heals next launch that
+		-- denial is foreign to the new actor -- the marker reads as another
+		-- actor's and the receipt belt skips it on the anon mismatch. The
+		-- grant would reopen analytics under B despite an unresolved refusal
+		-- by A. Refusing costs the host a retry; the alternative launders a
+		-- denial through an identity change.
+		return false, "consent_evidence_unreadable"
 	end
 	-- Mode B: the host's token_provider mints `bind_anon` from the
 	-- anonymous_id returned by get_anonymous_id() at flush time, while events
@@ -1923,6 +2087,16 @@ function Client:set_consent(decision)
 	self.consent_decision_seq = math.max(self.consent_seq_floor or 0,
 		self.consent_decision_seq or 0) + 1
 	self.consent_seq_floor = self.consent_decision_seq
+	-- An explicit decision ENDS any unreadable-evidence imposition: from here
+	-- the in-memory state is the user's own choice and persists as itself.
+	-- Without this the shadow would outlive its cause and every later identity
+	-- write would resurrect the pre-imposition state over the decision just
+	-- taken.
+	self.consent_unreadable_imposed = false
+	self.consent_outbox_unreadable = false
+	self.consent_restored_state = nil
+	self.consent_restored_decided_at = nil
+	self.consent_restored_decision_seq = 0
 	local marker_durable = true
 	if not granted then
 		-- WRITE-AHEAD DENIAL MARKER — written BEFORE the identity write so a
@@ -3297,6 +3471,23 @@ end
 -- eviction of a still-undelivered receipt is counted and surfaced through
 -- diagnostics. Returns true when the record matches the mirror.
 function Client:persist_consent_outbox()
+	if self.consent_outbox_unreadable then
+		-- HOLD, do not write. The damaged trail on disk is the evidence this
+		-- session's refusal rests on, and the mirror is the SALVAGEABLE SUBSET
+		-- of it. Writing the subset over the file replaces the damaged trail
+		-- with a clean one, and the next launch restores the grant -- the
+		-- evidence destroyed by an ordinary dispatch acknowledgment rather
+		-- than by anything that looks like a decision.
+		--
+		-- Marked owed, not lost: the write lands the moment a fresh decision
+		-- supersedes the unknown trail (set_consent clears the flag). Holding
+		-- also makes denial_receipt_retained_durably() refuse while dirty, so
+		-- teardown stops accepting this outbox as a witness -- the restrictive
+		-- direction, and the correct one while we cannot read it.
+		self.stats.consent_outbox_persist_failed = self.stats.consent_outbox_persist_failed + 1
+		self.consent_outbox_dirty = true
+		return false
+	end
 	local saved = storage.save_consent_outbox(self.config, self.consent_outbox)
 	if not saved then
 		self.stats.consent_outbox_persist_failed = self.stats.consent_outbox_persist_failed + 1
