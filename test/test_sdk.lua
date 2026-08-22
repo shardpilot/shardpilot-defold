@@ -8159,6 +8159,113 @@ local tests = {
 	end,
 	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
 	--
+	-- A FACT WITHOUT ITS SUBJECT, AND A COMBINATION THAT PICKED INSTEAD OF
+	-- MERGING. The census behind these found the second instance of a defect
+	-- fixed one round earlier -- so the round before had fixed an instance and
+	-- called it a class.
+	function()
+	local function outbox_paths(stores)
+		local base, fwd
+		for path in pairs(stores) do
+			if path:find("frozen%-successor$") then fwd = path
+			elseif path:sub(-15) == "/consent-outbox" then base = path end
+		end
+		return base, fwd
+	end
+	local function denial(key, actor)
+		return {
+			idempotency_key = key,
+			workspace_id = "ws", app_id = "app", environment_id = "env",
+			actor_identifier = actor,
+			decided_at = "2026-07-09T00:00:00Z",
+			categories = { analytics = false },
+			anonymous_id = actor,
+		}
+	end
+
+	-- J. THE SHADOW BELONGS TO A KEY. After this process froze the base, the
+	--    shadow it kept is the SUCCESSOR's -- and a later session whose reads
+	--    both fail selects the base, then substitutes that shadow for it. The
+	--    frozen base then reads as understood, so the next write goes to it and
+	--    rewrites the exact bytes the freeze exists to preserve.
+	reset(); storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base_path = select(1, outbox_paths(stores))
+	stores[base_path] = "garbage"
+	storage.reset()
+	storage.resolve_consent_outbox(identity_scope)
+	assert_true(storage.freeze_consent_outbox(identity_scope, { denial("frozen-era", "anon-j") }),
+		"this process freezes the base, so the shadow it keeps is the SUCCESSOR's")
+	-- A NEW SESSION, same process: the resolution is cleared, the shadow is not.
+	storage.begin_consent_outbox_session(identity_scope)
+	local threw = 0
+	local real_load = sys.load
+	sys.load = function(path)
+		if path:find("consent%-outbox") then
+			threw = threw + 1
+			error("both keys unreadable this session")
+		end
+		return real_load(path)
+	end
+	local r = storage.resolve_consent_outbox(identity_scope)
+	sys.load = real_load
+	assert_true(threw >= 2, "the fixture really threw for both keys")
+	assert_equal(r.live_key, "consent-outbox-frozen-successor",
+		"a MARKED shadow says which key it is: the successor, not the base it was substituted for")
+	assert_equal(r.unaccounted, true,
+		"and the frozen base stays unaccounted -- knowing the live content is a different fact")
+	assert_true(storage.save_consent_outbox(identity_scope, { denial("after-restart", "anon-j") }) ~= nil)
+	assert_equal(stores[base_path], "garbage",
+		"the write went to the successor: the frozen bytes are untouched, which is the whole point")
+	restore(); storage.reset()
+
+	-- K. COMBINING TWO SOURCES IS A MERGE. While a freeze debt stands,
+	--    acknowledgments shrink the caller's list -- so a fresh denial appended
+	--    after a few of them arrives SHORTER than the untouched base's salvage,
+	--    and picking the longer dropped it while telling the caller the write
+	--    succeeded.
+	reset(); storage.reset()
+	local stores2, restore2 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base2 = select(1, outbox_paths(stores2))
+	stores2[base2] = { receipts = {
+		denial("old-1", "anon-k"), denial("old-2", "anon-k"), denial("old-3", "anon-k"),
+		"an entry this build cannot read",
+	} }
+	storage.reset()
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:find("frozen%-successor$") then return false end
+		return real_save(path, record)
+	end
+	local r2 = storage.resolve_consent_outbox(identity_scope)
+	assert_equal(storage.freeze_consent_outbox(identity_scope, {}), false)
+	assert_equal(r2.freeze_owed, true, "the debt really stands")
+	sys.save = real_save
+	-- The pending list is SHORTER than the base's salvage -- which is what the
+	-- pick-the-longer branch keyed on. One entry, and it is the only new fact.
+	local saved = storage.save_consent_outbox(identity_scope, { denial("fresh-denial", "anon-k") })
+	assert_true(saved ~= nil, "the retry succeeds")
+	local live2 = stores2[base2 .. "-frozen-successor"]
+	local keys2 = {}
+	for i = 1, #live2.receipts do keys2[live2.receipts[i].idempotency_key] = true end
+	assert_equal(#live2.receipts, 4,
+		"all three salvaged receipts AND the pending one land -- neither source is picked over the other")
+	assert_true(keys2["fresh-denial"],
+		"the fresh denial is not dropped for being outnumbered by the base it never saw")
+	assert_true(keys2["old-1"] and keys2["old-3"], "and the salvage is not replaced by the shorter list")
+
+	-- L. AND THE CALLER IS TOLD WHAT LANDED, not what it handed in. Two paths
+	--    now write a list that differs from the argument, and the caller
+	--    assigns this return back over its mirror -- so returning the input
+	--    reports a mirror as durable while a different list is on disk.
+	assert_equal(#saved, 4,
+		"save_consent_outbox returns what was WRITTEN, not the one-entry list it was given")
+	restore2(); storage.reset()
+	end,
+	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
+	--
 	-- THE FREEZE'S BEHAVIOUR, one assertion per fact the resolution separates.
 	function()
 	local function seed_damaged(stores)
@@ -8420,33 +8527,40 @@ local tests = {
 	}
 	local FWD = "consent-outbox-frozen-successor"
 	local BASE = "consent-outbox"
-	-- The last column is `cause`, diagnostic only: "record" when the store
-	-- answered for the OTHER key while failing on the base (so the store works
-	-- and the record is damaged), "store" when neither answered, and nil when
-	-- nothing observed here supports either claim. It is deliberately absent
-	-- unless the base failed THIS launch -- once frozen, why the base became
-	-- unreadable is historical and this run cannot witness it.
+	-- The last column is `cause`, diagnostic only, and ONE rule decides it:
+	-- "store" only when the store answered for NEITHER key, "record" whenever
+	-- it DID answer and what it handed back is unusable -- whichever key that
+	-- was. Every shape in this table is CONTENT, and content is a reply, so
+	-- "store" cannot appear here at all; it is witnessed only by a read that
+	-- THROWS, which the separate case below covers.
+	--
+	-- Ten of these cells said nil until the rule was stated as above. They were
+	-- written to a different question -- "did the BASE fail this launch" -- and
+	-- so reported nothing about a successor occupied by a record we did not
+	-- write, or a base payload that is not a list, both of which this run
+	-- witnesses directly. nil survives only where the base is frozen and the
+	-- successor reads clean: why that base became unreadable is historical.
 	local cases = {
 		{ "A", "A", BASE, "readable",    "absent",  false, true,  nil      },
 		{ "A", "M", FWD,  "unaccounted", "held",    true,  true,  nil      },
-		{ "A", "U", FWD,  "unaccounted", "damaged", true,  false, nil      },
-		{ "A", "D", FWD,  "unaccounted", "damaged", true,  false, nil      },
+		{ "A", "U", FWD,  "unaccounted", "damaged", true,  false, "record" },
+		{ "A", "D", FWD,  "unaccounted", "damaged", true,  false, "record" },
 		{ "R", "A", BASE, "readable",    "absent",  false, true,  nil      },
 		{ "R", "M", FWD,  "unaccounted", "held",    true,  true,  nil      },
-		{ "R", "U", FWD,  "unaccounted", "damaged", true,  false, nil      },
-		{ "R", "D", FWD,  "unaccounted", "damaged", true,  false, nil      },
-		{ "P", "A", BASE, "unaccounted", "absent",  true,  true,  nil      },
+		{ "R", "U", FWD,  "unaccounted", "damaged", true,  false, "record" },
+		{ "R", "D", FWD,  "unaccounted", "damaged", true,  false, "record" },
+		{ "P", "A", BASE, "unaccounted", "absent",  true,  true,  "record" },
 		{ "P", "M", FWD,  "unaccounted", "held",    true,  true,  nil      },
-		{ "P", "U", FWD,  "unaccounted", "damaged", true,  false, nil      },
-		{ "P", "D", FWD,  "unaccounted", "damaged", true,  false, nil      },
+		{ "P", "U", FWD,  "unaccounted", "damaged", true,  false, "record" },
+		{ "P", "D", FWD,  "unaccounted", "damaged", true,  false, "record" },
 		{ "D", "A", BASE, "unaccounted", "absent",  true,  true,  "record" },
 		{ "D", "M", FWD,  "unaccounted", "held",    true,  true,  "record" },
 		{ "D", "U", FWD,  "unaccounted", "damaged", true,  false, "record" },
 		{ "D", "D", FWD,  "unaccounted", "damaged", true,  false, "record" },
-		{ "N", "A", BASE, "unaccounted", "absent",  true,  true,  nil      },
+		{ "N", "A", BASE, "unaccounted", "absent",  true,  true,  "record" },
 		{ "N", "M", FWD,  "unaccounted", "held",    true,  true,  nil      },
-		{ "N", "U", FWD,  "unaccounted", "damaged", true,  false, nil      },
-		{ "N", "D", FWD,  "unaccounted", "damaged", true,  false, nil      },
+		{ "N", "U", FWD,  "unaccounted", "damaged", true,  false, "record" },
+		{ "N", "D", FWD,  "unaccounted", "damaged", true,  false, "record" },
 	}
 	for i = 1, #cases do
 		local c = cases[i]
