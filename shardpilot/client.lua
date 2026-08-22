@@ -593,6 +593,13 @@ function M.new(config)
 		and valid_identity(marker.anonymous_id)
 	local imposed_denial_marker = false
 	local imposed_marker_code = nil
+	-- What the RECORD said before an unreadable-evidence arm overrode it.
+	-- Captured, not recomputed: once consent_state is overwritten the real
+	-- decision is gone, and persist_identity needs it to avoid writing a
+	-- manufactured denial over a genuine grant.
+	local restored_state = nil
+	local restored_decided_at = nil
+	local restored_decision_seq = 0
 	if marker_valid and marker.anonymous_id == anonymous_id then
 		-- STALE-MARKER GUARD (Codex #40 round 3): a marker whose decision
 		-- pair the RECORD strictly supersedes is RETIRED, never imposed —
@@ -634,6 +641,9 @@ function M.new(config)
 		-- already safe, and the record stays UNTOUCHED (no consolidation
 		-- write) — a transient read failure must not durably flip a real
 		-- grant; the next launch re-evaluates against a healed marker.
+		restored_state = consent_state
+		restored_decided_at = consent_decided_at
+		restored_decision_seq = consent_decision_seq
 		consent_state = "denied"
 		consent_decided_at = nil
 		consent_decision_seq = 0
@@ -711,6 +721,15 @@ function M.new(config)
 		-- retained denial receipts. nil for "unknown" and legacy records.
 		consent_decided_at = consent_decided_at,
 		consent_decision_seq = consent_decision_seq,
+		-- Set while a fail-closed state was imposed from evidence that could
+		-- not name what it lost (an unreadable marker, an unreadable receipt
+		-- trail). persist_identity consults this so a memory-only refusal
+		-- can never be written down; the arms that supersede it -- the
+		-- belt's concrete denial, an explicit fresh decision -- clear it.
+		consent_unreadable_imposed = restored_state ~= nil,
+		consent_restored_state = restored_state,
+		consent_restored_decided_at = restored_decided_at,
+		consent_restored_decision_seq = restored_decision_seq,
 		-- Set while the LATEST decision is a denial whose respective durable
 		-- write is still owed (identity record / write-ahead marker).
 		-- shutdown() retries both and refuses to finalize (consent_pending)
@@ -874,7 +893,38 @@ function M.new(config)
 	-- token is minted, so an undecided client stays fully dark. Loaded BEFORE
 	-- the spool so the belt cross-check below settles the boot consent state
 	-- first — the spool load/purge decision must read the FINAL state.
-	client.consent_outbox = storage.load_consent_outbox(normalized)
+	local outbox_err
+	client.consent_outbox, outbox_err = storage.load_consent_outbox(normalized)
+	if outbox_err ~= nil and client.consent_state == "granted" then
+		-- FAIL CLOSED on the granted restore, exactly as the unreadable
+		-- marker arm does above and for the same reason. This trail is an
+		-- accepted denial witness — shutdown() finalizes on a retained
+		-- receipt alone when the record and the marker both failed to
+		-- write — so a read that lost part of it cannot be read as "nothing
+		-- was ever refused". The salvageable entries stay loaded: they are
+		-- still deliverable, and the belt below still runs on them.
+		--
+		-- Memory-only, like the marker arm: the record is NOT rewritten (see
+		-- persist_identity, which shadows on consent_unreadable_imposed), the
+		-- file is not retired, and the next launch re-evaluates against a
+		-- trail that may by then read cleanly.
+		client.consent_restored_state = client.consent_state
+		client.consent_restored_decided_at = client.consent_decided_at
+		client.consent_restored_decision_seq = client.consent_decision_seq
+		client.consent_unreadable_imposed = true
+		client.consent_state = "denied"
+		client.consent_decided_at = nil
+		client.consent_decision_seq = 0
+		consent_state = client.consent_state
+		-- Surfaced under its own code, not the marker's: the marker decided
+		-- nothing here, and a diagnosis that misnames its cause sends the
+		-- integrator to the wrong file.
+		client:diagnose({
+			scope = "consent",
+			status = "restored",
+			code = "consent_outbox_unreadable",
+		})
+	end
 	if normalized.token_provider and not normalized.api_key
 		and #client.consent_outbox > 0 then
 		-- The narrow could-never-send anti-wedge drop, scoped to the ONE
@@ -963,7 +1013,22 @@ function M.new(config)
 	-- prove it postdates the receipt, so it fails closed to the denial;
 	-- receipts without a decision-time anon snapshot (legacy entries) are
 	-- skipped — they cannot prove actor scope.
-	if client.consent_state == "granted" then
+	-- The belt runs against the RESTORED record even when an unreadable-
+	-- evidence arm has already imposed a denial over it. Comparing against
+	-- the imposed state would skip the belt entirely (it is no longer
+	-- "granted") and lose the salvageable half of a damaged trail: a receipt
+	-- that IS readable and IS strictly newer is concrete evidence, and
+	-- concrete evidence should win over an unknown — including by being
+	-- written down, which the imposition alone must never be.
+	local belt_state = client.consent_state
+	local belt_decided_at = client.consent_decided_at
+	local belt_decision_seq = client.consent_decision_seq
+	if client.consent_unreadable_imposed then
+		belt_state = client.consent_restored_state
+		belt_decided_at = client.consent_restored_decided_at
+		belt_decision_seq = client.consent_restored_decision_seq
+	end
+	if belt_state == "granted" then
 		local stale_denial = nil
 		for i = 1, #client.consent_outbox do
 			local receipt = client.consent_outbox[i]
@@ -972,8 +1037,8 @@ function M.new(config)
 				and receipt.anonymous_id == client.anonymous_id
 				and type(receipt.decided_at) == "string"
 				and decision_pair_newer(receipt.decided_at,
-					receipt.decision_seq, client.consent_decided_at,
-					client.consent_decision_seq)
+					receipt.decision_seq, belt_decided_at,
+					belt_decision_seq)
 				and (stale_denial == nil
 					or decision_pair_newer(receipt.decided_at,
 						receipt.decision_seq, stale_denial.decided_at,
@@ -982,6 +1047,14 @@ function M.new(config)
 			end
 		end
 		if stale_denial then
+			-- Concrete receipt evidence SUPERSEDES the unknown-evidence
+			-- imposition, so the shadow ends here: from now on identity
+			-- writes persist this denial, which is exactly what should be
+			-- written down.
+			client.consent_unreadable_imposed = false
+			client.consent_restored_state = nil
+			client.consent_restored_decided_at = nil
+			client.consent_restored_decision_seq = 0
 			client.consent_state = stale_denial.reason == "denied_forced_minor"
 				and "denied_forced_minor" or "denied"
 			client.consent_decided_at = stale_denial.decided_at
@@ -1366,16 +1439,32 @@ end
 
 function Client:persist_identity()
 	local record = { anonymous_id = self.anonymous_id }
-	if self.consent_state == "granted" or consent_denied_state(self.consent_state) then
-		record.consent_analytics = self.consent_state
+	local state = self.consent_state
+	local decided_at = self.consent_decided_at
+	local decision_seq = self.consent_decision_seq
+	if self.consent_unreadable_imposed then
+		-- A fail-closed state imposed from unreadable evidence is MEMORY
+		-- ONLY. Every identity write goes through here — the anonymous-id
+		-- rotation, the experiments subject-id store, the boot self-heal —
+		-- and any one of them would otherwise stamp a manufactured denial
+		-- over a real granted record, making a session refusal permanent and
+		-- losing the grant even after the file heals. Shadowing at the one
+		-- place that serializes consent covers every caller, present and
+		-- future, instead of asking each to remember.
+		state = self.consent_restored_state
+		decided_at = self.consent_restored_decided_at
+		decision_seq = self.consent_restored_decision_seq
+	end
+	if state == "granted" or consent_denied_state(state) then
+		record.consent_analytics = state
 		-- The decision's own (stamp, seq) pair rides the record so a later
 		-- granted restore can be cross-checked against strictly-newer
 		-- retained denial receipts (the boot belt); the seq breaks
 		-- same-second stamp ties. Absent for legacy records — the belt then
 		-- fails closed to a retained denial.
-		if type(self.consent_decided_at) == "string" then
-			record.consent_decided_at = self.consent_decided_at
-			record.consent_decision_seq = self.consent_decision_seq or 0
+		if type(decided_at) == "string" then
+			record.consent_decided_at = decided_at
+			record.consent_decision_seq = decision_seq or 0
 		end
 	end
 	-- The experiments subject id rides the identity record whenever one is
@@ -1923,6 +2012,15 @@ function Client:set_consent(decision)
 	self.consent_decision_seq = math.max(self.consent_seq_floor or 0,
 		self.consent_decision_seq or 0) + 1
 	self.consent_seq_floor = self.consent_decision_seq
+	-- An explicit decision ENDS any unreadable-evidence imposition: from here
+	-- the in-memory state is the user's own choice and persists as itself.
+	-- Without this the shadow would outlive its cause and every later identity
+	-- write would resurrect the pre-imposition state over the decision just
+	-- taken.
+	self.consent_unreadable_imposed = false
+	self.consent_restored_state = nil
+	self.consent_restored_decided_at = nil
+	self.consent_restored_decision_seq = 0
 	local marker_durable = true
 	if not granted then
 		-- WRITE-AHEAD DENIAL MARKER — written BEFORE the identity write so a
