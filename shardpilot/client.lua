@@ -847,7 +847,44 @@ function M.new(config)
 	-- the spool so the belt cross-check below settles the boot consent state
 	-- first — the spool load/purge decision must read the FINAL state.
 	local outbox_err
+	-- A FRESH SESSION GETS A FRESH RESOLUTION. Resolving once is scoped to this
+	-- client, not to the process: without this a second sdk.new() inherits the
+	-- previous client's verdict, so one transient read failure fails closed
+	-- until the engine itself restarts.
+	storage.begin_consent_outbox_session(normalized)
 	client.consent_outbox, outbox_err = storage.load_consent_outbox(normalized)
+	if outbox_err ~= nil then
+		-- FREEZE the damaged key rather than rewriting it: the bytes stay where
+		-- they are, and what was salvageable rides forward into a successor key
+		-- that is equally durable -- so preserving the evidence costs nothing
+		-- in the ability to record new decisions.
+		local froze, recovered = storage.freeze_consent_outbox(normalized, client.consent_outbox)
+		if froze and recovered == nil then
+			-- ADOPTED, NOT WRITTEN. The freeze can settle by finding a marked
+			-- successor already on disk -- a previously frozen install whose
+			-- reads failed transiently -- and then it saved nothing, so it has
+			-- no `recovered` list to hand back. The RESOLUTION has the live
+			-- receipts; this mirror still holds the empty result of the read
+			-- that failed. Leave them divergent and the live trail is neither
+			-- dispatched nor carried into the next persistence, so the first
+			-- fresh decision rewrites the successor with only its own receipt
+			-- and deletes an undelivered denial -- by the shortest path yet.
+			--
+			-- Read back through the resolution rather than widening the return:
+			-- `recovered` means "the base re-read whole, the trail is fine",
+			-- and this case is the opposite -- the base stays unaccounted and
+			-- the alarm below must still fire. Two facts, so not one channel.
+			client.consent_outbox = storage.load_consent_outbox(normalized)
+		end
+		if recovered ~= nil then
+			-- The freeze declined because the record re-read whole: the failure
+			-- was transient. Take what it recovered, or this session keeps the
+			-- EMPTY set the failed read produced and the first decision writes
+			-- that over an intact trail.
+			client.consent_outbox = recovered
+			outbox_err = nil
+		end
+	end
 	-- TWO different facts, and only one is about the restored state. PRESERVING
 	-- THE EVIDENCE is unconditional: a trail that could not be read must not be
 	-- replaced by its salvageable subset whatever the record says, because a
@@ -856,8 +893,32 @@ function M.new(config)
 	-- undelivered denial. WITHHOLDING A GRANT is what stays conditional on
 	-- there being a grant. (Ported from the godot review before this repo's own
 	-- round could re-find it.)
-	if outbox_err ~= nil then
+	-- THE WRITE HOLD IS ITS OWN FACT. It is not "the trail is unaccounted": a
+	-- frozen base is unaccounted permanently while its successor is a perfectly
+	-- writable live trail, and keying the hold on the unaccounted fact leaves
+	-- settled receipts unprunable, wedges shutdown on consent_pending, and
+	-- re-sends them on every relaunch.
+	if not storage.consent_outbox_writable(normalized) then
 		client.consent_outbox_unreadable = true
+	end
+	-- ON EVERY LAUNCH, not only the one that found the damage: once the base is
+	-- frozen the successor reads perfectly, and outbox_err still reports the
+	-- trail as incomplete because the RESOLUTION knows the base is unaccounted.
+	-- That is one fact with one surface -- an earlier draft asked storage a
+	-- second time under a second name, and the mutants showed the two could
+	-- never disagree, which is the same duplication this design exists to end.
+	if outbox_err ~= nil then
+		client.stats.consent_denial_possibly_undelivered = 1
+		client:diagnose({
+			scope = "consent",
+			status = "unaccounted",
+			code = "consent_denial_possibly_undelivered",
+			-- Diagnostic only, and computed at resolve time where both keys are
+			-- visible: "record" if the store answered for the other key while
+			-- failing on this one, "store" if it answered for neither. It tells
+			-- an operator whether to look at the file or at the device.
+			cause = storage.consent_outbox_unaccounted_cause(normalized),
+		})
 	end
 	if outbox_err ~= nil and client.consent_state == "granted" then
 		-- FAIL CLOSED on the granted restore, exactly as the unreadable
@@ -3303,13 +3364,20 @@ end
 -- cap and pure-grant predicate so this prediction and the eviction loop
 -- can never disagree.
 function Client:consent_outbox_denial_full()
-	local overflow = #self.consent_outbox + 1 - storage.max_consent_outbox_entries
+	-- COUNTED OVER WHAT THE WRITE WILL FORM, not over this mirror. When a
+	-- freeze settles by adopting a successor another session wrote, that
+	-- successor's receipts merge into the next write -- so the mirror can sit
+	-- well under the cap while the list that actually lands is at it, this
+	-- check passes, and the cap then evicts the very grant it exists to
+	-- protect. The mirror is the right list only when nothing else is pending.
+	local effective = storage.consent_outbox_effective(self.config, self.consent_outbox)
+	local overflow = #effective + 1 - storage.max_consent_outbox_entries
 	if overflow < 1 then
 		return false
 	end
 	local evictable_grants = 0
-	for i = 1, #self.consent_outbox do
-		if storage.receipt_is_pure_grant(self.consent_outbox[i]) then
+	for i = 1, #effective do
+		if storage.receipt_is_pure_grant(effective[i]) then
 			evictable_grants = evictable_grants + 1
 			if evictable_grants >= overflow then
 				return false
