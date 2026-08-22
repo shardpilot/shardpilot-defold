@@ -912,6 +912,14 @@ function M.new(config)
 		client.consent_restored_decided_at = client.consent_decided_at
 		client.consent_restored_decision_seq = client.consent_decision_seq
 		client.consent_unreadable_imposed = true
+		-- SEPARATE from the shared imposition flag on purpose. The shadow in
+		-- persist_identity must cover BOTH arms — a manufactured denial must
+		-- never be written down whichever file could not be read — but the
+		-- outbox WRITE HOLD must key on THIS outbox failing and nothing else.
+		-- Keyed on the shared flag it held a perfectly readable outbox hostage
+		-- to an unreadable MARKER: an acknowledged receipt left the write owed
+		-- and shutdown() then answered consent_pending forever.
+		client.consent_outbox_unreadable = true
 		client.consent_state = "denied"
 		client.consent_decided_at = nil
 		client.consent_decision_seq = 0
@@ -1052,6 +1060,14 @@ function M.new(config)
 			-- writes persist this denial, which is exactly what should be
 			-- written down.
 			client.consent_unreadable_imposed = false
+			-- consent_outbox_unreadable is deliberately NOT cleared here. The
+			-- belt learned one thing — this readable receipt outranks the
+			-- restored record — and nothing about the entries it could NOT
+			-- read. An unreadable entry AFTER this denial is itself a later
+			-- decision and may be a grant, so replacing the damaged file with
+			-- the sanitized subset would discard a choice the user may have
+			-- made. The denial persists; the trail stays protected until a
+			-- fresh decision supersedes what could not be read.
 			client.consent_restored_state = nil
 			client.consent_restored_decided_at = nil
 			client.consent_restored_decision_seq = 0
@@ -1602,8 +1618,11 @@ function Client:set_anonymous_id(anonymous_id)
 	if not valid_identity(anonymous_id) then
 		return false, "invalid_anonymous_id"
 	end
-	if self.consent_unreadable_imposed then
-		-- REFUSE while the trail cannot be read. The unreadable evidence may
+	if self.consent_unreadable_imposed and anonymous_id ~= self.anonymous_id then
+		-- REFUSE a real ROTATION while the trail cannot be read. Re-asserting
+		-- the id already in force moves no actor and can launder nothing, and
+		-- hosts that routinely re-sync their stored id must not read a safe
+		-- no-op as a failure. The unreadable evidence may
 		-- hold a denial for the CURRENT anon; rotating carries the restored
 		-- grant onto a new anon, and when the evidence heals next launch that
 		-- denial is foreign to the new actor -- the marker reads as another
@@ -2029,6 +2048,7 @@ function Client:set_consent(decision)
 	-- write would resurrect the pre-imposition state over the decision just
 	-- taken.
 	self.consent_unreadable_imposed = false
+	self.consent_outbox_unreadable = false
 	self.consent_restored_state = nil
 	self.consent_restored_decided_at = nil
 	self.consent_restored_decision_seq = 0
@@ -3406,7 +3426,7 @@ end
 -- eviction of a still-undelivered receipt is counted and surfaced through
 -- diagnostics. Returns true when the record matches the mirror.
 function Client:persist_consent_outbox()
-	if self.consent_unreadable_imposed then
+	if self.consent_outbox_unreadable then
 		-- HOLD, do not write. The damaged trail on disk is the evidence this
 		-- session's refusal rests on, and the mirror is the SALVAGEABLE SUBSET
 		-- of it. Writing the subset over the file replaces the damaged trail

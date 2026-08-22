@@ -7912,7 +7912,68 @@ local tests = {
 	local holed = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(holed.consent_state, "denied",
 		"a receipt hidden past a hole still makes the trail unreadable")
+	-- A no-op id assignment rotates nothing and can launder nothing: refusing
+	-- it would make a safe re-sync read as a failure.
+	assert_true(holed:set_anonymous_id(holed.anonymous_id),
+		"re-asserting the CURRENT id is a no-op, not a rotation")
 	restore4()
+	storage.reset()
+
+	-- A NONEMPTY RECORD WITH NO receipts KEY IS NOT AN ABSENT FILE. An absent
+	-- file loads as an empty table here, which is why a missing key normally
+	-- means honestly empty; a record carrying something else entirely is a
+	-- record this build cannot make sense of.
+	reset()
+	storage.reset()
+	local stores5, restore5 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-outbox-nokey",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	for path, record in pairs(stores5) do
+		if path:sub(-15) == "/consent-outbox" then
+			record.receipts = nil
+			record.something_else = "a record shape this build does not know"
+		end
+	end
+	storage.reset()
+	local nokey = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(nokey.consent_state, "denied",
+		"a nonempty record without receipts is unreadable, not empty")
+	restore5()
+	storage.reset()
+
+	-- THE WRITE HOLD IS THE OUTBOX'S OWN FACT, NOT THE SHARED IMPOSITION. An
+	-- unreadable MARKER imposes the same session denial, but it says nothing
+	-- about the outbox -- which here read perfectly. Holding the outbox write
+	-- on the shared flag left an acknowledged receipt's rewrite owed forever
+	-- and wedged shutdown() on consent_pending.
+	reset()
+	storage.reset()
+	local stores6, restore6 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-marker-only",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	-- Present but not a valid denial: the marker's own unreadable arm.
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "granted",
+		anonymous_id = "anon-not-a-denial",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local marker_only = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(marker_only.consent_state, "denied",
+		"the unreadable marker still imposes its session denial")
+	assert_true(marker_only:persist_consent_outbox(),
+		"but a READABLE outbox is not held hostage to it")
+	assert_true(not marker_only.consent_outbox_dirty,
+		"and its write is not left owed")
+	restore6()
 	storage.reset()
 
 	-- SALVAGEABLE EVIDENCE STILL WINS. A damaged trail that ALSO holds a

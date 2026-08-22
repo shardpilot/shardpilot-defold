@@ -1266,6 +1266,14 @@ function M.load_consent_outbox(scope)
 		end
 		return {}, nil
 	end
+	if record.receipts == nil and next(record) ~= nil then
+		-- An ABSENT file loads as an empty table here, which is why a missing
+		-- receipts key normally means "honestly empty". A NONEMPTY record
+		-- without the one payload key it is supposed to carry is not an absent
+		-- file: it is a record this build cannot make sense of, and what it
+		-- held may have been a denial.
+		return {}, "consent_outbox_read_failed"
+	end
 	local entries, dropped = sanitize_outbox_entries(record.receipts)
 	if read_failed or dropped > 0 then
 		return entries, "consent_outbox_read_failed"
