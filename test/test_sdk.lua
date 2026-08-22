@@ -7793,11 +7793,22 @@ local tests = {
 	local tok, terr = client:track("gated_event")
 	assert_equal(tok, false)
 	assert_equal(terr, "consent_denied")
-	-- MEMORY ONLY, through a write that really happens: set_anonymous_id
-	-- persists the identity, and it runs AFTER the imposition. Without the
-	-- shadow in persist_identity this call writes the manufactured denial
-	-- durably and the grant never returns.
-	assert_true(client:set_anonymous_id("anon-rotated-while-imposed"))
+	-- ROTATION IS REFUSED while the evidence is unreadable. The unread trail
+	-- may hold a denial for the CURRENT anon; carrying the restored grant onto
+	-- a new one would make that denial foreign when the file heals -- the
+	-- marker reads as another actor's and the belt skips it on the anon
+	-- mismatch -- so analytics would reopen under B despite A's refusal.
+	local rok, rerr = client:set_anonymous_id("anon-rotated-while-imposed")
+	assert_equal(rok, false)
+	assert_equal(rerr, "consent_evidence_unreadable",
+		"identity rotation cannot launder a denial the trail may still hold")
+	-- MEMORY ONLY. persist_identity is the single place consent reaches disk,
+	-- so the shadow is asserted at its own boundary: without it this call
+	-- stamps the manufactured denial durably and the grant never returns.
+	-- (That every write funnels through here is what makes one guard enough;
+	-- the rotation refusal above is the belt on the one caller that could
+	-- also carry the grant onto a different actor.)
+	assert_true(client:persist_identity())
 	local identity_record = nil
 	for path, record in pairs(stores) do
 		if path:sub(-9) == "/identity" then
@@ -7844,7 +7855,64 @@ local tests = {
 	local partial = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(partial.consent_state, "denied",
 		"a trail holding an unreadable ENTRY fails closed too")
+	-- THE DAMAGED FILE IS NOT REPLACED BY ITS SALVAGEABLE SUBSET. The mirror
+	-- holds what could be read; writing that over the trail would leave a
+	-- CLEAN file and the next launch would restore the grant -- the evidence
+	-- destroyed by an ordinary dispatch acknowledgment rather than by anything
+	-- resembling a decision. The write is refused and marked owed.
+	assert_equal(partial:persist_consent_outbox(), false,
+		"the outbox rewrite is held while the trail is unreadable")
+	assert_true(partial.consent_outbox_dirty, "and the held write is recorded as owed")
+	local on_disk = nil
+	for path, record in pairs(stores2) do
+		if path:sub(-15) == "/consent-outbox" then
+			on_disk = record
+		end
+	end
+	assert_true(on_disk ~= nil and on_disk.receipts[1] == "this-entry-is-not-a-table",
+		"the damaged entry is still on disk, unreplaced")
 	restore2()
+	storage.reset()
+
+	-- A HOLE IS NOT THE END OF THE TABLE. `#entries` measures the array prefix
+	-- only, so a receipt sitting past a hole (or under a non-array key) is
+	-- never visited by the shape loop and would never be counted -- the loader
+	-- would report a fully understood trail while a denial sat unread behind
+	-- the gap.
+	reset()
+	storage.reset()
+	local stores4, restore4 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-outbox-hole",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	for path, record in pairs(stores4) do
+		if path:sub(-15) == "/consent-outbox" then
+			-- Index 2 is absent: #receipts is 1, and index 3 lives past it.
+			record.receipts = {
+				[1] = {
+					idempotency_key = "key-visible",
+					workspace_id = "ws",
+					app_id = "app",
+					environment_id = "env",
+					actor_identifier = "anon-outbox-hole",
+					decided_at = "2026-07-08T00:00:00Z",
+					decision_seq = 2,
+					categories = { analytics = true },
+					anonymous_id = "anon-outbox-hole",
+				},
+				[3] = "a receipt the prefix loop never reaches",
+			}
+		end
+	end
+	storage.reset()
+	local holed = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(holed.consent_state, "denied",
+		"a receipt hidden past a hole still makes the trail unreadable")
+	restore4()
 	storage.reset()
 
 	-- SALVAGEABLE EVIDENCE STILL WINS. A damaged trail that ALSO holds a

@@ -1602,6 +1602,17 @@ function Client:set_anonymous_id(anonymous_id)
 	if not valid_identity(anonymous_id) then
 		return false, "invalid_anonymous_id"
 	end
+	if self.consent_unreadable_imposed then
+		-- REFUSE while the trail cannot be read. The unreadable evidence may
+		-- hold a denial for the CURRENT anon; rotating carries the restored
+		-- grant onto a new anon, and when the evidence heals next launch that
+		-- denial is foreign to the new actor -- the marker reads as another
+		-- actor's and the receipt belt skips it on the anon mismatch. The
+		-- grant would reopen analytics under B despite an unresolved refusal
+		-- by A. Refusing costs the host a retry; the alternative launders a
+		-- denial through an identity change.
+		return false, "consent_evidence_unreadable"
+	end
 	-- Mode B: the host's token_provider mints `bind_anon` from the
 	-- anonymous_id returned by get_anonymous_id() at flush time, while events
 	-- already queued (or in flight) carry the previous anon snapshot taken at
@@ -3395,6 +3406,23 @@ end
 -- eviction of a still-undelivered receipt is counted and surfaced through
 -- diagnostics. Returns true when the record matches the mirror.
 function Client:persist_consent_outbox()
+	if self.consent_unreadable_imposed then
+		-- HOLD, do not write. The damaged trail on disk is the evidence this
+		-- session's refusal rests on, and the mirror is the SALVAGEABLE SUBSET
+		-- of it. Writing the subset over the file replaces the damaged trail
+		-- with a clean one, and the next launch restores the grant -- the
+		-- evidence destroyed by an ordinary dispatch acknowledgment rather
+		-- than by anything that looks like a decision.
+		--
+		-- Marked owed, not lost: the write lands the moment a fresh decision
+		-- supersedes the unknown trail (set_consent clears the flag). Holding
+		-- also makes denial_receipt_retained_durably() refuse while dirty, so
+		-- teardown stops accepting this outbox as a witness -- the restrictive
+		-- direction, and the correct one while we cannot read it.
+		self.stats.consent_outbox_persist_failed = self.stats.consent_outbox_persist_failed + 1
+		self.consent_outbox_dirty = true
+		return false
+	end
 	local saved = storage.save_consent_outbox(self.config, self.consent_outbox)
 	if not saved then
 		self.stats.consent_outbox_persist_failed = self.stats.consent_outbox_persist_failed + 1

@@ -1126,7 +1126,18 @@ local function sanitize_outbox_entries(entries)
 		return out, 1
 	end
 	local dropped = 0
-	for i = 1, #entries do
+	-- `#entries` is the ARRAY PREFIX ONLY, and the loop below never leaves it.
+	-- A table with a HOLE ({[1]=a, [3]=b}) or with non-array keys hides
+	-- receipts behind that prefix: they would never be visited, never counted,
+	-- and the loader would report a fully understood trail while a denial sat
+	-- unread. Walk every key first and charge anything outside the prefix.
+	local prefix = #entries
+	for key in pairs(entries) do
+		if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > prefix then
+			dropped = dropped + 1
+		end
+	end
+	for i = 1, prefix do
 		local entry = entries[i]
 		if type(entry) == "table"
 			and valid_receipt_field(entry.idempotency_key)
