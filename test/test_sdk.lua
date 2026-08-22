@@ -5188,13 +5188,21 @@ end
 
 -- ── consent-receipt outbox + denied_forced_minor ─────────────────────────────
 
+-- The LIVE outbox record. Two keys can exist: a frozen base, preserved verbatim
+-- because it could not be read, and its successor, which is what reads and
+-- writes use from then on. The successor wins here -- a caller asking for "the
+-- record" means the one in force, and the frozen one is deliberately inert.
 local function stored_consent_outbox_record(stores)
+	local base, base_path
 	for path, record in pairs(stores) do
-		if path:sub(-15) == "/consent-outbox" then
+		if path:find("/consent%-outbox%-frozen%-successor$") then
 			return record, path
 		end
+		if path:sub(-15) == "/consent-outbox" then
+			base, base_path = record, path
+		end
 	end
-	return nil
+	return base, base_path
 end
 
 -- AC-8 (consent & age-gate UX spec §7/§10): in a forced-minor session the
@@ -5868,7 +5876,16 @@ local function test_malformed_consent_outbox_dropped_failsafe()
 	assert_equal(second:snapshot().consent_recorded, 1)
 	assert_equal(#second.consent_outbox, 0)
 
-	-- a wholly garbled record (not even a table) starts clean, never throws
+	-- A wholly garbled record (not even a table) starts clean, never throws.
+	-- WHOLLY means every outbox key: the partial corruption above froze the base
+	-- and carried its one salvageable receipt into the successor, so garbling
+	-- the base alone would leave that receipt live and deliverable -- which is
+	-- the freeze working, not the load failing.
+	for key in pairs(stores) do
+		if key:find("consent%-outbox") then
+			stores[key] = nil
+		end
+	end
 	stores[path] = "garbage"
 	storage.reset()
 	reset()
@@ -7758,6 +7775,336 @@ local tests = {
 	test_same_second_regrant_outranks_undelivered_denial,
 	test_stale_denial_marker_never_beats_newer_grant,
 	test_unreadable_marker_fail_closed_stays_transient,
+	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
+	--
+	-- THE FREEZE'S BEHAVIOUR, one assertion per fact the resolution separates.
+	function()
+	local function seed_damaged(stores)
+		assert_true(storage.save(identity_scope, {
+			anonymous_id = "anon-freeze-behaviour",
+			consent_analytics = "granted",
+			consent_decided_at = "2026-07-07T00:00:00Z",
+			consent_decision_seq = 1,
+		}))
+		assert_true(storage.save_consent_outbox(identity_scope, {}))
+		for path, record in pairs(stores) do
+			if path:sub(-15) == "/consent-outbox" then
+				record.receipts = { "this-entry-is-not-a-table" }
+			end
+		end
+		storage.reset()
+	end
+	local function successor_of(stores)
+		for path, record in pairs(stores) do
+			if path:find("frozen%-successor$") then
+				return record, path
+			end
+		end
+		return nil
+	end
+
+	-- 1. THE MARKER TRAVELS WITH THE KEY. A successor rewritten without it reads
+	--    as absent next time, the base comes back as live, and the freeze is
+	--    silently lost -- exactly when the successor is healthiest.
+	reset(); storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	seed_damaged(stores)
+	local c1 = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_true(successor_of(stores) ~= nil, "the damaged key was frozen")
+	assert_true(c1:set_consent(false), "a fresh decision rewrites the successor")
+	local succ = successor_of(stores)
+	assert_true(succ ~= nil and succ.frozen == true,
+		"and the rewrite keeps the frozen marker")
+	restore(); storage.reset()
+
+	-- 2. WITHHOLDING SURVIVES THE LAUNCH THAT FOUND THE DAMAGE. Once frozen the
+	--    loader reads a clean successor and reports no error.
+	reset(); storage.reset()
+	local stores2, restore2 = install_stub_sys_storage()
+	seed_damaged(stores2)
+	assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	reset(); storage.reset()
+	local later = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(later.consent_state, "denied",
+		"a frozen base withholds on a launch that saw no read error at all")
+	restore2(); storage.reset()
+
+	-- 3. A DAMAGED SUCCESSOR IS NOT RECYCLED, and no key may be written while
+	--    both records are unaccounted -- the bounded case, where refusing is
+	--    the point.
+	reset(); storage.reset()
+	local stores3, restore3 = install_stub_sys_storage()
+	seed_damaged(stores3)
+	assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	local _, succ_path = successor_of(stores3)
+	stores3[succ_path] = "and now the successor is damaged too"
+	storage.reset()
+	-- The freeze reports "already frozen" here rather than refusing -- the base
+	-- was frozen long ago. The property that matters is not what it REPORTS but
+	-- that nothing overwrites the second record.
+	storage.freeze_consent_outbox(identity_scope, {})
+	assert_equal(stores3[succ_path], "and now the successor is damaged too",
+		"a damaged successor is left exactly as it was")
+	assert_equal(storage.save_consent_outbox(identity_scope, {}), nil,
+		"no key may be written while both records are unaccounted")
+	restore3(); storage.reset()
+
+	-- 4. AN OWED FREEZE RETRIES. A refusal with no path back is a dead end, not
+	--    fail-closed: without the retry a fresh offline denial could not be
+	--    retained even after storage recovered, until relaunch.
+	reset(); storage.reset()
+	local stores4, restore4 = install_stub_sys_storage()
+	seed_damaged(stores4)
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:find("frozen%-successor$") then
+			return false
+		end
+		return real_save(path, record)
+	end
+	local owed = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	sys.save = real_save
+	assert_true(successor_of(stores4) == nil, "the freeze really did fail to write")
+	local _, owed_err = storage.load_consent_outbox(identity_scope)
+	assert_equal(owed_err, "consent_outbox_read_failed",
+		"an owed freeze alone still reports the trail as unaccounted")
+	assert_true(owed:set_consent(false), "a decision after recovery is accepted")
+	assert_true(successor_of(stores4) ~= nil,
+		"and its write completes the owed freeze instead of refusing forever")
+	restore4(); storage.reset()
+
+	-- 5. A TRANSIENT READ FAILURE MUST NOT COST THE KEY. Freezing is
+	--    irreversible, so it may not rest on one failed read: the re-read
+	--    inside the freeze finds the record whole, declines, and hands the
+	--    recovered entries back -- otherwise the session keeps the EMPTY set
+	--    the failed read produced and the first decision writes that over an
+	--    intact trail.
+	reset(); storage.reset()
+	local stores5, restore5 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-transient",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {
+		{
+			idempotency_key = "key-survives",
+			workspace_id = "ws",
+			app_id = "app",
+			environment_id = "env",
+			actor_identifier = "user-parked",
+			kind = "user_verified",
+			decided_at = "2026-07-08T00:00:00Z",
+			categories = { analytics = true },
+			anonymous_id = "anon-transient",
+		},
+	}))
+	storage.reset()
+	local real_load = sys.load
+	local failed_once = false
+	sys.load = function(path)
+		if not failed_once and path:sub(-15) == "/consent-outbox" then
+			failed_once = true
+			error("transient read failure")
+		end
+		return real_load(path)
+	end
+	local transient = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	sys.load = real_load
+	assert_true(failed_once, "the fixture really did fail the first read")
+	assert_true(successor_of(stores5) == nil,
+		"a record that re-reads whole is not frozen -- the key is not spent")
+	-- A verified-kind receipt PARKS with no session to vouch its actor, so it
+	-- stays observable instead of dispatching and being pruned on the way out.
+	assert_equal(#transient.consent_outbox, 1,
+		"and the recovered receipt reaches the client, not the failed read's empty set")
+	assert_equal(transient.consent_state, "granted",
+		"so a transient failure withholds nothing")
+	restore5(); storage.reset()
+	end,
+	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
+	--
+	-- RESOLVING ONCE MEANS A TRANSIENT FAILURE COSTS THE WHOLE SESSION, not a
+	-- moment. That is the deliberate trade -- a wrong answer that is STABLE can
+	-- be reasoned about and is corrected at the next launch, while one that
+	-- flips mid-session cannot -- and it is only safe because the unknown
+	-- resolves RESTRICTIVELY. Both halves are asserted here: the grant is
+	-- withheld when the load failed, and it stays withheld even after the store
+	-- starts answering perfectly, until the session ends.
+	function()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-resolve-once",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	for path, record in pairs(stores) do
+		if path:sub(-15) == "/consent-outbox" then
+			record.receipts = { "this-entry-is-not-a-table" }
+		end
+	end
+	storage.reset()
+
+	local client = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(client.consent_state, "denied",
+		"a load that could not be understood withholds the granted restore")
+	assert_equal(client:track("gated"), false, "and nothing is authorized")
+
+	-- The store is now perfect. The session does NOT change its mind: the
+	-- resolution was taken at load and nothing re-reads to revise it.
+	for path, record in pairs(stores) do
+		if path:sub(-15) == "/consent-outbox" then
+			record.receipts = {}
+		end
+	end
+	assert_equal(client.consent_state, "denied",
+		"and it stays withheld for the session even once the store reads cleanly")
+	assert_equal(client:track("still_gated"), false, "still nothing is authorized")
+
+	-- A RELAUNCH DOES NOT LIFT IT, and that is the design rather than a gap: the
+	-- damage was real, so the base was frozen, and a frozen base is unaccounted
+	-- on every launch -- nothing reads those bytes back, so only a fresh
+	-- decision can supersede what they might have held. Preserving the evidence
+	-- must not be the thing that stops us acting on it.
+	reset()
+	storage.reset()
+	local relaunched = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(relaunched.consent_state, "denied",
+		"a frozen base withholds the restore on every later launch too")
+	-- The user's own decision is what clears it.
+	assert_true(relaunched:set_consent(true), "a fresh decision is accepted")
+	assert_equal(relaunched.consent_state, "granted", "and supersedes the unknown")
+	-- A TRANSIENT failure is the other path and does NOT freeze: the re-read
+	-- inside the freeze finds the record whole and declines, so no successor is
+	-- created and the next launch is clean. Asserted in the transient leg of
+	-- the unreadable-outbox test rather than here.
+	restore()
+	storage.reset()
+	end,
+	-- Declared inline rather than as `local function`: Lua caps a chunk at 200
+	-- locals and this file sits at the ceiling.
+	--
+	-- THE RESOLUTION'S OWN EXHAUSTIVE TEST, and it is exhaustive on purpose.
+	-- Resolving once concentrates the answer in a single value, which is what
+	-- stops derived facts flipping mid-session -- and concentrates the DEFECT
+	-- too: a bug here is invisible to per-fact mutants, because every fact
+	-- reads the same value. The space is four base states by four successor
+	-- states, sixteen cases, so enumeration is cheap and worth it.
+	--
+	-- Expectations are written out LITERALLY. Computing them from the same
+	-- rules the code applies would produce a test that cannot disagree with it.
+	function()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	local ns_base, ns_fwd
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	for path in pairs(stores) do
+		if path:sub(-15) == "/consent-outbox" then
+			ns_base = path
+			ns_fwd = path .. "-frozen-successor"
+		end
+	end
+	assert_true(ns_base ~= nil, "the outbox key exists so both paths are known")
+
+	local receipt = {
+		idempotency_key = "key-table-test",
+		workspace_id = "ws",
+		app_id = "app",
+		environment_id = "env",
+		actor_identifier = "anon-table-test",
+		decided_at = "2026-07-08T00:00:00Z",
+		categories = { analytics = false },
+		anonymous_id = "anon-table-test",
+	}
+	-- A: key absent. R: readable and well formed. P: readable, payload not a
+	-- list. N: readable table with no receipts key at all. D: present and not a
+	-- table at all -- note this is a REPLY the store
+	-- gave, just an unusable one, which is why it reads as a damaged RECORD and
+	-- never as a downed store. M/U: successor marked/unmarked.
+	local shapes = {
+		A = nil,
+		R = { receipts = { receipt } },
+		P = { receipts = "not a list" },
+		D = "garbage",
+		N = { something_else = "a record shape this build does not know" },
+		M = { frozen = true, receipts = { receipt } },
+		U = { receipts = { receipt } },
+	}
+	local FWD = "consent-outbox-frozen-successor"
+	local BASE = "consent-outbox"
+	-- The last column is `cause`, diagnostic only: "record" when the store
+	-- answered for the OTHER key while failing on the base (so the store works
+	-- and the record is damaged), "store" when neither answered, and nil when
+	-- nothing observed here supports either claim. It is deliberately absent
+	-- unless the base failed THIS launch -- once frozen, why the base became
+	-- unreadable is historical and this run cannot witness it.
+	local cases = {
+		{ "A", "A", BASE, "readable",    "absent",  false, true,  nil      },
+		{ "A", "M", FWD,  "unaccounted", "held",    true,  true,  nil      },
+		{ "A", "U", FWD,  "unaccounted", "damaged", true,  false, nil      },
+		{ "A", "D", FWD,  "unaccounted", "damaged", true,  false, nil      },
+		{ "R", "A", BASE, "readable",    "absent",  false, true,  nil      },
+		{ "R", "M", FWD,  "unaccounted", "held",    true,  true,  nil      },
+		{ "R", "U", FWD,  "unaccounted", "damaged", true,  false, nil      },
+		{ "R", "D", FWD,  "unaccounted", "damaged", true,  false, nil      },
+		{ "P", "A", BASE, "unaccounted", "absent",  true,  true,  nil      },
+		{ "P", "M", FWD,  "unaccounted", "held",    true,  true,  nil      },
+		{ "P", "U", FWD,  "unaccounted", "damaged", true,  false, nil      },
+		{ "P", "D", FWD,  "unaccounted", "damaged", true,  false, nil      },
+		{ "D", "A", BASE, "unaccounted", "absent",  true,  true,  "record" },
+		{ "D", "M", FWD,  "unaccounted", "held",    true,  true,  "record" },
+		{ "D", "U", FWD,  "unaccounted", "damaged", true,  false, "record" },
+		{ "D", "D", FWD,  "unaccounted", "damaged", true,  false, "record" },
+		{ "N", "A", BASE, "unaccounted", "absent",  true,  true,  nil      },
+		{ "N", "M", FWD,  "unaccounted", "held",    true,  true,  nil      },
+		{ "N", "U", FWD,  "unaccounted", "damaged", true,  false, nil      },
+		{ "N", "D", FWD,  "unaccounted", "damaged", true,  false, nil      },
+	}
+	for i = 1, #cases do
+		local c = cases[i]
+		local label = "base=" .. c[1] .. " successor=" .. c[2]
+		stores[ns_base] = shapes[c[1]]
+		stores[ns_fwd] = shapes[c[2]]
+		storage.reset()
+		local r = storage.resolve_consent_outbox(identity_scope)
+		assert_equal(r.live_key, c[3], label .. ": live_key")
+		assert_equal(r.base, c[4], label .. ": base")
+		assert_equal(r.successor, c[5], label .. ": successor")
+		assert_equal(r.unaccounted, c[6], label .. ": unaccounted")
+		assert_equal(r.writable, c[7], label .. ": writable")
+		assert_equal(r.cause, c[8], label .. ": cause")
+	end
+
+	-- A STORE THAT DOES NOT REPLY AT ALL is the one shape the table above cannot
+	-- express: every cell there is content, and content is a reply. Only a read
+	-- that THROWS proves nothing about which key is at fault -- so the cause is
+	-- withheld rather than guessed, the successor is "unknown" rather than
+	-- occupied, and writes are not refused, because refusing would protect
+	-- nothing on a host whose store cannot be read at all.
+	stores[ns_base] = shapes.R
+	stores[ns_fwd] = nil
+	storage.reset()
+	local real_load = sys.load
+	sys.load = function()
+		error("the store does not reply")
+	end
+	local silent = storage.resolve_consent_outbox(identity_scope)
+	sys.load = real_load
+	assert_equal(silent.successor, "unknown", "a silent store leaves the successor unknown")
+	assert_equal(silent.live_key, BASE, "and does not pretend a freeze happened")
+	assert_equal(silent.cause, "store", "and names the store, not a record")
+	assert_equal(silent.writable, true, "writes are not refused on a silent store")
+	assert_equal(silent.unaccounted, true, "but the base is unaccounted, so it fails closed")
+
+	restore()
+	storage.reset()
+	end,
 	-- Declared inline rather than as `local function`: Lua caps a chunk at
 	-- 200 locals and this file sits at the ceiling, so one more top-level
 	-- local breaks the 5.4 job while 5.1/LuaJIT still pass. The limit is per

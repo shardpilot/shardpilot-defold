@@ -848,6 +848,21 @@ function M.new(config)
 	-- first — the spool load/purge decision must read the FINAL state.
 	local outbox_err
 	client.consent_outbox, outbox_err = storage.load_consent_outbox(normalized)
+	if outbox_err ~= nil then
+		-- FREEZE the damaged key rather than rewriting it: the bytes stay where
+		-- they are, and what was salvageable rides forward into a successor key
+		-- that is equally durable -- so preserving the evidence costs nothing
+		-- in the ability to record new decisions.
+		local _, recovered = storage.freeze_consent_outbox(normalized, client.consent_outbox)
+		if recovered ~= nil then
+			-- The freeze declined because the record re-read whole: the failure
+			-- was transient. Take what it recovered, or this session keeps the
+			-- EMPTY set the failed read produced and the first decision writes
+			-- that over an intact trail.
+			client.consent_outbox = recovered
+			outbox_err = nil
+		end
+	end
 	-- TWO different facts, and only one is about the restored state. PRESERVING
 	-- THE EVIDENCE is unconditional: a trail that could not be read must not be
 	-- replaced by its salvageable subset whatever the record says, because a
@@ -858,6 +873,25 @@ function M.new(config)
 	-- round could re-find it.)
 	if outbox_err ~= nil then
 		client.consent_outbox_unreadable = true
+	end
+	-- ON EVERY LAUNCH, not only the one that found the damage: once the base is
+	-- frozen the successor reads perfectly, and outbox_err still reports the
+	-- trail as incomplete because the RESOLUTION knows the base is unaccounted.
+	-- That is one fact with one surface -- an earlier draft asked storage a
+	-- second time under a second name, and the mutants showed the two could
+	-- never disagree, which is the same duplication this design exists to end.
+	if outbox_err ~= nil then
+		client.stats.consent_denial_possibly_undelivered = 1
+		client:diagnose({
+			scope = "consent",
+			status = "unaccounted",
+			code = "consent_denial_possibly_undelivered",
+			-- Diagnostic only, and computed at resolve time where both keys are
+			-- visible: "record" if the store answered for the other key while
+			-- failing on this one, "store" if it answered for neither. It tells
+			-- an operator whether to look at the file or at the device.
+			cause = storage.consent_outbox_unaccounted_cause(normalized),
+		})
 	end
 	if outbox_err ~= nil and client.consent_state == "granted" then
 		-- FAIL CLOSED on the granted restore, exactly as the unreadable
