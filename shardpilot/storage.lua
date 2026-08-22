@@ -1190,6 +1190,49 @@ local function receipt_is_pure_grant(receipt)
 	end
 	return true
 end
+
+-- THE CAP IS A PROPERTY OF THE OUTBOX, NOT OF ONE ENTRY POINT. It lived inside
+-- save_consent_outbox, so the freeze's own write went around it: a damaged base
+-- holding more than the bound of salvageable receipts was written whole. Beyond
+-- exceeding a documented fixed bound, that write can exceed what the engine will
+-- save -- and then it NEVER CONVERGES, because the next retry re-reads the base,
+-- replaces the capped argument with the longer salvage list again, and attempts
+-- the identical oversized write with freeze_owed still armed.
+local function apply_outbox_cap(kept)
+	while #kept > max_consent_outbox_entries do
+		local evict_index = 1
+		for i = 1, #kept do
+			if receipt_is_pure_grant(kept[i]) then
+				evict_index = i
+				break
+			end
+		end
+		table.remove(kept, evict_index)
+	end
+	return kept
+end
+
+-- MERGE BY IDEMPOTENCY KEY, what is on disk first. Used on exactly ONE path: a
+-- freeze that settled by ADOPTING a successor already present, where the key
+-- holds receipts this caller never saw while the caller holds receipts that are
+-- still only in memory. Replacing loses theirs; reporting success loses ours.
+-- Deliberately NOT used on the ordinary write, which must REPLACE -- replacing
+-- is how an acknowledged receipt gets pruned, and a merge there would make
+-- every delivered receipt immortal.
+local function merge_outbox_entries(existing, incoming)
+	local out, seen = {}, {}
+	for _, list in ipairs({ existing or {}, incoming or {} }) do
+		for i = 1, #list do
+			local entry = list[i]
+			local key = type(entry) == "table" and entry.idempotency_key or nil
+			if key ~= nil and seen[key] == nil then
+				seen[key] = true
+				out[#out + 1] = entry
+			end
+		end
+	end
+	return out
+end
 -- Exported alongside the cap above: the client's grant-append gate must
 -- predict this store's eviction choices with the SAME predicate the
 -- eviction loop applies.
@@ -1418,13 +1461,13 @@ local function write_consent_outbox(ns, receipts, scope)
 		-- RETRY. The freeze could not be written when the damage was found;
 		-- the store may answer now, and refusing until relaunch would mean a
 		-- fresh offline denial cannot be retained even after recovery.
-		local froze = M.freeze_consent_outbox(scope, receipts)
+		local settled, _, persisted = M.freeze_consent_outbox(scope, receipts)
 		if r.freeze_owed then
 			-- Still owed: the base is unprotected and must not be written, and
 			-- the successor does not exist. Nothing may be written safely.
 			return false
 		end
-		if froze then
+		if settled and persisted then
 			-- THE RETRY WAS THIS WRITE. freeze_consent_outbox saved exactly
 			-- these receipts to the successor and updated the resolution;
 			-- writing them again buys nothing and can lose -- a transient
@@ -1432,8 +1475,19 @@ local function write_consent_outbox(ns, receipts, scope)
 			-- already durable, arming an owed write that is not owed.
 			return true
 		end
-		-- Not frozen and no longer owed means the BASE recovered and the freeze
-		-- declined. Nothing has been written yet; fall through and write it.
+		if settled then
+			-- SETTLED WITHOUT WRITING: the freeze ADOPTED a successor already
+			-- on disk. These receipts are still only in memory, and the key now
+			-- holds entries this caller never saw. Replacing it deletes theirs,
+			-- and returning true here -- which is what "settled" used to mean --
+			-- loses ours, because the caller clears its dirty flag on it.
+			-- Merge, then fall through and write the union. If the adopted
+			-- successor is not writable the `r.writable` gate below refuses,
+			-- which is the honest answer for a damaged one.
+			receipts = apply_outbox_cap(merge_outbox_entries(r.receipts, receipts))
+		end
+		-- Otherwise the BASE recovered and the freeze declined. Nothing has been
+		-- written yet; fall through and write it.
 	end
 	if not r.writable then
 		-- Both records unaccounted: no key may be written without destroying
@@ -1578,14 +1632,19 @@ end
 function M.freeze_consent_outbox(scope, carried)
 	local ns = spool_namespace(scope)
 	local r = resolution_for(ns, scope)
+	-- THIRD RETURN: did THIS CALL persist the receipts it was handed. Settling
+	-- and writing are different facts and only one path does both -- every
+	-- other way out of this function settles without saving a thing. They rode
+	-- one boolean until a caller read "settled" as "written" and cleared a
+	-- dirty flag over a receipt that existed only in memory.
 	if r.live_key == CONSENT_OUTBOX_FORWARD_KEY then
-		return true, nil
+		return true, nil, false
 	end
 	if r.successor == "damaged" then
 		-- Both records unaccounted. Refusing is the point; recycling a key we
 		-- cannot see is how the second witness gets destroyed.
 		r.freeze_owed = true
-		return false, nil
+		return false, nil, false
 	end
 	-- RE-READ BEFORE FREEZING. Freezing is irreversible, so it may not rest on
 	-- one failed read: a transient failure that now parses whole must not cost
@@ -1609,7 +1668,7 @@ function M.freeze_consent_outbox(scope, carried)
 			-- of one recovered read would resurrect a frozen base while a marked
 			-- successor sits beside it, ignoring the live trail entirely.
 			if confirm_successor(ns, r) ~= "absent" then
-				return true, nil
+				return true, nil, false
 			end
 			r.receipts = kept
 			r.base = "readable"
@@ -1618,7 +1677,7 @@ function M.freeze_consent_outbox(scope, carried)
 			-- forever -- a dead end wearing fail-closed's clothes, which is the
 			-- exact shape the retry exists to avoid.
 			r.freeze_owed = false
-			return false, kept
+			return false, kept, false
 		end
 		if #kept > #sanitize_outbox_entries(carried) then
 			carried = kept
@@ -1628,20 +1687,20 @@ function M.freeze_consent_outbox(scope, carried)
 	-- also failed, which says nothing about the forward key -- and this is the
 	-- last point before the save that would overwrite it.
 	if confirm_successor(ns, r) ~= "absent" then
-		return true, nil
+		return true, nil, false
 	end
 	local path = save_path(ns, CONSENT_OUTBOX_FORWARD_KEY)
 	if not path then
 		r.freeze_owed = true
-		return false, nil
+		return false, nil, false
 	end
-	local kept = sanitize_outbox_entries(carried)
+	local kept = apply_outbox_cap(sanitize_outbox_entries(carried))
 	local ok, saved = pcall(sys.save, path, { frozen = true, receipts = kept })
 	if not (ok and saved == true) then
 		-- OWED, not forgotten, and not a refusal either: the next write retries
 		-- it. A refusal with no path back is a dead end, not fail-closed.
 		r.freeze_owed = true
-		return false, nil
+		return false, nil, false
 	end
 	consent_outbox_memory[ns] = { frozen = true, receipts = kept }
 	r.live_key = CONSENT_OUTBOX_FORWARD_KEY
@@ -1650,7 +1709,7 @@ function M.freeze_consent_outbox(scope, carried)
 	r.unaccounted = true
 	r.receipts = kept
 	r.freeze_owed = false
-	return true, nil
+	return true, nil, true
 end
 
 -- Whether any key may safely be written. DISTINCT from the trail being
@@ -1658,6 +1717,21 @@ end
 -- a perfectly writable live trail, and conflating the two makes the outbox
 -- unprunable -- settled receipts never leave, shutdown wedges on
 -- consent_pending, and every relaunch re-sends them.
+-- A SESSION, NOT A PROCESS. `resolve once` was always scoped to a client
+-- session; the cache behind it is module-level, so a second sdk.new() in one
+-- process inherited the first one's verdict. A transient read failure that made
+-- the first session call the successor damaged then fails closed for every
+-- later client until the PROCESS restarts -- which on a game engine means until
+-- the editor is relaunched. Clearing the resolution here re-reads the store on
+-- the next question and costs one read.
+--
+-- The shadow of what this process WROTE is deliberately left alone: that is a
+-- fact about this process, it stays true across sessions, and dropping it would
+-- make a host whose reads fail report its own trail as lost.
+function M.begin_consent_outbox_session(scope)
+	outbox_resolution[spool_namespace(scope)] = nil
+end
+
 function M.consent_outbox_writable(scope)
 	local r = resolution_for(spool_namespace(scope), scope)
 	-- DELIBERATELY NOT `and not r.freeze_owed`. A debt is paid BY a write:
@@ -1678,17 +1752,7 @@ end
 
 function M.save_consent_outbox(scope, receipts)
 	local ns = spool_namespace(scope)
-	local kept = sanitize_outbox_entries(receipts)
-	while #kept > max_consent_outbox_entries do
-		local evict_index = 1
-		for i = 1, #kept do
-			if receipt_is_pure_grant(kept[i]) then
-				evict_index = i
-				break
-			end
-		end
-		table.remove(kept, evict_index)
-	end
+	local kept = apply_outbox_cap(sanitize_outbox_entries(receipts))
 	if not write_consent_outbox(ns, kept, scope) then
 		return nil
 	end

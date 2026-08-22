@@ -847,6 +847,11 @@ function M.new(config)
 	-- the spool so the belt cross-check below settles the boot consent state
 	-- first — the spool load/purge decision must read the FINAL state.
 	local outbox_err
+	-- A FRESH SESSION GETS A FRESH RESOLUTION. Resolving once is scoped to this
+	-- client, not to the process: without this a second sdk.new() inherits the
+	-- previous client's verdict, so one transient read failure fails closed
+	-- until the engine itself restarts.
+	storage.begin_consent_outbox_session(normalized)
 	client.consent_outbox, outbox_err = storage.load_consent_outbox(normalized)
 	if outbox_err ~= nil then
 		-- FREEZE the damaged key rather than rewriting it: the bytes stay where

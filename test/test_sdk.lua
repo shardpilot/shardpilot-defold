@@ -8050,6 +8050,115 @@ local tests = {
 	end,
 	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
 	--
+	-- SETTLING IS NOT WRITING, A CAP IS NOT AN ENTRY POINT, AND A SESSION IS NOT
+	-- A PROCESS. Three facts that were each folded into something adjacent.
+	function()
+	local function outbox_paths(stores)
+		local base, fwd
+		for path in pairs(stores) do
+			if path:find("frozen%-successor$") then fwd = path
+			elseif path:sub(-15) == "/consent-outbox" then base = path end
+		end
+		return base, fwd
+	end
+	local function denial(key, actor)
+		return {
+			idempotency_key = key,
+			workspace_id = "ws", app_id = "app", environment_id = "env",
+			actor_identifier = actor,
+			decided_at = "2026-07-09T00:00:00Z",
+			categories = { analytics = false },
+			anonymous_id = actor,
+		}
+	end
+
+	-- G. AN OWED FREEZE THAT ADOPTS HAS NOT WRITTEN. The retry settles by
+	--    finding a successor that appeared while the debt stood -- and saves
+	--    nothing. Reporting that as a successful write let the caller clear its
+	--    dirty flag over a receipt that existed only in memory; replacing the
+	--    key instead would delete what the successor already held. The union
+	--    is the only answer that loses neither.
+	reset(); storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base_path = select(1, outbox_paths(stores))
+	stores[base_path] = "garbage"
+	storage.reset()
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:find("frozen%-successor$") then return false end
+		return real_save(path, record)
+	end
+	local r = storage.resolve_consent_outbox(identity_scope)
+	assert_equal(storage.freeze_consent_outbox(identity_scope, {}), false)
+	assert_equal(r.freeze_owed, true, "the debt really stands")
+	sys.save = real_save
+	-- A successor APPEARS while the debt stands, holding a receipt this caller
+	-- has never seen. Without it the retry writes its own list and the test
+	-- cannot tell a merge from a plain write.
+	stores[base_path .. "-frozen-successor"] =
+		{ frozen = true, receipts = { denial("was-already-there", "anon-g") } }
+	assert_true(storage.save_consent_outbox(identity_scope, { denial("only-in-memory", "anon-g") }) ~= nil,
+		"the retry succeeds")
+	local live = stores[base_path .. "-frozen-successor"]
+	assert_equal(#live.receipts, 2,
+		"and BOTH survive: settling by adoption wrote nothing, so the caller's receipt still had to land")
+	local keys = {}
+	for i = 1, #live.receipts do keys[live.receipts[i].idempotency_key] = true end
+	assert_true(keys["was-already-there"], "the adopted receipt is not replaced")
+	assert_true(keys["only-in-memory"], "and the caller's receipt is not lost to a claimed write")
+	restore(); storage.reset()
+
+	-- H. THE CAP IS A PROPERTY OF THE OUTBOX, not of one entry point. The
+	--    freeze's own write went around it, so a damaged base holding more than
+	--    the bound was written whole -- and an oversized write NEVER CONVERGES,
+	--    because each retry re-reads the base and rebuilds the same long list.
+	reset(); storage.reset()
+	local stores2, restore2 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base2 = select(1, outbox_paths(stores2))
+	local oversized = {}
+	for i = 1, 33 do oversized[i] = denial("bulk-" .. i, "anon-h") end
+	-- One unreadable entry makes the base UNACCOUNTED, which is what summons
+	-- the freeze; the other 33 are salvageable and are what it carries.
+	oversized[34] = "an entry this build cannot read"
+	stores2[base2] = { receipts = oversized }
+	storage.reset()
+	local r2 = storage.resolve_consent_outbox(identity_scope)
+	assert_equal(r2.unaccounted, true, "the damaged entry summons the freeze")
+	assert_equal(#r2.receipts, 33, "and 33 salvageable receipts are over the bound of 32")
+	assert_true(storage.freeze_consent_outbox(identity_scope, {}), "the freeze writes")
+	local frozen2 = stores2[base2 .. "-frozen-successor"]
+	assert_equal(#frozen2.receipts, 32,
+		"the freeze's own write obeys the cap it does not own")
+	restore2(); storage.reset()
+
+	-- I. A SESSION IS NOT A PROCESS. Resolving once was always scoped to a
+	--    client; the cache behind it is module-level, so a second sdk.new() in
+	--    one process inherited the first client's verdict -- and one transient
+	--    read failure then failed closed until the ENGINE restarted.
+	reset(); storage.reset()
+	local stores3, restore3 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	storage.reset()
+	local real_load3 = sys.load
+	sys.load = function(path)
+		if path:find("frozen%-successor$") then error("the successor read fails, the base does not") end
+		return real_load3(path)
+	end
+	local client_a = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(client_a.consent_outbox_unreadable, true,
+		"the first session fails closed, which is correct while the read is failing")
+	-- The store recovers. Nothing else changes, and the process does not restart.
+	sys.load = real_load3
+	local client_b = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(client_b.consent_outbox_unreadable, nil,
+		"a NEW session re-reads: recovery must not require restarting the engine")
+	assert_true(client_b:set_consent(false), "and the recovered session can record decisions again")
+	restore3(); storage.reset()
+	end,
+	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
+	--
 	-- THE FREEZE'S BEHAVIOUR, one assertion per fact the resolution separates.
 	function()
 	local function seed_damaged(stores)
