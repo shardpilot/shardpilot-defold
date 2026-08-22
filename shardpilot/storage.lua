@@ -1219,6 +1219,25 @@ end
 -- Deliberately NOT used on the ordinary write, which must REPLACE -- replacing
 -- is how an acknowledged receipt gets pruned, and a merge there would make
 -- every delivered receipt immortal.
+-- THE RESOLUTION HANDS OUT COPIES OF ITS LIST, NEVER THE LIST. Returning the
+-- table itself made `client.consent_outbox` and `r.receipts` THE SAME OBJECT --
+-- so every mirror mutation silently edited the resolution, "the resolution is
+-- the single source of truth" was enforced by aliasing rather than by
+-- discipline, and the two could not disagree even when they SHOULD. That last
+-- part is what made it a bug rather than a shortcut: the whole point of asking
+-- what the next write will FORM is that it can differ from what this mirror
+-- holds, and an alias makes the answer identical by construction.
+--
+-- The entries are shared, deliberately. `sanitize_outbox_entries` builds a
+-- fresh table per receipt and nothing mutates one in place, so copying the
+-- outer list is what buys independence; copying each entry as well would be
+-- cost with no fact behind it.
+local function copy_outbox_entries(entries)
+	local out = {}
+	for i = 1, #entries do out[i] = entries[i] end
+	return out
+end
+
 local function merge_outbox_entries(existing, incoming)
 	local out, seen = {}, {}
 	for _, list in ipairs({ existing or {}, incoming or {} }) do
@@ -1227,11 +1246,32 @@ local function merge_outbox_entries(existing, incoming)
 			local key = type(entry) == "table" and entry.idempotency_key or nil
 			if key ~= nil and seen[key] == nil then
 				seen[key] = true
-				out[#out + 1] = entry
+				out[#out + 1] = { entry = entry, arrival = #out + 1 }
 			end
 		end
 	end
-	return out
+	-- CHRONOLOGICALLY, NOT BY SOURCE. Concatenating put every entry of one list
+	-- before every entry of the other, so a successor written by another
+	-- session could hold a NEWER decision than a stale caller mirror and still
+	-- sit in front of it -- breaking the serial decision order the outbox
+	-- promises, and, worse, handing `apply_outbox_cap` a list whose front is
+	-- not its oldest. The cap removes from the front, so it would discard the
+	-- newer decision and keep the older one.
+	--
+	-- `arrival` is the final tie-break because `table.sort` is NOT stable in
+	-- Lua: without it, two receipts sharing an instant and a sequence could
+	-- come out in either order on either interpreter, which is a difference two
+	-- SDK legs would eventually disagree about.
+	table.sort(out, function(a, b)
+		local ad, bd = a.entry.decided_at, b.entry.decided_at
+		if ad ~= bd then return ad < bd end
+		local as, bs = a.entry.decision_seq or 0, b.entry.decision_seq or 0
+		if as ~= bs then return as < bs end
+		return a.arrival < b.arrival
+	end)
+	local ordered = {}
+	for i = 1, #out do ordered[i] = out[i].entry end
+	return ordered
 end
 -- Exported alongside the cap above: the client's grant-append gate must
 -- predict this store's eviction choices with the SAME predicate the
@@ -1496,7 +1536,7 @@ local function write_consent_outbox(ns, receipts, scope)
 		-- RETRY. The freeze could not be written when the damage was found;
 		-- the store may answer now, and refusing until relaunch would mean a
 		-- fresh offline denial cannot be retained even after recovery.
-		local settled, _, persisted = M.freeze_consent_outbox(scope, receipts)
+		local settled, _recovered, persisted = M.freeze_consent_outbox(scope, receipts)
 		if r.freeze_owed then
 			-- Still owed: the base is unprotected and must not be written, and
 			-- the successor does not exist. Nothing may be written safely.
@@ -1512,19 +1552,39 @@ local function write_consent_outbox(ns, receipts, scope)
 			-- already durable, arming an owed write that is not owed.
 			return true, r.receipts
 		end
-		if settled then
-			-- SETTLED WITHOUT WRITING: the freeze ADOPTED a successor already
-			-- on disk. These receipts are still only in memory, and the key now
-			-- holds entries this caller never saw. Replacing it deletes theirs,
-			-- and returning true here -- which is what "settled" used to mean --
-			-- loses ours, because the caller clears its dirty flag on it.
-			-- Merge, then fall through and write the union. If the adopted
-			-- successor is not writable the `r.writable` gate below refuses,
-			-- which is the honest answer for a damaged one.
-			receipts = apply_outbox_cap(merge_outbox_entries(r.receipts, receipts))
+		-- EITHER OUTCOME LEAVES A LIST THIS CALLER DID NOT HAVE, and the first
+		-- version of this branch merged on only one of them. Settled-without-
+		-- writing means the freeze ADOPTED a successor already on disk;
+		-- not-settled means the BASE recovered and the freeze handed back what
+		-- it read (`_recovered`, which `r.receipts` now equals). Both leave the
+		-- resolution describing receipts the caller never saw, and in both the
+		-- caller's own receipts are still only in memory. Replacing deletes
+		-- theirs; returning success loses ours.
+		--
+		-- The census that fixed the adoption path enumerated the places two
+		-- lists are COMBINED and so could not see this one, where a second list
+		-- is DISCARDED -- it was bound to `_`. Counting by syntax instead of by
+		-- the fact is how an instance survives its own class fix.
+		local incoming = receipts
+		receipts = apply_outbox_cap(merge_outbox_entries(r.receipts, receipts))
+		-- AND THE MERGE MAY NOT SILENTLY DISPLACE WHAT THE CALLER HANDED IN.
+		-- An adopted successor can already hold the full cap of denials, so the
+		-- union overflows and the denial-preferring eviction removes the pure
+		-- grant just appended -- while the write reports success, the client
+		-- clears its dirty flag, and analytics opens on a grant that is never
+		-- dispatched. Refusing here is the same answer `consent_outbox_full`
+		-- already gives, reached from the one direction that could bypass it.
+		-- The ORDINARY write keeps its eviction semantics: this refusal exists
+		-- only where receipts the caller never saw are what displaced theirs.
+		local survived = {}
+		for i = 1, #receipts do survived[receipts[i].idempotency_key] = true end
+		for i = 1, #incoming do
+			local entry = incoming[i]
+			if type(entry) == "table" and entry.idempotency_key ~= nil
+				and survived[entry.idempotency_key] == nil then
+				return false
+			end
 		end
-		-- Otherwise the BASE recovered and the freeze declined. Nothing has been
-		-- written yet; fall through and write it.
 	end
 	if not r.writable then
 		-- Both records unaccounted: no key may be written without destroying
@@ -1597,9 +1657,9 @@ function M.load_consent_outbox(scope)
 	-- are visible. Nothing here re-reads the store.
 	local r = resolution_for(spool_namespace(scope), scope)
 	if r.unaccounted then
-		return r.receipts, "consent_outbox_read_failed"
+		return copy_outbox_entries(r.receipts), "consent_outbox_read_failed"
 	end
-	return r.receipts, nil
+	return copy_outbox_entries(r.receipts), nil
 end
 
 -- Replace the persisted outbox with `receipts` (oldest first), enforcing the
@@ -1781,6 +1841,16 @@ function M.begin_consent_outbox_session(scope)
 	outbox_resolution[spool_namespace(scope)] = nil
 end
 
+-- WHAT THE NEXT WRITE WILL ACTUALLY FORM. The client's grant refusal counts
+-- against its own mirror, and after a freeze settles by adopting a successor
+-- another session wrote, the mirror is smaller than the list that will land --
+-- so the refusal passes and the cap then evicts the grant it was protecting.
+-- Same question, asked of the right list.
+function M.consent_outbox_effective(scope, mirror)
+	local r = resolution_for(spool_namespace(scope), scope)
+	return merge_outbox_entries(r.receipts, sanitize_outbox_entries(mirror))
+end
+
 function M.consent_outbox_writable(scope)
 	local r = resolution_for(spool_namespace(scope), scope)
 	-- DELIBERATELY NOT `and not r.freeze_owed`. A debt is paid BY a write:
@@ -1811,7 +1881,7 @@ function M.save_consent_outbox(scope, receipts)
 	if not ok then
 		return nil
 	end
-	return written or kept
+	return copy_outbox_entries(written or kept)
 end
 
 -- True when the outbox has a durable backend on this runtime (the save-file

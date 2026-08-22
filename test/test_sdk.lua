@@ -8263,6 +8263,175 @@ local tests = {
 	assert_equal(#saved, 4,
 		"save_consent_outbox returns what was WRITTEN, not the one-entry list it was given")
 	restore2(); storage.reset()
+
+	-- M. THE RECOVERED LIST IS A SECOND SOURCE TOO. The census that fixed the
+	--    adoption path enumerated where two lists are COMBINED and so could not
+	--    see this one, where a second list is DISCARDED -- bound to `_`. When
+	--    the base recovers, the freeze hands back what it read; falling through
+	--    with the caller's mirror alone overwrites an undelivered denial and
+	--    reports success.
+	reset(); storage.reset()
+	local stores3, restore3 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base3 = select(1, outbox_paths(stores3))
+	local intact3 = { receipts = { denial("recovered-denial", "anon-m") } }
+	stores3[base3] = "garbage"
+	storage.reset()
+	local real_save3 = sys.save
+	sys.save = function(path, record)
+		if path:find("frozen%-successor$") then return false end
+		return real_save3(path, record)
+	end
+	local r3 = storage.resolve_consent_outbox(identity_scope)
+	assert_equal(storage.freeze_consent_outbox(identity_scope, {}), false)
+	assert_equal(r3.freeze_owed, true, "the debt stands")
+	sys.save = real_save3
+	-- The base recovers, holding a receipt the caller's mirror never had.
+	stores3[base3] = intact3
+	local saved3 = storage.save_consent_outbox(identity_scope, { denial("caller-held", "anon-m") })
+	assert_true(saved3 ~= nil, "the write succeeds once the base reads whole")
+	local keys3 = {}
+	for i = 1, #saved3 do keys3[saved3[i].idempotency_key] = true end
+	assert_equal(#saved3, 2,
+		"the recovered receipt is merged in, not discarded with the `_` it was bound to")
+	assert_true(keys3["recovered-denial"] and keys3["caller-held"],
+		"both sources survive: the recovered denial and the caller's own")
+	restore3(); storage.reset()
+
+	-- N. THE MERGE IS CHRONOLOGICAL, or the cap evicts the wrong end. Two
+	--    ordered sources concatenated put every entry of one before every entry
+	--    of the other, so a successor holding a NEWER decision than a stale
+	--    mirror sits in front of it -- and the cap, which removes from the
+	--    front, discards the newer one.
+	reset(); storage.reset()
+	local stores4, restore4 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base4 = select(1, outbox_paths(stores4))
+	local newer = denial("newer-decision", "anon-n")
+	newer.decided_at = "2026-08-01T00:00:00Z"
+	local older = denial("older-decision", "anon-n")
+	older.decided_at = "2026-06-01T00:00:00Z"
+	stores4[base4] = { receipts = { newer, "an entry this build cannot read" } }
+	storage.reset()
+	local r4 = storage.resolve_consent_outbox(identity_scope)
+	assert_equal(r4.unaccounted, true, "the damaged entry summons the freeze")
+	assert_true(storage.freeze_consent_outbox(identity_scope, { older }), "the freeze writes the union")
+	local live4 = stores4[base4 .. "-frozen-successor"]
+	assert_equal(#live4.receipts, 2)
+	assert_equal(live4.receipts[1].idempotency_key, "older-decision",
+		"the OLDER decision is first -- the cap removes from the front, so order is what it evicts by")
+	assert_equal(live4.receipts[2].idempotency_key, "newer-decision",
+		"and the newer one is last, whichever source each came from")
+	restore4(); storage.reset()
+
+	-- O. A MERGE MAY NOT SILENTLY DISPLACE WHAT THE CALLER HANDED IN. An
+	--    adopted successor can already hold the full cap of denials, so the
+	--    union overflows and the denial-preferring eviction removes the pure
+	--    GRANT just appended -- while the write reports success, the client
+	--    clears its dirty flag, and analytics opens on a grant never dispatched.
+	reset(); storage.reset()
+	local stores5, restore5 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base5 = select(1, outbox_paths(stores5))
+	stores5[base5] = "garbage"
+	storage.reset()
+	local real_save5 = sys.save
+	sys.save = function(path, record)
+		if path:find("frozen%-successor$") then return false end
+		return real_save5(path, record)
+	end
+	local r5 = storage.resolve_consent_outbox(identity_scope)
+	assert_equal(storage.freeze_consent_outbox(identity_scope, {}), false)
+	assert_equal(r5.freeze_owed, true, "the debt stands")
+	sys.save = real_save5
+	-- A successor appears holding a FULL cap of denials -- none of them
+	-- evictable in favour of a grant, which is the whole point of the rule.
+	local full = {}
+	for i = 1, 32 do full[i] = denial("full-" .. i, "anon-o") end
+	stores5[base5 .. "-frozen-successor"] = { frozen = true, receipts = full }
+	local grant = denial("the-grant", "anon-o")
+	grant.categories = { analytics = true }
+	grant.decided_at = "2026-09-01T00:00:00Z"
+	assert_equal(storage.save_consent_outbox(identity_scope, { grant }), nil,
+		"the write is REFUSED rather than quietly evicting the grant it was handed")
+	local live5 = stores5[base5 .. "-frozen-successor"]
+	assert_equal(#live5.receipts, 32, "and nothing was written: the 32 denials are untouched")
+	restore5(); storage.reset()
+
+	-- P. AND THE CLIENT MUST REFUSE THE GRANT, not merely fail to persist it.
+	--    The storage guard above stops the loss; it does not stop set_consent
+	--    from having already flipped the state, which is the fail-open half.
+	--    The refusal counts against the mirror, and the mirror is the right
+	--    list only when nothing else is pending: an acknowledgment shrinks it
+	--    before the prune lands, so the disk still holds what the merge will
+	--    bring back.
+	reset(); storage.reset()
+	local stores6, restore6 = install_stub_sys_storage()
+	local full6 = {}
+	for i = 1, 32 do full6[i] = denial("cap-" .. i, "anon-p") end
+	assert_true(storage.save_consent_outbox(identity_scope, full6))
+	storage.reset()
+	next_status = 500
+	local client6 = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(#client6.consent_outbox, 32, "the client loads the full cap")
+	assert_equal(client6:set_consent(true), false, "which already refuses a grant")
+	-- The mirror shrinks WITHOUT the prune being persisted -- what an
+	-- acknowledgment does before its rewrite lands. The disk still holds 32.
+	for _ = 1, 30 do table.remove(client6.consent_outbox) end
+	assert_equal(#client6.consent_outbox, 2, "the mirror now says two")
+	local ok6, err6 = client6:set_consent(true)
+	assert_equal(ok6, false,
+		"and the grant is STILL refused: the question is what the write will form, not what this mirror holds")
+	assert_equal(err6, "consent_outbox_full")
+	assert_equal(client6.consent_state, "unknown",
+		"a refused grant must not flip the state -- this client never decided, so unknown is what it stays")
+	restore6(); storage.reset()
+
+	-- Q. THREE DOORS ONTO THE SAME TABLE, and each is its own claim. P observes
+	--    one of them; an unobserved copy is a statement nobody checked, so the
+	--    other two get their own assertion here. Mutating what a caller was
+	--    handed must never edit the resolution behind it.
+	reset(); storage.reset()
+	local stores7, restore7 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {
+		denial("held-1", "anon-q"), denial("held-2", "anon-q"),
+	}))
+	storage.reset()
+	-- door 1: the clean load.
+	local first = storage.load_consent_outbox(identity_scope)
+	assert_equal(#first, 2, "the loader returns both")
+	table.remove(first)
+	local second = storage.load_consent_outbox(identity_scope)
+	assert_equal(#second, 2,
+		"clean load hands out a COPY: mutating it leaves the resolution whole")
+	-- door 2: the save return, which the caller assigns straight over its mirror.
+	local returned = storage.save_consent_outbox(identity_scope, {
+		denial("held-1", "anon-q"), denial("held-2", "anon-q"), denial("held-3", "anon-q"),
+	})
+	assert_equal(#returned, 3, "the write returns what landed")
+	table.remove(returned)
+	assert_equal(#storage.load_consent_outbox(identity_scope), 3,
+		"the save return is a COPY too: the caller pruning its mirror does not prune the resolution")
+	restore7(); storage.reset()
+
+	-- door 3: the UNACCOUNTED load, which returns through a different branch
+	--         and was the one the first mutant of this class missed entirely.
+	reset(); storage.reset()
+	local stores8, restore8 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local base8 = select(1, outbox_paths(stores8))
+	stores8[base8] = { receipts = {
+		denial("salvage-1", "anon-q"), denial("salvage-2", "anon-q"),
+		"an entry this build cannot read",
+	} }
+	storage.reset()
+	local list8, err8 = storage.load_consent_outbox(identity_scope)
+	assert_equal(err8, "consent_outbox_read_failed", "this really is the unaccounted branch")
+	assert_equal(#list8, 2, "with both salvageable receipts")
+	table.remove(list8)
+	assert_equal(#select(1, storage.load_consent_outbox(identity_scope)), 2,
+		"and it too hands out a COPY -- the branch is different, the hazard is the same")
+	restore8(); storage.reset()
 	end,
 	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
 	--

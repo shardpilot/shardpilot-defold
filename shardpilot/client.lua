@@ -3364,13 +3364,20 @@ end
 -- cap and pure-grant predicate so this prediction and the eviction loop
 -- can never disagree.
 function Client:consent_outbox_denial_full()
-	local overflow = #self.consent_outbox + 1 - storage.max_consent_outbox_entries
+	-- COUNTED OVER WHAT THE WRITE WILL FORM, not over this mirror. When a
+	-- freeze settles by adopting a successor another session wrote, that
+	-- successor's receipts merge into the next write -- so the mirror can sit
+	-- well under the cap while the list that actually lands is at it, this
+	-- check passes, and the cap then evicts the very grant it exists to
+	-- protect. The mirror is the right list only when nothing else is pending.
+	local effective = storage.consent_outbox_effective(self.config, self.consent_outbox)
+	local overflow = #effective + 1 - storage.max_consent_outbox_entries
 	if overflow < 1 then
 		return false
 	end
 	local evictable_grants = 0
-	for i = 1, #self.consent_outbox do
-		if storage.receipt_is_pure_grant(self.consent_outbox[i]) then
+	for i = 1, #effective do
+		if storage.receipt_is_pure_grant(effective[i]) then
 			evictable_grants = evictable_grants + 1
 			if evictable_grants >= overflow then
 				return false
