@@ -1865,8 +1865,8 @@ function M.freeze_consent_outbox(scope, carried)
 	end
 	local kept = apply_outbox_cap(sanitize_outbox_entries(carried))
 	-- DID THE CALLER'S OWN RECEIPTS SURVIVE THIS CAP. Second site of the guard
-	-- added on the merge path, and it was left unguarded because the finding
-	-- that prompted the guard pointed at the other one. Preserving the salvage
+	-- added on the merge path, and it was left unguarded because the report
+	-- behind that guard named the other site. Preserving the salvage
 	-- is unconditional and still happens; what may NOT happen is telling the
 	-- caller its receipts are durable when the cap dropped one -- the client
 	-- clears its dirty flag on that, and analytics opens on a grant that was
