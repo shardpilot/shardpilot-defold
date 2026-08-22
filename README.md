@@ -403,11 +403,20 @@ per-app spool and re-sends them on a later launch. Enabled by default
   This SDK cannot raise the alarm for you: its stats never leave the device.
   Route the hook (or the counter) into whatever you already page on.
 
-  What the SDK does with the damaged record is keep it, verbatim, in one
-  set-aside slot per scope so it is not destroyed by ordinary outbox
-  maintenance. That buys **visibility, not delivery** — nothing reads those
-  bytes back into the trail. Treat a non-zero value as an open item, not a
-  resolved one.
+  What the SDK does with a damaged record is **stop writing its key**. The bytes
+  stay exactly where they are, untouched, and new receipts go to a successor key
+  that is equally durable — so preserving the evidence costs nothing in the
+  ability to record new decisions. There is no copy and no rename: all
+  persistence here goes through `sys.save` only (on HTML5 that is browser
+  storage, not a filesystem), so not writing is the only preservation available.
+
+  Bounded at two keys, deliberately. If the successor also becomes unreadable,
+  that is not a cue for a third — two independent corruptions of the same small
+  record mean something wider is wrong.
+
+  That buys **visibility, not delivery**: nothing reads the frozen bytes back
+  into the trail, so a refusal frozen there has still not reached the server.
+  Treat a non-zero counter as an open item, not a resolved one.
 - Permanent `4xx` rejects are **never** spooled — they would fail forever.
 
 **Resend.** On the next `init`/`new`, spooled envelopes are re-sent through

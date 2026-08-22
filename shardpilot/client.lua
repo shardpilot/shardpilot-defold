@@ -870,12 +870,19 @@ function M.new(config)
 	-- round could re-find it.)
 	if outbox_err ~= nil then
 		client.consent_outbox_unreadable = true
-		-- Copy the damaged record aside BEFORE anything can rewrite it. This
-		-- does not deliver the denial and must not be read as if it did; it
-		-- makes a possible loss retained and countable instead of silent.
-		storage.set_aside_unreadable_outbox(normalized)
+		-- FREEZE the damaged key rather than rewriting it: the bytes stay where
+		-- they are, and what was salvageable rides forward into the successor
+		-- key, which is durable across restarts. This preserves the record
+		-- without costing the ability to write new decisions -- and it does not
+		-- deliver the frozen denial, which is a separate piece of work.
+		storage.freeze_consent_outbox(normalized, client.consent_outbox)
 	end
-	if storage.holds_unaccounted_outbox(normalized) then
+	-- THE ALARM RISES FROM THE CONDITION, NOT FROM THE RETENTION SUCCEEDING.
+	-- outbox_err already established that a denial may be undelivered; whether
+	-- the freeze could be written is a separate fact, and keying the alarm on it
+	-- would make the alarm vanish precisely during a storage failure -- the case
+	-- where it matters most.
+	if outbox_err ~= nil or storage.holds_frozen_consent_outbox(normalized) then
 		client.stats.consent_denial_possibly_undelivered = 1
 		client:diagnose({
 			scope = "consent",

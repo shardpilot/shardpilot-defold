@@ -1195,9 +1195,30 @@ end
 -- eviction loop applies.
 M.receipt_is_pure_grant = receipt_is_pure_grant
 
+local CONSENT_OUTBOX_KEY = "consent-outbox"
+local CONSENT_OUTBOX_FORWARD_KEY = "consent-outbox-frozen-successor"
+
+-- True when the base key has been frozen, i.e. the forward key exists.
+local function outbox_frozen(ns)
+	local path = save_path(ns, CONSENT_OUTBOX_FORWARD_KEY)
+	if not path then
+		return false
+	end
+	local ok, record = pcall(sys.load, path)
+	return ok and type(record) == "table" and next(record) ~= nil
+end
+
+-- The key writes and reads should use right now.
+local function outbox_live_key(ns)
+	if outbox_frozen(ns) then
+		return CONSENT_OUTBOX_FORWARD_KEY
+	end
+	return CONSENT_OUTBOX_KEY
+end
+
 local function write_consent_outbox(ns, receipts)
 	local record = { receipts = receipts }
-	local path = save_path(ns, "consent-outbox")
+	local path = save_path(ns, outbox_live_key(ns))
 	if not path then
 		-- No durable backend (plain Lua host): the in-memory record is the store.
 		consent_outbox_memory[ns] = record
@@ -1234,60 +1255,77 @@ end
 -- and a destroyed denial trail were the same value. The cache/spool loaders
 -- deliberately KEEP that degrade-to-empty behaviour: losing a cached event
 -- costs an event, while losing a denial costs a refusal the user made.
--- Set the unreadable outbox record aside, verbatim, under its own name, so the
--- salvage-then-rewrite path cannot destroy it.
+-- TWO KEYS, AND THE LIVE ONE IS DERIVED FROM DISK.
 --
--- THIS BUYS VISIBILITY, NOT DELIVERY, and the distinction is the point. Nothing
--- reads these bytes back into the trail: an unreadable entry has no extractable
--- idempotency key and no readable decided_at, and this store is whole-document,
--- so an unparseable byte anywhere makes the WHOLE record unreadable rather than
--- one entry of it. What the copy does is turn "a possible denial was silently
--- destroyed" into "a possible denial is retained and countable".
+-- sys.save/sys.load are keyed, so a damaged record is preserved by the simplest
+-- means available: STOP WRITING ITS KEY. The bytes stay exactly where they are,
+-- untouched -- which matters because this SDK cannot read them. All persistence
+-- goes through sys.save only (docs/privacy.md says so four times; on HTML5 it is
+-- browser storage, not a filesystem), so there is no byte copy to make and no
+-- rename to perform. Not writing is the only preservation available, and it is
+-- also the strongest.
 --
--- BOUNDED BY CONSTRUCTION: exactly one slot per scope. A second corruption
--- keeps the FIRST — the older record has had longer to hold an undelivered
--- denial — and only bumps the count. No lifetime machinery, nothing to expire.
-function M.set_aside_unreadable_outbox(scope)
+-- New receipts go to the FORWARD key, which is durable across restarts -- so
+-- freezing costs nothing in the ability to record new decisions. That is what
+-- separates this from "hold the write", which would have traded a stranger's
+-- possibly-lost denial for the caller's own.
+--
+-- NO STATE RECORDS WHICH KEY IS LIVE: the forward key's EXISTENCE is the marker.
+-- Present => the base key is frozen. Absent => the base key is live. Nothing to
+-- initialise, nothing to migrate, nothing to expire.
+--
+-- BOUNDED AT TWO, DELIBERATELY. If the forward key also becomes unreadable, that
+-- is not a cue for a third: two independent corruptions of the same small record
+-- mean something wider is wrong, and the honest response is to refuse the write
+-- and raise the alarm rather than to keep minting keys.
+-- Freeze the base key by writing `carried` (whatever was salvageable) into the
+-- forward key. The base key is never touched again by this store.
+function M.freeze_consent_outbox(scope, carried)
 	local ns = spool_namespace(scope)
-	local kept = save_path(ns, "consent-outbox-unaccounted")
-	local damaged = save_path(ns, "consent-outbox")
-	if not kept or not damaged then
-		return false
+	if outbox_frozen(ns) then
+		return true
 	end
-	local held_ok, held = pcall(sys.load, kept)
-	if held_ok and type(held) == "table" and next(held) ~= nil then
-		-- A slot is already held: never overwrite it, for the reason above.
-		return false
-	end
-	local raw_ok, raw = pcall(sys.load, damaged)
-	-- The record is unreadable BY DEFINITION here, so `raw` is usually nil or
-	-- not a table. Store what the read produced plus the fact that it could not
-	-- be understood: an empty forensic record still says "something was here
-	-- and this build could not read it".
-	local record = {
-		unreadable = true,
-		observed = (raw_ok and type(raw) == "table") and raw or nil,
-	}
-	local ok, saved = pcall(sys.save, kept, record)
-	return ok and saved == true
-end
-
--- True while a set-aside unreadable record is held for this scope.
-function M.holds_unaccounted_outbox(scope)
-	local ns = spool_namespace(scope)
-	local path = save_path(ns, "consent-outbox-unaccounted")
+	local path = save_path(ns, CONSENT_OUTBOX_FORWARD_KEY)
 	if not path then
 		return false
 	end
-	local ok, record = pcall(sys.load, path)
-	return ok and type(record) == "table" and next(record) ~= nil
+	-- RE-READ BEFORE FREEZING. The caller's read failed, but a transient
+	-- failure that now reads cleanly must not cost the record its key and latch
+	-- a page-worthy alarm forever. Freezing is irreversible by design, so it
+	-- must not rest on a single failed read.
+	local base = save_path(ns, CONSENT_OUTBOX_KEY)
+	if base then
+		local reread_ok, reread = pcall(sys.load, base)
+		if reread_ok and type(reread) == "table" then
+			local raw = reread.receipts
+			local kept, dropped = sanitize_outbox_entries(raw)
+			local whole = (raw == nil and next(reread) == nil)
+				or (type(raw) == "table" and dropped == 0)
+			if whole then
+				-- Understood after all. Nothing to preserve, nothing to freeze.
+				return false
+			end
+			-- Still damaged, but MORE was salvageable this time than the caller
+			-- managed: carry the better subset forward rather than the worse.
+			if #kept > #sanitize_outbox_entries(carried) then
+				carried = kept
+			end
+		end
+	end
+	local ok, saved = pcall(sys.save, path, { receipts = sanitize_outbox_entries(carried) })
+	return ok and saved == true
+end
+
+-- True while a frozen, unaccounted base record is being preserved.
+function M.holds_frozen_consent_outbox(scope)
+	return outbox_frozen(spool_namespace(scope))
 end
 
 function M.load_consent_outbox(scope)
 	local ns = spool_namespace(scope)
 	local record = nil
 	local read_failed = false
-	local path = save_path(ns, "consent-outbox")
+	local path = save_path(ns, outbox_live_key(ns))
 	if path then
 		local ok, loaded = pcall(sys.load, path)
 		if ok and type(loaded) == "table" then
@@ -1369,7 +1407,7 @@ end
 -- on plain Lua hosts, but it does not survive the process — so shutdown()
 -- must not count a fallback write as delivery-safe retention.
 function M.consent_outbox_is_durable(scope)
-	return save_path(spool_namespace(scope), "consent-outbox") ~= nil
+	return save_path(spool_namespace(scope), CONSENT_OUTBOX_KEY) ~= nil
 end
 
 -- ── remote-config cache ──────────────────────────────────────────────────────

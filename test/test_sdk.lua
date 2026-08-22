@@ -5188,13 +5188,21 @@ end
 
 -- ── consent-receipt outbox + denied_forced_minor ─────────────────────────────
 
+-- The LIVE outbox record. Two keys can exist: a frozen base preserved verbatim
+-- because it could not be read, and its successor, which is what writes and
+-- reads use from then on. The successor wins here -- a caller asking for "the
+-- record" means the one in force, and the frozen one is deliberately inert.
 local function stored_consent_outbox_record(stores)
+	local base, base_path
 	for path, record in pairs(stores) do
-		if path:sub(-15) == "/consent-outbox" then
+		if path:find("/consent%-outbox%-frozen%-successor$") then
 			return record, path
 		end
+		if path:sub(-15) == "/consent-outbox" then
+			base, base_path = record, path
+		end
 	end
-	return nil
+	return base, base_path
 end
 
 -- AC-8 (consent & age-gate UX spec §7/§10): in a forced-minor session the
@@ -5868,7 +5876,16 @@ local function test_malformed_consent_outbox_dropped_failsafe()
 	assert_equal(second:snapshot().consent_recorded, 1)
 	assert_equal(#second.consent_outbox, 0)
 
-	-- a wholly garbled record (not even a table) starts clean, never throws
+	-- a wholly garbled record (not even a table) starts clean, never throws.
+	-- WHOLLY means every outbox key: the partial corruption above froze the
+	-- base key and carried its one salvageable receipt into the successor, so
+	-- garbling the base alone would leave that receipt live and deliverable --
+	-- which is the freeze working, not the load failing.
+	for key in pairs(stores) do
+		if key:find("consent%-outbox") then
+			stores[key] = nil
+		end
+	end
 	stores[path] = "garbage"
 	storage.reset()
 	reset()
@@ -7787,8 +7804,8 @@ local tests = {
 	local first = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(first.stats.consent_denial_possibly_undelivered, 1,
 		"a record that could not be read raises the undelivered-denial condition")
-	assert_true(storage.holds_unaccounted_outbox(identity_scope),
-		"and the damaged record is held aside rather than dropped")
+	assert_true(storage.holds_frozen_consent_outbox(identity_scope),
+		"and the damaged key is frozen rather than rewritten")
 	assert_true(first:shutdown() ~= nil, "teardown runs")
 
 	-- SECOND LAUNCH with a perfectly readable outbox: the condition must STILL
@@ -7800,6 +7817,78 @@ local tests = {
 	assert_equal(second.stats.consent_denial_possibly_undelivered, 1,
 		"the condition survives a launch where nothing is wrong -- it is not an event")
 	restore()
+	storage.reset()
+
+	-- THE ALARM MUST NOT DEPEND ON THE FREEZE SUCCEEDING. Keying it on the
+	-- successor key existing would make it vanish exactly during a storage
+	-- failure -- the case where a denial is most likely to be lost and least
+	-- likely to be noticed.
+	reset()
+	storage.reset()
+	local stores2, restore2 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-freeze-fails",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	for path, record in pairs(stores2) do
+		if path:sub(-15) == "/consent-outbox" then
+			record.receipts = { "this-entry-is-not-a-table" }
+		end
+	end
+	storage.reset()
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:find("frozen%-successor$") then
+			return false
+		end
+		return real_save(path, record)
+	end
+	local unwritable = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	sys.save = real_save
+	assert_true(not storage.holds_frozen_consent_outbox(identity_scope),
+		"the freeze really did fail to write")
+	assert_equal(unwritable.stats.consent_denial_possibly_undelivered, 1,
+		"and the alarm rises anyway -- it reports the condition, not the retention")
+	restore2()
+	storage.reset()
+
+	-- A TRANSIENT READ FAILURE MUST NOT COST THE KEY. Freezing is irreversible,
+	-- so it may not rest on one failed read: the re-read inside the freeze finds
+	-- the record whole and declines.
+	reset()
+	storage.reset()
+	local stores3, restore3 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-transient",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	storage.reset()
+	local real_load = sys.load
+	local failed_once = false
+	sys.load = function(path)
+		if not failed_once and path:sub(-15) == "/consent-outbox" then
+			failed_once = true
+			error("transient read failure")
+		end
+		return real_load(path)
+	end
+	local transient = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	sys.load = real_load
+	assert_true(failed_once, "the fixture really did fail the first read")
+	assert_true(not storage.holds_frozen_consent_outbox(identity_scope),
+		"a record that re-reads whole is not frozen")
+	reset()
+	storage.reset()
+	local recovered = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(recovered.stats.consent_denial_possibly_undelivered, 0,
+		"and the alarm does not latch -- the next launch is clean")
+	restore3()
 	storage.reset()
 	end,
 	-- Declared inline rather than as `local function`: Lua caps a chunk at
