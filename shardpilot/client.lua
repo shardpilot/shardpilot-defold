@@ -674,6 +674,18 @@ function M.new(config)
 			consent_persist_failed = 0,
 			consent_outbox_evicted = 0,
 			consent_outbox_persist_failed = 0,
+			-- ALARM CONDITION, NOT TELEMETRY. Non-zero does not mean "the
+			-- mechanism worked" — it means a retained consent record could not
+			-- be read, so a denial it may have carried was never delivered,
+			-- and the server acts on delivered denials (it refuses further
+			-- ingest for the actor, excludes them from audience exports, and
+			-- sweeps already-exported rows). Undelivered therefore means
+			-- PERSONAL DATA STILL HELD for an actor who may have refused.
+			--
+			-- It stays non-zero on EVERY launch while the set-aside slot is
+			-- held, not only the launch that filled it: a condition, not an
+			-- event. Only clearing the slot clears it.
+			consent_denial_possibly_undelivered = 0,
 			spooled = 0,
 			spool_resent = 0,
 			spool_evicted = 0,
@@ -858,6 +870,18 @@ function M.new(config)
 	-- round could re-find it.)
 	if outbox_err ~= nil then
 		client.consent_outbox_unreadable = true
+		-- Copy the damaged record aside BEFORE anything can rewrite it. This
+		-- does not deliver the denial and must not be read as if it did; it
+		-- makes a possible loss retained and countable instead of silent.
+		storage.set_aside_unreadable_outbox(normalized)
+	end
+	if storage.holds_unaccounted_outbox(normalized) then
+		client.stats.consent_denial_possibly_undelivered = 1
+		client:diagnose({
+			scope = "consent",
+			status = "unaccounted",
+			code = "consent_denial_possibly_undelivered",
+		})
 	end
 	if outbox_err ~= nil and client.consent_state == "granted" then
 		-- FAIL CLOSED on the granted restore, exactly as the unreadable

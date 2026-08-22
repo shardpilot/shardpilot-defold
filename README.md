@@ -385,6 +385,29 @@ per-app spool and re-sends them on a later launch. Enabled by default
   read and releases the rotation. Flushing, waiting and retrying will not
   clear it — nothing is pending to drain. Re-asserting the id already in
   force is a no-op and is never refused.
+
+  **`stats.consent_denial_possibly_undelivered` is an alarm condition, not a
+  metric — watch it.** Non-zero does not mean "the mechanism worked". It means a
+  retained consent record on this device could not be read, so a refusal it may
+  have carried was never delivered. The server acts on delivered refusals: it
+  stops accepting that actor's events, excludes them from audience exports, and
+  sweeps rows already exported. A refusal that never arrives therefore leaves
+  personal data in place for someone who may have withdrawn consent.
+
+  It stays non-zero on **every** launch while the damaged record is held aside,
+  not only the launch that first saw it — a condition, not an event, so a
+  non-zero value cannot be missed by whoever was not watching that boot. The
+  same condition is surfaced through the `diagnostics` hook with status
+  `unaccounted` and code `consent_denial_possibly_undelivered`.
+
+  This SDK cannot raise the alarm for you: its stats never leave the device.
+  Route the hook (or the counter) into whatever you already page on.
+
+  What the SDK does with the damaged record is keep it, verbatim, in one
+  set-aside slot per scope so it is not destroyed by ordinary outbox
+  maintenance. That buys **visibility, not delivery** — nothing reads those
+  bytes back into the trail. Treat a non-zero value as an open item, not a
+  resolved one.
 - Permanent `4xx` rejects are **never** spooled — they would fail forever.
 
 **Resend.** On the next `init`/`new`, spooled envelopes are re-sent through

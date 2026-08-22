@@ -7758,6 +7758,50 @@ local tests = {
 	test_same_second_regrant_outranks_undelivered_denial,
 	test_stale_denial_marker_never_beats_newer_grant,
 	test_unreadable_marker_fail_closed_stays_transient,
+	-- Declared inline rather than as `local function`: Lua caps a chunk at 200
+	-- locals and this file sits at the ceiling.
+	--
+	-- THE DAMAGED RECORD IS SET ASIDE, AND THE ALARM IS A CONDITION. The copy
+	-- delivers nothing -- nothing reads those bytes back -- so what it buys is
+	-- that a possible denial becomes retained and countable instead of silently
+	-- destroyed. The counter therefore has to read non-zero on EVERY later
+	-- launch while the slot is held, not only on the one that filled it: an
+	-- event would be missed by anyone who was not watching that boot.
+	function()
+	reset()
+	storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-set-aside",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-07T00:00:00Z",
+		consent_decision_seq = 1,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	for path, record in pairs(stores) do
+		if path:sub(-15) == "/consent-outbox" then
+			record.receipts = { "this-entry-is-not-a-table" }
+		end
+	end
+	storage.reset()
+	local first = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(first.stats.consent_denial_possibly_undelivered, 1,
+		"a record that could not be read raises the undelivered-denial condition")
+	assert_true(storage.holds_unaccounted_outbox(identity_scope),
+		"and the damaged record is held aside rather than dropped")
+	assert_true(first:shutdown() ~= nil, "teardown runs")
+
+	-- SECOND LAUNCH with a perfectly readable outbox: the condition must STILL
+	-- hold, because the possible denial is still undelivered.
+	reset()
+	storage.reset()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	local second = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(second.stats.consent_denial_possibly_undelivered, 1,
+		"the condition survives a launch where nothing is wrong -- it is not an event")
+	restore()
+	storage.reset()
+	end,
 	-- Declared inline rather than as `local function`: Lua caps a chunk at
 	-- 200 locals and this file sits at the ceiling, so one more top-level
 	-- local breaks the 5.4 job while 5.1/LuaJIT still pass. The limit is per

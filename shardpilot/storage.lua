@@ -1234,6 +1234,55 @@ end
 -- and a destroyed denial trail were the same value. The cache/spool loaders
 -- deliberately KEEP that degrade-to-empty behaviour: losing a cached event
 -- costs an event, while losing a denial costs a refusal the user made.
+-- Set the unreadable outbox record aside, verbatim, under its own name, so the
+-- salvage-then-rewrite path cannot destroy it.
+--
+-- THIS BUYS VISIBILITY, NOT DELIVERY, and the distinction is the point. Nothing
+-- reads these bytes back into the trail: an unreadable entry has no extractable
+-- idempotency key and no readable decided_at, and this store is whole-document,
+-- so an unparseable byte anywhere makes the WHOLE record unreadable rather than
+-- one entry of it. What the copy does is turn "a possible denial was silently
+-- destroyed" into "a possible denial is retained and countable".
+--
+-- BOUNDED BY CONSTRUCTION: exactly one slot per scope. A second corruption
+-- keeps the FIRST — the older record has had longer to hold an undelivered
+-- denial — and only bumps the count. No lifetime machinery, nothing to expire.
+function M.set_aside_unreadable_outbox(scope)
+	local ns = spool_namespace(scope)
+	local kept = save_path(ns, "consent-outbox-unaccounted")
+	local damaged = save_path(ns, "consent-outbox")
+	if not kept or not damaged then
+		return false
+	end
+	local held_ok, held = pcall(sys.load, kept)
+	if held_ok and type(held) == "table" and next(held) ~= nil then
+		-- A slot is already held: never overwrite it, for the reason above.
+		return false
+	end
+	local raw_ok, raw = pcall(sys.load, damaged)
+	-- The record is unreadable BY DEFINITION here, so `raw` is usually nil or
+	-- not a table. Store what the read produced plus the fact that it could not
+	-- be understood: an empty forensic record still says "something was here
+	-- and this build could not read it".
+	local record = {
+		unreadable = true,
+		observed = (raw_ok and type(raw) == "table") and raw or nil,
+	}
+	local ok, saved = pcall(sys.save, kept, record)
+	return ok and saved == true
+end
+
+-- True while a set-aside unreadable record is held for this scope.
+function M.holds_unaccounted_outbox(scope)
+	local ns = spool_namespace(scope)
+	local path = save_path(ns, "consent-outbox-unaccounted")
+	if not path then
+		return false
+	end
+	local ok, record = pcall(sys.load, path)
+	return ok and type(record) == "table" and next(record) ~= nil
+end
+
 function M.load_consent_outbox(scope)
 	local ns = spool_namespace(scope)
 	local record = nil
