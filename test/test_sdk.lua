@@ -10352,4 +10352,154 @@ end)()
 	storage.reset()
 end)()
 
+-- SUPERSEDING AN UNREADABLE TRAIL IS RECORDED, AND THE WITNESS IS ITS OWN
+-- FIELD. An explicit act by the subject performed NOW supersedes a state we
+-- could not read; a default, an inference and a silent restart never do. The
+-- boot belt is not an exception -- what supersedes there is a RECEIPT, an
+-- explicit act of the subject that we can READ -- but it was performed EARLIER,
+-- and a consent record that cannot tell a fresh choice from an inference over
+-- old evidence carries no provenance at the one moment it most needs some.
+--
+-- Leading `;`: the statement above ends in `end)()` and Lua would otherwise
+-- read the `(` opening this block as its argument list.
+;(function()
+	local function identity_path(stores)
+		for path in pairs(stores) do
+			if path:sub(-9) == "/identity" then return path end
+		end
+	end
+	local function outbox_path(stores)
+		for path in pairs(stores) do
+			if path:sub(-15) == "/consent-outbox" then return path end
+		end
+	end
+	local function receipt(key, at, analytics, anon)
+		return {
+			idempotency_key = key,
+			workspace_id = "workspace-example", app_id = "app-example",
+			environment_id = "develop", actor_identifier = anon,
+			kind = "anon", decided_at = at,
+			categories = { analytics = analytics }, anonymous_id = anon,
+		}
+	end
+
+	-- A. THE SUBJECT ACTS NOW -> witness "decision", stamped with the ACT.
+	reset(); storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-supersede",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope,
+		{ receipt("sup-seed", "2026-07-01T00:00:00.000Z", true, "anon-supersede") }) ~= false)
+	local opath = outbox_path(stores)
+	stores[opath] = "garbage"
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-supersede", flush_interval_seconds = 9999 })))
+	assert_true(client.consent_unreadable_imposed,
+		"the fixture must REACH its subject: an unreadable trail imposes")
+	local ipath = identity_path(stores)
+	assert_equal(stores[ipath].consent_superseded_unreadable_by, nil,
+		"nothing is recorded while the imposition merely STANDS -- it superseded nothing")
+	assert_true(client:set_consent(false))
+	assert_equal(stores[ipath].consent_superseded_unreadable_by, "decision",
+		"an act performed NOW is witnessed as a decision")
+	assert_equal(stores[ipath].consent_superseded_unreadable_at,
+		client.consent_decided_at)
+	assert_true(stores[ipath].consent_superseded_unreadable_at
+		~= "2026-07-01T00:00:00.000Z",
+		"and is stamped with the ACT, never with the record it replaced")
+
+	-- B. THE FACT SURVIVES THE RESTART IT DESCRIBES, and an unrelated rewrite.
+	local first_at = stores[ipath].consent_superseded_unreadable_at
+	stores[opath] = nil
+	reset(); storage.reset()
+	local relaunch = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-supersede", flush_interval_seconds = 9999 })))
+	assert_equal(relaunch.consent_unreadable_imposed, false,
+		"the trail is gone, so this boot imposes nothing -- any fact below is READ BACK")
+	assert_equal(relaunch.consent_superseded_unreadable_by, "decision",
+		"the witness came off the record, not off this boot")
+	assert_true(relaunch:set_consent(true))
+	assert_equal(stores[ipath].consent_superseded_unreadable_at, first_at,
+		"a later write re-emits the ORIGINAL supersession rather than restamping it")
+	assert_equal(stores[ipath].consent_superseded_unreadable_by, "decision")
+	assert_equal(stores[ipath].consent_analytics, "granted",
+		"and the later write really landed -- otherwise the line above proves nothing")
+	restore(); storage.reset()
+
+	-- C. THE BELT READS AN EARLIER ACT -> witness "receipt", never "decision".
+	--    The imposition comes from an unreadable MARKER so the outbox stays
+	--    readable and the belt has a receipt to find.
+	reset(); storage.reset()
+	local bstores, brestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-belt-sup",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope,
+		{ receipt("belt-sup", "2026-07-02T00:00:00.000Z", false, "anon-belt-sup") }) ~= false)
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", anonymous_id = "anon-belt-sup",
+		decided_at = "2026-07-02T00:00:00.000Z", decision_seq = 1,
+	}))
+	for path in pairs(bstores) do
+		if path:sub(-15) == "/consent-denial" then bstores[path] = "garbage" end
+	end
+	storage.reset()
+	local belt = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-belt-sup", flush_interval_seconds = 9999 })))
+	local bpath = identity_path(bstores)
+	assert_equal(bstores[bpath].consent_superseded_unreadable_by, "receipt",
+		"an act read from durable evidence is NOT an act performed now")
+	assert_equal(bstores[bpath].consent_superseded_unreadable_at,
+		"2026-07-02T00:00:00.000Z",
+		"stamped with the receipt's own decision, not with this boot")
+	brestore(); storage.reset()
+
+	-- D. NO IMPOSITION, NO FACT -- shown reaching its subject.
+	reset(); storage.reset()
+	local pstores, prestore = install_stub_sys_storage()
+	local plain = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-plain", flush_interval_seconds = 9999 })))
+	assert_true(plain:set_consent(false))
+	local ppath = identity_path(pstores)
+	assert_equal(pstores[ppath].consent_analytics, "denied",
+		"the write REALLY happened -- otherwise the two absences below prove nothing")
+	assert_equal(pstores[ppath].consent_superseded_unreadable_by, nil)
+	assert_equal(pstores[ppath].consent_superseded_unreadable_at, nil)
+	prestore(); storage.reset()
+
+	-- E. THE WITNESS IS A CLOSED SET OF TWO. An unlisted one is not adopted and
+	--    not re-persisted: one damaged file must not become a permanent claim
+	--    about provenance. An exclusion list would fail open on the third
+	--    witness somebody invents; this enumerates what is ACCEPTED.
+	reset(); storage.reset()
+	local cstores, crestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-closed",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+		consent_superseded_unreadable_at = "2026-07-09T00:00:00.000Z",
+		consent_superseded_unreadable_by = "guessed",
+	}))
+	storage.reset()
+	local closed = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-closed", flush_interval_seconds = 9999 })))
+	assert_equal(closed.consent_superseded_unreadable_by, nil,
+		"an unlisted witness is not adopted")
+	assert_equal(closed.consent_superseded_unreadable_at, nil,
+		"and neither is its timestamp -- the pair travels together or not at all")
+	assert_true(closed:set_consent(false))
+	local cpath = identity_path(cstores)
+	assert_equal(cstores[cpath].consent_analytics, "denied",
+		"the rewrite REALLY happened, so the absence below is a decision not a no-op")
+	assert_equal(cstores[cpath].consent_superseded_unreadable_by, nil,
+		"and the unlisted witness is not written back")
+	crestore(); storage.reset()
+end)()
+
 print("shardpilot defold lua tests passed")

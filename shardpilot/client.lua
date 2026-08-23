@@ -577,6 +577,25 @@ function M.new(config)
 			consent_decision_seq = math.floor(stored.consent_decision_seq)
 		end
 	end
+	-- THE SUPERSESSION SURVIVES THE RESTART IT DESCRIBES. Read back so a
+	-- later identity rewrite re-emits it rather than silently dropping the one
+	-- fact that says this record replaced evidence nobody could read.
+	--
+	-- The witness is validated against a CLOSED SET of two, not against
+	-- "non-empty string". An open read admits whatever a corrupted or
+	-- hand-edited record happens to hold and then re-persists it, which turns
+	-- one damaged file into a permanent claim about provenance -- and the
+	-- accepted set is the thing that must be enumerated, because an
+	-- exclusion list fails open the moment a third witness is invented.
+	local consent_superseded_unreadable_at = nil
+	local consent_superseded_unreadable_by = nil
+	if type(stored.consent_superseded_unreadable_at) == "string"
+		and stored.consent_superseded_unreadable_at ~= ""
+		and (stored.consent_superseded_unreadable_by == "decision"
+			or stored.consent_superseded_unreadable_by == "receipt") then
+		consent_superseded_unreadable_at = stored.consent_superseded_unreadable_at
+		consent_superseded_unreadable_by = stored.consent_superseded_unreadable_by
+	end
 	-- WRITE-AHEAD DENIAL MARKER: a denied-state set_consent writes this small
 	-- witness BEFORE the identity write and retires it only once the record
 	-- durably holds the decision — so a denial whose identity persist failed
@@ -739,6 +758,8 @@ function M.new(config)
 		-- can never be written down; the arms that supersede it -- the
 		-- belt's concrete denial, an explicit fresh decision -- clear it.
 		consent_unreadable_imposed = restored_state ~= nil,
+		consent_superseded_unreadable_at = consent_superseded_unreadable_at,
+		consent_superseded_unreadable_by = consent_superseded_unreadable_by,
 		anonymous_id_regenerated = anonymous_id_regenerated,
 		consent_restored_state = restored_state,
 		consent_restored_decided_at = restored_decided_at,
@@ -1129,6 +1150,25 @@ function M.new(config)
 			-- imposition, so the shadow ends here: from now on identity
 			-- writes persist this denial, which is exactly what should be
 			-- written down.
+			--
+			-- THIS IS NOT AN EXCEPTION TO "a silent restart never supersedes",
+			-- and the distinction is worth stating because a later reader
+			-- finding a boot path that clears an imposition will otherwise
+			-- either copy it or delete it. What supersedes here is not the
+			-- restart and not a default: it is a RECEIPT, which is an explicit
+			-- act of the subject that we can read, compared by its own
+			-- (stamp, seq) against the restored record's. The restart merely
+			-- occasioned the comparison. It also moves in one direction only --
+			-- the belt looks for a stale DENIAL under a restored grant -- so
+			-- the worst it can do is refuse analytics the subject may have
+			-- allowed, never the reverse.
+			--
+			-- Recorded with `receipt` as the witness, never `decision`: this
+			-- act was performed EARLIER and merely read now, and the audit
+			-- distinction between that and a fresh choice is the whole content
+			-- of the rule.
+			client.consent_superseded_unreadable_at = stale_denial.decided_at
+			client.consent_superseded_unreadable_by = "receipt"
 			client.consent_unreadable_imposed = false
 			-- consent_outbox_unreadable is deliberately NOT cleared here. The
 			-- belt learned one thing — this readable receipt outranks the
@@ -1569,6 +1609,20 @@ function Client:persist_identity()
 			record.consent_decided_at = decided_at
 			record.consent_decision_seq = decision_seq or 0
 		end
+	end
+	-- The supersession rides EVERY identity write, exactly like the subject
+	-- id below and for the same reason: an unrelated rewrite (an anon
+	-- rotation, an experiments subject-id persist) must not drop a fact the
+	-- record already carried. It is written OUTSIDE the state branch above --
+	-- a supersession is a fact about the record's PROVENANCE, and gating it on
+	-- the state would drop it for the one state that does not persist a
+	-- consent key.
+	if type(self.consent_superseded_unreadable_at) == "string"
+		and self.consent_superseded_unreadable_at ~= ""
+		and (self.consent_superseded_unreadable_by == "decision"
+			or self.consent_superseded_unreadable_by == "receipt") then
+		record.consent_superseded_unreadable_at = self.consent_superseded_unreadable_at
+		record.consent_superseded_unreadable_by = self.consent_superseded_unreadable_by
 	end
 	-- The experiments subject id rides the identity record whenever one is
 	-- held — including when the experiments flag is currently off — so an
@@ -2129,6 +2183,24 @@ function Client:set_consent(decision)
 	self.consent_decision_seq = math.max(self.consent_seq_floor or 0,
 		self.consent_decision_seq or 0) + 1
 	self.consent_seq_floor = self.consent_decision_seq
+	if self.consent_unreadable_imposed then
+		-- THE SUPERSESSION IS RECORDED, not just performed. Without this the
+		-- successor record is indistinguishable from one written by a client
+		-- that never met an unreadable trail, and the one moment a consent
+		-- record most needs provenance -- the moment it replaced evidence
+		-- nobody could read -- is the moment it carries none.
+		--
+		-- The WITNESS is a separate field from the timestamp because they are
+		-- separate facts. "The subject decided just now" and "an older receipt
+		-- was found to outrank the restored record" are both supersessions of
+		-- an unreadable state and they carry different weight: only the first
+		-- is an act performed NOW. Folded onto one channel, a reader auditing
+		-- the record could not tell a fresh choice from an inference over old
+		-- evidence -- which is the distinction the rule this implements is
+		-- entirely made of.
+		self.consent_superseded_unreadable_at = self.consent_decided_at
+		self.consent_superseded_unreadable_by = "decision"
+	end
 	-- An explicit decision ENDS any unreadable-evidence imposition: from here
 	-- the in-memory state is the user's own choice and persists as itself.
 	-- Without this the shadow would outlive its cause and every later identity
