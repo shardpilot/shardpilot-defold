@@ -858,6 +858,12 @@ function M.new(config)
 	-- until the engine itself restarts.
 	storage.begin_consent_outbox_session(normalized)
 	client.consent_outbox, outbox_err = storage.load_consent_outbox(normalized)
+	-- A DEBT ANOTHER CLIENT LEFT IS THIS CLIENT'S TOO. The resolution is shared
+	-- across `sdk.new` for one app scope, so a receipt accepted into it whose
+	-- write failed is retained in memory and owed on disk -- and a client that
+	-- did not adopt the debt treats it as durably retained, letting shutdown
+	-- complete and a process exit lose the decision.
+	client.consent_outbox_dirty = storage.consent_outbox_owed(normalized)
 	-- TWO different facts, and only one is about the restored state. PRESERVING
 	-- THE EVIDENCE is unconditional: a trail that could not be read must not be
 	-- replaced by its salvageable subset whatever the record says, because a
@@ -1039,9 +1045,9 @@ function M.new(config)
 					dropped_keys[#dropped_keys + 1] = client.consent_outbox[i].idempotency_key
 				end
 			end
-			local ok, reason = storage.drop_consent_receipts(client.config, dropped_keys,
-				client:outbox_write_held())
-			client:record_outbox_op(ok, reason, nil)
+			local ok, reason, capped_out = storage.drop_consent_receipts(client.config,
+				dropped_keys, client:outbox_write_held())
+			client:record_outbox_op(ok, reason, capped_out)
 			client:diagnose({
 				scope = "consent",
 				status = "dropped",
@@ -3620,9 +3626,12 @@ function Client:remove_consent_receipt(idempotency_key)
 	-- distinguish this deliberate removal from a receipt the caller simply had
 	-- not seen, so the storage layer had to guess -- and guessing wrong here
 	-- restores an acknowledged receipt and re-sends it forever.
-	local ok, reason = storage.drop_consent_receipts(self.config, { idempotency_key },
-		self:outbox_write_held())
-	self:record_outbox_op(ok, reason, nil)
+	-- THE THIRD RESULT IS CAP EVICTIONS, not the intentional removal count --
+	-- capping an over-cap legacy record can discard undelivered receipts that
+	-- nobody asked to drop, and passing nil here made that silent.
+	local ok, reason, capped_out = storage.drop_consent_receipts(self.config,
+		{ idempotency_key }, self:outbox_write_held())
+	self:record_outbox_op(ok, reason, capped_out)
 end
 
 -- True when the durable consent outbox still RETAINS a denial-carrying

@@ -1368,7 +1368,7 @@ end
 function M.begin_consent_outbox_session(scope)
 	local ns = spool_namespace(scope)
 	local r = outbox_resolution[ns]
-	if r ~= nil and r.owed then
+	if r ~= nil and r.owed_reason == "write_failed" then
 		-- A RESOLUTION HOLDING UN-PERSISTED WORK IS NOT A CACHE, so a new
 		-- session may not replace it with whatever disk happens to say. Two
 		-- clients for one app scope share this resolution: discarding it here
@@ -1488,10 +1488,21 @@ local function outbox_write(ns, scope, receipts, withhold)
 	local r = outbox_resolution[ns]
 	if r ~= nil then
 		r.receipts = receipts
-		-- WHETHER DISK HOLDS WHAT THIS RESOLUTION HOLDS. Recorded because a
-		-- resolution carrying un-persisted work is NOT a cache of disk, and
-		-- anything that treats it as one may discard it.
-		r.owed = not durable
+		-- WHY DISK DOES NOT HOLD WHAT THIS RESOLUTION HOLDS -- not merely THAT
+		-- it does not. One boolean answered two questions that come apart in
+		-- exactly the case that matters:
+		--
+		--   "write_failed" -- the write was attempted and the store refused it.
+		--       Disk is BEHIND. Re-reading it loses work already accepted, and
+		--       nothing else can recover that work, so a session preserves this.
+		--   "held"         -- no write was attempted, because the trail is
+		--       unaccounted and the in-memory list is only its salvageable
+		--       subset. Disk is not behind, it is DELIBERATELY untouched. A new
+		--       session must re-read it: that recovery is the entire reason the
+		--       session boundary exists, and preserving this state instead made
+		--       every later client inherit the old unaccounted verdict until the
+		--       engine restarted.
+		r.owed_reason = durable and nil or (withhold and "held" or "write_failed")
 		if durable then
 			-- On disk, so the resolution describes disk -- the payload AND the
 			-- derived facts, or it keeps asserting something about a trail this
@@ -1607,6 +1618,15 @@ function M.flush_consent_outbox(scope, withhold)
 		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed"
 	end
 	return true
+end
+
+-- IS A DURABLE WRITE OUTSTANDING, and is it outstanding because the store
+-- refused one. A client constructed after another has already accepted work
+-- into this resolution has to adopt the debt with it: without that, its
+-- shutdown treats a memory-only receipt as durably retained and a process exit
+-- loses the decision.
+function M.consent_outbox_owed(scope)
+	return resolution_for(spool_namespace(scope), scope).owed_reason == "write_failed"
 end
 
 -- The retained receipts, as a COPY. The caller's mirror and the resolution are

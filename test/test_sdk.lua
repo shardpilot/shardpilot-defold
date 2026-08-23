@@ -8684,6 +8684,93 @@ local tests = {
 	assert_equal(#stores6[p6].receipts, 32,
 		"flush converges it as well -- the bound is a property of the record, not of one entry point")
 	restore6(); storage.reset()
+
+	-- K. THE REASON A WRITE IS OUTSTANDING DECIDES WHAT A SESSION DOES. One
+	--    boolean answered two questions that come apart exactly where it
+	--    matters: a REFUSED write means disk is behind and re-reading loses
+	--    accepted work; a WITHHELD one means disk is deliberately untouched and
+	--    re-reading is the recovery the session boundary exists for.
+	reset(); storage.reset()
+	local stores7, restore7 = install_stub_sys_storage()
+	assert_true(storage.append_consent_receipt(identity_scope, rec("held-case")))
+	-- a WITHHELD operation: no write attempted, disk deliberately untouched
+	local okh = storage.drop_consent_receipts(identity_scope, { "held-case" }, true)
+	assert_equal(okh, false, "withheld, so it reports no durable write")
+	assert_true(not storage.consent_outbox_owed(identity_scope),
+		"but nothing is OWED -- no write was refused, one was declined")
+	storage.begin_consent_outbox_session(identity_scope)
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 1,
+		"and the session RE-RESOLVES, which is the recovery it exists for")
+	restore7(); storage.reset()
+
+	-- L. A DEBT ANOTHER CLIENT LEFT IS THIS CLIENT'S TOO. Without adopting it,
+	--    a second client treats a memory-only receipt as durably retained and
+	--    lets shutdown complete -- a process exit then loses the decision.
+	reset(); storage.reset()
+	local stores8, restore8 = install_stub_sys_storage()
+	local first = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	local real_save8 = sys.save
+	sys.save = function() return false end
+	-- THE RECEIPT MUST NAME THIS CLIENT'S OWN ACTOR, or the boot identity filter
+	-- drops it as unsendable -- correctly -- and the debt disappears with it.
+	-- The first fixture named a foreign actor and tested that filter instead.
+	-- `user_verified` is the one kind the boot identity filter keeps
+	-- unconditionally. An anon receipt is filtered out by any client whose
+	-- generated id differs -- correctly -- and the debt disappears with it, so a
+	-- fixture built on one tests that filter instead of this adoption.
+	local mine = rec("memory-only")
+	mine.kind = "user_verified"
+	mine.actor_identifier = "user-example"
+	mine.anonymous_id = nil
+	assert_equal(storage.append_consent_receipt(identity_scope, mine), false)
+	sys.save = real_save8
+	assert_true(storage.consent_outbox_owed(identity_scope), "the debt is real and recorded")
+	local second = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	-- ASSERT THE CONSEQUENCE, not the flag. Adopting the debt is what makes the
+	-- init-time retry run at all, and once it runs the write succeeds and the
+	-- flag clears -- legitimately. What must be true either way is that the
+	-- receipt is no longer memory-only: a client that started clean over
+	-- somebody else's owed write never retries, and a process exit then loses
+	-- the decision. My first version asserted the flag and failed on the fix
+	-- working.
+	local p8
+	for p in pairs(stores8) do if p:sub(-15) == "/consent-outbox" then p8 = p end end
+	local on_disk8 = {}
+	for _, r in ipairs((stores8[p8] or { receipts = {} }).receipts) do
+		on_disk8[r.idempotency_key] = true
+	end
+	assert_true(on_disk8["memory-only"],
+		"the adopted debt was discharged: the receipt reached disk instead of dying with the process")
+	assert_true(first ~= nil)
+	restore8(); storage.reset()
+
+	-- M. A CAP EVICTION DURING A DROP IS STILL AN EVICTION. Acknowledging one
+	--    receipt can discard several others nobody asked to drop, and the
+	--    intentional removal count is a different number entirely.
+	reset(); storage.reset()
+	local issues2 = {}
+	local stores9, restore9 = install_stub_sys_storage()
+	local c9 = assert(sdk.new(config_mode_a({
+		flush_interval_seconds = 9999,
+		diagnostics = function(i) issues2[#issues2 + 1] = i end,
+	})))
+	local p9
+	assert_true(storage.append_consent_receipt(identity_scope, rec("seed9")))
+	for p in pairs(stores9) do if p:sub(-15) == "/consent-outbox" then p9 = p end end
+	local big = {}
+	for i = 1, 40 do big[i] = rec("legacy-" .. i) end
+	stores9[p9] = { receipts = big }
+	storage.reset()
+	-- THROUGH THE CALL SITE, not by handing the count to the reporter directly.
+	-- A first version called `record_outbox_op` itself and left the forwarding
+	-- in `remove_consent_receipt` unobserved -- the mutant that drops it stayed
+	-- green, which by this repo's standard makes that fix a claim.
+	c9.consent_outbox = storage.consent_outbox_receipts(identity_scope)
+	c9:remove_consent_receipt("legacy-1")
+	assert_equal(c9:snapshot().consent_outbox_evicted, 7,
+		"capping 39 down to 32 discarded seven nobody asked to drop, and they are counted")
+	assert_equal(issues2[#issues2].code, "outbox_overflow")
+	restore9(); storage.reset()
 	end,
 }
 
