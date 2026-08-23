@@ -1046,7 +1046,7 @@ function M.new(config)
 				end
 			end
 			local ok, reason, capped_out = storage.drop_consent_receipts(client.config,
-				dropped_keys, client:outbox_write_held())
+				dropped_keys)
 			client:record_outbox_op(ok, reason, capped_out)
 			client:diagnose({
 				scope = "consent",
@@ -2136,6 +2136,10 @@ function Client:set_consent(decision)
 	-- taken.
 	self.consent_unreadable_imposed = false
 	self.consent_outbox_unreadable = false
+	-- AND THE SHARED TRAIL'S HOLD ENDS WITH IT. The client's own flag is no
+	-- longer the whole fact: two clients for one scope share the resolution, so
+	-- a hold cleared only here would leave the other one still withholding.
+	storage.supersede_consent_outbox_hold(self.config)
 	self.consent_restored_state = nil
 	self.consent_restored_decided_at = nil
 	self.consent_restored_decision_seq = 0
@@ -3611,7 +3615,7 @@ end
 -- salvageable subset over it destroys that evidence with an ordinary
 -- acknowledgment rather than with anything resembling a decision.
 function Client:flush_consent_outbox()
-	local ok, reason = storage.flush_consent_outbox(self.config, self:outbox_write_held())
+	local ok, reason = storage.flush_consent_outbox(self.config)
 	return self:record_outbox_op(ok, reason, nil)
 end
 
@@ -3630,7 +3634,7 @@ function Client:remove_consent_receipt(idempotency_key)
 	-- capping an over-cap legacy record can discard undelivered receipts that
 	-- nobody asked to drop, and passing nil here made that silent.
 	local ok, reason, capped_out = storage.drop_consent_receipts(self.config,
-		{ idempotency_key }, self:outbox_write_held())
+		{ idempotency_key })
 	self:record_outbox_op(ok, reason, capped_out)
 end
 
@@ -3717,8 +3721,7 @@ function Client:send_consent_decision()
 	-- replaced existed because the mirror could alias the storage layer's
 	-- shadow; the resolution hands out copies now, so there is nothing to alias
 	-- and nothing for a call site to remember.
-	local ok, reason, evicted = storage.append_consent_receipt(self.config, payload,
-		self:outbox_write_held())
+	local ok, reason, evicted = storage.append_consent_receipt(self.config, payload)
 	self:record_outbox_op(ok, reason, evicted)
 	local attempted = self:try_send_consent_outbox()
 	if not attempted and not self.consent_send_in_flight then

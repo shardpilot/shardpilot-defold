@@ -8410,13 +8410,23 @@ local tests = {
 	-- C. WITHHELD skips the DISK write; the OPERATION still happens. Refusing
 	--    both would leave a caller re-sending a receipt the server already
 	--    accepted, forever, because its mirror could never lose it.
-	local okw, whyw = storage.drop_consent_receipts(identity_scope, { "b" }, true)
+	--
+	--    The hold is set up on the TRAIL rather than passed as an argument: it
+	--    is the state of a shared object, and a caller-supplied one let a client
+	--    with a stale view write over a trail another client was protecting.
+	-- a trail that is unaccounted AND still holds a salvageable receipt: the
+	-- shadow must not answer for it, so the process memory is cleared first.
+	stores2[opath(stores2)] = { receipts = { rec("b"), "an entry this build cannot read" } }
+	storage.reset()
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 1, "one salvageable receipt")
+	local okw, whyw = storage.drop_consent_receipts(identity_scope, { "b" })
 	assert_equal(okw, false)
 	assert_equal(whyw, "consent_outbox_held")
 	assert_true(not keys_of()["b"], "the drop applied in memory")
 	local on_disk = stores2[opath(stores2)]
-	assert_true(on_disk ~= nil and #on_disk.receipts == 1,
-		"and disk still holds what it held -- the WRITE was withheld, not the operation")
+	assert_true(on_disk ~= nil and #on_disk.receipts == 2
+			and on_disk.receipts[2] == "an entry this build cannot read",
+		"and disk is UNTOUCHED, damaged entry and all -- the WRITE was withheld, not the operation")
 	restore2(); storage.reset()
 
 	-- D. RECEIPTS ARE COPIES.
@@ -8694,7 +8704,11 @@ local tests = {
 	local stores7, restore7 = install_stub_sys_storage()
 	assert_true(storage.append_consent_receipt(identity_scope, rec("held-case")))
 	-- a WITHHELD operation: no write attempted, disk deliberately untouched
-	local okh = storage.drop_consent_receipts(identity_scope, { "held-case" }, true)
+	local hp
+	for p in pairs(stores7) do if p:sub(-15) == "/consent-outbox" then hp = p end end
+	stores7[hp] = { receipts = { rec("held-case"), "an entry this build cannot read" } }
+	storage.reset()
+	local okh = storage.drop_consent_receipts(identity_scope, { "held-case" })
 	assert_equal(okh, false, "withheld, so it reports no durable write")
 	assert_true(not storage.consent_outbox_owed(identity_scope),
 		"but nothing is OWED -- no write was refused, one was declined")
@@ -8771,6 +8785,32 @@ local tests = {
 		"capping 39 down to 32 discarded seven nobody asked to drop, and they are counted")
 	assert_equal(issues2[#issues2].code, "outbox_overflow")
 	restore9(); storage.reset()
+
+	-- N. THE HOLD BELONGS TO THE TRAIL, NOT TO A CLIENT. Two clients for one
+	--    scope share the resolution, so a hold taken from one client's flag let
+	--    the OTHER write over a trail it was protecting.
+	reset(); storage.reset()
+	local stores10, restore10 = install_stub_sys_storage()
+	local p10
+	assert_true(storage.append_consent_receipt(identity_scope, rec("seed10")))
+	for p in pairs(stores10) do if p:sub(-15) == "/consent-outbox" then p10 = p end end
+	stores10[p10] = { receipts = {
+		rec("undelivered-1"), rec("undelivered-2"), "an entry this build cannot read",
+	} }
+	storage.reset()
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 2, "two salvageable receipts")
+	-- a caller that believes the trail is fine cannot make it so
+	local okn = storage.drop_consent_receipts(identity_scope, { "undelivered-1" })
+	assert_equal(okn, false, "the write is withheld from the trail's state, not the caller's view")
+	assert_equal(#stores10[p10].receipts, 3,
+		"so no caller can save its shorter list over the undelivered receipts")
+
+	-- and an explicit decision ENDS the hold, on the trail, for every client
+	storage.supersede_consent_outbox_hold(identity_scope)
+	assert_true(storage.drop_consent_receipts(identity_scope, { "undelivered-2" }),
+		"after a decision supersedes it, writes land again")
+	assert_true(#stores10[p10].receipts < 3, "and the record is rewritten")
+	restore10(); storage.reset()
 	end,
 }
 

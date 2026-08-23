@@ -1522,9 +1522,22 @@ end
 -- receipt that carries a DENIAL. That last refusal is the point of the cap
 -- policy rather than an edge of it: a recorded denial outranks a grant, so a
 -- grant that cannot fit is refused rather than admitted at a denial's expense.
-function M.append_consent_receipt(scope, receipt, withhold)
+-- THE HOLD IS A FACT ABOUT THE TRAIL, and the trail is what storage owns -- so
+-- it is DERIVED here rather than passed in. Passing it was wrong for a reason
+-- worth stating, because "policy belongs to the caller" is otherwise right: the
+-- hold is not a policy about the CALLER's view, it is the state of a shared
+-- object. Two clients for one scope share this resolution, so a `withhold` taken
+-- from one client's stale flag let it write over a trail the other was
+-- protecting -- client A dispatching a full trail, client B replacing the shared
+-- resolution with an empty unaccounted one after a transient read failure, and
+-- A's acknowledgment then saving that empty list over every undelivered receipt.
+--
+-- What the caller does own is the DECISION that ends a hold, and that is
+-- `supersede_consent_outbox_hold` below.
+function M.append_consent_receipt(scope, receipt)
 	local ns = spool_namespace(scope)
 	local r = resolution_for(ns, scope)
+	local withhold = outbox_unaccounted(r)
 	local one = sanitize_outbox_entries({ receipt })
 	if #one ~= 1 then
 		return false, "consent_outbox_invalid"
@@ -1576,9 +1589,10 @@ end
 -- storage is told, rather than inferring from a list it was handed.
 -- Keys that are not present are not an error -- the caller asking twice, or
 -- asking about a receipt another path already removed, is not a failure.
-function M.drop_consent_receipts(scope, keys, withhold)
+function M.drop_consent_receipts(scope, keys)
 	local ns = spool_namespace(scope)
 	local r = resolution_for(ns, scope)
+	local withhold = outbox_unaccounted(r)
 	local drop = {}
 	for i = 1, #keys do
 		drop[keys[i]] = true
@@ -1610,14 +1624,33 @@ end
 -- boundary, so none of the three facts a handed-over list confuses can arise --
 -- this is the owed-write retry, and the only question it answers is whether
 -- disk has caught up with what this process already decided.
-function M.flush_consent_outbox(scope, withhold)
+function M.flush_consent_outbox(scope)
 	local ns = spool_namespace(scope)
 	local r = resolution_for(ns, scope)
+	local withhold = outbox_unaccounted(r)
 	local capped = cap_existing(copy_outbox_entries(r.receipts))
 	if not outbox_write(ns, scope, capped, withhold) then
 		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed"
 	end
 	return true
+end
+
+-- AN EXPLICIT DECISION ENDS THE HOLD. The client already does this to its own
+-- view; the fact lives here now, so the clear has to land here too. It clears
+-- the OBSERVATIONS the hold rested on, not just a flag: leaving `silent` or
+-- `unusable` in place meant a resolution preserved for its write debt still
+-- reported a read error, so the next client marked the outbox unreadable and
+-- withheld every retry even after the store recovered -- and an offline grant
+-- receipt stayed memory-only while the persisted identity already said granted.
+--
+-- This is the IN-SESSION clear that exists on the client today, moved to where
+-- the fact now lives. Whether a fresh decision supersedes an unreadable trail
+-- ACROSS RESTARTS is a different question and is not answered here.
+function M.supersede_consent_outbox_hold(scope)
+	local r = resolution_for(spool_namespace(scope), scope)
+	r.state = "readable"
+	r.record_damaged = false
+	r.shadow_answered = true
 end
 
 -- IS A DURABLE WRITE OUTSTANDING, and is it outstanding because the store
