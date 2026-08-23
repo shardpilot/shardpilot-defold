@@ -1503,7 +1503,12 @@ function M.append_consent_receipt(scope, receipt, withhold)
 		evicted = evicted + 1
 	end
 	if not outbox_write(ns, scope, kept, withhold) then
-		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed"
+		-- THE EVICTION COUNT RIDES OUT ON BOTH PATHS. The cap has already
+		-- removed the entry from the in-memory list -- `outbox_write` applies
+		-- the operation whether or not disk takes it -- and a later flush
+		-- commits that permanently. Dropping the count here made capacity loss
+		-- silent for exactly the runs where a write was failing.
+		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed", evicted
 	end
 	return true, nil, evicted
 end
@@ -1528,9 +1533,14 @@ function M.drop_consent_receipts(scope, keys, withhold)
 			kept[#kept + 1] = r.receipts[i]
 		end
 	end
-	if removed == 0 then
-		return true, nil, 0
-	end
+	-- NO EARLY RETURN FOR A NO-OP. "Nothing to remove" and "disk already agrees"
+	-- are two facts, and returning success for the first cleared the caller's
+	-- debt for the second. Reachable: an over-capacity append whose write failed
+	-- evicts in memory and leaves the write owed; the acknowledged receipt's
+	-- callback then drops a key that is already gone, takes this path, and the
+	-- debt disappears -- so a process exit resurrects the old receipt from stale
+	-- disk and loses the new decision. The write costs one save and is the only
+	-- thing that makes the success it reports true.
 	if not outbox_write(ns, scope, kept, withhold) then
 		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed"
 	end

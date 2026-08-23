@@ -3339,13 +3339,21 @@ end
 -- cap and pure-grant predicate so this prediction and the eviction loop
 -- can never disagree.
 function Client:consent_outbox_denial_full()
-	local overflow = #self.consent_outbox + 1 - storage.max_consent_outbox_entries
+	-- ASKED OF THE LIST THE APPEND WILL SEE, not of this mirror. The two are
+	-- normally equal and are not required to be: another `sdk.new` for the same
+	-- app scope shares the resolution, so a mirror can be stale against it. A
+	-- pre-check on the stale one PASSES while the append REFUSES, and by then
+	-- the state has flipped -- a grant reported as granted whose receipt was
+	-- never retained and never dispatched, with events flowing locally against
+	-- a server that has no grant.
+	local held = storage.consent_outbox_receipts(self.config)
+	local overflow = #held + 1 - storage.max_consent_outbox_entries
 	if overflow < 1 then
 		return false
 	end
 	local evictable_grants = 0
-	for i = 1, #self.consent_outbox do
-		if storage.receipt_is_pure_grant(self.consent_outbox[i]) then
+	for i = 1, #held do
+		if storage.receipt_is_pure_grant(held[i]) then
 			evictable_grants = evictable_grants + 1
 			if evictable_grants >= overflow then
 				return false
@@ -3540,14 +3548,24 @@ function Client:outbox_write_held()
 	return self.consent_outbox_unreadable == true
 end
 
+-- A REFUSAL AND AN OWED WRITE ARE TWO FACTS, and `ok == false` was carrying
+-- both. `consent_outbox_full` and `consent_outbox_invalid` mean the operation
+-- was REFUSED -- nothing was accepted, so nothing is owed and a later flush has
+-- nothing to converge. `held` and `write_failed` mean the operation HAPPENED in
+-- memory and disk has not caught up, which is a debt. Marking a refusal as a
+-- debt let the next flush clear it and report success for a receipt that was
+-- never taken.
+local OUTBOX_REFUSALS = {
+	consent_outbox_full = true,
+	consent_outbox_invalid = true,
+}
+
 function Client:record_outbox_op(ok, reason, evicted)
 	self.consent_outbox = storage.consent_outbox_receipts(self.config)
-	if not ok then
-		self.stats.consent_outbox_persist_failed = self.stats.consent_outbox_persist_failed + 1
-		self.consent_outbox_dirty = true
-		return false, reason
-	end
-	self.consent_outbox_dirty = false
+	-- EVICTIONS ARE REPORTED ON BOTH PATHS. An append over capacity whose
+	-- durable write failed has ALREADY evicted in memory, and a later flush
+	-- commits that permanently -- so counting it only on success loses the one
+	-- signal capacity loss has.
 	if (evicted or 0) > 0 then
 		self.stats.consent_outbox_evicted = self.stats.consent_outbox_evicted + evicted
 		self:diagnose({
@@ -3557,6 +3575,14 @@ function Client:record_outbox_op(ok, reason, evicted)
 			count = evicted,
 		})
 	end
+	if not ok then
+		self.stats.consent_outbox_persist_failed = self.stats.consent_outbox_persist_failed + 1
+		if not OUTBOX_REFUSALS[reason] then
+			self.consent_outbox_dirty = true
+		end
+		return false, reason
+	end
+	self.consent_outbox_dirty = false
 	return true
 end
 
