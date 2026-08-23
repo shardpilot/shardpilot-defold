@@ -1234,51 +1234,157 @@ end
 -- and a destroyed denial trail were the same value. The cache/spool loaders
 -- deliberately KEEP that degrade-to-empty behaviour: losing a cached event
 -- costs an event, while losing a denial costs a refusal the user made.
-function M.load_consent_outbox(scope)
-	local ns = spool_namespace(scope)
-	local record = nil
-	local read_failed = false
-	local path = save_path(ns, "consent-outbox")
-	if path then
-		local ok, loaded = pcall(sys.load, path)
-		if ok and type(loaded) == "table" then
-			record = loaded
-		elseif not ok or loaded ~= nil then
-			-- Threw, or answered with something that is not a record. Note
-			-- `ok and loaded == nil` is NOT this case: that is the backend
-			-- answering cleanly with nothing, which is an absent file.
-			read_failed = true
-		end
+-- ── the outbox's state is RESOLVED ONCE, at load ────────────────────────────
+--
+-- The loader used to re-derive "can this trail be trusted" on every question,
+-- from a fresh read each time. A transient failure could therefore flip the
+-- answer mid-session: the same file read twice gave two verdicts, and every
+-- rule built on the second one silently disagreed with the first.
+--
+-- So the state is established ONCE per client session and everything else is a
+-- thin read of it. `begin_consent_outbox_session` is what starts a session;
+-- resolving once is scoped to a CLIENT, not to a process, because a module
+-- cache outlives the client and a second `sdk.new()` in one process would
+-- otherwise inherit the first one's verdict until the engine restarts.
+
+local CONSENT_OUTBOX_KEY = "consent-outbox"
+local outbox_resolution = {}
+
+-- FOUR STATES, because a store can fail in two ways that mean different things
+-- and one value cannot carry both:
+--
+--   "absent"   -- the store replied, and there is nothing here.
+--   "readable" -- the store replied with a record this build understands.
+--   "unusable" -- the store REPLIED, and what came back is not a record.
+--   "silent"   -- the store did not reply at all: the read threw.
+--
+-- The last two used to share one value with the discriminator returned
+-- alongside, for every caller to remember to read. They do not mean the same
+-- thing to an operator -- one says look at the file, the other says look at the
+-- device -- so they are not one value.
+--
+-- Having no durable backend at all is NOT a fifth state: that is a different
+-- question and `consent_outbox_is_durable` already answers it.
+local function read_outbox_key(ns, key)
+	local path = save_path(ns, key)
+	if not path then
+		return "absent", nil
+	end
+	local ok, record = pcall(sys.load, path)
+	if not ok then
+		return "silent", nil
 	end
 	if record == nil then
-		local shadow = consent_outbox_memory[ns]
-		if type(shadow) == "table" then
-			-- A shadow written by a successful save THIS session answers for
-			-- the trail, exactly as the marker loader lets one do: the
-			-- process knows what it wrote even when the file will not read.
-			record = shadow
-			read_failed = false
-		end
+		return "absent", nil
 	end
 	if type(record) ~= "table" then
-		if read_failed then
-			return {}, "consent_outbox_read_failed"
-		end
-		return {}, nil
+		return "unusable", nil
 	end
-	if record.receipts == nil and next(record) ~= nil then
-		-- An ABSENT file loads as an empty table here, which is why a missing
-		-- receipts key normally means "honestly empty". A NONEMPTY record
-		-- without the one payload key it is supposed to carry is not an absent
-		-- file: it is a record this build cannot make sense of, and what it
-		-- held may have been a denial.
-		return {}, "consent_outbox_read_failed"
+	if next(record) == nil then
+		-- An absent file loads as an empty table on this backend.
+		return "absent", nil
 	end
-	local entries, dropped = sanitize_outbox_entries(record.receipts)
-	if read_failed or dropped > 0 then
-		return entries, "consent_outbox_read_failed"
+	return "readable", record
+end
+
+-- Copies, never the list itself. Handing out `r.receipts` made the caller's
+-- mirror and the resolution the SAME table, so every mirror mutation silently
+-- edited the resolution and the two could not disagree even where they should.
+-- Entries are shared deliberately: `sanitize_outbox_entries` builds a fresh
+-- table per receipt and nothing mutates one in place.
+local function copy_outbox_entries(entries)
+	local out = {}
+	for i = 1, #entries do
+		out[i] = entries[i]
 	end
-	return entries, nil
+	return out
+end
+
+-- Everything below is DERIVED from the observations the resolution stores,
+-- computed on demand rather than stamped at resolve time. A stamped conclusion
+-- goes stale at every later site that changes one of its inputs, and the sites
+-- that change an input are exactly the sites that perform a READ.
+local function outbox_unaccounted(r)
+	if r.shadow_answered then
+		-- This process wrote this trail itself, so nothing about it is
+		-- unaccounted however badly the read path is behaving.
+		return false
+	end
+	return r.state == "unusable" or r.state == "silent" or r.record_damaged
+end
+
+-- What an operator should go and look at: the FILE, or the DEVICE. "store" only
+-- when the store never replied; "record" whenever it DID reply and the reply
+-- cannot be used. nil when nothing is unaccounted.
+local function outbox_cause(r)
+	if not outbox_unaccounted(r) then
+		return nil
+	end
+	if r.state == "silent" then
+		return "store"
+	end
+	return "record"
+end
+
+function M.resolve_consent_outbox(scope)
+	local ns = spool_namespace(scope)
+	local state, record = read_outbox_key(ns, CONSENT_OUTBOX_KEY)
+
+	local shadow_answered = false
+	if record == nil and type(consent_outbox_memory[ns]) == "table" then
+		-- A shadow written by a successful save THIS session answers for a read
+		-- that failed: the process knows what it wrote.
+		shadow_answered = true
+		record = consent_outbox_memory[ns]
+	end
+
+	local receipts, dropped = sanitize_outbox_entries(
+		type(record) == "table" and record.receipts or nil
+	)
+	-- A NONEMPTY RECORD WITH NO receipts KEY IS NOT AN EMPTY TRAIL. An absent
+	-- file is what loads as empty, which is why a missing key normally means
+	-- honestly empty; a record carrying something else is one this build cannot
+	-- make sense of, and what it held may have been a denial.
+	local shape_foreign = type(record) == "table"
+		and record.receipts == nil
+		and next(record) ~= nil
+
+	local resolution = {
+		-- OBSERVATIONS. Each changes only where a read happens.
+		state = state,
+		record_damaged = dropped > 0 or shape_foreign,
+		shadow_answered = shadow_answered,
+		receipts = receipts,
+	}
+	outbox_resolution[ns] = resolution
+	return resolution
+end
+
+local function resolution_for(ns, scope)
+	return outbox_resolution[ns] or M.resolve_consent_outbox(scope)
+end
+
+-- A SESSION, NOT A PROCESS. Called by the client at init, before the load.
+function M.begin_consent_outbox_session(scope)
+	outbox_resolution[spool_namespace(scope)] = nil
+end
+
+-- A THIN READ OF THE RESOLUTION, not a second reader. The three-valued contract
+-- is unchanged -- entries plus `consent_outbox_read_failed` -- but the judgement
+-- behind it is made once, where the read happened.
+function M.load_consent_outbox(scope)
+	local r = resolution_for(spool_namespace(scope), scope)
+	if outbox_unaccounted(r) then
+		return copy_outbox_entries(r.receipts), "consent_outbox_read_failed"
+	end
+	return copy_outbox_entries(r.receipts), nil
+end
+
+-- Diagnostic only, and deliberately NOT a fourth value of the loader's error:
+-- nothing behavioural distinguishes these, and what they DO distinguish is what
+-- an operator should go and look at, which belongs in the alarm's text.
+function M.consent_outbox_unaccounted_cause(scope)
+	return outbox_cause(resolution_for(spool_namespace(scope), scope))
 end
 
 -- Replace the persisted outbox with `receipts` (oldest first), enforcing the
@@ -1312,7 +1418,18 @@ function M.save_consent_outbox(scope, receipts)
 	if not write_consent_outbox(ns, kept) then
 		return nil
 	end
-	return kept
+	-- THE RESOLUTION NOW DESCRIBES WHAT IS ON DISK, BECAUSE THIS CALL PUT IT
+	-- THERE. Leaving it stale would trade "re-derivation flips a fact" for "the
+	-- resolution drifted from the disk it describes", which is the same class
+	-- facing the other way.
+	local r = outbox_resolution[ns]
+	if r ~= nil then
+		r.state = "readable"
+		r.record_damaged = false
+		r.shadow_answered = true
+		r.receipts = kept
+	end
+	return copy_outbox_entries(kept)
 end
 
 -- True when the outbox has a durable backend on this runtime (the save-file
@@ -1764,6 +1881,7 @@ function M.reset()
 	crash_settings_memory = {}
 	spool_memory = {}
 	consent_outbox_memory = {}
+	outbox_resolution = {}
 	remote_config_memory = {}
 	experiments_memory = {}
 	experiments_clear_memory = {}

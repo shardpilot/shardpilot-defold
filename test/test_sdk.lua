@@ -8204,6 +8204,112 @@ local tests = {
 	sdk.shutdown()
 	assert_equal(sdk.get_session_id(), nil, "after shutdown it is nil again")
 	end,
+	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
+	--
+	-- THE OUTBOX'S STATE IS RESOLVED ONCE, AND THE READ BEHIND IT HAS FOUR
+	-- ANSWERS. "The store did not reply" and "the store replied with something
+	-- unusable" used to be one value; they send an operator to different places,
+	-- so they are not one value.
+	function()
+	local function outbox_path(stores)
+		for path in pairs(stores) do
+			if path:sub(-15) == "/consent-outbox" then return path end
+		end
+	end
+	local function denial(key)
+		return {
+			idempotency_key = key,
+			workspace_id = "ws", app_id = "app", environment_id = "env",
+			actor_identifier = "anon-fv",
+			decided_at = "2026-07-09T00:00:00Z",
+			categories = { analytics = false },
+			anonymous_id = "anon-fv",
+		}
+	end
+
+	-- A. THE FOUR STATES, one assertion per fact, and the two that used to share
+	--    a value asserted against EACH OTHER rather than only against "clean".
+	reset(); storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, { denial("held") }))
+	local path = outbox_path(stores)
+	storage.reset()
+
+	-- readable
+	assert_equal(select(2, storage.load_consent_outbox(identity_scope)), nil,
+		"a record this build understands is not unaccounted")
+	assert_equal(storage.consent_outbox_unaccounted_cause(identity_scope), nil,
+		"and there is nothing to diagnose")
+
+	-- absent
+	stores[path] = nil; storage.reset()
+	assert_equal(select(2, storage.load_consent_outbox(identity_scope)), nil,
+		"an absent trail is honestly empty, not unaccounted")
+	assert_equal(storage.consent_outbox_unaccounted_cause(identity_scope), nil)
+
+	-- unusable: the store REPLIED, with something that is not a record
+	stores[path] = "garbage"; storage.reset()
+	assert_equal(select(2, storage.load_consent_outbox(identity_scope)),
+		"consent_outbox_read_failed", "an unusable reply is unaccounted")
+	assert_equal(storage.consent_outbox_unaccounted_cause(identity_scope), "record",
+		"and it names the RECORD: the store answered, so the device is fine")
+
+	-- silent: the store did not reply at all
+	stores[path] = { receipts = { denial("held") } }
+	storage.reset()
+	local real_load = sys.load
+	sys.load = function() error("the store does not reply") end
+	assert_equal(select(2, storage.load_consent_outbox(identity_scope)),
+		"consent_outbox_read_failed", "a silent store is unaccounted too")
+	assert_equal(storage.consent_outbox_unaccounted_cause(identity_scope), "store",
+		"but it names the STORE -- nothing was answered, so nothing accuses the file")
+	sys.load = real_load
+	restore(); storage.reset()
+
+	-- B. A SESSION IS NOT A PROCESS. One transient failure must not fail closed
+	--    for every later client until the ENGINE restarts -- which on a game
+	--    engine means until the editor is relaunched.
+	reset(); storage.reset()
+	local stores2, restore2 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, {}))
+	storage.reset()
+	local real_load2 = sys.load
+	sys.load = function(p)
+		if p:sub(-15) == "/consent-outbox" then error("this session cannot read it") end
+		return real_load2(p)
+	end
+	local client_a = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(client_a.consent_outbox_unreadable, true,
+		"the first session fails closed, correctly, while the read is failing")
+	assert_equal(client_a:snapshot().consent_denial_possibly_undelivered, 1,
+		"and the alarm fires: there may be undeleted data behind an unaccounted denial")
+	sys.load = real_load2
+	local client_b = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	assert_equal(client_b.consent_outbox_unreadable, nil,
+		"a NEW session re-reads: recovery must not require restarting the engine")
+	assert_equal(client_b:snapshot().consent_denial_possibly_undelivered, 0,
+		"and a healthy client reports ZERO, not nothing -- an alarm you cannot see is not one")
+	restore2(); storage.reset()
+
+	-- C. THE RESOLUTION HANDS OUT COPIES. Returning its own list made the
+	--    caller's mirror and the resolution the same table, so the two could not
+	--    disagree even where they should.
+	reset(); storage.reset()
+	local stores3, restore3 = install_stub_sys_storage()
+	assert_true(storage.save_consent_outbox(identity_scope, { denial("a"), denial("b") }))
+	storage.reset()
+	local first = storage.load_consent_outbox(identity_scope)
+	assert_equal(#first, 2)
+	table.remove(first)
+	assert_equal(#storage.load_consent_outbox(identity_scope), 2,
+		"mutating what the loader handed back leaves the resolution whole")
+	local returned = storage.save_consent_outbox(identity_scope, { denial("a"), denial("b"), denial("c") })
+	assert_equal(#returned, 3)
+	table.remove(returned)
+	assert_equal(#storage.load_consent_outbox(identity_scope), 3,
+		"and so does mutating what the write handed back")
+	restore3(); storage.reset()
+	end,
 }
 
 for _, test in ipairs(tests) do

@@ -670,6 +670,11 @@ function M.new(config)
 			observed = 0,
 			suppressed = 0,
 			consent_recorded = 0,
+			-- Declared here so a healthy client reports 0 rather than nothing:
+			-- an ALARM whose absence and whose zero look identical cannot be
+			-- alerted on, and this one means "there are undeleted personal data
+			-- behind an unaccounted denial".
+			consent_denial_possibly_undelivered = 0,
 			consent_failed = 0,
 			consent_persist_failed = 0,
 			consent_outbox_evicted = 0,
@@ -847,6 +852,11 @@ function M.new(config)
 	-- the spool so the belt cross-check below settles the boot consent state
 	-- first — the spool load/purge decision must read the FINAL state.
 	local outbox_err
+	-- A FRESH SESSION GETS A FRESH RESOLUTION. Resolving once is scoped to this
+	-- client, not to the process: without this a second sdk.new() inherits the
+	-- previous client's verdict, so one transient read failure fails closed
+	-- until the engine itself restarts.
+	storage.begin_consent_outbox_session(normalized)
 	client.consent_outbox, outbox_err = storage.load_consent_outbox(normalized)
 	-- TWO different facts, and only one is about the restored state. PRESERVING
 	-- THE EVIDENCE is unconditional: a trail that could not be read must not be
@@ -858,6 +868,18 @@ function M.new(config)
 	-- round could re-find it.)
 	if outbox_err ~= nil then
 		client.consent_outbox_unreadable = true
+		client.stats.consent_denial_possibly_undelivered = 1
+		client:diagnose({
+			scope = "consent",
+			status = "unaccounted",
+			code = "consent_denial_possibly_undelivered",
+			-- WHICH THING TO GO AND LOOK AT. Computed where the read happened,
+			-- because that is the only place the difference is visible: a store
+			-- that never replied and a store that replied with something
+			-- unusable both leave us without a trail, and they send an operator
+			-- to different places. "store" is the device, "record" is the file.
+			cause = storage.consent_outbox_unaccounted_cause(normalized),
+		})
 	end
 	if outbox_err ~= nil and client.consent_state == "granted" then
 		-- FAIL CLOSED on the granted restore, exactly as the unreadable
