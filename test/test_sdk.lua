@@ -10500,6 +10500,72 @@ end)()
 	assert_equal(cstores[cpath].consent_superseded_unreadable_by, nil,
 		"and the unlisted witness is not written back")
 	crestore(); storage.reset()
+
+	-- F. THE BELT WITHOUT AN IMPOSITION STAMPS NOTHING. This block is reached by
+	--    two roads and only one of them supersedes anything: an unreadable trail
+	--    imposed a denial, or the marker and outbox both loaded cleanly and the
+	--    belt is merely correcting a stale readable grant. Recording the second
+	--    as a supersession would log an event that did not happen -- and would
+	--    overwrite genuine earlier provenance with a fresher, false one.
+	reset(); storage.reset()
+	local nstores, nrestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-no-imposition",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+		consent_superseded_unreadable_at = "2026-06-01T00:00:00.000Z",
+		consent_superseded_unreadable_by = "decision",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope,
+		{ receipt("no-imp-denial", "2026-07-02T00:00:00.000Z", false,
+			"anon-no-imposition") }) ~= false)
+	storage.reset()
+	local nobelt = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-no-imposition", flush_interval_seconds = 9999 })))
+	assert_equal(nobelt.consent_unreadable_imposed, false,
+		"the fixture must REACH its subject the other way: nothing was unreadable")
+	local npath = identity_path(nstores)
+	assert_equal(nstores[npath].consent_analytics, "denied",
+		"and the belt REALLY ran -- the newer denial receipt converged the record")
+	assert_equal(nstores[npath].consent_superseded_unreadable_by, "decision",
+		"the earlier genuine provenance survives; the belt did not overwrite it")
+	assert_equal(nstores[npath].consent_superseded_unreadable_at,
+		"2026-06-01T00:00:00.000Z",
+		"and its timestamp is the ORIGINAL one, not this receipt's")
+	nrestore(); storage.reset()
+
+	-- G. PROVENANCE DOES NOT CROSS ACTORS. A configured anonymous_id replacing a
+	--    different valid persisted actor makes this boot ignore that actor's
+	--    consent; adopting its supersession anyway would carry the OLD subject's
+	--    witness under the NEW anon on the next identity write and keep it under
+	--    every later decision. The record would say this actor superseded
+	--    evidence it never had.
+	reset(); storage.reset()
+	local ostores, orestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-previous-subject",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+		consent_superseded_unreadable_at = "2026-06-01T00:00:00.000Z",
+		consent_superseded_unreadable_by = "decision",
+	}))
+	storage.reset()
+	local override = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-new-subject", flush_interval_seconds = 9999 })))
+	assert_equal(override.consent_superseded_unreadable_by, nil,
+		"the new subject does not inherit the previous one's provenance")
+	assert_equal(override.consent_state, "unknown",
+		"the fixture REALLY overrode: the old actor's consent is ignored too")
+	assert_true(override:set_consent(false))
+	local opath = identity_path(ostores)
+	assert_equal(ostores[opath].anonymous_id, "anon-new-subject",
+		"the record is the NEW actor's -- otherwise the absence below proves nothing")
+	assert_equal(ostores[opath].consent_analytics, "denied",
+		"and its own decision landed")
+	assert_equal(ostores[opath].consent_superseded_unreadable_by, nil,
+		"carrying no witness from the subject it replaced")
+	assert_equal(ostores[opath].consent_superseded_unreadable_at, nil)
+	orestore(); storage.reset()
 end)()
 
 print("shardpilot defold lua tests passed")

@@ -587,9 +587,19 @@ function M.new(config)
 	-- one damaged file into a permanent claim about provenance -- and the
 	-- accepted set is the thing that must be enumerated, because an
 	-- exclusion list fails open the moment a third witness is invented.
+	-- GATED ON `override_replaced_actor` FOR THE SAME REASON THE STATE ABOVE IS.
+	-- A supersession is provenance for a DECISION, so it belongs to the subject
+	-- who made it. When a configured `anonymous_id` replaces a different valid
+	-- persisted actor this boot deliberately ignores that actor's consent -- and
+	-- adopting its provenance anyway would have carried the OLD subject's witness
+	-- and timestamp under the NEW anon on the very next identity self-heal, and
+	-- kept them under every later decision the new actor made. Attributing one
+	-- subject's consent history to another is worse than losing it: the record
+	-- would say this actor superseded evidence it never had.
 	local consent_superseded_unreadable_at = nil
 	local consent_superseded_unreadable_by = nil
-	if type(stored.consent_superseded_unreadable_at) == "string"
+	if not override_replaced_actor
+		and type(stored.consent_superseded_unreadable_at) == "string"
 		and stored.consent_superseded_unreadable_at ~= ""
 		and (stored.consent_superseded_unreadable_by == "decision"
 			or stored.consent_superseded_unreadable_by == "receipt") then
@@ -1167,8 +1177,20 @@ function M.new(config)
 			-- act was performed EARLIER and merely read now, and the audit
 			-- distinction between that and a fresh choice is the whole content
 			-- of the rule.
-			client.consent_superseded_unreadable_at = stale_denial.decided_at
-			client.consent_superseded_unreadable_by = "receipt"
+			--
+			-- ONLY WHEN AN IMPOSITION ACTUALLY STOOD. This block is reached by
+			-- two roads: an unreadable trail imposed a denial and the belt is
+			-- superseding it, or the marker and the outbox both loaded cleanly
+			-- and the belt is merely correcting a stale readable grant. Nothing
+			-- unreadable was superseded on the second road, so stamping there
+			-- would record an event that did not happen -- and would overwrite
+			-- genuine earlier provenance read off the record at boot with a
+			-- fresher, false one. The flag is read BEFORE it is cleared, because
+			-- clearing it is what this block does next.
+			if client.consent_unreadable_imposed then
+				client.consent_superseded_unreadable_at = stale_denial.decided_at
+				client.consent_superseded_unreadable_by = "receipt"
+			end
 			client.consent_unreadable_imposed = false
 			-- consent_outbox_unreadable is deliberately NOT cleared here. The
 			-- belt learned one thing — this readable receipt outranks the
