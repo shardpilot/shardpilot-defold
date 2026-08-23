@@ -1366,7 +1366,23 @@ end
 
 -- A SESSION, NOT A PROCESS. Called by the client at init, before the load.
 function M.begin_consent_outbox_session(scope)
-	outbox_resolution[spool_namespace(scope)] = nil
+	local ns = spool_namespace(scope)
+	local r = outbox_resolution[ns]
+	if r ~= nil and r.owed then
+		-- A RESOLUTION HOLDING UN-PERSISTED WORK IS NOT A CACHE, so a new
+		-- session may not replace it with whatever disk happens to say. Two
+		-- clients for one app scope share this resolution: discarding it here
+		-- re-read the STALE durable record, and the first client's retry then
+		-- flushed that replacement and cleared its debt -- dropping a consent
+		-- receipt accepted in memory that never reached disk.
+		--
+		-- Re-resolving is what a fresh session is FOR: a transient READ failure
+		-- must not fail closed until the engine restarts. That reason is about
+		-- a resolution disk could answer better than, and says nothing about
+		-- one disk is behind.
+		return
+	end
+	outbox_resolution[ns] = nil
 end
 
 -- A THIN READ OF THE RESOLUTION, not a second reader. The three-valued contract
@@ -1440,11 +1456,42 @@ end
 -- receipt cannot be re-sent by this process, and a fresh decision applies now.
 -- Refusing both would leave the caller re-sending a receipt the server already
 -- accepted, forever, because its mirror can never lose it.
+-- THE BOUND APPLIED TO A LIST NOBODY APPENDED TO. The loader keeps an over-cap
+-- durable record on purpose so identity filtering runs over the whole of it, and
+-- the whole-list write used to enforce the bound on the way out. A drop or a
+-- flush writing its list straight through means a legacy or externally produced
+-- oversized record never converges -- acknowledging some entries leaves it over
+-- the bound forever, and the documented fixed cap becomes a number nothing
+-- enforces. Denial-preferring, like every other eviction here: pure grants go
+-- first, and only an all-denials overflow costs a denial.
+--
+-- Returns the list AND what it cost, because those are two answers and a caller
+-- that surfaces evictions needs both.
+local function cap_existing(kept)
+	local removed = 0
+	while #kept > max_consent_outbox_entries do
+		local evict_index = 1
+		for i = 1, #kept do
+			if receipt_is_pure_grant(kept[i]) then
+				evict_index = i
+				break
+			end
+		end
+		table.remove(kept, evict_index)
+		removed = removed + 1
+	end
+	return kept, removed
+end
+
 local function outbox_write(ns, scope, receipts, withhold)
 	local durable = not withhold and write_consent_outbox(ns, receipts)
 	local r = outbox_resolution[ns]
 	if r ~= nil then
 		r.receipts = receipts
+		-- WHETHER DISK HOLDS WHAT THIS RESOLUTION HOLDS. Recorded because a
+		-- resolution carrying un-persisted work is NOT a cache of disk, and
+		-- anything that treats it as one may discard it.
+		r.owed = not durable
 		if durable then
 			-- On disk, so the resolution describes disk -- the payload AND the
 			-- derived facts, or it keeps asserting something about a trail this
@@ -1541,10 +1588,11 @@ function M.drop_consent_receipts(scope, keys, withhold)
 	-- debt disappears -- so a process exit resurrects the old receipt from stale
 	-- disk and loses the new decision. The write costs one save and is the only
 	-- thing that makes the success it reports true.
-	if not outbox_write(ns, scope, kept, withhold) then
-		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed"
+	local capped, over = cap_existing(kept)
+	if not outbox_write(ns, scope, capped, withhold) then
+		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed", over
 	end
-	return true, nil, removed
+	return true, nil, over
 end
 
 -- Write what the resolution ALREADY HOLDS to disk. No list crosses the
@@ -1554,7 +1602,8 @@ end
 function M.flush_consent_outbox(scope, withhold)
 	local ns = spool_namespace(scope)
 	local r = resolution_for(ns, scope)
-	if not outbox_write(ns, scope, r.receipts, withhold) then
+	local capped = cap_existing(copy_outbox_entries(r.receipts))
+	if not outbox_write(ns, scope, capped, withhold) then
 		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed"
 	end
 	return true

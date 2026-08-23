@@ -8626,6 +8626,64 @@ local tests = {
 	assert_not_equal(client4.consent_state, "granted",
 		"so the state never flips on a receipt that could not be retained")
 	restore4(); storage.reset()
+
+	-- I. A NEW SESSION MAY NOT DISCARD UN-PERSISTED WORK. Re-resolving exists so
+	--    a transient READ failure does not fail closed until the engine
+	--    restarts -- a reason about a resolution disk could answer better than.
+	--    It says nothing about one disk is BEHIND.
+	reset(); storage.reset()
+	local stores5, restore5 = install_stub_sys_storage()
+	assert_true(storage.append_consent_receipt(identity_scope, rec("on-disk")))
+	local real_save5 = sys.save
+	sys.save = function() return false end
+	assert_equal(storage.append_consent_receipt(identity_scope, rec("accepted-in-memory")), false,
+		"the durable write fails, so the receipt lives only in the resolution")
+	sys.save = real_save5
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 2)
+	-- a SECOND client for the same app scope starts a session
+	storage.begin_consent_outbox_session(identity_scope)
+	local after = {}
+	for _, r in ipairs(storage.consent_outbox_receipts(identity_scope)) do
+		after[r.idempotency_key] = true
+	end
+	assert_true(after["accepted-in-memory"],
+		"the un-persisted receipt survives: a second session must not replace the resolution with stale disk")
+	assert_true(after["on-disk"])
+	-- and once the debt is paid, a session DOES re-resolve again
+	assert_true(storage.flush_consent_outbox(identity_scope))
+	storage.begin_consent_outbox_session(identity_scope)
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 2,
+		"re-resolving still happens -- it is only withheld while a write is owed")
+	restore5(); storage.reset()
+
+	-- J. AN OVER-CAP RECORD CONVERGES ON THE NEXT WRITE. The loader keeps one on
+	--    purpose so identity filtering runs over the whole of it; a drop that
+	--    wrote its list straight through left it over the bound forever.
+	reset(); storage.reset()
+	local stores6, restore6 = install_stub_sys_storage()
+	assert_true(storage.append_consent_receipt(identity_scope, rec("seed")))
+	local p6
+	for p in pairs(stores6) do if p:sub(-15) == "/consent-outbox" then p6 = p end end
+	local oversized = {}
+	for i = 1, 40 do oversized[i] = rec("legacy-" .. i) end
+	stores6[p6] = { receipts = oversized }
+	storage.reset()
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 40,
+		"the loader keeps all forty -- filtering has to see them")
+	assert_true(storage.drop_consent_receipts(identity_scope, { "legacy-1" }))
+	assert_equal(#stores6[p6].receipts, 32,
+		"and the next write brings it to the documented bound rather than 39")
+
+	-- the FLUSH path converges it too, and needs its own case: a client whose
+	-- only pending action is an owed write never calls drop, so a cap enforced
+	-- on one path and not the other leaves that client over the bound forever.
+	stores6[p6] = { receipts = oversized }
+	storage.reset()
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 40)
+	assert_true(storage.flush_consent_outbox(identity_scope))
+	assert_equal(#stores6[p6].receipts, 32,
+		"flush converges it as well -- the bound is a property of the record, not of one entry point")
+	restore6(); storage.reset()
 	end,
 }
 
