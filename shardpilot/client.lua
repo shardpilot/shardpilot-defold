@@ -177,6 +177,32 @@ end
 -- damaged or hand-edited file happens to carry and then re-persists it, turning
 -- one bad file into a permanent claim about provenance -- and an exclusion list
 -- would fail open the moment somebody invents a fourth witness.
+-- PROVENANCE ORDERS BY SEQ FIRST, and consent orders by STAMP first. They are
+-- different questions and I had used one helper for both.
+--
+-- `decision_pair_newer` compares stamps first and lets the seq break only a TIE.
+-- That is right for consent, which is compared across installs and actors where
+-- a foreign seq means nothing. It is wrong here: a device clock moving BACKWARD
+-- gives the newer act a higher seq and an EARLIER stamp, so the timestamp-first
+-- test answers `false` and an older provenance overwrites a fresh one -- the
+-- exact case I claimed the seq had fixed when I added it. Verified by probe:
+-- `decision_pair_newer("09:00", 2, "10:00", 1)` returns false.
+--
+-- Within ONE install the seq is monotone whatever the clock does, so it is the
+-- authority and the stamp only breaks ITS ties. Across two clients of one scope
+-- the seq collides (both restore the same floor), which the shared-hold gate is
+-- what prevents from mattering -- see `unreadable_trail_stands`.
+local function supersession_newer(at, seq, base_at, base_seq)
+	if base_at == nil then
+		return true
+	end
+	local a, b = seq or 0, base_seq or 0
+	if a ~= b then
+		return a > b
+	end
+	return at > base_at
+end
+
 local function supersession_pair(at, by, seq)
 	if type(at) ~= "string" or at == ""
 		or not (by == "decision" or by == "receipt") then
@@ -209,6 +235,25 @@ end
 -- supersession on an ordinary later decision -- replacing accurate provenance
 -- with a false, later event. The hold is the shared fact; the flag is a cache of
 -- it, and a cache is not the fact.
+-- THE DURABILITY BOUND OF THIS FACT, stated because it was never stated and the
+-- absence of a bound is what made the mechanism grow without one. The
+-- supersession provenance is durable in exactly TWO places: the identity record,
+-- and the write-ahead denial marker that covers an identity write which failed.
+-- It is NOT reconstructed from anywhere else, and two paths are known to lose it:
+--
+--   * a superseding GRANT whose identity write fails has no marker (markers are
+--     denial-only, by Decision 5c's write-ahead design), so a process exit there
+--     loses the fact;
+--   * the whole-record merge reads the RECORD, not the marker, so provenance
+--     that exists only in a marker is not merged forward by a sibling.
+--
+-- Both are real and both are DECLINED here rather than left unsaid. Closing them
+-- needs a grant-side durable witness and a marker-reading merge -- more
+-- machinery for an audit fact than the fact is worth, on a change that has grown
+-- 3.6x from its first submission across five review rounds. An audit fact whose
+-- preservation costs more than the decision it annotates is the wrong trade, and
+-- the honest form of that judgement is a written bound, not a sixth round.
+--
 -- ONE BUILDER for every denial-marker payload. There are FOUR writers -- the
 -- belt's convergence fallback, set_consent, the delivery callback and the
 -- shutdown retry -- and the provenance was added to exactly one of them, so the
@@ -232,7 +277,7 @@ local function denial_marker_payload(self, state)
 			durable.consent_superseded_unreadable_at,
 			durable.consent_superseded_unreadable_by,
 			durable.consent_superseded_unreadable_seq)
-		if dat ~= nil and decision_pair_newer(dat, dseq, at, seq) then
+		if dat ~= nil and supersession_newer(dat, dseq, at, seq) then
 			at, by, seq = dat, dby, dseq
 		end
 	end
@@ -249,11 +294,22 @@ local function denial_marker_payload(self, state)
 end
 
 local function unreadable_trail_stands(self)
-	if self.consent_unreadable_imposed or self.consent_marker_unreadable then
+	-- The MARKER arm stands alone: a marker is read per boot from a per-actor
+	-- file and there is no shared resolution behind it, so this client's
+	-- observation is the whole fact.
+	if self.consent_marker_unreadable then
 		return true
 	end
-	return self.consent_outbox_unreadable == true
-		and storage.consent_outbox_unaccounted_cause(self.config) ~= nil
+	-- BOTH OUTBOX-BACKED ARMS consult the shared cause, not just one of them.
+	-- `consent_unreadable_imposed` is armed by the same unreadable OUTBOX as
+	-- `consent_outbox_unreadable`; it differs only in that the restore was a
+	-- GRANT. Consulting the shared cause on the second arm while the first
+	-- returned unconditionally left the identical staleness open on the granted
+	-- path -- a set of two where I closed one.
+	if not (self.consent_unreadable_imposed or self.consent_outbox_unreadable) then
+		return false
+	end
+	return storage.consent_outbox_unaccounted_cause(self.config) ~= nil
 end
 
 local function valid_identity(value)
@@ -1797,7 +1853,7 @@ function Client:persist_identity()
 			durable.consent_superseded_unreadable_at,
 			durable.consent_superseded_unreadable_by,
 			durable.consent_superseded_unreadable_seq)
-		if dat ~= nil and decision_pair_newer(dat, dseq,
+		if dat ~= nil and supersession_newer(dat, dseq,
 			record.consent_superseded_unreadable_at,
 			record.consent_superseded_unreadable_seq) then
 			record.consent_superseded_unreadable_at = dat

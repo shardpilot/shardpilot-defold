@@ -10383,6 +10383,25 @@ end)()
 		}
 	end
 
+	-- Seed a granted record over a CORRUPTED outbox, so any client constructed
+	-- after this boots with a genuine imposition. Poking the flag by hand is a
+	-- fixture that lies: the predicate consults the SHARED resolution, and a
+	-- forced flag with a healthy trail is a state the product cannot be in.
+	local function seed_unreadable(anon)
+		assert_true(storage.save(identity_scope, {
+			anonymous_id = anon,
+			consent_analytics = "granted",
+			-- STAMPED AT THE EPOCH, because the harness clock returns 1970
+			-- dates: a 2026 seed is in the FUTURE relative to anything the
+			-- client will write, so the stale-marker guard would retire a
+			-- freshly written denial marker as older than the record. The
+			-- fixture has to live in the same time as the code it drives.
+			consent_decided_at = "1970-01-01T00:00:00Z",
+		}))
+		assert_true(storage.save_consent_outbox(identity_scope,
+			{ receipt(anon .. "-seed", "1970-01-01T00:00:00Z", true, anon) }) ~= false)
+	end
+
 	-- A. THE SUBJECT ACTS NOW -> witness "decision", stamped with the ACT.
 	reset(); storage.reset()
 	local stores, restore = install_stub_sys_storage()
@@ -10605,14 +10624,16 @@ end)()
 	--    on any later unrelated write of its own.
 	reset(); storage.reset()
 	local sstores, srestore = install_stub_sys_storage()
+	seed_unreadable("anon-shared")
+	sstores[outbox_path(sstores)] = "garbage"
+	storage.reset()
 	local first = assert(sdk.new(config_mode_a({
 		anonymous_id = "anon-shared", flush_interval_seconds = 9999 })))
 	local second = assert(sdk.new(config_mode_a({
 		anonymous_id = "anon-shared", flush_interval_seconds = 9999 })))
 	local spath = identity_path(sstores)
-	-- The FIRST client meets an unreadable trail and supersedes it.
-	first.consent_unreadable_imposed = true
-	first.consent_restored_state = "granted"
+	assert_true(first.consent_unreadable_imposed,
+		"the imposition is REAL, not poked -- the fixture must reach its subject")
 	assert_true(first:set_consent(false))
 	local stamped = sstores[spath].consent_superseded_unreadable_at
 	assert_equal(sstores[spath].consent_superseded_unreadable_by, "decision",
@@ -10648,11 +10669,13 @@ end)()
 	local j_real_iso = j_clock.iso_utc
 	local j_frozen = j_real_iso()
 	j_clock.iso_utc = function() return j_frozen end
+	seed_unreadable("anon-sameseq")
+	jstores[outbox_path(jstores)] = "garbage"
+	storage.reset()
 	local ja = assert(sdk.new(config_mode_a({
 		anonymous_id = "anon-sameseq", flush_interval_seconds = 9999 })))
 	local jpath = identity_path(jstores)
-	ja.consent_unreadable_imposed = true
-	ja.consent_restored_state = "granted"
+	assert_true(ja.consent_unreadable_imposed, "a REAL imposition, not a poked flag")
 	assert_true(ja:set_consent(false))
 	local first_seq = jstores[jpath].consent_superseded_unreadable_seq
 	local first_at = jstores[jpath].consent_superseded_unreadable_at
@@ -10662,6 +10685,9 @@ end)()
 	assert_equal(jb.consent_superseded_unreadable_seq, first_seq,
 		"the sibling holds the FIRST supersession -- not nil, which is the case a strict compare handles")
 	-- A SECOND supersession, same frozen second, strictly higher seq.
+	local ja_op = outbox_path(jstores)
+	if ja_op then jstores[ja_op] = "garbage" end
+	storage.reset()
 	ja.consent_unreadable_imposed = true
 	ja.consent_restored_state = "granted"
 	assert_true(ja:set_consent(true))
@@ -10686,10 +10712,12 @@ end)()
 	--    cannot reconstruct it -- the belt runs only against a granted restore.
 	reset(); storage.reset()
 	local kstores, krestore = install_stub_sys_storage()
+	seed_unreadable("anon-marker-prov")
+	kstores[outbox_path(kstores)] = "garbage"
+	storage.reset()
 	local kc = assert(sdk.new(config_mode_a({
 		anonymous_id = "anon-marker-prov", flush_interval_seconds = 9999 })))
-	kc.consent_unreadable_imposed = true
-	kc.consent_restored_state = "granted"
+	assert_true(kc.consent_unreadable_imposed, "a REAL imposition, not a poked flag")
 	local real_save = sys.save
 	sys.save = function(path, record)
 		if path:sub(-9) == "/identity" then return false end
@@ -10722,12 +10750,14 @@ end)()
 	--    the marker, and the next boot would impose it over the newer one.
 	reset(); storage.reset()
 	local lstores, lrestore = install_stub_sys_storage()
+	seed_unreadable("anon-marker-merge")
+	lstores[outbox_path(lstores)] = "garbage"
+	storage.reset()
 	local la = assert(sdk.new(config_mode_a({
 		anonymous_id = "anon-marker-merge", flush_interval_seconds = 9999 })))
 	local lb = assert(sdk.new(config_mode_a({
 		anonymous_id = "anon-marker-merge", flush_interval_seconds = 9999 })))
-	la.consent_unreadable_imposed = true
-	la.consent_restored_state = "granted"
+	assert_true(la.consent_unreadable_imposed, "a REAL imposition, not a poked flag")
 	assert_true(la:set_consent(false))
 	local lpath = identity_path(lstores)
 	local newer_at = lstores[lpath].consent_superseded_unreadable_at
@@ -10843,6 +10873,44 @@ end)()
 	assert_equal(nstores2[npath2].consent_superseded_unreadable_at, true_at)
 	n_clock.iso_utc = n_real_iso
 	nrestore2(); storage.reset()
+
+	-- O. A BACKWARD CLOCK. The seq was added precisely so a clock moving back
+	--    could not roll provenance back with it -- and the helper it was wired
+	--    to compares STAMPS first, letting the seq break only a TIE. So the
+	--    newer act (higher seq, EARLIER stamp) lost, which is the exact case the
+	--    seq exists for. Provenance orders by SEQ first; consent still orders by
+	--    stamp first, because consent is compared across installs where a
+	--    foreign seq means nothing.
+	reset(); storage.reset()
+	local ostores2, orestore2 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-backward",
+		consent_analytics = "denied",
+		consent_decided_at = "1970-01-01T00:00:00Z",
+		-- The DURABLE copy: later stamp, LOWER seq. Under a timestamp-first
+		-- comparison this looks newer and wins.
+		consent_superseded_unreadable_at = "1970-01-01T10:00:00Z",
+		consent_superseded_unreadable_by = "receipt",
+		consent_superseded_unreadable_seq = 1,
+	}))
+	storage.reset()
+	local ob = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-backward", flush_interval_seconds = 9999 })))
+	assert_equal(ob.consent_superseded_unreadable_seq, 1,
+		"the durable pair was adopted -- the fixture reaches its subject")
+	-- The client now holds a STRICTLY NEWER act whose stamp went BACKWARD.
+	ob.consent_superseded_unreadable_at = "1970-01-01T09:00:00Z"
+	ob.consent_superseded_unreadable_by = "decision"
+	ob.consent_superseded_unreadable_seq = 2
+	assert_true(ob:persist_identity())
+	local opath2 = identity_path(ostores2)
+	assert_equal(ostores2[opath2].consent_superseded_unreadable_seq, 2,
+		"the higher SEQ wins even though its stamp is earlier")
+	assert_equal(ostores2[opath2].consent_superseded_unreadable_by, "decision")
+	assert_equal(ostores2[opath2].consent_superseded_unreadable_at,
+		"1970-01-01T09:00:00Z",
+		"and the whole pair travels together, not just the seq")
+	orestore2(); storage.reset()
 end)()
 
 print("shardpilot defold lua tests passed")
