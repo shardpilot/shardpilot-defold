@@ -1402,6 +1402,161 @@ end
 -- successfully written EMPTY record, silently dropping a receipt while
 -- reporting success; failing the save keeps the receipt in the caller's
 -- mirror, marked owed and retried at every dispatch point.
+-- ── the caller names an OPERATION, never hands over a list ──────────────────
+--
+-- A whole-list write cannot say WHY a receipt is missing from what it was
+-- handed. Three different facts share that one representation:
+--
+--   * acknowledged and pruned      -- it must NOT come back
+--   * never seen by this caller    -- it MUST come back
+--   * removed on purpose, because no credential this session holds can ever
+--     send it                      -- it must NOT come back
+--
+-- The storage layer had to guess between them, and guessing wrong in the third
+-- case resurrects a receipt the client deliberately filtered: a revived anon
+-- grant then holds the event grant gate open for the session and blocks
+-- anonymous-id rotation. So the caller says APPEND THIS or DROP THESE, the
+-- resolution owns the list, and there is nothing left to guess.
+--
+-- Both operations refuse while the trail is unaccounted, and they refuse HERE
+-- rather than at the call site. The damaged file is the evidence a session's
+-- refusal rests on, and the mirror is only its salvageable subset -- writing
+-- the subset over it destroys the evidence with an ordinary acknowledgment
+-- instead of a decision. A rule the caller has to remember is a rule one caller
+-- forgets.
+
+-- WHAT THIS PROCESS HOLDS AND WHETHER DISK AGREES ARE TWO FACTS. The
+-- resolution takes the new list either way; only the return says whether it
+-- reached the store. Folding them would mean a failed write also un-does the
+-- operation in memory -- so a denial the player just made would not dispatch,
+-- and an acknowledged receipt would come back and re-send, both because the
+-- disk was briefly unavailable. The decision applies in memory and the trail is
+-- marked dirty; that is what the caller's retry is for.
+-- THE HOLD IS ABOUT DISK, NOT ABOUT WHAT THE PROCESS KNOWS. While the trail is
+-- unaccounted the damaged file is the evidence this session's refusal rests on,
+-- and the in-memory list is only its salvageable subset -- writing the subset
+-- over it destroys the evidence with an ordinary acknowledgment. So the durable
+-- write is withheld. The OPERATION still happens in memory: an acknowledged
+-- receipt cannot be re-sent by this process, and a fresh decision applies now.
+-- Refusing both would leave the caller re-sending a receipt the server already
+-- accepted, forever, because its mirror can never lose it.
+local function outbox_write(ns, scope, receipts, withhold)
+	local durable = not withhold and write_consent_outbox(ns, receipts)
+	local r = outbox_resolution[ns]
+	if r ~= nil then
+		r.receipts = receipts
+		if durable then
+			-- On disk, so the resolution describes disk -- the payload AND the
+			-- derived facts, or it keeps asserting something about a trail this
+			-- process just wrote.
+			r.state = "readable"
+			r.record_damaged = false
+			r.shadow_answered = true
+		end
+	end
+	return durable
+end
+
+-- Append ONE receipt. Returns `true, nil, evicted` on success, or
+-- `false, reason` -- `consent_outbox_unaccounted` while the trail cannot be
+-- read, `consent_outbox_invalid` for a receipt this build would not keep, and
+-- `consent_outbox_full` when the cap could only be honoured by evicting a
+-- receipt that carries a DENIAL. That last refusal is the point of the cap
+-- policy rather than an edge of it: a recorded denial outranks a grant, so a
+-- grant that cannot fit is refused rather than admitted at a denial's expense.
+function M.append_consent_receipt(scope, receipt, withhold)
+	local ns = spool_namespace(scope)
+	local r = resolution_for(ns, scope)
+	local one = sanitize_outbox_entries({ receipt })
+	if #one ~= 1 then
+		return false, "consent_outbox_invalid"
+	end
+	local kept = copy_outbox_entries(r.receipts)
+	kept[#kept + 1] = one[1]
+	local evicted = 0
+	while #kept > max_consent_outbox_entries do
+		-- THE INCOMING RECEIPT IS NOT A CANDIDATE FOR ITS OWN EVICTION. It sits
+		-- last, and searching the whole list found it first when everything
+		-- ahead of it was a denial -- so a grant appended to a denial-full
+		-- outbox evicted ITSELF and the append reported success. The caller
+		-- then flips its state on a receipt that is not there.
+		local evict_index = nil
+		for i = 1, #kept - 1 do
+			if receipt_is_pure_grant(kept[i]) then
+				evict_index = i
+				break
+			end
+		end
+		if evict_index == nil then
+			-- Nothing over the cap is a pure grant, so honouring it costs a
+			-- DENIAL -- and what that means depends on what is being appended.
+			-- A fresh denial outranks a stale one, so it evicts the oldest and
+			-- the trail keeps its most recent refusals. A GRANT does not
+			-- outrank any denial, so it is REFUSED and nothing is written: the
+			-- caller's state must not flip on a receipt that did not land.
+			if receipt_is_pure_grant(one[1]) then
+				return false, "consent_outbox_full"
+			end
+			evict_index = 1
+		end
+		table.remove(kept, evict_index)
+		evicted = evicted + 1
+	end
+	if not outbox_write(ns, scope, kept, withhold) then
+		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed"
+	end
+	return true, nil, evicted
+end
+
+-- Drop receipts BY KEY, which is the operation a whole-list write could not
+-- express. Dropping is explicit, so nothing downstream can restore them:
+-- storage is told, rather than inferring from a list it was handed.
+-- Keys that are not present are not an error -- the caller asking twice, or
+-- asking about a receipt another path already removed, is not a failure.
+function M.drop_consent_receipts(scope, keys, withhold)
+	local ns = spool_namespace(scope)
+	local r = resolution_for(ns, scope)
+	local drop = {}
+	for i = 1, #keys do
+		drop[keys[i]] = true
+	end
+	local kept, removed = {}, 0
+	for i = 1, #r.receipts do
+		if drop[r.receipts[i].idempotency_key] then
+			removed = removed + 1
+		else
+			kept[#kept + 1] = r.receipts[i]
+		end
+	end
+	if removed == 0 then
+		return true, nil, 0
+	end
+	if not outbox_write(ns, scope, kept, withhold) then
+		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed"
+	end
+	return true, nil, removed
+end
+
+-- Write what the resolution ALREADY HOLDS to disk. No list crosses the
+-- boundary, so none of the three facts a handed-over list confuses can arise --
+-- this is the owed-write retry, and the only question it answers is whether
+-- disk has caught up with what this process already decided.
+function M.flush_consent_outbox(scope, withhold)
+	local ns = spool_namespace(scope)
+	local r = resolution_for(ns, scope)
+	if not outbox_write(ns, scope, r.receipts, withhold) then
+		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed"
+	end
+	return true
+end
+
+-- The retained receipts, as a COPY. The caller's mirror and the resolution are
+-- never the same table: an in-place append at a call site would otherwise
+-- mutate the resolution ahead of -- and regardless of -- the durable write.
+function M.consent_outbox_receipts(scope)
+	return copy_outbox_entries(resolution_for(spool_namespace(scope), scope).receipts)
+end
+
 function M.save_consent_outbox(scope, receipts)
 	local ns = spool_namespace(scope)
 	local kept = sanitize_outbox_entries(receipts)

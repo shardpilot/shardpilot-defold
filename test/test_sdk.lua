@@ -5590,6 +5590,13 @@ local function test_consent_outbox_cap_evicts_oldest_pure_grants_first()
 	assert_equal(denials, 20, "cap pressure must never evict a denial while grants remain")
 
 	-- the client mirror adopts the trim and counts the eviction
+	--
+	-- RE-EXPRESSED FOR THE OPERATIONS SHAPE, not weakened. This block used to
+	-- mutate the mirror directly and let the whole-list write apply the cap --
+	-- which asserted the old REPRESENTATION (a caller hands over a list and
+	-- storage trims it) rather than the property. The property is that the cap
+	-- is enforced and the eviction is counted and surfaced, and it is now
+	-- enforced where the receipt arrives: at the append.
 	reset()
 	storage.reset()
 	local issues = {}
@@ -5599,16 +5606,31 @@ local function test_consent_outbox_cap_evicts_oldest_pure_grants_first()
 		end,
 	})))
 	for i = 1, 33 do
-		client.consent_outbox[i] = cap_test_receipt(100 + i)
+		assert_true(storage.append_consent_receipt(client.config, cap_test_receipt(100 + i)),
+			"every receipt is accepted; the 33rd is what forces the eviction")
 	end
-	assert_true(client:persist_consent_outbox())
+	client.consent_outbox = storage.consent_outbox_receipts(client.config)
 	assert_equal(#client.consent_outbox, 32)
 	assert_equal(client.consent_outbox[1].idempotency_key, "receipt-101",
 		"the denial head survives; the oldest grant was evicted")
 	assert_equal(client.consent_outbox[2].idempotency_key, "receipt-103")
+
+	-- AND THE CLIENT COUNTS AND SURFACES IT. That half is the client's
+	-- contract, not the store's, so it is exercised against the client's own
+	-- reporting path rather than inferred from a list length -- which is what
+	-- the old block did, and why it could not tell an eviction from a prune.
+	assert_true(client:record_outbox_op(true, nil, 1))
 	assert_equal(client:snapshot().consent_outbox_evicted, 1)
 	assert_equal(issues[#issues].scope, "consent")
 	assert_equal(issues[#issues].code, "outbox_overflow")
+	assert_equal(issues[#issues].count, 1)
+	-- A DROP REPORTS NOTHING HERE, which is the distinction the old shared
+	-- parameter could not carry: removing an acknowledged receipt is not an
+	-- overflow, and counting it as one would page on ordinary delivery.
+	local before = client:snapshot().consent_outbox_evicted
+	assert_true(client:record_outbox_op(true, nil, nil))
+	assert_equal(client:snapshot().consent_outbox_evicted, before,
+		"a drop is not an eviction")
 	storage.reset()
 end
 
@@ -7860,7 +7882,7 @@ local tests = {
 	-- CLEAN file and the next launch would restore the grant -- the evidence
 	-- destroyed by an ordinary dispatch acknowledgment rather than by anything
 	-- resembling a decision. The write is refused and marked owed.
-	assert_equal(partial:persist_consent_outbox(), false,
+	assert_equal(partial:flush_consent_outbox(), false,
 		"the outbox rewrite is held while the trail is unreadable")
 	assert_true(partial.consent_outbox_dirty, "and the held write is recorded as owed")
 	local on_disk = nil
@@ -7969,7 +7991,7 @@ local tests = {
 	local marker_only = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(marker_only.consent_state, "denied",
 		"the unreadable marker still imposes its session denial")
-	assert_true(marker_only:persist_consent_outbox(),
+	assert_true(marker_only:flush_consent_outbox(),
 		"but a READABLE outbox is not held hostage to it")
 	assert_true(not marker_only.consent_outbox_dirty,
 		"and its write is not left owed")
@@ -7999,7 +8021,7 @@ local tests = {
 	local denied_restore = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(denied_restore.consent_state, "denied",
 		"the denied restore stands; nothing is imposed over it")
-	assert_equal(denied_restore:persist_consent_outbox(), false,
+	assert_equal(denied_restore:flush_consent_outbox(), false,
 		"but the damaged trail is still held -- evidence outlives the state that read it")
 	restore7()
 	storage.reset()
@@ -8308,6 +8330,191 @@ local tests = {
 	table.remove(returned)
 	assert_equal(#storage.load_consent_outbox(identity_scope), 3,
 		"and so does mutating what the write handed back")
+	restore3(); storage.reset()
+	end,
+	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
+	--
+	-- THE CALLER NAMES AN OPERATION. A whole-list write could not say WHY a
+	-- receipt was missing from what it was handed -- acknowledged and pruned,
+	-- never seen by this caller, or removed on purpose because no credential
+	-- this session holds can ever send it. Three facts, one representation, and
+	-- the store had to guess between them.
+	function()
+	local function opath(stores)
+		for p in pairs(stores) do
+			if p:sub(-15) == "/consent-outbox" then return p end
+		end
+	end
+	local function rec(key, grant)
+		return {
+			idempotency_key = key,
+			workspace_id = "ws", app_id = "app", environment_id = "env",
+			actor_identifier = "anon-op",
+			decided_at = "2026-07-09T00:00:00Z",
+			categories = { analytics = grant == true },
+			anonymous_id = "anon-op",
+		}
+	end
+	local function keys_of()
+		local out = {}
+		for _, r in ipairs(storage.consent_outbox_receipts(identity_scope)) do
+			out[r.idempotency_key] = true
+		end
+		return out
+	end
+
+	-- A. APPEND is ONE receipt, and the cap is decided where it arrives.
+	reset(); storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.append_consent_receipt(identity_scope, rec("first")))
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 1)
+	local okbad, whybad = storage.append_consent_receipt(identity_scope, { idempotency_key = "bad" })
+	assert_equal(okbad, false)
+	assert_equal(whybad, "consent_outbox_invalid",
+		"a receipt this build would not keep is refused, not stored half-formed")
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 1, "and nothing landed")
+
+	-- the cap evicts a pure GRANT before any denial
+	stores[opath(stores)] = nil; storage.reset()
+	assert_true(storage.append_consent_receipt(identity_scope, rec("old-grant", true)))
+	for i = 1, 31 do assert_true(storage.append_consent_receipt(identity_scope, rec("d-" .. i))) end
+	local ok32, _, ev = storage.append_consent_receipt(identity_scope, rec("d-32"))
+	assert_true(ok32)
+	assert_equal(ev, 1, "one eviction")
+	assert_true(not keys_of()["old-grant"], "and it is the pure grant that went")
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 32)
+
+	-- with only denials over the cap, a FRESH denial evicts the oldest denial
+	local oldest = storage.consent_outbox_receipts(identity_scope)[1].idempotency_key
+	assert_true(storage.append_consent_receipt(identity_scope, rec("d-fresh")))
+	assert_true(not keys_of()[oldest], "a fresh denial outranks a stale one")
+	-- but a GRANT is REFUSED rather than admitted at a denial's expense
+	local okg, whyg = storage.append_consent_receipt(identity_scope, rec("late-grant", true))
+	assert_equal(okg, false)
+	assert_equal(whyg, "consent_outbox_full")
+	assert_true(not keys_of()["late-grant"], "and it did not land")
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 32, "nothing was evicted for it")
+	restore(); storage.reset()
+
+	-- B. DROP is BY KEY, and an unknown key is not a failure: asking twice, or
+	--    about a receipt another path already removed, is not an error.
+	reset(); storage.reset()
+	local stores2, restore2 = install_stub_sys_storage()
+	assert_true(storage.append_consent_receipt(identity_scope, rec("a")))
+	assert_true(storage.append_consent_receipt(identity_scope, rec("b")))
+	assert_true(storage.drop_consent_receipts(identity_scope, { "a" }))
+	assert_true(not keys_of()["a"] and keys_of()["b"])
+	assert_true(storage.drop_consent_receipts(identity_scope, { "a", "nonexistent" }),
+		"dropping what is already gone is not a failure")
+
+	-- C. WITHHELD skips the DISK write; the OPERATION still happens. Refusing
+	--    both would leave a caller re-sending a receipt the server already
+	--    accepted, forever, because its mirror could never lose it.
+	local okw, whyw = storage.drop_consent_receipts(identity_scope, { "b" }, true)
+	assert_equal(okw, false)
+	assert_equal(whyw, "consent_outbox_held")
+	assert_true(not keys_of()["b"], "the drop applied in memory")
+	local on_disk = stores2[opath(stores2)]
+	assert_true(on_disk ~= nil and #on_disk.receipts == 1,
+		"and disk still holds what it held -- the WRITE was withheld, not the operation")
+	restore2(); storage.reset()
+
+	-- D. RECEIPTS ARE COPIES.
+	reset(); storage.reset()
+	local stores3b, restore3b = install_stub_sys_storage()
+	assert_true(storage.append_consent_receipt(identity_scope, rec("x")))
+	local handed = storage.consent_outbox_receipts(identity_scope)
+	table.remove(handed)
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 1,
+		"mutating what was handed out leaves the resolution whole")
+	restore3b(); storage.reset()
+	end,
+	-- Declared inline: Lua caps a chunk at 200 locals and this file is at it.
+	--
+	-- THREE FINDINGS FROM THE PREVIOUS SHAPE, SHOWN UNREACHABLE RATHER THAN
+	-- UNNAMED. Each test sets up the scenario the finding described and then
+	-- runs EVERY operation this API offers, asserting the bad outcome never
+	-- arrives. "The merge is gone" is an absence claim about a name; this is a
+	-- claim about what can be constructed.
+	function()
+	local function rec(key, grant)
+		return {
+			idempotency_key = key,
+			workspace_id = "ws", app_id = "app", environment_id = "env",
+			actor_identifier = "anon-un",
+			decided_at = "2026-07-09T00:00:00Z",
+			categories = { analytics = grant == true },
+			anonymous_id = "anon-un",
+		}
+	end
+	local function held()
+		local out = {}
+		for _, r in ipairs(storage.consent_outbox_receipts(identity_scope)) do
+			out[r.idempotency_key] = true
+		end
+		return out
+	end
+
+	-- bbOWx -- A RECEIPT DROPPED ON PURPOSE CANNOT COME BACK. The old shape
+	--          inferred intent from a list it was handed, so a receipt the
+	--          client had filtered for credential/identity reasons looked
+	--          identical to one the caller had simply not seen, and the merge
+	--          restored it: a revived anon grant then holds the event grant gate
+	--          open for the session and blocks anonymous-id rotation.
+	reset(); storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.append_consent_receipt(identity_scope, rec("keep")))
+	assert_true(storage.append_consent_receipt(identity_scope, rec("filtered-on-purpose")))
+	assert_true(storage.drop_consent_receipts(identity_scope, { "filtered-on-purpose" }))
+	-- every operation the API offers, in turn
+	assert_true(storage.append_consent_receipt(identity_scope, rec("later")))
+	assert_true(storage.flush_consent_outbox(identity_scope))
+	assert_true(storage.drop_consent_receipts(identity_scope, { "nothing" }))
+	storage.consent_outbox_receipts(identity_scope)
+	storage.begin_consent_outbox_session(identity_scope)
+	storage.resolve_consent_outbox(identity_scope)
+	assert_true(not held()["filtered-on-purpose"],
+		"no operation restores it -- storage was TOLD, and there is no path that infers otherwise")
+	assert_true(held()["keep"] and held()["later"], "and nothing else was lost proving it")
+	restore(); storage.reset()
+
+	-- bbOWt -- A REFUSAL CANNOT BE BYPASSED BY A LATER RETRY. The old shape let
+	--          the next persistence replace the whole successor with the
+	--          caller's mirror, so a refused write became a successful one that
+	--          also deleted everything the refusal was protecting.
+	reset(); storage.reset()
+	local stores2, restore2 = install_stub_sys_storage()
+	for i = 1, 32 do assert_true(storage.append_consent_receipt(identity_scope, rec("den-" .. i))) end
+	assert_equal(select(2, storage.append_consent_receipt(identity_scope, rec("grant", true))),
+		"consent_outbox_full", "the grant is refused at a denial-full cap")
+	-- every operation, again, looking for one that lets the grant in or drops a denial
+	assert_true(storage.flush_consent_outbox(identity_scope))
+	assert_true(storage.drop_consent_receipts(identity_scope, { "not-here" }))
+	storage.begin_consent_outbox_session(identity_scope)
+	storage.resolve_consent_outbox(identity_scope)
+	assert_equal(select(2, storage.append_consent_receipt(identity_scope, rec("grant", true))),
+		"consent_outbox_full", "and it is refused again -- there is no whole-list write to bypass it with")
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 32)
+	assert_true(not held()["grant"], "the grant never lands")
+	for i = 1, 32 do
+		assert_true(held()["den-" .. i], "and every denial the refusal protects is still here")
+	end
+	restore2(); storage.reset()
+
+	-- bbOWo -- CAPACITY IS ANSWERED AGAINST THE LIST STORAGE OWNS. The old shape
+	--          asked the caller's mirror, which shrinks on acknowledgment before
+	--          the prune lands -- so a grant was admitted against a list that no
+	--          longer matched disk, and the cap then evicted it silently.
+	reset(); storage.reset()
+	local stores3, restore3 = install_stub_sys_storage()
+	for i = 1, 32 do assert_true(storage.append_consent_receipt(identity_scope, rec("cap-" .. i))) end
+	local stale_mirror = storage.consent_outbox_receipts(identity_scope)
+	for _ = 1, 30 do table.remove(stale_mirror) end
+	assert_equal(#stale_mirror, 2, "a caller's mirror can be stale; that is the premise")
+	assert_equal(select(2, storage.append_consent_receipt(identity_scope, rec("grant", true))),
+		"consent_outbox_full",
+		"and it changes nothing: the answer comes from the list storage holds, which no caller can hand it")
+	assert_equal(#storage.consent_outbox_receipts(identity_scope), 32)
 	restore3(); storage.reset()
 	end,
 }

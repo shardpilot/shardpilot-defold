@@ -1026,8 +1026,22 @@ function M.new(config)
 			end
 		end
 		if mismatched_receipts > 0 then
-			client.consent_outbox = kept_receipts
-			client:persist_consent_outbox()
+			-- AN INTENTIONAL REMOVAL, said out loud. These receipts name an
+			-- actor no credential this session holds can send for, so they are
+			-- not pending work -- and under a whole-list write the storage layer
+			-- could not tell that from a list the caller had not seen, and would
+			-- restore them. A restored anon grant then holds the event grant
+			-- gate open for the session and blocks anon rotation.
+			local held, dropped_keys = {}, {}
+			for j = 1, #kept_receipts do held[kept_receipts[j]] = true end
+			for i = 1, #client.consent_outbox do
+				if not held[client.consent_outbox[i]] then
+					dropped_keys[#dropped_keys + 1] = client.consent_outbox[i].idempotency_key
+				end
+			end
+			local ok, reason = storage.drop_consent_receipts(client.config, dropped_keys,
+				client:outbox_write_held())
+			client:record_outbox_op(ok, reason, nil)
 			client:diagnose({
 				scope = "consent",
 				status = "dropped",
@@ -3492,32 +3506,49 @@ end
 -- actually kept: the fixed entry cap evicts the OLDEST receipts first, and an
 -- eviction of a still-undelivered receipt is counted and surfaced through
 -- diagnostics. Returns true when the record matches the mirror.
-function Client:persist_consent_outbox()
-	if self.consent_outbox_unreadable then
-		-- HOLD, do not write. The damaged trail on disk is the evidence this
-		-- session's refusal rests on, and the mirror is the SALVAGEABLE SUBSET
-		-- of it. Writing the subset over the file replaces the damaged trail
-		-- with a clean one, and the next launch restores the grant -- the
-		-- evidence destroyed by an ordinary dispatch acknowledgment rather
-		-- than by anything that looks like a decision.
-		--
-		-- Marked owed, not lost: the write lands the moment a fresh decision
-		-- supersedes the unknown trail (set_consent clears the flag). Holding
-		-- also makes denial_receipt_retained_durably() refuse while dirty, so
-		-- teardown stops accepting this outbox as a witness -- the restrictive
-		-- direction, and the correct one while we cannot read it.
+-- WHAT AN OPERATION DID, recorded once. Three call sites would otherwise each
+-- remember a different part of it -- the failure stat, the dirty flag, the
+-- eviction diagnostic -- and the one that forgot would fail silently.
+--
+-- THE MIRROR FOLLOWS THE RESOLUTION ON BOTH PATHS. A write that did not reach
+-- disk still HAPPENED in memory: the decision applies, the receipt dispatches,
+-- and the trail is marked dirty for a later retry. Reading the mirror only on
+-- success would let a transient disk failure silently undo the operation the
+-- caller just performed.
+-- `evicted` is ONLY ever an append's eviction count. A drop passes nil rather
+-- than its removal count: overloading one parameter with "evicted" and
+-- "removed" needed a flag at the call site to tell them apart, which is two
+-- facts on one channel -- the defect this whole PR exists to remove, invented
+-- while removing it.
+-- THE HOLD STAYS WHERE IT WAS: in the client, in ONE place, in front of every
+-- operation. While the trail is unreadable the damaged file is the evidence
+-- this session's refusal rests on, and the in-memory list is only its
+-- salvageable subset -- writing the subset over it destroys the evidence with
+-- an ordinary acknowledgment rather than with anything resembling a decision.
+--
+-- Deliberately NOT moved into the storage layer by this change. It is a POLICY
+-- about when a write is allowed, and this PR changes the SHAPE of the write.
+-- Moving it would also break the one path that legitimately clears it -- a
+-- fresh decision supersedes the unknown trail -- because the client clears its
+-- own flag and the resolution would not know. That is the subject of PR 3.
+-- THE HOLD IS ABOUT DISK, AND ONLY ABOUT DISK. The operation still happens in
+-- memory: an acknowledged receipt cannot be re-sent by this process, and a
+-- fresh decision applies now. Withholding both would leave the caller re-sending
+-- a receipt the server already accepted, forever, because its mirror can never
+-- lose it -- which is exactly what a first attempt at this guard did.
+function Client:outbox_write_held()
+	return self.consent_outbox_unreadable == true
+end
+
+function Client:record_outbox_op(ok, reason, evicted)
+	self.consent_outbox = storage.consent_outbox_receipts(self.config)
+	if not ok then
 		self.stats.consent_outbox_persist_failed = self.stats.consent_outbox_persist_failed + 1
 		self.consent_outbox_dirty = true
-		return false
+		return false, reason
 	end
-	local saved = storage.save_consent_outbox(self.config, self.consent_outbox)
-	if not saved then
-		self.stats.consent_outbox_persist_failed = self.stats.consent_outbox_persist_failed + 1
-		self.consent_outbox_dirty = true
-		return false
-	end
-	if #self.consent_outbox > #saved then
-		local evicted = #self.consent_outbox - #saved
+	self.consent_outbox_dirty = false
+	if (evicted or 0) > 0 then
 		self.stats.consent_outbox_evicted = self.stats.consent_outbox_evicted + evicted
 		self:diagnose({
 			scope = "consent",
@@ -3526,10 +3557,9 @@ function Client:persist_consent_outbox()
 			count = evicted,
 		})
 	end
-	self.consent_outbox = saved
-	self.consent_outbox_dirty = false
 	return true
 end
+
 
 -- Retry an owed durable outbox write (a failed enqueue persist or a failed
 -- post-delivery prune) so the record converges as soon as storage recovers,
@@ -3538,7 +3568,19 @@ function Client:retry_consent_outbox_persist()
 	if not self.consent_outbox_dirty then
 		return true
 	end
-	return self:persist_consent_outbox()
+	return self:flush_consent_outbox()
+end
+
+-- Write what storage ALREADY HOLDS. The successor to persist_consent_outbox,
+-- and the rename is the point: nothing is handed over, so the storage layer is
+-- never asked to infer why a receipt is missing from a list it was given. What
+-- survives unchanged is the HOLD -- while the trail is unaccounted the damaged
+-- file is the evidence this session's refusal rests on, and writing the
+-- salvageable subset over it destroys that evidence with an ordinary
+-- acknowledgment rather than with anything resembling a decision.
+function Client:flush_consent_outbox()
+	local ok, reason = storage.flush_consent_outbox(self.config, self:outbox_write_held())
+	return self:record_outbox_op(ok, reason, nil)
 end
 
 -- Drop one delivered (or terminally rejected) receipt from the mirror and
@@ -3548,14 +3590,13 @@ end
 -- app die first, the next launch re-sends the stale entry and the server
 -- de-duplicates it on its idempotency_key.
 function Client:remove_consent_receipt(idempotency_key)
-	local kept = {}
-	for i = 1, #self.consent_outbox do
-		if self.consent_outbox[i].idempotency_key ~= idempotency_key then
-			kept[#kept + 1] = self.consent_outbox[i]
-		end
-	end
-	self.consent_outbox = kept
-	self:persist_consent_outbox()
+	-- TOLD, not inferred from a list handed over. A whole-list write could not
+	-- distinguish this deliberate removal from a receipt the caller simply had
+	-- not seen, so the storage layer had to guess -- and guessing wrong here
+	-- restores an acknowledged receipt and re-sends it forever.
+	local ok, reason = storage.drop_consent_receipts(self.config, { idempotency_key },
+		self:outbox_write_held())
+	self:record_outbox_op(ok, reason, nil)
 end
 
 -- True when the durable consent outbox still RETAINS a denial-carrying
@@ -3637,17 +3678,13 @@ function Client:send_consent_decision()
 		-- not chosen — the reason is the only difference from a plain denial.
 		payload.reason = "denied_forced_minor"
 	end
-	-- Append via a fresh list: the mirror may alias the list held by the
-	-- storage layer's in-process shadow (persist adopts the saved list), and
-	-- an in-place append would mutate that shadow ahead of — and regardless
-	-- of — the durable write.
-	local appended = {}
-	for i = 1, #self.consent_outbox do
-		appended[i] = self.consent_outbox[i]
-	end
-	appended[#appended + 1] = payload
-	self.consent_outbox = appended
-	self:persist_consent_outbox()
+	-- ONE receipt, named as an append. The copy-to-avoid-aliasing dance this
+	-- replaced existed because the mirror could alias the storage layer's
+	-- shadow; the resolution hands out copies now, so there is nothing to alias
+	-- and nothing for a call site to remember.
+	local ok, reason, evicted = storage.append_consent_receipt(self.config, payload,
+		self:outbox_write_held())
+	self:record_outbox_op(ok, reason, evicted)
 	local attempted = self:try_send_consent_outbox()
 	if not attempted and not self.consent_send_in_flight then
 		-- Never dispatched: no usable token yet (e.g. an async Mode B mint
