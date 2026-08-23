@@ -10911,6 +10911,104 @@ end)()
 		"1970-01-01T09:00:00Z",
 		"and the whole pair travels together, not just the seq")
 	orestore2(); storage.reset()
+
+	-- P. PROVENANCE DOES NOT CROSS A RUNTIME ROTATION EITHER. The boot path
+	--    refuses a previous actor's provenance under a configured override; the
+	--    actor also changes at RUNTIME through set_anonymous_id, and that path
+	--    bypassed the boot gate entirely.
+	reset(); storage.reset()
+	local pstores, prestore = install_stub_sys_storage()
+	seed_unreadable("anon-rot-a")
+	pstores[outbox_path(pstores)] = "garbage"
+	storage.reset()
+	local pc = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-rot-a", flush_interval_seconds = 9999 })))
+	assert_true(pc.consent_unreadable_imposed, "a real imposition")
+	assert_true(pc:set_consent(false))
+	local ppath = identity_path(pstores)
+	assert_equal(pstores[ppath].consent_superseded_unreadable_by, "decision",
+		"actor A recorded a supersession")
+	assert_true(pc:set_anonymous_id("anon-rot-b"))
+	assert_equal(pstores[ppath].anonymous_id, "anon-rot-b",
+		"the rotation REALLY happened -- otherwise the line below proves nothing")
+	assert_equal(pstores[ppath].consent_superseded_unreadable_by, nil,
+		"and B carries no provenance from the subject it replaced")
+	assert_equal(pstores[ppath].consent_superseded_unreadable_at, nil)
+	prestore(); storage.reset()
+
+	-- Q. THE MARKER ARM IS STALE-ABLE TOO. Two clients boot on an unreadable
+	--    marker; the first one's successful decision CLEARS it, so the second's
+	--    cached flag describes a file that no longer exists. I had written that
+	--    this arm "stands alone" because a marker is a per-actor file -- the
+	--    file is per-actor, but its STATE is shared.
+	reset(); storage.reset()
+	local qstores, qrestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-marker-shared",
+		consent_analytics = "denied",
+		consent_decided_at = "1970-01-01T00:00:00Z",
+	}))
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", anonymous_id = "anon-marker-shared",
+		decided_at = "1970-01-01T00:00:00Z", decision_seq = 1,
+	}))
+	for path in pairs(qstores) do
+		if path:sub(-15) == "/consent-denial" then qstores[path] = "garbage" end
+	end
+	storage.reset()
+	local q1 = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-shared", flush_interval_seconds = 9999 })))
+	local q2 = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-shared", flush_interval_seconds = 9999 })))
+	assert_equal(q2.consent_marker_unreadable, true,
+		"both clients cached the unreadable marker -- that is the setup")
+	assert_true(q1:set_consent(true))
+	local qpath = identity_path(qstores)
+	local q_at = qstores[qpath].consent_superseded_unreadable_at
+	assert_equal(qstores[qpath].consent_superseded_unreadable_by, "decision",
+		"the first client recorded the real supersession")
+	assert_true(q2:set_consent(false))
+	assert_equal(qstores[qpath].consent_analytics, "denied",
+		"the sibling's decision really landed")
+	assert_equal(q2.consent_superseded_unreadable_by, nil,
+		"but it stamped nothing: the marker it cached was already superseded")
+	assert_equal(qstores[qpath].consent_superseded_unreadable_at, q_at,
+		"so the accurate provenance stands")
+	qrestore(); storage.reset()
+
+	-- R. THE SEQ FLOOR MUST COVER THE PROVENANCE IT ADOPTS. A record can carry a
+	--    VALID provenance triplet while its consent value is malformed, and then
+	--    the decision seq restores as 0 while the provenance seq does not. The
+	--    next genuine supersession would mint BELOW the pair it replaces, and the
+	--    seq-first merge would put the older provenance straight back over it.
+	reset(); storage.reset()
+	local rstores, rrestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-floor",
+		consent_analytics = "not-a-consent-value",
+		consent_superseded_unreadable_at = "1970-01-01T00:00:05Z",
+		consent_superseded_unreadable_by = "receipt",
+		consent_superseded_unreadable_seq = 5,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope,
+		{ receipt("floor-seed", "1970-01-01T00:00:00Z", false, "anon-floor") }) ~= false)
+	rstores[outbox_path(rstores)] = "garbage"
+	storage.reset()
+	local rc = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-floor", flush_interval_seconds = 9999 })))
+	assert_equal(rc.consent_superseded_unreadable_seq, 5,
+		"the provenance was adopted -- the fixture reaches its subject")
+	assert_equal(rc.consent_decision_seq, 0,
+		"while the decision seq restored as 0, which is the whole setup")
+	assert_equal(rc.consent_outbox_unreadable, true,
+		"and the trail is unreadable, so the decision below supersedes")
+	assert_true(rc:set_consent(false))
+	local rpath = identity_path(rstores)
+	assert_true(rstores[rpath].consent_superseded_unreadable_seq > 5,
+		"the fresh supersession minted ABOVE the provenance it replaces")
+	assert_equal(rstores[rpath].consent_superseded_unreadable_by, "decision",
+		"so the merge did not put the older pair back")
+	rrestore(); storage.reset()
 end)()
 
 print("shardpilot defold lua tests passed")

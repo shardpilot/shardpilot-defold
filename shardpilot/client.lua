@@ -294,11 +294,21 @@ local function denial_marker_payload(self, state)
 end
 
 local function unreadable_trail_stands(self)
-	-- The MARKER arm stands alone: a marker is read per boot from a per-actor
-	-- file and there is no shared resolution behind it, so this client's
-	-- observation is the whole fact.
+	-- THE MARKER ARM DOES NOT STAND ALONE, and an earlier version of this
+	-- comment said it did. The marker is a per-actor FILE, but a successful
+	-- decision CLEARS it -- so when two live clients both booted on an
+	-- unreadable marker and the first one decides, the second's cached flag
+	-- describes a file that no longer exists. Same staleness as the outbox
+	-- arms, one artefact over, and asserting "there is no shared state here"
+	-- was the reasoning that let it through.
+	--
+	-- The durable state is re-read: the flag says what THIS client saw at boot,
+	-- and only a marker that is still unreadable NOW is still standing.
 	if self.consent_marker_unreadable then
-		return true
+		local marker, marker_err = storage.load_consent_denial_marker(self.config)
+		local present = type(marker) == "table" and next(marker) ~= nil
+		return marker_err ~= nil
+			or (present and not consent_denied_state(marker.consent_analytics))
 	end
 	-- BOTH OUTBOX-BACKED ARMS consult the shared cause, not just one of them.
 	-- `consent_unreadable_imposed` is armed by the same unreadable OUTBOX as
@@ -1280,6 +1290,17 @@ function M.new(config)
 			consent_seq_floor = math.floor(retained_seq)
 		end
 	end
+	-- AND THE PROVENANCE SEQ THE BOOT JUST ADOPTED. A record can carry a valid
+	-- provenance triplet while its consent value or decision pair is malformed,
+	-- and then `consent_decision_seq` is 0 while the adopted provenance seq is
+	-- not -- so the next genuine supersession would mint BELOW the pair it
+	-- replaces, and the seq-first merge would put the older provenance back over
+	-- it. The floor is the max over everything the install is known to have
+	-- minted, and the provenance seq is such a witness exactly like a retained
+	-- receipt's.
+	if consent_superseded_unreadable_seq > consent_seq_floor then
+		consent_seq_floor = consent_superseded_unreadable_seq
+	end
 	client.consent_seq_floor = consent_seq_floor
 	-- BELT against a stale granted record: the write-ahead marker above is
 	-- the primary witness for a denial whose identity write failed, but a
@@ -2053,6 +2074,24 @@ function Client:set_anonymous_id(anonymous_id)
 		or #self.owed_summaries > 0
 		or (self.experiments and self.experiments:has_owed_exposures())) then
 		return false, "events_pending"
+	end
+	if anonymous_id ~= self.anonymous_id then
+		-- PROVENANCE BELONGS TO THE SUBJECT WHO MADE THE DECISION, and this is
+		-- the SECOND place the actor changes. The boot path already refuses to
+		-- adopt a previous actor's provenance under a configured override; this
+		-- runtime rotation bypassed that gate entirely and `persist_identity`
+		-- would have serialised A's cached pair under B's identity, saying that
+		-- B superseded evidence it never had. The repository treats a
+		-- post-rotation id as a different person (`docs/crash.md:369-373`), so
+		-- carrying consent history across it is a misattribution, not a
+		-- convenience.
+		--
+		-- CLEARED rather than gated: unlike the boot path there is nothing to
+		-- read back for the new actor, and a record for B carrying no
+		-- provenance is honest -- B has superseded nothing.
+		self.consent_superseded_unreadable_at = nil
+		self.consent_superseded_unreadable_by = nil
+		self.consent_superseded_unreadable_seq = 0
 	end
 	self.anonymous_id = anonymous_id
 	self:persist_identity()
