@@ -10631,6 +10631,90 @@ end)()
 	assert_equal(sstores[spath].consent_superseded_unreadable_at, stamped,
 		"nor rewind its stamp")
 	srestore(); storage.reset()
+
+	-- J. SAME-SECOND ORDERING. `clock.iso_utc()` is SECOND-precision, so a
+	--    strict timestamp comparison cannot tell two supersessions inside one
+	--    second apart. The distinguishing shape is NOT a sibling holding nil --
+	--    a strict `>` merges that correctly too, which is why an earlier version
+	--    of this case could not kill the mutant. It is a sibling holding the
+	--    FIRST supersession while the record has moved to the SECOND, same
+	--    stamp, higher seq: `durable > record` is then FALSE and the sibling
+	--    writes the OLDER witness back. Ordered on the decision PAIR, as consent
+	--    already is. The clock is FROZEN so the same second is a fact of the
+	--    fixture rather than a race the test usually wins.
+	reset(); storage.reset()
+	local jstores, jrestore = install_stub_sys_storage()
+	local j_clock = require "shardpilot.clock"
+	local j_real_iso = j_clock.iso_utc
+	local j_frozen = j_real_iso()
+	j_clock.iso_utc = function() return j_frozen end
+	local ja = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-sameseq", flush_interval_seconds = 9999 })))
+	local jpath = identity_path(jstores)
+	ja.consent_unreadable_imposed = true
+	ja.consent_restored_state = "granted"
+	assert_true(ja:set_consent(false))
+	local first_seq = jstores[jpath].consent_superseded_unreadable_seq
+	local first_at = jstores[jpath].consent_superseded_unreadable_at
+	-- The sibling is constructed HERE: it reads the FIRST supersession.
+	local jb = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-sameseq", flush_interval_seconds = 9999 })))
+	assert_equal(jb.consent_superseded_unreadable_seq, first_seq,
+		"the sibling holds the FIRST supersession -- not nil, which is the case a strict compare handles")
+	-- A SECOND supersession, same frozen second, strictly higher seq.
+	ja.consent_unreadable_imposed = true
+	ja.consent_restored_state = "granted"
+	assert_true(ja:set_consent(true))
+	local second_seq = jstores[jpath].consent_superseded_unreadable_seq
+	assert_equal(jstores[jpath].consent_superseded_unreadable_at, first_at,
+		"same second: the stamps are EQUAL, so only the seq can order them")
+	assert_true(second_seq > first_seq,
+		"and the fixture REACHES its subject -- the second outranks by seq alone")
+	-- The stale sibling forces a whole-record write carrying the FIRST pair.
+	jb.experiments_client_id = "exp-sameseq"
+	assert_true(jb:persist_identity())
+	assert_equal(jstores[jpath].experiments_client_id, "exp-sameseq",
+		"the sibling's write really landed")
+	assert_equal(jstores[jpath].consent_superseded_unreadable_seq, second_seq,
+		"and the NEWER supersession survived a same-second comparison")
+	j_clock.iso_utc = j_real_iso
+	jrestore(); storage.reset()
+
+	-- K. THE DENIAL MARKER CARRIES THE PROVENANCE, because the failure it exists
+	--    to survive is exactly the one that would lose it: a superseding DENIAL
+	--    whose identity save fails, then a process exit. The retained receipt
+	--    cannot reconstruct it -- the belt runs only against a granted restore.
+	reset(); storage.reset()
+	local kstores, krestore = install_stub_sys_storage()
+	local kc = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-prov", flush_interval_seconds = 9999 })))
+	kc.consent_unreadable_imposed = true
+	kc.consent_restored_state = "granted"
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:sub(-9) == "/identity" then return false end
+		return real_save(path, record)
+	end
+	local kok, kerr = kc:set_consent(false)
+	sys.save = real_save
+	assert_equal(kok, false, "the identity write failed, which is the path under test")
+	assert_equal(kerr, "consent_persist_failed")
+	local mpath = nil
+	for path in pairs(kstores) do
+		if path:sub(-15) == "/consent-denial" then mpath = path end
+	end
+	assert_true(mpath ~= nil, "the write-ahead marker landed")
+	assert_equal(kstores[mpath].superseded_unreadable_by, "decision",
+		"and it carries the provenance the record never got to hold")
+	-- Simulated exit + relaunch: the marker is imposed and the fact comes back.
+	reset(); storage.reset()
+	local relaunched = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-prov", flush_interval_seconds = 9999 })))
+	assert_equal(relaunched.consent_state, "denied",
+		"the marker really imposed -- otherwise the line below proves nothing")
+	assert_equal(relaunched.consent_superseded_unreadable_by, "decision",
+		"and the supersession survived the storage failure it was written for")
+	krestore(); storage.reset()
 end)()
 
 print("shardpilot defold lua tests passed")

@@ -598,6 +598,7 @@ function M.new(config)
 	-- would say this actor superseded evidence it never had.
 	local consent_superseded_unreadable_at = nil
 	local consent_superseded_unreadable_by = nil
+	local consent_superseded_unreadable_seq = 0
 	if not override_replaced_actor
 		and type(stored.consent_superseded_unreadable_at) == "string"
 		and stored.consent_superseded_unreadable_at ~= ""
@@ -605,6 +606,11 @@ function M.new(config)
 			or stored.consent_superseded_unreadable_by == "receipt") then
 		consent_superseded_unreadable_at = stored.consent_superseded_unreadable_at
 		consent_superseded_unreadable_by = stored.consent_superseded_unreadable_by
+		if type(stored.consent_superseded_unreadable_seq) == "number"
+			and stored.consent_superseded_unreadable_seq >= 0 then
+			consent_superseded_unreadable_seq =
+				math.floor(stored.consent_superseded_unreadable_seq)
+		end
 	end
 	-- WRITE-AHEAD DENIAL MARKER: a denied-state set_consent writes this small
 	-- witness BEFORE the identity write and retires it only once the record
@@ -668,6 +674,21 @@ function M.new(config)
 			if marker_stamp ~= nil then
 				consent_decided_at = marker_stamp
 				consent_decision_seq = marker_seq
+			end
+			-- And the provenance the record never got to hold. Same closed set
+			-- of witnesses as the record read, for the same reason: a marker is
+			-- a file too, and an open read would re-persist whatever a damaged
+			-- one happened to carry.
+			if type(marker.superseded_unreadable_at) == "string"
+				and marker.superseded_unreadable_at ~= ""
+				and (marker.superseded_unreadable_by == "decision"
+					or marker.superseded_unreadable_by == "receipt") then
+				consent_superseded_unreadable_at = marker.superseded_unreadable_at
+				consent_superseded_unreadable_by = marker.superseded_unreadable_by
+				consent_superseded_unreadable_seq =
+					(type(marker.superseded_unreadable_seq) == "number"
+						and marker.superseded_unreadable_seq >= 0)
+						and math.floor(marker.superseded_unreadable_seq) or 0
 			end
 			imposed_denial_marker = true
 		end
@@ -770,6 +791,7 @@ function M.new(config)
 		consent_unreadable_imposed = restored_state ~= nil,
 		consent_superseded_unreadable_at = consent_superseded_unreadable_at,
 		consent_superseded_unreadable_by = consent_superseded_unreadable_by,
+		consent_superseded_unreadable_seq = consent_superseded_unreadable_seq,
 		anonymous_id_regenerated = anonymous_id_regenerated,
 		consent_restored_state = restored_state,
 		consent_restored_decided_at = restored_decided_at,
@@ -1190,6 +1212,8 @@ function M.new(config)
 			if client.consent_unreadable_imposed then
 				client.consent_superseded_unreadable_at = stale_denial.decided_at
 				client.consent_superseded_unreadable_by = "receipt"
+				client.consent_superseded_unreadable_seq =
+					stale_denial.decision_seq or 0
 			end
 			client.consent_unreadable_imposed = false
 			-- consent_outbox_unreadable is deliberately NOT cleared here. The
@@ -1645,6 +1669,7 @@ function Client:persist_identity()
 			or self.consent_superseded_unreadable_by == "receipt") then
 		record.consent_superseded_unreadable_at = self.consent_superseded_unreadable_at
 		record.consent_superseded_unreadable_by = self.consent_superseded_unreadable_by
+		record.consent_superseded_unreadable_seq = self.consent_superseded_unreadable_seq or 0
 	end
 	-- The experiments subject id rides the identity record whenever one is
 	-- held — including when the experiments flag is currently off — so an
@@ -1676,11 +1701,19 @@ function Client:persist_identity()
 		and durable.consent_superseded_unreadable_at ~= ""
 		and (durable.consent_superseded_unreadable_by == "decision"
 			or durable.consent_superseded_unreadable_by == "receipt")
-		and (record.consent_superseded_unreadable_at == nil
-			or durable.consent_superseded_unreadable_at
-				> record.consent_superseded_unreadable_at) then
+		and decision_pair_newer(
+			durable.consent_superseded_unreadable_at,
+			(type(durable.consent_superseded_unreadable_seq) == "number"
+				and durable.consent_superseded_unreadable_seq >= 0)
+				and math.floor(durable.consent_superseded_unreadable_seq) or 0,
+			record.consent_superseded_unreadable_at,
+			record.consent_superseded_unreadable_seq) then
 		record.consent_superseded_unreadable_at = durable.consent_superseded_unreadable_at
 		record.consent_superseded_unreadable_by = durable.consent_superseded_unreadable_by
+		record.consent_superseded_unreadable_seq =
+			(type(durable.consent_superseded_unreadable_seq) == "number"
+				and durable.consent_superseded_unreadable_seq >= 0)
+				and math.floor(durable.consent_superseded_unreadable_seq) or 0
 	end
 	return storage.save(self.config, record)
 end
@@ -2260,6 +2293,13 @@ function Client:set_consent(decision)
 		-- entirely made of.
 		self.consent_superseded_unreadable_at = self.consent_decided_at
 		self.consent_superseded_unreadable_by = "decision"
+		-- THE SEQ IS NOT A THIRD FACT; it is how the ONE fact is ordered.
+		-- `clock.iso_utc()` is second-precision, so two supersessions inside one
+		-- second compare EQUAL and a strict `>` let a stale sibling save its
+		-- older witness over the newer one -- and a backward clock adjustment
+		-- did the same across seconds. The decision pair is what this codebase
+		-- already orders consent by; provenance rides the same pair.
+		self.consent_superseded_unreadable_seq = self.consent_decision_seq
 	end
 	-- An explicit decision ENDS any unreadable-evidence imposition: from here
 	-- the in-memory state is the user's own choice and persists as itself.
@@ -2288,11 +2328,23 @@ function Client:set_consent(decision)
 		-- durability and its failure keeps the consent_persist_failed
 		-- contract — but shutdown() refuses to finalize while a denial has
 		-- NO durable witness at all (record, marker, or retained receipt).
+		-- THE MARKER CARRIES THE PROVENANCE TOO, because the failure it exists
+		-- to survive is exactly the one that would lose it. Written BEFORE the
+		-- identity save: if that save fails and the process exits, the next boot
+		-- imposes this marker and consolidates the denial -- and without these
+		-- two fields it would consolidate a decision that superseded an
+		-- unreadable trail while recording no trace that it had. The retained
+		-- receipt cannot reconstruct it either: the belt runs only against a
+		-- restored GRANT. So the one path the marker is for is the one path the
+		-- audit fact silently disappeared on.
 		marker_durable = storage.save_consent_denial_marker(self.config, {
 			consent_analytics = next_state,
 			anonymous_id = self.anonymous_id,
 			decided_at = self.consent_decided_at,
 			decision_seq = self.consent_decision_seq,
+			superseded_unreadable_at = self.consent_superseded_unreadable_at,
+			superseded_unreadable_by = self.consent_superseded_unreadable_by,
+			superseded_unreadable_seq = self.consent_superseded_unreadable_seq,
 		})
 	end
 	local persisted = self:persist_identity()

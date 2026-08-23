@@ -882,7 +882,11 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 - **Durable storage is nine small bounded records** per configured app — the
   last three only ever created by the features that own them (a consent
   denial, and a run with `experiments_enabled` on): the
-  identity record (anonymous ID + consent decision — plus, once a run with
+  identity record (anonymous ID + consent decision; plus, when a decision has
+  superseded a consent trail this device could not read, **the timestamp of that
+  decision and which kind of act it was** — `"decision"` for a choice the player
+  made, `"receipt"` for an earlier choice recovered from an undelivered receipt —
+  retained so a consent record can say where it came from; plus, once a run with
   `experiments_enabled` has minted one, the SDK-minted experiment subject id,
   which every later identity rewrite carries forward **even on launches with
   the flag off**; so clearing only the two experiment records below does not
@@ -903,7 +907,10 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   remote-config cache (the last served config body + ETag, no analytics
   payload; overwritten by the next successful fetch), the small write-ahead
   consent denial marker (written before a denial is applied so the denial
-  survives a crash mid-purge; no analytics payload), and — created only by a
+  survives a crash mid-purge; no analytics payload — it carries the denial and,
+  when that denial superseded an unreadable consent trail, the same provenance
+  pair the identity record holds, so the fact is not lost if the identity write
+  is what failed), and — created only by a
   run with `experiments_enabled` on — the experiment-assignment cache and its
   clear marker. Those last two are the SDK's most identifier-bearing storage
   and are retained across a consent downgrade and across a later launch with

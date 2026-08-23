@@ -8,7 +8,13 @@ described below (disable with `spool_enabled = false` for a fully
 memory-only event path).
 
 Durable storage is namespaced per configured app. The identity record —
-the generated UUIDv7 anonymous ID and the analytics consent decision, plus,
+the generated UUIDv7 anonymous ID and the analytics consent decision; plus, when
+a decision has superseded a consent trail this device could not read, the
+timestamp of that decision and which kind of act it was (`"decision"` for a
+choice the player made, `"receipt"` for an earlier choice recovered from an
+undelivered receipt), so that a consent record can state its own provenance
+instead of being indistinguishable from one written by a device that never met
+an unreadable trail; plus,
 once a run with `experiments_enabled` has minted one, the SDK-minted
 experiment subject id (`spcid_…`) — is
 written through
@@ -149,7 +155,9 @@ sends nothing until an explicit `set_enabled` decision is persisted again.
   outbox (both described below), the remote-config cache (described
   below), the small write-ahead consent denial marker (written before a
   denial is applied so the denial survives a crash mid-purge; no analytics
-  payload), and — created only by a run with `experiments_enabled` on — the
+  payload — it carries the denial and, when that denial superseded an unreadable
+  consent trail, the same provenance pair the identity record holds, so the fact
+  is not lost if the identity write is what failed), and — created only by a run with `experiments_enabled` on — the
   experiment-assignment cache and its clear marker, both detailed below. The
   last three exist only once the feature that owns them has run: a build that
   has never denied consent and never enabled experiments carries six. No
