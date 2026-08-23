@@ -10976,6 +10976,94 @@ end)()
 		"so the accurate provenance stands")
 	qrestore(); storage.reset()
 
+	-- Q2. THE MARKER ARM MUST FALL THROUGH, AND ITS VALIDITY TEST IS BOOT'S.
+	--     Three defects in one six-line block: a helper called before it was
+	--     declared (a runtime crash on a path no test reached), a validity copy
+	--     WEAKER than boot's (a marker naming no actor read as healed), and an
+	--     arm that ANSWERED for the whole predicate instead of falling through.
+	reset(); storage.reset()
+	local q2s, q2restore = install_stub_sys_storage()
+	seed_unreadable("anon-marker-fallthrough")
+	q2s[outbox_path(q2s)] = "garbage"
+	-- A marker that is PRESENT and denial-shaped but names NO actor: boot calls
+	-- that malformed, so a re-read calling it healed is the weaker copy.
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", decided_at = "1970-01-01T00:00:00Z",
+		decision_seq = 1,
+	}))
+	storage.reset()
+	local q2c = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-fallthrough", flush_interval_seconds = 9999 })))
+	assert_equal(q2c.consent_marker_unreadable, true,
+		"boot rejects an actor-less marker as malformed -- the state under test")
+	assert_true(q2c:set_consent(false))
+	local q2path = identity_path(q2s)
+	assert_equal(q2s[q2path].consent_superseded_unreadable_by, "decision",
+		"and the decision over it is recorded, with no crash on the way")
+	q2restore(); storage.reset()
+
+	-- Q3. THE MARKER ARM, ISOLATED. Q2 left BOTH the marker and the outbox
+	--     unreadable, so the outbox arm carried the predicate and neither
+	--     marker-arm mutant could be distinguished. Here the outbox is CLEAN and
+	--     the restore is not a grant, so nothing but the marker arm can make the
+	--     trail stand -- and the marker is denial-shaped with NO actor, which is
+	--     exactly what boot calls malformed and a weaker copy calls healed.
+	reset(); storage.reset()
+	local q3s, q3restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-marker-only",
+		consent_analytics = "denied",
+		consent_decided_at = "1970-01-01T00:00:00Z",
+	}))
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", decided_at = "1970-01-01T00:00:00Z",
+		decision_seq = 1,
+	}))
+	storage.reset()
+	local q3c = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-only", flush_interval_seconds = 9999 })))
+	assert_equal(q3c.consent_marker_unreadable, true,
+		"the marker is the ONLY unreadable artefact")
+	assert_equal(q3c.consent_unreadable_imposed, false,
+		"no imposition -- the restore is not a grant")
+	assert_true(q3c.consent_outbox_unreadable ~= true,
+		"and the outbox is clean, so no other arm can carry the predicate")
+	assert_true(q3c:set_consent(true))
+	local q3path = identity_path(q3s)
+	assert_equal(q3s[q3path].consent_superseded_unreadable_by, "decision",
+		"so the stamp proves the MARKER arm alone made the trail stand")
+	q3restore(); storage.reset()
+
+	-- Q4. THE MARKER ARM MUST FALL THROUGH. The marker HEALS between boot and the
+	--     decision while the outbox stays unreadable. An arm that answers for the
+	--     whole predicate would report no trail standing and skip the stamp.
+	reset(); storage.reset()
+	local q4s, q4restore = install_stub_sys_storage()
+	seed_unreadable("anon-fallthrough")
+	q4s[outbox_path(q4s)] = "garbage"
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", decided_at = "1970-01-01T00:00:00Z",
+		decision_seq = 1,
+	}))
+	for path in pairs(q4s) do
+		if path:sub(-15) == "/consent-denial" then q4s[path] = "garbage" end
+	end
+	storage.reset()
+	local q4c = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-fallthrough", flush_interval_seconds = 9999 })))
+	assert_equal(q4c.consent_marker_unreadable, true, "both reads failed at boot")
+	assert_equal(q4c.consent_outbox_unreadable, true)
+	-- The MARKER heals; the outbox does not.
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", anonymous_id = "anon-fallthrough",
+		decided_at = "1970-01-01T00:00:00Z", decision_seq = 1,
+	}))
+	assert_true(q4c:set_consent(true))
+	local q4path = identity_path(q4s)
+	assert_equal(q4s[q4path].consent_superseded_unreadable_by, "decision",
+		"the healed marker must not answer for the still-unreadable outbox")
+	q4restore(); storage.reset()
+
 	-- R. THE SEQ FLOOR MUST COVER THE PROVENANCE IT ADOPTS. A record can carry a
 	--    VALID provenance triplet while its consent value is malformed, and then
 	--    the decision seq restores as 0 while the provenance seq does not. The

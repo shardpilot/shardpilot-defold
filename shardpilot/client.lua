@@ -177,6 +177,19 @@ end
 -- damaged or hand-edited file happens to carry and then re-persists it, turning
 -- one bad file into a permanent claim about provenance -- and an exclusion list
 -- would fail open the moment somebody invents a fourth witness.
+
+local function valid_identity(value)
+	return type(value) == "string" and value ~= "" and #value <= max_identifier_bytes
+end
+
+-- Both explicit denial flavors close the analytics pipeline identically. The
+-- forced-minor state exists so an age-gate-forced denial is distinguishable
+-- ON ITS RECEIPT (reason = "denied_forced_minor") from a denial the player
+-- chose; every analytics gate treats the two as the same denied state.
+local function consent_denied_state(state)
+	return state == "denied" or state == "denied_forced_minor"
+end
+
 -- PROVENANCE ORDERS BY SEQ FIRST, and consent orders by STAMP first. They are
 -- different questions and I had used one helper for both.
 --
@@ -293,6 +306,25 @@ local function denial_marker_payload(self, state)
 	}
 end
 
+-- ONE marker-validity test, shared with the boot path. The re-read carried its
+-- own copy and it was WEAKER: boot requires a denied state AND a valid actor,
+-- while the copy checked only the state -- so a marker naming no actor, which
+-- boot rejects as malformed, read as HEALED here. A second copy of a validity
+-- rule is the defect this change exists to record, and I wrote one inside the
+-- fix for a second copy of a staleness rule.
+local function marker_trail_unreadable(scope)
+	local marker, marker_err = storage.load_consent_denial_marker(scope)
+	if marker_err ~= nil then
+		return true
+	end
+	if type(marker) ~= "table" or next(marker) == nil then
+		return false            -- absent is not unreadable
+	end
+	return not (consent_denied_state(marker.consent_analytics)
+		and valid_identity(marker.anonymous_id))
+end
+
+
 local function unreadable_trail_stands(self)
 	-- THE MARKER ARM DOES NOT STAND ALONE, and an earlier version of this
 	-- comment said it did. The marker is a per-actor FILE, but a successful
@@ -304,11 +336,13 @@ local function unreadable_trail_stands(self)
 	--
 	-- The durable state is re-read: the flag says what THIS client saw at boot,
 	-- and only a marker that is still unreadable NOW is still standing.
-	if self.consent_marker_unreadable then
-		local marker, marker_err = storage.load_consent_denial_marker(self.config)
-		local present = type(marker) == "table" and next(marker) ~= nil
-		return marker_err ~= nil
-			or (present and not consent_denied_state(marker.consent_analytics))
+	-- FALLS THROUGH when the marker has healed, instead of returning. Both reads
+	-- can fail at boot; if the marker recovers and the outbox has not, returning
+	-- the marker's answer here would say no trail stands while an unreadable
+	-- outbox is sitting right below. An arm that ANSWERS for the whole predicate
+	-- is only safe when it is the last one.
+	if self.consent_marker_unreadable and marker_trail_unreadable(self.config) then
+		return true
 	end
 	-- BOTH OUTBOX-BACKED ARMS consult the shared cause, not just one of them.
 	-- `consent_unreadable_imposed` is armed by the same unreadable OUTBOX as
@@ -320,18 +354,6 @@ local function unreadable_trail_stands(self)
 		return false
 	end
 	return storage.consent_outbox_unaccounted_cause(self.config) ~= nil
-end
-
-local function valid_identity(value)
-	return type(value) == "string" and value ~= "" and #value <= max_identifier_bytes
-end
-
--- Both explicit denial flavors close the analytics pipeline identically. The
--- forced-minor state exists so an age-gate-forced denial is distinguishable
--- ON ITS RECEIPT (reason = "denied_forced_minor") from a denial the player
--- chose; every analytics gate treats the two as the same denied state.
-local function consent_denied_state(state)
-	return state == "denied" or state == "denied_forced_minor"
 end
 
 -- Canonical-actor selection for consent receipts (ADR-0222 §1, the ADR-0202
