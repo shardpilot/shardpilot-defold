@@ -884,9 +884,10 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
   denial, and a run with `experiments_enabled` on): the
   identity record (anonymous ID + consent decision; plus, when a decision has
   superseded a consent trail this device could not read, **the timestamp of that
-  decision and which kind of act it was** — `"decision"` for a choice the player
+  decision, which kind of act it was** — `"decision"` for a choice the player
   made, `"receipt"` for an earlier choice recovered from an undelivered receipt —
-  retained so a consent record can say where it came from; plus, once a run with
+  **and that decision's per-install sequence number**, which orders two such acts
+  that share a second; retained so a consent record can say where it came from; plus, once a run with
   `experiments_enabled` has minted one, the SDK-minted experiment subject id,
   which every later identity rewrite carries forward **even on launches with
   the flag off**; so clearing only the two experiment records below does not

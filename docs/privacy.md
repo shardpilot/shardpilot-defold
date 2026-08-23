@@ -10,9 +10,12 @@ memory-only event path).
 Durable storage is namespaced per configured app. The identity record —
 the generated UUIDv7 anonymous ID and the analytics consent decision; plus, when
 a decision has superseded a consent trail this device could not read, the
-timestamp of that decision and which kind of act it was (`"decision"` for a
+timestamp of that decision, which kind of act it was (`"decision"` for a
 choice the player made, `"receipt"` for an earlier choice recovered from an
-undelivered receipt), so that a consent record can state its own provenance
+undelivered receipt), and that decision's per-install sequence number — a
+monotone counter, carrying no clock and no identifier, which exists only to order
+two such acts that share a second — so that a consent record can state its own
+provenance
 instead of being indistinguishable from one written by a device that never met
 an unreadable trail; plus,
 once a run with `experiments_enabled` has minted one, the SDK-minted

@@ -185,6 +185,77 @@ local function supersession_pair(at, by, seq)
 	return at, by, (type(seq) == "number" and seq >= 0) and math.floor(seq) or 0
 end
 
+-- ONE PREDICATE over the whole set of "a durable consent artefact could not be
+-- read", because the set has THREE members and the stamp gate had been written
+-- against one, then two. They are: the fail-closed imposition (armed only on a
+-- restored GRANT), an unreadable consent-outbox trail, and an unreadable denial
+-- MARKER -- the last of which had no flag at all under a non-granted restore.
+--
+-- A LIMITATION THAT THIS GATE IS WHAT PREVENTS, stated because it is invisible
+-- otherwise. The (stamp, seq) pair that orders provenance cannot order two
+-- clients of ONE scope: both restore the same seq floor at boot and therefore
+-- mint the SAME pair, so `decision_pair_newer` sees a tie and the merge keeps
+-- whichever copy it already had. That does not bite only because two GENUINE
+-- supersessions on one scope are impossible -- the first decision clears the
+-- shared hold, so the second client has nothing left to supersede. If this gate
+-- is ever relaxed, the ordering degrades to last-writer-wins and the seq must
+-- become per-SCOPE, not per-client. Measured, not assumed: with one client at
+-- seq 1, a sibling's next decision also mints 1.
+--
+-- The outbox arm consults the SHARED resolution, not only this client's flag.
+-- Two live clients for one scope both observe an unreadable trail; the first
+-- client's explicit decision clears the shared hold, and the second one's local
+-- flag stays set. Reading the local flag alone, that second client stamps a NEW
+-- supersession on an ordinary later decision -- replacing accurate provenance
+-- with a false, later event. The hold is the shared fact; the flag is a cache of
+-- it, and a cache is not the fact.
+-- ONE BUILDER for every denial-marker payload. There are FOUR writers -- the
+-- belt's convergence fallback, set_consent, the delivery callback and the
+-- shutdown retry -- and the provenance was added to exactly one of them, so the
+-- other three serialised the OLD schema. A marker written by any of them, then
+-- imposed at the next boot, consolidated a denial with no trace that it had
+-- superseded anything: the very failure the marker exists to survive.
+--
+-- It also MERGES the durable pair before serialising, for the same reason
+-- persist_identity does. The record merge happens inside persist_identity,
+-- AFTER the marker is written, so a sibling holding older provenance could put
+-- its stale pair into the marker and -- if the identity save then failed -- the
+-- next boot would impose that marker and replace a newer supersession with an
+-- older one. Merging here closes the window instead of narrowing it.
+local function denial_marker_payload(self, state)
+	local at, by, seq = self.consent_superseded_unreadable_at,
+		self.consent_superseded_unreadable_by,
+		self.consent_superseded_unreadable_seq
+	local durable = storage.load(self.config)
+	if type(durable) == "table" and durable.anonymous_id == self.anonymous_id then
+		local dat, dby, dseq = supersession_pair(
+			durable.consent_superseded_unreadable_at,
+			durable.consent_superseded_unreadable_by,
+			durable.consent_superseded_unreadable_seq)
+		if dat ~= nil and decision_pair_newer(dat, dseq, at, seq) then
+			at, by, seq = dat, dby, dseq
+		end
+	end
+	at, by, seq = supersession_pair(at, by, seq)
+	return {
+		consent_analytics = state,
+		anonymous_id = self.anonymous_id,
+		decided_at = self.consent_decided_at,
+		decision_seq = self.consent_decision_seq,
+		superseded_unreadable_at = at,
+		superseded_unreadable_by = by,
+		superseded_unreadable_seq = seq,
+	}
+end
+
+local function unreadable_trail_stands(self)
+	if self.consent_unreadable_imposed or self.consent_marker_unreadable then
+		return true
+	end
+	return self.consent_outbox_unreadable == true
+		and storage.consent_outbox_unaccounted_cause(self.config) ~= nil
+end
+
 local function valid_identity(value)
 	return type(value) == "string" and value ~= "" and #value <= max_identifier_bytes
 end
@@ -644,6 +715,7 @@ function M.new(config)
 	-- its actor: it fails closed over a granted restore only — the one
 	-- restore it could be contradicting — and is never retired on this
 	-- launch's evidence.
+	local marker_unreadable = false
 	local marker, marker_err = storage.load_consent_denial_marker(normalized)
 	local marker_present = type(marker) == "table" and next(marker) ~= nil
 	local marker_valid = marker_present
@@ -719,6 +791,17 @@ function M.new(config)
 		consent_decided_at = nil
 		consent_decision_seq = 0
 		imposed_marker_code = "denial_marker_unreadable"
+		marker_unreadable = true
+	elseif marker_err ~= nil or (marker_present and not marker_valid) then
+		-- THE SAME UNREADABILITY UNDER A NON-GRANTED RESTORE. The arm above
+		-- fails closed only for a restored GRANT -- correctly, since a
+		-- non-granted boot is already safe and must not durably flip. But the
+		-- MARKER is just as unreadable here, and an explicit decision that
+		-- follows replaces or clears it. Represented by its own flag rather
+		-- than through `consent_unreadable_imposed`, which is armed only for
+		-- the granted arm: one flag carrying two conditions is the defect this
+		-- whole change exists to record.
+		marker_unreadable = true
 	end
 	local client = setmetatable({
 		config = normalized,
@@ -806,6 +889,7 @@ function M.new(config)
 		consent_superseded_unreadable_at = consent_superseded_unreadable_at,
 		consent_superseded_unreadable_by = consent_superseded_unreadable_by,
 		consent_superseded_unreadable_seq = consent_superseded_unreadable_seq,
+		consent_marker_unreadable = marker_unreadable,
 		anonymous_id_regenerated = anonymous_id_regenerated,
 		consent_restored_state = restored_state,
 		consent_restored_decided_at = restored_decided_at,
@@ -1261,12 +1345,7 @@ function M.new(config)
 				-- refuses to finalize while the denial has no durable
 				-- witness, and its retry path re-attempts both writes.
 				local witness_durable = storage.save_consent_denial_marker(
-					normalized, {
-						consent_analytics = client.consent_state,
-						anonymous_id = client.anonymous_id,
-						decided_at = client.consent_decided_at,
-						decision_seq = client.consent_decision_seq,
-					})
+					normalized, denial_marker_payload(client, client.consent_state))
 				client.consent_denial_record_pending = true
 				client.consent_denial_marker_pending = not witness_durable
 			end
@@ -2278,7 +2357,7 @@ function Client:set_consent(decision)
 	self.consent_decision_seq = math.max(self.consent_seq_floor or 0,
 		self.consent_decision_seq or 0) + 1
 	self.consent_seq_floor = self.consent_decision_seq
-	if self.consent_unreadable_imposed or self.consent_outbox_unreadable then
+	if unreadable_trail_stands(self) then
 		-- BOTH unreadable states, because this decision ends BOTH -- the two
 		-- lines below clear them together, and gating the stamp on only the
 		-- imposition lost provenance for the case the imposition never covers.
@@ -2319,6 +2398,7 @@ function Client:set_consent(decision)
 	-- taken.
 	self.consent_unreadable_imposed = false
 	self.consent_outbox_unreadable = false
+	self.consent_marker_unreadable = false
 	-- AND THE SHARED TRAIL'S HOLD ENDS WITH IT. The client's own flag is no
 	-- longer the whole fact: two clients for one scope share the resolution, so
 	-- a hold cleared only here would leave the other one still withholding.
@@ -2348,15 +2428,8 @@ function Client:set_consent(decision)
 		-- receipt cannot reconstruct it either: the belt runs only against a
 		-- restored GRANT. So the one path the marker is for is the one path the
 		-- audit fact silently disappeared on.
-		marker_durable = storage.save_consent_denial_marker(self.config, {
-			consent_analytics = next_state,
-			anonymous_id = self.anonymous_id,
-			decided_at = self.consent_decided_at,
-			decision_seq = self.consent_decision_seq,
-			superseded_unreadable_at = self.consent_superseded_unreadable_at,
-			superseded_unreadable_by = self.consent_superseded_unreadable_by,
-			superseded_unreadable_seq = self.consent_superseded_unreadable_seq,
-		})
+		marker_durable = storage.save_consent_denial_marker(
+			self.config, denial_marker_payload(self, next_state))
 	end
 	local persisted = self:persist_identity()
 	if persisted then
@@ -4069,12 +4142,8 @@ function Client:try_send_consent_outbox()
 					and consent_denied_state(self.consent_state)
 					and type(payload.categories) == "table"
 					and payload.categories.analytics == false then
-					if storage.save_consent_denial_marker(self.config, {
-						consent_analytics = self.consent_state,
-						anonymous_id = self.anonymous_id,
-						decided_at = self.consent_decided_at,
-						decision_seq = self.consent_decision_seq,
-					}) then
+					if storage.save_consent_denial_marker(self.config,
+						denial_marker_payload(self, self.consent_state)) then
 						self.consent_denial_marker_pending = false
 					end
 				end
@@ -5318,15 +5387,13 @@ function Client:shutdown(reason)
 			self.consent_denial_record_pending = false
 			self.consent_denial_marker_pending = false
 		elseif self.consent_denial_marker_pending
-			and storage.save_consent_denial_marker(self.config, {
-				consent_analytics = self.consent_state,
-				anonymous_id = self.anonymous_id,
-				decided_at = self.consent_decided_at,
-				-- The decision's full pair rides every marker write: a
-				-- seq-less marker would lose the same-second tie-break at
-				-- the next boot's stale-marker comparison.
-				decision_seq = self.consent_decision_seq,
-			}) then
+			-- The decision's full pair rides every marker write (a seq-less
+			-- marker would lose the same-second tie-break at the next boot's
+			-- stale-marker comparison), and so does the supersession pair --
+			-- both through the one builder, so a fifth writer cannot omit
+			-- either by being written somewhere else.
+			and storage.save_consent_denial_marker(self.config,
+				denial_marker_payload(self, self.consent_state)) then
 			self.consent_denial_marker_pending = false
 		end
 		if self.consent_denial_record_pending and self.consent_denial_marker_pending

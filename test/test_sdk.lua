@@ -10715,6 +10715,134 @@ end)()
 	assert_equal(relaunched.consent_superseded_unreadable_by, "decision",
 		"and the supersession survived the storage failure it was written for")
 	krestore(); storage.reset()
+
+	-- L. THE MARKER IS BUILT BEFORE THE RECORD MERGE RUNS, so it must merge the
+	--    durable pair itself. A sibling holding OLDER provenance that makes a
+	--    denial whose identity save fails would otherwise put its stale pair in
+	--    the marker, and the next boot would impose it over the newer one.
+	reset(); storage.reset()
+	local lstores, lrestore = install_stub_sys_storage()
+	local la = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-merge", flush_interval_seconds = 9999 })))
+	local lb = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-merge", flush_interval_seconds = 9999 })))
+	la.consent_unreadable_imposed = true
+	la.consent_restored_state = "granted"
+	assert_true(la:set_consent(false))
+	local lpath = identity_path(lstores)
+	local newer_at = lstores[lpath].consent_superseded_unreadable_at
+	local newer_seq = lstores[lpath].consent_superseded_unreadable_seq
+	assert_equal(lb.consent_superseded_unreadable_by, nil,
+		"the sibling holds NOTHING -- which is what makes its marker stale")
+	local l_real_save = sys.save
+	sys.save = function(path, record)
+		if path:sub(-9) == "/identity" then return false end
+		return l_real_save(path, record)
+	end
+	local lok = lb:set_consent(false)
+	sys.save = l_real_save
+	assert_equal(lok, false, "the identity save failed, which is the path under test")
+	local lmpath = nil
+	for path in pairs(lstores) do
+		if path:sub(-15) == "/consent-denial" then lmpath = path end
+	end
+	assert_true(lmpath ~= nil, "the sibling's marker landed")
+	assert_equal(lstores[lmpath].superseded_unreadable_at, newer_at,
+		"and it carries the NEWER durable provenance, not the sibling's absence")
+	assert_equal(lstores[lmpath].superseded_unreadable_seq, newer_seq)
+	lrestore(); storage.reset()
+
+	-- M. AN UNREADABLE DENIAL MARKER UNDER A NON-GRANTED RESTORE is the THIRD
+	--    member of the unreadable set. The fail-closed imposition is armed only
+	--    for a restored GRANT, so this state had no flag at all and an explicit
+	--    decision that replaced the unreadable marker recorded nothing.
+	reset(); storage.reset()
+	local mstores, mrestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-marker-unreadable",
+		consent_analytics = "denied",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+	}))
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", anonymous_id = "anon-marker-unreadable",
+		decided_at = "2026-07-01T00:00:00.000Z", decision_seq = 1,
+	}))
+	for path in pairs(mstores) do
+		if path:sub(-15) == "/consent-denial" then mstores[path] = "garbage" end
+	end
+	storage.reset()
+	local mc = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-unreadable", flush_interval_seconds = 9999 })))
+	assert_equal(mc.consent_unreadable_imposed, false,
+		"the granted-only imposition does NOT arm here -- that is the gap")
+	assert_equal(mc.consent_marker_unreadable, true,
+		"but the marker IS unreadable, which is the state under test")
+	assert_true(mc:set_consent(true))
+	local mpath2 = identity_path(mstores)
+	assert_equal(mstores[mpath2].consent_superseded_unreadable_by, "decision",
+		"an explicit act over an unreadable MARKER is recorded too")
+	assert_equal(mstores[mpath2].consent_analytics, "granted",
+		"and the decision itself landed")
+	mrestore(); storage.reset()
+
+	-- N. THE HOLD IS SHARED; THE LOCAL FLAG IS A CACHE OF IT. Two clients both
+	--    see an unreadable trail. The first client's decision supersedes it and
+	--    clears the SHARED hold. An ordinary later decision by the second client
+	--    must NOT record a second supersession over accurate provenance.
+	--
+	--    The restored state is DENIED on purpose. Under a restored GRANT both
+	--    clients also arm `consent_unreadable_imposed`, the predicate's first
+	--    arm short-circuits, and the shared-hold consultation is never reached --
+	--    an earlier version of this case did that and could not kill the mutant.
+	--    The clock is FROZEN so a second boundary cannot make the two stamps
+	--    differ and rescue the assertion by accident.
+	reset(); storage.reset()
+	local nstores2, nrestore2 = install_stub_sys_storage()
+	local n_clock = require "shardpilot.clock"
+	local n_real_iso = n_clock.iso_utc
+	local n_frozen = n_real_iso()
+	n_clock.iso_utc = function() return n_frozen end
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-shared-hold",
+		consent_analytics = "denied",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope,
+		{ receipt("hold-seed", "2026-07-01T00:00:00.000Z", false,
+			"anon-shared-hold") }) ~= false)
+	local hopath = outbox_path(nstores2)
+	nstores2[hopath] = "garbage"
+	storage.reset()
+	local n1 = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-shared-hold", flush_interval_seconds = 9999 })))
+	local n2 = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-shared-hold", flush_interval_seconds = 9999 })))
+	assert_equal(n2.consent_unreadable_imposed, false,
+		"the imposition must NOT be armed, or the predicate short-circuits before the hold")
+	assert_equal(n2.consent_outbox_unreadable, true,
+		"both clients cached the unreadable trail -- that is the setup")
+	assert_true(n1:set_consent(true))
+	local npath2 = identity_path(nstores2)
+	local true_at = nstores2[npath2].consent_superseded_unreadable_at
+	local true_seq = nstores2[npath2].consent_superseded_unreadable_seq
+	assert_equal(nstores2[npath2].consent_superseded_unreadable_by, "decision",
+		"the first client recorded the real supersession")
+	-- The second client's flag is now STALE: the shared hold is cleared.
+	assert_true(n2:set_consent(false))
+	-- ASSERTED ON THE CLIENT, because the record cannot tell these apart: two
+	-- clients on one scope restore the same seq floor and therefore MINT THE
+	-- SAME (stamp, seq) pair, so a false stamp from the sibling is indexed
+	-- identically to the true one and `decision_pair_newer` sees a tie. The
+	-- question is whether the sibling stamped AT ALL, and that is readable here.
+	assert_equal(n2.consent_superseded_unreadable_by, nil,
+		"the sibling did not stamp: the shared hold was already cleared")
+	assert_equal(nstores2[npath2].consent_analytics, "denied",
+		"the second decision really landed -- otherwise the lines below prove nothing")
+	assert_equal(nstores2[npath2].consent_superseded_unreadable_seq, true_seq,
+		"and it did NOT stamp a second, false supersession over the accurate one")
+	assert_equal(nstores2[npath2].consent_superseded_unreadable_at, true_at)
+	n_clock.iso_utc = n_real_iso
+	nrestore2(); storage.reset()
 end)()
 
 print("shardpilot defold lua tests passed")
