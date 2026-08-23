@@ -1628,11 +1628,15 @@ function M.flush_consent_outbox(scope)
 	local ns = spool_namespace(scope)
 	local r = resolution_for(ns, scope)
 	local withhold = outbox_unaccounted(r)
-	local capped = cap_existing(copy_outbox_entries(r.receipts))
+	-- THE COUNT RIDES OUT HERE TOO. Both paths that cap a list they did not
+	-- build must say what it cost: a client whose only pending action is an owed
+	-- write never calls drop, so evictions on this path are the only ones it
+	-- would ever see -- and returning nothing made them the ones it never does.
+	local capped, over = cap_existing(copy_outbox_entries(r.receipts))
 	if not outbox_write(ns, scope, capped, withhold) then
-		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed"
+		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed", over
 	end
-	return true
+	return true, nil, over
 end
 
 -- AN EXPLICIT DECISION ENDS THE HOLD. The client already does this to its own

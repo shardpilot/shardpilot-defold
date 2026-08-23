@@ -8690,9 +8690,28 @@ local tests = {
 	stores6[p6] = { receipts = oversized }
 	storage.reset()
 	assert_equal(#storage.consent_outbox_receipts(identity_scope), 40)
-	assert_true(storage.flush_consent_outbox(identity_scope))
+	local okf, _, capped_f = storage.flush_consent_outbox(identity_scope)
+	assert_true(okf)
 	assert_equal(#stores6[p6].receipts, 32,
 		"flush converges it as well -- the bound is a property of the record, not of one entry point")
+	assert_equal(capped_f, 8,
+		"and it SAYS what that cost: a client whose only pending action is an owed write never calls drop, so these are the only evictions it would ever see")
+
+	-- THROUGH THE CLIENT'S OWN FLUSH, so the forwarding is observed and not just
+	-- the storage return. A first version asserted the storage value alone and
+	-- the mutant that drops the forwarding stayed green.
+	local issues6 = {}
+	local c6 = assert(sdk.new(config_mode_a({
+		flush_interval_seconds = 9999,
+		diagnostics = function(i) issues6[#issues6 + 1] = i end,
+	})))
+	stores6[p6] = { receipts = oversized }
+	storage.reset()
+	c6.consent_outbox = storage.consent_outbox_receipts(identity_scope)
+	assert_true(c6:flush_consent_outbox())
+	assert_equal(c6:snapshot().consent_outbox_evicted, 8,
+		"the client counts them, which is the only place an operator sees them")
+	assert_equal(issues6[#issues6].code, "outbox_overflow")
 	restore6(); storage.reset()
 
 	-- K. THE REASON A WRITE IS OUTSTANDING DECIDES WHAT A SESSION DOES. One

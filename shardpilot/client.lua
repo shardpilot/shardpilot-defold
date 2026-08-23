@@ -3615,8 +3615,8 @@ end
 -- salvageable subset over it destroys that evidence with an ordinary
 -- acknowledgment rather than with anything resembling a decision.
 function Client:flush_consent_outbox()
-	local ok, reason = storage.flush_consent_outbox(self.config)
-	return self:record_outbox_op(ok, reason, nil)
+	local ok, reason, capped_out = storage.flush_consent_outbox(self.config)
+	return self:record_outbox_op(ok, reason, capped_out)
 end
 
 -- Drop one delivered (or terminally rejected) receipt from the mirror and
