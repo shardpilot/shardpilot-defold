@@ -10566,6 +10566,71 @@ end)()
 		"carrying no witness from the subject it replaced")
 	assert_equal(ostores[opath].consent_superseded_unreadable_at, nil)
 	orestore(); storage.reset()
+
+	-- H. AN UNREADABLE OUTBOX UNDER A NON-GRANTED RESTORE IS THE SECOND
+	--    unreadable state this decision ends, and the fail-closed imposition
+	--    never covers it: that arm fires only on a restored GRANT. The trail is
+	--    just as unreadable, and set_consent replaces it just as squarely.
+	reset(); storage.reset()
+	local dstores, drestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-denied-unreadable",
+		consent_analytics = "denied",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope,
+		{ receipt("den-seed", "2026-07-01T00:00:00.000Z", false,
+			"anon-denied-unreadable") }) ~= false)
+	local dopath = outbox_path(dstores)
+	dstores[dopath] = "garbage"
+	storage.reset()
+	local denied = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-denied-unreadable", flush_interval_seconds = 9999 })))
+	assert_equal(denied.consent_unreadable_imposed, false,
+		"the imposition arm does NOT fire here -- that is the whole point")
+	assert_equal(denied.consent_outbox_unreadable, true,
+		"but the trail IS unreadable, which is the state under test")
+	assert_true(denied:set_consent(true))
+	local dpath = identity_path(dstores)
+	assert_equal(dpath ~= nil, true)
+	assert_equal(dstores[dpath].consent_superseded_unreadable_by, "decision",
+		"an explicit act over an unreadable trail is recorded whichever flag carried it")
+	assert_equal(dstores[dpath].consent_analytics, "granted",
+		"and the decision itself really landed")
+	drestore(); storage.reset()
+
+	-- I. A SIBLING CLIENT MUST NOT ROLL PROVENANCE BACK. The record is shared
+	--    and every identity write is whole-record, so a client constructed
+	--    BEFORE a supersession holds nil for these fields and would erase them
+	--    on any later unrelated write of its own.
+	reset(); storage.reset()
+	local sstores, srestore = install_stub_sys_storage()
+	local first = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-shared", flush_interval_seconds = 9999 })))
+	local second = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-shared", flush_interval_seconds = 9999 })))
+	local spath = identity_path(sstores)
+	-- The FIRST client meets an unreadable trail and supersedes it.
+	first.consent_unreadable_imposed = true
+	first.consent_restored_state = "granted"
+	assert_true(first:set_consent(false))
+	local stamped = sstores[spath].consent_superseded_unreadable_at
+	assert_equal(sstores[spath].consent_superseded_unreadable_by, "decision",
+		"the first client recorded the supersession")
+	assert_true(type(stamped) == "string" and stamped ~= "")
+	-- The SECOND client was constructed before that and holds nil.
+	assert_equal(second.consent_superseded_unreadable_by, nil,
+		"the sibling never saw it -- which is the hazard, not a bug in the fixture")
+	second.experiments_client_id = "exp-subject-forcing-a-write"
+	assert_true(second:persist_identity(),
+		"an unrelated whole-record write from the stale sibling")
+	assert_equal(sstores[spath].experiments_client_id, "exp-subject-forcing-a-write",
+		"the sibling's write REALLY landed -- otherwise the line below proves nothing")
+	assert_equal(sstores[spath].consent_superseded_unreadable_by, "decision",
+		"and it did not roll the provenance back")
+	assert_equal(sstores[spath].consent_superseded_unreadable_at, stamped,
+		"nor rewind its stamp")
+	srestore(); storage.reset()
 end)()
 
 print("shardpilot defold lua tests passed")

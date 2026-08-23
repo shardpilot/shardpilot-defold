@@ -1653,6 +1653,35 @@ function Client:persist_identity()
 	if type(self.experiments_client_id) == "string" and self.experiments_client_id ~= "" then
 		record.experiments_client_id = self.experiments_client_id
 	end
+	-- THE RECORD IS SHARED AND THIS WRITE IS WHOLE-RECORD, so a client that has
+	-- not seen a supersession must not roll one back. Two clients on one scope
+	-- are ordinary here: the second is constructed with whatever the record said
+	-- at ITS init, and any later unrelated write of its own -- an anon rewrite,
+	-- an experiments subject-id persist -- would otherwise rebuild the whole
+	-- record from those stale fields and silently erase provenance the first
+	-- client recorded in between. Same shape as the outbox hold, which had to
+	-- move into the shared resolution for exactly this reason.
+	--
+	-- ACTOR-SAFELY: only a record for THIS anon can contribute. A record left by
+	-- a different actor is not this subject's history, and merging it would
+	-- reintroduce the cross-actor attribution the boot path refuses.
+	--
+	-- NEWER WINS, compared on the stamp, so a second supersession is not rolled
+	-- back by a client still holding the first. One load on a path that was
+	-- already doing a save.
+	local durable = storage.load(self.config)
+	if type(durable) == "table"
+		and durable.anonymous_id == self.anonymous_id
+		and type(durable.consent_superseded_unreadable_at) == "string"
+		and durable.consent_superseded_unreadable_at ~= ""
+		and (durable.consent_superseded_unreadable_by == "decision"
+			or durable.consent_superseded_unreadable_by == "receipt")
+		and (record.consent_superseded_unreadable_at == nil
+			or durable.consent_superseded_unreadable_at
+				> record.consent_superseded_unreadable_at) then
+		record.consent_superseded_unreadable_at = durable.consent_superseded_unreadable_at
+		record.consent_superseded_unreadable_by = durable.consent_superseded_unreadable_by
+	end
 	return storage.save(self.config, record)
 end
 
@@ -2205,7 +2234,16 @@ function Client:set_consent(decision)
 	self.consent_decision_seq = math.max(self.consent_seq_floor or 0,
 		self.consent_decision_seq or 0) + 1
 	self.consent_seq_floor = self.consent_decision_seq
-	if self.consent_unreadable_imposed then
+	if self.consent_unreadable_imposed or self.consent_outbox_unreadable then
+		-- BOTH unreadable states, because this decision ends BOTH -- the two
+		-- lines below clear them together, and gating the stamp on only the
+		-- imposition lost provenance for the case the imposition never covers.
+		-- The fail-closed imposition fires only on a restored GRANT; an outbox
+		-- that fails to read under a restored `denied` or `unknown` sets
+		-- `consent_outbox_unreadable` and nothing else. The trail is just as
+		-- unreadable there, and this decision replaces it just as squarely: it
+		-- clears the shared hold and appends a fresh receipt over it.
+		--
 		-- THE SUPERSESSION IS RECORDED, not just performed. Without this the
 		-- successor record is indistinguishable from one written by a client
 		-- that never met an unreadable trail, and the one moment a consent
