@@ -167,6 +167,24 @@ local function decision_pair_newer(stamp, seq, base_stamp, base_seq)
 	return (seq or 0) > (base_seq or 0)
 end
 
+-- ONE HOME for the supersession pair's read rules, because they were stated in
+-- FOUR places -- the record read, the marker restore, the persist write and the
+-- sibling merge -- and a rule with four homes is the defect this whole change
+-- exists to record. A third witness value would have been added to three of the
+-- four; the seq normalisation was already copied verbatim four times.
+--
+-- The witness set is CLOSED and enumerated. An open read admits whatever a
+-- damaged or hand-edited file happens to carry and then re-persists it, turning
+-- one bad file into a permanent claim about provenance -- and an exclusion list
+-- would fail open the moment somebody invents a fourth witness.
+local function supersession_pair(at, by, seq)
+	if type(at) ~= "string" or at == ""
+		or not (by == "decision" or by == "receipt") then
+		return nil
+	end
+	return at, by, (type(seq) == "number" and seq >= 0) and math.floor(seq) or 0
+end
+
 local function valid_identity(value)
 	return type(value) == "string" and value ~= "" and #value <= max_identifier_bytes
 end
@@ -599,17 +617,15 @@ function M.new(config)
 	local consent_superseded_unreadable_at = nil
 	local consent_superseded_unreadable_by = nil
 	local consent_superseded_unreadable_seq = 0
-	if not override_replaced_actor
-		and type(stored.consent_superseded_unreadable_at) == "string"
-		and stored.consent_superseded_unreadable_at ~= ""
-		and (stored.consent_superseded_unreadable_by == "decision"
-			or stored.consent_superseded_unreadable_by == "receipt") then
-		consent_superseded_unreadable_at = stored.consent_superseded_unreadable_at
-		consent_superseded_unreadable_by = stored.consent_superseded_unreadable_by
-		if type(stored.consent_superseded_unreadable_seq) == "number"
-			and stored.consent_superseded_unreadable_seq >= 0 then
-			consent_superseded_unreadable_seq =
-				math.floor(stored.consent_superseded_unreadable_seq)
+	if not override_replaced_actor then
+		local at, by, seq = supersession_pair(
+			stored.consent_superseded_unreadable_at,
+			stored.consent_superseded_unreadable_by,
+			stored.consent_superseded_unreadable_seq)
+		if at ~= nil then
+			consent_superseded_unreadable_at = at
+			consent_superseded_unreadable_by = by
+			consent_superseded_unreadable_seq = seq
 		end
 	end
 	-- WRITE-AHEAD DENIAL MARKER: a denied-state set_consent writes this small
@@ -679,16 +695,14 @@ function M.new(config)
 			-- of witnesses as the record read, for the same reason: a marker is
 			-- a file too, and an open read would re-persist whatever a damaged
 			-- one happened to carry.
-			if type(marker.superseded_unreadable_at) == "string"
-				and marker.superseded_unreadable_at ~= ""
-				and (marker.superseded_unreadable_by == "decision"
-					or marker.superseded_unreadable_by == "receipt") then
-				consent_superseded_unreadable_at = marker.superseded_unreadable_at
-				consent_superseded_unreadable_by = marker.superseded_unreadable_by
-				consent_superseded_unreadable_seq =
-					(type(marker.superseded_unreadable_seq) == "number"
-						and marker.superseded_unreadable_seq >= 0)
-						and math.floor(marker.superseded_unreadable_seq) or 0
+			local mat, mby, mseq = supersession_pair(
+				marker.superseded_unreadable_at,
+				marker.superseded_unreadable_by,
+				marker.superseded_unreadable_seq)
+			if mat ~= nil then
+				consent_superseded_unreadable_at = mat
+				consent_superseded_unreadable_by = mby
+				consent_superseded_unreadable_seq = mseq
 			end
 			imposed_denial_marker = true
 		end
@@ -1663,13 +1677,16 @@ function Client:persist_identity()
 	-- a supersession is a fact about the record's PROVENANCE, and gating it on
 	-- the state would drop it for the one state that does not persist a
 	-- consent key.
-	if type(self.consent_superseded_unreadable_at) == "string"
-		and self.consent_superseded_unreadable_at ~= ""
-		and (self.consent_superseded_unreadable_by == "decision"
-			or self.consent_superseded_unreadable_by == "receipt") then
-		record.consent_superseded_unreadable_at = self.consent_superseded_unreadable_at
-		record.consent_superseded_unreadable_by = self.consent_superseded_unreadable_by
-		record.consent_superseded_unreadable_seq = self.consent_superseded_unreadable_seq or 0
+	do
+		local at, by, seq = supersession_pair(
+			self.consent_superseded_unreadable_at,
+			self.consent_superseded_unreadable_by,
+			self.consent_superseded_unreadable_seq)
+		if at ~= nil then
+			record.consent_superseded_unreadable_at = at
+			record.consent_superseded_unreadable_by = by
+			record.consent_superseded_unreadable_seq = seq
+		end
 	end
 	-- The experiments subject id rides the identity record whenever one is
 	-- held — including when the experiments flag is currently off — so an
@@ -1696,24 +1713,18 @@ function Client:persist_identity()
 	-- already doing a save.
 	local durable = storage.load(self.config)
 	if type(durable) == "table"
-		and durable.anonymous_id == self.anonymous_id
-		and type(durable.consent_superseded_unreadable_at) == "string"
-		and durable.consent_superseded_unreadable_at ~= ""
-		and (durable.consent_superseded_unreadable_by == "decision"
-			or durable.consent_superseded_unreadable_by == "receipt")
-		and decision_pair_newer(
+		and durable.anonymous_id == self.anonymous_id then
+		local dat, dby, dseq = supersession_pair(
 			durable.consent_superseded_unreadable_at,
-			(type(durable.consent_superseded_unreadable_seq) == "number"
-				and durable.consent_superseded_unreadable_seq >= 0)
-				and math.floor(durable.consent_superseded_unreadable_seq) or 0,
+			durable.consent_superseded_unreadable_by,
+			durable.consent_superseded_unreadable_seq)
+		if dat ~= nil and decision_pair_newer(dat, dseq,
 			record.consent_superseded_unreadable_at,
 			record.consent_superseded_unreadable_seq) then
-		record.consent_superseded_unreadable_at = durable.consent_superseded_unreadable_at
-		record.consent_superseded_unreadable_by = durable.consent_superseded_unreadable_by
-		record.consent_superseded_unreadable_seq =
-			(type(durable.consent_superseded_unreadable_seq) == "number"
-				and durable.consent_superseded_unreadable_seq >= 0)
-				and math.floor(durable.consent_superseded_unreadable_seq) or 0
+			record.consent_superseded_unreadable_at = dat
+			record.consent_superseded_unreadable_by = dby
+			record.consent_superseded_unreadable_seq = dseq
+		end
 	end
 	return storage.save(self.config, record)
 end
