@@ -10352,4 +10352,751 @@ end)()
 	storage.reset()
 end)()
 
+-- SUPERSEDING AN UNREADABLE TRAIL IS RECORDED, AND THE WITNESS IS ITS OWN
+-- FIELD. An explicit act by the subject performed NOW supersedes a state we
+-- could not read; a default, an inference and a silent restart never do. The
+-- boot belt is not an exception -- what supersedes there is a RECEIPT, an
+-- explicit act of the subject that we can READ -- but it was performed EARLIER,
+-- and a consent record that cannot tell a fresh choice from an inference over
+-- old evidence carries no provenance at the one moment it most needs some.
+--
+-- Leading `;`: the statement above ends in `end)()` and Lua would otherwise
+-- read the `(` opening this block as its argument list.
+;(function()
+	local function identity_path(stores)
+		for path in pairs(stores) do
+			if path:sub(-9) == "/identity" then return path end
+		end
+	end
+	local function outbox_path(stores)
+		for path in pairs(stores) do
+			if path:sub(-15) == "/consent-outbox" then return path end
+		end
+	end
+	local function receipt(key, at, analytics, anon)
+		return {
+			idempotency_key = key,
+			workspace_id = "workspace-example", app_id = "app-example",
+			environment_id = "develop", actor_identifier = anon,
+			kind = "anon", decided_at = at,
+			categories = { analytics = analytics }, anonymous_id = anon,
+		}
+	end
+
+	-- Seed a granted record over a CORRUPTED outbox, so any client constructed
+	-- after this boots with a genuine imposition. Poking the flag by hand is a
+	-- fixture that lies: the predicate consults the SHARED resolution, and a
+	-- forced flag with a healthy trail is a state the product cannot be in.
+	local function seed_unreadable(anon)
+		assert_true(storage.save(identity_scope, {
+			anonymous_id = anon,
+			consent_analytics = "granted",
+			-- STAMPED AT THE EPOCH, because the harness clock returns 1970
+			-- dates: a 2026 seed is in the FUTURE relative to anything the
+			-- client will write, so the stale-marker guard would retire a
+			-- freshly written denial marker as older than the record. The
+			-- fixture has to live in the same time as the code it drives.
+			consent_decided_at = "1970-01-01T00:00:00Z",
+		}))
+		assert_true(storage.save_consent_outbox(identity_scope,
+			{ receipt(anon .. "-seed", "1970-01-01T00:00:00Z", true, anon) }) ~= false)
+	end
+
+	-- A. THE SUBJECT ACTS NOW -> witness "decision", stamped with the ACT.
+	reset(); storage.reset()
+	local stores, restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-supersede",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope,
+		{ receipt("sup-seed", "2026-07-01T00:00:00.000Z", true, "anon-supersede") }) ~= false)
+	local opath = outbox_path(stores)
+	stores[opath] = "garbage"
+	storage.reset()
+	local client = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-supersede", flush_interval_seconds = 9999 })))
+	assert_true(client.consent_unreadable_imposed,
+		"the fixture must REACH its subject: an unreadable trail imposes")
+	local ipath = identity_path(stores)
+	assert_equal(stores[ipath].consent_superseded_unreadable_by, nil,
+		"nothing is recorded while the imposition merely STANDS -- it superseded nothing")
+	assert_true(client:set_consent(false))
+	assert_equal(stores[ipath].consent_superseded_unreadable_by, "decision",
+		"an act performed NOW is witnessed as a decision")
+	assert_equal(stores[ipath].consent_superseded_unreadable_at,
+		client.consent_decided_at)
+	assert_true(stores[ipath].consent_superseded_unreadable_at
+		~= "2026-07-01T00:00:00.000Z",
+		"and is stamped with the ACT, never with the record it replaced")
+
+	-- B. THE FACT SURVIVES THE RESTART IT DESCRIBES, and an unrelated rewrite.
+	local first_at = stores[ipath].consent_superseded_unreadable_at
+	stores[opath] = nil
+	reset(); storage.reset()
+	local relaunch = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-supersede", flush_interval_seconds = 9999 })))
+	assert_equal(relaunch.consent_unreadable_imposed, false,
+		"the trail is gone, so this boot imposes nothing -- any fact below is READ BACK")
+	assert_equal(relaunch.consent_superseded_unreadable_by, "decision",
+		"the witness came off the record, not off this boot")
+	assert_true(relaunch:set_consent(true))
+	assert_equal(stores[ipath].consent_superseded_unreadable_at, first_at,
+		"a later write re-emits the ORIGINAL supersession rather than restamping it")
+	assert_equal(stores[ipath].consent_superseded_unreadable_by, "decision")
+	assert_equal(stores[ipath].consent_analytics, "granted",
+		"and the later write really landed -- otherwise the line above proves nothing")
+	restore(); storage.reset()
+
+	-- C. THE BELT READS AN EARLIER ACT -> witness "receipt", never "decision".
+	--    The imposition comes from an unreadable MARKER so the outbox stays
+	--    readable and the belt has a receipt to find.
+	reset(); storage.reset()
+	local bstores, brestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-belt-sup",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope,
+		{ receipt("belt-sup", "2026-07-02T00:00:00.000Z", false, "anon-belt-sup") }) ~= false)
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", anonymous_id = "anon-belt-sup",
+		decided_at = "2026-07-02T00:00:00.000Z", decision_seq = 1,
+	}))
+	for path in pairs(bstores) do
+		if path:sub(-15) == "/consent-denial" then bstores[path] = "garbage" end
+	end
+	storage.reset()
+	local belt = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-belt-sup", flush_interval_seconds = 9999 })))
+	local bpath = identity_path(bstores)
+	assert_equal(bstores[bpath].consent_superseded_unreadable_by, "receipt",
+		"an act read from durable evidence is NOT an act performed now")
+	assert_equal(bstores[bpath].consent_superseded_unreadable_at,
+		"2026-07-02T00:00:00.000Z",
+		"stamped with the receipt's own decision, not with this boot")
+	brestore(); storage.reset()
+
+	-- D. NO IMPOSITION, NO FACT -- shown reaching its subject.
+	reset(); storage.reset()
+	local pstores, prestore = install_stub_sys_storage()
+	local plain = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-plain", flush_interval_seconds = 9999 })))
+	assert_true(plain:set_consent(false))
+	local ppath = identity_path(pstores)
+	assert_equal(pstores[ppath].consent_analytics, "denied",
+		"the write REALLY happened -- otherwise the two absences below prove nothing")
+	assert_equal(pstores[ppath].consent_superseded_unreadable_by, nil)
+	assert_equal(pstores[ppath].consent_superseded_unreadable_at, nil)
+	prestore(); storage.reset()
+
+	-- E. THE WITNESS IS A CLOSED SET OF TWO. An unlisted one is not adopted and
+	--    not re-persisted: one damaged file must not become a permanent claim
+	--    about provenance. An exclusion list would fail open on the third
+	--    witness somebody invents; this enumerates what is ACCEPTED.
+	reset(); storage.reset()
+	local cstores, crestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-closed",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+		consent_superseded_unreadable_at = "2026-07-09T00:00:00.000Z",
+		consent_superseded_unreadable_by = "guessed",
+	}))
+	storage.reset()
+	local closed = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-closed", flush_interval_seconds = 9999 })))
+	assert_equal(closed.consent_superseded_unreadable_by, nil,
+		"an unlisted witness is not adopted")
+	assert_equal(closed.consent_superseded_unreadable_at, nil,
+		"and neither is its timestamp -- the pair travels together or not at all")
+	assert_true(closed:set_consent(false))
+	local cpath = identity_path(cstores)
+	assert_equal(cstores[cpath].consent_analytics, "denied",
+		"the rewrite REALLY happened, so the absence below is a decision not a no-op")
+	assert_equal(cstores[cpath].consent_superseded_unreadable_by, nil,
+		"and the unlisted witness is not written back")
+	crestore(); storage.reset()
+
+	-- F. THE BELT WITHOUT AN IMPOSITION STAMPS NOTHING. This block is reached by
+	--    two roads and only one of them supersedes anything: an unreadable trail
+	--    imposed a denial, or the marker and outbox both loaded cleanly and the
+	--    belt is merely correcting a stale readable grant. Recording the second
+	--    as a supersession would log an event that did not happen -- and would
+	--    overwrite genuine earlier provenance with a fresher, false one.
+	reset(); storage.reset()
+	local nstores, nrestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-no-imposition",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+		consent_superseded_unreadable_at = "2026-06-01T00:00:00.000Z",
+		consent_superseded_unreadable_by = "decision",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope,
+		{ receipt("no-imp-denial", "2026-07-02T00:00:00.000Z", false,
+			"anon-no-imposition") }) ~= false)
+	storage.reset()
+	local nobelt = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-no-imposition", flush_interval_seconds = 9999 })))
+	assert_equal(nobelt.consent_unreadable_imposed, false,
+		"the fixture must REACH its subject the other way: nothing was unreadable")
+	local npath = identity_path(nstores)
+	assert_equal(nstores[npath].consent_analytics, "denied",
+		"and the belt REALLY ran -- the newer denial receipt converged the record")
+	assert_equal(nstores[npath].consent_superseded_unreadable_by, "decision",
+		"the earlier genuine provenance survives; the belt did not overwrite it")
+	assert_equal(nstores[npath].consent_superseded_unreadable_at,
+		"2026-06-01T00:00:00.000Z",
+		"and its timestamp is the ORIGINAL one, not this receipt's")
+	nrestore(); storage.reset()
+
+	-- G. PROVENANCE DOES NOT CROSS ACTORS. A configured anonymous_id replacing a
+	--    different valid persisted actor makes this boot ignore that actor's
+	--    consent; adopting its supersession anyway would carry the OLD subject's
+	--    witness under the NEW anon on the next identity write and keep it under
+	--    every later decision. The record would say this actor superseded
+	--    evidence it never had.
+	reset(); storage.reset()
+	local ostores, orestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-previous-subject",
+		consent_analytics = "granted",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+		consent_superseded_unreadable_at = "2026-06-01T00:00:00.000Z",
+		consent_superseded_unreadable_by = "decision",
+	}))
+	storage.reset()
+	local override = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-new-subject", flush_interval_seconds = 9999 })))
+	assert_equal(override.consent_superseded_unreadable_by, nil,
+		"the new subject does not inherit the previous one's provenance")
+	assert_equal(override.consent_state, "unknown",
+		"the fixture REALLY overrode: the old actor's consent is ignored too")
+	assert_true(override:set_consent(false))
+	local opath = identity_path(ostores)
+	assert_equal(ostores[opath].anonymous_id, "anon-new-subject",
+		"the record is the NEW actor's -- otherwise the absence below proves nothing")
+	assert_equal(ostores[opath].consent_analytics, "denied",
+		"and its own decision landed")
+	assert_equal(ostores[opath].consent_superseded_unreadable_by, nil,
+		"carrying no witness from the subject it replaced")
+	assert_equal(ostores[opath].consent_superseded_unreadable_at, nil)
+	orestore(); storage.reset()
+
+	-- H. AN UNREADABLE OUTBOX UNDER A NON-GRANTED RESTORE IS THE SECOND
+	--    unreadable state this decision ends, and the fail-closed imposition
+	--    never covers it: that arm fires only on a restored GRANT. The trail is
+	--    just as unreadable, and set_consent replaces it just as squarely.
+	reset(); storage.reset()
+	local dstores, drestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-denied-unreadable",
+		consent_analytics = "denied",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope,
+		{ receipt("den-seed", "2026-07-01T00:00:00.000Z", false,
+			"anon-denied-unreadable") }) ~= false)
+	local dopath = outbox_path(dstores)
+	dstores[dopath] = "garbage"
+	storage.reset()
+	local denied = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-denied-unreadable", flush_interval_seconds = 9999 })))
+	assert_equal(denied.consent_unreadable_imposed, false,
+		"the imposition arm does NOT fire here -- that is the whole point")
+	assert_equal(denied.consent_outbox_unreadable, true,
+		"but the trail IS unreadable, which is the state under test")
+	assert_true(denied:set_consent(true))
+	local dpath = identity_path(dstores)
+	assert_equal(dpath ~= nil, true)
+	assert_equal(dstores[dpath].consent_superseded_unreadable_by, "decision",
+		"an explicit act over an unreadable trail is recorded whichever flag carried it")
+	assert_equal(dstores[dpath].consent_analytics, "granted",
+		"and the decision itself really landed")
+	drestore(); storage.reset()
+
+	-- I. A SIBLING CLIENT MUST NOT ROLL PROVENANCE BACK. The record is shared
+	--    and every identity write is whole-record, so a client constructed
+	--    BEFORE a supersession holds nil for these fields and would erase them
+	--    on any later unrelated write of its own.
+	reset(); storage.reset()
+	local sstores, srestore = install_stub_sys_storage()
+	seed_unreadable("anon-shared")
+	sstores[outbox_path(sstores)] = "garbage"
+	storage.reset()
+	local first = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-shared", flush_interval_seconds = 9999 })))
+	local second = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-shared", flush_interval_seconds = 9999 })))
+	local spath = identity_path(sstores)
+	assert_true(first.consent_unreadable_imposed,
+		"the imposition is REAL, not poked -- the fixture must reach its subject")
+	assert_true(first:set_consent(false))
+	local stamped = sstores[spath].consent_superseded_unreadable_at
+	assert_equal(sstores[spath].consent_superseded_unreadable_by, "decision",
+		"the first client recorded the supersession")
+	assert_true(type(stamped) == "string" and stamped ~= "")
+	-- The SECOND client was constructed before that and holds nil.
+	assert_equal(second.consent_superseded_unreadable_by, nil,
+		"the sibling never saw it -- which is the hazard, not a bug in the fixture")
+	second.experiments_client_id = "exp-subject-forcing-a-write"
+	assert_true(second:persist_identity(),
+		"an unrelated whole-record write from the stale sibling")
+	assert_equal(sstores[spath].experiments_client_id, "exp-subject-forcing-a-write",
+		"the sibling's write REALLY landed -- otherwise the line below proves nothing")
+	assert_equal(sstores[spath].consent_superseded_unreadable_by, "decision",
+		"and it did not roll the provenance back")
+	assert_equal(sstores[spath].consent_superseded_unreadable_at, stamped,
+		"nor rewind its stamp")
+	srestore(); storage.reset()
+
+	-- J. SAME-SECOND ORDERING. `clock.iso_utc()` is SECOND-precision, so a
+	--    strict timestamp comparison cannot tell two supersessions inside one
+	--    second apart. The distinguishing shape is NOT a sibling holding nil --
+	--    a strict `>` merges that correctly too, which is why an earlier version
+	--    of this case could not kill the mutant. It is a sibling holding the
+	--    FIRST supersession while the record has moved to the SECOND, same
+	--    stamp, higher seq: `durable > record` is then FALSE and the sibling
+	--    writes the OLDER witness back. Ordered on the decision PAIR, as consent
+	--    already is. The clock is FROZEN so the same second is a fact of the
+	--    fixture rather than a race the test usually wins.
+	reset(); storage.reset()
+	local jstores, jrestore = install_stub_sys_storage()
+	local j_clock = require "shardpilot.clock"
+	local j_real_iso = j_clock.iso_utc
+	local j_frozen = j_real_iso()
+	j_clock.iso_utc = function() return j_frozen end
+	seed_unreadable("anon-sameseq")
+	jstores[outbox_path(jstores)] = "garbage"
+	storage.reset()
+	local ja = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-sameseq", flush_interval_seconds = 9999 })))
+	local jpath = identity_path(jstores)
+	assert_true(ja.consent_unreadable_imposed, "a REAL imposition, not a poked flag")
+	assert_true(ja:set_consent(false))
+	local first_seq = jstores[jpath].consent_superseded_unreadable_seq
+	local first_at = jstores[jpath].consent_superseded_unreadable_at
+	-- The sibling is constructed HERE: it reads the FIRST supersession.
+	local jb = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-sameseq", flush_interval_seconds = 9999 })))
+	assert_equal(jb.consent_superseded_unreadable_seq, first_seq,
+		"the sibling holds the FIRST supersession -- not nil, which is the case a strict compare handles")
+	-- A SECOND supersession, same frozen second, strictly higher seq.
+	local ja_op = outbox_path(jstores)
+	if ja_op then jstores[ja_op] = "garbage" end
+	storage.reset()
+	ja.consent_unreadable_imposed = true
+	ja.consent_restored_state = "granted"
+	assert_true(ja:set_consent(true))
+	local second_seq = jstores[jpath].consent_superseded_unreadable_seq
+	assert_equal(jstores[jpath].consent_superseded_unreadable_at, first_at,
+		"same second: the stamps are EQUAL, so only the seq can order them")
+	assert_true(second_seq > first_seq,
+		"and the fixture REACHES its subject -- the second outranks by seq alone")
+	-- The stale sibling forces a whole-record write carrying the FIRST pair.
+	jb.experiments_client_id = "exp-sameseq"
+	assert_true(jb:persist_identity())
+	assert_equal(jstores[jpath].experiments_client_id, "exp-sameseq",
+		"the sibling's write really landed")
+	assert_equal(jstores[jpath].consent_superseded_unreadable_seq, second_seq,
+		"and the NEWER supersession survived a same-second comparison")
+	j_clock.iso_utc = j_real_iso
+	jrestore(); storage.reset()
+
+	-- K. THE DENIAL MARKER CARRIES THE PROVENANCE, because the failure it exists
+	--    to survive is exactly the one that would lose it: a superseding DENIAL
+	--    whose identity save fails, then a process exit. The retained receipt
+	--    cannot reconstruct it -- the belt runs only against a granted restore.
+	reset(); storage.reset()
+	local kstores, krestore = install_stub_sys_storage()
+	seed_unreadable("anon-marker-prov")
+	kstores[outbox_path(kstores)] = "garbage"
+	storage.reset()
+	local kc = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-prov", flush_interval_seconds = 9999 })))
+	assert_true(kc.consent_unreadable_imposed, "a REAL imposition, not a poked flag")
+	local real_save = sys.save
+	sys.save = function(path, record)
+		if path:sub(-9) == "/identity" then return false end
+		return real_save(path, record)
+	end
+	local kok, kerr = kc:set_consent(false)
+	sys.save = real_save
+	assert_equal(kok, false, "the identity write failed, which is the path under test")
+	assert_equal(kerr, "consent_persist_failed")
+	local mpath = nil
+	for path in pairs(kstores) do
+		if path:sub(-15) == "/consent-denial" then mpath = path end
+	end
+	assert_true(mpath ~= nil, "the write-ahead marker landed")
+	assert_equal(kstores[mpath].superseded_unreadable_by, "decision",
+		"and it carries the provenance the record never got to hold")
+	-- Simulated exit + relaunch: the marker is imposed and the fact comes back.
+	reset(); storage.reset()
+	local relaunched = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-prov", flush_interval_seconds = 9999 })))
+	assert_equal(relaunched.consent_state, "denied",
+		"the marker really imposed -- otherwise the line below proves nothing")
+	assert_equal(relaunched.consent_superseded_unreadable_by, "decision",
+		"and the supersession survived the storage failure it was written for")
+	krestore(); storage.reset()
+
+	-- L. THE MARKER IS BUILT BEFORE THE RECORD MERGE RUNS, so it must merge the
+	--    durable pair itself. A sibling holding OLDER provenance that makes a
+	--    denial whose identity save fails would otherwise put its stale pair in
+	--    the marker, and the next boot would impose it over the newer one.
+	reset(); storage.reset()
+	local lstores, lrestore = install_stub_sys_storage()
+	seed_unreadable("anon-marker-merge")
+	lstores[outbox_path(lstores)] = "garbage"
+	storage.reset()
+	local la = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-merge", flush_interval_seconds = 9999 })))
+	local lb = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-merge", flush_interval_seconds = 9999 })))
+	assert_true(la.consent_unreadable_imposed, "a REAL imposition, not a poked flag")
+	assert_true(la:set_consent(false))
+	local lpath = identity_path(lstores)
+	local newer_at = lstores[lpath].consent_superseded_unreadable_at
+	local newer_seq = lstores[lpath].consent_superseded_unreadable_seq
+	assert_equal(lb.consent_superseded_unreadable_by, nil,
+		"the sibling holds NOTHING -- which is what makes its marker stale")
+	local l_real_save = sys.save
+	sys.save = function(path, record)
+		if path:sub(-9) == "/identity" then return false end
+		return l_real_save(path, record)
+	end
+	local lok = lb:set_consent(false)
+	sys.save = l_real_save
+	assert_equal(lok, false, "the identity save failed, which is the path under test")
+	local lmpath = nil
+	for path in pairs(lstores) do
+		if path:sub(-15) == "/consent-denial" then lmpath = path end
+	end
+	assert_true(lmpath ~= nil, "the sibling's marker landed")
+	assert_equal(lstores[lmpath].superseded_unreadable_at, newer_at,
+		"and it carries the NEWER durable provenance, not the sibling's absence")
+	assert_equal(lstores[lmpath].superseded_unreadable_seq, newer_seq)
+	lrestore(); storage.reset()
+
+	-- M. AN UNREADABLE DENIAL MARKER UNDER A NON-GRANTED RESTORE is the THIRD
+	--    member of the unreadable set. The fail-closed imposition is armed only
+	--    for a restored GRANT, so this state had no flag at all and an explicit
+	--    decision that replaced the unreadable marker recorded nothing.
+	reset(); storage.reset()
+	local mstores, mrestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-marker-unreadable",
+		consent_analytics = "denied",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+	}))
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", anonymous_id = "anon-marker-unreadable",
+		decided_at = "2026-07-01T00:00:00.000Z", decision_seq = 1,
+	}))
+	for path in pairs(mstores) do
+		if path:sub(-15) == "/consent-denial" then mstores[path] = "garbage" end
+	end
+	storage.reset()
+	local mc = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-unreadable", flush_interval_seconds = 9999 })))
+	assert_equal(mc.consent_unreadable_imposed, false,
+		"the granted-only imposition does NOT arm here -- that is the gap")
+	assert_equal(mc.consent_marker_unreadable, true,
+		"but the marker IS unreadable, which is the state under test")
+	assert_true(mc:set_consent(true))
+	local mpath2 = identity_path(mstores)
+	assert_equal(mstores[mpath2].consent_superseded_unreadable_by, "decision",
+		"an explicit act over an unreadable MARKER is recorded too")
+	assert_equal(mstores[mpath2].consent_analytics, "granted",
+		"and the decision itself landed")
+	mrestore(); storage.reset()
+
+	-- N. THE HOLD IS SHARED; THE LOCAL FLAG IS A CACHE OF IT. Two clients both
+	--    see an unreadable trail. The first client's decision supersedes it and
+	--    clears the SHARED hold. An ordinary later decision by the second client
+	--    must NOT record a second supersession over accurate provenance.
+	--
+	--    The restored state is DENIED on purpose. Under a restored GRANT both
+	--    clients also arm `consent_unreadable_imposed`, the predicate's first
+	--    arm short-circuits, and the shared-hold consultation is never reached --
+	--    an earlier version of this case did that and could not kill the mutant.
+	--    The clock is FROZEN so a second boundary cannot make the two stamps
+	--    differ and rescue the assertion by accident.
+	reset(); storage.reset()
+	local nstores2, nrestore2 = install_stub_sys_storage()
+	local n_clock = require "shardpilot.clock"
+	local n_real_iso = n_clock.iso_utc
+	local n_frozen = n_real_iso()
+	n_clock.iso_utc = function() return n_frozen end
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-shared-hold",
+		consent_analytics = "denied",
+		consent_decided_at = "2026-07-01T00:00:00.000Z",
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope,
+		{ receipt("hold-seed", "2026-07-01T00:00:00.000Z", false,
+			"anon-shared-hold") }) ~= false)
+	local hopath = outbox_path(nstores2)
+	nstores2[hopath] = "garbage"
+	storage.reset()
+	local n1 = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-shared-hold", flush_interval_seconds = 9999 })))
+	local n2 = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-shared-hold", flush_interval_seconds = 9999 })))
+	assert_equal(n2.consent_unreadable_imposed, false,
+		"the imposition must NOT be armed, or the predicate short-circuits before the hold")
+	assert_equal(n2.consent_outbox_unreadable, true,
+		"both clients cached the unreadable trail -- that is the setup")
+	assert_true(n1:set_consent(true))
+	local npath2 = identity_path(nstores2)
+	local true_at = nstores2[npath2].consent_superseded_unreadable_at
+	local true_seq = nstores2[npath2].consent_superseded_unreadable_seq
+	assert_equal(nstores2[npath2].consent_superseded_unreadable_by, "decision",
+		"the first client recorded the real supersession")
+	-- The second client's flag is now STALE: the shared hold is cleared.
+	assert_true(n2:set_consent(false))
+	-- ASSERTED ON THE CLIENT, because the record cannot tell these apart: two
+	-- clients on one scope restore the same seq floor and therefore MINT THE
+	-- SAME (stamp, seq) pair, so a false stamp from the sibling is indexed
+	-- identically to the true one and `decision_pair_newer` sees a tie. The
+	-- question is whether the sibling stamped AT ALL, and that is readable here.
+	assert_equal(n2.consent_superseded_unreadable_by, nil,
+		"the sibling did not stamp: the shared hold was already cleared")
+	assert_equal(nstores2[npath2].consent_analytics, "denied",
+		"the second decision really landed -- otherwise the lines below prove nothing")
+	assert_equal(nstores2[npath2].consent_superseded_unreadable_seq, true_seq,
+		"and it did NOT stamp a second, false supersession over the accurate one")
+	assert_equal(nstores2[npath2].consent_superseded_unreadable_at, true_at)
+	n_clock.iso_utc = n_real_iso
+	nrestore2(); storage.reset()
+
+	-- O. A BACKWARD CLOCK. The seq was added precisely so a clock moving back
+	--    could not roll provenance back with it -- and the helper it was wired
+	--    to compares STAMPS first, letting the seq break only a TIE. So the
+	--    newer act (higher seq, EARLIER stamp) lost, which is the exact case the
+	--    seq exists for. Provenance orders by SEQ first; consent still orders by
+	--    stamp first, because consent is compared across installs where a
+	--    foreign seq means nothing.
+	reset(); storage.reset()
+	local ostores2, orestore2 = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-backward",
+		consent_analytics = "denied",
+		consent_decided_at = "1970-01-01T00:00:00Z",
+		-- The DURABLE copy: later stamp, LOWER seq. Under a timestamp-first
+		-- comparison this looks newer and wins.
+		consent_superseded_unreadable_at = "1970-01-01T10:00:00Z",
+		consent_superseded_unreadable_by = "receipt",
+		consent_superseded_unreadable_seq = 1,
+	}))
+	storage.reset()
+	local ob = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-backward", flush_interval_seconds = 9999 })))
+	assert_equal(ob.consent_superseded_unreadable_seq, 1,
+		"the durable pair was adopted -- the fixture reaches its subject")
+	-- The client now holds a STRICTLY NEWER act whose stamp went BACKWARD.
+	ob.consent_superseded_unreadable_at = "1970-01-01T09:00:00Z"
+	ob.consent_superseded_unreadable_by = "decision"
+	ob.consent_superseded_unreadable_seq = 2
+	assert_true(ob:persist_identity())
+	local opath2 = identity_path(ostores2)
+	assert_equal(ostores2[opath2].consent_superseded_unreadable_seq, 2,
+		"the higher SEQ wins even though its stamp is earlier")
+	assert_equal(ostores2[opath2].consent_superseded_unreadable_by, "decision")
+	assert_equal(ostores2[opath2].consent_superseded_unreadable_at,
+		"1970-01-01T09:00:00Z",
+		"and the whole pair travels together, not just the seq")
+	orestore2(); storage.reset()
+
+	-- P. PROVENANCE DOES NOT CROSS A RUNTIME ROTATION EITHER. The boot path
+	--    refuses a previous actor's provenance under a configured override; the
+	--    actor also changes at RUNTIME through set_anonymous_id, and that path
+	--    bypassed the boot gate entirely.
+	reset(); storage.reset()
+	local pstores, prestore = install_stub_sys_storage()
+	seed_unreadable("anon-rot-a")
+	pstores[outbox_path(pstores)] = "garbage"
+	storage.reset()
+	local pc = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-rot-a", flush_interval_seconds = 9999 })))
+	assert_true(pc.consent_unreadable_imposed, "a real imposition")
+	assert_true(pc:set_consent(false))
+	local ppath = identity_path(pstores)
+	assert_equal(pstores[ppath].consent_superseded_unreadable_by, "decision",
+		"actor A recorded a supersession")
+	assert_true(pc:set_anonymous_id("anon-rot-b"))
+	assert_equal(pstores[ppath].anonymous_id, "anon-rot-b",
+		"the rotation REALLY happened -- otherwise the line below proves nothing")
+	assert_equal(pstores[ppath].consent_superseded_unreadable_by, nil,
+		"and B carries no provenance from the subject it replaced")
+	assert_equal(pstores[ppath].consent_superseded_unreadable_at, nil)
+	prestore(); storage.reset()
+
+	-- Q. THE MARKER ARM IS STALE-ABLE TOO. Two clients boot on an unreadable
+	--    marker; the first one's successful decision CLEARS it, so the second's
+	--    cached flag describes a file that no longer exists. I had written that
+	--    this arm "stands alone" because a marker is a per-actor file -- the
+	--    file is per-actor, but its STATE is shared.
+	reset(); storage.reset()
+	local qstores, qrestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-marker-shared",
+		consent_analytics = "denied",
+		consent_decided_at = "1970-01-01T00:00:00Z",
+	}))
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", anonymous_id = "anon-marker-shared",
+		decided_at = "1970-01-01T00:00:00Z", decision_seq = 1,
+	}))
+	for path in pairs(qstores) do
+		if path:sub(-15) == "/consent-denial" then qstores[path] = "garbage" end
+	end
+	storage.reset()
+	local q1 = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-shared", flush_interval_seconds = 9999 })))
+	local q2 = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-shared", flush_interval_seconds = 9999 })))
+	assert_equal(q2.consent_marker_unreadable, true,
+		"both clients cached the unreadable marker -- that is the setup")
+	assert_true(q1:set_consent(true))
+	local qpath = identity_path(qstores)
+	local q_at = qstores[qpath].consent_superseded_unreadable_at
+	assert_equal(qstores[qpath].consent_superseded_unreadable_by, "decision",
+		"the first client recorded the real supersession")
+	assert_true(q2:set_consent(false))
+	assert_equal(qstores[qpath].consent_analytics, "denied",
+		"the sibling's decision really landed")
+	assert_equal(q2.consent_superseded_unreadable_by, nil,
+		"but it stamped nothing: the marker it cached was already superseded")
+	assert_equal(qstores[qpath].consent_superseded_unreadable_at, q_at,
+		"so the accurate provenance stands")
+	qrestore(); storage.reset()
+
+	-- Q2. THE MARKER ARM MUST FALL THROUGH, AND ITS VALIDITY TEST IS BOOT'S.
+	--     Three defects in one six-line block: a helper called before it was
+	--     declared (a runtime crash on a path no test reached), a validity copy
+	--     WEAKER than boot's (a marker naming no actor read as healed), and an
+	--     arm that ANSWERED for the whole predicate instead of falling through.
+	reset(); storage.reset()
+	local q2s, q2restore = install_stub_sys_storage()
+	seed_unreadable("anon-marker-fallthrough")
+	q2s[outbox_path(q2s)] = "garbage"
+	-- A marker that is PRESENT and denial-shaped but names NO actor: boot calls
+	-- that malformed, so a re-read calling it healed is the weaker copy.
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", decided_at = "1970-01-01T00:00:00Z",
+		decision_seq = 1,
+	}))
+	storage.reset()
+	local q2c = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-fallthrough", flush_interval_seconds = 9999 })))
+	assert_equal(q2c.consent_marker_unreadable, true,
+		"boot rejects an actor-less marker as malformed -- the state under test")
+	assert_true(q2c:set_consent(false))
+	local q2path = identity_path(q2s)
+	assert_equal(q2s[q2path].consent_superseded_unreadable_by, "decision",
+		"and the decision over it is recorded, with no crash on the way")
+	q2restore(); storage.reset()
+
+	-- Q3. THE MARKER ARM, ISOLATED. Q2 left BOTH the marker and the outbox
+	--     unreadable, so the outbox arm carried the predicate and neither
+	--     marker-arm mutant could be distinguished. Here the outbox is CLEAN and
+	--     the restore is not a grant, so nothing but the marker arm can make the
+	--     trail stand -- and the marker is denial-shaped with NO actor, which is
+	--     exactly what boot calls malformed and a weaker copy calls healed.
+	reset(); storage.reset()
+	local q3s, q3restore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-marker-only",
+		consent_analytics = "denied",
+		consent_decided_at = "1970-01-01T00:00:00Z",
+	}))
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", decided_at = "1970-01-01T00:00:00Z",
+		decision_seq = 1,
+	}))
+	storage.reset()
+	local q3c = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-only", flush_interval_seconds = 9999 })))
+	assert_equal(q3c.consent_marker_unreadable, true,
+		"the marker is the ONLY unreadable artefact")
+	assert_equal(q3c.consent_unreadable_imposed, false,
+		"no imposition -- the restore is not a grant")
+	assert_true(q3c.consent_outbox_unreadable ~= true,
+		"and the outbox is clean, so no other arm can carry the predicate")
+	assert_true(q3c:set_consent(true))
+	local q3path = identity_path(q3s)
+	assert_equal(q3s[q3path].consent_superseded_unreadable_by, "decision",
+		"so the stamp proves the MARKER arm alone made the trail stand")
+	q3restore(); storage.reset()
+
+	-- Q4. THE MARKER ARM MUST FALL THROUGH. The marker HEALS between boot and the
+	--     decision while the outbox stays unreadable. An arm that answers for the
+	--     whole predicate would report no trail standing and skip the stamp.
+	reset(); storage.reset()
+	local q4s, q4restore = install_stub_sys_storage()
+	seed_unreadable("anon-fallthrough")
+	q4s[outbox_path(q4s)] = "garbage"
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", decided_at = "1970-01-01T00:00:00Z",
+		decision_seq = 1,
+	}))
+	for path in pairs(q4s) do
+		if path:sub(-15) == "/consent-denial" then q4s[path] = "garbage" end
+	end
+	storage.reset()
+	local q4c = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-fallthrough", flush_interval_seconds = 9999 })))
+	assert_equal(q4c.consent_marker_unreadable, true, "both reads failed at boot")
+	assert_equal(q4c.consent_outbox_unreadable, true)
+	-- The MARKER heals; the outbox does not.
+	assert_true(storage.save_consent_denial_marker(identity_scope, {
+		consent_analytics = "denied", anonymous_id = "anon-fallthrough",
+		decided_at = "1970-01-01T00:00:00Z", decision_seq = 1,
+	}))
+	assert_true(q4c:set_consent(true))
+	local q4path = identity_path(q4s)
+	assert_equal(q4s[q4path].consent_superseded_unreadable_by, "decision",
+		"the healed marker must not answer for the still-unreadable outbox")
+	q4restore(); storage.reset()
+
+	-- R. THE SEQ FLOOR MUST COVER THE PROVENANCE IT ADOPTS. A record can carry a
+	--    VALID provenance triplet while its consent value is malformed, and then
+	--    the decision seq restores as 0 while the provenance seq does not. The
+	--    next genuine supersession would mint BELOW the pair it replaces, and the
+	--    seq-first merge would put the older provenance straight back over it.
+	reset(); storage.reset()
+	local rstores, rrestore = install_stub_sys_storage()
+	assert_true(storage.save(identity_scope, {
+		anonymous_id = "anon-floor",
+		consent_analytics = "not-a-consent-value",
+		consent_superseded_unreadable_at = "1970-01-01T00:00:05Z",
+		consent_superseded_unreadable_by = "receipt",
+		consent_superseded_unreadable_seq = 5,
+	}))
+	assert_true(storage.save_consent_outbox(identity_scope,
+		{ receipt("floor-seed", "1970-01-01T00:00:00Z", false, "anon-floor") }) ~= false)
+	rstores[outbox_path(rstores)] = "garbage"
+	storage.reset()
+	local rc = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-floor", flush_interval_seconds = 9999 })))
+	assert_equal(rc.consent_superseded_unreadable_seq, 5,
+		"the provenance was adopted -- the fixture reaches its subject")
+	assert_equal(rc.consent_decision_seq, 0,
+		"while the decision seq restored as 0, which is the whole setup")
+	assert_equal(rc.consent_outbox_unreadable, true,
+		"and the trail is unreadable, so the decision below supersedes")
+	assert_true(rc:set_consent(false))
+	local rpath = identity_path(rstores)
+	assert_true(rstores[rpath].consent_superseded_unreadable_seq > 5,
+		"the fresh supersession minted ABOVE the provenance it replaces")
+	assert_equal(rstores[rpath].consent_superseded_unreadable_by, "decision",
+		"so the merge did not put the older pair back")
+	rrestore(); storage.reset()
+end)()
+
 print("shardpilot defold lua tests passed")
