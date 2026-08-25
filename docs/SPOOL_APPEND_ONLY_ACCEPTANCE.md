@@ -44,7 +44,7 @@ the client rebuilt its id index over the whole result. Four passes over the
 entire backlog to append one envelope.
 
 Now a spool **state** carries each entry's estimate and their running total, so
-admission is O(added + evicted). `spool_admit` is the single implementation of
+the **measuring** is O(added) — nothing is estimated twice. `spool_admit` is the single implementation of
 the caps and both paths use it: the whole-record `save_spool` is expressed as
 admission into an empty state.
 
@@ -83,6 +83,16 @@ them is a lie about what was persisted**, and the first version of the
 optimisation made exactly that trade without noticing. The repository's own
 FIFO fixture caught it. Not estimating an entry and not accounting for it are
 different things that looked like one thing.
+
+⚠ **Admission is not O(1) overall, and the first version of this document
+said so.** `table.remove(t, 1)` shifts every surviving element, so an eviction
+costs O(backlog) pointer moves across two arrays. That term is left in place on
+purpose: the write it accompanies hands the whole table to `sys.save`, which
+serialises every surviving envelope on the same call. A head-offset
+representation would still have to materialise a contiguous array for that
+write — two pointer shifts traded for one copy, inside a serialisation that
+does not change. The cost worth removing was the re-measuring, and that is the
+row that moved.
 
 ## Not changed
 

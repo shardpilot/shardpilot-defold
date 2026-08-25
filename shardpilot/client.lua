@@ -4881,13 +4881,12 @@ function Client:spool_envelopes(envelopes)
 			self.spool_retry_after_ms)
 		if not saved then
 			self.stats.spool_persist_failed = self.stats.spool_persist_failed + 1
-			-- The state was shrunk with the failed writes, so it still
-			-- describes what the store holds; the mirror follows it.
-			self.spool_record = state.events
-			self.spool_index = {}
-			for i = 1, #state.events do
-				self.spool_index[state.events[i].event_id] = true
-			end
+			-- ⚠ NOTHING LANDED, SO THE DISK STILL HOLDS THE PRE-APPEND
+			-- RECORD -- and admission had already mutated the mirror in
+			-- place. Undo it, so the mirror describes the file again. The
+			-- id index is untouched here on purpose: it is only updated
+			-- after a write succeeds, so it is already pre-append.
+			storage.spool_restore(state, fresh, evicted)
 			return false
 		end
 		-- ⚠ ADDS BEFORE ERASES. An envelope of this batch can be evicted on

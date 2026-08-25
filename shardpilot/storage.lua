@@ -987,14 +987,33 @@ local spool_estimate_base = 2
 -- load with no eviction recorded -- the state disagreed with the disk about
 -- what existed.
 function M.spool_state_for(events)
+	local state = { events = {}, sizes = {}, total = spool_estimate_base, ids = {} }
+	M.spool_admit_all(state, events)
+	return state
+end
+
+-- Add entries to a state with NO cap applied, refusing an id it already
+-- holds.
+--
+-- ⚠ ONE ENTRY PER ID IS AN INVARIANT NOW, not an accident. The loader
+-- deliberately salvages every table-shaped entry carrying a valid event_id
+-- rather than deduplicating, so a garbled record can hold the same id twice
+-- -- and a caller keeping a boolean id index cannot then evict one copy
+-- without wrongly declaring the id gone while another survives. The record
+-- is normalised here instead, which is the same repair the loader already
+-- performs on shape.
+function M.spool_admit_all(state, events)
 	local kept = sanitize_spool_events(events)
-	local sizes = {}
-	local total = spool_estimate_base
 	for i = 1, #kept do
-		sizes[i] = approx_envelope_bytes(kept[i])
-		total = total + sizes[i]
+		local entry = kept[i]
+		if not state.ids[entry.event_id] then
+			local size = approx_envelope_bytes(entry)
+			state.events[#state.events + 1] = entry
+			state.sizes[#state.sizes + 1] = size
+			state.ids[entry.event_id] = true
+			state.total = state.total + size
+		end
 	end
-	return { events = kept, sizes = sizes, total = total }
 end
 
 -- Admit `fresh` into `state`, evicting the OLDEST entries until both caps
@@ -1006,11 +1025,21 @@ end
 -- append evicts, so the O(#record) pass this removes would come straight
 -- back in the caller.
 --
--- ⚠ COST IS O(#fresh + #evicted), NOT O(#state). That is the whole point:
--- appending one envelope used to re-estimate every envelope already spooled
--- -- 437.6 of them per append at the default caps, measured in
--- docs/SPOOL_OVERFLOW_LATENCY_BOUND.md. Entries carry their estimate from
--- the moment they are admitted, so nothing is measured twice.
+-- ⚠ THE MEASURING is O(#fresh): appending one envelope used to re-estimate
+-- every envelope already spooled -- 437.6 of them per append at the default
+-- caps, measured in docs/SPOOL_OVERFLOW_LATENCY_BOUND.md -- and entries now
+-- carry their estimate from the moment they are admitted, so nothing is
+-- measured twice. That is the cost this exists to remove.
+--
+-- ⚠ IT IS NOT O(1) OVERALL, AND SAYING SO WOULD BE FALSE. table.remove(t, 1)
+-- shifts every surviving element, so an eviction costs O(#state) pointer
+-- moves in two arrays. That term stays, deliberately: the write it
+-- accompanies hands the WHOLE table to sys.save, which serialises every
+-- surviving envelope on the same call -- the platform has no append (see
+-- docs/SPOOL_OVERFLOW_LATENCY_BOUND.md). Replacing the shift with a head
+-- offset would still have to materialise a contiguous array for that write,
+-- trading two pointer shifts for one copy while the serialisation it sits
+-- inside is untouched.
 --
 -- There is ONE implementation of the caps and both paths use it. A second
 -- copy for the append path would be a second place for the two to drift, and
@@ -1046,13 +1075,7 @@ function M.spool_admit(state, fresh, max_events, max_bytes)
 		end
 		admitted = trimmed
 	end
-	for i = 1, #admitted do
-		local entry = admitted[i]
-		local size = approx_envelope_bytes(entry)
-		state.events[#state.events + 1] = entry
-		state.sizes[#state.sizes + 1] = size
-		state.total = state.total + size
-	end
+	M.spool_admit_all(state, admitted)
 	-- Evict oldest-first until both caps hold. table.remove(t, 1) is O(#t),
 	-- so the shift is proportional to what SURVIVES rather than to what is
 	-- evicted -- fine for the one-or-two evictions a steady-state append
@@ -1062,8 +1085,10 @@ function M.spool_admit(state, fresh, max_events, max_bytes)
 	while #state.events > 0
 		and (#state.events > limit_events or state.total > limit_bytes) do
 		state.total = state.total - state.sizes[1]
-		evicted[#evicted + 1] = table.remove(state.events, 1)
+		local gone = table.remove(state.events, 1)
 		table.remove(state.sizes, 1)
+		state.ids[gone.event_id] = nil
+		evicted[#evicted + 1] = gone
 	end
 	-- Appended rather than interleaved. A batch big enough to be skipped is
 	-- one that fills the count cap by itself, so every prior entry is
@@ -1091,17 +1116,70 @@ end
 -- know which ids stopped existing.
 function M.write_spool_state(scope, state, retry_after_until_ms)
 	local ns = spool_namespace(scope)
+	if write_spool(ns, state.events, retry_after_until_ms) then
+		return state.events, {}
+	end
+	-- ⚠ THE RETRIES SHRINK A COPY, NOT THE CALLER'S STATE. A FAILED WRITE
+	-- LEAVES THE FILE AT ITS PREVIOUS CONTENTS -- so if nothing lands at
+	-- all, the state must still describe what is on disk. Shrinking it in
+	-- place emptied it while the file still held the backlog, and the next
+	-- append that succeeded then wrote mirror-plus-new over the top,
+	-- silently discarding everything previously persisted.
+	local events, sizes = {}, {}
+	local total = state.total
+	for i = 1, #state.events do
+		events[i] = state.events[i]
+		sizes[i] = state.sizes[i]
+	end
 	local shed = {}
-	while true do
-		if write_spool(ns, state.events, retry_after_until_ms) then
-			return state.events, shed
+	while #events > 0 do
+		total = total - sizes[1]
+		shed[#shed + 1] = table.remove(events, 1)
+		table.remove(sizes, 1)
+		if write_spool(ns, events, retry_after_until_ms) then
+			state.events, state.sizes, state.total = events, sizes, total
+			for i = 1, #shed do
+				state.ids[shed[i].event_id] = nil
+			end
+			return events, shed
 		end
-		if #state.events == 0 then
-			return nil, shed
+	end
+	return nil, shed
+end
+
+-- Undo an admission that no write survived. Cheap by construction: the batch
+-- went in at the TAIL and the caps evicted from the FRONT, so both ends are
+-- known without touching the middle.
+--
+-- Entries that arrived with THIS batch are not restored -- they were never on
+-- disk, and the caller reports them as uncaptured.
+function M.spool_restore(state, fresh, evicted)
+	local from_batch = {}
+	for i = 1, #fresh do
+		local entry = fresh[i]
+		if type(entry) == "table" and type(entry.event_id) == "string" then
+			from_batch[entry.event_id] = true
 		end
-		state.total = state.total - state.sizes[1]
-		shed[#shed + 1] = table.remove(state.events, 1)
-		table.remove(state.sizes, 1)
+	end
+	while #state.events > 0 do
+		local last = state.events[#state.events]
+		if not (type(last) == "table" and from_batch[last.event_id]) then
+			break
+		end
+		state.total = state.total - state.sizes[#state.sizes]
+		state.ids[last.event_id] = nil
+		table.remove(state.events)
+		table.remove(state.sizes)
+	end
+	for i = #evicted, 1, -1 do
+		local entry = evicted[i]
+		if not from_batch[entry.event_id] then
+			local size = approx_envelope_bytes(entry)
+			table.insert(state.events, 1, entry)
+			table.insert(state.sizes, 1, size)
+			state.ids[entry.event_id] = true
+			state.total = state.total + size
+		end
 	end
 end
 
@@ -1114,7 +1192,7 @@ end
 -- This is the whole-record path, expressed through the same admission the
 -- append path uses: an empty state, everything admitted at once.
 function M.save_spool(scope, events, max_events, max_bytes, retry_after_until_ms)
-	local state = { events = {}, sizes = {}, total = spool_estimate_base }
+	local state = { events = {}, sizes = {}, total = spool_estimate_base, ids = {} }
 	M.spool_admit(state, events, max_events, max_bytes)
 	return M.write_spool_state(scope, state, retry_after_until_ms)
 end

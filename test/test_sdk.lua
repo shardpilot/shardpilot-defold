@@ -11229,6 +11229,81 @@ end)()
 	assert_equal(#mixed.spool_record, 2,
 		"the identity check rebuilt from the swapped record")
 
+	-- 6. ⚠ A FAILED APPEND MUST LEAVE THE MIRROR DESCRIBING THE FILE.
+	--    Admission mutates the record in place, and the write retries used
+	--    to shrink that same table -- so a store that stayed unavailable
+	--    emptied the mirror while the FILE still held the backlog. The next
+	--    append that succeeded then wrote mirror-plus-new over the top and
+	--    the persisted backlog was gone.
+	reset(); storage.reset(); seed_granted_consent()
+	local fstores = {}
+	local fail_writes = false
+	sys.get_save_file = function(app, name) return app .. "/" .. name end
+	sys.save = function(path, record)
+		if fail_writes then return false end
+		fstores[path] = record
+		return true
+	end
+	sys.load = function(path) return fstores[path] end
+	local keeper = assert(sdk.new(config({
+		flush_interval_seconds = 9999, spool_max_events = 50 })))
+	keeper.consent_state = "granted"
+	drive_appends(keeper, 6, 300)
+	assert_equal(#keeper.spool_record, 6, "the premise: six envelopes are persisted")
+	local persisted = nil
+	for path, record in pairs(fstores) do
+		if path:sub(-6) == "/spool" then persisted = record end
+	end
+	assert_equal(#persisted.events, 6, "and the file holds them")
+
+	fail_writes = true
+	local ok = keeper:spool_envelopes({ {
+		event_id = "a6-during-outage", event_name = "outage",
+		event_ts = "2026-08-25T19:00:00.000Z", anonymous_id = "anon-a6",
+		session_id = "sess-a6", session_sequence = 1, props = {} } })
+	assert_equal(ok, false, "an append that cannot be written reports failure")
+	assert_equal(#keeper.spool_record, 6,
+		"and the mirror still describes the six envelopes the FILE still holds")
+	assert_true(keeper.spool_index["a6-during-outage"] == nil,
+		"the envelope that never landed is not marked present")
+	assert_equal(#persisted.events, 6, "the file itself is untouched")
+
+	fail_writes = false
+	assert_true(keeper:spool_envelopes({ {
+		event_id = "a6-after-outage", event_name = "recovered",
+		event_ts = "2026-08-25T19:00:00.000Z", anonymous_id = "anon-a6",
+		session_id = "sess-a6", session_sequence = 2, props = {} } }),
+		"once the store recovers the append lands")
+	for path, record in pairs(fstores) do
+		if path:sub(-6) == "/spool" then persisted = record end
+	end
+	assert_equal(#persisted.events, 7,
+		"and the six previously persisted envelopes are STILL there, not overwritten")
+	assert_equal(persisted.events[1].event_id, "a6-000301",
+		"with the oldest still oldest")
+
+	-- 7. ⚠ ONE ENTRY PER ID. The loader salvages every table-shaped entry
+	--    with a valid id rather than deduplicating, so a garbled file can
+	--    carry the same id twice -- and a boolean id index cannot then have
+	--    one copy evicted without wrongly declaring the id gone while
+	--    another survives. The record is normalised instead.
+	local twin = { event_id = "a6-twin", event_name = "twin",
+		event_ts = "2026-08-25T19:00:00.000Z", anonymous_id = "anon-a6",
+		session_id = "sess-a6", session_sequence = 1, props = {} }
+	local dup_state = storage.spool_state_for({ twin, twin, {
+		event_id = "a6-other", event_name = "other",
+		event_ts = "2026-08-25T19:00:00.000Z", anonymous_id = "anon-a6",
+		session_id = "sess-a6", session_sequence = 2, props = {} } })
+	assert_equal(#dup_state.events, 2,
+		"a record carrying the same id twice is normalised to one entry")
+	assert_equal(dup_state.events[1].event_id, "a6-twin", "keeping the first")
+	assert_equal(#dup_state.sizes, 2, "and its size estimates track the entries")
+	local dup_admitted = storage.spool_admit(dup_state, { twin }, 50, 262144)
+	assert_equal(#dup_admitted, 0, "nothing evicted")
+	assert_equal(#dup_state.events, 2,
+		"and re-admitting an id the state already holds does not duplicate it")
+
+	sys.get_save_file = nil; sys.save = nil; sys.load = nil
 	restore(); storage.reset()
 end)()
 
