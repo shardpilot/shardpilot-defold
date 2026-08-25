@@ -2,20 +2,85 @@ name: ci
 
 on:
   pull_request:
+  # ⚠ EVERY PUSH, NOT ONLY main. This repository is PUBLIC: a branch pushed here
+  # is readable the moment it lands, whether or not a pull request ever opens.
+  # A `branches: [main]` filter meant the secret scan and the publication gate
+  # skipped exactly the case where the contents are already exposed and nobody
+  # is looking. Tags are included for the same reason and a stronger one — a tag
+  # is the artifact people install, and one release here was cut off-main.
+  #
+  # No job is conditioned to narrow this back down. A condition is how a gate
+  # stops running without anyone noticing, which is the failure being fixed; the
+  # cost of running the rest of the suite on a branch push is CI minutes.
   push:
-    branches:
-      - main
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# ⚠ NO WORKFLOW-LEVEL CONCURRENCY, DELIBERATELY. `cancel-in-progress` at this
+# level cancels the run for a superseded push — which is exactly the disclosure
+# case: a branch pushed with a credential and force-pushed a minute later. The
+# cancelled run never scanned the commit that was public, and the replacement
+# run checks out history in which that commit is no longer reachable, so not
+# even the `--log-opts=--all` pass can reach it. Cancelling a security scan on
+# the grounds that a newer commit exists is cancelling it for the one push that
+# mattered.
+#
+# So the publication-sensitive jobs carry no concurrency group at all and always
+# run to completion. The rest opt in per job, keyed by job as well as ref so
+# they do not queue behind one another.
 
 jobs:
+  # Workspace security baseline, mirroring the pattern the other SDK
+  # repositories already run (godot/unity/unreal/cli). Both passes: the working
+  # tree and the full history across all refs, so a secret can neither live at
+  # HEAD nor hide in an earlier commit. Exact-pinned image.
+  #
+  # There IS a .gitleaks.toml here, and it carries no `paths` clause on purpose:
+  # measured against v8.30.1, an allowlist with `paths` excuses the whole FILE
+  # even with condition = "AND", and the files needing exceptions are test files
+  # — the likeliest place for a pasted credential. Exceptions name the literal.
+  #
+  # ⚠ THIS REPOSITORY IS PUBLIC, which inverts the usual urgency. Everywhere
+  # else a missing secret scan is a gap to close before a visibility flip; here
+  # a credential is exposed at the moment it is pushed. It was measured on
+  # 2026-08-20 that this was one of only two candidate repositories running no
+  # secret scanner at all — and the only two already public.
+  #
+  # fetch-depth: 0 is required by the history pass and by nothing else in this
+  # workflow.
+  secret-scan:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Scan working tree for secrets
+        uses: docker://ghcr.io/gitleaks/gitleaks:v8.30.1
+        with:
+          args: dir --verbose --redact /github/workspace
+
+      - name: Scan git history for secrets
+        uses: docker://ghcr.io/gitleaks/gitleaks:v8.30.1
+        env:
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: /github/workspace
+        with:
+          args: git --verbose --redact --log-opts=--all /github/workspace
   static:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
+      # No fetch-depth here on purpose. The gate's roster rule now asks whether
+      # each literal still appears in the TRACKED TREE, which a one-commit clone
+      # answers perfectly well — the earlier `fetch-depth: 0` existed only for
+      # the history-based version of that rule and was pure cost once the rule
+      # changed. Verified by cloning this branch with --depth 1 and running the
+      # gate: exit 0.
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -27,6 +92,12 @@ jobs:
 
       - name: Version consistency
         run: ./scripts/check_versions.sh
+
+      # This repository is already public, so it is NOT in the org's
+      # publication-candidate list and nothing else scans it. The script's
+      # header states which lane is gated and which is only reported.
+      - name: No internal material in the published non-source surface
+        run: ./scripts/check_public_surface.sh
 
   # Engine-real leg: proves on every PR that the WORKING TREE still packages
   # and builds as a real Defold library dependency — scripts/package_release.sh
@@ -41,6 +112,18 @@ jobs:
   # pin bump automatically refreshes the cached bob.jar.
   bob-build:
     runs-on: ubuntu-latest
+    concurrency:
+      # ⚠ A LITERAL JOB NAME, NOT `github.job`. That context is not populated
+      # when the group is evaluated, so every job sharing an event and a ref
+      # collapsed into ONE group and they cancelled each other — one gate lost
+      # per run, whichever started second. It was visible as a single cancelled
+      # check with no competing run to explain it.
+      # ⚠ THE EVENT IS PART OF THE GROUP. A push and a pull_request run on the
+      # same commit are different work to CI, and without it they cancelled
+      # each other — leaving a cancelled check on the pull request, which reads
+      # as a failure and blocks the merge it was never about.
+      group: ${{ github.workflow }}-${{ github.event_name }}-bob-build-${{ github.ref }}
+      cancel-in-progress: true
     timeout-minutes: 15
 
     steps:
@@ -68,6 +151,23 @@ jobs:
   # reliance on 5.1-only quirks — it is NOT a runtime the SDK targets.
   lua-tests:
     runs-on: ubuntu-latest
+      # ⚠ THE MATRIX AXIS IS PART OF THE GROUP. Without it every leg of the
+      # matrix shares one group, and `cancel-in-progress` has the legs cancel
+      # each other as they start — leaving one runtime tested and the others
+      # reported as nothing at all. A gate that silently drops legs is the
+      # failure this whole change is about.
+    concurrency:
+      # ⚠ A LITERAL JOB NAME, NOT `github.job`. That context is not populated
+      # when the group is evaluated, so every job sharing an event and a ref
+      # collapsed into ONE group and they cancelled each other — one gate lost
+      # per run, whichever started second. It was visible as a single cancelled
+      # check with no competing run to explain it.
+      # ⚠ THE EVENT IS PART OF THE GROUP. A push and a pull_request run on the
+      # same commit are different work to CI, and without it they cancelled
+      # each other — leaving a cancelled check on the pull request, which reads
+      # as a failure and blocks the merge it was never about.
+      group: ${{ github.workflow }}-${{ github.event_name }}-lua-tests-${{ matrix.interpreter }}-${{ github.ref }}
+      cancel-in-progress: true
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -101,6 +201,9 @@ jobs:
       - name: Lua experiments tests
         run: ${{ matrix.interpreter }} test/test_experiments.lua
 
+      - name: Lua platform-fold conformance tests
+        run: ${{ matrix.interpreter }} test/test_platform_fold.lua
+
       # A5: allocation bytes per track(), the metric that matters on a game
       # client — a per-frame allocation is somebody's GC pause, and it is the
       # one cost an engine integration cannot hide on a background thread.
@@ -122,5 +225,22 @@ jobs:
             echo
             echo '```'
             cat bench-${{ matrix.interpreter }}.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A6: the spool's cost under sustained overflow. The assertion that
+      # holds this lives in test_sdk.lua (estimates per append, counted); this
+      # prints the numbers behind docs/SPOOL_OVERFLOW_LATENCY_BOUND.md so a
+      # regression is visible as a shape and not only as a failed bound.
+      - name: Spool overflow benchmark
+        run: ${{ matrix.interpreter }} test/bench_spool_append.lua | tee spool-${{ matrix.interpreter }}.txt
+
+      - name: Publish spool benchmark results
+        run: |
+          {
+            echo "### spool overflow — ${{ matrix.interpreter }}"
+            echo
+            echo '```'
+            cat spool-${{ matrix.interpreter }}.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

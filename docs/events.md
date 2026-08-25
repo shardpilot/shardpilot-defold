@@ -42,8 +42,8 @@ where it differs):
 `p95_ping_ms`, `max_ping_ms`, `ping_sample_count`, `disconnect_count`, and
 `transport`.
 
-Project Tower-specific event names should be sent through generic `track()`
-from the game integration later; they are not hardcoded SDK core behavior.
+Game-specific event names should be sent through the generic `track()` call
+from your own integration code; they are not hardcoded SDK core behavior.
 
 All of the above is **consent-first**: no event — helper-emitted or
 `track()`-ed — is enqueued, spooled, or sent until an explicit

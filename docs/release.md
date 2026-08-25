@@ -1,15 +1,47 @@
 # Release
 
 The ShardPilot Defold SDK is published as the latest release git tag plus a
-GitHub Release (currently `v0.10.0` for both). This is an early alpha
+GitHub Release (currently `v0.10.1` for both). This is an early alpha
 pre-release: the API is unstable and may change before v1.
 
 **Tag lag is normal, and the version above leads the tag.** In-tree version
 claims move in the version-bump commit; the tag and GitHub Release are cut
 from that commit's merge, afterwards. So between the merge and the tagging
 step the version named here is **pending**, not published, and its archive URL
-404s — `v0.9.1` is the last one that definitely resolves. `git tag -l` on a
-fresh fetch is the authority on what is actually published, not this line.
+404s. `git tag -l` on a fresh fetch is the authority on what is actually
+published, not this line.
+
+**Do not fall back to an earlier tag.** This paragraph used to name the last
+tag that "definitely resolves" as a fallback, and after `v0.10.1` that advice
+pointed at an artifact carrying the internal material `v0.10.1` exists to stop
+distributing — a runbook sending a reader back to the thing being withdrawn.
+Measured across every tag: `v0.8.0`, `v0.8.1`, `v0.9.0`, `v0.9.1` and `v0.10.0`
+carry all eight of those files, `v0.6.0` and `v0.7.0` carry two, and `v0.5.0`
+and earlier predate them. If the pending tag 404s, WAIT for it.
+
+**`v0.10.1` itself is an exception to the ordering below**, and it is worth
+knowing so its tree does not look like a mistake. It was cut as a
+deletion-only patch directly on top of `v0.10.0` rather than from a
+version-bump merge, so it still declares `M.VERSION = "0.10.0"`. That was
+deliberate: the tag's whole purpose was to carry a removal and be verifiable
+as carrying only that, which putting a version bump in it would have defeated.
+
+**Check an off-main tag before you push it.** A tag archive is fetchable the
+moment the tag exists, and a `push`-triggered workflow necessarily runs after
+that point — so the check that counts is the one you run first. This applies to
+any tag cut from somewhere other than a merge on `main`, as `v0.10.1` was,
+deliberately, to carry only a removal.
+
+Run `./scripts/check_public_surface.sh` from a checkout OF THE TAGGED TREE
+before pushing the tag. From a detached worktree at the tag:
+
+```bash
+git worktree add /tmp/tagcheck <the-commit-to-tag>
+cd /tmp/tagcheck && ./scripts/check_public_surface.sh   # must exit 0
+```
+
+This is a procedure, not a gate, and it is written down here because that is
+the honest description of it — the run before the push is the whole control.
 
 Release ordering: merge the version-bump commit — it moves every in-tree
 version claim together, which `./scripts/check_versions.sh` enforces — then

@@ -8,7 +8,16 @@ described below (disable with `spool_enabled = false` for a fully
 memory-only event path).
 
 Durable storage is namespaced per configured app. The identity record —
-the generated UUIDv7 anonymous ID and the analytics consent decision, plus,
+the generated UUIDv7 anonymous ID and the analytics consent decision; plus, when
+a decision has superseded a consent trail this device could not read, the
+timestamp of that decision, which kind of act it was (`"decision"` for a
+choice the player made, `"receipt"` for an earlier choice recovered from an
+undelivered receipt), and that decision's per-install sequence number — a
+monotone counter, carrying no clock and no identifier, which exists only to order
+two such acts that share a second — so that a consent record can state its own
+provenance
+instead of being indistinguishable from one written by a device that never met
+an unreadable trail; plus,
 once a run with `experiments_enabled` has minted one, the SDK-minted
 experiment subject id (`spcid_…`) — is
 written through
@@ -81,7 +90,7 @@ consent-receipt outbox** (see below) until the server acknowledges it:
 receipts survive process death, re-send on later launches, and retry with
 backoff until delivered, in decision order.
 
-**The receipt's actor is the canonical actor** (ADR-0222), chosen at
+**The receipt's actor is the canonical actor**, chosen at
 decision time exactly like the event plane binds identity: the verified
 `user_id` (`kind = "user_verified"`) only when a Mode B `token_provider`
 backs the session and the host has called `identify()`; the SDK-managed
@@ -149,7 +158,9 @@ sends nothing until an explicit `set_enabled` decision is persisted again.
   outbox (both described below), the remote-config cache (described
   below), the small write-ahead consent denial marker (written before a
   denial is applied so the denial survives a crash mid-purge; no analytics
-  payload), and — created only by a run with `experiments_enabled` on — the
+  payload — it carries the denial and, when that denial superseded an unreadable
+  consent trail, the same provenance pair the identity record holds, so the fact
+  is not lost if the identity write is what failed), and — created only by a run with `experiments_enabled` on — the
   experiment-assignment cache and its clear marker, both detailed below. The
   last three exist only once the feature that owns them has run: a build that
   has never denied consent and never enabled experiments carries six. No
@@ -402,7 +413,7 @@ offline launch still gets the previously fetched values. This cache:
   denied analytics consent does not block it or clear the cache — consistent
   across our SDKs;
 - carries **targeting attributes only under an explicit grant** (the one
-  personal-data-shaped exception, dark by default): with the ADR-0310 opt-in
+  personal-data-shaped exception, dark by default): with the targeting opt-in
   (`remote_config_attributes_enabled = true`) the attributes the game stores
   via `set_remote_config_attributes` ride the fetch as query parameters so
   server-side delivery rules can target this client — and they ride ONLY

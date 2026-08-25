@@ -26,7 +26,8 @@ ShardPilot Defold SDK v0 is configured with a Lua table:
   -- api_key = "sp_ingest_...",
   batch_size = 25,
   buffer_size = 1000,
-  -- flush_interval_seconds defaults to 15. It is the longest a PARTIAL batch
+  -- flush_interval_seconds defaults to 15 on main; at the pinned tag v0.10.1 the
+  -- default is 1, because that tag carries no source change. It is the longest a PARTIAL batch
   -- waits before publishing, not a heartbeat: update(dt) publishes nothing
   -- when the queue is empty. Set it explicitly only if you want a different
   -- cadence -- pinning it to 1 here is what stopped batching from happening.
@@ -131,7 +132,7 @@ the `api_key` authenticates only the remote-config fetch.
   fallback, the `401`/`403` fail-closed rule, and the cache's scope check —
   are in the README's "Remote config" section.
 - **`remote_config_attributes_enabled`** (default `false` = dark, boolean).
-  ADR-0310 opt-in: fetches carry the targeting attributes stored via
+  Opt-in: fetches carry the targeting attributes stored via
   `set_remote_config_attributes(attributes)` as query parameters, so
   server-side delivery rules can target this client (`nil`/empty clears; the
   setter is inert while the flag is off, and the flag without
@@ -365,12 +366,64 @@ never handed back as the answer to another.
 Full fetch semantics (the not-assigned reasons, `404`, and the
 transient/`Retry-After` rules) are in the README's "Experiments" section.
 
+## Platform
+
+`platform` is optional. Leave it unset and the SDK detects it from
+`sys.get_sys_info`; set it when you run outside Defold or on a system the
+detector does not recognise.
+
+**A value you set is folded to the vocabulary ingest accepts** — `web`, `ios`,
+`android`, `windows`, `macos`, `linux` — so `Windows`, `WIN32`, `OSX`,
+`html5`, `browser` and `steamdeck` all arrive as the canonical member. The fold
+is case- and padding-insensitive.
+
+This matters because the ingest vocabulary is **closed**, and a batch carrying
+one out-of-vocabulary platform is rejected **in full** — every event in it, not
+just the one with the odd field. Before the fold, `platform = "Windows 11"`
+did exactly that.
+
+**A value that is not recognised is omitted rather than sent.** `platform` is
+optional at the door, so an event without it is accepted while an event with a
+wrong one is not. Because dropping it silently would leave you believing a
+value you set was understood, the omission is reported through `diagnostics`:
+
+```lua
+{ scope = "config", status = "ignored", code = "platform_unmapped",
+  platform = "Windows 11" }
+```
+
+Nothing is reported when you set nothing — detection is the ordinary path, and
+a warning there would fire on every correctly configured game. A blank string
+counts as unset.
+
+If your platform is genuinely absent from that list — a console, say — it has
+no representation on the analytics envelope today; do not invent a spelling for
+it, because every spelling fails the batch equally.
+
+**A backlog spooled by an earlier launch is folded too, at load.** Offline
+envelopes are re-sent *verbatim* rather than rebuilt, so events spooled before
+this version — carrying whatever platform that launch wrote — would otherwise
+keep failing after the upgrade, and take the fresh events batched beside them
+down with them. **Every** value present on a restored envelope is folded or removed — an
+earlier launch wrote `config.platform` unvalidated, so a blank or a non-string
+may be sitting there; an absent key is left absent. Values that fold are
+canonicalised silently; values that do not are dropped from the envelope and
+reported once with a count, as
+`{ scope = "spool", status = "ignored", code = "platform_unmapped", count = N }`.
+`event_id` and `event_ts` are untouched.
+
+> **The crash platform is a different field and is not folded.** `crash.init`
+> resolves its own platform, a crash report may carry any lowercase token
+> (`ps5`, `switch`, `steam`), and that value takes part in crash-group
+> fingerprinting — folding it would refingerprint existing groups. See
+> `docs/crash.md`.
+
 ## Schema-revision declaration
 
 - **`schema_revision`** (default: the SDK's built-in revision; string or
   `false`). Every `POST {ingest_url}/v1/events:batch` request declares, in
   the `X-ShardPilot-Schema-Revision` request header, the revision of the
-  analytics-service envelope-schema set this SDK build was provisioned
+  ingest envelope-schema set this SDK build was provisioned
   against (`shardpilot/schema_revision.lua` — a public content digest of
   the service's embedded schema files, not a secret; it is re-synced when
   the service's schema set changes). The ingest service uses the
@@ -484,8 +537,7 @@ unknown states alike, because a receipt documents the decision itself. See
   `"user_verified"`, chosen by the canonical-actor rule described in
   `docs/privacy.md` — next to `actor_identifier`. `false` is the escape
   hatch for a deployment whose ingest service still runs the pre-amendment
-  strict decoder (`INGEST_CONSENT_KIND_MODE=off` rejects a kind-bearing
-  body `400` as an unknown field, a terminal outcome that would drop the
+  strict decoder (which rejects a kind-bearing body `400` as an unknown field, a terminal outcome that would drop the
   receipt, denials included): it suppresses the **wire field only** — the
   kind is still chosen at decision time, persisted with the receipt, and
   used to select the dispatch credential (anon-keyed receipts under the
@@ -493,12 +545,17 @@ unknown states alike, because a receipt documents the decision itself. See
   under the minted Mode B token).
 
 The optional `diagnostics` hook is invoked with each non-accepted ingest
-outcome the server reports. Inside a `202` events-batch response the SDK parses
+outcome the server reports, and with the one issue this SDK can see before
+any request is made: a configured `platform` it did not recognise, reported as
+`{ scope = "config", status = "ignored", code = "platform_unmapped" }` at
+construction (see "Platform"). Inside a `202` events-batch response the SDK parses
 the per-event status array and reports every `observed`, `duplicate`,
 `rejected`, or `suppressed_no_consent` event (with its server `code`); on a
 non-2xx it reports the parsed error envelope (`error.code` plus per-field
 detail codes); when a permanent reject drops entries from the offline
-spool it reports `{ scope = "spool", status = "dropped", code, count }`; and
+spool it reports `{ scope = "spool", status = "dropped", code, count }`; when
+restored spool envelopes carry a platform this SDK does not recognise it reports
+`{ scope = "spool", status = "ignored", code = "platform_unmapped", count }`; and
 when a consent receipt is dropped (a permanent rejection, an overflow of
 the outbox cap, or the Mode-B-only identity-change drop at load) it reports
 `{ scope = "consent", status = "dropped", code }` (codes `outbox_overflow`
