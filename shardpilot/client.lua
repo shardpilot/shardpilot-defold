@@ -1081,6 +1081,10 @@ function M.new(config)
 		-- backoff, or the server buys a POST per frame by repeating itself.
 		consent_zero_retried_key = nil,
 		spool_record = {},
+		-- The append path's derived view of spool_record (per-entry size
+		-- estimates and their running total), or nil when it must be
+		-- rebuilt. Never a source of truth: spool_record is.
+		spool_state = nil,
 		spool_index = {},
 		spool_batches = {},
 		-- Deferred durable-spool work (retried at later dispatch points):
@@ -1876,6 +1880,7 @@ function M.new(config)
 		end
 		if #spooled > 0 then
 			client.spool_record = spooled
+			client.spool_state = nil
 			local chunk = nil
 			for i = 1, #spooled do
 				client.spool_index[spooled[i].event_id] = true
@@ -2516,6 +2521,7 @@ function Client:set_consent(decision)
 		-- or resends) and the purge is retried at later dispatch points; the
 		-- failure is surfaced to the caller below so it can also retry.
 		self.spool_record = {}
+		self.spool_state = nil
 		self.spool_index = {}
 		self.spool_settled = {}
 		self.spool_rewrite_pending = false
@@ -4683,6 +4689,25 @@ function Client:ensure_batch_payload(batch)
 	return batch.payload
 end
 
+-- The append path's view of `spool_record`: per-entry size estimates and their
+-- running total, so appending one envelope does not re-measure the backlog.
+--
+-- ⚠ THE IDENTITY CHECK IS THE INVARIANT. A state is trusted only while its
+-- `events` IS the mirror table -- not a copy, the same table. Anything that
+-- replaces spool_record wholesale therefore invalidates the state whether or
+-- not it remembered to say so, and the cost of forgetting is one rebuild
+-- rather than an admission decided against a record that no longer exists.
+function Client:spool_state_for_record()
+	local state = self.spool_state
+	if state and state.events == self.spool_record then
+		return state
+	end
+	state = storage.spool_state_for(self.spool_record)
+	self.spool_record = state.events
+	self.spool_state = state
+	return state
+end
+
 -- Replace the persisted spool with `events` and refresh the client mirror
 -- from what storage actually kept after cap eviction. Every write drops the
 -- entries marked settled (acknowledged/terminally rejected but whose earlier
@@ -4713,6 +4738,11 @@ function Client:write_spool_record(events)
 		self.stats.spool_evicted = self.stats.spool_evicted + (#target - #saved)
 	end
 	self.spool_record = saved
+	-- The derived append state describes the PREVIOUS record. Dropping it
+	-- here is belt; the identity check in spool_state_for_record is braces,
+	-- so a future assignment site that forgets this costs a rebuild rather
+	-- than an answer taken from a state that is not this record's.
+	self.spool_state = nil
 	self.spool_index = {}
 	for i = 1, #saved do
 		self.spool_index[saved[i].event_id] = true
@@ -4828,6 +4858,57 @@ function Client:spool_envelopes(envelopes)
 	if #fresh == 0 and not replaced then
 		return true
 	end
+	-- ⚠ THE APPEND PATH, AND WHY IT IS NARROW. Appending one envelope used to
+	-- copy the whole record, re-estimate every entry in it (json.encode per
+	-- envelope on real Defold), and rebuild the id index over the result --
+	-- 437.6 envelopes re-measured per appended envelope at the default caps,
+	-- measured in docs/SPOOL_OVERFLOW_LATENCY_BOUND.md.
+	--
+	-- This handles the CLEAN STEADY STATE only: nothing settled awaiting a
+	-- removal rewrite, nothing replaced in place, no rewrite or condemnation
+	-- owed. Every one of those cases is a thing the whole-record rewrite
+	-- establishes, and re-establishing them on a second mutation path is how
+	-- a fast path becomes a source of quiet disagreement. They fall through
+	-- to the rewrite below, which is unchanged.
+	if not replaced
+		and next(self.spool_settled) == nil
+		and not self.spool_rewrite_pending
+		and not self.condemned_spool_pending then
+		local state = self:spool_state_for_record()
+		local evicted = storage.spool_admit(state, fresh,
+			self.config.spool_max_events, self.config.spool_max_bytes)
+		local saved, shed = storage.write_spool_state(self.config, state,
+			self.spool_retry_after_ms)
+		if not saved then
+			self.stats.spool_persist_failed = self.stats.spool_persist_failed + 1
+			-- ⚠ NOTHING LANDED, SO THE DISK STILL HOLDS THE PRE-APPEND
+			-- RECORD -- and admission had already mutated the mirror in
+			-- place. Undo it, so the mirror describes the file again. The
+			-- id index is untouched here on purpose: it is only updated
+			-- after a write succeeds, so it is already pre-append.
+			storage.spool_restore(state, fresh, evicted)
+			return false
+		end
+		-- ⚠ ADDS BEFORE ERASES. An envelope of this batch can be evicted on
+		-- arrival (it is admitted, then the caps push it straight back out),
+		-- and it appears in BOTH lists. Erasing first would leave it marked
+		-- present -- the same ordering bug the Godot port hit, where a batch
+		-- member evicted on arrival stayed in the index and was never
+		-- re-captured.
+		for i = 1, #fresh do
+			self.spool_index[fresh[i].event_id] = true
+		end
+		for i = 1, #evicted do
+			self.spool_index[evicted[i].event_id] = nil
+		end
+		for i = 1, #shed do
+			self.spool_index[shed[i].event_id] = nil
+		end
+		self.spool_record = saved
+		self.stats.spool_evicted = self.stats.spool_evicted + #evicted + #shed
+		self.spool_disk_deadline_ms = self.spool_retry_after_ms
+		return self:report_spool_capture(envelopes, fresh)
+	end
 	local combined = {}
 	for i = 1, #self.spool_record do
 		combined[#combined + 1] = self.spool_record[i]
@@ -4844,19 +4925,27 @@ function Client:spool_envelopes(envelopes)
 		end
 		return false
 	end
-	-- Cap eviction may have discarded envelopes: the caps evict oldest-first
-	-- across the whole record, and once the older entries are gone the
-	-- eviction reaches into the batch being appended. Evicting entries this
-	-- call was NOT asked to persist is the documented FIFO; but ANY envelope
-	-- of THIS request that is absent from the saved record was not captured —
-	-- whether it entered as fresh, sat at its original position as an
-	-- in-place replacement (the resurrect path above), or was ALREADY
-	-- persisted by an earlier write and just got pushed out by this very
-	-- append (a persist() remnant whose older half this write evicted while
-	-- "succeeding"). Count the new survivors for the stat, then verify the
-	-- whole requested set, so a durability-dependent caller
-	-- (shutdown/persist) never claims a remnant safe on the strength of a
-	-- write that evicted part of it.
+	return self:report_spool_capture(envelopes, fresh)
+end
+
+-- What a spool write actually captured, for both the append path and the
+-- whole-record rewrite. ⚠ ONE IMPLEMENTATION ON PURPOSE: this is where the
+-- durability contract is decided, and a second copy alongside the append path
+-- would be a second place for it to drift from the one callers rely on.
+--
+-- Cap eviction may have discarded envelopes: the caps evict oldest-first
+-- across the whole record, and once the older entries are gone the eviction
+-- reaches into the batch being appended. Evicting entries this call was NOT
+-- asked to persist is the documented FIFO; but ANY envelope of THIS request
+-- that is absent from the saved record was not captured — whether it entered
+-- as fresh, sat at its original position as an in-place replacement (the
+-- resurrect path), or was ALREADY persisted by an earlier write and just got
+-- pushed out by this very append (a persist() remnant whose older half this
+-- write evicted while "succeeding"). Count the new survivors for the stat,
+-- then verify the whole requested set, so a durability-dependent caller
+-- (shutdown/persist) never claims a remnant safe on the strength of a write
+-- that evicted part of it.
+function Client:report_spool_capture(envelopes, fresh)
 	local survivors = 0
 	for i = 1, #fresh do
 		if self.spool_index[fresh[i].event_id] then

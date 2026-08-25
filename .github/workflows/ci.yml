@@ -203,3 +203,44 @@ jobs:
 
       - name: Lua platform-fold conformance tests
         run: ${{ matrix.interpreter }} test/test_platform_fold.lua
+
+      # A5: allocation bytes per track(), the metric that matters on a game
+      # client — a per-frame allocation is somebody's GC pause, and it is the
+      # one cost an engine integration cannot hide on a background thread.
+      #
+      # Across the WHOLE matrix, because luajit is what Defold actually ships:
+      # the reference interpreter's byte counts are indicative, LuaJIT's are the
+      # ones a studio would feel. Running both is the comparison.
+      #
+      # The harness gates itself — every event must enqueue and none may drop —
+      # because its first version measured a full queue taking the drop path and
+      # printed a table in which allocation FELL as the props got richer.
+      - name: Track() allocation benchmark
+        run: ${{ matrix.interpreter }} test/bench_sdk.lua | tee bench-${{ matrix.interpreter }}.txt
+
+      - name: Publish benchmark results
+        run: |
+          {
+            echo "### track() allocation — ${{ matrix.interpreter }}"
+            echo
+            echo '```'
+            cat bench-${{ matrix.interpreter }}.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A6: the spool's cost under sustained overflow. The assertion that
+      # holds this lives in test_sdk.lua (estimates per append, counted); this
+      # prints the numbers behind docs/SPOOL_OVERFLOW_LATENCY_BOUND.md so a
+      # regression is visible as a shape and not only as a failed bound.
+      - name: Spool overflow benchmark
+        run: ${{ matrix.interpreter }} test/bench_spool_append.lua | tee spool-${{ matrix.interpreter }}.txt
+
+      - name: Publish spool benchmark results
+        run: |
+          {
+            echo "### spool overflow — ${{ matrix.interpreter }}"
+            echo
+            echo '```'
+            cat spool-${{ matrix.interpreter }}.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

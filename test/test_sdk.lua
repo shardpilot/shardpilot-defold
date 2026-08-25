@@ -11099,4 +11099,212 @@ end)()
 	rrestore(); storage.reset()
 end)()
 
+-- === A6 spool overflow: the append must not re-measure the backlog =========
+--
+-- Wrapped in an immediately-invoked FUNCTION for the same 200-local reason as
+-- the block above.
+--
+-- ⚠ THESE ASSERT A COST, NOT A BEHAVIOUR, and that is the only kind of
+-- assertion that can hold this fix. The append path is a pure optimisation:
+-- delete it and every behavioural test here still passes, because the
+-- whole-record rewrite it falls back to produces the identical record. What
+-- changes is how much work an append does, so that is what is pinned --
+-- envelopes re-measured per appended envelope, counted exactly rather than
+-- timed, so no machine or interpreter can be bought to satisfy it.
+--
+-- Baseline and bound: docs/SPOOL_OVERFLOW_LATENCY_BOUND.md (437.6 per append
+-- before this, bounded at 1.0).
+;(function()
+	-- approx_envelope_bytes uses json.encode when a `json` global exists,
+	-- which real Defold provides. Counting its calls counts exactly the work
+	-- the fix removes.
+	local function install_counting_json()
+		local saved = rawget(_G, "json")
+		local count = 0
+		_G.json = {
+			encode = function(value)
+				count = count + 1
+				return "{" .. tostring(#tostring(value)) .. "}"
+			end,
+		}
+		return function() return count end, function() _G.json = saved end
+	end
+
+	local function drive_appends(client, n, first_index)
+		for i = 1, n do
+			client:spool_envelopes({ {
+				event_id = string.format("a6-%06d", first_index + i),
+				event_name = "overflow_probe",
+				event_ts = "2026-08-25T19:00:00.000Z",
+				anonymous_id = "anon-a6",
+				session_id = "sess-a6",
+				session_sequence = i,
+				props = { level = i, mode = "campaign" },
+			} })
+		end
+	end
+
+	-- 1. Sustained overflow costs a constant number of estimates per append.
+	reset(); storage.reset(); seed_granted_consent()
+	local stores, restore = install_stub_sys_storage()
+	local client = assert(sdk.new(config({
+		flush_interval_seconds = 9999, spool_max_events = 50 })))
+	client.consent_state = "granted"
+	drive_appends(client, 60, 0)           -- fill past the cap first
+	assert_equal(#client.spool_record, 50, "the premise: the spool is at its cap")
+
+	local encodes, restore_json = install_counting_json()
+	drive_appends(client, 200, 60)
+	local per_append = encodes() / 200
+	assert_true(per_append <= 1.0, string.format(
+		"A6: an append must not re-measure the backlog -- %.1f estimates per "
+		.. "append at a 50-entry cap (bound 1.0; it was the whole backlog)",
+		per_append))
+	restore_json()
+	assert_equal(#client.spool_record, 50, "and the cap still holds")
+
+	-- 2. The id index tracks eviction. Every append at a full spool evicts,
+	--    and the index is updated incrementally rather than rebuilt -- so an
+	--    evicted id must actually be gone from it, and a surviving one must
+	--    still be there. Without this the incremental update could drift
+	--    from the record and nothing above would notice.
+	local indexed = 0
+	for _ in pairs(client.spool_index) do indexed = indexed + 1 end
+	assert_equal(indexed, 50, "the index holds exactly the record's ids")
+	for i = 1, #client.spool_record do
+		assert_true(client.spool_index[client.spool_record[i].event_id] == true,
+			"every surviving entry is indexed")
+	end
+	assert_true(client.spool_index["a6-000001"] == nil,
+		"and an evicted entry is not")
+
+	-- 3. A batch that overflows the cap BY ITSELF. Its leading envelopes are
+	--    evicted on arrival: admitted, then pushed straight back out. They
+	--    must be reported as evictions (the count-cap skip once dropped them
+	--    silently) and must NOT be left marked present in the index -- the
+	--    adds-before-erases ordering.
+	reset(); storage.reset(); seed_granted_consent()
+	local burst = assert(sdk.new(config({
+		flush_interval_seconds = 9999, spool_max_events = 3 })))
+	burst.consent_state = "granted"
+	local batch = {}
+	for i = 1, 10 do
+		batch[i] = { event_id = string.format("burst-%02d", i),
+			event_name = "burst", event_ts = "2026-08-25T19:00:00.000Z",
+			anonymous_id = "anon-a6", session_id = "sess-a6",
+			session_sequence = i, props = {} }
+	end
+	local captured = burst:spool_envelopes(batch)
+	assert_equal(captured, false,
+		"a batch larger than the cap cannot claim it captured all of it")
+	assert_equal(#burst.spool_record, 3, "the cap holds")
+	assert_equal(burst.spool_record[1].event_id, "burst-08", "oldest evicted first")
+	assert_equal(burst:snapshot().spool_evicted, 7,
+		"and all seven evicted entries are reported, not silently dropped")
+	assert_true(burst.spool_index["burst-01"] == nil,
+		"an envelope evicted on arrival must not stay marked present")
+	assert_true(burst.spool_index["burst-10"] == true, "and a survivor must")
+
+	-- 4. The derived state is never trusted across a wholesale replacement of
+	--    the record. A rewrite installs a different table; the append path
+	--    must notice and rebuild rather than admit against the old one.
+	reset(); storage.reset(); seed_granted_consent()
+	local mixed = assert(sdk.new(config({
+		flush_interval_seconds = 9999, spool_max_events = 4 })))
+	mixed.consent_state = "granted"
+	drive_appends(mixed, 2, 0)
+	assert_true(mixed:write_spool_record({ mixed.spool_record[1] }),
+		"a whole-record rewrite replaces the mirror")
+	assert_equal(mixed.spool_state, nil, "and drops the derived state")
+	drive_appends(mixed, 2, 100)
+	assert_equal(#mixed.spool_record, 3,
+		"the append after a rewrite starts from the rewritten record, not the old one")
+	assert_equal(mixed.spool_record[1].event_id, "a6-000001")
+
+	-- 5. And a state whose table was swapped WITHOUT the invalidation being
+	--    remembered is still not trusted -- the identity check, not the
+	--    bookkeeping, is what makes that safe.
+	mixed.spool_record = { mixed.spool_record[1] }   -- deliberately no invalidation
+	drive_appends(mixed, 1, 200)
+	assert_equal(#mixed.spool_record, 2,
+		"the identity check rebuilt from the swapped record")
+
+	-- 6. ⚠ A FAILED APPEND MUST LEAVE THE MIRROR DESCRIBING THE FILE.
+	--    Admission mutates the record in place, and the write retries used
+	--    to shrink that same table -- so a store that stayed unavailable
+	--    emptied the mirror while the FILE still held the backlog. The next
+	--    append that succeeded then wrote mirror-plus-new over the top and
+	--    the persisted backlog was gone.
+	reset(); storage.reset(); seed_granted_consent()
+	local fstores = {}
+	local fail_writes = false
+	sys.get_save_file = function(app, name) return app .. "/" .. name end
+	sys.save = function(path, record)
+		if fail_writes then return false end
+		fstores[path] = record
+		return true
+	end
+	sys.load = function(path) return fstores[path] end
+	local keeper = assert(sdk.new(config({
+		flush_interval_seconds = 9999, spool_max_events = 50 })))
+	keeper.consent_state = "granted"
+	drive_appends(keeper, 6, 300)
+	assert_equal(#keeper.spool_record, 6, "the premise: six envelopes are persisted")
+	local persisted = nil
+	for path, record in pairs(fstores) do
+		if path:sub(-6) == "/spool" then persisted = record end
+	end
+	assert_equal(#persisted.events, 6, "and the file holds them")
+
+	fail_writes = true
+	local ok = keeper:spool_envelopes({ {
+		event_id = "a6-during-outage", event_name = "outage",
+		event_ts = "2026-08-25T19:00:00.000Z", anonymous_id = "anon-a6",
+		session_id = "sess-a6", session_sequence = 1, props = {} } })
+	assert_equal(ok, false, "an append that cannot be written reports failure")
+	assert_equal(#keeper.spool_record, 6,
+		"and the mirror still describes the six envelopes the FILE still holds")
+	assert_true(keeper.spool_index["a6-during-outage"] == nil,
+		"the envelope that never landed is not marked present")
+	assert_equal(#persisted.events, 6, "the file itself is untouched")
+
+	fail_writes = false
+	assert_true(keeper:spool_envelopes({ {
+		event_id = "a6-after-outage", event_name = "recovered",
+		event_ts = "2026-08-25T19:00:00.000Z", anonymous_id = "anon-a6",
+		session_id = "sess-a6", session_sequence = 2, props = {} } }),
+		"once the store recovers the append lands")
+	for path, record in pairs(fstores) do
+		if path:sub(-6) == "/spool" then persisted = record end
+	end
+	assert_equal(#persisted.events, 7,
+		"and the six previously persisted envelopes are STILL there, not overwritten")
+	assert_equal(persisted.events[1].event_id, "a6-000301",
+		"with the oldest still oldest")
+
+	-- 7. ⚠ ONE ENTRY PER ID. The loader salvages every table-shaped entry
+	--    with a valid id rather than deduplicating, so a garbled file can
+	--    carry the same id twice -- and a boolean id index cannot then have
+	--    one copy evicted without wrongly declaring the id gone while
+	--    another survives. The record is normalised instead.
+	local twin = { event_id = "a6-twin", event_name = "twin",
+		event_ts = "2026-08-25T19:00:00.000Z", anonymous_id = "anon-a6",
+		session_id = "sess-a6", session_sequence = 1, props = {} }
+	local dup_state = storage.spool_state_for({ twin, twin, {
+		event_id = "a6-other", event_name = "other",
+		event_ts = "2026-08-25T19:00:00.000Z", anonymous_id = "anon-a6",
+		session_id = "sess-a6", session_sequence = 2, props = {} } })
+	assert_equal(#dup_state.events, 2,
+		"a record carrying the same id twice is normalised to one entry")
+	assert_equal(dup_state.events[1].event_id, "a6-twin", "keeping the first")
+	assert_equal(#dup_state.sizes, 2, "and its size estimates track the entries")
+	local dup_admitted = storage.spool_admit(dup_state, { twin }, 50, 262144)
+	assert_equal(#dup_admitted, 0, "nothing evicted")
+	assert_equal(#dup_state.events, 2,
+		"and re-admitting an id the state already holds does not duplicate it")
+
+	sys.get_save_file = nil; sys.save = nil; sys.load = nil
+	restore(); storage.reset()
+end)()
+
 print("shardpilot defold lua tests passed")

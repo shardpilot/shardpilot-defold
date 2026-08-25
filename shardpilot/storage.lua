@@ -970,55 +970,231 @@ function M.load_spool(scope)
 	return sanitize_spool_events(record.events), sanitize_deadline(record.retry_after_until_ms)
 end
 
--- Replace the persisted spool with `events` (oldest first), enforcing the
--- count and approximate-bytes caps by evicting the OLDEST entries first.
--- `retry_after_until_ms` (optional) is stored with the record. Returns the
--- list that was actually persisted (possibly shorter than the input after
--- eviction), or nil when the durable write failed outright.
-function M.save_spool(scope, events, max_events, max_bytes, retry_after_until_ms)
-	local ns = spool_namespace(scope)
+-- The base of the byte estimate: what an empty record costs before any
+-- envelope is counted. Named because the running total in a spool state must
+-- start from exactly the same place the one-shot estimate did, or the two
+-- paths would disagree about when the budget is reached.
+local spool_estimate_base = 2
+
+-- A spool STATE is the persisted list plus what an append needs to know about
+-- it without re-reading it: the per-entry size estimates and their running
+-- total.
+--
+-- ⚠ THIS APPLIES NO CAPS, deliberately. The caps belong to admission, which
+-- knows the caller's configured limits; a state is just "what is here". An
+-- earlier version of this idea in the Godot SDK defaulted the cap here
+-- instead, and a backlog larger than the default was silently trimmed on
+-- load with no eviction recorded -- the state disagreed with the disk about
+-- what existed.
+function M.spool_state_for(events)
+	local state = { events = {}, sizes = {}, total = spool_estimate_base, ids = {} }
+	M.spool_admit_all(state, events)
+	return state
+end
+
+-- Add entries to a state with NO cap applied, refusing an id it already
+-- holds.
+--
+-- ⚠ ONE ENTRY PER ID IS AN INVARIANT NOW, not an accident. The loader
+-- deliberately salvages every table-shaped entry carrying a valid event_id
+-- rather than deduplicating, so a garbled record can hold the same id twice
+-- -- and a caller keeping a boolean id index cannot then evict one copy
+-- without wrongly declaring the id gone while another survives. The record
+-- is normalised here instead, which is the same repair the loader already
+-- performs on shape.
+function M.spool_admit_all(state, events)
 	local kept = sanitize_spool_events(events)
+	for i = 1, #kept do
+		local entry = kept[i]
+		if not state.ids[entry.event_id] then
+			local size = approx_envelope_bytes(entry)
+			state.events[#state.events + 1] = entry
+			state.sizes[#state.sizes + 1] = size
+			state.ids[entry.event_id] = true
+			state.total = state.total + size
+		end
+	end
+end
+
+-- Admit `fresh` into `state`, evicting the OLDEST entries until both caps
+-- hold. Mutates `state` and returns the evicted entries, oldest first.
+--
+-- The entries rather than a count, because the caller keeps an id index over
+-- the record: given only a number it would have to rebuild that index over
+-- the whole record to find out which ids left -- and at a full spool every
+-- append evicts, so the O(#record) pass this removes would come straight
+-- back in the caller.
+--
+-- ⚠ THE MEASURING is O(#fresh): appending one envelope used to re-estimate
+-- every envelope already spooled -- 437.6 of them per append at the default
+-- caps, measured in docs/SPOOL_OVERFLOW_LATENCY_BOUND.md -- and entries now
+-- carry their estimate from the moment they are admitted, so nothing is
+-- measured twice. That is the cost this exists to remove.
+--
+-- ⚠ IT IS NOT O(1) OVERALL, AND SAYING SO WOULD BE FALSE. table.remove(t, 1)
+-- shifts every surviving element, so an eviction costs O(#state) pointer
+-- moves in two arrays. That term stays, deliberately: the write it
+-- accompanies hands the WHOLE table to sys.save, which serialises every
+-- surviving envelope on the same call -- the platform has no append (see
+-- docs/SPOOL_OVERFLOW_LATENCY_BOUND.md). Replacing the shift with a head
+-- offset would still have to materialise a contiguous array for that write,
+-- trading two pointer shifts for one copy while the serialisation it sits
+-- inside is untouched.
+--
+-- There is ONE implementation of the caps and both paths use it. A second
+-- copy for the append path would be a second place for the two to drift, and
+-- the eviction rule is exactly what a reader and a writer must agree on.
+function M.spool_admit(state, fresh, max_events, max_bytes)
 	local limit_events = (type(max_events) == "number" and max_events > 0) and max_events or 500
 	local limit_bytes = (type(max_bytes) == "number" and max_bytes > 0) and max_bytes or 262144
 	if limit_bytes > max_spool_file_bytes then
 		limit_bytes = max_spool_file_bytes
 	end
-	while #kept > limit_events do
-		table.remove(kept, 1)
-	end
-	-- Estimate each entry once, then evict from the front (oldest) until the
-	-- summed estimate fits the byte budget.
-	local total = 2
-	local sizes = {}
-	for i = 1, #kept do
-		sizes[i] = approx_envelope_bytes(kept[i])
-		total = total + sizes[i]
-	end
-	local drop = 0
-	while drop < #kept and total > limit_bytes do
-		drop = drop + 1
-		total = total - sizes[drop]
-	end
-	if drop > 0 then
+	local admitted = sanitize_spool_events(fresh)
+	-- An entry the count cap will certainly evict is never estimated. Only
+	-- the leading (#admitted - limit_events) of THIS batch qualify: anything
+	-- after that may survive, depending on how much of `state` the cap
+	-- displaces. The one-shot path applied its count cap before estimating
+	-- and this keeps that property -- without it, saving a 10k-entry list
+	-- would estimate 10k envelopes to persist 500.
+	--
+	-- ⚠ AND THEY ARE STILL EVICTIONS. Skipping the estimate must not skip
+	-- the accounting: the first version of this dropped them silently, and
+	-- the existing FIFO fixture caught it as spool_evicted 0 where 1 was
+	-- owed. Not estimating an entry is a cost decision; not reporting it is
+	-- a lie about what was persisted.
+	local skipped = {}
+	local skip = #admitted - limit_events
+	if skip > 0 then
 		local trimmed = {}
-		for i = drop + 1, #kept do
-			trimmed[#trimmed + 1] = kept[i]
+		for i = 1, skip do
+			skipped[#skipped + 1] = admitted[i]
 		end
-		kept = trimmed
+		for i = skip + 1, #admitted do
+			trimmed[#trimmed + 1] = admitted[i]
+		end
+		admitted = trimmed
 	end
-	-- The estimate ignores serialization overhead, so a near-budget list can
-	-- still overflow the save-file cap and fail the write. Evict the oldest
-	-- entries one at a time and retry until the write succeeds or nothing is
-	-- left to save (then the backend itself is unavailable).
-	while true do
-		if write_spool(ns, kept, retry_after_until_ms) then
-			return kept
-		end
-		if #kept == 0 then
-			return nil
-		end
-		table.remove(kept, 1)
+	M.spool_admit_all(state, admitted)
+	-- Evict oldest-first until both caps hold. table.remove(t, 1) is O(#t),
+	-- so the shift is proportional to what SURVIVES rather than to what is
+	-- evicted -- fine for the one-or-two evictions a steady-state append
+	-- causes, and the whole-record case only arises on the first admission
+	-- after a load, which pays it once.
+	local evicted = {}
+	while #state.events > 0
+		and (#state.events > limit_events or state.total > limit_bytes) do
+		state.total = state.total - state.sizes[1]
+		local gone = table.remove(state.events, 1)
+		table.remove(state.sizes, 1)
+		state.ids[gone.event_id] = nil
+		evicted[#evicted + 1] = gone
 	end
+	-- Appended rather than interleaved. A batch big enough to be skipped is
+	-- one that fills the count cap by itself, so every prior entry is
+	-- evicted too and this IS the FIFO order; only a byte cap biting into
+	-- the same batch could reorder the tail, and nothing consumes the order
+	-- -- the caller uses the set (which ids left) and the count.
+	for i = 1, #skipped do
+		evicted[#evicted + 1] = skipped[i]
+	end
+	return evicted
+end
+
+-- Persist `state` (already admitted) plus the deadline. Returns the list that
+-- was actually persisted, or nil when the durable write failed outright.
+--
+-- The estimate ignores serialization overhead, so a near-budget list can still
+-- overflow the save-file cap and fail the write. Evict the oldest entries one
+-- at a time and retry until the write succeeds or nothing is left to save
+-- (then the backend itself is unavailable). ⚠ THE STATE IS SHRUNK WITH THE
+-- LIST: a state describing entries the store rejected would send the next
+-- append's admission decision off a record that does not exist.
+-- Returns the persisted list plus the entries the retry loop shed (usually
+-- none), or nil plus what it shed. The shed entries are returned for the same
+-- reason admission returns its evictions: a caller indexing the record has to
+-- know which ids stopped existing.
+function M.write_spool_state(scope, state, retry_after_until_ms)
+	local ns = spool_namespace(scope)
+	if write_spool(ns, state.events, retry_after_until_ms) then
+		return state.events, {}
+	end
+	-- ⚠ THE RETRIES SHRINK A COPY, NOT THE CALLER'S STATE. A FAILED WRITE
+	-- LEAVES THE FILE AT ITS PREVIOUS CONTENTS -- so if nothing lands at
+	-- all, the state must still describe what is on disk. Shrinking it in
+	-- place emptied it while the file still held the backlog, and the next
+	-- append that succeeded then wrote mirror-plus-new over the top,
+	-- silently discarding everything previously persisted.
+	local events, sizes = {}, {}
+	local total = state.total
+	for i = 1, #state.events do
+		events[i] = state.events[i]
+		sizes[i] = state.sizes[i]
+	end
+	local shed = {}
+	while #events > 0 do
+		total = total - sizes[1]
+		shed[#shed + 1] = table.remove(events, 1)
+		table.remove(sizes, 1)
+		if write_spool(ns, events, retry_after_until_ms) then
+			state.events, state.sizes, state.total = events, sizes, total
+			for i = 1, #shed do
+				state.ids[shed[i].event_id] = nil
+			end
+			return events, shed
+		end
+	end
+	return nil, shed
+end
+
+-- Undo an admission that no write survived. Cheap by construction: the batch
+-- went in at the TAIL and the caps evicted from the FRONT, so both ends are
+-- known without touching the middle.
+--
+-- Entries that arrived with THIS batch are not restored -- they were never on
+-- disk, and the caller reports them as uncaptured.
+function M.spool_restore(state, fresh, evicted)
+	local from_batch = {}
+	for i = 1, #fresh do
+		local entry = fresh[i]
+		if type(entry) == "table" and type(entry.event_id) == "string" then
+			from_batch[entry.event_id] = true
+		end
+	end
+	while #state.events > 0 do
+		local last = state.events[#state.events]
+		if not (type(last) == "table" and from_batch[last.event_id]) then
+			break
+		end
+		state.total = state.total - state.sizes[#state.sizes]
+		state.ids[last.event_id] = nil
+		table.remove(state.events)
+		table.remove(state.sizes)
+	end
+	for i = #evicted, 1, -1 do
+		local entry = evicted[i]
+		if not from_batch[entry.event_id] then
+			local size = approx_envelope_bytes(entry)
+			table.insert(state.events, 1, entry)
+			table.insert(state.sizes, 1, size)
+			state.ids[entry.event_id] = true
+			state.total = state.total + size
+		end
+	end
+end
+
+-- Replace the persisted spool with `events` (oldest first), enforcing the
+-- count and approximate-bytes caps by evicting the OLDEST entries first.
+-- `retry_after_until_ms` (optional) is stored with the record. Returns the
+-- list that was actually persisted (possibly shorter than the input after
+-- eviction), or nil when the durable write failed outright.
+--
+-- This is the whole-record path, expressed through the same admission the
+-- append path uses: an empty state, everything admitted at once.
+function M.save_spool(scope, events, max_events, max_bytes, retry_after_until_ms)
+	local state = { events = {}, sizes = {}, total = spool_estimate_base, ids = {} }
+	M.spool_admit(state, events, max_events, max_bytes)
+	return M.write_spool_state(scope, state, retry_after_until_ms)
 end
 
 -- Drop the whole spool — envelopes and any stored deadline (consent revoked,
