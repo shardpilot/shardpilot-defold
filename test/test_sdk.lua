@@ -11099,4 +11099,137 @@ end)()
 	rrestore(); storage.reset()
 end)()
 
+-- === A6 spool overflow: the append must not re-measure the backlog =========
+--
+-- Wrapped in an immediately-invoked FUNCTION for the same 200-local reason as
+-- the block above.
+--
+-- ⚠ THESE ASSERT A COST, NOT A BEHAVIOUR, and that is the only kind of
+-- assertion that can hold this fix. The append path is a pure optimisation:
+-- delete it and every behavioural test here still passes, because the
+-- whole-record rewrite it falls back to produces the identical record. What
+-- changes is how much work an append does, so that is what is pinned --
+-- envelopes re-measured per appended envelope, counted exactly rather than
+-- timed, so no machine or interpreter can be bought to satisfy it.
+--
+-- Baseline and bound: docs/SPOOL_OVERFLOW_LATENCY_BOUND.md (437.6 per append
+-- before this, bounded at 1.0).
+;(function()
+	-- approx_envelope_bytes uses json.encode when a `json` global exists,
+	-- which real Defold provides. Counting its calls counts exactly the work
+	-- the fix removes.
+	local function install_counting_json()
+		local saved = rawget(_G, "json")
+		local count = 0
+		_G.json = {
+			encode = function(value)
+				count = count + 1
+				return "{" .. tostring(#tostring(value)) .. "}"
+			end,
+		}
+		return function() return count end, function() _G.json = saved end
+	end
+
+	local function drive_appends(client, n, first_index)
+		for i = 1, n do
+			client:spool_envelopes({ {
+				event_id = string.format("a6-%06d", first_index + i),
+				event_name = "overflow_probe",
+				event_ts = "2026-08-25T19:00:00.000Z",
+				anonymous_id = "anon-a6",
+				session_id = "sess-a6",
+				session_sequence = i,
+				props = { level = i, mode = "campaign" },
+			} })
+		end
+	end
+
+	-- 1. Sustained overflow costs a constant number of estimates per append.
+	reset(); storage.reset(); seed_granted_consent()
+	local stores, restore = install_stub_sys_storage()
+	local client = assert(sdk.new(config({
+		flush_interval_seconds = 9999, spool_max_events = 50 })))
+	client.consent_state = "granted"
+	drive_appends(client, 60, 0)           -- fill past the cap first
+	assert_equal(#client.spool_record, 50, "the premise: the spool is at its cap")
+
+	local encodes, restore_json = install_counting_json()
+	drive_appends(client, 200, 60)
+	local per_append = encodes() / 200
+	assert_true(per_append <= 1.0, string.format(
+		"A6: an append must not re-measure the backlog -- %.1f estimates per "
+		.. "append at a 50-entry cap (bound 1.0; it was the whole backlog)",
+		per_append))
+	restore_json()
+	assert_equal(#client.spool_record, 50, "and the cap still holds")
+
+	-- 2. The id index tracks eviction. Every append at a full spool evicts,
+	--    and the index is updated incrementally rather than rebuilt -- so an
+	--    evicted id must actually be gone from it, and a surviving one must
+	--    still be there. Without this the incremental update could drift
+	--    from the record and nothing above would notice.
+	local indexed = 0
+	for _ in pairs(client.spool_index) do indexed = indexed + 1 end
+	assert_equal(indexed, 50, "the index holds exactly the record's ids")
+	for i = 1, #client.spool_record do
+		assert_true(client.spool_index[client.spool_record[i].event_id] == true,
+			"every surviving entry is indexed")
+	end
+	assert_true(client.spool_index["a6-000001"] == nil,
+		"and an evicted entry is not")
+
+	-- 3. A batch that overflows the cap BY ITSELF. Its leading envelopes are
+	--    evicted on arrival: admitted, then pushed straight back out. They
+	--    must be reported as evictions (the count-cap skip once dropped them
+	--    silently) and must NOT be left marked present in the index -- the
+	--    adds-before-erases ordering.
+	reset(); storage.reset(); seed_granted_consent()
+	local burst = assert(sdk.new(config({
+		flush_interval_seconds = 9999, spool_max_events = 3 })))
+	burst.consent_state = "granted"
+	local batch = {}
+	for i = 1, 10 do
+		batch[i] = { event_id = string.format("burst-%02d", i),
+			event_name = "burst", event_ts = "2026-08-25T19:00:00.000Z",
+			anonymous_id = "anon-a6", session_id = "sess-a6",
+			session_sequence = i, props = {} }
+	end
+	local captured = burst:spool_envelopes(batch)
+	assert_equal(captured, false,
+		"a batch larger than the cap cannot claim it captured all of it")
+	assert_equal(#burst.spool_record, 3, "the cap holds")
+	assert_equal(burst.spool_record[1].event_id, "burst-08", "oldest evicted first")
+	assert_equal(burst:snapshot().spool_evicted, 7,
+		"and all seven evicted entries are reported, not silently dropped")
+	assert_true(burst.spool_index["burst-01"] == nil,
+		"an envelope evicted on arrival must not stay marked present")
+	assert_true(burst.spool_index["burst-10"] == true, "and a survivor must")
+
+	-- 4. The derived state is never trusted across a wholesale replacement of
+	--    the record. A rewrite installs a different table; the append path
+	--    must notice and rebuild rather than admit against the old one.
+	reset(); storage.reset(); seed_granted_consent()
+	local mixed = assert(sdk.new(config({
+		flush_interval_seconds = 9999, spool_max_events = 4 })))
+	mixed.consent_state = "granted"
+	drive_appends(mixed, 2, 0)
+	assert_true(mixed:write_spool_record({ mixed.spool_record[1] }),
+		"a whole-record rewrite replaces the mirror")
+	assert_equal(mixed.spool_state, nil, "and drops the derived state")
+	drive_appends(mixed, 2, 100)
+	assert_equal(#mixed.spool_record, 3,
+		"the append after a rewrite starts from the rewritten record, not the old one")
+	assert_equal(mixed.spool_record[1].event_id, "a6-000001")
+
+	-- 5. And a state whose table was swapped WITHOUT the invalidation being
+	--    remembered is still not trusted -- the identity check, not the
+	--    bookkeeping, is what makes that safe.
+	mixed.spool_record = { mixed.spool_record[1] }   -- deliberately no invalidation
+	drive_appends(mixed, 1, 200)
+	assert_equal(#mixed.spool_record, 2,
+		"the identity check rebuilt from the swapped record")
+
+	restore(); storage.reset()
+end)()
+
 print("shardpilot defold lua tests passed")

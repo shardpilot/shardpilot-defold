@@ -93,9 +93,10 @@ appends and nothing else. Measured on `test/bench_spool_append.lua`, whose
 **Entries handed to `sys.save` per append stays at the backlog size, and this
 change does not reduce it.** `sys.save` takes a whole table; the platform
 offers no append and no partial write, so the write is O(backlog) by
-construction. Its cost is engine-side C that no harness in this repository can
-measure — `scripts/ci_bob_build.sh` builds with `bob.jar` but never starts the
-engine, and it says so.
+construction. Its cost is engine-side C, and putting a number on it means
+running the engine: `scripts/ci_bob_build.sh` resolves and compiles this
+library with `bob.jar` and stops there, as that script states in its own
+words.
 
 Stating a bound on a quantity I cannot measure would be worse than stating
 none. So this is recorded as **owed, with the measurement that would settle
