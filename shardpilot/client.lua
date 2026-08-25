@@ -1,4 +1,5 @@
 local envelope = require "shardpilot.envelope"
+local envelope_platform = require "shardpilot.envelope_platform"
 local clock = require "shardpilot.clock"
 local compression = require "shardpilot.compression"
 local experiments_mod = require "shardpilot.experiments"
@@ -485,6 +486,65 @@ local function normalize_non_negative_number(value, default_value, error_code)
 	return value
 end
 
+-- Coerce a value for a diagnostics field. SCALARS ONLY, deliberately: a table
+-- or userdata becomes "" rather than being handed to `tostring`, whose
+-- `__tostring` metamethod is integrator code and may raise. Defined here rather
+-- than beside `Client:diagnose` because the config-time reporter below runs long
+-- before a client exists, and one coercion rule shared beats two that drift.
+local function diag_field(value)
+	local t = type(value)
+	if t == "string" then
+		return value
+	elseif t == "number" or t == "boolean" then
+		return tostring(value)
+	end
+	return ""
+end
+
+-- Resolve the platform that goes on the EVENT ENVELOPE.
+--
+-- Two inputs with different standing, which is the whole of this function:
+--
+--   * The host SET one. It is folded to the ingest vocabulary; a value that
+--     folds to nothing is OMITTED (the key is optional at the door, so an
+--     omitted platform is accepted while an out-of-vocabulary one fails the
+--     entire batch) -- and reported, because omitting it silently is how a host
+--     who typed something meaningful never learns it was not understood.
+--
+--   * The host set nothing. `platform.detect()` answers, and it already answers
+--     in the canonical vocabulary. This is the ordinary default path and it is
+--     SILENT: a warning here would fire on every correctly-configured game,
+--     which is how a diagnostic gets switched off before the day it matters.
+--
+-- A blank string counts as "set nothing" -- it carries no more intent than nil,
+-- and warning about it would be noise. Note this also stops a blank reaching
+-- the wire, which it previously did (`config.platform or ...` treats "" as
+-- present, Lua having no falsy empty string).
+local function resolve_envelope_platform(config)
+	local configured = config.platform
+	if configured == nil or configured == "" then
+		return platform.detect()
+	end
+
+	local folded = envelope_platform.normalize(configured)
+	if folded then
+		return folded
+	end
+
+	-- Integrator code, on the same terms the publish path gives it: optional,
+	-- and never allowed to break construction.
+	local hook = config.diagnostics
+	if type(hook) == "function" then
+		pcall(hook, {
+			scope = "config",
+			status = "ignored",
+			code = "platform_unmapped",
+			platform = diag_field(configured),
+		})
+	end
+	return nil
+end
+
 local function validate_config(config)
 	if type(config) ~= "table" then
 		return nil, "config_required"
@@ -667,7 +727,7 @@ local function validate_config(config)
 		schema_revision = declared_schema_revision,
 		consent_kind_emission_enabled = config.consent_kind_emission_enabled ~= false,
 		request_compression_enabled = config.request_compression_enabled ~= false,
-		platform = config.platform or platform.detect(),
+		platform = resolve_envelope_platform(config),
 		transport = config.transport,
 		token_provider = config.token_provider,
 		api_key = has_api_key and config.api_key or nil,
@@ -1634,6 +1694,50 @@ function M.new(config)
 					count = mismatched,
 				})
 			end
+		end
+		-- AND THE BACKLOG IS FOLDED TOO. Envelopes spooled by an earlier launch
+		-- carry the platform THAT launch put on them, and the resend path sends
+		-- them verbatim rather than rebuilding them. Folding only the live
+		-- config would therefore leave exactly the events that motivated the
+		-- upgrade still failing -- and a batch is rejected WHOLE, so each such
+		-- envelope takes the fresh events batched beside it down with it.
+		--
+		-- Same rule as at config time: a value that folds is canonicalised
+		-- silently (no fact changes), one that does not is dropped from the
+		-- envelope and reported with a count. `event_id` and `event_ts` are
+		-- untouched, so the round trip the resend path depends on still holds.
+		--
+		-- EVERY PRESENT VALUE, not just a non-empty string. An earlier launch
+		-- put `config.platform` on the envelope unvalidated, so a blank, a
+		-- number or a table could be sitting there -- and the blank is not
+		-- hypothetical, it is the case this version stopped producing
+		-- (`config.platform or ...` treats "" as present, Lua having no falsy
+		-- empty string). Skipping those would fix the live config while leaving
+		-- the backlog carrying exactly the values that fail the batch. An ABSENT
+		-- key is left absent: there is nothing to fold and nothing was lost.
+		--
+		-- A blank is silent at config time and reported here, and the asymmetry
+		-- is deliberate: at config time nothing had reached an envelope yet and
+		-- detection answers for it, while here it is already ON one that is
+		-- about to be sent, so removing it changes that envelope.
+		local unfoldable = 0
+		for i = 1, #spooled do
+			local raw = spooled[i].platform
+			if raw ~= nil then
+				local folded = envelope_platform.normalize(raw)
+				spooled[i].platform = folded
+				if not folded then
+					unfoldable = unfoldable + 1
+				end
+			end
+		end
+		if unfoldable > 0 then
+			client:diagnose({
+				scope = "spool",
+				status = "ignored",
+				code = "platform_unmapped",
+				count = unfoldable,
+			})
 		end
 		local condemned = 0
 		local condemnation_covers = false
@@ -3159,16 +3263,6 @@ end
 -- so a malformed or proxy-mangled body could carry a non-string (number/boolean/
 -- table). Concatenating a non-scalar raises a Lua error, which — happening inside
 -- the batch callback — would abort flush(); coerce scalars and drop the rest.
-local function diag_field(value)
-	local t = type(value)
-	if t == "string" then
-		return value
-	elseif t == "number" or t == "boolean" then
-		return tostring(value)
-	end
-	return ""
-end
-
 -- Surface a per-event or batch issue through the optional diagnostics hook and
 -- record it on the snapshot so an integrator learns their events were
 -- observed/rejected/suppressed inside an otherwise "successful" 202.
@@ -5393,6 +5487,8 @@ function Client:flush(options)
 				-- fresh queue drains, through the same token/consent/deferral
 				-- gates. The payload is the persisted envelopes verbatim —
 				-- never rebuilt — so event_id/event_ts survive the round trip.
+				-- (`platform` is the one field normalised at LOAD, before this
+				-- point, because a stale spelling would fail the whole batch.)
 				local chunk = table.remove(self.spool_batches, 1)
 				local batch = { spool_origin = true, payload = { events = chunk } }
 				for i = 1, #chunk do

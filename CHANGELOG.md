@@ -6,6 +6,46 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **A configured `platform` is now folded to the vocabulary ingest accepts, and
+  reported when it is not recognised.** Behaviour change for hosts that set
+  `platform` explicitly; no change for hosts that leave it to detection.
+
+  The ingest vocabulary is closed — `web`, `ios`, `android`, `windows`,
+  `macos`, `linux` — and a batch carrying one out-of-vocabulary platform is
+  rejected **in full**, every event in it. `config.platform` is typed by a
+  human, so `platform = "Windows 11"` (or `"win-x64"`, or `"PC"`) reached that
+  door as written and failed every batch the client sent. Spellings the fold
+  understands — `Windows`, `WIN32`, `OSX`, `html5`, `browser`, `steamdeck`,
+  case and padding included — now arrive as the canonical member.
+
+  A value that is **not** recognised is omitted rather than sent: the field is
+  optional at the door, so an event without it is accepted while an event with
+  a wrong one is not. Omitting it silently would leave you believing a value
+  you set was understood, so it is reported through `diagnostics` as
+  `{ scope = "config", status = "ignored", code = "platform_unmapped" }`.
+  Setting nothing reports nothing — detection is the ordinary path, and a
+  warning there would fire on every correctly configured game.
+
+  A blank `platform` now counts as unset (detection answers) instead of
+  reaching the wire as an empty string, which `config.platform or ...` did
+  because Lua has no falsy empty string.
+
+  **The offline backlog is folded at load, not only the live config.** Spooled
+  envelopes are re-sent verbatim rather than rebuilt, so events spooled by an
+  earlier launch would otherwise keep failing after the upgrade — and because a
+  batch is rejected whole, each stale envelope would take the fresh events
+  batched beside it down too. Every value present on a restored envelope is
+  folded or removed — an earlier launch wrote `config.platform` unvalidated, so
+  a blank or a non-string may be sitting there — while an absent key is left
+  absent. Unrecognised values are reported once with a count; `event_id` and
+  `event_ts` are untouched.
+
+  **The crash platform is untouched.** `crash.init` resolves its own, a crash
+  report may carry any lowercase token (`ps5`, `switch`, `steam`), and that
+  value takes part in crash-group fingerprinting — folding it would
+  refingerprint existing groups. A test builds both clients from one config
+  table and fails if the crash value moves.
+
 - **Documentation-only: internal ShardPilot material removed from the
   published tree, and a gate added so it does not come back.** No API, wire
   format or behaviour change.

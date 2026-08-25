@@ -200,3 +200,6 @@ jobs:
 
       - name: Lua experiments tests
         run: ${{ matrix.interpreter }} test/test_experiments.lua
+
+      - name: Lua platform-fold conformance tests
+        run: ${{ matrix.interpreter }} test/test_platform_fold.lua

@@ -11,6 +11,7 @@ required_files=(
   shardpilot/sdk.lua
   shardpilot/client.lua
   shardpilot/envelope.lua
+  shardpilot/envelope_platform.lua
   shardpilot/queue.lua
   shardpilot/transport.lua
   shardpilot/remote_config.lua
