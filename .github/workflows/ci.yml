@@ -110,10 +110,18 @@ jobs:
       # built on purpose. It needs no network and no history depth.
       #
       # It shares this job's ten-minute clock rather than taking its own, because
-      # `static` is already at ten and the harness measured ~150s in the sibling
-      # repository. If that stops fitting, give it its own job as shardpilot-go
-      # did rather than raising this one: outgrowing a shared timeout fails as a
-      # cancelled job, which reads like an outage.
+      # `static` is already at ten. Measured HERE rather than inherited: 135s at
+      # the fourteen controls, on a developer box, 2026-08-26. The sibling
+      # repository's CI range at the same control count is 130-157s, and that is
+      # indicative only -- cost is controls x gate-cost, and the gate scans a
+      # different corpus in each repo, so the sibling's number is not a
+      # measurement of this one.
+      #
+      # Budget against the SLOW end when this is next revisited: a figure
+      # justifying a bound has to be argued from the side the risk is on, and for
+      # a timeout the risk is overrun. If it stops fitting, give the harness its
+      # own job as shardpilot-go did rather than raising this one -- outgrowing a
+      # shared timeout fails as a cancelled job, which reads like an outage.
       - name: Every lane B refusal still fires
         run: ./scripts/test_lane_b_ratchet.sh
 
