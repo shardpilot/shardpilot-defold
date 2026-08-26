@@ -99,6 +99,24 @@ jobs:
       - name: No internal material in the published non-source surface
         run: ./scripts/check_public_surface.sh
 
+      # ⚠ THE GATE PASSING SAYS NOTHING ABOUT WHETHER ITS CHECKS STILL EXIST.
+      # In shardpilot-go, two of the lane B ratchet's review findings were checks
+      # that had been correct two rounds earlier and were dropped in a
+      # restructure -- and both survived a green run of the gate. This drives
+      # each refusal to its condition and fails when one stops firing.
+      #
+      # ⚠ NO env HERE, deliberately: every comparison target is synthesized from
+      # HEAD, so a CI-provided base ref could only replace a target the harness
+      # built on purpose. It needs no network and no history depth.
+      #
+      # It shares this job's ten-minute clock rather than taking its own, because
+      # `static` is already at ten and the harness measured ~150s in the sibling
+      # repository. If that stops fitting, give it its own job as shardpilot-go
+      # did rather than raising this one: outgrowing a shared timeout fails as a
+      # cancelled job, which reads like an outage.
+      - name: Every lane B refusal still fires
+        run: ./scripts/test_lane_b_ratchet.sh
+
   # Engine-real leg: proves on every PR that the WORKING TREE still packages
   # and builds as a real Defold library dependency — scripts/package_release.sh
   # ZIP served over localhost, resolved and compiled by a pinned,
