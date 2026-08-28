@@ -17,8 +17,20 @@ Two fixtures in the unit-test suite. `sp_ingest_abc123` is a placeholder
 publishable key used to construct a client in a test; `receipt-historic-anon-2`
 is an idempotency key — a request-deduplication token, not a credential.
 Neither authenticates anything.
+
+⚠ BOTH ARE ANCHORED, AND THAT IS THE WHOLE POINT OF NAMING A LITERAL. gitleaks
+matches an allowlist regex against the extracted secret UNANCHORED, so an
+unanchored `receipt-historic-anon-2` forgives every secret CONTAINING it —
+`receipt-historic-anon-20`, `-200`, and the rest of an infinite family, which is
+the family this exception was narrowed to escape. Measured on a planted
+repository: with `receipt-historic-anon-2` unanchored, a committed
+`receipt-historic-anon-299` went unreported; with `^receipt-historic-anon-2$` it
+is reported. Measured on this repository's whole history, the anchored pair
+suppresses exactly what the unanchored pair suppressed — four findings under the
+pinned defaults, none under either — so the anchors cost nothing here and are
+the only thing making "a literal names one value" true.
 """
 regexes = [
-  '''sp_ingest_abc123''',
-  '''receipt-historic-anon-2''',
+  '''^sp_ingest_abc123$''',
+  '''^receipt-historic-anon-2$''',
 ]
