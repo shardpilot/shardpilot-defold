@@ -14,11 +14,11 @@ useDefault = true
 [[allowlists]]
 description = """
 Two fixtures in the unit-test suite. `sp_ingest_abc123` is a placeholder
-publishable key used to construct a client in a test; `receipt-historic-anon-N`
+publishable key used to construct a client in a test; `receipt-historic-anon-2`
 is an idempotency key — a request-deduplication token, not a credential.
 Neither authenticates anything.
 """
 regexes = [
   '''sp_ingest_abc123''',
-  '''receipt-historic-anon-\d+''',
+  '''receipt-historic-anon-2''',
 ]
