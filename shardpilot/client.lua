@@ -2765,18 +2765,6 @@ function Client:screen_view(screen_name, props)
 	return self:track("app.screen_view", out)
 end
 
-function Client:tutorial_start(tutorial_id)
-	return self:track("tutorial_start", { tutorial_id = tutorial_id })
-end
-
-function Client:tutorial_step_complete(tutorial_id, step_id)
-	return self:track("tutorial_step_complete", { tutorial_id = tutorial_id, step_id = step_id })
-end
-
-function Client:tutorial_complete(tutorial_id)
-	return self:track("tutorial_complete", { tutorial_id = tutorial_id })
-end
-
 function Client:track(event_name, props, context)
 	return self:enqueue_event(event_name, props, context, nil)
 end

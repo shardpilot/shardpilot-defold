@@ -27,28 +27,31 @@ where it differs):
 - `app.session_started` (from the `session_start()` helper)
 - `app.session_ended` (from the `session_end()` helper)
 - `app.screen_view` (from the `screen_view()` helper)
-- `tutorial_start` — **⚠ not registered**
-- `tutorial_step_complete` — **⚠ not registered**
-- `tutorial_complete` — **⚠ not registered**
 - `perf_summary`
 - `network_summary`
 
-**⚠ The three tutorial helpers emit event names that have no schema in the
-platform's registry, and this page listed them as supported.** Today an
-unregistered name is accepted and stored but produces no fact, so these events
-are invisible in every report. `analytics-service#497` changes that to a
-**whole-batch rejection**: from that deploy, any batch containing one of these
-three is refused in full, **taking every valid event batched alongside it**.
+Every name on this list is registered in the platform's schema registry, as
+measured on 2026-08-29. An event name with no registered schema produces no fact
+today and, from `analytics-service#497`, is rejected **together with every event
+batched alongside it** — so this list being accurate is not documentation
+hygiene.
 
-Do not call these helpers. They cannot be fixed by renaming — no registered
-equivalent exists — and registering them is not planned: ADR-0161 places
-game-specific tracking helpers in adapters or domain packs rather than SDK core,
-so a schema minted to stop the rejection would ratify exactly what that decision
-excludes. Their removal is under review as one decision covering every
-game-specific helper in the SDKs.
+## Removed: `tutorial_start`, `tutorial_step_complete`, `tutorial_complete`
 
-Every other name on this list is registered; these three are the exception, and
-the list is accurate as measured against the registry on 2026-08-29.
+These three helpers were removed in 2026-08-29. They emitted event names with no
+schema in the registry, so their events already produced no fact anywhere, and
+after `analytics-service#497` they would have taken whole batches down with them.
+
+They were not renamed, because no registered equivalent exists, and no schema was
+minted for them: ADR-0161 places game-specific names and tracking helpers in
+adapters or domain packs rather than SDK core, and the other four SDKs already
+follow it — Defold was the only one carrying typed game verbs. Registering them
+to silence the rejection would have ratified a game-specific name as a platform
+contract by way of avoiding an error code.
+
+**Migration:** call `track()` directly with whatever name your analytics contract
+registers — `client:track("your_event", { … })`. The removed helpers did nothing
+but wrap that call.
 
 `perf_summary` aggregates frame samples from `update(dt)` and uses
 `avg_fps`, `p50_frame_time_ms`, `p95_frame_time_ms`, `max_frame_time_ms`,
