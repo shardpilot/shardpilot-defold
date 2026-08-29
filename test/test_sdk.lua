@@ -7789,12 +7789,15 @@ local tests = {
 		local loaded, _, _, migrated = storage.load_spool(spool_scope)
 		-- CONTROL: two survive and the loader reports two changes, so the drop
 		-- below reads as a drop rather than as a load that returned nothing.
-		assert_equal(#loaded, 2, "the renamed event and the innocent sibling survive")
-		assert_equal(migrated, 2, "one renamed, one dropped")
+		-- CONTROL: the innocent sibling survives, so the two absences read as
+		-- drops rather than as a load that returned nothing.
+		assert_equal(#loaded, 1, "both legacy names are DROPPED; only the sibling survives")
+		assert_equal(migrated, 2, "and the loader counts both drops")
 		local by_id = {}
 		for i = 1, #loaded do by_id[loaded[i].event_id] = loaded[i] end
-		assert_equal(by_id["legacy-1"].event_name, "app.session_ended")
 		assert_equal(by_id["legacy-3"].event_name, "app.screen_view")
+		assert_true(by_id["legacy-1"] == nil,
+			"a legacy session_end is dropped, never renamed: nothing tells the SDK's own from a caller's")
 		assert_true(by_id["legacy-2"] == nil, "a removed helper's event is dropped")
 
 		-- A record written by THIS version is never repaired: a game may call
@@ -7814,6 +7817,146 @@ local tests = {
 		assert_equal(fresh[1].event_name, "session_end")
 		assert_equal(fresh[2].event_name, "tutorial_start")
 
+		sys.get_save_file = nil; sys.save = nil; sys.load = nil
+	end,
+	-- INLINE for the 200-local ceiling.
+	--
+	-- An UNUSABLE stamp reads as epoch 0, not as itself. `tonumber` accepts
+	-- "-1", and a negative epoch fails `epoch >= rule.since` for every rule --
+	-- so a garbled header would skip the whole migration, and the boot rewrite
+	-- would then re-stamp the file at the current epoch, putting it permanently
+	-- beyond repair while it kept causing whole-batch rejection. And the DROP is
+	-- reported: the migration rationale rests on the count making the loss
+	-- visible, and an earlier revision consumed the count only to decide whether
+	-- a rewrite was owed, so the deletion itself was silent.
+	function()
+		reset()
+		storage.reset()
+		local stores = {}
+		local issues = {}
+		sys.get_save_file = function(_, file_name) return "planted/" .. file_name end
+		sys.save = function(path, record) stores[path] = record; return true end
+		sys.load = function(path) return stores[path] end
+		stores["planted/spool"] = {
+			events = {
+				{ event_id = "garbled-1", event_name = "session_end" },
+				{ event_id = "garbled-2", event_name = "app.screen_view" },
+			},
+			wire_names = -1,
+		}
+
+		local loaded, _, _, migrated, dropped = storage.load_spool(spool_scope)
+		assert_equal(#loaded, 1, "a NEGATIVE stamp runs every rule, as epoch 0 does")
+		assert_equal(migrated, 1, "and the migration is counted")
+		assert_equal(dropped, 1, "and the drop is counted SEPARATELY from a rename")
+
+		-- CONTROL: a stamp at the current epoch is honoured, so the line above
+		-- reads as "invalid falls back to 0" rather than "every record runs".
+		stores["planted/spool"] = {
+			events = { { event_id = "mine-1", event_name = "session_end" } },
+			wire_names = 1,
+		}
+		local kept, _, _, _, kept_dropped = storage.load_spool(spool_scope)
+		assert_equal(#kept, 1, "a VALID current stamp still protects a caller's event")
+		assert_equal(kept_dropped or 0, 0, "and drops nothing")
+
+        -- The host is told. A migrated backlog and an empty spool are otherwise
+        -- indistinguishable to it.
+		stores["planted/spool"] = {
+			events = { { event_id = "gone-1", event_name = "tutorial_start" } },
+		}
+		seed_granted_consent()
+		assert(sdk.new(config({
+			diagnostics = function(issue) issues[#issues + 1] = issue end,
+		})))
+		local reported = nil
+		for i = 1, #issues do
+			if issues[i].code == "legacy_event_name" then reported = issues[i] end
+		end
+		assert_true(reported ~= nil, "the drop reaches the host as a diagnostic")
+		assert_equal(reported.scope, "spool")
+		assert_equal(reported.status, "dropped")
+		assert_equal(reported.count, 1, "carrying how many were lost")
+
+		sys.get_save_file = nil; sys.save = nil; sys.load = nil
+	end,
+	-- INLINE for the 200-local ceiling.
+	--
+	-- Both halves of the rule interval, exercised on rules that do not exist
+	-- yet. Every rule shipped today is `since = 0` -- SDK-owned from the
+	-- beginning -- which is exactly what hid the lower bound: an upper-bound
+	-- check looks correct while no rule needs the other end. The rules are
+	-- INJECTED INTO THE REAL WALKER through its upvalues (found by NAME, since
+	-- the index differs between LuaJIT and 5.5) rather than reimplemented here,
+	-- because a test that carries its own copy of the interval logic is testing
+	-- the copy.
+	function()
+		reset()
+		storage.reset()
+		local stores = {}
+		sys.get_save_file = function(_, file_name) return "planted/" .. file_name end
+		sys.save = function(path, record) stores[path] = record; return true end
+		sys.load = function(path) return stores[path] end
+
+		local function upvalue(fn, want)
+			local i = 1
+			while true do
+				local n, v = debug.getupvalue(fn, i)
+				if not n then return nil end
+				if n == want then return i, v end
+				i = i + 1
+			end
+		end
+		local _, walker = upvalue(storage.load_spool, "migrate_spool_events")
+		assert_true(walker ~= nil, "the walker is reachable, so the injection below lands on it")
+		local removed_at, removed_was = upvalue(walker, "spool_removed_events")
+		local renamed_at, renamed_was = upvalue(walker, "spool_renamed_events")
+		assert_true(removed_at ~= nil and renamed_at ~= nil, "both rule maps are reachable")
+
+		-- `late_name` becomes SDK-owned at epoch 1 and is retired at epoch 2.
+		-- `a` -> `b` at epoch 1, then `b` -> `c` at epoch 2: a chain.
+		debug.setupvalue(walker, removed_at, {
+			["late_name"] = { since = 1, changed = 2 },
+		})
+		debug.setupvalue(walker, renamed_at, {
+			["a"] = { to = "b", since = 0, changed = 1 },
+			["b"] = { to = "c", since = 1, changed = 2 },
+		})
+
+		stores["planted/spool"] = {
+			events = {
+				{ event_id = "callers", event_name = "late_name" },
+				{ event_id = "chained", event_name = "a" },
+			},
+		}
+		local loaded, _, _, migrated = storage.load_spool(spool_scope)
+		local by_id = {}
+		for i = 1, #loaded do by_id[loaded[i].event_id] = loaded[i] end
+
+		-- LOWER BOUND. At epoch 0 this name was the CALLER'S: the SDK did not
+		-- emit it until epoch 1. An upper-bound-only rule drops it on `0 < 2`.
+		assert_true(by_id["callers"] ~= nil,
+			"a name the SDK did not own yet at epoch 0 is a caller's event, and survives")
+		assert_equal(by_id["callers"].event_name, "late_name", "and is not rewritten either")
+
+		-- CHAIN. One lookup leaves this as `b`, a name no epoch registers --
+		-- resent under it, and poisoning its batch.
+		assert_true(by_id["chained"] ~= nil, "the renamed event is retained")
+		assert_equal(by_id["chained"].event_name, "c",
+			"the chain is WALKED to its final name, not stepped once to the obsolete middle")
+		assert_equal(migrated, 1, "and the walk counts the entry once, not once per hop")
+
+		-- The same `late_name` written at epoch 1 IS the SDK's own, and goes.
+		stores["planted/spool"] = {
+			events = { { event_id = "ours", event_name = "late_name" } },
+			wire_names = 1,
+		}
+		local after, _, _, after_migrated = storage.load_spool(spool_scope)
+		assert_equal(#after, 0, "inside its interval the same name is the SDK's own, and is dropped")
+		assert_equal(after_migrated, 1, "counted")
+
+		debug.setupvalue(walker, removed_at, removed_was)
+		debug.setupvalue(walker, renamed_at, renamed_was)
 		sys.get_save_file = nil; sys.save = nil; sys.load = nil
 	end,
 	-- INLINE for the 200-local ceiling.

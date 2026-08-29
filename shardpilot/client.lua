@@ -1653,7 +1653,8 @@ function M.new(config)
 			client.spool_purge_pending = true
 		end
 	else
-		local spooled, stored_deadline, spool_miss, spool_migrated = storage.load_spool(normalized)
+		local spooled, stored_deadline, spool_miss, spool_migrated, spool_dropped =
+			storage.load_spool(normalized)
 		-- Server-requested backpressure survives a relaunch: when the record
 		-- carries a still-future Retry-After deadline, seed the publish
 		-- deferral so the startup resend waits out the remaining window
@@ -1892,6 +1893,21 @@ function M.new(config)
 				-- without the migration replays those names onto the wire.
 				client.spool_rewrite_pending = true
 			end
+		end
+		if (spool_dropped or 0) > 0 then
+			-- ⚠ A DROP IS A LOSS AND IS REPORTED. The migration rationale rests
+			-- on the count making the deletion visible, and the count was
+			-- consumed only to decide whether a rewrite is owed -- so the
+			-- deletion itself was silent, and a host had no way to tell a
+			-- migrated backlog from an empty one. One diagnostic per
+			-- non-accepted outcome, as the identity-mismatch and overflow paths
+			-- alongside already do.
+			client:diagnose({
+				scope = "spool",
+				status = "dropped",
+				code = "legacy_event_name",
+				count = spool_dropped,
+			})
 		end
 		if #spooled > 0 then
 			client.spool_record = spooled

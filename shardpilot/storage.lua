@@ -912,18 +912,55 @@ end
 -- A record with no stamp was written before this existed and reads as epoch 0.
 local spool_wire_name_epoch = 1
 
--- RENAMED: the event still exists under a registered name, so the envelope is
--- rewritten and kept.
-local spool_renamed_events = {
-	["session_end"] = "app.session_ended",
-}
+-- ⚠ NOT RENAMED — DROPPED, and the reason is that nothing can tell the two
+-- cases apart. A pre-epoch `session_end` may be this SDK's own shutdown summary
+-- or a game's own `track("session_end", …)`, and `shutdown(reason)` takes a
+-- CALLER-SUPPLIED reason, so even the one-prop `{ reason = … }` shape is
+-- something a public caller produces. No property on the envelope distinguishes
+-- them.
+--
+-- Three costs, and dropping adds none. These events are unregistered: they
+-- produce no fact today and never will under a name nobody registered. Renaming
+-- makes the SDK's own land while filing customers' events as session
+-- boundaries, which session facts then carry. Keeping them means a whole-batch
+-- refusal once ingest stops accepting unregistered names, which takes their
+-- valid batch-mates down. Dropping loses only what the platform was already
+-- discarding, and the count makes the loss visible.
+-- Empty today: `session_end` moved to the drop set because nothing distinguishes
+-- an SDK summary from a caller's event. Kept with its shape because the next
+-- name that needs migrating will face the same question — and it carries the
+-- SAME half-open interval as the drop set, for the same two reasons. Without
+-- `changed` the rule fires on every record forever, so a caller-owned event
+-- under the OLD name is rewritten on the next launch; without `since` it
+-- reaches back past the point the name became SDK-owned and rewrites a caller's
+-- event that predates the SDK ever emitting it. Both arrive through the map
+-- that looks safe because it is empty.
+--   ["some_old_name"] = { to = "app.some_new_name", since = 1, changed = 2 },
+local spool_renamed_events = {}
 -- REMOVED: the helper is gone and no registered name accepts these, so the
 -- entry is DROPPED. Keeping it would poison every batch it lands in for as
 -- long as the backlog survives, and there is nothing to rewrite it to.
+-- Each rule is a HALF-OPEN INTERVAL, `since <= record_epoch < changed`, and it
+-- needs both ends.
+--
+-- `changed` is the epoch that retired the name, and without it the rule would
+-- keep firing after the next bump: at epoch 2 an epoch-1 record would enter
+-- migration and lose these names -- but an epoch-1 writer no longer emits any of
+-- them, so what is stored under that epoch is precisely a caller's own event,
+-- which these rules exist to protect.
+--
+-- `since` is the epoch at which the name became SDK-OWNED, and it is the same
+-- argument pointed backwards. "An epoch-0 record predates every rule" is true of
+-- the epoch SYSTEM and false of ownership: a name this SDK only began emitting
+-- at epoch 1 and retired at epoch 2 was a CALLER'S name at epoch 0, and an
+-- upper bound alone drops it on `0 < 2`. These four are SDK-owned from the
+-- beginning, which is why `since = 0` -- and why an upper-bound-only rule set
+-- looked correct here. The next rule added will not have that property.
 local spool_removed_events = {
-	["tutorial_start"] = true,
-	["tutorial_step_complete"] = true,
-	["tutorial_complete"] = true,
+	["session_end"] = { since = 0, changed = 1 },
+	["tutorial_start"] = { since = 0, changed = 1 },
+	["tutorial_step_complete"] = { since = 0, changed = 1 },
+	["tutorial_complete"] = { since = 0, changed = 1 },
 }
 
 -- Shape only: an entry without a usable event_id cannot be resent or evicted by
@@ -954,23 +991,57 @@ end
 -- is indistinguishable from an empty spool, so the durable record would keep
 -- those names forever -- re-filtered on every launch, and replayed onto the
 -- wire by a rollback to an SDK with no migration.
-local function migrate_spool_events(events)
+-- Returns `out, migrated, dropped`. The two counts differ in KIND and the
+-- caller needs both: `migrated` drives the rewrite decision (a rename keeps the
+-- entry, so the record still owes a durable write), while `dropped` is a LOSS
+-- and is reported to the host. Folding them together made a deletion
+-- indistinguishable from a repair -- and this SDK's rule set is all drops, so
+-- the fold hid the only outcome that costs a customer anything.
+local function migrate_spool_events(events, record_epoch)
 	local out = {}
 	local migrated = 0
+	local dropped = 0
 	for i = 1, #events do
 		local entry = events[i]
 		local name = entry.event_name
-		if type(name) == "string" and spool_removed_events[name] then
+		-- ⚠ THE CHAIN IS WALKED, not stepped once. With `A`->`B` at epoch 1 and
+		-- `B`->`C` at epoch 2, a single lookup leaves an epoch-0 `A` as `B` -- a
+		-- name no epoch registers, resent under it and poisoning its batch,
+		-- which is the whole failure the migration exists to avoid.
+		--
+		-- Each hop ADVANCES the working epoch to the rule that fired. Once `A`
+		-- has been rewritten to `B` it stands where an epoch-1 writer's record
+		-- stands, so the `B` rule must be judged at epoch 1, not at 0 -- and
+		-- judging it at 0 is what its own `since` bound would refuse. The walk
+		-- terminates because `changed` is strictly greater than the epoch it is
+		-- reached from, so the working epoch strictly increases on every hop.
+		local epoch = record_epoch
+		local dropped_here = false
+		while type(name) == "string" do
+			local removal = spool_removed_events[name]
+			if removal and epoch >= removal.since and epoch < removal.changed then
+				dropped_here = true
+				break
+			end
+			local rename = spool_renamed_events[name]
+			if not (rename and epoch >= rename.since and epoch < rename.changed) then
+				break
+			end
+			name = rename.to
+			epoch = rename.changed
+		end
+		if dropped_here then
 			migrated = migrated + 1
+			dropped = dropped + 1
 		else
-			if type(name) == "string" and spool_renamed_events[name] then
-				entry.event_name = spool_renamed_events[name]
+			if name ~= entry.event_name then
+				entry.event_name = name
 				migrated = migrated + 1
 			end
 			out[#out + 1] = entry
 		end
 	end
-	return out, migrated
+	return out, migrated, dropped
 end
 
 -- The record optionally carries a server-requested backpressure deadline
@@ -1036,13 +1107,21 @@ function M.load_spool(scope)
 		return {}, nil, nil, 0
 	end
 	local shaped = sanitize_spool_events(record.events)
-	if (tonumber(record.wire_names) or 0) >= spool_wire_name_epoch then
-		-- Written by this version: every name in it is a name a caller chose,
-		-- so nothing here is legacy and nothing is repaired.
-		return shaped, sanitize_deadline(record.retry_after_until_ms), nil, 0
+	-- ⚠ AN INVALID STAMP READS AS EPOCH 0, NOT AS ITSELF. `tonumber` accepts
+	-- "-1" and "1.5", and a NEGATIVE epoch fails `epoch >= rule.since` for every
+	-- rule -- so a garbled header skips the whole migration, the legacy names
+	-- survive, and the boot rewrite then re-stamps the file at the current
+	-- epoch, putting it permanently beyond repair while it keeps causing
+	-- whole-batch rejection. Epoch 0 is the right reading for anything
+	-- unusable: it is what an unstamped record means, it runs every rule, and
+	-- it is the only value that can only ever REPAIR.
+	local stamp = tonumber(record.wire_names)
+	local record_epoch = 0
+	if stamp and stamp >= 0 and stamp == math.floor(stamp) then
+		record_epoch = stamp
 	end
-	local kept, migrated = migrate_spool_events(shaped)
-	return kept, sanitize_deadline(record.retry_after_until_ms), nil, migrated
+	local kept, migrated, dropped = migrate_spool_events(shaped, record_epoch)
+	return kept, sanitize_deadline(record.retry_after_until_ms), nil, migrated, dropped
 end
 
 -- The base of the byte estimate: what an empty record costs before any
