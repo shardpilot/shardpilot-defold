@@ -25,7 +25,7 @@ Built-in helpers enqueue (wire `event_name`, with the helper in parentheses
 where it differs):
 
 - `app.session_started` (from the `session_start()` helper)
-- `session_end`
+- `app.session_ended` (from the `session_end()` helper)
 - `app.screen_view` (from the `screen_view()` helper)
 - `tutorial_start`
 - `tutorial_step_complete`

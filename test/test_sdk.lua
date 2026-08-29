@@ -510,7 +510,7 @@ local function test_session_start_renews_session_and_resets_sequence()
 
 	assert_true(client:session_end("complete"))
 	assert_true(client:flush())
-	assert_contains(requests[2].body, '"event_name":"session_end"')
+	assert_contains(requests[2].body, '"event_name":"app.session_ended"')
 	assert_contains(requests[2].body, '"session_id":"' .. first_session_id .. '"')
 	assert_contains(requests[2].body, '"session_sequence":2')
 
@@ -973,7 +973,7 @@ local function test_session_end_while_denied_completes_locally()
 	assert_true(ok, err)
 	assert_equal(client.session_active, false)
 	for _, request in ipairs(requests) do
-		assert_not_contains(request.body, '"event_name":"session_end"')
+		assert_not_contains(request.body, '"event_name":"app.session_ended"')
 	end
 	storage.reset()
 end
@@ -1487,7 +1487,7 @@ local function test_shutdown_completes_when_consent_denied()
 	assert_equal(client.initialized, false)
 	assert_equal(client.session_active, false)
 	for _, request in ipairs(requests) do
-		assert_not_contains(request.body, '"event_name":"session_end"')
+		assert_not_contains(request.body, '"event_name":"app.session_ended"')
 	end
 
 	local ok, err = client:track("after_shutdown")
@@ -1695,7 +1695,7 @@ local function test_shutdown_emits_session_end()
 	client:identify("user-example")
 	client:session_start()
 	assert_true(client:shutdown("app_final"))
-	assert_contains(requests[1].body, '"event_name":"session_end"')
+	assert_contains(requests[1].body, '"event_name":"app.session_ended"')
 	assert_equal(client.initialized, false)
 end
 
@@ -1731,7 +1731,7 @@ local function test_shutdown_queue_full_completes_after_final_flush()
 	local seen_session_end = false
 	for i = 1, #requests do
 		if requests[i].body
-			and requests[i].body:find('"event_name":"session_end"', 1, true) then
+			and requests[i].body:find('"event_name":"app.session_ended"', 1, true) then
 			seen_session_end = true
 		end
 	end
@@ -1772,7 +1772,7 @@ local function test_flush_and_shutdown_wait_for_async_publish()
 	assert_equal(err, "pending")
 	assert_equal(client.initialized, true)
 	assert_equal(#client.queue.items, 2)
-	assert_contains(client.queue.items[2].event_name, "session_end")
+	assert_contains(client.queue.items[2].event_name, "app.session_ended")
 
 	callbacks[1](nil, nil, { status = 202, response = '{"accepted":1}' })
 	assert_equal(client.publish_in_flight, false)
@@ -3382,7 +3382,7 @@ local function test_shutdown_spools_undelivered_and_finalizes()
 		names[env.event_name] = true
 	end
 	assert_true(names["undelivered_at_exit"] ~= nil)
-	assert_true(names["session_end"] ~= nil)
+	assert_true(names["app.session_ended"] ~= nil)
 	restore()
 
 	reset()
@@ -3441,7 +3441,7 @@ local function test_shutdown_full_queue_spools_session_end_and_summaries()
 		spooled_names[record.events[i].event_name] = true
 	end
 	assert_true(spooled_names["app.session_started"] ~= nil)
-	assert_true(spooled_names["session_end"] ~= nil,
+	assert_true(spooled_names["app.session_ended"] ~= nil,
 		"the deferred session end must ride the durable spool")
 	assert_true(spooled_names["perf_summary"] ~= nil,
 		"a full queue must not drop the exit perf summary — it rides the spool")
@@ -3461,7 +3461,7 @@ local function test_shutdown_full_queue_spools_session_end_and_summaries()
 		end
 	end
 	assert_true(resent["app.session_started"] ~= nil)
-	assert_true(resent["session_end"] ~= nil)
+	assert_true(resent["app.session_ended"] ~= nil)
 	assert_true(resent["perf_summary"] ~= nil)
 	assert_true(resent["network_summary"] ~= nil)
 	assert_equal(#storage.load_spool(spool_scope), 0,
@@ -4674,7 +4674,7 @@ local function test_shutdown_fails_when_remnant_evicted_by_caps()
 	assert_equal(client:snapshot().spool_evicted, 2)
 	local leftover = storage.load_spool(spool_scope)
 	assert_equal(#leftover, 1, "the cap holds; the newest envelope survived")
-	assert_equal(leftover[1].event_name, "session_end")
+	assert_equal(leftover[1].event_name, "app.session_ended")
 
 	-- the in-memory copy is intact: recovery delivers everything and clears
 	client.config.token_provider = function(callback)

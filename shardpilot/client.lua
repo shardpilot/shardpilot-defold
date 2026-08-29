@@ -2746,7 +2746,7 @@ function Client:session_end(reason)
 		self.session_active = false
 		return true
 	end
-	local ok, err = self:track("session_end", { reason = reason or "session_end" })
+	local ok, err = self:track("app.session_ended", { reason = reason or "session_end" })
 	if not ok then
 		return false, err
 	end
