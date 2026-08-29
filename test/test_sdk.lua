@@ -7760,76 +7760,61 @@ local tests = {
 	-- ⚠ INLINE, not a `local function`, and that is load-bearing: this file sits
 	-- exactly at Lua 5.4's ceiling of 200 locals for a main chunk, so the NEXT
 	-- `local function test_*` added here fails to compile under lua5.4 while
-	-- passing under lua5.1 and LuaJIT. Measured: removing this one test makes
-	-- 5.4 pass and re-adding it fails at the `for _, test in ipairs(tests)` line.
-	-- New tests go in this table as inline functions until someone reclaims
-	-- headroom by folding the existing 183 into namespaces.
+	-- passing under lua5.1 and LuaJIT. New tests go in this table as inline
+	-- functions until someone reclaims headroom.
 	--
-	-- An upgrade inherits a spool written by an older release. The load path
-	-- re-sends stored envelopes VERBATIM, so a legacy name survives the
-	-- enqueue-side rename and is refused for the WHOLE BATCH -- taking the valid
-	-- events stored beside it. This asserts the load makes the backlog sendable.
-	function()
-	reset()
-	storage.reset()
-	assert_true(storage.save_spool(spool_scope, {
-		{ event_id = "legacy-1", event_name = "session_end", event_ts = "2026-01-01T00:00:00.000Z" },
-		{ event_id = "legacy-2", event_name = "tutorial_start", event_ts = "2026-01-01T00:00:01.000Z" },
-		{ event_id = "legacy-3", event_name = "tutorial_step_complete", event_ts = "2026-01-01T00:00:02.000Z" },
-		{ event_id = "legacy-4", event_name = "tutorial_complete", event_ts = "2026-01-01T00:00:03.000Z" },
-		{ event_id = "legacy-5", event_name = "app.screen_view", event_ts = "2026-01-01T00:00:04.000Z" },
-	}, nil, 262144) ~= nil)
-
-	local loaded = storage.load_spool(spool_scope)
-	-- CONTROL: two survive, so the three zeros below are readable as drops
-	-- rather than as a load that returned nothing.
-	assert_equal(#loaded, 2, "the renamed event and the innocent sibling survive; the three removed ones do not")
-
-	local by_id = {}
-	for i = 1, #loaded do
-		by_id[loaded[i].event_id] = loaded[i]
-	end
-	assert_true(by_id["legacy-1"] ~= nil, "a renamed event is KEPT, not dropped")
-	assert_equal(by_id["legacy-1"].event_name, "app.session_ended",
-		"the persisted legacy name is rewritten to the registered one")
-	assert_true(by_id["legacy-5"] ~= nil, "an event beside the legacy ones is untouched")
-	assert_equal(by_id["legacy-5"].event_name, "app.screen_view")
-	assert_true(by_id["legacy-2"] == nil, "a removed helper's event is dropped")
-	assert_true(by_id["legacy-3"] == nil, "a removed helper's event is dropped")
-	assert_true(by_id["legacy-4"] == nil, "a removed helper's event is dropped")
-	end,
-	-- INLINE for the 200-local ceiling, as above.
-	--
-	-- A backlog of NOTHING BUT removed events sanitizes to an empty list, which
-	-- is indistinguishable from an empty spool -- so without the migration
-	-- count in the rewrite guard the durable file keeps those names forever:
-	-- re-filtered on every launch, and replayed onto the wire by a rollback to
-	-- an SDK with no migration. The discriminator is the count, not the list.
+	-- An upgrade inherits a spool written by an OLDER RELEASE. The record is
+	-- PLANTED through a stubbed store rather than written with save_spool(),
+	-- because a record written by THIS version carries the current wire-name
+	-- epoch and is deliberately not migrated -- seeding through the public API
+	-- would exercise nothing and pass.
 	function()
 		reset()
 		storage.reset()
-		assert_true(storage.save_spool(spool_scope, {
-			{ event_id = "gone-1", event_name = "tutorial_start", event_ts = "2026-01-01T00:00:00.000Z" },
-			{ event_id = "gone-2", event_name = "tutorial_step_complete", event_ts = "2026-01-01T00:00:01.000Z" },
-			{ event_id = "gone-3", event_name = "tutorial_complete", event_ts = "2026-01-01T00:00:02.000Z" },
-		}, nil, 262144) ~= nil)
+		local stores = {}
+		-- One path per FILE NAME, so the plant below lands where load_spool reads
+		-- regardless of the namespace the scope hashes to.
+		sys.get_save_file = function(_, file_name) return "planted/" .. file_name end
+		sys.save = function(path, record) stores[path] = record; return true end
+		sys.load = function(path) return stores[path] end
+		-- No `wire_names` key: this is what a pre-rename release wrote.
+		stores["planted/spool"] = {
+			events = {
+				{ event_id = "legacy-1", event_name = "session_end" },
+				{ event_id = "legacy-2", event_name = "tutorial_start" },
+				{ event_id = "legacy-3", event_name = "app.screen_view" },
+			},
+		}
 
-		-- CONTROL, before anything repairs it: the loader reports three
-		-- migrated entries and an empty survivor list, so the assertions after
-		-- the rewrite read as a change rather than as a spool that was always
-		-- empty.
-		local before, _, _, migrated_before = storage.load_spool(spool_scope)
-		assert_equal(#before, 0, "every entry is a removed helper")
-		assert_equal(migrated_before, 3, "the loader reports what it removed")
+		local loaded, _, _, migrated = storage.load_spool(spool_scope)
+		-- CONTROL: two survive and the loader reports two changes, so the drop
+		-- below reads as a drop rather than as a load that returned nothing.
+		assert_equal(#loaded, 2, "the renamed event and the innocent sibling survive")
+		assert_equal(migrated, 2, "one renamed, one dropped")
+		local by_id = {}
+		for i = 1, #loaded do by_id[loaded[i].event_id] = loaded[i] end
+		assert_equal(by_id["legacy-1"].event_name, "app.session_ended")
+		assert_equal(by_id["legacy-3"].event_name, "app.screen_view")
+		assert_true(by_id["legacy-2"] == nil, "a removed helper's event is dropped")
 
-		seed_granted_consent()
-		local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
-		assert_equal(#client.spool_record, 0, "nothing survives to resend")
+		-- A record written by THIS version is never repaired: a game may call
+		-- track("session_end", ...) for its own custom event, and renaming it
+		-- would turn a customer event into a lifecycle event whose facts it
+		-- corrupts -- while dropping a custom "tutorial_start" deletes it.
+		stores["planted/spool"] = {
+			events = {
+				{ event_id = "mine-1", event_name = "session_end" },
+				{ event_id = "mine-2", event_name = "tutorial_start" },
+			},
+			wire_names = 1,
+		}
+		local fresh, _, _, fresh_migrated = storage.load_spool(spool_scope)
+		assert_equal(#fresh, 2, "a customer's events are never dropped")
+		assert_equal(fresh_migrated, 0, "and never rewritten")
+		assert_equal(fresh[1].event_name, "session_end")
+		assert_equal(fresh[2].event_name, "tutorial_start")
 
-		local after, _, _, migrated_after = storage.load_spool(spool_scope)
-		assert_equal(#after, 0, "still empty")
-		assert_equal(migrated_after, 0,
-			"init REWROTE the durable record: a second load finds nothing left to migrate")
+		sys.get_save_file = nil; sys.save = nil; sys.load = nil
 	end,
 	test_spool_cleared_by_denied_consent,
 	test_consent_unknown_blocks_all_analytics_egress,

@@ -903,6 +903,15 @@ end
 -- the one place every persisted envelope passes through, so it is where the
 -- backlog is made sendable.
 --
+-- The wire-name epoch a record was WRITTEN under. Bumped whenever this SDK
+-- changes a name it emits, and stored in the spool record. Migration keys on it
+-- rather than on the name alone, because a name cannot distinguish "written by
+-- an older release" from "a game's own custom event that happens to use this
+-- string" -- and rewriting the latter turns a customer event into a lifecycle
+-- event whose facts it then corrupts, while DROPPING one deletes it outright.
+-- A record with no stamp was written before this existed and reads as epoch 0.
+local spool_wire_name_epoch = 1
+
 -- RENAMED: the event still exists under a registered name, so the envelope is
 -- rewritten and kept.
 local spool_renamed_events = {
@@ -975,7 +984,11 @@ local function sanitize_deadline(value)
 end
 
 local function write_spool(ns, events, retry_after_until_ms)
-	local record = { events = events, retry_after_until_ms = sanitize_deadline(retry_after_until_ms) }
+	local record = {
+		events = events,
+		retry_after_until_ms = sanitize_deadline(retry_after_until_ms),
+		wire_names = spool_wire_name_epoch,
+	}
 	local path = save_path(ns, "spool")
 	if not path then
 		-- No durable backend (plain Lua host): the in-memory record is the store.
@@ -1022,7 +1035,13 @@ function M.load_spool(scope)
 	if type(record) ~= "table" then
 		return {}, nil, nil, 0
 	end
-	local kept, migrated = migrate_spool_events(sanitize_spool_events(record.events))
+	local shaped = sanitize_spool_events(record.events)
+	if (tonumber(record.wire_names) or 0) >= spool_wire_name_epoch then
+		-- Written by this version: every name in it is a name a caller chose,
+		-- so nothing here is legacy and nothing is repaired.
+		return shaped, sanitize_deadline(record.retry_after_until_ms), nil, 0
+	end
+	local kept, migrated = migrate_spool_events(shaped)
 	return kept, sanitize_deadline(record.retry_after_until_ms), nil, migrated
 end
 
