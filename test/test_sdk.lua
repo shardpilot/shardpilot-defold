@@ -7816,6 +7816,36 @@ local tests = {
 
 		sys.get_save_file = nil; sys.save = nil; sys.load = nil
 	end,
+	-- INLINE for the 200-local ceiling.
+	--
+	-- When the migration rewrite FAILS and migration dropped everything, there
+	-- is no surviving event to resend and no acknowledgement that would ever
+	-- force another write -- so without recording the debt the stale file
+	-- survives every future launch, and a rollback to a release without the
+	-- migration replays those names.
+	function()
+		reset()
+		storage.reset()
+		local stores = {}
+		sys.get_save_file = function(_, file_name) return "planted/" .. file_name end
+		sys.save = function(path, record)
+			if path == "planted/spool" then return false end
+			stores[path] = record
+			return true
+		end
+		sys.load = function(path) return stores[path] end
+		stores["planted/spool"] = {
+			events = { { event_id = "gone-1", event_name = "tutorial_start" } },
+		}
+
+		seed_granted_consent()
+		local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+		assert_equal(#client.spool_record, 0, "nothing survives the migration")
+		assert_true(client.spool_rewrite_pending,
+			"a FAILED migration rewrite records the debt, so it retries at the next dispatch")
+
+		sys.get_save_file = nil; sys.save = nil; sys.load = nil
+	end,
 	test_spool_cleared_by_denied_consent,
 	test_consent_unknown_blocks_all_analytics_egress,
 	test_blocked_period_samples_never_summarized,

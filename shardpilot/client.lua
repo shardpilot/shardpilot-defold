@@ -1882,6 +1882,15 @@ function M.new(config)
 				-- at the launch after next.
 				client.spool_rewrite_pending = true
 				client.condemned_spool_pending = true
+			elseif (spool_migrated or 0) > 0 then
+				-- The MIGRATION could not land durably, and it is owed for the
+				-- same reason a condemnation is: the stale file still carries
+				-- legacy names. When migration dropped everything there is no
+				-- surviving event to resend and no acknowledgement that would
+				-- ever force another write, so without this the file stays as
+				-- it is for every future launch — and a rollback to a release
+				-- without the migration replays those names onto the wire.
+				client.spool_rewrite_pending = true
 			end
 		end
 		if #spooled > 0 then
