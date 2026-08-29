@@ -27,11 +27,28 @@ where it differs):
 - `app.session_started` (from the `session_start()` helper)
 - `app.session_ended` (from the `session_end()` helper)
 - `app.screen_view` (from the `screen_view()` helper)
-- `tutorial_start`
-- `tutorial_step_complete`
-- `tutorial_complete`
+- `tutorial_start` — **⚠ not registered**
+- `tutorial_step_complete` — **⚠ not registered**
+- `tutorial_complete` — **⚠ not registered**
 - `perf_summary`
 - `network_summary`
+
+**⚠ The three tutorial helpers emit event names that have no schema in the
+platform's registry, and this page listed them as supported.** Today an
+unregistered name is accepted and stored but produces no fact, so these events
+are invisible in every report. `analytics-service#497` changes that to a
+**whole-batch rejection**: from that deploy, any batch containing one of these
+three is refused in full, **taking every valid event batched alongside it**.
+
+Do not call these helpers. They cannot be fixed by renaming — no registered
+equivalent exists — and registering them is not planned: ADR-0161 places
+game-specific tracking helpers in adapters or domain packs rather than SDK core,
+so a schema minted to stop the rejection would ratify exactly what that decision
+excludes. Their removal is under review as one decision covering every
+game-specific helper in the SDKs.
+
+Every other name on this list is registered; these three are the exception, and
+the list is accurate as measured against the registry on 2026-08-29.
 
 `perf_summary` aggregates frame samples from `update(dt)` and uses
 `avg_fps`, `p50_frame_time_ms`, `p95_frame_time_ms`, `max_frame_time_ms`,
