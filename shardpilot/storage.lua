@@ -926,6 +926,14 @@ local spool_wire_name_epoch = 1
 -- refusal once ingest stops accepting unregistered names, which takes their
 -- valid batch-mates down. Dropping loses only what the platform was already
 -- discarding, and the count makes the loss visible.
+-- Empty today: `session_end` moved to the drop set because nothing distinguishes
+-- an SDK summary from a caller's event. Kept with its shape because the next
+-- name that needs migrating will face the same question — and the VALUE is the
+-- introducing epoch, exactly as in the drop set. A rename without one would fire
+-- on every record forever, so a caller-owned event under the new name would be
+-- rewritten on the next launch, which is the corruption the epoch exists to
+-- prevent, arriving through the map that looks safe because it is empty.
+--   ["some_old_name"] = { to = "app.some_new_name", epoch = 2 },
 local spool_renamed_events = {}
 -- REMOVED: the helper is gone and no registered name accepts these, so the
 -- entry is DROPPED. Keeping it would poison every batch it lands in for as
@@ -981,8 +989,9 @@ local function migrate_spool_events(events, record_epoch)
 			and record_epoch < spool_removed_events[name] then
 			migrated = migrated + 1
 		else
-			if type(name) == "string" and spool_renamed_events[name] then
-				entry.event_name = spool_renamed_events[name]
+			local rename = type(name) == "string" and spool_renamed_events[name] or nil
+			if rename and record_epoch < rename.epoch then
+				entry.event_name = rename.to
 				migrated = migrated + 1
 			end
 			out[#out + 1] = entry
