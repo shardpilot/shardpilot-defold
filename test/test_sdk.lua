@@ -7821,6 +7821,85 @@ local tests = {
 	end,
 	-- INLINE for the 200-local ceiling.
 	--
+	-- Both halves of the rule interval, exercised on rules that do not exist
+	-- yet. Every rule shipped today is `since = 0` -- SDK-owned from the
+	-- beginning -- which is exactly what hid the lower bound: an upper-bound
+	-- check looks correct while no rule needs the other end. The rules are
+	-- INJECTED INTO THE REAL WALKER through its upvalues (found by NAME, since
+	-- the index differs between LuaJIT and 5.5) rather than reimplemented here,
+	-- because a test that carries its own copy of the interval logic is testing
+	-- the copy.
+	function()
+		reset()
+		storage.reset()
+		local stores = {}
+		sys.get_save_file = function(_, file_name) return "planted/" .. file_name end
+		sys.save = function(path, record) stores[path] = record; return true end
+		sys.load = function(path) return stores[path] end
+
+		local function upvalue(fn, want)
+			local i = 1
+			while true do
+				local n, v = debug.getupvalue(fn, i)
+				if not n then return nil end
+				if n == want then return i, v end
+				i = i + 1
+			end
+		end
+		local _, walker = upvalue(storage.load_spool, "migrate_spool_events")
+		assert_true(walker ~= nil, "the walker is reachable, so the injection below lands on it")
+		local removed_at, removed_was = upvalue(walker, "spool_removed_events")
+		local renamed_at, renamed_was = upvalue(walker, "spool_renamed_events")
+		assert_true(removed_at ~= nil and renamed_at ~= nil, "both rule maps are reachable")
+
+		-- `late_name` becomes SDK-owned at epoch 1 and is retired at epoch 2.
+		-- `a` -> `b` at epoch 1, then `b` -> `c` at epoch 2: a chain.
+		debug.setupvalue(walker, removed_at, {
+			["late_name"] = { since = 1, changed = 2 },
+		})
+		debug.setupvalue(walker, renamed_at, {
+			["a"] = { to = "b", since = 0, changed = 1 },
+			["b"] = { to = "c", since = 1, changed = 2 },
+		})
+
+		stores["planted/spool"] = {
+			events = {
+				{ event_id = "callers", event_name = "late_name" },
+				{ event_id = "chained", event_name = "a" },
+			},
+		}
+		local loaded, _, _, migrated = storage.load_spool(spool_scope)
+		local by_id = {}
+		for i = 1, #loaded do by_id[loaded[i].event_id] = loaded[i] end
+
+		-- LOWER BOUND. At epoch 0 this name was the CALLER'S: the SDK did not
+		-- emit it until epoch 1. An upper-bound-only rule drops it on `0 < 2`.
+		assert_true(by_id["callers"] ~= nil,
+			"a name the SDK did not own yet at epoch 0 is a caller's event, and survives")
+		assert_equal(by_id["callers"].event_name, "late_name", "and is not rewritten either")
+
+		-- CHAIN. One lookup leaves this as `b`, a name no epoch registers --
+		-- resent under it, and poisoning its batch.
+		assert_true(by_id["chained"] ~= nil, "the renamed event is retained")
+		assert_equal(by_id["chained"].event_name, "c",
+			"the chain is WALKED to its final name, not stepped once to the obsolete middle")
+		assert_equal(migrated, 1, "and the walk counts the entry once, not once per hop")
+
+		-- The same `late_name` written at epoch 1 IS the SDK's own, and goes.
+		stores["planted/spool"] = {
+			events = { { event_id = "ours", event_name = "late_name" } },
+			wire_names = 1,
+		}
+		local after, _, _, after_migrated = storage.load_spool(spool_scope)
+		assert_equal(#after, 0, "inside its interval the same name is the SDK's own, and is dropped")
+		assert_equal(after_migrated, 1, "counted")
+
+		debug.setupvalue(walker, removed_at, removed_was)
+		debug.setupvalue(walker, renamed_at, renamed_was)
+		sys.get_save_file = nil; sys.save = nil; sys.load = nil
+	end,
+	-- INLINE for the 200-local ceiling.
+	--
 	-- When the migration rewrite FAILS and migration dropped everything, there
 	-- is no surviving event to resend and no acknowledgement that would ever
 	-- force another write -- so without recording the debt the stale file

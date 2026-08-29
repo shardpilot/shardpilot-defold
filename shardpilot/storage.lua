@@ -928,27 +928,39 @@ local spool_wire_name_epoch = 1
 -- discarding, and the count makes the loss visible.
 -- Empty today: `session_end` moved to the drop set because nothing distinguishes
 -- an SDK summary from a caller's event. Kept with its shape because the next
--- name that needs migrating will face the same question — and the VALUE is the
--- introducing epoch, exactly as in the drop set. A rename without one would fire
--- on every record forever, so a caller-owned event under the new name would be
--- rewritten on the next launch, which is the corruption the epoch exists to
--- prevent, arriving through the map that looks safe because it is empty.
---   ["some_old_name"] = { to = "app.some_new_name", epoch = 2 },
+-- name that needs migrating will face the same question — and it carries the
+-- SAME half-open interval as the drop set, for the same two reasons. Without
+-- `changed` the rule fires on every record forever, so a caller-owned event
+-- under the OLD name is rewritten on the next launch; without `since` it
+-- reaches back past the point the name became SDK-owned and rewrites a caller's
+-- event that predates the SDK ever emitting it. Both arrive through the map
+-- that looks safe because it is empty.
+--   ["some_old_name"] = { to = "app.some_new_name", since = 1, changed = 2 },
 local spool_renamed_events = {}
 -- REMOVED: the helper is gone and no registered name accepts these, so the
 -- entry is DROPPED. Keeping it would poison every batch it lands in for as
 -- long as the backlog survives, and there is nothing to rewrite it to.
--- Each rule carries THE EPOCH THAT INTRODUCED IT, and fires only for records
--- written before it. An unversioned rule set would keep firing after the next
--- bump: at epoch 2, an epoch-1 record would enter migration and lose these
--- names -- but an epoch-1 writer no longer emits any of them, so what is stored
--- under that epoch is precisely a caller's own event, which these rules exist to
--- protect. An epoch-0 record predates every rule and runs all of them.
+-- Each rule is a HALF-OPEN INTERVAL, `since <= record_epoch < changed`, and it
+-- needs both ends.
+--
+-- `changed` is the epoch that retired the name, and without it the rule would
+-- keep firing after the next bump: at epoch 2 an epoch-1 record would enter
+-- migration and lose these names -- but an epoch-1 writer no longer emits any of
+-- them, so what is stored under that epoch is precisely a caller's own event,
+-- which these rules exist to protect.
+--
+-- `since` is the epoch at which the name became SDK-OWNED, and it is the same
+-- argument pointed backwards. "An epoch-0 record predates every rule" is true of
+-- the epoch SYSTEM and false of ownership: a name this SDK only began emitting
+-- at epoch 1 and retired at epoch 2 was a CALLER'S name at epoch 0, and an
+-- upper bound alone drops it on `0 < 2`. These four are SDK-owned from the
+-- beginning, which is why `since = 0` -- and why an upper-bound-only rule set
+-- looked correct here. The next rule added will not have that property.
 local spool_removed_events = {
-	["session_end"] = 1,
-	["tutorial_start"] = 1,
-	["tutorial_step_complete"] = 1,
-	["tutorial_complete"] = 1,
+	["session_end"] = { since = 0, changed = 1 },
+	["tutorial_start"] = { since = 0, changed = 1 },
+	["tutorial_step_complete"] = { since = 0, changed = 1 },
+	["tutorial_complete"] = { since = 0, changed = 1 },
 }
 
 -- Shape only: an entry without a usable event_id cannot be resent or evicted by
@@ -985,13 +997,37 @@ local function migrate_spool_events(events, record_epoch)
 	for i = 1, #events do
 		local entry = events[i]
 		local name = entry.event_name
-		if type(name) == "string" and spool_removed_events[name]
-			and record_epoch < spool_removed_events[name] then
+		-- ⚠ THE CHAIN IS WALKED, not stepped once. With `A`->`B` at epoch 1 and
+		-- `B`->`C` at epoch 2, a single lookup leaves an epoch-0 `A` as `B` -- a
+		-- name no epoch registers, resent under it and poisoning its batch,
+		-- which is the whole failure the migration exists to avoid.
+		--
+		-- Each hop ADVANCES the working epoch to the rule that fired. Once `A`
+		-- has been rewritten to `B` it stands where an epoch-1 writer's record
+		-- stands, so the `B` rule must be judged at epoch 1, not at 0 -- and
+		-- judging it at 0 is what its own `since` bound would refuse. The walk
+		-- terminates because `changed` is strictly greater than the epoch it is
+		-- reached from, so the working epoch strictly increases on every hop.
+		local epoch = record_epoch
+		local dropped = false
+		while type(name) == "string" do
+			local removal = spool_removed_events[name]
+			if removal and epoch >= removal.since and epoch < removal.changed then
+				dropped = true
+				break
+			end
+			local rename = spool_renamed_events[name]
+			if not (rename and epoch >= rename.since and epoch < rename.changed) then
+				break
+			end
+			name = rename.to
+			epoch = rename.changed
+		end
+		if dropped then
 			migrated = migrated + 1
 		else
-			local rename = type(name) == "string" and spool_renamed_events[name] or nil
-			if rename and record_epoch < rename.epoch then
-				entry.event_name = rename.to
+			if name ~= entry.event_name then
+				entry.event_name = name
 				migrated = migrated + 1
 			end
 			out[#out + 1] = entry
