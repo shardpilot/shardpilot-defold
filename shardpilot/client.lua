@@ -1653,7 +1653,7 @@ function M.new(config)
 			client.spool_purge_pending = true
 		end
 	else
-		local spooled, stored_deadline, spool_miss = storage.load_spool(normalized)
+		local spooled, stored_deadline, spool_miss, spool_migrated = storage.load_spool(normalized)
 		-- Server-requested backpressure survives a relaunch: when the record
 		-- carries a still-future Retry-After deadline, seed the publish
 		-- deferral so the startup resend waits out the remaining window
@@ -1852,7 +1852,13 @@ function M.new(config)
 				})
 			end
 		end
-		if #spooled > 0 or mismatched > 0 or condemned > 0 then
+		-- spool_migrated counts entries the loader RENAMED or DROPPED for legacy
+		-- wire names. It belongs in this guard because it is the one repair the
+		-- surviving count cannot express: an all-removed backlog sanitizes to an
+		-- empty list, and without the rewrite the durable file keeps those names
+		-- -- re-filtered every launch, and replayed onto the wire by a rollback
+		-- to an SDK that has no migration.
+		if #spooled > 0 or mismatched > 0 or condemned > 0 or (spool_migrated or 0) > 0 then
 			if #spooled == 0 then
 				client.spool_retry_after_ms = nil
 			end

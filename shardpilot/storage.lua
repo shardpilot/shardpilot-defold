@@ -917,6 +917,12 @@ local spool_removed_events = {
 	["tutorial_complete"] = true,
 }
 
+-- Shape only: an entry without a usable event_id cannot be resent or evicted by
+-- id, so it is not an envelope. Every caller gets this; legacy-name repair does
+-- NOT live here, because it is a property of READING AN OLD RECORD rather than
+-- of sanitising a list, and running it on the write path would silently drop a
+-- name the current SDK cannot produce while making a legacy backlog impossible
+-- to seed in a test.
 local function sanitize_spool_events(events)
 	local out = {}
 	if type(events) ~= "table" then
@@ -925,18 +931,37 @@ local function sanitize_spool_events(events)
 	for i = 1, #events do
 		local entry = events[i]
 		if type(entry) == "table" and type(entry.event_id) == "string" and entry.event_id ~= "" then
-			local name = entry.event_name
-			if type(name) == "string" and spool_removed_events[name] then
-				-- dropped: no registered name to carry it
-			else
-				if type(name) == "string" and spool_renamed_events[name] then
-					entry.event_name = spool_renamed_events[name]
-				end
-				out[#out + 1] = entry
-			end
+			out[#out + 1] = entry
 		end
 	end
 	return out
+end
+
+-- Load-time repair of wire names an older release persisted. Returns the
+-- surviving entries and HOW MANY were changed -- renamed or dropped.
+--
+-- The caller needs that second value because the surviving COUNT cannot carry
+-- it: a backlog of nothing but removed events migrates to an empty list, which
+-- is indistinguishable from an empty spool, so the durable record would keep
+-- those names forever -- re-filtered on every launch, and replayed onto the
+-- wire by a rollback to an SDK with no migration.
+local function migrate_spool_events(events)
+	local out = {}
+	local migrated = 0
+	for i = 1, #events do
+		local entry = events[i]
+		local name = entry.event_name
+		if type(name) == "string" and spool_removed_events[name] then
+			migrated = migrated + 1
+		else
+			if type(name) == "string" and spool_renamed_events[name] then
+				entry.event_name = spool_renamed_events[name]
+				migrated = migrated + 1
+			end
+			out[#out + 1] = entry
+		end
+	end
+	return out, migrated
 end
 
 -- The record optionally carries a server-requested backpressure deadline
@@ -988,16 +1013,17 @@ function M.load_spool(scope)
 			-- unreadable file); callers that must prove spool CLEANLINESS
 			-- — the condemnation-marker retire rule — read the third value
 			-- and treat the launch as unproven instead of clean.
-			return {}, nil, "unreadable"
+			return {}, nil, "unreadable", 0
 		end
 	end
 	if record == nil then
 		record = spool_memory[ns]
 	end
 	if type(record) ~= "table" then
-		return {}, nil
+		return {}, nil, nil, 0
 	end
-	return sanitize_spool_events(record.events), sanitize_deadline(record.retry_after_until_ms)
+	local kept, migrated = migrate_spool_events(sanitize_spool_events(record.events))
+	return kept, sanitize_deadline(record.retry_after_until_ms), nil, migrated
 end
 
 -- The base of the byte estimate: what an empty record costs before any

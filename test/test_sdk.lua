@@ -7798,6 +7798,39 @@ local tests = {
 	assert_true(by_id["legacy-3"] == nil, "a removed helper's event is dropped")
 	assert_true(by_id["legacy-4"] == nil, "a removed helper's event is dropped")
 	end,
+	-- INLINE for the 200-local ceiling, as above.
+	--
+	-- A backlog of NOTHING BUT removed events sanitizes to an empty list, which
+	-- is indistinguishable from an empty spool -- so without the migration
+	-- count in the rewrite guard the durable file keeps those names forever:
+	-- re-filtered on every launch, and replayed onto the wire by a rollback to
+	-- an SDK with no migration. The discriminator is the count, not the list.
+	function()
+		reset()
+		storage.reset()
+		assert_true(storage.save_spool(spool_scope, {
+			{ event_id = "gone-1", event_name = "tutorial_start", event_ts = "2026-01-01T00:00:00.000Z" },
+			{ event_id = "gone-2", event_name = "tutorial_step_complete", event_ts = "2026-01-01T00:00:01.000Z" },
+			{ event_id = "gone-3", event_name = "tutorial_complete", event_ts = "2026-01-01T00:00:02.000Z" },
+		}, nil, 262144) ~= nil)
+
+		-- CONTROL, before anything repairs it: the loader reports three
+		-- migrated entries and an empty survivor list, so the assertions after
+		-- the rewrite read as a change rather than as a spool that was always
+		-- empty.
+		local before, _, _, migrated_before = storage.load_spool(spool_scope)
+		assert_equal(#before, 0, "every entry is a removed helper")
+		assert_equal(migrated_before, 3, "the loader reports what it removed")
+
+		seed_granted_consent()
+		local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+		assert_equal(#client.spool_record, 0, "nothing survives to resend")
+
+		local after, _, _, migrated_after = storage.load_spool(spool_scope)
+		assert_equal(#after, 0, "still empty")
+		assert_equal(migrated_after, 0,
+			"init REWROTE the durable record: a second load finds nothing left to migrate")
+	end,
 	test_spool_cleared_by_denied_consent,
 	test_consent_unknown_blocks_all_analytics_egress,
 	test_blocked_period_samples_never_summarized,
