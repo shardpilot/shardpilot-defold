@@ -510,7 +510,7 @@ local function test_session_start_renews_session_and_resets_sequence()
 
 	assert_true(client:session_end("complete"))
 	assert_true(client:flush())
-	assert_contains(requests[2].body, '"event_name":"session_end"')
+	assert_contains(requests[2].body, '"event_name":"app.session_ended"')
 	assert_contains(requests[2].body, '"session_id":"' .. first_session_id .. '"')
 	assert_contains(requests[2].body, '"session_sequence":2')
 
@@ -973,7 +973,7 @@ local function test_session_end_while_denied_completes_locally()
 	assert_true(ok, err)
 	assert_equal(client.session_active, false)
 	for _, request in ipairs(requests) do
-		assert_not_contains(request.body, '"event_name":"session_end"')
+		assert_not_contains(request.body, '"event_name":"app.session_ended"')
 	end
 	storage.reset()
 end
@@ -1487,7 +1487,7 @@ local function test_shutdown_completes_when_consent_denied()
 	assert_equal(client.initialized, false)
 	assert_equal(client.session_active, false)
 	for _, request in ipairs(requests) do
-		assert_not_contains(request.body, '"event_name":"session_end"')
+		assert_not_contains(request.body, '"event_name":"app.session_ended"')
 	end
 
 	local ok, err = client:track("after_shutdown")
@@ -1695,7 +1695,7 @@ local function test_shutdown_emits_session_end()
 	client:identify("user-example")
 	client:session_start()
 	assert_true(client:shutdown("app_final"))
-	assert_contains(requests[1].body, '"event_name":"session_end"')
+	assert_contains(requests[1].body, '"event_name":"app.session_ended"')
 	assert_equal(client.initialized, false)
 end
 
@@ -1731,7 +1731,7 @@ local function test_shutdown_queue_full_completes_after_final_flush()
 	local seen_session_end = false
 	for i = 1, #requests do
 		if requests[i].body
-			and requests[i].body:find('"event_name":"session_end"', 1, true) then
+			and requests[i].body:find('"event_name":"app.session_ended"', 1, true) then
 			seen_session_end = true
 		end
 	end
@@ -1772,7 +1772,7 @@ local function test_flush_and_shutdown_wait_for_async_publish()
 	assert_equal(err, "pending")
 	assert_equal(client.initialized, true)
 	assert_equal(#client.queue.items, 2)
-	assert_contains(client.queue.items[2].event_name, "session_end")
+	assert_contains(client.queue.items[2].event_name, "app.session_ended")
 
 	callbacks[1](nil, nil, { status = 202, response = '{"accepted":1}' })
 	assert_equal(client.publish_in_flight, false)
@@ -3382,7 +3382,7 @@ local function test_shutdown_spools_undelivered_and_finalizes()
 		names[env.event_name] = true
 	end
 	assert_true(names["undelivered_at_exit"] ~= nil)
-	assert_true(names["session_end"] ~= nil)
+	assert_true(names["app.session_ended"] ~= nil)
 	restore()
 
 	reset()
@@ -3441,7 +3441,7 @@ local function test_shutdown_full_queue_spools_session_end_and_summaries()
 		spooled_names[record.events[i].event_name] = true
 	end
 	assert_true(spooled_names["app.session_started"] ~= nil)
-	assert_true(spooled_names["session_end"] ~= nil,
+	assert_true(spooled_names["app.session_ended"] ~= nil,
 		"the deferred session end must ride the durable spool")
 	assert_true(spooled_names["perf_summary"] ~= nil,
 		"a full queue must not drop the exit perf summary — it rides the spool")
@@ -3461,7 +3461,7 @@ local function test_shutdown_full_queue_spools_session_end_and_summaries()
 		end
 	end
 	assert_true(resent["app.session_started"] ~= nil)
-	assert_true(resent["session_end"] ~= nil)
+	assert_true(resent["app.session_ended"] ~= nil)
 	assert_true(resent["perf_summary"] ~= nil)
 	assert_true(resent["network_summary"] ~= nil)
 	assert_equal(#storage.load_spool(spool_scope), 0,
@@ -4674,7 +4674,7 @@ local function test_shutdown_fails_when_remnant_evicted_by_caps()
 	assert_equal(client:snapshot().spool_evicted, 2)
 	local leftover = storage.load_spool(spool_scope)
 	assert_equal(#leftover, 1, "the cap holds; the newest envelope survived")
-	assert_equal(leftover[1].event_name, "session_end")
+	assert_equal(leftover[1].event_name, "app.session_ended")
 
 	-- the in-memory copy is intact: recovery delivers everything and clears
 	client.config.token_provider = function(callback)
@@ -7757,6 +7757,95 @@ local tests = {
 	test_spool_persists_transient_failure_and_resends_next_launch,
 	test_spool_overflow_evicts_oldest_first,
 	test_spool_corrupted_record_starts_clean,
+	-- ⚠ INLINE, not a `local function`, and that is load-bearing: this file sits
+	-- exactly at Lua 5.4's ceiling of 200 locals for a main chunk, so the NEXT
+	-- `local function test_*` added here fails to compile under lua5.4 while
+	-- passing under lua5.1 and LuaJIT. New tests go in this table as inline
+	-- functions until someone reclaims headroom.
+	--
+	-- An upgrade inherits a spool written by an OLDER RELEASE. The record is
+	-- PLANTED through a stubbed store rather than written with save_spool(),
+	-- because a record written by THIS version carries the current wire-name
+	-- epoch and is deliberately not migrated -- seeding through the public API
+	-- would exercise nothing and pass.
+	function()
+		reset()
+		storage.reset()
+		local stores = {}
+		-- One path per FILE NAME, so the plant below lands where load_spool reads
+		-- regardless of the namespace the scope hashes to.
+		sys.get_save_file = function(_, file_name) return "planted/" .. file_name end
+		sys.save = function(path, record) stores[path] = record; return true end
+		sys.load = function(path) return stores[path] end
+		-- No `wire_names` key: this is what a pre-rename release wrote.
+		stores["planted/spool"] = {
+			events = {
+				{ event_id = "legacy-1", event_name = "session_end" },
+				{ event_id = "legacy-2", event_name = "tutorial_start" },
+				{ event_id = "legacy-3", event_name = "app.screen_view" },
+			},
+		}
+
+		local loaded, _, _, migrated = storage.load_spool(spool_scope)
+		-- CONTROL: two survive and the loader reports two changes, so the drop
+		-- below reads as a drop rather than as a load that returned nothing.
+		assert_equal(#loaded, 2, "the renamed event and the innocent sibling survive")
+		assert_equal(migrated, 2, "one renamed, one dropped")
+		local by_id = {}
+		for i = 1, #loaded do by_id[loaded[i].event_id] = loaded[i] end
+		assert_equal(by_id["legacy-1"].event_name, "app.session_ended")
+		assert_equal(by_id["legacy-3"].event_name, "app.screen_view")
+		assert_true(by_id["legacy-2"] == nil, "a removed helper's event is dropped")
+
+		-- A record written by THIS version is never repaired: a game may call
+		-- track("session_end", ...) for its own custom event, and renaming it
+		-- would turn a customer event into a lifecycle event whose facts it
+		-- corrupts -- while dropping a custom "tutorial_start" deletes it.
+		stores["planted/spool"] = {
+			events = {
+				{ event_id = "mine-1", event_name = "session_end" },
+				{ event_id = "mine-2", event_name = "tutorial_start" },
+			},
+			wire_names = 1,
+		}
+		local fresh, _, _, fresh_migrated = storage.load_spool(spool_scope)
+		assert_equal(#fresh, 2, "a customer's events are never dropped")
+		assert_equal(fresh_migrated, 0, "and never rewritten")
+		assert_equal(fresh[1].event_name, "session_end")
+		assert_equal(fresh[2].event_name, "tutorial_start")
+
+		sys.get_save_file = nil; sys.save = nil; sys.load = nil
+	end,
+	-- INLINE for the 200-local ceiling.
+	--
+	-- When the migration rewrite FAILS and migration dropped everything, there
+	-- is no surviving event to resend and no acknowledgement that would ever
+	-- force another write -- so without recording the debt the stale file
+	-- survives every future launch, and a rollback to a release without the
+	-- migration replays those names.
+	function()
+		reset()
+		storage.reset()
+		local stores = {}
+		sys.get_save_file = function(_, file_name) return "planted/" .. file_name end
+		sys.save = function(path, record)
+			if path == "planted/spool" then return false end
+			stores[path] = record
+			return true
+		end
+		sys.load = function(path) return stores[path] end
+		stores["planted/spool"] = {
+			events = { { event_id = "gone-1", event_name = "tutorial_start" } },
+		}
+
+		seed_granted_consent()
+		local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+		assert_equal(#client.spool_record, 0, "nothing survives the migration")
+		assert_true(client.spool_rewrite_pending,
+			"a FAILED migration rewrite records the debt, so it retries at the next dispatch")
+
+		sys.get_save_file = nil; sys.save = nil; sys.load = nil
+	end,
 	test_spool_cleared_by_denied_consent,
 	test_consent_unknown_blocks_all_analytics_egress,
 	test_blocked_period_samples_never_summarized,

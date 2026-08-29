@@ -895,6 +895,43 @@ end
 -- non-empty string event_id). A corrupted or partially garbled record thus
 -- degrades to the salvageable subset — or a clean empty spool — instead of
 -- erroring into game code.
+-- Wire names an older release of this SDK persisted, and what a load must do
+-- with them. The spool re-sends stored envelopes VERBATIM, so an upgrade that
+-- only fixes the enqueue path leaves the old backlog on the wire under names
+-- ingest no longer accepts -- and an unregistered name is refused for the WHOLE
+-- BATCH, which takes the valid events stored beside it down too. The load is
+-- the one place every persisted envelope passes through, so it is where the
+-- backlog is made sendable.
+--
+-- The wire-name epoch a record was WRITTEN under. Bumped whenever this SDK
+-- changes a name it emits, and stored in the spool record. Migration keys on it
+-- rather than on the name alone, because a name cannot distinguish "written by
+-- an older release" from "a game's own custom event that happens to use this
+-- string" -- and rewriting the latter turns a customer event into a lifecycle
+-- event whose facts it then corrupts, while DROPPING one deletes it outright.
+-- A record with no stamp was written before this existed and reads as epoch 0.
+local spool_wire_name_epoch = 1
+
+-- RENAMED: the event still exists under a registered name, so the envelope is
+-- rewritten and kept.
+local spool_renamed_events = {
+	["session_end"] = "app.session_ended",
+}
+-- REMOVED: the helper is gone and no registered name accepts these, so the
+-- entry is DROPPED. Keeping it would poison every batch it lands in for as
+-- long as the backlog survives, and there is nothing to rewrite it to.
+local spool_removed_events = {
+	["tutorial_start"] = true,
+	["tutorial_step_complete"] = true,
+	["tutorial_complete"] = true,
+}
+
+-- Shape only: an entry without a usable event_id cannot be resent or evicted by
+-- id, so it is not an envelope. Every caller gets this; legacy-name repair does
+-- NOT live here, because it is a property of READING AN OLD RECORD rather than
+-- of sanitising a list, and running it on the write path would silently drop a
+-- name the current SDK cannot produce while making a legacy backlog impossible
+-- to seed in a test.
 local function sanitize_spool_events(events)
 	local out = {}
 	if type(events) ~= "table" then
@@ -909,6 +946,33 @@ local function sanitize_spool_events(events)
 	return out
 end
 
+-- Load-time repair of wire names an older release persisted. Returns the
+-- surviving entries and HOW MANY were changed -- renamed or dropped.
+--
+-- The caller needs that second value because the surviving COUNT cannot carry
+-- it: a backlog of nothing but removed events migrates to an empty list, which
+-- is indistinguishable from an empty spool, so the durable record would keep
+-- those names forever -- re-filtered on every launch, and replayed onto the
+-- wire by a rollback to an SDK with no migration.
+local function migrate_spool_events(events)
+	local out = {}
+	local migrated = 0
+	for i = 1, #events do
+		local entry = events[i]
+		local name = entry.event_name
+		if type(name) == "string" and spool_removed_events[name] then
+			migrated = migrated + 1
+		else
+			if type(name) == "string" and spool_renamed_events[name] then
+				entry.event_name = spool_renamed_events[name]
+				migrated = migrated + 1
+			end
+			out[#out + 1] = entry
+		end
+	end
+	return out, migrated
+end
+
 -- The record optionally carries a server-requested backpressure deadline
 -- (`retry_after_until_ms`, wall-clock epoch ms recorded from a 429
 -- Retry-After) so a relaunch inside the window can keep waiting it out.
@@ -920,7 +984,11 @@ local function sanitize_deadline(value)
 end
 
 local function write_spool(ns, events, retry_after_until_ms)
-	local record = { events = events, retry_after_until_ms = sanitize_deadline(retry_after_until_ms) }
+	local record = {
+		events = events,
+		retry_after_until_ms = sanitize_deadline(retry_after_until_ms),
+		wire_names = spool_wire_name_epoch,
+	}
 	local path = save_path(ns, "spool")
 	if not path then
 		-- No durable backend (plain Lua host): the in-memory record is the store.
@@ -958,16 +1026,23 @@ function M.load_spool(scope)
 			-- unreadable file); callers that must prove spool CLEANLINESS
 			-- — the condemnation-marker retire rule — read the third value
 			-- and treat the launch as unproven instead of clean.
-			return {}, nil, "unreadable"
+			return {}, nil, "unreadable", 0
 		end
 	end
 	if record == nil then
 		record = spool_memory[ns]
 	end
 	if type(record) ~= "table" then
-		return {}, nil
+		return {}, nil, nil, 0
 	end
-	return sanitize_spool_events(record.events), sanitize_deadline(record.retry_after_until_ms)
+	local shaped = sanitize_spool_events(record.events)
+	if (tonumber(record.wire_names) or 0) >= spool_wire_name_epoch then
+		-- Written by this version: every name in it is a name a caller chose,
+		-- so nothing here is legacy and nothing is repaired.
+		return shaped, sanitize_deadline(record.retry_after_until_ms), nil, 0
+	end
+	local kept, migrated = migrate_spool_events(shaped)
+	return kept, sanitize_deadline(record.retry_after_until_ms), nil, migrated
 end
 
 -- The base of the byte estimate: what an empty record costs before any

@@ -25,13 +25,32 @@ Built-in helpers enqueue (wire `event_name`, with the helper in parentheses
 where it differs):
 
 - `app.session_started` (from the `session_start()` helper)
-- `session_end`
+- `app.session_ended` (from the `session_end()` helper)
 - `app.screen_view` (from the `screen_view()` helper)
-- `tutorial_start`
-- `tutorial_step_complete`
-- `tutorial_complete`
 - `perf_summary`
 - `network_summary`
+
+Every name on this list is registered in the platform's schema registry, as
+measured on 2026-08-29. An event name with no registered schema produces no fact
+today, and once ingest begins rejecting unregistered names it is refused
+**together with every event batched alongside it** — so this list being accurate
+is not documentation hygiene.
+
+## Removed: `tutorial_start`, `tutorial_step_complete`, `tutorial_complete`
+
+These three helpers were removed in 2026-08-29. They emitted event names with no
+schema in the registry, so their events already produced no fact anywhere, and
+once ingest begins rejecting unregistered names they would have taken whole
+batches down with them.
+
+They were not renamed, because no registered equivalent exists, and no schema was
+minted for them: game-specific names and tracking helpers belong in a game's own
+adapter rather than in a universal telemetry SDK, and the other four ShardPilot
+SDKs already work that way — Defold was the only one shipping typed game verbs.
+
+**Migration:** call `track()` directly with whatever name your analytics contract
+registers — `client:track("your_event", { … })`. The removed helpers did nothing
+but wrap that call.
 
 `perf_summary` aggregates frame samples from `update(dt)` and uses
 `avg_fps`, `p50_frame_time_ms`, `p95_frame_time_ms`, `max_frame_time_ms`,

@@ -6,6 +6,33 @@
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
 
+- **BREAKING: `session_end` now goes on the wire as `app.session_ended`.** The
+  name this SDK sent had no schema in the platform registry, so its events were
+  stored and produced no fact anywhere — invisible in every report. The
+  registered name is pinned by `analytics.session_ended.v1`'s own `event_name`
+  const, and ingest is changing to reject an unregistered name with a
+  **whole-batch 400**, which would have refused every batch carrying a shutdown
+  event along with its valid siblings.
+
+  The `session_end()` method is unchanged — this is the wire name only. If you
+  query or alert on `event_name = "session_end"`, update those to
+  `app.session_ended`.
+
+- **BREAKING: the `tutorial_start`, `tutorial_step_complete` and
+  `tutorial_complete` helpers are removed.** They emitted names with no schema
+  in the registry, so like `session_end` their events already produced no fact,
+  and once ingest begins rejecting unregistered names they would have taken
+  whole batches down.
+
+  They were not renamed — no registered equivalent exists — and no schema was
+  minted for them. Game-specific names and tracking helpers belong in a game's
+  own adapter rather than in a universal telemetry SDK, and the other four
+  ShardPilot SDKs already work that way: Defold was the only one shipping typed
+  game verbs.
+
+  **Migration:** `client:track("your_event", { … })` with whatever name your
+  analytics contract registers. The removed helpers wrapped nothing else.
+
 - **A configured `platform` is now folded to the vocabulary ingest accepts, and
   reported when it is not recognised.** Behaviour change for hosts that set
   `platform` explicitly; no change for hosts that leave it to detection.
