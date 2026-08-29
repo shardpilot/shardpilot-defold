@@ -895,6 +895,28 @@ end
 -- non-empty string event_id). A corrupted or partially garbled record thus
 -- degrades to the salvageable subset — or a clean empty spool — instead of
 -- erroring into game code.
+-- Wire names an older release of this SDK persisted, and what a load must do
+-- with them. The spool re-sends stored envelopes VERBATIM, so an upgrade that
+-- only fixes the enqueue path leaves the old backlog on the wire under names
+-- ingest no longer accepts -- and an unregistered name is refused for the WHOLE
+-- BATCH, which takes the valid events stored beside it down too. The load is
+-- the one place every persisted envelope passes through, so it is where the
+-- backlog is made sendable.
+--
+-- RENAMED: the event still exists under a registered name, so the envelope is
+-- rewritten and kept.
+local spool_renamed_events = {
+	["session_end"] = "app.session_ended",
+}
+-- REMOVED: the helper is gone and no registered name accepts these, so the
+-- entry is DROPPED. Keeping it would poison every batch it lands in for as
+-- long as the backlog survives, and there is nothing to rewrite it to.
+local spool_removed_events = {
+	["tutorial_start"] = true,
+	["tutorial_step_complete"] = true,
+	["tutorial_complete"] = true,
+}
+
 local function sanitize_spool_events(events)
 	local out = {}
 	if type(events) ~= "table" then
@@ -903,7 +925,15 @@ local function sanitize_spool_events(events)
 	for i = 1, #events do
 		local entry = events[i]
 		if type(entry) == "table" and type(entry.event_id) == "string" and entry.event_id ~= "" then
-			out[#out + 1] = entry
+			local name = entry.event_name
+			if type(name) == "string" and spool_removed_events[name] then
+				-- dropped: no registered name to carry it
+			else
+				if type(name) == "string" and spool_renamed_events[name] then
+					entry.event_name = spool_renamed_events[name]
+				end
+				out[#out + 1] = entry
+			end
 		end
 	end
 	return out
