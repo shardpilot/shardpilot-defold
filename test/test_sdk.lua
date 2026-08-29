@@ -7789,12 +7789,15 @@ local tests = {
 		local loaded, _, _, migrated = storage.load_spool(spool_scope)
 		-- CONTROL: two survive and the loader reports two changes, so the drop
 		-- below reads as a drop rather than as a load that returned nothing.
-		assert_equal(#loaded, 2, "the renamed event and the innocent sibling survive")
-		assert_equal(migrated, 2, "one renamed, one dropped")
+		-- CONTROL: the innocent sibling survives, so the two absences read as
+		-- drops rather than as a load that returned nothing.
+		assert_equal(#loaded, 1, "both legacy names are DROPPED; only the sibling survives")
+		assert_equal(migrated, 2, "and the loader counts both drops")
 		local by_id = {}
 		for i = 1, #loaded do by_id[loaded[i].event_id] = loaded[i] end
-		assert_equal(by_id["legacy-1"].event_name, "app.session_ended")
 		assert_equal(by_id["legacy-3"].event_name, "app.screen_view")
+		assert_true(by_id["legacy-1"] == nil,
+			"a legacy session_end is dropped, never renamed: nothing tells the SDK's own from a caller's")
 		assert_true(by_id["legacy-2"] == nil, "a removed helper's event is dropped")
 
 		-- A record written by THIS version is never repaired: a game may call

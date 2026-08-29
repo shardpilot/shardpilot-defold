@@ -912,15 +912,26 @@ end
 -- A record with no stamp was written before this existed and reads as epoch 0.
 local spool_wire_name_epoch = 1
 
--- RENAMED: the event still exists under a registered name, so the envelope is
--- rewritten and kept.
-local spool_renamed_events = {
-	["session_end"] = "app.session_ended",
-}
+-- ⚠ NOT RENAMED — DROPPED, and the reason is that nothing can tell the two
+-- cases apart. A pre-epoch `session_end` may be this SDK's own shutdown summary
+-- or a game's own `track("session_end", …)`, and `shutdown(reason)` takes a
+-- CALLER-SUPPLIED reason, so even the one-prop `{ reason = … }` shape is
+-- something a public caller produces. No property on the envelope distinguishes
+-- them.
+--
+-- Three costs, and dropping adds none. These events are unregistered: they
+-- produce no fact today and never will under a name nobody registered. Renaming
+-- makes the SDK's own land while filing customers' events as session
+-- boundaries, which session facts then carry. Keeping them means a whole-batch
+-- refusal once ingest stops accepting unregistered names, which takes their
+-- valid batch-mates down. Dropping loses only what the platform was already
+-- discarding, and the count makes the loss visible.
+local spool_renamed_events = {}
 -- REMOVED: the helper is gone and no registered name accepts these, so the
 -- entry is DROPPED. Keeping it would poison every batch it lands in for as
 -- long as the backlog survives, and there is nothing to rewrite it to.
 local spool_removed_events = {
+	["session_end"] = true,
 	["tutorial_start"] = true,
 	["tutorial_step_complete"] = true,
 	["tutorial_complete"] = true,
