@@ -7821,6 +7821,67 @@ local tests = {
 	end,
 	-- INLINE for the 200-local ceiling.
 	--
+	-- An UNUSABLE stamp reads as epoch 0, not as itself. `tonumber` accepts
+	-- "-1", and a negative epoch fails `epoch >= rule.since` for every rule --
+	-- so a garbled header would skip the whole migration, and the boot rewrite
+	-- would then re-stamp the file at the current epoch, putting it permanently
+	-- beyond repair while it kept causing whole-batch rejection. And the DROP is
+	-- reported: the migration rationale rests on the count making the loss
+	-- visible, and an earlier revision consumed the count only to decide whether
+	-- a rewrite was owed, so the deletion itself was silent.
+	function()
+		reset()
+		storage.reset()
+		local stores = {}
+		local issues = {}
+		sys.get_save_file = function(_, file_name) return "planted/" .. file_name end
+		sys.save = function(path, record) stores[path] = record; return true end
+		sys.load = function(path) return stores[path] end
+		stores["planted/spool"] = {
+			events = {
+				{ event_id = "garbled-1", event_name = "session_end" },
+				{ event_id = "garbled-2", event_name = "app.screen_view" },
+			},
+			wire_names = -1,
+		}
+
+		local loaded, _, _, migrated, dropped = storage.load_spool(spool_scope)
+		assert_equal(#loaded, 1, "a NEGATIVE stamp runs every rule, as epoch 0 does")
+		assert_equal(migrated, 1, "and the migration is counted")
+		assert_equal(dropped, 1, "and the drop is counted SEPARATELY from a rename")
+
+		-- CONTROL: a stamp at the current epoch is honoured, so the line above
+		-- reads as "invalid falls back to 0" rather than "every record runs".
+		stores["planted/spool"] = {
+			events = { { event_id = "mine-1", event_name = "session_end" } },
+			wire_names = 1,
+		}
+		local kept, _, _, _, kept_dropped = storage.load_spool(spool_scope)
+		assert_equal(#kept, 1, "a VALID current stamp still protects a caller's event")
+		assert_equal(kept_dropped or 0, 0, "and drops nothing")
+
+        -- The host is told. A migrated backlog and an empty spool are otherwise
+        -- indistinguishable to it.
+		stores["planted/spool"] = {
+			events = { { event_id = "gone-1", event_name = "tutorial_start" } },
+		}
+		seed_granted_consent()
+		assert(sdk.new(config({
+			diagnostics = function(issue) issues[#issues + 1] = issue end,
+		})))
+		local reported = nil
+		for i = 1, #issues do
+			if issues[i].code == "legacy_event_name" then reported = issues[i] end
+		end
+		assert_true(reported ~= nil, "the drop reaches the host as a diagnostic")
+		assert_equal(reported.scope, "spool")
+		assert_equal(reported.status, "dropped")
+		assert_equal(reported.count, 1, "carrying how many were lost")
+
+		sys.get_save_file = nil; sys.save = nil; sys.load = nil
+	end,
+	-- INLINE for the 200-local ceiling.
+	--
 	-- Both halves of the rule interval, exercised on rules that do not exist
 	-- yet. Every rule shipped today is `since = 0` -- SDK-owned from the
 	-- beginning -- which is exactly what hid the lower bound: an upper-bound

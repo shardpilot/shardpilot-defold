@@ -991,9 +991,16 @@ end
 -- is indistinguishable from an empty spool, so the durable record would keep
 -- those names forever -- re-filtered on every launch, and replayed onto the
 -- wire by a rollback to an SDK with no migration.
+-- Returns `out, migrated, dropped`. The two counts differ in KIND and the
+-- caller needs both: `migrated` drives the rewrite decision (a rename keeps the
+-- entry, so the record still owes a durable write), while `dropped` is a LOSS
+-- and is reported to the host. Folding them together made a deletion
+-- indistinguishable from a repair -- and this SDK's rule set is all drops, so
+-- the fold hid the only outcome that costs a customer anything.
 local function migrate_spool_events(events, record_epoch)
 	local out = {}
 	local migrated = 0
+	local dropped = 0
 	for i = 1, #events do
 		local entry = events[i]
 		local name = entry.event_name
@@ -1009,11 +1016,11 @@ local function migrate_spool_events(events, record_epoch)
 		-- terminates because `changed` is strictly greater than the epoch it is
 		-- reached from, so the working epoch strictly increases on every hop.
 		local epoch = record_epoch
-		local dropped = false
+		local dropped_here = false
 		while type(name) == "string" do
 			local removal = spool_removed_events[name]
 			if removal and epoch >= removal.since and epoch < removal.changed then
-				dropped = true
+				dropped_here = true
 				break
 			end
 			local rename = spool_renamed_events[name]
@@ -1023,8 +1030,9 @@ local function migrate_spool_events(events, record_epoch)
 			name = rename.to
 			epoch = rename.changed
 		end
-		if dropped then
+		if dropped_here then
 			migrated = migrated + 1
+			dropped = dropped + 1
 		else
 			if name ~= entry.event_name then
 				entry.event_name = name
@@ -1033,7 +1041,7 @@ local function migrate_spool_events(events, record_epoch)
 			out[#out + 1] = entry
 		end
 	end
-	return out, migrated
+	return out, migrated, dropped
 end
 
 -- The record optionally carries a server-requested backpressure deadline
@@ -1099,9 +1107,21 @@ function M.load_spool(scope)
 		return {}, nil, nil, 0
 	end
 	local shaped = sanitize_spool_events(record.events)
-	local record_epoch = tonumber(record.wire_names) or 0
-	local kept, migrated = migrate_spool_events(shaped, record_epoch)
-	return kept, sanitize_deadline(record.retry_after_until_ms), nil, migrated
+	-- ⚠ AN INVALID STAMP READS AS EPOCH 0, NOT AS ITSELF. `tonumber` accepts
+	-- "-1" and "1.5", and a NEGATIVE epoch fails `epoch >= rule.since` for every
+	-- rule -- so a garbled header skips the whole migration, the legacy names
+	-- survive, and the boot rewrite then re-stamps the file at the current
+	-- epoch, putting it permanently beyond repair while it keeps causing
+	-- whole-batch rejection. Epoch 0 is the right reading for anything
+	-- unusable: it is what an unstamped record means, it runs every rule, and
+	-- it is the only value that can only ever REPAIR.
+	local stamp = tonumber(record.wire_names)
+	local record_epoch = 0
+	if stamp and stamp >= 0 and stamp == math.floor(stamp) then
+		record_epoch = stamp
+	end
+	local kept, migrated, dropped = migrate_spool_events(shaped, record_epoch)
+	return kept, sanitize_deadline(record.retry_after_until_ms), nil, migrated, dropped
 end
 
 -- The base of the byte estimate: what an empty record costs before any
