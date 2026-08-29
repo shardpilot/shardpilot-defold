@@ -11,8 +11,8 @@
   stored and produced no fact anywhere — invisible in every report. The
   registered name is pinned by `analytics.session_ended.v1`'s own `event_name`
   const, and ingest is changing to reject an unregistered name with a
-  **whole-batch 400** (`analytics-service#497`), which would have refused every
-  batch carrying a shutdown event along with its valid siblings.
+  **whole-batch 400**, which would have refused every batch carrying a shutdown
+  event along with its valid siblings.
 
   The `session_end()` method is unchanged — this is the wire name only. If you
   query or alert on `event_name = "session_end"`, update those to
@@ -21,14 +21,14 @@
 - **BREAKING: the `tutorial_start`, `tutorial_step_complete` and
   `tutorial_complete` helpers are removed.** They emitted names with no schema
   in the registry, so like `session_end` their events already produced no fact,
-  and after `analytics-service#497` they would have taken whole batches down.
+  and once ingest begins rejecting unregistered names they would have taken
+  whole batches down.
 
   They were not renamed — no registered equivalent exists — and no schema was
-  minted for them. ADR-0161 places game-specific names and tracking helpers in
-  adapters or domain packs rather than SDK core, and the other four SDKs already
-  follow that: Defold was the only one carrying typed game verbs. Registering
-  them to silence the rejection would have ratified a game-specific name as a
-  platform contract in order to avoid an error code.
+  minted for them. Game-specific names and tracking helpers belong in a game's
+  own adapter rather than in a universal telemetry SDK, and the other four
+  ShardPilot SDKs already work that way: Defold was the only one shipping typed
+  game verbs.
 
   **Migration:** `client:track("your_event", { … })` with whatever name your
   analytics contract registers. The removed helpers wrapped nothing else.
