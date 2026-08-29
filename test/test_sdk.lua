@@ -3077,42 +3077,6 @@ end
 
 -- Consent recheck: a persisted denial clears the spool at load without
 -- sending; a runtime set_consent(false) purges a live spool the same way.
--- An upgrade inherits a spool written by an older release. The load path
--- re-sends stored envelopes VERBATIM, so a legacy name survives the enqueue-side
--- rename and is refused for the WHOLE BATCH -- taking the valid events stored
--- beside it. This asserts the load makes the backlog sendable: the renamed
--- event is rewritten and kept, the removed ones are dropped, and an ordinary
--- event beside them is untouched.
-local function test_spool_migrates_legacy_event_names()
-	reset()
-	storage.reset()
-	assert_true(storage.save_spool(spool_scope, {
-		{ event_id = "legacy-1", event_name = "session_end", event_ts = "2026-01-01T00:00:00.000Z" },
-		{ event_id = "legacy-2", event_name = "tutorial_start", event_ts = "2026-01-01T00:00:01.000Z" },
-		{ event_id = "legacy-3", event_name = "tutorial_step_complete", event_ts = "2026-01-01T00:00:02.000Z" },
-		{ event_id = "legacy-4", event_name = "tutorial_complete", event_ts = "2026-01-01T00:00:03.000Z" },
-		{ event_id = "legacy-5", event_name = "app.screen_view", event_ts = "2026-01-01T00:00:04.000Z" },
-	}, nil, 262144) ~= nil)
-
-	local loaded = storage.load_spool(spool_scope)
-	-- CONTROL: two survive, so the three zeros below are readable as drops
-	-- rather than as a load that returned nothing.
-	assert_equal(#loaded, 2, "the renamed event and the innocent sibling survive; the three removed ones do not")
-
-	local by_id = {}
-	for i = 1, #loaded do
-		by_id[loaded[i].event_id] = loaded[i]
-	end
-	assert_true(by_id["legacy-1"] ~= nil, "a renamed event is KEPT, not dropped")
-	assert_equal(by_id["legacy-1"].event_name, "app.session_ended",
-		"the persisted legacy name is rewritten to the registered one")
-	assert_true(by_id["legacy-5"] ~= nil, "an event beside the legacy ones is untouched")
-	assert_equal(by_id["legacy-5"].event_name, "app.screen_view")
-	assert_true(by_id["legacy-2"] == nil, "a removed helper's event is dropped")
-	assert_true(by_id["legacy-3"] == nil, "a removed helper's event is dropped")
-	assert_true(by_id["legacy-4"] == nil, "a removed helper's event is dropped")
-end
-
 local function test_spool_cleared_by_denied_consent()
 	reset()
 	storage.reset()
@@ -7793,7 +7757,47 @@ local tests = {
 	test_spool_persists_transient_failure_and_resends_next_launch,
 	test_spool_overflow_evicts_oldest_first,
 	test_spool_corrupted_record_starts_clean,
-	test_spool_migrates_legacy_event_names,
+	-- ⚠ INLINE, not a `local function`, and that is load-bearing: this file sits
+	-- exactly at Lua 5.4's ceiling of 200 locals for a main chunk, so the NEXT
+	-- `local function test_*` added here fails to compile under lua5.4 while
+	-- passing under lua5.1 and LuaJIT. Measured: removing this one test makes
+	-- 5.4 pass and re-adding it fails at the `for _, test in ipairs(tests)` line.
+	-- New tests go in this table as inline functions until someone reclaims
+	-- headroom by folding the existing 183 into namespaces.
+	--
+	-- An upgrade inherits a spool written by an older release. The load path
+	-- re-sends stored envelopes VERBATIM, so a legacy name survives the
+	-- enqueue-side rename and is refused for the WHOLE BATCH -- taking the valid
+	-- events stored beside it. This asserts the load makes the backlog sendable.
+	function()
+	reset()
+	storage.reset()
+	assert_true(storage.save_spool(spool_scope, {
+		{ event_id = "legacy-1", event_name = "session_end", event_ts = "2026-01-01T00:00:00.000Z" },
+		{ event_id = "legacy-2", event_name = "tutorial_start", event_ts = "2026-01-01T00:00:01.000Z" },
+		{ event_id = "legacy-3", event_name = "tutorial_step_complete", event_ts = "2026-01-01T00:00:02.000Z" },
+		{ event_id = "legacy-4", event_name = "tutorial_complete", event_ts = "2026-01-01T00:00:03.000Z" },
+		{ event_id = "legacy-5", event_name = "app.screen_view", event_ts = "2026-01-01T00:00:04.000Z" },
+	}, nil, 262144) ~= nil)
+
+	local loaded = storage.load_spool(spool_scope)
+	-- CONTROL: two survive, so the three zeros below are readable as drops
+	-- rather than as a load that returned nothing.
+	assert_equal(#loaded, 2, "the renamed event and the innocent sibling survive; the three removed ones do not")
+
+	local by_id = {}
+	for i = 1, #loaded do
+		by_id[loaded[i].event_id] = loaded[i]
+	end
+	assert_true(by_id["legacy-1"] ~= nil, "a renamed event is KEPT, not dropped")
+	assert_equal(by_id["legacy-1"].event_name, "app.session_ended",
+		"the persisted legacy name is rewritten to the registered one")
+	assert_true(by_id["legacy-5"] ~= nil, "an event beside the legacy ones is untouched")
+	assert_equal(by_id["legacy-5"].event_name, "app.screen_view")
+	assert_true(by_id["legacy-2"] == nil, "a removed helper's event is dropped")
+	assert_true(by_id["legacy-3"] == nil, "a removed helper's event is dropped")
+	assert_true(by_id["legacy-4"] == nil, "a removed helper's event is dropped")
+	end,
 	test_spool_cleared_by_denied_consent,
 	test_consent_unknown_blocks_all_analytics_egress,
 	test_blocked_period_samples_never_summarized,
