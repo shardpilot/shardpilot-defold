@@ -930,11 +930,17 @@ local spool_renamed_events = {}
 -- REMOVED: the helper is gone and no registered name accepts these, so the
 -- entry is DROPPED. Keeping it would poison every batch it lands in for as
 -- long as the backlog survives, and there is nothing to rewrite it to.
+-- Each rule carries THE EPOCH THAT INTRODUCED IT, and fires only for records
+-- written before it. An unversioned rule set would keep firing after the next
+-- bump: at epoch 2, an epoch-1 record would enter migration and lose these
+-- names -- but an epoch-1 writer no longer emits any of them, so what is stored
+-- under that epoch is precisely a caller's own event, which these rules exist to
+-- protect. An epoch-0 record predates every rule and runs all of them.
 local spool_removed_events = {
-	["session_end"] = true,
-	["tutorial_start"] = true,
-	["tutorial_step_complete"] = true,
-	["tutorial_complete"] = true,
+	["session_end"] = 1,
+	["tutorial_start"] = 1,
+	["tutorial_step_complete"] = 1,
+	["tutorial_complete"] = 1,
 }
 
 -- Shape only: an entry without a usable event_id cannot be resent or evicted by
@@ -965,13 +971,14 @@ end
 -- is indistinguishable from an empty spool, so the durable record would keep
 -- those names forever -- re-filtered on every launch, and replayed onto the
 -- wire by a rollback to an SDK with no migration.
-local function migrate_spool_events(events)
+local function migrate_spool_events(events, record_epoch)
 	local out = {}
 	local migrated = 0
 	for i = 1, #events do
 		local entry = events[i]
 		local name = entry.event_name
-		if type(name) == "string" and spool_removed_events[name] then
+		if type(name) == "string" and spool_removed_events[name]
+			and record_epoch < spool_removed_events[name] then
 			migrated = migrated + 1
 		else
 			if type(name) == "string" and spool_renamed_events[name] then
@@ -1047,12 +1054,8 @@ function M.load_spool(scope)
 		return {}, nil, nil, 0
 	end
 	local shaped = sanitize_spool_events(record.events)
-	if (tonumber(record.wire_names) or 0) >= spool_wire_name_epoch then
-		-- Written by this version: every name in it is a name a caller chose,
-		-- so nothing here is legacy and nothing is repaired.
-		return shaped, sanitize_deadline(record.retry_after_until_ms), nil, 0
-	end
-	local kept, migrated = migrate_spool_events(shaped)
+	local record_epoch = tonumber(record.wire_names) or 0
+	local kept, migrated = migrate_spool_events(shaped, record_epoch)
 	return kept, sanitize_deadline(record.retry_after_until_ms), nil, migrated
 end
 
