@@ -2710,7 +2710,16 @@ LANE_B_BASELINE=scripts/public-surface-lane-b-baseline.txt
 # round 5 pointed out what that misses -- a refusal blocking its own remedy is
 # not a refusal with a bad sentence, it is one that should not fire. The index
 # symlink refusal below stays: there the two sides genuinely disagree.
-if [ -e "$LANE_B_BASELINE" ] && [ ! -f "$LANE_B_BASELINE" ]; then
+# ⚠ AND A SYMLINK IS EXEMPT, because `-e` follows it. A link to a DIRECTORY or a
+# FIFO answers no to `-f` and yes to `-e`, so this generic guard was still
+# refusing the two shapes the working-tree symlink removal was meant to release --
+# and refusing them on the writer path, which is where the repair lives. The
+# rename handles exactly this: the file's own measured table records `leaf ->
+# DIRECTORY` with `-T` as "link replaced, the outside copy intact". A real
+# directory or FIFO at the path is still refused, because `-L` is false there and
+# `mv -fT` genuinely cannot install a file over a directory.
+if [ -e "$LANE_B_BASELINE" ] && [ ! -f "$LANE_B_BASELINE" ] \
+   && [ ! -L "$LANE_B_BASELINE" ]; then
   # refusal:structural
   # ⚠ A DIRECTORY HERE PASSES EVERY OTHER CHECK. Its link count is 1, it is not
   # a symlink, and `mv` then moves the temporary INSIDE it rather than replacing
@@ -3319,10 +3328,31 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
     echo "  (baseline-vs-target check skipped: ${PUBLIC_SURFACE_BASE_REF} carries no $LANE_B_BASELINE)"
   fi
 else
-  echo "  (baseline-vs-target check skipped: PUBLIC_SURFACE_BASE_REF unset — CI sets it)"
+  # ⚠ AND THIS LINE USED TO SAY "CI sets it", WHICH WAS FALSE TWICE. In round 1 it
+  # was false because the workflow never set the variable at all -- a reassurance
+  # printed on exactly the runs where nothing was compared. It became false again
+  # when the comparison for push events was split out: CI now leaves this unset on
+  # a push deliberately, and the old wording reported a designed gap as an
+  # accident. A message that explains away its own silence is worse than silence.
+  echo "  (baseline-vs-target check NOT RUN: no comparison target was given."
+  echo "   On a pull request CI supplies one. On a push it does not yet -- that"
+  echo "   selection is a separate change -- so nothing here compared this tree"
+  echo "   against another commit.)"
 fi
 
-echo "LANE B RATCHET — held at $(printf '%s' "$lane_b_now" | grep -c . ) file(s), $(printf '%s' "$lane_b_now" | awk '{n += $1} END {print n + 0}') occurrence(s). The number may fall and may not rise."
+# ⚠ TWO SENTENCES, BECAUSE THE RUN ESTABLISHES TWO DIFFERENT THINGS. "May not
+# rise" is a claim about this tree versus ANOTHER COMMIT, and it is earned only
+# when a comparison target was given. Without one, all that was established is
+# that the baseline agrees with the tree -- and a change raising the count and the
+# baseline together satisfies that agreement perfectly. Printing the strong
+# sentence on a run that did not do the work is how a log becomes a false record.
+lane_b_files="$(printf '%s' "$lane_b_now" | grep -c . )"
+lane_b_total="$(printf '%s' "$lane_b_now" | awk '{n += $1} END {print n + 0}')"
+if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
+  echo "LANE B RATCHET — held at ${lane_b_files} file(s), ${lane_b_total} occurrence(s). The number may fall and may not rise."
+else
+  echo "LANE B RATCHET — the baseline agrees with the tree at ${lane_b_files} file(s), ${lane_b_total} occurrence(s). NOT checked against another commit on this run: a change that raised both together would satisfy this line."
+fi
 
 gate_finished=yes
 echo "LANE A (GATED) — clean. ${scan_files} tracked file(s) were read; a run that scanned none refuses above rather than reporting this line."
