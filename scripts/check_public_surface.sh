@@ -2708,45 +2708,27 @@ if [ -e "$LANE_B_BASELINE" ] && [ ! -f "$LANE_B_BASELINE" ]; then
   echo "REFUSING: $LANE_B_BASELINE is not a regular file." >&2
   exit 2
 fi
-if [ -e "$LANE_B_BASELINE" ]; then
-  # A hard link is a second name for one inode, and a redirect writes THROUGH
-  # it: the other name changes too, and nothing here can put it back. `ls -ld`
-  # field 2 is the link count on GNU and BSD alike; `stat` spells it differently
-  # on each, and this gate documents bash 3.2 systems as supported.
-  # ⚠ THE PROBE CAN FAIL AS WELL AS LIE, AND ERREXIT WAS EATING THE FIRST. This
-  # assignment sits at the top level under `set -e` and `pipefail`: an `ls` that
-  # exits nonzero -- an I/O error, a permission failure, a stub -- aborted the
-  # gate with status 1 and NO refusal, before the case below could speak. The
-  # control added for this guard supplied a successful `ls` with nonnumeric
-  # output, so it exercised the lie and never the failure: the same
-  # one-shape-of-input gap the guard itself was bought back for.
-  set +e
-  lane_b_links="$(ls -ld "$LANE_B_BASELINE" 2>/dev/null | awk '{print $2}'; exit "${PIPESTATUS[0]}")"
-  lane_b_links_st=$?
-  set -e
-  if [ "$lane_b_links_st" -ne 0 ]; then
-    # refusal:structural
-    echo "REFUSING: could not read the hard-link count of $LANE_B_BASELINE." >&2
-    echo "  The probe itself failed (exit $lane_b_links_st), so the gate cannot" >&2
-    echo "  establish that the baseline has only one name." >&2
-    exit 2
-  fi
-  case "${lane_b_links:-}" in
-    ''|*[!0-9]*)
-      # refusal:structural
-      echo "REFUSING: could not read the hard-link count of $LANE_B_BASELINE." >&2
-      exit 2
-      ;;
-  esac
-  if [ "$lane_b_links" -gt 1 ]; then
-    # refusal:structural
-    echo "REFUSING: $LANE_B_BASELINE has $lane_b_links hard links." >&2
-    echo "  --write-baseline writes through the inode, so every other name for" >&2
-    echo "  it would change and this gate could put none of them back." >&2
-    exit 2
-  fi
-fi
-
+# ⚠ THE HARD-LINK REFUSAL IS GONE, BECAUSE THE PREMISE IT RESTED ON IS.
+# It used to read: "a hard link is a second name for one inode, and a redirect
+# writes THROUGH it: the other name changes too, and nothing here can put it
+# back." That was true while the writer redirected onto the baseline. It does
+# not redirect onto the baseline any more -- it serialises into a private
+# directory and installs the result with `mv -fT`, and a rename replaces the
+# DIRECTORY ENTRY, leaving every other link to the old inode untouched.
+# Measured, with a second link to the baseline standing:
+#
+#   before   link count 2   other name reads ORIGINAL
+#   mv -fT   baseline reads NEW   other name still reads ORIGINAL   count 1
+#
+# So the guard turned a safe shape -- a checkout or cache that materialises the
+# baseline with a second link -- into exit 2 for a hazard that no longer exists.
+# A refusal whose reason has been repaired away is not conservative; it is a
+# false failure with a confident message. Removed with its two controls.
+#
+# The probe it used, `ls -ld` on the baseline, was also the hook a different
+# control used to swap the parent directory mid-run. That control now hooks the
+# `git ls-files` below instead: a hook living inside a step does not survive
+# that step being replaced, and this is the second time that rule has been paid.
 lane_b_mode="$(git ls-files -s -- "$LANE_B_BASELINE" | awk '{print $1}' || true)"
 case "${lane_b_mode:-}" in
   120000)
@@ -2835,6 +2817,27 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # directory cannot be entered by anyone else. Two refusals and their two
     # pre-existence checks go away with it -- the states they enumerated are no
     # longer reachable.
+    # ⚠ MODE 700 PROTECTS THE DIRECTORY, NOT ITS NAME. Review round 4: after
+    # `mkdir` returns, a process with the same uid -- or anyone able to rename
+    # entries in a group-writable scripts/ -- can move this directory aside and
+    # leave a symlink standing at the name. Every later use of the NAME would then
+    # resolve elsewhere, and the write-aside redirect would follow a planted
+    # `new`. The mode answers "who may enter"; it says nothing about "which
+    # directory this name means, one instruction later".
+    #
+    # So the name is used exactly once. The run ENTERS the directory it created
+    # and holds it as its working directory: from there `new` and `probe` resolve
+    # against a held inode, which a rename of the name cannot reach. Measured --
+    # the directory renamed away and a symlink to elsewhere planted at the name,
+    # mid-run: the bare-name write landed in the renamed directory and the
+    # symlink's target was untouched.
+    #
+    # The install crosses back with `../<leaf>`, and `..` resolves from the held
+    # directory's own inode rather than from any path, so it is the real parent
+    # even after the name is swapped. The one state that defeats it is the whole
+    # directory being MOVED to a different parent, which changes what `..` means.
+    # That is checked by identity immediately before the install.
+    lane_b_anchor_ino="$(ls -di . 2>/dev/null | awk '{print $1}')"
     lane_b_workdir="$lane_b_leaf.write.d"
     if ! mkdir -m 700 "$lane_b_workdir" 2>/dev/null; then
       # refusal:structural
@@ -2845,7 +2848,23 @@ if [ "${1:-}" = "--write-baseline" ]; then
       echo "  writable. Nothing was followed and nothing was written." >&2
       exit 2
     fi
-    lane_b_tmp="$lane_b_workdir/new"
+    if ! cd -P "$lane_b_workdir"; then
+      # refusal:structural
+      echo "REFUSING: could not enter the private write directory." >&2
+      echo "  This run created it a moment ago. Failing to enter it means the" >&2
+      echo "  name no longer refers to it, so nothing is written." >&2
+      rm -rf "$lane_b_workdir"
+      exit 2
+    fi
+    lane_b_scrub() {
+      # Only ever removes the directory from the parent it was created in. If `..`
+      # is not the anchored directory, leave the filesystem alone: a cleanup that
+      # resolves a name it no longer trusts is a delete somewhere else.
+      [ "$(ls -di .. 2>/dev/null | awk '{print $1}')" = "$lane_b_anchor_ino" ] || return 0
+      cd -P .. 2>/dev/null || return 0
+      rm -rf "$lane_b_workdir"
+    }
+    lane_b_tmp=new
     #
     # Opened ONCE, in this shell, and its status read. A probe in a subshell
     # would create the file and then make the real open fail on its own probe --
@@ -2874,7 +2893,7 @@ if [ "${1:-}" = "--write-baseline" ]; then
       echo "REFUSING: could not create the write-aside for the baseline." >&2
       echo "  The private directory was created a moment ago and is empty, so" >&2
       echo "  nothing stands at this path: the filesystem refused a new file." >&2
-      rm -rf "$lane_b_workdir"
+      lane_b_scrub
       exit 2
     fi
   {
@@ -2920,7 +2939,7 @@ if [ "${1:-}" = "--write-baseline" ]; then
     echo "REFUSING: could not write the baseline (serialisation failed)." >&2
     echo "  The partial file is removed rather than renamed into place." >&2
     exec 9>&-
-    rm -rf "$lane_b_workdir"
+    lane_b_scrub
     exit 2
   }
   exec 9>&-
@@ -2952,14 +2971,14 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # deleted rather than hardened. The rename is still measured on the real
     # filesystem, which is what the probe is for: this is a subdirectory of the
     # baseline's own directory, not a temporary somewhere else.
-    lane_b_tprobe="$lane_b_workdir/probe"
-    lane_b_tprobe_dst="$lane_b_workdir/probe.dst"
+    lane_b_tprobe=probe
+    lane_b_tprobe_dst=probe.dst
     : > "$lane_b_tprobe" || {
       # refusal:structural
       echo "REFUSING: could not create the rename probe." >&2
       echo "  Its directory was created by this run and is private, so this is" >&2
       echo "  the filesystem refusing a new file rather than anything planted." >&2
-      rm -rf "$lane_b_workdir"
+      lane_b_scrub
       exit 2
     }
     lane_b_have_T=no
@@ -2976,15 +2995,27 @@ if [ "${1:-}" = "--write-baseline" ]; then
       echo "  the rename move the new baseline INSIDE that directory while this" >&2
       echo "  gate reports success. Refusing to write rather than report a write" >&2
       echo "  that did not happen." >&2
-      rm -rf "$lane_b_workdir"
+      lane_b_scrub
       exit 2
     fi
-    mv -fT "$lane_b_tmp" "$lane_b_leaf" || {
+    # ⚠ IDENTITY, NOT A PATH, IMMEDIATELY BEFORE THE INSTALL. `..` from the held
+    # directory is its real parent unless the directory itself was moved into a
+    # different one. That is the single state the held cwd does not cover, and it
+    # is cheap to name: the parent's inode must still be the one anchored above.
+    if [ "$(ls -di .. 2>/dev/null | awk '{print $1}')" != "$lane_b_anchor_ino" ]; then
+      # refusal:structural
+      echo "REFUSING: the private write directory is no longer where it was made." >&2
+      echo "  Its parent is not the directory this run anchored, so installing" >&2
+      echo "  through it would put the baseline somewhere this gate did not" >&2
+      echo "  choose. The serialised file is left where it is rather than moved." >&2
+      exit 2
+    fi
+    mv -fT "$lane_b_tmp" "../$lane_b_leaf" || {
       echo "REFUSING: could not put the new baseline in place." >&2
-      rm -rf "$lane_b_workdir"
+      lane_b_scrub
       exit 2
     }
-    rm -rf "$lane_b_workdir"
+    lane_b_scrub
   ) || exit $?
   echo "WROTE $LANE_B_BASELINE"
   # The EXIT trap treats rc=0 without this as a run that died mid-flight, which

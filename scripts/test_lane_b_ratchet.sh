@@ -736,7 +736,7 @@ lane_b_swapstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
   echo '#!/bin/sh'
   printf 'REAL_MV=%q\n' "$(command -v mv)"
   echo 'case " $* " in'
-  echo '  *public-surface-lane-b-baseline.txt.write.d/new*)'
+  echo '  *../public-surface-lane-b-baseline.txt*)'
   printf '    "$REAL_MV" %q %q 2>/dev/null &&\n' "$PWD/scripts" "$PWD/scripts.real"
   printf '      ln -s %q %q 2>/dev/null &&\n' "$lane_b_outside/scripts" "$PWD/scripts"
   printf '      : > %q\n' "$lane_b_outside/.hook-fired"
@@ -841,17 +841,17 @@ for lane_b_shape in file dir; do
   lane_b_leafstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
   {
     echo '#!/bin/sh'
-    printf 'REAL_LS=%q\n' "$(command -v ls)"
+    printf 'REAL_LS=%q\n' "$(command -v git)"
     echo 'case "$*" in'
-    echo '  "-ld scripts/public-surface-lane-b-baseline.txt")'
+    echo '  "ls-files -s -- scripts/public-surface-lane-b-baseline.txt")'
     echo '    rm -f scripts/public-surface-lane-b-baseline.txt 2>/dev/null'
     printf '    ln -s %q scripts/public-surface-lane-b-baseline.txt 2>/dev/null &&\n' "$lane_b_leaftgt"
     printf '      : > %q\n' "$lane_b_leafout/.hook-fired"
     echo '    ;;'
     echo 'esac'
     echo 'exec "$REAL_LS" "$@"'
-  } > "$lane_b_leafstub/ls"
-  chmod +x "$lane_b_leafstub/ls"
+  } > "$lane_b_leafstub/git"
+  chmod +x "$lane_b_leafstub/git"
   checks=$((checks + 1))
   lane_b_leaf_label="a leaf swapped in before the write is replaced, not followed (target: $lane_b_shape)"
   lane_b_leaf_rc=0
@@ -894,7 +894,7 @@ done
 lane_b_mvstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
-  echo 'case " $* " in *public-surface-lane-b-baseline.txt.write.d/new*) exit 1 ;; esac'
+  echo 'case " $* " in *../public-surface-lane-b-baseline.txt*) exit 1 ;; esac'
   printf 'exec %q "$@"\n' "$(command -v mv)"
 } > "$lane_b_mvstub/mv"
 chmod +x "$lane_b_mvstub/mv"
@@ -1006,21 +1006,23 @@ restore
 # reads $SELF out of scripts/ and refuses for a different reason entirely. So
 # the hook is the same `ls -ld` probe -- but the stub defers to the real `ls`
 # FIRST and swaps afterwards, because the gate consumes that probe's output
-# immediately and a failed probe would fire the hard-link refusal instead.
+# immediately. Both stubs hooked the `ls -ld` link-count probe until that
+# probe was deleted with the refusal it served: a hook inside a step does
+# not survive the step being replaced, and this is where that rule was paid.
 lane_b_cdstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
-  printf 'REAL_LS=%q\n' "$(command -v ls)"
+  printf 'REAL_LS=%q\n' "$(command -v git)"
   echo 'case "$*" in'
-  echo '  "-ld scripts/public-surface-lane-b-baseline.txt")'
+  echo '  "ls-files -s -- scripts/public-surface-lane-b-baseline.txt")'
   echo '    out="$("$REAL_LS" "$@" 2>&1)"; st=$?'
   echo '    mv scripts scripts.real 2>/dev/null && : > scripts 2>/dev/null'
   echo '    printf "%s\n" "$out"; exit "$st"'
   echo '    ;;'
   echo 'esac'
   echo 'exec "$REAL_LS" "$@"'
-} > "$lane_b_cdstub/ls"
-chmod +x "$lane_b_cdstub/ls"
+} > "$lane_b_cdstub/git"
+chmod +x "$lane_b_cdstub/git"
 checks=$((checks + 1))
 lane_b_cd_rc=0
 lane_b_cd_out="$(env "PATH=$lane_b_cdstub:$PATH" "$GATE" --write-baseline 2>&1)" || lane_b_cd_rc=$?
@@ -1032,37 +1034,6 @@ rm -rf "$lane_b_cdstub"
 restore
 restore
 
-# ⚠ AND THE UNREADABLE LINK COUNT. The hard-link scene only ever supplies a
-# valid count greater than one, so the branch that refuses when `ls -ld` gives
-# something non-numeric was uncovered -- and that branch is what stops the gate
-# writing without having established the baseline has one name. A stub whose
-# `ls -ld` returns a non-numeric second field, deferring to the real one for
-# every other invocation.
-#
-# ⚠ AND IT HAS TWO FORMS OF INPUT, WHICH IS WHY IT IS EXTENDED RATHER THAN
-# JOINED BY A NEW CONTROL. The probe can LIE (exit 0, nonsense in field 2) or it
-# can FAIL (nonzero exit). Only the lie was driven, and the failure went to a
-# different place entirely: the assignment sits under errexit, so a failing `ls`
-# killed the gate with status 1 and no refusal at all. A second control with its
-# own name would have hidden that the first one was half an axis; the label
-# carries the form instead, so the pair reads as one guard with two points.
-for lane_b_form in nonnumeric probe-fails; do
-  lane_b_lsstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
-  {
-    echo '#!/bin/sh'
-    if [ "$lane_b_form" = nonnumeric ]; then
-      echo 'case " $* " in *public-surface-lane-b-baseline.txt*) echo "-rw-r--r-- ? nobody nobody 0 Jan 1 00:00 x"; exit 0 ;; esac'
-    else
-      echo 'case " $* " in *public-surface-lane-b-baseline.txt*) exit 1 ;; esac'
-    fi
-    printf 'exec %q "$@"\n' "$(command -v ls)"
-  } > "$lane_b_lsstub/ls"
-  chmod +x "$lane_b_lsstub/ls"
-  expect_env "an unreadable link count refuses ($lane_b_form)" \
-    "PATH=$lane_b_lsstub:$PATH" 2 "could not read the hard-link count"
-  rm -rf "$lane_b_lsstub"
-  restore
-done
 
 # ⚠ TWO LEVERS, PERMISSIONS FIRST, EACH PROBED. The first version reached for
 # the immutable attribute because that is what works HERE, where the harness can
@@ -1222,10 +1193,12 @@ expect_env "an unreadable occurrence pass refuses" \
 rm -rf "$STUB"
 
 # A hard link is a second name for one inode and a redirect writes THROUGH it.
-ln "$BASELINE" "$BASELINE.hard"
-expect "a hard-linked baseline refuses" 2 "hard links"
-rm -f "$BASELINE.hard"
-restore
+# ⚠ THREE CONTROLS REMOVED AROUND HERE, NOT RENUMBERED AWAY. They asserted the
+# gate's hard-link refusal and its two unreadable-count branches. The refusal is
+# gone: the writer installs by rename now, so a second link to the baseline is a
+# safe shape and refusing it was a false failure with a confident message. A
+# control for a deleted refusal is not lost coverage; keeping it would have been
+# coverage of nothing.
 
 # ⚠ NOT STAGED, DELIBERATELY. Staging a symlink puts mode 120000 in the index,
 # so the INDEX check fires and this one is never reached. The two refusals exist
@@ -1354,7 +1327,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=42
+EXPECTED_CHECKS=39
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
