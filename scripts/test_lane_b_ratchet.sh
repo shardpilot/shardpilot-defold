@@ -1227,39 +1227,45 @@ restore
 # ⚠ THE PAID PATH, WHICH NOTHING HERE HAD EVER RUN. When the last lane B
 # occurrence is gone the scan produces nothing, and round 7 lifted the file count
 # into an assignment of its own -- where `grep -c .` printing 0 and exiting 1
-# killed the gate under errexit before it could say anything. The one outcome
-# this ratchet exists to reach was the one it could not survive, and no control
-# noticed: the comments-only control exits earlier, on a deliberate mismatch.
+# killed the gate under errexit before it could say anything. The outcome this
+# ratchet exists to reach was the one it could not survive.
 #
-# The scene is the debt paid: no Lua in the index at all, and a baseline with
-# nothing but its header. `git reset` puts the index back, because `restore` only
-# knows the paths it was told about.
-lane_b_paid_rc=0
+# ⚠ AND THE WHOLE SCENE IS NOT CONSTRUCTIBLE HERE, WHICH IS ITSELF THE ANSWER TO
+# WHY NOTHING CAUGHT IT. Emptying lane B means removing every internal reference
+# from the Lua sources -- and those are the only places the ROSTER literals
+# appear, so the gate then refuses by design: "a gate against publishing internal
+# names must not be the only thing publishing them". A genuinely paid tree is a
+# coordinated change to the gate's own data, which a control that must not edit
+# the gate cannot stage. Two attempts at the scene failed on that, after a third
+# failed because `git add -A` put back the files it had just removed.
+#
+# So this drives the EXPRESSIONS rather than the scene: the two counting lines are
+# read out of the shipped gate and run under `set -euo pipefail` with an empty
+# scan, which is exactly the state that killed it. Weaker than a full run, and
+# named as weaker -- but it fails against `grep -c` and passes against awk, which
+# is the property that was missing.
+lane_b_count_src="$(grep -E '^lane_b_(files|total)=' "$GATE")"
 checks=$((checks + 1))
-# ⚠ ORDER: STAGE FIRST, THEN UNSTAGE THE LUA. `git add -A` re-adds everything,
-# including the files just removed from the index -- so doing it afterwards put
-# the whole corpus back and the scan found 97 occurrences against a header-only
-# baseline. The control failed, correctly, on a scene it had dismantled itself.
-printf '# format-version: 3\n' > "$BASELINE"
-git add -A >/dev/null 2>&1 || true
-git rm -q --cached -- '*.lua' >/dev/null 2>&1 || true
-lane_b_paid_out="$("$GATE" 2>&1)" || lane_b_paid_rc=$?
-if [ "$lane_b_paid_rc" -ne 0 ]; then
-  echo "FAIL [a fully paid tree finishes the run]: exit $lane_b_paid_rc" >&2
-  printf '%s\n' "$lane_b_paid_out" | tail -3 | sed 's/^/    /' >&2
+if [ -z "$lane_b_count_src" ]; then
+  echo "FAIL [the summary counters survive an empty scan]: no lane_b_files or" >&2
+  echo "  lane_b_total assignment found in $GATE -- the control reads the shipped" >&2
+  echo "  lines by name, and the names moved." >&2
   failures=$((failures + 1))
 else
-  case "$lane_b_paid_out" in
-    *"0 occurrence(s)"*) ;;
-    *)
-      echo "FAIL [a fully paid tree finishes the run]: exit 0, but the summary" >&2
-      echo "  did not report zero occurrences -- so it finished describing" >&2
-      echo "  something other than the paid tree." >&2
-      failures=$((failures + 1)) ;;
-  esac
+  lane_b_count_rc=0
+  lane_b_count_out="$(lane_b_now="" bash -euo pipefail -c "$lane_b_count_src
+printf '%s %s\n' \"\$lane_b_files\" \"\$lane_b_total\"" 2>&1)" || lane_b_count_rc=$?
+  if [ "$lane_b_count_rc" -ne 0 ]; then
+    echo "FAIL [the summary counters survive an empty scan]: the shipped lines" >&2
+    echo "  exited $lane_b_count_rc on a paid tree. Under errexit that is the gate" >&2
+    echo "  dying before its dead-run marker and before any summary." >&2
+    failures=$((failures + 1))
+  elif [ "$lane_b_count_out" != "0 0" ]; then
+    echo "FAIL [the summary counters survive an empty scan]: got" >&2
+    echo "  '$lane_b_count_out', expected '0 0'." >&2
+    failures=$((failures + 1))
+  fi
 fi
-git reset -q HEAD -- . >/dev/null 2>&1 || true
-git checkout -q HEAD -- . >/dev/null 2>&1 || true
 restore
 
 # ⚠ THE TARGET THAT PREDATES THE BASELINE -- which is this change's own CI case.
