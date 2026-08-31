@@ -229,6 +229,8 @@ trap 'rm -f ${LANE_B_TMPFILES[@]+"${LANE_B_TMPFILES[@]}"}' EXIT
 
 
 GATE=scripts/check_public_surface.sh
+# ⚠ ABSOLUTE, because the selector controls run it from other directories.
+SELECTOR="$PWD/scripts/lane_b_base_ref.sh"
 BASELINE=scripts/public-surface-lane-b-baseline.txt
 # ⚠ THE PIN IS GONE WITH THE OVERRIDE. This used to unset and re-export
 # LANE_B_BASELINE so nothing could redirect the gate's writer at an arbitrary
@@ -1374,7 +1376,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=40
+EXPECTED_CHECKS=48
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1387,11 +1389,31 @@ EXPECTED_CHECKS=40
 #
 # So the count is read out of the workflow and compared to the enforced one. It
 # is the same rule as EXPECTED_CHECKS itself, applied one file over.
-# ⚠ THE COMPARISON-BASE SELECTION AND ITS EIGHT CONTROLS LIVE IN A FOLLOW-UP.
-# That step had been wrong six times, and every fix produced the next defect; it
-# is split out so this ratchet can be judged on its own and that policy can churn
-# without holding it. What stays here is the gate's END of the contract, below:
-# what it does when it is told the target has no ancestry.
+# ⚠ THE COMPARISON BASE, WHICH NOTHING HERE USED TO EXECUTE. Four defects lived
+# in three lines of workflow YAML: the variable never set, a new ref compared
+# against the default branch, the mutable `github.ref` making the base the commit
+# under test, and a previously FAILED tip trusted as an accepted base. All four
+# were found by reading. The choice is a script now, and these drive it.
+#
+# Each control asserts WHICH ANSWER, not an exit code: these cases differ by the
+# rev they choose, and every wrong choice still exits 0.
+base_ref_case() {  # label want -- args...
+  local label="$1" want="$2"; shift 2
+  [ "${1:-}" = -- ] && shift
+  local got rc=0
+  checks=$((checks + 1))
+  got="$("$SELECTOR" "$@" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL [$label]: the selector exited $rc rather than choosing" >&2
+    printf '%s\n' "$got" | sed 's/^/    /' >&2
+    failures=$((failures + 1))
+  elif [ "$got" != "$want" ]; then
+    echo "FAIL [$label]: chose '$got', expected '$want'" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+lane_b_zero=0000000000000000000000000000000000000000
 
 # ⚠ AND THE GATE'S END OF THE CONTRACT. The controls below drive the CHOICE;
 # this one drives what the gate does when the choice is EMPTY. Measuring that by
@@ -1401,6 +1423,113 @@ EXPECTED_CHECKS=40
 expect_env "an empty target counts every occurrence as new" \
   "PUBLIC_SURFACE_BASE_REF=EMPTY" 1 "absent from"
 
+
+base_ref_case "a pull request uses its own base sha" "feedface" -- \
+  --event pull_request --pr-base feedface --before cafe1234 --sha aaaa \
+  --ref refs/heads/topic --default-branch main
+
+base_ref_case "an all-zero pr base is absence, not a rev" "cafe1234" -- \
+  --event push --pr-base "$lane_b_zero" --before cafe1234 --sha aaaa \
+  --ref refs/heads/main --default-branch main
+
+base_ref_case "a push to the trunk uses its previous tip" "cafe1234" -- \
+  --event push --before cafe1234 --sha aaaa --ref refs/heads/main --default-branch main
+
+base_ref_case "a trunk push with no previous tip has no ancestry" "EMPTY" -- \
+  --event push --before "$lane_b_zero" --sha aaaa --ref refs/heads/main --default-branch main
+
+# ⚠ A REAL REPOSITORY, BECAUSE THE REMAINING CASES ARE GIT QUESTIONS. The scene
+# is exactly the one review round 5 described: push A raises lane B material on a
+# branch and fails; push B is an empty commit whose `before` is A. Trusting
+# `before` compares B against A and sees no increase.
+lane_b_brrepo="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+(
+  cd "$lane_b_brrepo"
+  git init -q .
+  git -c user.email=t@invalid -c user.name=t commit -q --allow-empty -m root
+  git branch -M main
+  git -c user.email=t@invalid -c user.name=t commit -q --allow-empty -m "main moves on"
+  git checkout -q -b feature main~1
+  git -c user.email=t@invalid -c user.name=t commit -q --allow-empty -m "push A: raises lane B"
+  git -c user.email=t@invalid -c user.name=t commit -q --allow-empty -m "push B: empty"
+  git update-ref refs/remotes/origin/main main
+) >/dev/null 2>&1
+lane_b_branchpoint="$(git -C "$lane_b_brrepo" rev-parse main~1)"
+lane_b_pushA="$(git -C "$lane_b_brrepo" rev-parse feature~1)"
+lane_b_tip="$(git -C "$lane_b_brrepo" rev-parse feature)"
+
+lane_b_selector_out=""
+lane_b_selector_rc=0
+checks=$((checks + 1))
+lane_b_selector_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --before "$lane_b_pushA" --sha "$lane_b_tip" \
+  --ref refs/heads/feature --default-branch main) 2>&1 )" || lane_b_selector_rc=$?
+if [ "$lane_b_selector_rc" -ne 0 ]; then
+  echo "FAIL [a branch push is measured from where it left the trunk]: exit $lane_b_selector_rc" >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_selector_out" = "$lane_b_pushA" ]; then
+  echo "FAIL [a branch push is measured from where it left the trunk]: it chose" >&2
+  echo "  the previous tip, which is the push this gate may already have" >&2
+  echo "  rejected. An empty follow-up commit would then pass while carrying" >&2
+  echo "  exactly the material that failed." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_selector_out" != "$lane_b_branchpoint
+$lane_b_pushA" ]; then
+  echo "FAIL [a branch push is measured from where it left the trunk]: chose" >&2
+  printf '%s\n' "$lane_b_selector_out" | sed 's/^/    /' >&2
+  echo "  expected BOTH, one per line: the merge base $lane_b_branchpoint" >&2
+  echo "  and the previous tip $lane_b_pushA. Each covers the other's gap --" >&2
+  echo "  the merge base alone turns a reduction into reusable slack, and the" >&2
+  echo "  previous tip alone carries a rejected tip's material through." >&2
+  failures=$((failures + 1))
+fi
+
+# ⚠ AND NOT TWICE ON A BRANCH'S FIRST PUSH, where the two answers coincide. A
+# caller running the same comparison twice reports one failure as two.
+lane_b_dedup_out=""
+lane_b_dedup_rc=0
+checks=$((checks + 1))
+lane_b_dedup_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --before "$lane_b_branchpoint" --sha "$lane_b_tip" \
+  --ref refs/heads/feature --default-branch main) 2>&1 )" || lane_b_dedup_rc=$?
+if [ "$lane_b_dedup_rc" -ne 0 ] || [ "$lane_b_dedup_out" != "$lane_b_branchpoint" ]; then
+  echo "FAIL [coinciding bases are emitted once]: chose" >&2
+  printf '%s\n' "$lane_b_dedup_out" | sed 's/^/    /' >&2
+  echo "  expected the single rev $lane_b_branchpoint (exit $lane_b_dedup_rc)." >&2
+  failures=$((failures + 1))
+fi
+
+# An orphan branch shares no history with the trunk, so there is no accepted
+# ancestry to grandfather anything -- and borrowing the trunk's slack is the
+# defect this replaces.
+(
+  cd "$lane_b_brrepo"
+  git checkout -q --orphan orphan
+  git rm -rq --cached . 2>/dev/null || true
+  git -c user.email=t@invalid -c user.name=t commit -q --allow-empty -m orphan
+) >/dev/null 2>&1
+lane_b_orphan="$(git -C "$lane_b_brrepo" rev-parse orphan)"
+lane_b_orphan_out=""
+lane_b_orphan_rc=0
+checks=$((checks + 1))
+lane_b_orphan_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --before "$lane_b_zero" --sha "$lane_b_orphan" \
+  --ref refs/heads/orphan --default-branch main) 2>&1 )" || lane_b_orphan_rc=$?
+if [ "$lane_b_orphan_rc" -ne 0 ] || [ "$lane_b_orphan_out" != EMPTY ]; then
+  echo "FAIL [a ref with no shared history compares against nothing]: chose" >&2
+  echo "  '$lane_b_orphan_out' (exit $lane_b_orphan_rc), expected EMPTY. Falling" >&2
+  echo "  back to the trunk lets an unrelated ref pass on the trunk's slack." >&2
+  failures=$((failures + 1))
+fi
+rm -rf "$lane_b_brrepo"
+
+# The refusals: a missing commit, and a flag the caller and this file disagree on.
+lane_b_sel_rc=0
+checks=$((checks + 1))
+lane_b_sel_out="$("$SELECTOR" --event push --before cafe1234 --ref refs/heads/topic \
+  --default-branch main 2>&1)" || lane_b_sel_rc=$?
+judge "a push with no commit of its own refuses" "$lane_b_sel_rc" 2 \
+  "--sha is required" "$lane_b_sel_out"
 
 lane_b_ciyml=".github/workflows/ci.yml"
 checks=$((checks + 1))

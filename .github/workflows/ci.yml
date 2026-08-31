@@ -105,37 +105,67 @@ jobs:
       # false in this repository: a check that never runs is worse than an
       # absent one, because it manufactures the appearance of a check.
       #
-      # ⚠ EVERY PULL REQUEST IS COMPARED; PUSH EVENTS ARE THE FOLLOW-UP. A pull
-      # request carries its own base sha, which is the tree the change lands on
-      # and the most accurate target available -- so the anti-cheat runs on every
-      # PR, which is how changes reach this repository.
+      # ⚠ THE CHOICE LIVES IN A SCRIPT NOW, BECAUSE IT WAS WRONG FOUR TIMES.
+      # It was never set, so the comparison never ran while the gate printed "CI
+      # sets it"; then a new ref was compared against the DEFAULT BRANCH, which
+      # it does not descend from; then the fix for that read the MUTABLE
+      # `github.ref`, so a second push made the base the commit under test; then
+      # a root ref fell back to the default branch again, and a previously FAILED
+      # tip was trusted as an accepted base. Four defects, three lines of YAML,
+      # every one found by reading -- because nothing executed the choice.
       #
-      # Push events (branches, tags, refs with no shared history) need a choice
-      # rather than a field, and that choice had been wrong six times in three
-      # lines of YAML -- never set, the default branch, a mutable ref, a failed
-      # tip, a root ref, and reductions turned into reusable slack. It is a
-      # driven unit in its own change rather than a seventh guess here.
-      #
-      # ⚠ SO THIS IS A STATED GAP, NOT AN OVERSIGHT: a push to a branch with no
-      # open pull request is not compared against anything. The gate still runs
-      # and still holds the baseline against the tree; what it cannot do on that
-      # path is catch a baseline edited upward in the same commit.
+      # scripts/lane_b_base_ref.sh is that choice with inputs and one output, and
+      # the ratchet harness drives every case. This step only fetches what the
+      # script names. The rules it applies, and why, are documented there.
       - name: Fetch the comparison base for the lane B ratchet
         run: |
           set -euo pipefail
-          base='${{ github.event.pull_request.base.sha }}'
-          if [ -n "$base" ]; then
-            git fetch --depth=1 origin "$base"
-            echo "SP_LANE_B_BASE=$base" >> "$GITHUB_ENV"
-          fi
+          # The merge base needs history on both sides, so the default branch is
+          # fetched and the checkout deepened. Both are best-effort: when they
+          # fail the selection below falls to EMPTY, which is strict rather than
+          # permissive -- the failure mode of a missing history is a refusal, not
+          # a skipped comparison.
+          git fetch --no-tags origin \
+            "+refs/heads/${{ github.event.repository.default_branch }}:refs/remotes/origin/${{ github.event.repository.default_branch }}" || true
+          git fetch --unshallow origin 2>/dev/null || true
+          bases="$(./scripts/lane_b_base_ref.sh \
+            --event '${{ github.event_name }}' \
+            --pr-base '${{ github.event.pull_request.base.sha }}' \
+            --before '${{ github.event.before }}' \
+            --sha '${{ github.sha }}' \
+            --ref '${{ github.ref }}' \
+            --default-branch '${{ github.event.repository.default_branch }}')"
+          for base in $bases; do
+            [ "$base" = EMPTY ] && continue
+            git fetch --depth=1 origin "$base" 2>/dev/null || true
+          done
+          # Space-separated: a git revision contains no spaces, and GITHUB_ENV
+          # needs a heredoc delimiter for anything multi-line.
+          echo "SP_LANE_B_BASES=$(printf '%s ' $bases)" >> "$GITHUB_ENV"
 
       # This repository is already public, so it is NOT in the org's
       # publication-candidate list and nothing else scans it. The script's
       # header states which lane is gated and which is only reported.
+      # ⚠ ONCE PER BASE, AND ZERO RUNS IS A REFUSAL. The selector emits one or
+      # more accepted states and the count may rise against none of them; a rise
+      # against any of them is a rise. An empty list would run the gate no times
+      # at all and report success, which is the shape of every defect this step
+      # has produced -- so it is refused rather than treated as "nothing to do".
       - name: No internal material in the published non-source surface
-        run: ./scripts/check_public_surface.sh
-        env:
-          PUBLIC_SURFACE_BASE_REF: ${{ env.SP_LANE_B_BASE }}
+        run: |
+          set -euo pipefail
+          ran=0
+          for base in ${SP_LANE_B_BASES:-}; do
+            echo "== lane B comparison base: $base"
+            PUBLIC_SURFACE_BASE_REF="$base" ./scripts/check_public_surface.sh
+            ran=$((ran + 1))
+          done
+          if [ "$ran" -eq 0 ]; then
+            echo "REFUSING: no lane B comparison base was selected." >&2
+            echo "  The gate did not run. A step that checks nothing must not" >&2
+            echo "  report success." >&2
+            exit 2
+          fi
 
   # ⚠ ITS OWN JOB, AND THE SHARED CLOCK IS WHY. This ran inside `static`, whose
   # budget is ten minutes shared with checkout, syntax, the library and version
@@ -154,7 +184,7 @@ jobs:
   #
   # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
   # FOURTEEN controls, which is what this harness had before the sibling's
-  # lineage was ported into it, and this harness is at 40 controls now. The
+  # lineage was ported into it, and this harness is at 48 controls now. The
   # bound is re-argued from a measurement taken at the SHIPPING count: a figure
   # derived for a different configuration is not a measurement of this one,
   # which is the mistake this comment already records the sibling making.
@@ -162,7 +192,7 @@ jobs:
   # Measured on this rig: 353.7s for 35 controls, 10.1s each (2026-08-31). The
   # slow review datum -- 55s per control -- stays a floor rather than a duration,
   # because that run did not finish. The budget is sized from the floor, not from
-  # the fast rig: 40 x 55s is 2200s, so the arithmetic demands 37 minutes.
+  # the fast rig: 48 x 55s is 2640s, so the arithmetic demands 44 minutes.
   #
   # Shipping 50 rather than 39. The floor is what the control enforces; the
   # margin above it is a separate decision, and 40 would have been one control
