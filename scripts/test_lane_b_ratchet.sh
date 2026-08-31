@@ -910,6 +910,41 @@ rm -rf "$lane_b_mvstub"
 # a pre-GNU mv would, and defers otherwise -- so the gate's behavioural probe
 # concludes the option is missing and refuses instead of using semantics it has
 # measured to be unsafe.
+# ⚠ THE WINDOW BETWEEN `mkdir` AND `cd`, WHICH THE HELD DIRECTORY DOES NOT COVER.
+# Holding the directory makes every later bare name safe, but the run still has to
+# NAME it once, to enter it. Between the create and the entry a process that can
+# rename in scripts/ can move the new directory aside and leave a symlink at the
+# name, and the gate would then enter, serialise into, and install from a
+# directory it did not make.
+#
+# That window cannot be closed in shell -- there is no open-and-enter primitive
+# here -- so it is caught rather than prevented: after entering, `..` must still
+# be the directory the run anchored, checked by inode immediately before the
+# install. This control is what makes that a check rather than a claim. A stub
+# `mkdir` creates the directory for real, then performs exactly the swap
+# described, so the gate enters a planted directory whose parent is elsewhere.
+lane_b_stolen="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+lane_b_mkstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+{
+  echo '#!/bin/sh'
+  printf 'REAL_MKDIR=%q\n' "$(command -v mkdir)"
+  echo 'case " $* " in'
+  echo '  *public-surface-lane-b-baseline.txt.write.d*)'
+  echo '    "$REAL_MKDIR" "$@" || exit $?'
+  printf '    mv public-surface-lane-b-baseline.txt.write.d %q/taken 2>/dev/null &&\n' "$lane_b_stolen"
+  printf '      ln -s %q/taken public-surface-lane-b-baseline.txt.write.d 2>/dev/null\n' "$lane_b_stolen"
+  echo '    exit 0'
+  echo '    ;;'
+  echo 'esac'
+  echo 'exec "$REAL_MKDIR" "$@"'
+} > "$lane_b_mkstub/mkdir"
+chmod +x "$lane_b_mkstub/mkdir"
+expect_env "a private directory moved out of its parent refuses" \
+  "PATH=$lane_b_mkstub:$PATH" 2 "no longer where it was made" --write-baseline
+rm -f scripts/public-surface-lane-b-baseline.txt.write.d
+rm -rf "$lane_b_mkstub" "$lane_b_stolen"
+restore
+
 lane_b_notstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
@@ -1327,7 +1362,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=39
+EXPECTED_CHECKS=40
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
