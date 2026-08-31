@@ -1364,7 +1364,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=46
+EXPECTED_CHECKS=47
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1402,6 +1402,15 @@ base_ref_case() {  # label want -- args...
 }
 
 lane_b_zero=0000000000000000000000000000000000000000
+
+# ⚠ AND THE GATE'S END OF THE CONTRACT. The controls below drive the CHOICE;
+# this one drives what the gate does when the choice is EMPTY. Measuring that by
+# hand is how the first version of this mode shipped passing: it set the target
+# baseline and never reached the comparison, because the comparison lives inside
+# the branch it had skipped past, and a hand-run reads exit 0 as "fine".
+expect_env "an empty target counts every occurrence as new" \
+  "PUBLIC_SURFACE_BASE_REF=EMPTY" 1 "absent from"
+
 
 base_ref_case "a pull request uses its own base sha" "feedface" -- \
   --event pull_request --pr-base feedface --before cafe1234 --sha aaaa \
