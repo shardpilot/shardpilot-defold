@@ -2810,12 +2810,42 @@ if [ "${1:-}" = "--write-baseline" ]; then
     #   set -C > t   nothing at the path       rc 0
     #   set -C > t   regular / symlink-to-file / symlink-to-dir / dangling
     #                                          rc 1, outside file intact
+    #   set -C > t   with t a FIFO             BLOCKS FOREVER
     #
-    # `set -C` makes bash open with O_CREAT|O_EXCL, and O_EXCL refuses a symlink,
-    # even a dangling one -- so the open IS the check, with no window between
-    # them. The random suffix is not the guarantee, only a way to stop a blind
-    # pre-creation from turning every write into a refusal.
-    lane_b_tmp="$lane_b_leaf.tmp.$$.${RANDOM}${RANDOM}"
+    # ⚠ THAT LAST ROW IS WHY THIS NO LONGER USES `set -C`, AND THE ROW ABOVE IT
+    # IS WHY THE CLAIM SURVIVED SO LONG. This file used to say "`set -C` makes
+    # bash open with O_CREAT|O_EXCL, so the open IS the check". That is true of
+    # regular files and symlinks, and the four shapes measured were all of those.
+    # noclobber is specified for REGULAR files: against a FIFO bash opens the
+    # existing entry and waits for a reader, so the exclusive-create refusal is
+    # never reached and the job hangs until its CI timeout. Measured on bash 5.2:
+    # `set -C; : > fifo` had not returned after five seconds. An enumeration that
+    # omits a case is not a proof about the case it omits.
+    #
+    # ⚠ SO THE PRIMITIVE IS `mkdir`, WHICH HAS NO SUCH CARVE-OUT. It is atomic,
+    # it never follows a symlink for the final component, and it fails EEXIST
+    # against every shape. Measured, all six: directory, regular file,
+    # symlink-to-directory, symlink-to-file, dangling symlink, FIFO -- rc 1,
+    # "File exists", no hang and nothing followed.
+    #
+    # Both temporaries then live INSIDE a directory this run created and owns at
+    # mode 700. That removes the check-then-create race rather than narrowing it:
+    # there is no window in which another process can plant anything at either
+    # path, because neither path exists until the directory does, and the
+    # directory cannot be entered by anyone else. Two refusals and their two
+    # pre-existence checks go away with it -- the states they enumerated are no
+    # longer reachable.
+    lane_b_workdir="$lane_b_leaf.write.d"
+    if ! mkdir -m 700 "$lane_b_workdir" 2>/dev/null; then
+      # refusal:structural
+      echo "REFUSING: could not create the private write directory." >&2
+      echo "  Expected to create $(dirname "$LANE_B_BASELINE")/$lane_b_workdir" >&2
+      echo "  and own it. Something already stands there -- a leftover from a" >&2
+      echo "  killed run, or something planted -- or the directory is not" >&2
+      echo "  writable. Nothing was followed and nothing was written." >&2
+      exit 2
+    fi
+    lane_b_tmp="$lane_b_workdir/new"
     #
     # Opened ONCE, in this shell, and its status read. A probe in a subshell
     # would create the file and then make the real open fail on its own probe --
@@ -2832,9 +2862,7 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # judge() separates "wrong exit" from "right exit, wrong reason" -- the exit
     # was 2, exactly as expected, and only the reason showed the damage.
     lane_b_aside=yes
-    set -C
     exec 9>"$lane_b_tmp" || lane_b_aside=no
-    set +C
     if [ "$lane_b_aside" = no ]; then
       # refusal:structural
       # ⚠ ITS OWN MESSAGE, BECAUSE SHARING ONE HID A COVERAGE GAP. This said
@@ -2844,13 +2872,9 @@ if [ "${1:-}" = "--write-baseline" ]; then
       # partial-write handler below could be deleted with every control green.
       # A shared message is a shared alibi.
       echo "REFUSING: could not create the write-aside for the baseline." >&2
-      if [ -e "$lane_b_tmp" ] || [ -L "$lane_b_tmp" ]; then
-        echo "  Something already stands at the write-aside path. An exclusive" >&2
-        echo "  create refuses it rather than writing through whatever it" >&2
-        echo "  points at, so nothing outside this directory was touched." >&2
-      else
-        echo "  The directory would not accept a new file." >&2
-      fi
+      echo "  The private directory was created a moment ago and is empty, so" >&2
+      echo "  nothing stands at this path: the filesystem refused a new file." >&2
+      rm -rf "$lane_b_workdir"
       exit 2
     fi
   {
@@ -2896,7 +2920,7 @@ if [ "${1:-}" = "--write-baseline" ]; then
     echo "REFUSING: could not write the baseline (serialisation failed)." >&2
     echo "  The partial file is removed rather than renamed into place." >&2
     exec 9>&-
-    rm -f "$lane_b_tmp"
+    rm -rf "$lane_b_workdir"
     exit 2
   }
   exec 9>&-
@@ -2918,60 +2942,26 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # extension: a real rename in the held directory, not a scrape of --help.
     # Where it is missing the gate refuses instead of falling back to semantics
     # it has just measured to be unsafe.
-    # ⚠ AND THE PROBE IS THE SAME HAZARD THIS BLOCK EXISTS TO MEASURE. The
-    # paragraph a hundred lines above records that the write-aside "had a
-    # predictable name and was opened with an ordinary redirect, so a symlink
-    # planted at that name is followed" -- and then this probe was given a
-    # predictable name and an ordinary redirect. `set -C` is switched back off
-    # right after the write-aside, so the exclusive open protected the file that
-    # holds the data and not the file that certifies it is safe to install.
-    # Worse, the name was NOT unpredictable: the write-aside's name appears in
-    # this same directory and spells out the PID and two draws from a `RANDOM`
-    # sequence, and the next draws follow from those. Publishing the first name
-    # publishes the second.
-    #
-    # ⚠ SO THE NAME IS FIXED INSTEAD OF RANDOM, which is the opposite of the
-    # usual advice and is the point. An unpredictable name asks to be guessed;
-    # a FIXED one can be checked, and can be DRIVEN by a control that plants a
-    # symlink at it. This trades one real cost: a run killed between the create
-    # and the cleanup leaves the file behind, and every later write refuses
-    # until it is removed. The refusal says which file, so the cost is one
-    # deletion by someone who is already at a keyboard -- against a hazard that
-    # otherwise cannot be tested at all.
-    lane_b_tprobe="$lane_b_leaf.rename-probe"
-    lane_b_tprobe_dst="$lane_b_tprobe.dst"
-    # Checked before the create, so a pre-existing entry gets its OWN reason.
-    # Without this, a directory planted at the destination makes `mv -T` fail
-    # and the gate then refuses for "this mv has no --no-target-directory" --
-    # the right exit for the wrong reason, which is the failure this file's
-    # harness is built to separate.
-    if [ -e "$lane_b_tprobe" ] || [ -L "$lane_b_tprobe" ] \
-       || [ -e "$lane_b_tprobe_dst" ] || [ -L "$lane_b_tprobe_dst" ]; then
+    # ⚠ AND THE PROBE LIVES IN THAT DIRECTORY TOO. Round 2 found it built its
+    # evidence file with an ordinary redirect at a predictable name; round 3
+    # found that the exclusive create which replaced it still let a FIFO block,
+    # and that `mv -fT` would happily replace a destination planted between the
+    # check and the move. Both were races against paths anyone could reach.
+    # Inside a directory created atomically at mode 700, neither path is
+    # reachable, so both races are gone and the two checks that guarded them are
+    # deleted rather than hardened. The rename is still measured on the real
+    # filesystem, which is what the probe is for: this is a subdirectory of the
+    # baseline's own directory, not a temporary somewhere else.
+    lane_b_tprobe="$lane_b_workdir/probe"
+    lane_b_tprobe_dst="$lane_b_workdir/probe.dst"
+    : > "$lane_b_tprobe" || {
       # refusal:structural
-      echo "REFUSING: the rename probe's path is occupied." >&2
-      echo "  Expected nothing at $(dirname "$LANE_B_BASELINE")/$lane_b_tprobe" >&2
-      echo "  (or its .dst). A leftover from a killed run is removed safely;" >&2
-      echo "  anything else planted there is refused rather than followed." >&2
-      rm -f "$lane_b_tmp"
+      echo "REFUSING: could not create the rename probe." >&2
+      echo "  Its directory was created by this run and is private, so this is" >&2
+      echo "  the filesystem refusing a new file rather than anything planted." >&2
+      rm -rf "$lane_b_workdir"
       exit 2
-    fi
-    lane_b_probe_made=no
-    # ⚠ `2>/dev/null` BEFORE THE `>`, NOT AFTER. Redirections are applied left
-    # to right, so `: > f 2>/dev/null` fails the open while stderr is still the
-    # terminal and prints "cannot overwrite existing file" over this gate's own
-    # message. Measured both orders; only this one is silent.
-    set -C
-    : 2>/dev/null > "$lane_b_tprobe" && lane_b_probe_made=yes
-    set +C
-    if [ "$lane_b_probe_made" != yes ]; then
-      # refusal:structural
-      echo "REFUSING: could not create the rename probe exclusively." >&2
-      echo "  The open is O_CREAT|O_EXCL, so it refuses a symlink, an existing" >&2
-      echo "  file and a directory alike, and it did. Nothing was written" >&2
-      echo "  through whatever stands at that path." >&2
-      rm -f "$lane_b_tmp"
-      exit 2
-    fi
+    }
     lane_b_have_T=no
     if mv -fT "$lane_b_tprobe" "$lane_b_tprobe_dst" 2>/dev/null; then
       lane_b_have_T=yes
@@ -2986,14 +2976,15 @@ if [ "${1:-}" = "--write-baseline" ]; then
       echo "  the rename move the new baseline INSIDE that directory while this" >&2
       echo "  gate reports success. Refusing to write rather than report a write" >&2
       echo "  that did not happen." >&2
-      rm -f "$lane_b_tmp"
+      rm -rf "$lane_b_workdir"
       exit 2
     fi
     mv -fT "$lane_b_tmp" "$lane_b_leaf" || {
       echo "REFUSING: could not put the new baseline in place." >&2
-      rm -f "$lane_b_tmp"
+      rm -rf "$lane_b_workdir"
       exit 2
     }
+    rm -rf "$lane_b_workdir"
   ) || exit $?
   echo "WROTE $LANE_B_BASELINE"
   # The EXIT trap treats rc=0 without this as a run that died mid-flight, which
@@ -3125,6 +3116,41 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
   if [ -n "$base_copy" ]; then
     base_version="$(printf '%s' "$base_copy" | { grep -m1 '^# format-version:' || [ $? -eq 1 ]; } | tr -dc '0-9')"
     if [ "${base_version:-1}" != "$LANE_B_FORMAT" ]; then
+      # ⚠ AND THE SKIP IS THE ANTI-CHEAT'S OFF SWITCH, WHICH IS WHY IT IS NOT
+      # FREE. Skipping is right -- a format-1 target read by the format-3 reader
+      # binds every path to the count field, so every current path looks absent
+      # and an untouched PR fails. But a change that BUMPS the format also makes
+      # the target's format old, and can then raise lane B counts in the same
+      # commit: the comparison is discarded, the only surviving check is the
+      # current baseline against the current tree, and the raised baseline
+      # agrees with the raised tree. Green, with the ratchet switched off by the
+      # very change it was meant to measure.
+      #
+      # So a skew is allowed to skip only when it carries nothing else. A format
+      # migration that also touches lane B source is refused and told to split;
+      # a pure migration passes, because then there is nothing for the skipped
+      # comparison to have caught. The index tree is the current side, matching
+      # every other read in this gate.
+      lane_b_skew_src=""
+      if ! lane_b_skew_src="$(git diff --cached --name-only \
+             "${PUBLIC_SURFACE_BASE_REF}" -- '*.lua')"; then
+        # refusal:structural
+        echo "REFUSING: could not compare lane B source against ${PUBLIC_SURFACE_BASE_REF}." >&2
+        echo "  The target's baseline is an older format, which is only safe to" >&2
+        echo "  skip when nothing else moved -- and that is what could not be" >&2
+        echo "  established. Refusing rather than skipping on an unread answer." >&2
+        exit 2
+      fi
+      if [ -n "$lane_b_skew_src" ]; then
+        # refusal:structural
+        echo "REFUSING: a baseline format change may not carry lane B source changes." >&2
+        echo "  The target baseline is format ${base_version:-1} and this script reads" >&2
+        echo "  $LANE_B_FORMAT, so the baseline-vs-target comparison cannot be made." >&2
+        echo "  These lane B source file(s) also differ from the target:" >&2
+        printf '%s\n' "$lane_b_skew_src" | sed 's/^/    /' >&2
+        echo "  Land the format migration on its own, then the source change." >&2
+        exit 2
+      fi
       echo "  (baseline-vs-target check skipped: target baseline is format ${base_version:-1}, this script reads $LANE_B_FORMAT)"
       base_copy=""
     fi

@@ -347,7 +347,10 @@ restore() {
   # the two leaves it UNTRACKED in the worktree, where `git rm --cached` cannot
   # reach it. Removing the record without removing the file is the same half-
   # restore as removing the file without the record.
-  rm -f "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" "$BASELINE.rename-probe" "$BASELINE.rename-probe.dst" shardpilot/client.lua.tmp
+  rm -f "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" shardpilot/client.lua.tmp
+  # A DIRECTORY, so `rm -f` cannot reach it: the private write directory is
+  # left behind by a killed writer, and a control plants one on purpose.
+  rm -rf "$BASELINE.write.d"
   git checkout -q HEAD -- "${RESTORE_PATHS[@]}" 2>/dev/null || true
   # ⚠ EVERY SCRATCH PATH, NOT JUST THE PROBE. Controls stage before running, so
   # an interruption after the missing- or symlink-baseline setup leaves .bak,
@@ -356,8 +359,7 @@ restore() {
   # the record is not a restore.
   git rm -q --cached --ignore-unmatch \
     "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" \
-    "$BASELINE.hard" "$BASELINE.rename-probe" "$BASELINE.rename-probe.dst" \
-    shardpilot/client.lua.tmp \
+    "$BASELINE.hard" shardpilot/client.lua.tmp \
     >/dev/null 2>&1 || true
 }
 # ⚠ TRAP-ONLY, AND SEPARATE FROM restore(). The scratch DIRECTORIES were removed
@@ -600,6 +602,20 @@ restore
 # covered the branch it meant to and missed the one next to it.
 old_commit="$(synth_target '/^# format-version:/d')"
 expect_ref "an older-format target is skipped, not misparsed" "$old_commit" 0 "target baseline is format 1"
+
+# ⚠ AND THE SKIP ABOVE IS THE ANTI-CHEAT'S OFF SWITCH. The control above asserts
+# that a skew SKIPS; it says nothing about what may ride along with the skew.
+# Review round 3: bump the format and raise lane B counts in one change, and the
+# comparison is discarded, leaving only the raised baseline checked against the
+# raised tree. Green, with the ratchet switched off by the change it was meant
+# to measure. Asserting the skip and asserting the bypass are two questions, and
+# the first control answering the first is why the second went unnoticed.
+printf -- '\n-- See %s for the freeze this follows.\n' "$marker" >> shardpilot/client.lua
+"$GATE" --write-baseline >/dev/null 2>&1 || true
+skew_commit="$(synth_target '/^# format-version:/d')"
+expect_ref "a format skew may not carry a lane B source change" "$skew_commit" 2 \
+  "may not carry lane B source changes"
+restore
 
 # ⚠ A COUNT THAT MUST BE REACHED, same rule the gate applies to itself: a run
 # that asserts nothing prints the same closing line as a run that asserts
@@ -900,18 +916,21 @@ expect_env "an mv without --no-target-directory refuses" \
   "PATH=$lane_b_notstub:$PATH" 2 "has no --no-target-directory" --write-baseline
 rm -rf "$lane_b_notstub"
 
-# ⚠ AND THE PROBE THAT ANSWERS THAT QUESTION IS ITSELF A PATH. Round 2 of review
-# found it: the block above certifies that `mv -T` is safe to use, and it built
-# its evidence file with an ordinary redirect at a predictable name. `set -C` is
-# switched off directly after the write-aside, so the exclusive open covered the
-# file holding the data and not the file certifying it was safe to install --
-# and the write-aside's own name, sitting in the same directory, spells out the
-# PID and two draws of `RANDOM`, from which the next draws follow.
+# ⚠ AND THE PATHS THAT ANSWER THAT QUESTION ARE NOW INSIDE A PRIVATE DIRECTORY.
+# Three review rounds walked this one down. Round 2: the probe was built with an
+# ordinary redirect at a predictable name, so a planted symlink was followed.
+# Round 3: the exclusive create that replaced it does not refuse a FIFO -- bash's
+# noclobber is specified for REGULAR files, so `set -C; : > fifo` opens the entry
+# and waits for a reader, and the job hangs to its CI timeout instead of
+# refusing; and `mv -fT` still replaces a destination planted between the check
+# and the move. Both were races against paths anyone could reach.
 #
-# The repair fixes the name rather than randomising it harder, which is what
-# makes these three controls possible at all: an unpredictable path cannot be
-# planted by a control, so the hazard could only ever have been argued.
-lane_b_probe_path="$BASELINE.rename-probe"
+# `mkdir` has no carve-out: atomic, never follows the final component, EEXIST
+# against every shape. So the write-aside and both probe paths moved inside one
+# directory created at mode 700, and the races stopped existing rather than
+# being narrowed. The controls below plant at the DIRECTORY's path, which is the
+# only reachable path left.
+lane_b_probe_path="$BASELINE.write.d"
 lane_b_probe_outside="$lane_b_scratch/probe-outside.txt"
 printf 'PRECIOUS UNRELATED FILE\n' > "$lane_b_probe_outside"
 
@@ -920,47 +939,55 @@ lane_b_probe_rc=0
 checks=$((checks + 1))
 git add -A >/dev/null 2>&1 || true
 lane_b_probe_out="$("$GATE" --write-baseline 2>&1)" || lane_b_probe_rc=$?
-judge "a symlink at the rename probe's path refuses" \
-  "$lane_b_probe_rc" 2 "the rename probe's path is occupied" "$lane_b_probe_out"
+judge "a symlink at the private directory's path refuses" \
+  "$lane_b_probe_rc" 2 "could not create the private write directory" "$lane_b_probe_out"
 
 # ⚠ SEPARATE, BECAUSE A REFUSAL IS NOT PROOF THE FILE SURVIVED. The gate could
 # refuse for this reason and still have truncated the target on the way -- the
-# exit code says what the gate decided, not what the filesystem did. This reads
-# the outside file.
+# exit code says what the gate decided, not what the filesystem did.
 checks=$((checks + 1))
 if [ "$(cat "$lane_b_probe_outside")" != "PRECIOUS UNRELATED FILE" ]; then
-  echo "FAIL [nothing is written through the planted probe link]: the outside" >&2
-  echo "  file changed. The refusal fired and the write happened anyway, which" >&2
-  echo "  is the exact shape this refusal exists to prevent." >&2
+  echo "FAIL [nothing is written through the planted link]: the outside file" >&2
+  echo "  changed. The refusal fired and the write happened anyway, which is" >&2
+  echo "  the exact shape this refusal exists to prevent." >&2
   failures=$((failures + 1))
 fi
 rm -f "$lane_b_probe_path"
 restore
 
-# ⚠ AND THE RIGHT EXIT FOR THE WRONG REASON, WHICH IS WHY THIS IS ITS OWN
-# CONTROL. A directory planted at the probe's DESTINATION makes `mv -T` fail,
-# and before the repair the gate read that as "this mv has no
-# --no-target-directory" -- exit 2 with a true-sounding message about a
-# capability the mv actually has. The control above it would have stayed green,
-# because it asserts that needle. So this asserts the occupancy reason AND the
-# absence of the capability reason; the second half is what separates them.
-mkdir -p "$lane_b_probe_path.dst"
-lane_b_probe2_rc=0
+# ⚠ THE FIFO, AND IT IS TIMED BECAUSE THE FAILURE MODE IS A HANG, NOT A WRONG
+# ANSWER. Every other control here can fail by returning the wrong thing. This
+# one failed, before the repair, by never returning at all -- which in CI is not
+# a red control but a cancelled job, and a cancelled job reads like an outage
+# rather than like a check that fired. `timeout` turns "never returns" into an
+# exit code this harness can judge: 124 means the hang came back.
+mkfifo "$lane_b_probe_path"
+lane_b_fifo_rc=0
 checks=$((checks + 1))
 git add -A >/dev/null 2>&1 || true
-lane_b_probe2_out="$("$GATE" --write-baseline 2>&1)" || lane_b_probe2_rc=$?
-judge "a directory at the probe destination refuses for the right reason" \
-  "$lane_b_probe2_rc" 2 "the rename probe's path is occupied" "$lane_b_probe2_out"
-case "$lane_b_probe2_out" in
-  *"has no --no-target-directory"*)
-    echo "FAIL [a directory at the probe destination refuses for the right" >&2
-    echo "  reason]: the gate blamed a missing mv capability for a planted" >&2
-    echo "  directory. Two conditions sharing one message is how a check goes" >&2
-    echo "  missing: the control asserting that needle would stay green while" >&2
-    echo "  the condition it was written for stopped being reachable." >&2
-    failures=$((failures + 1)) ;;
-esac
-rm -rf "$lane_b_probe_path.dst"
+lane_b_fifo_out="$(timeout 120 "$GATE" --write-baseline 2>&1)" || lane_b_fifo_rc=$?
+if [ "$lane_b_fifo_rc" -eq 124 ]; then
+  echo "FAIL [a FIFO at the private directory's path refuses instead of" >&2
+  echo "  hanging]: the gate did not return within 120s. noclobber does not" >&2
+  echo "  refuse a non-regular file; it opens the FIFO and waits for a reader." >&2
+  failures=$((failures + 1))
+else
+  judge "a FIFO at the private directory's path refuses instead of hanging" \
+    "$lane_b_fifo_rc" 2 "could not create the private write directory" "$lane_b_fifo_out"
+fi
+rm -f "$lane_b_probe_path"
+restore
+
+# A leftover from a killed run is the ordinary case, and it must refuse rather
+# than reuse: a directory left behind may hold a stale write-aside.
+mkdir -p "$lane_b_probe_path"
+lane_b_left_rc=0
+checks=$((checks + 1))
+git add -A >/dev/null 2>&1 || true
+lane_b_left_out="$("$GATE" --write-baseline 2>&1)" || lane_b_left_rc=$?
+judge "a leftover private directory refuses rather than being reused" \
+  "$lane_b_left_rc" 2 "could not create the private write directory" "$lane_b_left_out"
+rm -rf "$lane_b_probe_path"
 restore
 
 # ⚠ AND THE OTHER BRANCH THE SWEEP FOUND WITH NOTHING POINTING AT IT: the
@@ -1312,7 +1339,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=40
+EXPECTED_CHECKS=42
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many

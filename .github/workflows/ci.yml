@@ -105,11 +105,25 @@ jobs:
       # false in this repository: a check that never runs is worse than an
       # absent one, because it manufactures the appearance of a check.
       #
-      # The three cases are distinguished rather than guessed. A pull request
-      # carries its own base sha; a push to a branch carries the ref's previous
-      # tip; a newly created ref carries the all-zero sha, and only then is the
-      # default branch the right comparison. Each is fetched --depth=1, because
-      # the gate reads one tree and needs no history.
+      # The cases are distinguished rather than guessed. A pull request carries
+      # its own base sha; a push to an existing branch carries the ref's previous
+      # tip; a NEWLY CREATED ref carries the all-zero sha.
+      #
+      # ⚠ AND FOR THAT LAST ONE THE DEFAULT BRANCH IS THE WRONG ANSWER, WHICH
+      # THIS COMMENT USED TO ASSERT WAS THE RIGHT ONE. Every branch and tag push
+      # is scanned here, including off-main releases. If main already carries a
+      # higher count for a file, a new branch compared against MAIN can add an
+      # occurrence, raise its own baseline, and still pass -- it borrows slack
+      # from a branch it does not descend from. The comparison a new ref needs is
+      # its own parent. So the ref is fetched --depth=2 and FETCH_HEAD^ is used;
+      # depth 2 because one tree is read and one parent is needed, nothing more.
+      #
+      # The default branch survives only as the last resort for a ref whose tip
+      # has no parent at all -- a root commit, where there is no ancestry to
+      # compare with and no better answer exists. Measured on a genuinely shallow
+      # clone (file:// so --depth is honoured): after --depth=2 on a new branch,
+      # FETCH_HEAD^ resolves to the commit the branch was cut from, not to the
+      # default branch's tip.
       - name: Fetch the comparison base for the lane B ratchet
         run: |
           set -euo pipefail
@@ -122,6 +136,9 @@ jobs:
           elif [ -n "$before" ] && [ "$before" != "$zero" ]; then
             git fetch --depth=1 origin "$before"
             echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
+          elif git fetch --depth=2 origin "${{ github.ref }}" \
+               && git rev-parse --verify --quiet 'FETCH_HEAD^' >/dev/null; then
+            echo "SP_LANE_B_BASE=FETCH_HEAD^" >> "$GITHUB_ENV"
           else
             git fetch --depth=1 origin "${{ github.event.repository.default_branch }}"
             echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
@@ -152,16 +169,22 @@ jobs:
   #
   # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
   # FOURTEEN controls, which is what this harness had before the sibling's
-  # lineage was ported into it, and this harness is at 40 controls now. The
+  # lineage was ported into it, and this harness is at 42 controls now. The
   # bound is re-argued from a measurement taken at the SHIPPING count: a figure
   # derived for a different configuration is not a measurement of this one,
   # which is the mistake this comment already records the sibling making.
   #
-  # Measured on this rig at 40 controls: 353.7s for 35 of them, 10.1s each
-  # (2026-08-31). The slow review datum -- 55s per control -- stays a floor
-  # rather than a duration, because that run did not finish. The budget is
-  # sized from the floor, not from the fast rig: 40 x 55s is 2200s, so 40
-  # minutes. Twenty would not have covered it, and nothing would have said so.
+  # Measured on this rig: 353.7s for 35 controls, 10.1s each (2026-08-31). The
+  # slow review datum -- 55s per control -- stays a floor rather than a duration,
+  # because that run did not finish. The budget is sized from the floor, not from
+  # the fast rig: 42 x 55s is 2310s, so the arithmetic demands 39 minutes.
+  #
+  # Shipping 50 rather than 39. The floor is what the control enforces; the
+  # margin above it is a separate decision, and 40 would have been one control
+  # from red -- a bound that has to be revisited by the next person to add a
+  # check is a bound that will be raised in a hurry rather than argued. Fifty
+  # carries eight more controls before the arithmetic speaks again. This is
+  # margin over a measured floor, not a guess in place of one.
   #
   # THIS NUMBER IS NOW CHECKED, not asserted. The harness reads timeout-minutes
   # for this job back out of this file and fails if it is under the count times
@@ -179,7 +202,7 @@ jobs:
   # built on purpose. It needs no network and no history depth.
   lane-b-ratchet-controls:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
 
     steps:
       - name: Checkout
