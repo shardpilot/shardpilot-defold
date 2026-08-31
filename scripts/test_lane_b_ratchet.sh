@@ -1177,9 +1177,75 @@ fi
 # the run would refuse for a different reason before reaching this one.
 mv "$BASELINE" "$BASELINE.real"
 mkdir "$BASELINE"
-expect_nostage "a directory at the baseline path refuses" 2 "is not a regular file"
+# ⚠ THE WRITER, NOT A PLAIN RUN. A plain run reads the STAGED blob and never
+# looks at the working-tree entry, so a directory standing there is irrelevant to
+# it; the refusal is about what a rename can install over, which only the writer
+# asks. Driving it with a plain run asserted a refusal that should not fire.
+lane_b_dir_rc=0
+checks=$((checks + 1))
+lane_b_dir_out="$("$GATE" --write-baseline 2>&1)" || lane_b_dir_rc=$?
+judge "a directory at the baseline path refuses the WRITE" \
+  "$lane_b_dir_rc" 2 "is a directory, and cannot be written" "$lane_b_dir_out"
+
+# ⚠ AND THE SAME SHAPE MUST NOT REFUSE A READ. Same scene, no writing.
+lane_b_dirread_rc=0
+checks=$((checks + 1))
+lane_b_dirread_out="$("$GATE" 2>&1)" || lane_b_dirread_rc=$?
+if [ "$lane_b_dirread_rc" -ne 0 ]; then
+  echo "FAIL [a directory at the baseline path does not refuse a read]: exit" >&2
+  echo "  $lane_b_dirread_rc. The read goes through the index; whatever stands" >&2
+  echo "  in the working tree is not what it reads." >&2
+  failures=$((failures + 1))
+fi
 
 rmdir "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
+
+# ⚠ A FIFO IS NOT A DIRECTORY, AND THE RENAME REPLACES IT. Measured: `mv -fT src
+# fifo` returns 0, leaves a regular file with the new contents, and never opens
+# the FIFO -- so refusing this shape blocked a repair the writer can perform.
+mv "$BASELINE" "$BASELINE.real"
+mkfifo "$BASELINE"
+lane_b_fifobase_rc=0
+checks=$((checks + 1))
+lane_b_fifobase_out="$(timeout 120 "$GATE" --write-baseline 2>&1)" || lane_b_fifobase_rc=$?
+if [ "$lane_b_fifobase_rc" -eq 124 ]; then
+  echo "FAIL [a FIFO at the baseline path is replaced, not opened]: the gate did" >&2
+  echo "  not return within 120s -- something opened the FIFO and waited." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_fifobase_rc" -ne 0 ]; then
+  echo "FAIL [a FIFO at the baseline path is replaced, not opened]: exit $lane_b_fifobase_rc" >&2
+  printf '%s\n' "$lane_b_fifobase_out" | sed 's/^/    /' >&2
+  failures=$((failures + 1))
+elif [ -p "$BASELINE" ]; then
+  echo "FAIL [a FIFO at the baseline path is replaced, not opened]: the FIFO is" >&2
+  echo "  still standing after a write that reported success." >&2
+  failures=$((failures + 1))
+fi
+rm -f "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
+restore
+
+# ⚠ THE TARGET THAT PREDATES THE BASELINE -- which is this change's own CI case.
+# The comparison cannot run, and the summary must not claim it did. Review round
+# 8: the strong sentence was selected by the variable being SET rather than by
+# the comparison having happened, so exactly the run that established least
+# announced the most.
+lane_b_pre_commit="$(synth_target '')"
+lane_b_pre_rc=0
+checks=$((checks + 1))
+git add -A >/dev/null 2>&1 || true
+lane_b_pre_out="$(PUBLIC_SURFACE_BASE_REF="$lane_b_pre_commit" "$GATE" 2>&1)" || lane_b_pre_rc=$?
+if [ "$lane_b_pre_rc" -ne 0 ]; then
+  echo "FAIL [a target without the baseline does not earn the strong sentence]: exit $lane_b_pre_rc" >&2
+  failures=$((failures + 1))
+else
+  case "$lane_b_pre_out" in
+    *"may fall and may not rise"*)
+      echo "FAIL [a target without the baseline does not earn the strong sentence]:" >&2
+      echo "  the comparison was skipped and the summary claimed it held anyway." >&2
+      failures=$((failures + 1)) ;;
+  esac
+fi
+restore
 
 # ⚠ AND A SYMLINK TO A DIRECTORY IS NOT THAT SHAPE, THOUGH `-e`/`-f` cannot tell
 # them apart. Review round 7: the generic guard above still refused a link whose
@@ -1444,7 +1510,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=43
+EXPECTED_CHECKS=47
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
