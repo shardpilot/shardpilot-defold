@@ -1248,7 +1248,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=36
+EXPECTED_CHECKS=37
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1332,6 +1332,57 @@ else
     echo "  which needs ${lane_b_need}s ($(((lane_b_need + 59) / 60))m). Raise" >&2
     echo "  timeout-minutes to at least $(((lane_b_need + 59) / 60)), or remove" >&2
     echo "  controls -- do not lower the constant to fit." >&2
+    failures=$((failures + 1))
+  fi
+fi
+
+# ⚠ AND THE POLICY SENTENCE ITSELF IS A NUMBER-IN-PROSE. The review that
+# opened this work found the gate announcing "REPORTED, NOT GATED" while the
+# ratchet gated on change, and named two sites: the scope declaration and the
+# runtime summary. Fixing exactly those two left the same stale sentence at two
+# more -- the printable-signature exemption and the character-reference refusal
+# -- because both justify EXEMPTING lane B from a refusal, and a refusal ends
+# the run before the lane split, so the exemption's reasoning is a policy claim.
+# A finding names instances; the class is the finding's real size.
+#
+# The word "gated" carries two meanings here that a reader cannot separate
+# without context: gated AT ZERO, which lane B is not, and gated ON CHANGE,
+# which it is. So the invariant is that the word never appears about lane B
+# unqualified. That is enforceable, not advisory: measured before choosing it,
+# this file had exactly ONE violation, and the sibling's merged main has exactly
+# one, at the same place -- so the rule can be met today rather than aspired to.
+#
+# Known limit, stated rather than papered over: this reads lines that NAME the
+# lane. The printable-signature site says "source is REPORTED AT ZERO rather
+# than gated there" and never writes "lane B", so it is outside this control's
+# reach and was found by reading. A sentence can still go stale by not naming
+# its subject.
+checks=$((checks + 1))
+if [ ! -f "$GATE" ]; then
+  echo "FAIL [lane B's policy is never stated unqualified]: $GATE is missing," >&2
+  echo "  so the wording cannot be checked and this control would otherwise" >&2
+  echo "  have passed without reading anything." >&2
+  failures=$((failures + 1))
+else
+  set +e
+  lane_b_unqual="$(awk '
+    { l = tolower($0) }
+    l ~ /lane[ -]?b/ && l ~ /gated/ && l !~ /at zero/ && l !~ /on change/ {
+      printf "%d: %s\n", NR, $0
+    }
+  ' "$GATE")"
+  lane_b_awk_st=$?
+  set -e
+  if [ "$lane_b_awk_st" -ne 0 ]; then
+    echo "FAIL [lane B's policy is never stated unqualified]: awk exited" >&2
+    echo "  $lane_b_awk_st reading $GATE, so nothing was checked. An empty" >&2
+    echo "  result from a broken reader is not a clean result." >&2
+    failures=$((failures + 1))
+  elif [ -n "$lane_b_unqual" ]; then
+    echo "FAIL [lane B's policy is never stated unqualified]: these line(s) say" >&2
+    echo "  'gated' about lane B without saying which gating is meant:" >&2
+    printf '%s\n' "$lane_b_unqual" | sed 's/^/    /' >&2
+    echo "  Write 'gated at zero' or 'gated on change'. Lane B is the second." >&2
     failures=$((failures + 1))
   fi
 fi

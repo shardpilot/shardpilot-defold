@@ -991,7 +991,8 @@ scan_tree() {
     # writes a PDF, or names a compression header, holds those characters
     # legitimately — and a refusal ends the run before the lane split, so an
     # unconditional test on printable bytes silently outranks this file's own
-    # promise that source is REPORTED rather than gated. The refusals that rest
+    # promise that source is REPORTED AT ZERO rather than gated there. The
+    # refusals that rest
     # on NON-printable bytes are unambiguous and still apply everywhere; the
     # printable ones are skipped for the reported lane, which is the narrowest
     # place to draw the line.
@@ -999,9 +1000,9 @@ scan_tree() {
     # ⚠ DECIDED BEFORE THE FIRST REFUSAL THAT CONSULTS IT. Placed after one, it
     # was an unbound variable under `set -u` and the run died there — with the
     # probes reading that as a pass, because a dead run refuses nothing.
-    # ⚠ THE SAME PREDICATE THE go SPLIT USES, deliberately case-SENSITIVE
+    # ⚠ THE SAME PREDICATE THE LANE SPLIT USES, deliberately case-SENSITIVE
     # and deliberately `$f`. Folding it here while the split reads `$f` made a
-    # file named `logo.GO` exempt from the printable checks and gated by
+    # file named `logo.LUA` exempt from the printable checks and gated by
     # lane A at the same time — a raster renamed that way passed both the
     # extension refusal and the magic one. Two predicates for one question is
     # the defect; which one wins matters less than that they agree.
@@ -1416,7 +1417,7 @@ scan_tree() {
     # The message says what to do, which is the whole reason this can be a
     # refusal instead of a miss: the remedy is one keystroke, so a false
     # refusal costs a contributor a character rather than an argument.
-    # ⚠ LANE B IS REPORTED, NOT GATED, and this refusal has to honour that or it
+    # ⚠ LANE B IS NOT GATED AT ZERO, and this refusal has to honour that or it
     # silently promotes a whole lane. A source file may legitimately carry the
     # bytes of a character reference inside a string literal, and a source
     # viewer shows those bytes rather than a decoded character — the hazard
@@ -2420,7 +2421,7 @@ EOF
   fixture_checks=$((fixture_checks + 1))
   case "$scanned_a" in
     *"$FIXTURE_ENTITYLANEB_NAME"*)
-      echo "SELFTEST: a lane-B source file was reported on the gated lane" >&2
+      echo "SELFTEST: a lane-B source file was reported on lane A, gated at zero" >&2
       fixture_fail=1 ;;
   esac
   # The NUL fixture gets its own tree: a refusal ends the run it happens in,
