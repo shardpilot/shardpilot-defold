@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Choose the lane B ratchet's comparison base for one CI event.
 #
+# Prints ONE OR MORE revisions, one per line, or the word EMPTY. The caller must
+# run the comparison against every line and require all of them to hold: a rise
+# against any accepted state is a rise.
+#
 # ⚠ THIS EXISTS BECAUSE THE CHOICE WAS WRONG FOUR TIMES IN THREE LINES OF YAML.
 # It was never set at all, so the comparison never ran while the gate printed
 # "CI sets it"; then a new ref was compared against the DEFAULT BRANCH, which it
@@ -76,8 +80,21 @@ if [ "$ref" = "refs/heads/$default" ]; then
   exit 0
 fi
 
-# 3. Any other ref: branch or tag. The base is where it left the default branch,
-#    NOT its previous tip.
+# 3. Any other ref: branch or tag. TWO bases, and the count may rise against
+#    neither.
+#
+#    ⚠ THE MERGE BASE ALONE TURNS EVERY REDUCTION INTO SLACK. Push A takes a file
+#    from the merge base's 10 down to 5 and passes; push B adds five back and
+#    raises its baseline to 10, and against the unchanged merge base that is not a
+#    rise either. The advertised rule -- the number may fall and may not rise --
+#    stops holding across published pushes, and the debt someone paid becomes
+#    reusable. The previous tip catches exactly that, because 5 -> 10 rises
+#    against it.
+#
+#    ⚠ AND THE PREVIOUS TIP ALONE IS THE HOLE THE MERGE BASE CLOSES: a tip this
+#    gate already rejected is not an accepted state, so an empty follow-up commit
+#    would carry the rejected material through. Each base covers the other's gap,
+#    so both are emitted and the caller must satisfy both.
 #
 #    ⚠ AND NOT `before`, WHICH CAN BE A TIP THIS GATE ALREADY REJECTED. Push A
 #    adds lane B material, raises its baseline and fails; push B is an empty
@@ -87,6 +104,12 @@ fi
 #    measured against a state the project accepted.
 if base="$(git merge-base "$sha" "$remote/$default" 2>/dev/null)" && [ -n "$base" ]; then
   printf '%s\n' "$base"
+  # Deduplicated rather than printed twice: on the first push of a branch the two
+  # answers coincide, and a caller running the same comparison twice would report
+  # the same failure twice and look like two problems.
+  if [ -n "$before" ] && [ "$before" != "$base" ]; then
+    printf '%s\n' "$before"
+  fi
   exit 0
 fi
 

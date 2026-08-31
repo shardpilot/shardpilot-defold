@@ -2741,16 +2741,24 @@ fi
 # control used to swap the parent directory mid-run. That control now hooks the
 # `git ls-files` below instead: a hook living inside a step does not survive
 # that step being replaced, and this is the second time that rule has been paid.
-lane_b_mode="$(git ls-files -s -- "$LANE_B_BASELINE" | awk '{print $1}' || true)"
-case "${lane_b_mode:-}" in
-  120000)
-    # refusal:structural
-    echo "REFUSING: $LANE_B_BASELINE is a symlink in the index." >&2
-    echo "  The working tree would follow it and the merge target would not," >&2
-    echo "  so the two sides of this ratchet would compare different files." >&2
-    exit 2
-    ;;
-esac
+# ⚠ AND THE INDEX SYMLINK REFUSAL IS GONE TOO -- the third of this class, and the
+# one I had checked and KEPT. Its argument was that the two sides read different
+# objects. They do not any more: the gate reads the index entry with `git
+# cat-file`, which for mode 120000 returns the LINK TARGET AS TEXT, and that text
+# carries no format marker. Measured with the guard removed:
+#
+#   REFUSING: scripts/public-surface-lane-b-baseline.txt is format 1, this script reads 3.
+#
+# So the refusal still happens, one check later and for a true reason, while the
+# pre-writer guard blocked --write-baseline from installing a regular file that
+# would have repaired the entry on the next `git add`. Same shape as the hard-link
+# and working-tree-symlink guards: a refusal that outlived its premise and stood
+# between the operator and the remedy.
+#
+# ⚠ THIS ONE MATTERS MORE THAN THE OTHER TWO, because I audited all fifty
+# refusals after round 4, examined this one, and recorded it as still earned. The
+# audit's instrument was my own reading of each stated reason, and it got this
+# wrong in the direction that keeps code: a guard I did not have to defend.
 
 
 lane_b_now="$(printf '%s' "$scan_lane_b_counts" | { grep -v '^$' || [ $? -eq 1 ]; } | sort -k2)"
@@ -2865,7 +2873,13 @@ if [ "${1:-}" = "--write-baseline" ]; then
       echo "REFUSING: could not enter the private write directory." >&2
       echo "  This run created it a moment ago. Failing to enter it means the" >&2
       echo "  name no longer refers to it, so nothing is written." >&2
-      rm -rf "$lane_b_workdir"
+      # ⚠ AND THE CLEANUP HERE IS `rmdir`, FOR THE REASON THE ENTRY FAILED. The
+      # scrub below is careful because it runs from inside a held inode; this
+      # path is the one where the name is already known to be untrustworthy, and
+      # it used `rm -rf` on it. `rmdir` refuses a non-empty directory and a
+      # symlink alike, so a replacement is left standing rather than deleted --
+      # the same rule, applied to the path that needs it most.
+      rmdir "$lane_b_workdir" 2>/dev/null || true
       exit 2
     fi
     lane_b_workdir_ino="$(ls -di . 2>/dev/null | awk '{print $1}')"
@@ -2904,8 +2918,27 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # prevent, introduced by the block itself. The harness caught it because
     # judge() separates "wrong exit" from "right exit, wrong reason" -- the exit
     # was 2, exactly as expected, and only the reason showed the damage.
+    # ⚠ AND MODE 700 DOES NOT KEEP OUT A PROCESS THAT IS ALREADY US. Measured: a
+    # second shell with the same uid enters this directory and plants `new` as a
+    # symlink, and an ordinary redirect follows it -- the outside file read back
+    # the baseline body. Holding the inode stops the DIRECTORY being swapped; it
+    # says nothing about what appears inside it.
+    #
+    # `set -C` closes the plant, because O_EXCL refuses an existing regular file
+    # and an existing symlink. It does NOT close a planted FIFO, which bash opens
+    # and waits on -- the carve-out this file already documents. That residue is
+    # named rather than fixed: there is no primitive here that creates a file and
+    # refuses every shape, and the honest boundary is stated below.
+    #
+    # ⚠ AND THE CLAIM ABOVE IS NARROWER THAN THE ONE I MADE IN REVIEW. I said
+    # same-uid races were inside this block's threat model. They are not, and
+    # cannot be: a process running as this one can rewrite the baseline after the
+    # gate exits. What this defends is the gate never WRITING THROUGH a path it
+    # did not choose. Anything else was overclaimed.
     lane_b_aside=yes
+    set -C
     exec 9>"$lane_b_tmp" || lane_b_aside=no
+    set +C
     if [ "$lane_b_aside" = no ]; then
       # refusal:structural
       # ⚠ ITS OWN MESSAGE, BECAUSE SHARING ONE HID A COVERAGE GAP. This said
@@ -2997,14 +3030,18 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # baseline's own directory, not a temporary somewhere else.
     lane_b_tprobe=probe
     lane_b_tprobe_dst=probe.dst
-    : > "$lane_b_tprobe" || {
+    set -C
+    : 2>/dev/null > "$lane_b_tprobe" || {
+      set +C
       # refusal:structural
       echo "REFUSING: could not create the rename probe." >&2
       echo "  Its directory was created by this run and is private, so this is" >&2
-      echo "  the filesystem refusing a new file rather than anything planted." >&2
+      echo "  the filesystem refusing a new file, or something planted inside" >&2
+      echo "  it by a process sharing this one's uid." >&2
       lane_b_scrub
       exit 2
     }
+    set +C
     lane_b_have_T=no
     if mv -fT "$lane_b_tprobe" "$lane_b_tprobe_dst" 2>/dev/null; then
       lane_b_have_T=yes

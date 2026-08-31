@@ -496,7 +496,13 @@ ln -sf /dev/null "$BASELINE.link"; mv "$BASELINE" "$BASELINE.real"; ln -sf "$(ba
 # failing rather than by my noticing. The index refusal has its own scene below,
 # where the index and the working tree DISAGREE, which is the only state that
 # isolates it.
-expect "a symlinked baseline refuses" 2 "is a symlink in the index"
+# ⚠ THE NEEDLE MOVED TWICE IN TWO ROUNDS, WHICH IS THE POINT OF ASSERTING
+# REASONS. This scene has always been "the baseline is a symlink"; the refusal
+# that catches it was the working-tree guard, then the index guard, and now the
+# format check -- because `git cat-file` on a mode-120000 entry returns the link
+# target as text, which carries no format marker. Two guards were removed under
+# it and the scene is still refused, one check later and for a true reason.
+expect "a symlinked baseline refuses" 2 "is format 1"
 rm -f "$BASELINE" "$BASELINE.link"; mv "$BASELINE.real" "$BASELINE"
 # `sed -i` with no argument is GNU-only too -- BSD sed reads the next word as
 # the backup suffix. Write to a temporary file and move it, everywhere.
@@ -1174,7 +1180,7 @@ rmdir "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
 # the disagreement.
 lane_b_link_blob="$(printf '%s' "$BASELINE.real" | git hash-object -w --stdin)"
 git update-index --add --cacheinfo "120000,$lane_b_link_blob,$BASELINE"
-expect_nostage "an index-only symlink refuses" 2 "is a symlink in the index"
+expect_nostage "an index-only symlink refuses" 2 "is format 1"
 git update-index --add --cacheinfo "100644,$(git hash-object -w "$BASELINE"),$BASELINE"
 restore
 
@@ -1364,7 +1370,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=47
+EXPECTED_CHECKS=48
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1461,9 +1467,29 @@ elif [ "$lane_b_selector_out" = "$lane_b_pushA" ]; then
   echo "  rejected. An empty follow-up commit would then pass while carrying" >&2
   echo "  exactly the material that failed." >&2
   failures=$((failures + 1))
-elif [ "$lane_b_selector_out" != "$lane_b_branchpoint" ]; then
+elif [ "$lane_b_selector_out" != "$lane_b_branchpoint
+$lane_b_pushA" ]; then
   echo "FAIL [a branch push is measured from where it left the trunk]: chose" >&2
-  echo "  '$lane_b_selector_out', expected the merge base '$lane_b_branchpoint'." >&2
+  printf '%s\n' "$lane_b_selector_out" | sed 's/^/    /' >&2
+  echo "  expected BOTH, one per line: the merge base $lane_b_branchpoint" >&2
+  echo "  and the previous tip $lane_b_pushA. Each covers the other's gap --" >&2
+  echo "  the merge base alone turns a reduction into reusable slack, and the" >&2
+  echo "  previous tip alone carries a rejected tip's material through." >&2
+  failures=$((failures + 1))
+fi
+
+# ⚠ AND NOT TWICE ON A BRANCH'S FIRST PUSH, where the two answers coincide. A
+# caller running the same comparison twice reports one failure as two.
+lane_b_dedup_out=""
+lane_b_dedup_rc=0
+checks=$((checks + 1))
+lane_b_dedup_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --before "$lane_b_branchpoint" --sha "$lane_b_tip" \
+  --ref refs/heads/feature --default-branch main) 2>&1 )" || lane_b_dedup_rc=$?
+if [ "$lane_b_dedup_rc" -ne 0 ] || [ "$lane_b_dedup_out" != "$lane_b_branchpoint" ]; then
+  echo "FAIL [coinciding bases are emitted once]: chose" >&2
+  printf '%s\n' "$lane_b_dedup_out" | sed 's/^/    /' >&2
+  echo "  expected the single rev $lane_b_branchpoint (exit $lane_b_dedup_rc)." >&2
   failures=$((failures + 1))
 fi
 
