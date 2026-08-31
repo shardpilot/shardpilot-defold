@@ -1554,7 +1554,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=47
+EXPECTED_CHECKS=49
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1581,6 +1581,56 @@ EXPECTED_CHECKS=47
 expect_env "an empty target counts every occurrence as new" \
   "PUBLIC_SURFACE_BASE_REF=EMPTY" 1 "absent from"
 
+
+# ⚠ TWO MATCHES ON ONE LINE, SEPARATED BY THE BYTE THE KEY WAS JOINED WITH.
+# awk's SUBSEP is 0x1c, and the counter used to build a key by joining and then
+# split it back apart in END -- so two distinct matches whose text agrees up to
+# that byte collapsed into one, `best` took their maximum instead of their sum,
+# and adding the second to an already-baselined line passed with no baseline
+# edit. That is the round-1 defect re-entering through the encoding of the key.
+printf -- '-- See %s and\034 %s for the freeze.\nreturn {}\n' "$marker" "$marker" > "$NEW_FILE"
+git add -A >/dev/null 2>&1 || true
+"$GATE" --write-baseline >/dev/null 2>&1 || true
+lane_b_subsep_n="$(awk -v f="$NEW_FILE" '$2 == f {print $1}' "$BASELINE")"
+checks=$((checks + 1))
+if [ "$lane_b_subsep_n" != 2 ]; then
+  echo "FAIL [two matches around a SUBSEP byte count as two]: recorded" >&2
+  echo "  '${lane_b_subsep_n:-nothing}' for $NEW_FILE, expected 2. One means the" >&2
+  echo "  key was taken apart on a byte the match itself contains, so the second" >&2
+  echo "  occurrence can be added to a counted line for free." >&2
+  failures=$((failures + 1))
+fi
+restore
+
+# ⚠ AND A SKIPPED COMPARISON MUST GIVE ONE REASON, NOT TWO. The format-skew
+# branch announces its reason and then stands down by clearing `base_copy` --
+# which the branch below reads as "the target carries no baseline", so a
+# migration printed both accounts of one run. An empty value is the absence of a
+# reason, and two causes sharing it means the second speaks for the first.
+lane_b_skew_commit="$(synth_target '/^# format-version:/d')"
+lane_b_skew_rc=0
+checks=$((checks + 1))
+git add -A >/dev/null 2>&1 || true
+lane_b_skew_out="$(PUBLIC_SURFACE_BASE_REF="$lane_b_skew_commit" "$GATE" 2>&1)" || lane_b_skew_rc=$?
+if [ "$lane_b_skew_rc" -ne 0 ]; then
+  echo "FAIL [a format skew gives one reason, not two]: exit $lane_b_skew_rc" >&2
+  failures=$((failures + 1))
+else
+  case "$lane_b_skew_out" in
+    *"carries no $BASELINE"*)
+      echo "FAIL [a format skew gives one reason, not two]: the run announced the" >&2
+      echo "  format skew and then also said the target carries no baseline." >&2
+      failures=$((failures + 1)) ;;
+  esac
+  case "$lane_b_skew_out" in
+    *"target baseline is format"*) ;;
+    *)
+      echo "FAIL [a format skew gives one reason, not two]: the skew reason was" >&2
+      echo "  not printed at all, so the run explains nothing." >&2
+      failures=$((failures + 1)) ;;
+  esac
+fi
+restore
 
 lane_b_ciyml=".github/workflows/ci.yml"
 checks=$((checks + 1))

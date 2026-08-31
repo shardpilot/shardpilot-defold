@@ -1802,12 +1802,26 @@ scan_tree() {
               # would only re-introduce a disagreement -- and would strip the
               # underscores that normal form deliberately keeps, collapsing two
               # distinct identifiers on one line into one key.
-              if (m != "") seen[pass SUBSEP n ":" m]++
+              # ⚠ THE KEY IS REMEMBERED, NOT RE-PARSED. It used to be split back
+              # apart on SUBSEP in END -- and SUBSEP is 0x1c, a byte a wildcard
+              # match can contain. Two distinct matches on one line whose text
+              # agrees up to that byte then produced the SAME a[2], so `best`
+              # took their maximum instead of their sum: adding the second one
+              # to an already-baselined line left the count unchanged and passed
+              # the ratchet with no baseline edit. That is the round-1 defect --
+              # an occurrence hiding on a counted line -- re-entering through
+              # the encoding of the key. Measured: the split form counts two
+              # such matches as 1, this form as 2.
+              #
+              # A joined key that must be taken apart again is a parser, and
+              # this file has paid for parsers. Storing the part END needs
+              # removes the split, so no byte in the match is special.
+              if (m != "") { k = pass SUBSEP n ":" m; seen[k]++; keyof[k] = n ":" m }
             }
             END {
               for (k in seen) {
-                split(k, a, SUBSEP)
-                if (seen[k] > best[a[2]]) best[a[2]] = seen[k]
+                kk = keyof[k]
+                if (seen[k] > best[kk]) best[kk] = seen[k]
               }
               total = 0
               for (k in best) total += best[k]
@@ -3299,6 +3313,14 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
         exit 2
       fi
       echo "  (baseline-vs-target check skipped: target baseline is format ${base_version:-1}, this script reads $LANE_B_FORMAT)"
+      # ⚠ AND THE REASON IS RECORDED, BECAUSE THE NEXT BRANCH SHARES A VARIABLE
+      # WITH IT. Clearing `base_copy` is how this branch stands down -- and the
+      # branch below reads the same emptiness as "the target carries no
+      # baseline", so a format migration printed BOTH explanations and a reader
+      # got two contradictory accounts of one successful run. An empty value is
+      # not a reason; it is the absence of one, and two causes sharing it means
+      # the second speaks for the first.
+      lane_b_skip_said=yes
       base_copy=""
     fi
   fi
@@ -3353,7 +3375,8 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
     done <<< "$lane_b_base"
   else
     # Named, not swallowed: the target may predate the baseline.
-    echo "  (baseline-vs-target check skipped: ${PUBLIC_SURFACE_BASE_REF} carries no $LANE_B_BASELINE)"
+    [ "${lane_b_skip_said:-no}" = yes ] \
+      || echo "  (baseline-vs-target check skipped: ${PUBLIC_SURFACE_BASE_REF} carries no $LANE_B_BASELINE)"
   fi
 else
   # ⚠ AND THIS LINE USED TO SAY "CI sets it", WHICH WAS FALSE TWICE. In round 1 it
