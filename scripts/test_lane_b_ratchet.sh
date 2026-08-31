@@ -849,17 +849,21 @@ for lane_b_shape in file dir; do
   lane_b_leafstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
   {
     echo '#!/bin/sh'
-    printf 'REAL_LS=%q\n' "$(command -v git)"
+    printf 'REAL_LS=%q\n' "$(command -v basename)"
     echo 'case "$*" in'
-    echo '  "ls-files -s -- scripts/public-surface-lane-b-baseline.txt")'
-    echo '    rm -f scripts/public-surface-lane-b-baseline.txt 2>/dev/null'
-    printf '    ln -s %q scripts/public-surface-lane-b-baseline.txt 2>/dev/null &&\n' "$lane_b_leaftgt"
+    # ⚠ HOOKED ON `basename`, WHICH RUNS AFTER THE GATE ENTERS scripts/ -- so the
+    # plant is a bare leaf name, not a path. Three hooks in this file have now
+    # died with the step they lived inside; dirname and basename are the two
+    # moments these scenes need and are not checks that can be deleted.
+    echo '  "scripts/public-surface-lane-b-baseline.txt")'
+    echo '    rm -f public-surface-lane-b-baseline.txt 2>/dev/null'
+    printf '    ln -s %q public-surface-lane-b-baseline.txt 2>/dev/null &&\n' "$lane_b_leaftgt"
     printf '      : > %q\n' "$lane_b_leafout/.hook-fired"
     echo '    ;;'
     echo 'esac'
     echo 'exec "$REAL_LS" "$@"'
-  } > "$lane_b_leafstub/git"
-  chmod +x "$lane_b_leafstub/git"
+  } > "$lane_b_leafstub/basename"
+  chmod +x "$lane_b_leafstub/basename"
   checks=$((checks + 1))
   lane_b_leaf_label="a leaf swapped in before the write is replaced, not followed (target: $lane_b_shape)"
   lane_b_leaf_rc=0
@@ -1055,17 +1059,19 @@ restore
 lane_b_cdstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
-  printf 'REAL_LS=%q\n' "$(command -v git)"
+  printf 'REAL_LS=%q\n' "$(command -v dirname)"
   echo 'case "$*" in'
-  echo '  "ls-files -s -- scripts/public-surface-lane-b-baseline.txt")'
+  # ⚠ HOOKED ON `dirname`, whose value the gate needs BEFORE it can enter the
+  # directory -- so the swap lands while the run is still at the repository root.
+  echo '  "scripts/public-surface-lane-b-baseline.txt")'
   echo '    out="$("$REAL_LS" "$@" 2>&1)"; st=$?'
   echo '    mv scripts scripts.real 2>/dev/null && : > scripts 2>/dev/null'
   echo '    printf "%s\n" "$out"; exit "$st"'
   echo '    ;;'
   echo 'esac'
   echo 'exec "$REAL_LS" "$@"'
-} > "$lane_b_cdstub/git"
-chmod +x "$lane_b_cdstub/git"
+} > "$lane_b_cdstub/dirname"
+chmod +x "$lane_b_cdstub/dirname"
 checks=$((checks + 1))
 lane_b_cd_rc=0
 lane_b_cd_out="$(env "PATH=$lane_b_cdstub:$PATH" "$GATE" --write-baseline 2>&1)" || lane_b_cd_rc=$?
