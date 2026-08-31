@@ -2324,7 +2324,17 @@ if [ -n "$scan_lane_a" ]; then
   printf '%s' "$scan_lane_a" >&2
   exit 1
 fi
-gate_finished=yes
+# ⚠ NO `gate_finished=yes` HERE. It used to sit on this line, ahead of the whole
+# lane B ratchet below, so an abort anywhere in the ratchet reached the EXIT trap
+# already marked finished — and that trap's refusal, which exists to catch
+# precisely a run that stopped before its own last line, was bypassed. On bash
+# 3.2 a `set -u` failure arrives at the trap with status 0, so such a run would
+# have reported success having produced no ratchet verdict at all.
+#
+# The marker is set on the two paths that legitimately end a run: the
+# `--write-baseline` writer's own exit, and the real end below. Measured against
+# the sibling repository's merged main, which carries exactly those two and no
+# third — this early one is local to this copy.
 # ── LANE B RATCHET ────────────────────────────────────────────────────────────
 # Lane B cannot be gated AT ZERO today: 33 matching lines already exist, and
 # failing on them would break every build until that debt is paid. That is why

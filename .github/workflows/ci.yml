@@ -96,35 +96,82 @@ jobs:
       - name: Version consistency
         run: ./scripts/check_versions.sh
 
+      # ⚠ THE COMPARISON BASE IS SUPPLIED, AND UNTIL NOW IT WAS NOT. The gate
+      # compares the lane B baseline against the merge target so that a change
+      # cannot add material and regenerate the baseline upward in one commit.
+      # That comparison is skipped when PUBLIC_SURFACE_BASE_REF is unset — and
+      # this workflow never set it, so on every run since the ratchet landed the
+      # skip branch was taken. The gate even printed "CI sets it", which was
+      # false in this repository: a check that never runs is worse than an
+      # absent one, because it manufactures the appearance of a check.
+      #
+      # The three cases are distinguished rather than guessed. A pull request
+      # carries its own base sha; a push to a branch carries the ref's previous
+      # tip; a newly created ref carries the all-zero sha, and only then is the
+      # default branch the right comparison. Each is fetched --depth=1, because
+      # the gate reads one tree and needs no history.
+      - name: Fetch the comparison base for the lane B ratchet
+        run: |
+          set -euo pipefail
+          base_sha='${{ github.event.pull_request.base.sha }}'
+          before='${{ github.event.before }}'
+          zero='0000000000000000000000000000000000000000'
+          if [ -n "$base_sha" ]; then
+            git fetch --depth=1 origin "$base_sha"
+            echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
+          elif [ -n "$before" ] && [ "$before" != "$zero" ]; then
+            git fetch --depth=1 origin "$before"
+            echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
+          else
+            git fetch --depth=1 origin "${{ github.event.repository.default_branch }}"
+            echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
+          fi
+
       # This repository is already public, so it is NOT in the org's
       # publication-candidate list and nothing else scans it. The script's
       # header states which lane is gated and which is only reported.
       - name: No internal material in the published non-source surface
         run: ./scripts/check_public_surface.sh
+        env:
+          PUBLIC_SURFACE_BASE_REF: ${{ env.SP_LANE_B_BASE }}
+
+  # ⚠ ITS OWN JOB, AND THE SHARED CLOCK IS WHY. This ran inside `static`, whose
+  # budget is ten minutes shared with checkout, syntax, the library and version
+  # checks and a full surface scan. Review reported it still inside its
+  # `--write-baseline` control after **more than thirteen minutes** and killed
+  # it — so on that runner the required check was cancelled before it could
+  # report anything, which reads as an outage rather than as a check that got
+  # expensive.
+  #
+  # ⚠ THE SLOW OBSERVATION IS A FLOOR, NOT A DURATION. It did not finish, so no
+  # bound can be derived from it honestly: 13 minutes over at most 14 controls
+  # is at least 55s per control, and the true figure is unknown. Measured here
+  # for contrast, on this tree: 143s for 14 controls, 10.2s per control. That is
+  # a 5.5x spread between environments, and the slow one is not reproducible
+  # here.
+  #
+  # So the number below is argued rather than measured: 14 x 55s is 770s from
+  # the only slow datum, and 20 minutes carries that with margin. If it is ever
+  # exceeded, the reading is NOT "raise it again" — a control harness whose cost
+  # per control varies 5.5x between runners has a hang, not a performance
+  # problem, and the `--write-baseline` control is where the slow run was seen.
+  #
+  # ⚠ NO env HERE, deliberately: every comparison target is synthesized from
+  # HEAD, so a CI-provided base ref could only replace a target the harness
+  # built on purpose. It needs no network and no history depth.
+  lane-b-ratchet-controls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
 
       # ⚠ THE GATE PASSING SAYS NOTHING ABOUT WHETHER ITS CHECKS STILL EXIST.
       # In shardpilot-go, two of the lane B ratchet's review findings were checks
       # that had been correct two rounds earlier and were dropped in a
       # restructure -- and both survived a green run of the gate. This drives
       # each refusal to its condition and fails when one stops firing.
-      #
-      # ⚠ NO env HERE, deliberately: every comparison target is synthesized from
-      # HEAD, so a CI-provided base ref could only replace a target the harness
-      # built on purpose. It needs no network and no history depth.
-      #
-      # It shares this job's ten-minute clock rather than taking its own, because
-      # `static` is already at ten. Measured HERE rather than inherited: 135s at
-      # the fourteen controls, on a developer box, 2026-08-26. The sibling
-      # repository's CI range at the same control count is 130-157s, and that is
-      # indicative only -- cost is controls x gate-cost, and the gate scans a
-      # different corpus in each repo, so the sibling's number is not a
-      # measurement of this one.
-      #
-      # Budget against the SLOW end when this is next revisited: a figure
-      # justifying a bound has to be argued from the side the risk is on, and for
-      # a timeout the risk is overrun. If it stops fitting, give the harness its
-      # own job as shardpilot-go did rather than raising this one -- outgrowing a
-      # shared timeout fails as a cancelled job, which reads like an outage.
       - name: Every lane B refusal still fires
         run: ./scripts/test_lane_b_ratchet.sh
 
