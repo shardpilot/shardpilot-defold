@@ -1653,7 +1653,8 @@ function M.new(config)
 			client.spool_purge_pending = true
 		end
 	else
-		local spooled, stored_deadline, spool_miss = storage.load_spool(normalized)
+		local spooled, stored_deadline, spool_miss, spool_migrated, spool_dropped =
+			storage.load_spool(normalized)
 		-- Server-requested backpressure survives a relaunch: when the record
 		-- carries a still-future Retry-After deadline, seed the publish
 		-- deferral so the startup resend waits out the remaining window
@@ -1852,7 +1853,13 @@ function M.new(config)
 				})
 			end
 		end
-		if #spooled > 0 or mismatched > 0 or condemned > 0 then
+		-- spool_migrated counts entries the loader RENAMED or DROPPED for legacy
+		-- wire names. It belongs in this guard because it is the one repair the
+		-- surviving count cannot express: an all-removed backlog sanitizes to an
+		-- empty list, and without the rewrite the durable file keeps those names
+		-- -- re-filtered every launch, and replayed onto the wire by a rollback
+		-- to an SDK that has no migration.
+		if #spooled > 0 or mismatched > 0 or condemned > 0 or (spool_migrated or 0) > 0 then
 			if #spooled == 0 then
 				client.spool_retry_after_ms = nil
 			end
@@ -1876,7 +1883,31 @@ function M.new(config)
 				-- at the launch after next.
 				client.spool_rewrite_pending = true
 				client.condemned_spool_pending = true
+			elseif (spool_migrated or 0) > 0 then
+				-- The MIGRATION could not land durably, and it is owed for the
+				-- same reason a condemnation is: the stale file still carries
+				-- legacy names. When migration dropped everything there is no
+				-- surviving event to resend and no acknowledgement that would
+				-- ever force another write, so without this the file stays as
+				-- it is for every future launch — and a rollback to a release
+				-- without the migration replays those names onto the wire.
+				client.spool_rewrite_pending = true
 			end
+		end
+		if (spool_dropped or 0) > 0 then
+			-- ⚠ A DROP IS A LOSS AND IS REPORTED. The migration rationale rests
+			-- on the count making the deletion visible, and the count was
+			-- consumed only to decide whether a rewrite is owed -- so the
+			-- deletion itself was silent, and a host had no way to tell a
+			-- migrated backlog from an empty one. One diagnostic per
+			-- non-accepted outcome, as the identity-mismatch and overflow paths
+			-- alongside already do.
+			client:diagnose({
+				scope = "spool",
+				status = "dropped",
+				code = "legacy_event_name",
+				count = spool_dropped,
+			})
 		end
 		if #spooled > 0 then
 			client.spool_record = spooled
@@ -2746,7 +2777,7 @@ function Client:session_end(reason)
 		self.session_active = false
 		return true
 	end
-	local ok, err = self:track("session_end", { reason = reason or "session_end" })
+	local ok, err = self:track("app.session_ended", { reason = reason or "session_end" })
 	if not ok then
 		return false, err
 	end
@@ -2763,18 +2794,6 @@ function Client:screen_view(screen_name, props)
 	end
 	out.screen_name = screen_name
 	return self:track("app.screen_view", out)
-end
-
-function Client:tutorial_start(tutorial_id)
-	return self:track("tutorial_start", { tutorial_id = tutorial_id })
-end
-
-function Client:tutorial_step_complete(tutorial_id, step_id)
-	return self:track("tutorial_step_complete", { tutorial_id = tutorial_id, step_id = step_id })
-end
-
-function Client:tutorial_complete(tutorial_id)
-	return self:track("tutorial_complete", { tutorial_id = tutorial_id })
 end
 
 function Client:track(event_name, props, context)

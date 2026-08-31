@@ -3039,7 +3039,7 @@ local function test_shutdown_captures_deferred_session_end_when_flush_cannot_sen
 	for _, record in pairs(stores) do
 		collect(record)
 	end
-	assert_true(names["session_end"],
+	assert_true(names["app.session_ended"],
 		"the deferred session end is durably captured in the spool")
 	assert_true(names["experiment_exposure"],
 		"the owed exposure is durably captured in the spool")
@@ -3074,7 +3074,7 @@ local function test_shutdown_completes_with_active_session_and_full_queue()
 	end
 	assert_true(names["experiment_exposure"],
 		"the owed exposure rides a shutdown batch")
-	assert_true(names["session_end"],
+	assert_true(names["app.session_ended"],
 		"the deferred session end rides a shutdown batch")
 end
 
@@ -3568,7 +3568,7 @@ local function test_shutdown_fails_when_housekeeping_events_cannot_persist()
 		local body = requests[#requests].body or ""
 		if fail_housekeeping
 			and (body:find("experiment_exposure", 1, true)
-				or body:find('"event_name":"session_end"', 1, true)) then
+				or body:find('"event_name":"app.session_ended"', 1, true)) then
 			callback(nil, nil, { status = 500, response = "" })
 			return true
 		end
@@ -5166,9 +5166,9 @@ local function test_shutdown_closes_session_opened_by_final_drain()
 				saw_exposure_session = sid
 			end
 			local esid = requests[i].body:match(
-				'"event_name":"session_end".-"session_id":"(session%-[^"]+)"')
+				'"event_name":"app%.session_ended".-"session_id":"(session%-[^"]+)"')
 				or requests[i].body:match(
-				'"session_id":"(session%-[^"]+)".-"event_name":"session_end"')
+				'"session_id":"(session%-[^"]+)".-"event_name":"app%.session_ended"')
 			if esid then
 				saw_session_end_session = esid
 			end

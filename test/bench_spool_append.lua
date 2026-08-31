@@ -139,5 +139,11 @@ io.write(string.format("p95 empty(first 100) %.3f ms   p95 full(last 100) %.3f m
 	p95e, p95f, p95f / p95e))
 io.write(string.format("sys.save calls %d   entries handed to sys.save %d (%.1f per append)\n",
 	save_calls, save_entries, save_entries / N))
-io.write(string.format("json.encode calls %d (%.1f per append) -- every entry re-encoded, every time\n",
+-- The count, and NOT a claim about what it means. This line used to end
+-- "every entry re-encoded, every time", which was true before the append
+-- optimisation and false after: storage.lua encodes only each newly admitted
+-- envelope, so the figure is ~1.0 per append while the record holds hundreds.
+-- A caption contradicting the number directly above it is read as the finding,
+-- because prose outranks a column in a reader's eye.
+io.write(string.format("json.encode calls %d (%.1f per append)\n",
 	encode_calls, encode_calls / N))
