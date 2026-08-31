@@ -152,15 +152,15 @@ jobs:
   #
   # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
   # FOURTEEN controls, which is what this harness had before the sibling's
-  # lineage was ported into it, and this harness is at 37 controls now. The
+  # lineage was ported into it, and this harness is at 40 controls now. The
   # bound is re-argued from a measurement taken at the SHIPPING count: a figure
   # derived for a different configuration is not a measurement of this one,
   # which is the mistake this comment already records the sibling making.
   #
-  # Measured on this rig at 37 controls: 353.7s for 35 of them, 10.1s each
+  # Measured on this rig at 40 controls: 353.7s for 35 of them, 10.1s each
   # (2026-08-31). The slow review datum -- 55s per control -- stays a floor
   # rather than a duration, because that run did not finish. The budget is
-  # sized from the floor, not from the fast rig: 37 x 55s is 2035s, so 40
+  # sized from the floor, not from the fast rig: 40 x 55s is 2200s, so 40
   # minutes. Twenty would not have covered it, and nothing would have said so.
   #
   # THIS NUMBER IS NOW CHECKED, not asserted. The harness reads timeout-minutes

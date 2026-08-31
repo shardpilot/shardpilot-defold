@@ -2918,15 +2918,66 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # extension: a real rename in the held directory, not a scrape of --help.
     # Where it is missing the gate refuses instead of falling back to semantics
     # it has just measured to be unsafe.
-    lane_b_tprobe=".lane_b_rename_probe.$$.${RANDOM}${RANDOM}"
+    # ⚠ AND THE PROBE IS THE SAME HAZARD THIS BLOCK EXISTS TO MEASURE. The
+    # paragraph a hundred lines above records that the write-aside "had a
+    # predictable name and was opened with an ordinary redirect, so a symlink
+    # planted at that name is followed" -- and then this probe was given a
+    # predictable name and an ordinary redirect. `set -C` is switched back off
+    # right after the write-aside, so the exclusive open protected the file that
+    # holds the data and not the file that certifies it is safe to install.
+    # Worse, the name was NOT unpredictable: the write-aside's name appears in
+    # this same directory and spells out the PID and two draws from a `RANDOM`
+    # sequence, and the next draws follow from those. Publishing the first name
+    # publishes the second.
+    #
+    # ⚠ SO THE NAME IS FIXED INSTEAD OF RANDOM, which is the opposite of the
+    # usual advice and is the point. An unpredictable name asks to be guessed;
+    # a FIXED one can be checked, and can be DRIVEN by a control that plants a
+    # symlink at it. This trades one real cost: a run killed between the create
+    # and the cleanup leaves the file behind, and every later write refuses
+    # until it is removed. The refusal says which file, so the cost is one
+    # deletion by someone who is already at a keyboard -- against a hazard that
+    # otherwise cannot be tested at all.
+    lane_b_tprobe="$lane_b_leaf.rename-probe"
+    lane_b_tprobe_dst="$lane_b_tprobe.dst"
+    # Checked before the create, so a pre-existing entry gets its OWN reason.
+    # Without this, a directory planted at the destination makes `mv -T` fail
+    # and the gate then refuses for "this mv has no --no-target-directory" --
+    # the right exit for the wrong reason, which is the failure this file's
+    # harness is built to separate.
+    if [ -e "$lane_b_tprobe" ] || [ -L "$lane_b_tprobe" ] \
+       || [ -e "$lane_b_tprobe_dst" ] || [ -L "$lane_b_tprobe_dst" ]; then
+      # refusal:structural
+      echo "REFUSING: the rename probe's path is occupied." >&2
+      echo "  Expected nothing at $(dirname "$LANE_B_BASELINE")/$lane_b_tprobe" >&2
+      echo "  (or its .dst). A leftover from a killed run is removed safely;" >&2
+      echo "  anything else planted there is refused rather than followed." >&2
+      rm -f "$lane_b_tmp"
+      exit 2
+    fi
+    lane_b_probe_made=no
+    # ⚠ `2>/dev/null` BEFORE THE `>`, NOT AFTER. Redirections are applied left
+    # to right, so `: > f 2>/dev/null` fails the open while stderr is still the
+    # terminal and prints "cannot overwrite existing file" over this gate's own
+    # message. Measured both orders; only this one is silent.
+    set -C
+    : 2>/dev/null > "$lane_b_tprobe" && lane_b_probe_made=yes
+    set +C
+    if [ "$lane_b_probe_made" != yes ]; then
+      # refusal:structural
+      echo "REFUSING: could not create the rename probe exclusively." >&2
+      echo "  The open is O_CREAT|O_EXCL, so it refuses a symlink, an existing" >&2
+      echo "  file and a directory alike, and it did. Nothing was written" >&2
+      echo "  through whatever stands at that path." >&2
+      rm -f "$lane_b_tmp"
+      exit 2
+    fi
     lane_b_have_T=no
-    if : > "$lane_b_tprobe" 2>/dev/null; then
-      if mv -fT "$lane_b_tprobe" "$lane_b_tprobe.dst" 2>/dev/null; then
-        lane_b_have_T=yes
-        rm -f "$lane_b_tprobe.dst"
-      else
-        rm -f "$lane_b_tprobe"
-      fi
+    if mv -fT "$lane_b_tprobe" "$lane_b_tprobe_dst" 2>/dev/null; then
+      lane_b_have_T=yes
+      rm -f "$lane_b_tprobe_dst"
+    else
+      rm -f "$lane_b_tprobe"
     fi
     if [ "$lane_b_have_T" != yes ]; then
       # refusal:structural
