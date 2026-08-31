@@ -152,13 +152,22 @@ jobs:
   #
   # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
   # FOURTEEN controls, which is what this harness had before the sibling's
-  # lineage was ported into it, and this harness is at 35 controls now. The
+  # lineage was ported into it, and this harness is at 36 controls now. The
   # bound is re-argued from a measurement taken at the SHIPPING count: a figure
   # derived for a different configuration is not a measurement of this one,
   # which is the mistake this comment already records the sibling making.
   #
-  # Measured here at 35 controls: SEE_BELOW. The slow review datum stays a
-  # floor, not a duration -- it did not finish.
+  # Measured on this rig at 36 controls: 353.7s for 35 of them, 10.1s each
+  # (2026-08-31). The slow review datum -- 55s per control -- stays a floor
+  # rather than a duration, because that run did not finish. The budget is
+  # sized from the floor, not from the fast rig: 36 x 55s is 1980s, so 40
+  # minutes. Twenty would not have covered it, and nothing would have said so.
+  #
+  # THIS NUMBER IS NOW CHECKED, not asserted. The harness reads timeout-minutes
+  # for this job back out of this file and fails if it is under the count times
+  # the slow constant, so adding a control raises the floor by itself. That
+  # control exists because the previous version of this paragraph derived 20
+  # minutes for FOURTEEN controls and survived the move to 35 unchanged.
   #
   # If the bound is ever exceeded, the reading is NOT "raise it again": a
   # control harness whose cost per control varies 5.5x between runners has a
@@ -170,7 +179,7 @@ jobs:
   # built on purpose. It needs no network and no history depth.
   lane-b-ratchet-controls:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
 
     steps:
       - name: Checkout

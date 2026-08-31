@@ -1248,7 +1248,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=35
+EXPECTED_CHECKS=36
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1278,6 +1278,60 @@ else
   elif [ "$lane_b_stated" -ne "$EXPECTED_CHECKS" ]; then
     echo "FAIL [the workflow states this harness's size]: the workflow says" >&2
     echo "  $lane_b_stated control(s), this harness enforces $EXPECTED_CHECKS." >&2
+    failures=$((failures + 1))
+  fi
+fi
+
+# ⚠ AND THE JOB'S TIME BUDGET IS THE SAME NUMBER-IN-PROSE, ONE FIELD OVER.
+# The workflow's timeout-minutes for this job was derived as "14 controls x 55s
+# is 770s, and 20 minutes carries that with margin". Both halves of that
+# sentence were true when written. Then the sibling's lineage was ported in and
+# the harness went from 14 controls to 35, at which point 20 minutes stopped
+# carrying the derivation -- 35 x 55s is 1925s, thirty-two minutes -- and
+# nothing failed, because the bound was prose and prose does not recompute.
+#
+# That is the same failure the control directly above exists to catch, found in
+# the field beside the sentence it guards. So the arithmetic is the check: the
+# budget must be at least the enforced control count times the slowest cost per
+# control ever observed. Add a control and the floor rises on its own; the
+# number cannot go stale without the build saying so.
+#
+# 55 is a FLOOR, not a duration: it comes from a review-machine run that was
+# still going when it was cut off, so the true slow cost is at least that. The
+# fast measurement on this rig is 10.1s per control (353.7s for 35, 2026-08-31),
+# and it is deliberately NOT the constant here -- sizing a timeout from the
+# faster of two runners is how a bound gets set that only one machine can meet.
+#
+# Exceeding the resulting budget still does not mean "raise it again". A harness
+# whose cost per control varies 5.5x between runners has a hang, not a
+# performance problem, and `--write-baseline` is where the slow run was seen.
+SLOW_SECONDS_PER_CONTROL=55
+checks=$((checks + 1))
+if [ ! -f "$lane_b_ciyml" ]; then
+  echo "FAIL [the job's time budget covers its controls]: $lane_b_ciyml is" >&2
+  echo "  missing, so the budget cannot be checked and this control would" >&2
+  echo "  otherwise have passed without reading anything." >&2
+  failures=$((failures + 1))
+else
+  lane_b_budget="$(awk '
+    /^  lane-b-ratchet-controls:[[:space:]]*$/ { injob = 1; next }
+    injob && /^  [^[:space:]#]/ { injob = 0 }
+    injob && $1 == "timeout-minutes:" { print $2; exit }
+  ' "$lane_b_ciyml")"
+  lane_b_need=$((EXPECTED_CHECKS * SLOW_SECONDS_PER_CONTROL))
+  if [ -z "$lane_b_budget" ]; then
+    echo "FAIL [the job's time budget covers its controls]: no timeout-minutes" >&2
+    echo "  found for job 'lane-b-ratchet-controls' in $lane_b_ciyml -- either" >&2
+    echo "  the job was renamed or the field was dropped, and an absent budget" >&2
+    echo "  is GitHub's six-hour default, not a bound." >&2
+    failures=$((failures + 1))
+  elif [ "$((lane_b_budget * 60))" -lt "$lane_b_need" ]; then
+    echo "FAIL [the job's time budget covers its controls]: the workflow gives" >&2
+    echo "  this job ${lane_b_budget}m ($((lane_b_budget * 60))s) for" >&2
+    echo "  $EXPECTED_CHECKS control(s) at ${SLOW_SECONDS_PER_CONTROL}s each," >&2
+    echo "  which needs ${lane_b_need}s ($(((lane_b_need + 59) / 60))m). Raise" >&2
+    echo "  timeout-minutes to at least $(((lane_b_need + 59) / 60)), or remove" >&2
+    echo "  controls -- do not lower the constant to fit." >&2
     failures=$((failures + 1))
   fi
 fi
