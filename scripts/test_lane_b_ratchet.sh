@@ -1554,7 +1554,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=49
+EXPECTED_CHECKS=51
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1581,6 +1581,46 @@ EXPECTED_CHECKS=49
 expect_env "an empty target counts every occurrence as new" \
   "PUBLIC_SURFACE_BASE_REF=EMPTY" 1 "absent from"
 
+
+# ⚠ AN INTERNAL FLAG MUST NOT BE AN INPUT. The summary chooses between "may not
+# rise" and "not checked against another commit" on a flag set where the
+# comparison happens -- and that flag was only ever assigned in the true case and
+# read with a default, so an exported value was inherited and an uncompared run
+# attested to work it had not done. Driven in both directions, because the
+# initialisation could equally be wrong the other way and pin the flag to no.
+lane_b_flag_rc=0
+checks=$((checks + 1))
+git add -A >/dev/null 2>&1 || true
+lane_b_flag_out="$(lane_b_compared=yes lane_b_skip_said=yes "$GATE" 2>&1)" || lane_b_flag_rc=$?
+if [ "$lane_b_flag_rc" -ne 0 ]; then
+  echo "FAIL [an exported flag does not reach the summary]: exit $lane_b_flag_rc" >&2
+  failures=$((failures + 1))
+else
+  case "$lane_b_flag_out" in
+    *"may fall and may not rise"*)
+      echo "FAIL [an exported flag does not reach the summary]: an uncompared run" >&2
+      echo "  claimed the comparison held, because the flag came from the" >&2
+      echo "  environment rather than from the work." >&2
+      failures=$((failures + 1)) ;;
+  esac
+fi
+lane_b_flag2_rc=0
+checks=$((checks + 1))
+lane_b_flag2_out="$(PUBLIC_SURFACE_BASE_REF=HEAD "$GATE" 2>&1)" || lane_b_flag2_rc=$?
+if [ "$lane_b_flag2_rc" -ne 0 ]; then
+  echo "FAIL [a real comparison still earns the strong sentence]: exit $lane_b_flag2_rc" >&2
+  failures=$((failures + 1))
+else
+  case "$lane_b_flag2_out" in
+    *"may fall and may not rise"*) ;;
+    *)
+      echo "FAIL [a real comparison still earns the strong sentence]: the run" >&2
+      echo "  compared against a target and then declined to say so -- the" >&2
+      echo "  initialisation pinned the flag instead of resetting it." >&2
+      failures=$((failures + 1)) ;;
+  esac
+fi
+restore
 
 # ⚠ TWO MATCHES ON ONE LINE, SEPARATED BY THE BYTE THE KEY WAS JOINED WITH.
 # awk's SUBSEP is 0x1c, and the counter used to build a key by joining and then
