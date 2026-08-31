@@ -64,13 +64,27 @@ if [ -z "$sha" ]; then
   exit 2
 fi
 
-# 2. A push to the default branch. Its previous tip is the accepted state, and
-#    there is no merge base to appeal to -- the branch IS the trunk.
+# 2. A push to the default branch. Its previous tip is the accepted state.
 #
-#    ⚠ NAMED LIMIT: this trusts the previous tip. If the default branch is itself
-#    red, that trust is misplaced. It is the only base available for the trunk,
-#    and the alternative -- "the last commit whose CI passed" -- is not in the
-#    event payload.
+#    ⚠ AND THAT IS A PREMISE, NOT A DEDUCTION. Review showed the hole: commit A
+#    adds an occurrence and raises its baseline, CI fails, and an otherwise empty
+#    commit B is green because its `before` is A and the two baselines agree --
+#    A's material laundered onto the trunk. There is no merge base to appeal to
+#    and the event payload carries no record of which commit was last ACCEPTED.
+#
+#    The repository's rule settles it rather than the code: THE TRUNK ADVANCES
+#    ONLY THROUGH PULL REQUESTS. Under that rule the previous tip cannot be an
+#    unreviewed state -- the only way a commit reaches the trunk is as the head of
+#    a pull request whose own comparison was green -- so `before` is an accepted
+#    state by construction rather than by luck.
+#
+#    ⚠ THE PREMISE IS NOT SELF-ENFORCING, AND THIS FILE CANNOT MAKE IT SO. Nothing
+#    reachable from a CI event distinguishes a merge landed from a pull request
+#    from a direct push. Branch protection on the default branch is what holds it,
+#    and that is repository configuration rather than code. If direct pushes are
+#    ever permitted, this line silently becomes the hole described above -- so the
+#    premise is written here, where the trust is taken, rather than in a commit
+#    message nobody reads twice.
 if [ "$ref" = "refs/heads/$default" ]; then
   if [ -n "$before" ]; then
     printf '%s\n' "$before"
