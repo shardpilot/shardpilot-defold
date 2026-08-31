@@ -2692,12 +2692,24 @@ LANE_B_BASELINE=scripts/public-surface-lane-b-baseline.txt
 # would write through either. I deleted both of these with the rest and the
 # control harness refused within one run -- which is the whole argument for
 # keeping controls for guards whose subject survives.
-if [ -L "$LANE_B_BASELINE" ]; then
-  # refusal:structural
-  echo "REFUSING: $LANE_B_BASELINE is a symlink in the working tree." >&2
-  echo "  --write-baseline would follow it and write through to its target." >&2
-  exit 2
-fi
+# ⚠ THE WORKING-TREE SYMLINK REFUSAL IS GONE, FOR THE SAME REASON THE HARD-LINK
+# ONE WAS. It said "--write-baseline would follow it and write through to its
+# target", which stopped being true when the writer stopped redirecting onto the
+# baseline. Measured on this tree, with the index holding the regular blob and
+# the working tree holding a link to a file outside the repository:
+#
+#   before   index 100644, worktree a symlink   outside reads PRECIOUS OUTSIDE
+#   mv -fT   worktree is a regular file          outside reads PRECIOUS OUTSIDE
+#
+# So the gate refused a shape it could not be harmed by -- and worse, refused it
+# on the WRITER path too, which is the one thing that repairs it. The reads all
+# go through the index, so the link is not followed there either.
+#
+# I found the stale premise myself, in an audit of all fifty refusals, and drew
+# the wrong conclusion from it: keep the refusal, correct its wording. Review
+# round 5 pointed out what that misses -- a refusal blocking its own remedy is
+# not a refusal with a bad sentence, it is one that should not fire. The index
+# symlink refusal below stays: there the two sides genuinely disagree.
 if [ -e "$LANE_B_BASELINE" ] && [ ! -f "$LANE_B_BASELINE" ]; then
   # refusal:structural
   # ⚠ A DIRECTORY HERE PASSES EVERY OTHER CHECK. Its link count is 1, it is not
@@ -2856,13 +2868,25 @@ if [ "${1:-}" = "--write-baseline" ]; then
       rm -rf "$lane_b_workdir"
       exit 2
     fi
+    lane_b_workdir_ino="$(ls -di . 2>/dev/null | awk '{print $1}')"
+    # ⚠ THE CLEANUP RE-OPENED THE NAME THE REST OF THIS BLOCK REFUSES TO TRUST.
+    # Review round 5: the parent check is not enough. Rename this directory aside
+    # and put a DIFFERENT directory at the same name in the same parent, and the
+    # parent inode still matches -- so `rm -rf <name>` deleted whatever now stood
+    # there. Every write above was careful to resolve against a held inode, and
+    # then the last line spelled the name out again and recursed over it.
+    #
+    # So the contents go from INSIDE, where names resolve against an inode nothing
+    # can swap, and the directory itself goes by `rmdir` -- which refuses a
+    # non-empty directory and a symlink alike, so anything standing at the name is
+    # left where it is. The inode is checked too, but `rmdir` is what makes a
+    # mistake harmless rather than merely unlikely.
     lane_b_scrub() {
-      # Only ever removes the directory from the parent it was created in. If `..`
-      # is not the anchored directory, leave the filesystem alone: a cleanup that
-      # resolves a name it no longer trusts is a delete somewhere else.
+      rm -f new probe probe.dst 2>/dev/null
       [ "$(ls -di .. 2>/dev/null | awk '{print $1}')" = "$lane_b_anchor_ino" ] || return 0
       cd -P .. 2>/dev/null || return 0
-      rm -rf "$lane_b_workdir"
+      [ "$(ls -di "$lane_b_workdir" 2>/dev/null | awk '{print $1}')" = "$lane_b_workdir_ino" ] || return 0
+      rmdir "$lane_b_workdir" 2>/dev/null || true
     }
     lane_b_tmp=new
     #
@@ -3092,50 +3116,73 @@ fi
 # The anti-cheat. Without this, the two rules above are satisfiable by editing
 # the baseline upward in the same commit that adds the occurrence.
 if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
-  # ⚠ TWO REASONS THE COMPARISON CAN BE UNAVAILABLE, and they are not the same
-  # fact. A ref that does not RESOLVE is a broken instrument -- a shallow clone
-  # that never fetched the base -- and reporting "skipped" for it would let the
-  # anti-cheat evaporate exactly where it is needed. A ref that resolves but
-  # carries no baseline is a true statement about the world: the target predates
-  # this file, which is the case on the change that introduces it.
-  if ! git rev-parse --verify --quiet "${PUBLIC_SURFACE_BASE_REF}^{commit}" >/dev/null; then
-    # refusal:structural
-    echo "REFUSING: PUBLIC_SURFACE_BASE_REF=${PUBLIC_SURFACE_BASE_REF} does not resolve." >&2
-    echo "  The baseline-vs-target check cannot run, and skipping it silently is" >&2
-    echo "  how a ratchet becomes a comment. Fetch the base ref, or unset the" >&2
-    echo "  variable deliberately if there is genuinely nothing to compare." >&2
-    exit 2
-  fi
-  # ⚠ SET BEFORE ASKED. `set -u` makes an unassigned base_copy fatal at the
-  # first expansion, and the branch that leaves it unassigned is precisely the
-  # advertised legal skip -- a target that predates this file. So the skip
-  # aborted the run instead of skipping, on every change that introduces the
-  # baseline, this one included. Observed as a red `public-surface` on the merge
-  # run while the branch run stayed green, because only the merge run has a base.
-  base_copy=""
-
-  # ⚠ THE PROBE ITSELF MUST BE UNAMBIGUOUS -- this is the sixth time on this
-  # change that a "nothing came back" was read as "there is nothing". Patching
-  # each site was not working, so the SHAPE of the question changed instead.
+  # ⚠ A THIRD ANSWER, BECAUSE "NO ANCESTRY" IS NOT "NOTHING TO COMPARE". A push
+  # that creates an orphan branch, or tags a root commit, has no parent and no
+  # merge base -- and the workflow used to answer that by comparing against the
+  # DEFAULT BRANCH, which the commit does not descend from. Review round 5: such
+  # a ref can then add occurrences, write matching counts, and pass on whatever
+  # slack the default branch's baseline happens to carry.
   #
-  # `cat-file -e` fails for BOTH a missing path and a broken lookup, so its
-  # nonzero says nothing on its own. `ls-tree <ref> -- <path>` separates them:
-  # it exits 0 whether or not the path is there and prints a line only when it
-  # is, so success-with-empty-output IS absence and a nonzero IS an instrument
-  # failure. One question, one meaning per answer.
-  if ! base_listing="$(git ls-tree --name-only "${PUBLIC_SURFACE_BASE_REF}" -- "${LANE_B_BASELINE}")"; then
-    # refusal:structural
-    echo "REFUSING: could not list ${LANE_B_BASELINE} on ${PUBLIC_SURFACE_BASE_REF}." >&2
-    echo "  That is a broken object store or an unreadable tree, not an absent" >&2
-    echo "  baseline, and skipping the anti-cheat on it is how this gate stops" >&2
-    echo "  being one." >&2
-    exit 2
-  fi
-  if [ -n "$base_listing" ]; then
-    if ! base_copy="$(git show "${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE}")"; then
+  # A commit with no ancestry has no grandfathered debt either, so the honest
+  # target is an empty baseline: every occurrence is new. Nothing special is
+  # needed downstream -- the comparison already treats a path absent from the
+  # target as zero and fails, which is the "ABSENT IS ZERO" rule above -- so this
+  # supplies a baseline with a header and no rows and lets that rule speak.
+  #
+  # It is a WORD rather than the empty-tree hash on purpose. `git show <empty
+  # tree>:<path>` fails exactly like a target that predates this file, and the
+  # gate would announce a legal skip: the hole again, wearing the costume of a
+  # correct answer.
+  if [ "${PUBLIC_SURFACE_BASE_REF}" = EMPTY ]; then
+    base_copy="# format-version: $LANE_B_FORMAT"
+    echo "  (baseline-vs-target check: the pushed ref has no ancestry, so the"
+    echo "   target baseline is EMPTY -- every lane B occurrence counts as new)"
+  else
+    # ⚠ TWO REASONS THE COMPARISON CAN BE UNAVAILABLE, and they are not the same
+    # fact. A ref that does not RESOLVE is a broken instrument -- a shallow clone
+    # that never fetched the base -- and reporting "skipped" for it would let the
+    # anti-cheat evaporate exactly where it is needed. A ref that resolves but
+    # carries no baseline is a true statement about the world: the target predates
+    # this file, which is the case on the change that introduces it.
+    if ! git rev-parse --verify --quiet "${PUBLIC_SURFACE_BASE_REF}^{commit}" >/dev/null; then
       # refusal:structural
-      echo "REFUSING: ${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE} is listed but could not be read." >&2
+      echo "REFUSING: PUBLIC_SURFACE_BASE_REF=${PUBLIC_SURFACE_BASE_REF} does not resolve." >&2
+      echo "  The baseline-vs-target check cannot run, and skipping it silently is" >&2
+      echo "  how a ratchet becomes a comment. Fetch the base ref, or unset the" >&2
+      echo "  variable deliberately if there is genuinely nothing to compare." >&2
       exit 2
+    fi
+    # ⚠ SET BEFORE ASKED. `set -u` makes an unassigned base_copy fatal at the
+    # first expansion, and the branch that leaves it unassigned is precisely the
+    # advertised legal skip -- a target that predates this file. So the skip
+    # aborted the run instead of skipping, on every change that introduces the
+    # baseline, this one included. Observed as a red `public-surface` on the merge
+    # run while the branch run stayed green, because only the merge run has a base.
+    base_copy=""
+
+    # ⚠ THE PROBE ITSELF MUST BE UNAMBIGUOUS -- this is the sixth time on this
+    # change that a "nothing came back" was read as "there is nothing". Patching
+    # each site was not working, so the SHAPE of the question changed instead.
+    #
+    # `cat-file -e` fails for BOTH a missing path and a broken lookup, so its
+    # nonzero says nothing on its own. `ls-tree <ref> -- <path>` separates them:
+    # it exits 0 whether or not the path is there and prints a line only when it
+    # is, so success-with-empty-output IS absence and a nonzero IS an instrument
+    # failure. One question, one meaning per answer.
+    if ! base_listing="$(git ls-tree --name-only "${PUBLIC_SURFACE_BASE_REF}" -- "${LANE_B_BASELINE}")"; then
+      # refusal:structural
+      echo "REFUSING: could not list ${LANE_B_BASELINE} on ${PUBLIC_SURFACE_BASE_REF}." >&2
+      echo "  That is a broken object store or an unreadable tree, not an absent" >&2
+      echo "  baseline, and skipping the anti-cheat on it is how this gate stops" >&2
+      echo "  being one." >&2
+      exit 2
+    fi
+    if [ -n "$base_listing" ]; then
+      if ! base_copy="$(git show "${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE}")"; then
+        # refusal:structural
+        echo "REFUSING: ${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE} is listed but could not be read." >&2
+        exit 2
+      fi
     fi
   fi
   # ⚠ THE TARGET'S FORMAT, ASKED BEFORE ITS ROWS ARE READ. I had this check and

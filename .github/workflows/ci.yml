@@ -105,57 +105,40 @@ jobs:
       # false in this repository: a check that never runs is worse than an
       # absent one, because it manufactures the appearance of a check.
       #
-      # The cases are distinguished rather than guessed. A pull request carries
-      # its own base sha; a push to an existing branch carries the ref's previous
-      # tip; a NEWLY CREATED ref carries the all-zero sha.
+      # ⚠ THE CHOICE LIVES IN A SCRIPT NOW, BECAUSE IT WAS WRONG FOUR TIMES.
+      # It was never set, so the comparison never ran while the gate printed "CI
+      # sets it"; then a new ref was compared against the DEFAULT BRANCH, which
+      # it does not descend from; then the fix for that read the MUTABLE
+      # `github.ref`, so a second push made the base the commit under test; then
+      # a root ref fell back to the default branch again, and a previously FAILED
+      # tip was trusted as an accepted base. Four defects, three lines of YAML,
+      # every one found by reading -- because nothing executed the choice.
       #
-      # ⚠ AND THE NEW-REF CASE READS THE EVENT'S SHA, NOT THE REF. The first fix
-      # for it fetched `github.ref` two deep and took FETCH_HEAD^. A ref is
-      # MUTABLE: if a second push lands before this step runs, that resolves the
-      # live tip, and when the later tip is a child of the event commit,
-      # FETCH_HEAD^ IS the event commit -- so the push that added lane B material
-      # and raised its baseline is compared against its own raised baseline and
-      # passes. Reproduced: with the ref moved on, FETCH_HEAD^ read back the very
-      # commit under test, while the event sha's parent read back the commit
-      # before it. `github.sha` is fixed for the event, so the history is deepened
-      # by one and its parent is used.
-      #
-      # ⚠ AND FOR THAT LAST ONE THE DEFAULT BRANCH IS THE WRONG ANSWER, WHICH
-      # THIS COMMENT USED TO ASSERT WAS THE RIGHT ONE. Every branch and tag push
-      # is scanned here, including off-main releases. If main already carries a
-      # higher count for a file, a new branch compared against MAIN can add an
-      # occurrence, raise its own baseline, and still pass -- it borrows slack
-      # from a branch it does not descend from. The comparison a new ref needs is
-      # its own parent. So the ref is fetched --depth=2 and FETCH_HEAD^ is used;
-      # depth 2 because one tree is read and one parent is needed, nothing more.
-      #
-      # The default branch survives only as the last resort for a ref whose tip
-      # has no parent at all -- a root commit, where there is no ancestry to
-      # compare with and no better answer exists. Measured on a genuinely shallow
-      # clone (file:// so --depth is honoured): after --depth=2 on a new branch,
-      # FETCH_HEAD^ resolves to the commit the branch was cut from, not to the
-      # default branch's tip.
+      # scripts/lane_b_base_ref.sh is that choice with inputs and one output, and
+      # the ratchet harness drives every case. This step only fetches what the
+      # script names. The rules it applies, and why, are documented there.
       - name: Fetch the comparison base for the lane B ratchet
         run: |
           set -euo pipefail
-          base_sha='${{ github.event.pull_request.base.sha }}'
-          before='${{ github.event.before }}'
-          sha='${{ github.sha }}'
-          zero='0000000000000000000000000000000000000000'
-          if [ -n "$base_sha" ]; then
-            git fetch --depth=1 origin "$base_sha"
-            echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
-          elif [ -n "$before" ] && [ "$before" != "$zero" ]; then
-            git fetch --depth=1 origin "$before"
-            echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
-          elif git rev-parse --verify --quiet "$sha^" >/dev/null \
-               || { git fetch --deepen=1 origin >/dev/null 2>&1 \
-                    && git rev-parse --verify --quiet "$sha^" >/dev/null; }; then
-            echo "SP_LANE_B_BASE=$sha^" >> "$GITHUB_ENV"
-          else
-            git fetch --depth=1 origin "${{ github.event.repository.default_branch }}"
-            echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
+          # The merge base needs history on both sides, so the default branch is
+          # fetched and the checkout deepened. Both are best-effort: when they
+          # fail the selection below falls to EMPTY, which is strict rather than
+          # permissive -- the failure mode of a missing history is a refusal, not
+          # a skipped comparison.
+          git fetch --no-tags origin \
+            "+refs/heads/${{ github.event.repository.default_branch }}:refs/remotes/origin/${{ github.event.repository.default_branch }}" || true
+          git fetch --unshallow origin 2>/dev/null || true
+          base="$(./scripts/lane_b_base_ref.sh \
+            --event '${{ github.event_name }}' \
+            --pr-base '${{ github.event.pull_request.base.sha }}' \
+            --before '${{ github.event.before }}' \
+            --sha '${{ github.sha }}' \
+            --ref '${{ github.ref }}' \
+            --default-branch '${{ github.event.repository.default_branch }}')"
+          if [ "$base" != EMPTY ]; then
+            git fetch --depth=1 origin "$base" 2>/dev/null || true
           fi
+          echo "SP_LANE_B_BASE=$base" >> "$GITHUB_ENV"
 
       # This repository is already public, so it is NOT in the org's
       # publication-candidate list and nothing else scans it. The script's
@@ -182,7 +165,7 @@ jobs:
   #
   # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
   # FOURTEEN controls, which is what this harness had before the sibling's
-  # lineage was ported into it, and this harness is at 40 controls now. The
+  # lineage was ported into it, and this harness is at 46 controls now. The
   # bound is re-argued from a measurement taken at the SHIPPING count: a figure
   # derived for a different configuration is not a measurement of this one,
   # which is the mistake this comment already records the sibling making.
@@ -190,7 +173,7 @@ jobs:
   # Measured on this rig: 353.7s for 35 controls, 10.1s each (2026-08-31). The
   # slow review datum -- 55s per control -- stays a floor rather than a duration,
   # because that run did not finish. The budget is sized from the floor, not from
-  # the fast rig: 40 x 55s is 2200s, so the arithmetic demands 37 minutes.
+  # the fast rig: 46 x 55s is 2530s, so the arithmetic demands 43 minutes.
   #
   # Shipping 50 rather than 39. The floor is what the control enforces; the
   # margin above it is a separate decision, and 40 would have been one control
