@@ -143,8 +143,21 @@ jobs:
           SP_DEFAULT: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
+          # ⚠ FETCH BEFORE CLASSIFYING, NOT AFTER. The selector INSPECTS the
+          # revisions it is given -- a target that does not carry the baseline is
+          # EMPTY rather than a skip -- and it can only inspect what is present.
+          # A depth-one checkout of a pull request whose base is outside the
+          # default branch's history does not contain that base, so classifying
+          # first and fetching afterwards asked the selector about an object it
+          # could not see: it passed the revision through, the later fetch made it
+          # resolvable, and the gate then found no baseline on it and skipped --
+          # letting the change add lane B material with a matching raised
+          # baseline. Both fetches are best-effort; when one fails the revision
+          # stays unresolvable and the gate refuses it by name, which is the
+          # correct outcome and not this one.
           git fetch --no-tags origin \
             "+refs/heads/$SP_DEFAULT:refs/remotes/origin/$SP_DEFAULT" || true
+          [ -n "$SP_PR_BASE" ] && git fetch --depth=1 origin "$SP_PR_BASE" || true
           bases="$(./scripts/lane_b_base_ref.sh \
             --event "$SP_EVENT" \
             --pr-base "$SP_PR_BASE" \
@@ -200,7 +213,7 @@ jobs:
   #
   # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
   # FOURTEEN controls, which is what this harness had before the sibling's
-  # lineage was ported into it, and this harness is at 58 controls now. The
+  # lineage was ported into it, and this harness is at 60 controls now. The
   # bound is re-argued from a measurement taken at the SHIPPING count: a figure
   # derived for a different configuration is not a measurement of this one,
   # which is the mistake this comment already records the sibling making.
@@ -208,7 +221,7 @@ jobs:
   # Measured on this rig: 353.7s for 35 controls, 10.1s each (2026-08-31). The
   # slow review datum -- 55s per control -- stays a floor rather than a duration,
   # because that run did not finish. The budget is sized from the floor, not from
-  # the fast rig: 58 x 55s is 3190s, so the arithmetic demands 54 minutes.
+  # the fast rig: 60 x 55s is 3300s, so the arithmetic demands 55 minutes.
   #
   # Shipping 50 rather than 39. The floor is what the control enforces; the
   # margin above it is a separate decision, and 40 would have been one control

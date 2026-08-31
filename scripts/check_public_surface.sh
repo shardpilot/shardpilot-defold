@@ -329,6 +329,21 @@ gate_tmp() {
 # having died mid-run. A flag set on the last line is the only thing that
 # distinguishes finishing from stopping, so that is what the trap reads.
 gate_finished=no
+# ⚠ AND EVERY OTHER INTERNAL FLAG IS INITIALISED HERE TOO, FOR THE REASON THE ONE
+# ABOVE ALWAYS WAS. A flag that is only ever ASSIGNED where its condition holds,
+# and READ with `${flag:-no}`, inherits whatever the environment exported. Review
+# round 10: `lane_b_compared=yes ./check_public_surface.sh` made an uncompared run
+# print "the number may fall and may not rise" -- the log attesting to work that
+# did not happen, which is the third round running that the defect was in what the
+# run SAYS. Measured: with the export, the strong sentence; without it, the weak
+# one. `gate_finished` was never exposed because it was initialised; these are.
+#
+# A default at the point of USE reads like a safety net and is the opposite: it
+# makes the ambient value the fallback. The initialisation is the safety net, and
+# the reads below no longer carry defaults, so re-introducing the pattern means
+# writing `${...:-}` again rather than merely forgetting a line.
+lane_b_compared=no
+lane_b_skip_said=no
 
 # ⚠ THE TRAP PRESERVES THE STATUS, and does not touch an EMPTY array.
 # Measured on bash 3.2: a `set -u` failure followed by an EXIT trap whose last
@@ -3375,7 +3390,7 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
     done <<< "$lane_b_base"
   else
     # Named, not swallowed: the target may predate the baseline.
-    [ "${lane_b_skip_said:-no}" = yes ] \
+    [ "$lane_b_skip_said" = yes ] \
       || echo "  (baseline-vs-target check skipped: ${PUBLIC_SURFACE_BASE_REF} carries no $LANE_B_BASELINE)"
   fi
 else
@@ -3385,10 +3400,16 @@ else
   # when the comparison for push events was split out: CI now leaves this unset on
   # a push deliberately, and the old wording reported a designed gap as an
   # accident. A message that explains away its own silence is worse than silence.
-  echo "  (baseline-vs-target check NOT RUN: no comparison target was given."
-  echo "   On a pull request CI supplies one. On a push it does not yet -- that"
-  echo "   selection is a separate change -- so nothing here compared this tree"
-  echo "   against another commit.)"
+  # ⚠ AND THIS TEXT DESCRIBES CI, WHICH IS A THING IT CANNOT SEE. It has been
+  # wrong twice for that reason: it said "CI sets it" when CI did not, and then
+  # "on a push it does not yet" while the change that made CI do so was in
+  # flight. A runtime diagnostic that narrates another component's roadmap goes
+  # stale on somebody else's merge. It now says what THIS run did and what to
+  # supply, which is true whatever CI is doing this week.
+  echo "  (baseline-vs-target check NOT RUN: no comparison target was given, so"
+  echo "   nothing here compared this tree against another commit. Set"
+  echo "   PUBLIC_SURFACE_BASE_REF to a revision to compare, or EMPTY to require"
+  echo "   that every occurrence be new.)"
 fi
 
 # ⚠ TWO SENTENCES, BECAUSE THE RUN ESTABLISHES TWO DIFFERENT THINGS. "May not
@@ -3415,7 +3436,7 @@ lane_b_total="$(printf '%s\n' "$lane_b_now" | awk '{n += $1} END {print n + 0}')
 # the comparison unmade with the variable set -- and the first of those is the
 # change that introduces this file, so the strong sentence printed on exactly the
 # run that established least. The comparison sets the flag where it happens.
-if [ "${lane_b_compared:-no}" = yes ]; then
+if [ "$lane_b_compared" = yes ]; then
   echo "LANE B RATCHET — held at ${lane_b_files} file(s), ${lane_b_total} occurrence(s). The number may fall and may not rise."
 else
   echo "LANE B RATCHET — the baseline agrees with the tree at ${lane_b_files} file(s), ${lane_b_total} occurrence(s). NOT checked against another commit on this run: a change that raised both together would satisfy this line."
