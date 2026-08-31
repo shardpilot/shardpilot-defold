@@ -2647,12 +2647,20 @@ fi
 # longer be constructed.
 #
 # WHAT SURVIVES, and why each is about the repository rather than the override:
-#   the index-mode check -- a COMMITTED symlink at this path travels to everyone
-#     who checks out, and is a state a constant path does not prevent;
-#   the working-tree symlink and hard-link checks -- both reachable at this
-#     fixed path with no variable at all, only a filesystem;
 #   the write-aside and its status check -- a partial serialisation renamed into
-#     place is a truncated baseline the next run reads as paid debt.
+#     place is a truncated baseline the next run reads as paid debt;
+#   the private write directory -- created atomically and then ENTERED, so every
+#     later path is a bare name resolved against a held inode;
+#   the directory refusal on the writer -- the one working-tree shape `mv -fT`
+#     cannot install over.
+#
+# ⚠ AND THIS LIST NAMED THREE GUARDS THAT NO LONGER EXIST: the index-mode check,
+# the working-tree symlink check and the hard-link check. All three rested on the
+# writer redirecting ONTO the baseline; it installs by rename now, so each was
+# refusing a shape it could not be harmed by, and two of them blocked the very
+# repair. An inventory of protections is exactly the text a later audit trusts
+# instead of reading the code, so a stale one is worse than none -- it is where
+# someone concludes they are covered.
 # ⚠ A SETTER IS TOLD, NOT IGNORED -- AND THIS RUNS BEFORE THE ASSIGNMENT, since
 # afterwards the name is always set. Removing the override left one thing worse
 # than before: whoever exports this now gets SILENCE. Their baseline goes to the
@@ -2718,7 +2726,19 @@ LANE_B_BASELINE=scripts/public-surface-lane-b-baseline.txt
 # DIRECTORY` with `-T` as "link replaced, the outside copy intact". A real
 # directory or FIFO at the path is still refused, because `-L` is false there and
 # `mv -fT` genuinely cannot install a file over a directory.
-if [ -e "$LANE_B_BASELINE" ] && [ ! -f "$LANE_B_BASELINE" ] \
+# The writer's own mode, named once. The guard below is about what `mv -fT` can
+# install over, which is a question only the writing path asks.
+LANE_B_WRITING=no
+[ "${1:-}" = "--write-baseline" ] && LANE_B_WRITING=yes
+
+# ⚠ AND ONLY A DIRECTORY, AND ONLY WHEN WRITING. Two safe shapes were still being
+# refused. A run that does not write reads the STAGED blob and never touches the
+# working-tree entry at all, so whatever stands there is irrelevant to it. And
+# `mv -fT` replaces a FIFO or a socket the same way it replaces a symlink --
+# measured: `mv -fT src fifo` returned 0, left a regular file with the new
+# contents, and never opened the FIFO. A real DIRECTORY is the one shape the
+# rename cannot install over, and that only matters to the writer.
+if [ "$LANE_B_WRITING" = yes ] && [ -d "$LANE_B_BASELINE" ] \
    && [ ! -L "$LANE_B_BASELINE" ]; then
   # refusal:structural
   # ⚠ A DIRECTORY HERE PASSES EVERY OTHER CHECK. Its link count is 1, it is not
@@ -2726,7 +2746,10 @@ if [ -e "$LANE_B_BASELINE" ] && [ ! -f "$LANE_B_BASELINE" ] \
   # the baseline -- while the gate prints WROTE and exits 0. Reachable with no
   # variable at all, only a filesystem, which is why it survived the removal of
   # the override and should not have been deleted with it.
-  echo "REFUSING: $LANE_B_BASELINE is not a regular file." >&2
+  echo "REFUSING: $LANE_B_BASELINE is a directory, and cannot be written." >&2
+  echo "  A rename installs a file over a link, a FIFO or a socket; it cannot" >&2
+  echo "  install one over a directory. Reading is unaffected -- that goes" >&2
+  echo "  through the index -- so this refuses the write, not the run." >&2
   exit 2
 fi
 # ⚠ THE HARD-LINK REFUSAL IS GONE, BECAUSE THE PREMISE IT RESTED ON IS.
@@ -3280,6 +3303,11 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
     fi
   fi
   if [ -n "$base_copy" ]; then
+    # ⚠ SET HERE, WHERE THE WORK HAPPENS, and nowhere else. Every earlier place
+    # that could have set it -- the variable being present, the ref resolving, the
+    # target carrying a file -- is a statement about the INPUT, and the summary
+    # was overstating precisely by reading one of those.
+    lane_b_compared=yes
     # ⚠ IFS= AND A MANUAL SPLIT. `read -r count path` uses the default
     # whitespace IFS, which strips LEADING spaces from the last field: a file
     # named " client.lua" serializes as "7  client.lua" and would be read as
@@ -3346,9 +3374,25 @@ fi
 # that the baseline agrees with the tree -- and a change raising the count and the
 # baseline together satisfies that agreement perfectly. Printing the strong
 # sentence on a run that did not do the work is how a log becomes a false record.
-lane_b_files="$(printf '%s' "$lane_b_now" | grep -c . )"
-lane_b_total="$(printf '%s' "$lane_b_now" | awk '{n += $1} END {print n + 0}')"
-if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
+# ⚠ NOT `grep -c .`, WHICH EXITS 1 WHEN THE ANSWER IS ZERO. That was harmless
+# while the count sat inside an `echo` argument -- the echo's status was what
+# errexit saw -- and fatal the moment round 7 lifted it into an assignment of its
+# own: on a tree whose lane B debt is fully PAID, `lane_b_now` is empty, grep
+# prints 0, exits 1, and the gate dies there without setting the dead-run marker
+# and without printing a summary. The one path this whole ratchet exists to reach
+# was the one path that killed it, and no control noticed, because the
+# comments-only control exits earlier on a deliberate baseline mismatch.
+#
+# awk counts and exits 0 whether the answer is zero or not.
+lane_b_files="$(printf '%s\n' "$lane_b_now" | awk 'NF {c++} END {print c + 0}')"
+lane_b_total="$(printf '%s\n' "$lane_b_now" | awk '{n += $1} END {print n + 0}')"
+# ⚠ AND THE FLAG IS WHAT RAN, NOT WHAT WAS ASKED FOR. Keying this off the
+# variable was a second-order version of the same overstatement: a target that
+# predates the baseline, and a format skew that carries nothing else, both leave
+# the comparison unmade with the variable set -- and the first of those is the
+# change that introduces this file, so the strong sentence printed on exactly the
+# run that established least. The comparison sets the flag where it happens.
+if [ "${lane_b_compared:-no}" = yes ]; then
   echo "LANE B RATCHET — held at ${lane_b_files} file(s), ${lane_b_total} occurrence(s). The number may fall and may not rise."
 else
   echo "LANE B RATCHET — the baseline agrees with the tree at ${lane_b_files} file(s), ${lane_b_total} occurrence(s). NOT checked against another commit on this run: a change that raised both together would satisfy this line."

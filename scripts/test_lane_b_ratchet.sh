@@ -1179,9 +1179,119 @@ fi
 # the run would refuse for a different reason before reaching this one.
 mv "$BASELINE" "$BASELINE.real"
 mkdir "$BASELINE"
-expect_nostage "a directory at the baseline path refuses" 2 "is not a regular file"
+# ⚠ THE WRITER, NOT A PLAIN RUN. A plain run reads the STAGED blob and never
+# looks at the working-tree entry, so a directory standing there is irrelevant to
+# it; the refusal is about what a rename can install over, which only the writer
+# asks. Driving it with a plain run asserted a refusal that should not fire.
+lane_b_dir_rc=0
+checks=$((checks + 1))
+lane_b_dir_out="$("$GATE" --write-baseline 2>&1)" || lane_b_dir_rc=$?
+judge "a directory at the baseline path refuses the WRITE" \
+  "$lane_b_dir_rc" 2 "is a directory, and cannot be written" "$lane_b_dir_out"
+
+# ⚠ AND THE SAME SHAPE MUST NOT REFUSE A READ. Same scene, no writing.
+lane_b_dirread_rc=0
+checks=$((checks + 1))
+lane_b_dirread_out="$("$GATE" 2>&1)" || lane_b_dirread_rc=$?
+if [ "$lane_b_dirread_rc" -ne 0 ]; then
+  echo "FAIL [a directory at the baseline path does not refuse a read]: exit" >&2
+  echo "  $lane_b_dirread_rc. The read goes through the index; whatever stands" >&2
+  echo "  in the working tree is not what it reads." >&2
+  failures=$((failures + 1))
+fi
 
 rmdir "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
+
+# ⚠ A FIFO IS NOT A DIRECTORY, AND THE RENAME REPLACES IT. Measured: `mv -fT src
+# fifo` returns 0, leaves a regular file with the new contents, and never opens
+# the FIFO -- so refusing this shape blocked a repair the writer can perform.
+mv "$BASELINE" "$BASELINE.real"
+mkfifo "$BASELINE"
+lane_b_fifobase_rc=0
+checks=$((checks + 1))
+lane_b_fifobase_out="$(timeout 120 "$GATE" --write-baseline 2>&1)" || lane_b_fifobase_rc=$?
+if [ "$lane_b_fifobase_rc" -eq 124 ]; then
+  echo "FAIL [a FIFO at the baseline path is replaced, not opened]: the gate did" >&2
+  echo "  not return within 120s -- something opened the FIFO and waited." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_fifobase_rc" -ne 0 ]; then
+  echo "FAIL [a FIFO at the baseline path is replaced, not opened]: exit $lane_b_fifobase_rc" >&2
+  printf '%s\n' "$lane_b_fifobase_out" | sed 's/^/    /' >&2
+  failures=$((failures + 1))
+elif [ -p "$BASELINE" ]; then
+  echo "FAIL [a FIFO at the baseline path is replaced, not opened]: the FIFO is" >&2
+  echo "  still standing after a write that reported success." >&2
+  failures=$((failures + 1))
+fi
+rm -f "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
+restore
+
+# ⚠ THE PAID PATH, WHICH NOTHING HERE HAD EVER RUN. When the last lane B
+# occurrence is gone the scan produces nothing, and round 7 lifted the file count
+# into an assignment of its own -- where `grep -c .` printing 0 and exiting 1
+# killed the gate under errexit before it could say anything. The outcome this
+# ratchet exists to reach was the one it could not survive.
+#
+# ⚠ AND THE WHOLE SCENE IS NOT CONSTRUCTIBLE HERE, WHICH IS ITSELF THE ANSWER TO
+# WHY NOTHING CAUGHT IT. Emptying lane B means removing every internal reference
+# from the Lua sources -- and those are the only places the ROSTER literals
+# appear, so the gate then refuses by design: "a gate against publishing internal
+# names must not be the only thing publishing them". A genuinely paid tree is a
+# coordinated change to the gate's own data, which a control that must not edit
+# the gate cannot stage. Two attempts at the scene failed on that, after a third
+# failed because `git add -A` put back the files it had just removed.
+#
+# So this drives the EXPRESSIONS rather than the scene: the two counting lines are
+# read out of the shipped gate and run under `set -euo pipefail` with an empty
+# scan, which is exactly the state that killed it. Weaker than a full run, and
+# named as weaker -- but it fails against `grep -c` and passes against awk, which
+# is the property that was missing.
+lane_b_count_src="$(grep -E '^lane_b_(files|total)=' "$GATE")"
+checks=$((checks + 1))
+if [ -z "$lane_b_count_src" ]; then
+  echo "FAIL [the summary counters survive an empty scan]: no lane_b_files or" >&2
+  echo "  lane_b_total assignment found in $GATE -- the control reads the shipped" >&2
+  echo "  lines by name, and the names moved." >&2
+  failures=$((failures + 1))
+else
+  lane_b_count_rc=0
+  lane_b_count_out="$(lane_b_now="" bash -euo pipefail -c "$lane_b_count_src
+printf '%s %s\n' \"\$lane_b_files\" \"\$lane_b_total\"" 2>&1)" || lane_b_count_rc=$?
+  if [ "$lane_b_count_rc" -ne 0 ]; then
+    echo "FAIL [the summary counters survive an empty scan]: the shipped lines" >&2
+    echo "  exited $lane_b_count_rc on a paid tree. Under errexit that is the gate" >&2
+    echo "  dying before its dead-run marker and before any summary." >&2
+    failures=$((failures + 1))
+  elif [ "$lane_b_count_out" != "0 0" ]; then
+    echo "FAIL [the summary counters survive an empty scan]: got" >&2
+    echo "  '$lane_b_count_out', expected '0 0'." >&2
+    failures=$((failures + 1))
+  fi
+fi
+restore
+
+# ⚠ THE TARGET THAT PREDATES THE BASELINE -- which is this change's own CI case.
+# The comparison cannot run, and the summary must not claim it did. Review round
+# 8: the strong sentence was selected by the variable being SET rather than by
+# the comparison having happened, so exactly the run that established least
+# announced the most.
+lane_b_pre_commit="$(synth_target '')"
+lane_b_pre_rc=0
+checks=$((checks + 1))
+git add -A >/dev/null 2>&1 || true
+lane_b_pre_out="$(PUBLIC_SURFACE_BASE_REF="$lane_b_pre_commit" "$GATE" 2>&1)" || lane_b_pre_rc=$?
+if [ "$lane_b_pre_rc" -ne 0 ]; then
+  echo "FAIL [a target without the baseline does not earn the strong sentence]: exit $lane_b_pre_rc" >&2
+  failures=$((failures + 1))
+else
+  case "$lane_b_pre_out" in
+    *"may fall and may not rise"*)
+      echo "FAIL [a target without the baseline does not earn the strong sentence]:" >&2
+      echo "  the comparison was skipped and the summary claimed it held anyway." >&2
+      failures=$((failures + 1)) ;;
+  esac
+fi
+restore
 
 # ⚠ AND A SYMLINK TO A DIRECTORY IS NOT THAT SHAPE, THOUGH `-e`/`-f` cannot tell
 # them apart. Review round 7: the generic guard above still refused a link whose
@@ -1446,7 +1556,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=52
+EXPECTED_CHECKS=56
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
