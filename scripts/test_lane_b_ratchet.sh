@@ -1469,7 +1469,12 @@ if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   exit 2
 fi
 if [ "$failures" -ne 0 ]; then
-  echo "lane B ratchet: $failures of $checks control(s) FAILED" >&2
+  # ⚠ "ACROSS", NOT "OF". A control may assert two things -- the planted-probe
+  # pair asserts a refusal AND that the outside file survived it -- so $failures
+  # can exceed the number of failing controls. "4 of 40 control(s) FAILED" reads
+  # as four broken controls when it was three. A count that overstates its own
+  # subject is the same defect this harness exists to find, in its last line.
+  echo "lane B ratchet: $failures failure(s) across $checks control(s)" >&2
   exit 1
 fi
 echo "lane B ratchet: $checks control(s), 0 failure(s) — against ${lane_b_tested}"
