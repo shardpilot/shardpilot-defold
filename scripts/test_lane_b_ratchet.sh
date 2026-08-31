@@ -1563,8 +1563,13 @@ fi
 # comparison twice reports one failure as two.
 lane_b_dedup_out=""
 checks=$((checks + 1))
+# The real coincidence is a branch's FIRST push: `before` is the point it was
+# cut from, which is also the merge base. (An earlier version of this control
+# asked for `before` and `sha` to be the same commit -- a push that moved
+# nothing -- and then called the correct two-line answer a failure. The scene
+# was invented rather than taken from what a push looks like.)
 lane_b_dedup_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
-  --event push --before "$lane_b_pushA" --sha "$lane_b_pushA" \
+  --event push --before "$lane_b_mb" --sha "$lane_b_pushA" \
   --ref refs/heads/feature --default-branch main) 2>&1 )" || true
 if [ "$lane_b_dedup_out" != "$lane_b_mb" ]; then
   echo "FAIL [coinciding states are emitted once]: chose" >&2
