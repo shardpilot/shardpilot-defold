@@ -20,6 +20,7 @@ set -euo pipefail
 ZERO=0000000000000000000000000000000000000000
 event=""; pr_base=""; before=""; sha=""; ref=""; default=""; remote=origin
 baseline=scripts/public-surface-lane-b-baseline.txt
+lane_b_trunk_rev=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -50,6 +51,8 @@ if [ -z "$default" ]; then
   echo "REFUSING: --default-branch is required." >&2
   exit 2
 fi
+git rev-parse --verify --quiet "$remote/$default^{commit}" >/dev/null 2>&1 \
+  && lane_b_trunk_rev="$remote/$default"
 
 # ⚠ A REVISION WITHOUT THE BASELINE IS NOT ALWAYS A WEAKER TARGET -- IT DEPENDS
 # ON WHY. The gate skips a target that predates the baseline file, which is right
@@ -149,51 +152,36 @@ fi
 #    green while carrying exactly the material that made A fail. The merge base
 #    is immune: it is a commit on the default branch, so the whole branch is
 #    measured against a state the project accepted.
-#    ⚠ AND TWO ENDPOINTS ARE NOT ENOUGH EITHER. Review: from a merge base of 10,
-#    push A reduces to 5 and passes; push B raises to 8 and FAILS; push C reduces
-#    to 7 and passes, because 7 is no greater than the merge base (10) or than its
-#    immediate predecessor B (8) -- while sitting above the last accepted value, 5.
-#    The branch ratchets at 7 and the debt paid by A is partly reclaimed. The same
-#    move works by DELETING and recreating the ref: `before` arrives all-zero, the
-#    previous-tip comparison drops out, and only the merge base is left.
+# 3. Any other ref -- a branch or a tag. It is compared against the TRUNK AS IT
+#    STANDS, and nothing published may carry more than the trunk currently does.
 #
-#    The state the comparison needs is "the lowest published value", and it is not
-#    in the event payload -- but it IS in the history. Every commit between the
-#    merge base and the pushed one was published on this ref, so the count may
-#    rise against NONE of them. Requiring that against every ancestor is the same
-#    as comparing against the per-file minimum, computed from git rather than from
-#    a record CI would have to keep.
+#    ⚠ THIS IS THE THIRD MODEL, AND THE FIRST TWO WERE BOTH WRONG. "The previous
+#    tip" let a rejected push launder its material through an empty follow-up.
+#    "The merge base, and every commit since it" was worse in both directions at
+#    once: too strict, because `rev-list` cannot tell a previously PUBLISHED tip
+#    from a commit created locally -- a developer who commits 10 -> 5 and then
+#    5 -> 7 before pushing once is refused, though 7 is an honest reduction from
+#    the published 10; and too weak, because a tag placed on an older commit has
+#    that commit as its own merge base, so it was compared with itself and
+#    republished debt the trunk had already paid down. It was also unaffordable:
+#    one gate run per state, at roughly a minute each in the review container,
+#    against a job budget of ten.
 #
-#    `before` is added when it is an ancestor. When it is not -- a force-push --
-#    it names a history this push discards, and it may not even be fetchable; the
-#    merge base still governs, and that narrowing is stated rather than hidden.
-lane_b_ancestors_max=100
-if base="$(git merge-base "$sha" "$remote/$default" 2>/dev/null)" && [ -n "$base" ]; then
-  revs="$base"
-  if walked="$(git rev-list "$base..$sha" 2>/dev/null)"; then
-    for r in $walked; do
-      [ "$r" = "$sha" ] && continue
-      revs="$revs
-$r"
-    done
-  fi
-  if [ -n "$before" ] && git merge-base --is-ancestor "$before" "$sha" 2>/dev/null; then
-    revs="$revs
-$before"
-  fi
-  n="$(printf '%s\n' "$revs" | grep -c .)"
-  if [ "$n" -gt "$lane_b_ancestors_max" ]; then
-    echo "REFUSING: $n published states since the merge base, over the limit of" >&2
-    echo "  $lane_b_ancestors_max. Each one is a comparison the caller must run," >&2
-    echo "  so an unbounded list is an unbounded job. Rebase the ref onto the" >&2
-    echo "  default branch, or raise the limit deliberately after measuring." >&2
-    exit 2
-  fi
-  emit "$revs"
+#    The trunk's current state is one comparison, cannot be gamed by local
+#    history, and refuses the tag case outright: 10 occurrences against a trunk
+#    that has paid down to 5 is a rise, whoever cut the tag.
+#
+#    ⚠ WHAT IT DOES NOT ENFORCE, SAID PLAINLY: monotonicity WITHIN a branch. A
+#    branch may go 5 -> 7 while the trunk sits at 10 and this will pass. That is
+#    deliberate -- the branch is not published to anyone -- and it is caught where
+#    it matters, at the pull request, whose base is the trunk's own tip and whose
+#    comparison is the strict one.
+if [ "$lane_b_trunk_rev" != "" ]; then
+  emit "$lane_b_trunk_rev"
   exit 0
 fi
 
-# 4. No merge base at all: an orphan branch, or a tag on a root commit. There is
-#    no accepted ancestry, so there is no grandfathered debt either -- the target
-#    is an empty baseline rather than some other branch's slack.
+# 4. No trunk to compare against -- an unfetched default branch, or a repository
+#    that has none. There is no accepted state to appeal to, so nothing is
+#    grandfathered: every occurrence is new.
 printf 'EMPTY\n'

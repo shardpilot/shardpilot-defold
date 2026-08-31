@@ -1618,14 +1618,10 @@ base_ref_case "a push to the trunk uses its previous tip" "cafe1234" -- \
 base_ref_case "a trunk push with no previous tip has no ancestry" "EMPTY" -- \
   --event push --before "$lane_b_zero" --sha aaaa --ref refs/heads/main --default-branch main
 
-# ⚠ A REAL REPOSITORY WITH A REAL BASELINE, BECAUSE THE REMAINING CASES ARE GIT
-# QUESTIONS AND THE ANSWERS DEPEND ON WHAT EACH REVISION CARRIES. The scene is the
-# one review round 1 of #69 described: from a merge base of 10, push A reduces to
-# 5 and passes, push B raises to 8 and FAILS, push C reduces to 7. Comparing C
-# against the merge base (10) and against its immediate predecessor B (8) passes
-# it -- while 7 sits above the last accepted value, 5, and the branch ratchets
-# there permanently. Every commit since the merge base was published on this ref,
-# so the count may rise against none of them.
+# ⚠ A REAL REPOSITORY, BECAUSE THE REMAINING CASES ARE GIT QUESTIONS. The model
+# is the trunk as it stands: nothing published may carry more than the trunk
+# currently does. These four assert WHICH revision is chosen, because every wrong
+# choice here still exits 0.
 lane_b_brrepo="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 (
   cd "$lane_b_brrepo"
@@ -1633,65 +1629,63 @@ lane_b_brrepo="$(mktemp -d "$lane_b_scratch/XXXXXX")"
   mkdir -p scripts
   printf '# format-version: 3\n10 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
   git add -A
-  git -c user.email=t@invalid -c user.name=t commit -qm "merge base: 10"
+  git -c user.email=t@invalid -c user.name=t commit -qm "old: 10"
   git branch -M main
-  git checkout -q -b feature
   printf '# format-version: 3\n5 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
-  git -c user.email=t@invalid -c user.name=t commit -qam "A: 10 -> 5, accepted"
-  printf '# format-version: 3\n8 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
-  git -c user.email=t@invalid -c user.name=t commit -qam "B: 5 -> 8, rejected"
-  printf '# format-version: 3\n7 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
-  git -c user.email=t@invalid -c user.name=t commit -qam "C: 8 -> 7"
+  git -c user.email=t@invalid -c user.name=t commit -qam "trunk pays down to 5"
   git update-ref refs/remotes/origin/main main
 ) >/dev/null 2>&1
-lane_b_mb="$(git -C "$lane_b_brrepo" rev-parse main)"
-lane_b_pushA="$(git -C "$lane_b_brrepo" rev-parse feature~2)"
-lane_b_pushB="$(git -C "$lane_b_brrepo" rev-parse feature~1)"
-lane_b_tip="$(git -C "$lane_b_brrepo" rev-parse feature)"
+lane_b_old="$(git -C "$lane_b_brrepo" rev-parse main~1)"
+lane_b_trunk="$(git -C "$lane_b_brrepo" rev-parse main)"
 
-lane_b_selector_out=""
-lane_b_selector_rc=0
 checks=$((checks + 1))
-lane_b_selector_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
-  --event push --before "$lane_b_pushB" --sha "$lane_b_tip" \
-  --ref refs/heads/feature --default-branch main) 2>&1 )" || lane_b_selector_rc=$?
-if [ "$lane_b_selector_rc" -ne 0 ]; then
-  echo "FAIL [every published state since the branch point is a floor]: exit $lane_b_selector_rc" >&2
-  failures=$((failures + 1))
-elif [ "$lane_b_selector_out" != "$lane_b_mb
-$lane_b_pushB
-$lane_b_pushA" ]; then
-  echo "FAIL [every published state since the branch point is a floor]: chose" >&2
-  printf '%s\n' "$lane_b_selector_out" | sed 's/^/    /' >&2
-  echo "  expected the merge base, then B, then A -- one per line. Without A the" >&2
-  echo "  reduction A published is spendable again: C's 7 is under the merge" >&2
-  echo "  base's 10 and under B's 8, and only A's 5 refuses it." >&2
+lane_b_branch_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --before "$lane_b_old" --sha "$lane_b_trunk" \
+  --ref refs/heads/topic --default-branch main) 2>&1 )" || true
+if [ "$lane_b_branch_out" != "origin/main" ]; then
+  echo "FAIL [a branch push is measured against the trunk as it stands]: chose" >&2
+  printf '%s\n' "$lane_b_branch_out" | sed 's/^/    /' >&2
+  echo "  expected origin/main. Measuring against the branch's own history lets" >&2
+  echo "  local commits set the floor, and lets a rejected tip launder material." >&2
   failures=$((failures + 1))
 fi
 
-# ⚠ AND NOT TWICE where two answers coincide: a caller running the same
-# comparison twice reports one failure as two.
-lane_b_dedup_out=""
+# ⚠ THE TAG ON AN OLDER COMMIT, which the previous model compared with ITSELF:
+# `git merge-base` of a commit already on the trunk is that commit, so cutting a
+# release tag at the value-10 commit republished ten occurrences after the trunk
+# had paid down to five -- and a tag's source archive is the distributed artifact.
 checks=$((checks + 1))
-# The real coincidence is a branch's FIRST push: `before` is the point it was
-# cut from, which is also the merge base. (An earlier version of this control
-# asked for `before` and `sha` to be the same commit -- a push that moved
-# nothing -- and then called the correct two-line answer a failure. The scene
-# was invented rather than taken from what a push looks like.)
-lane_b_dedup_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
-  --event push --before "$lane_b_mb" --sha "$lane_b_pushA" \
-  --ref refs/heads/feature --default-branch main) 2>&1 )" || true
-if [ "$lane_b_dedup_out" != "$lane_b_mb" ]; then
-  echo "FAIL [coinciding states are emitted once]: chose" >&2
-  printf '%s\n' "$lane_b_dedup_out" | sed 's/^/    /' >&2
-  echo "  expected the single rev $lane_b_mb." >&2
+lane_b_tag_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --before "$lane_b_zero" --sha "$lane_b_old" \
+  --ref refs/tags/v1 --default-branch main) 2>&1 )" || true
+if [ "$lane_b_tag_out" = "$lane_b_old" ]; then
+  echo "FAIL [a tag on an older commit is measured against the trunk, not itself]:" >&2
+  echo "  it chose the tagged commit, so the comparison is the tree against" >&2
+  echo "  itself and any debt the trunk has since paid is republished." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_tag_out" != "origin/main" ]; then
+  echo "FAIL [a tag on an older commit is measured against the trunk, not itself]:" >&2
+  printf '%s\n' "$lane_b_tag_out" | sed 's/^/    /' >&2
+  echo "  expected origin/main." >&2
   failures=$((failures + 1))
 fi
 
-# ⚠ A REVISION THE TRUNK HAS OUTGROWN IS BLIND, NOT WEAK. With the baseline on the
-# trunk, an ancestor that predates it would otherwise be announced as a skip, and
-# the push could add material with a matching baseline that later pushes then
-# treat as published. It is EMPTY instead: every occurrence new.
+# No trunk to appeal to: nothing is grandfathered.
+checks=$((checks + 1))
+lane_b_notrunk_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --before "$lane_b_zero" --sha "$lane_b_trunk" \
+  --ref refs/heads/topic --default-branch nosuchbranch) 2>&1 )" || true
+if [ "$lane_b_notrunk_out" != EMPTY ]; then
+  echo "FAIL [no trunk to compare against means nothing is grandfathered]: chose" >&2
+  printf '%s\n' "$lane_b_notrunk_out" | sed 's/^/    /' >&2
+  echo "  expected EMPTY." >&2
+  failures=$((failures + 1))
+fi
+
+# ⚠ A TARGET THE TRUNK HAS OUTGROWN IS BLIND, NOT WEAK. A pull request based on a
+# commit from before the baseline existed would otherwise be announced as a skip,
+# and the change could add material with a matching baseline that later work then
+# treats as published.
 ( cd "$lane_b_brrepo"
   git checkout -q --orphan blind
   git rm -rqf --cached . 2>/dev/null || true
@@ -1703,25 +1697,12 @@ fi
 lane_b_blind="$(git -C "$lane_b_brrepo" rev-parse blind)"
 checks=$((checks + 1))
 lane_b_blind_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
-  --event push --pr-base "$lane_b_blind" --default-branch main) 2>&1 )" || true
+  --event pull_request --pr-base "$lane_b_blind" --default-branch main) 2>&1 )" || true
 if [ "$lane_b_blind_out" != EMPTY ]; then
   echo "FAIL [a target without the baseline is EMPTY once the trunk has one]:" >&2
   printf '%s\n' "$lane_b_blind_out" | sed 's/^/    /' >&2
-  echo "  expected EMPTY. Passing the revision through makes the gate announce a" >&2
-  echo "  skip, and a skipped comparison is where material is laundered in." >&2
-  failures=$((failures + 1))
-fi
-
-# A ref with no shared history at all: no ancestry, so no grandfathered debt.
-checks=$((checks + 1))
-lane_b_orphan_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
-  --event push --before "$lane_b_zero" --sha "$lane_b_blind" \
-  --ref refs/heads/blind --default-branch main) 2>&1 )" || true
-if [ "$lane_b_orphan_out" != EMPTY ]; then
-  echo "FAIL [a ref with no shared history compares against nothing]: chose" >&2
-  printf '%s\n' "$lane_b_orphan_out" | sed 's/^/    /' >&2
-  echo "  expected EMPTY. Falling back to the trunk lets an unrelated ref pass" >&2
-  echo "  on the trunk's slack." >&2
+  echo "  expected EMPTY. Passing it through makes the gate announce a skip, and" >&2
+  echo "  a skipped comparison is where material is laundered in." >&2
   failures=$((failures + 1))
 fi
 rm -rf "$lane_b_brrepo"

@@ -126,29 +126,36 @@ jobs:
       # nothing is compared.
       - name: Fetch the comparison base for the lane B ratchet
         if: github.event.deleted != true
+        # ⚠ EVERY VALUE THROUGH `env`, BECAUSE A REF NAME IS ATTACKER TEXT. A
+        # `${{ }}` expression is pasted into the shell program before bash sees
+        # it, and git accepts quotes, semicolons, parentheses and `$(...)` in ref
+        # names -- verified with `git check-ref-format --branch`, which accepts
+        # `a'b`, `x$(id)`, `y;z` and `p(q)`. So a writer could push a branch whose
+        # NAME closes the quote and runs commands here, and an ordinary apostrophe
+        # would corrupt the command by accident. Through `env` the value is data
+        # bash reads, never program text it parses.
+        env:
+          SP_EVENT: ${{ github.event_name }}
+          SP_PR_BASE: ${{ github.event.pull_request.base.sha }}
+          SP_BEFORE: ${{ github.event.before }}
+          SP_SHA: ${{ github.sha }}
+          SP_REF: ${{ github.ref }}
+          SP_DEFAULT: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          # The merge base needs history on both sides, so the default branch is
-          # fetched and the checkout deepened. Both are best-effort: when they
-          # fail the selection below falls to EMPTY, which is strict rather than
-          # permissive -- the failure mode of a missing history is a refusal, not
-          # a skipped comparison.
           git fetch --no-tags origin \
-            "+refs/heads/${{ github.event.repository.default_branch }}:refs/remotes/origin/${{ github.event.repository.default_branch }}" || true
-          git fetch --unshallow origin 2>/dev/null || true
+            "+refs/heads/$SP_DEFAULT:refs/remotes/origin/$SP_DEFAULT" || true
           bases="$(./scripts/lane_b_base_ref.sh \
-            --event '${{ github.event_name }}' \
-            --pr-base '${{ github.event.pull_request.base.sha }}' \
-            --before '${{ github.event.before }}' \
-            --sha '${{ github.sha }}' \
-            --ref '${{ github.ref }}' \
-            --default-branch '${{ github.event.repository.default_branch }}')"
+            --event "$SP_EVENT" \
+            --pr-base "$SP_PR_BASE" \
+            --before "$SP_BEFORE" \
+            --sha "$SP_SHA" \
+            --ref "$SP_REF" \
+            --default-branch "$SP_DEFAULT")"
           for base in $bases; do
             [ "$base" = EMPTY ] && continue
             git fetch --depth=1 origin "$base" 2>/dev/null || true
           done
-          # Space-separated: a git revision contains no spaces, and GITHUB_ENV
-          # needs a heredoc delimiter for anything multi-line.
           echo "SP_LANE_B_BASES=$(printf '%s ' $bases)" >> "$GITHUB_ENV"
 
       # This repository is already public, so it is NOT in the org's
