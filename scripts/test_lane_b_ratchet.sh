@@ -482,7 +482,11 @@ expect() {
   judge "$label" "$rc" "$want" "$needle" "$out"
 }
 
-expect "clean tree holds"            0 "LANE B RATCHET — held at"
+# ⚠ THE NEEDLE IS THE PREFIX, NOT THE CLAIM. This runs with no comparison
+# target, and the summary now says which of two things the run established;
+# asserting the strong wording here would demand a sentence this run has not
+# earned -- which is what review round 7 found the gate printing.
+expect "clean tree holds"            0 "LANE B RATCHET —"
 mv "$BASELINE" "$BASELINE.bak"
 expect "a missing baseline refuses"  2 "is missing"
 mv "$BASELINE.bak" "$BASELINE"
@@ -1175,6 +1179,8 @@ mv "$BASELINE" "$BASELINE.real"
 mkdir "$BASELINE"
 expect_nostage "a directory at the baseline path refuses" 2 "is not a regular file"
 
+rmdir "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
+
 # ⚠ AND A SYMLINK TO A DIRECTORY IS NOT THAT SHAPE, THOUGH `-e`/`-f` cannot tell
 # them apart. Review round 7: the generic guard above still refused a link whose
 # target is a directory -- and refused it on the writer path, where the repair
@@ -1239,7 +1245,6 @@ else
   esac
 fi
 restore
-rmdir "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
 
 # ⚠ THE INDEX DISAGREEING WITH THE WORKING TREE, which is the only state that
 # isolates the index-mode refusal: with a symlink in BOTH, the working-tree check
