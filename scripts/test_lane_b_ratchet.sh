@@ -611,7 +611,12 @@ expect_ref "an older-format target is skipped, not misparsed" "$old_commit" 0 "t
 # to measure. Asserting the skip and asserting the bypass are two questions, and
 # the first control answering the first is why the second went unnoticed.
 printf -- '\n-- See %s for the freeze this follows.\n' "$marker" >> shardpilot/client.lua
+# ⚠ STAGED BEFORE THE WRITE, because the writer reads the INDEX. Without this the
+# baseline is regenerated from the unstaged tree, the count does not move, and the
+# control fails at the ordinary ratchet with exit 1 -- proving nothing about skew.
+git add -A >/dev/null 2>&1 || true
 "$GATE" --write-baseline >/dev/null 2>&1 || true
+git add -A >/dev/null 2>&1 || true
 skew_commit="$(synth_target '/^# format-version:/d')"
 expect_ref "a format skew may not carry a lane B source change" "$skew_commit" 2 \
   "may not carry lane B source changes"
@@ -731,7 +736,7 @@ lane_b_swapstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
   echo '#!/bin/sh'
   printf 'REAL_MV=%q\n' "$(command -v mv)"
   echo 'case " $* " in'
-  echo '  *public-surface-lane-b-baseline.txt.tmp.*)'
+  echo '  *public-surface-lane-b-baseline.txt.write.d/new*)'
   printf '    "$REAL_MV" %q %q 2>/dev/null &&\n' "$PWD/scripts" "$PWD/scripts.real"
   printf '      ln -s %q %q 2>/dev/null &&\n' "$lane_b_outside/scripts" "$PWD/scripts"
   printf '      : > %q\n' "$lane_b_outside/.hook-fired"
@@ -889,7 +894,7 @@ done
 lane_b_mvstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
-  echo 'case " $* " in *public-surface-lane-b-baseline.txt.tmp.*) exit 1 ;; esac'
+  echo 'case " $* " in *public-surface-lane-b-baseline.txt.write.d/new*) exit 1 ;; esac'
   printf 'exec %q "$@"\n' "$(command -v mv)"
 } > "$lane_b_mvstub/mv"
 chmod +x "$lane_b_mvstub/mv"
@@ -1097,11 +1102,21 @@ else
   lane_b_out="$("$GATE" --write-baseline 2>&1)" || lane_b_rc=$?
   chmod 755 scripts 2>/dev/null || true
   chattr -i scripts 2>/dev/null || true
-  # The needle names the OPEN failure, which is what this lever actually causes.
-  # It used to name the string both handlers shared, which read as covering the
-  # partial-write handler too; that one has no lever and is named as a limit in
-  # the gate rather than implied to be covered here.
-  judge "a failed write-aside create refuses" "${lane_b_rc:-0}" 2 "could not create the write-aside" "$lane_b_out"
+  # ⚠ THE NEEDLE MOVED ONE REFUSAL EARLIER, AND THE HARNESS SAID SO. This
+  # asserted "could not create the write-aside" until the writer's temporaries
+  # moved inside a private directory: an unwritable scripts/ now fails at the
+  # `mkdir`, one step before the open, so the run refuses for a different and
+  # more accurate reason. The control was red for exactly one run, with "exit 2
+  # as expected, but the reason was not ..." -- which is the argument for
+  # asserting reasons rather than codes, made against my own change.
+  #
+  # What this leaves behind is stated rather than hidden: the write-aside's own
+  # create-failure branch now has NO lever in this harness. Inside a directory
+  # created a moment earlier at mode 700, the open fails only on ENOSPC or a
+  # descriptor limit, neither of which an unprivileged control can produce here.
+  # It is kept because it is a real error path with a precise message, and named
+  # here as uncovered rather than left looking covered by this control.
+  judge "an unwritable baseline directory refuses" "${lane_b_rc:-0}" 2 "could not create the private write directory" "$lane_b_out"
 fi
 chmod 755 scripts 2>/dev/null || true
 chattr -i scripts 2>/dev/null || true
