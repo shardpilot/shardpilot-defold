@@ -150,11 +150,20 @@ jobs:
   # a 5.5x spread between environments, and the slow one is not reproducible
   # here.
   #
-  # So the number below is argued rather than measured: 14 x 55s is 770s from
-  # the only slow datum, and 20 minutes carries that with margin. If it is ever
-  # exceeded, the reading is NOT "raise it again" — a control harness whose cost
-  # per control varies 5.5x between runners has a hang, not a performance
-  # problem, and the `--write-baseline` control is where the slow run was seen.
+  # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
+  # FOURTEEN controls, which is what this harness had before the sibling's
+  # lineage was ported into it, and this harness is at 35 controls now. The
+  # bound is re-argued from a measurement taken at the SHIPPING count: a figure
+  # derived for a different configuration is not a measurement of this one,
+  # which is the mistake this comment already records the sibling making.
+  #
+  # Measured here at 35 controls: SEE_BELOW. The slow review datum stays a
+  # floor, not a duration -- it did not finish.
+  #
+  # If the bound is ever exceeded, the reading is NOT "raise it again": a
+  # control harness whose cost per control varies 5.5x between runners has a
+  # hang, not a performance problem, and the `--write-baseline` control is
+  # where the slow run was seen.
   #
   # ⚠ NO env HERE, deliberately: every comparison target is synthesized from
   # HEAD, so a CI-provided base ref could only replace a target the harness

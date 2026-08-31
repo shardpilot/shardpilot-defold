@@ -7,19 +7,26 @@
 # FALLS without this file being updated, so paying debt is recorded
 # rather than silently banked as slack.
 #
-# format-version: 2
+# format-version: 3
 # Format: <occurrences> <path> -- count FIRST so a path may contain spaces
-18 shardpilot/client.lua
-1 shardpilot/crash.lua
-8 shardpilot/crash/client.lua
-4 shardpilot/crash/dump.lua
+#
+# format 3 counts OCCURRENCES; format 2 counted MATCHING LINES. Two
+# identifiers on one line were one tick in format 2, so a second one
+# could be added to an existing line without any number moving. The
+# version moved because the numbers mean something different, not
+# because the layout changed -- reading a format-2 file with this
+# parser would understate every count that has such a line.
+20 shardpilot/client.lua
+2 shardpilot/crash.lua
+13 shardpilot/crash/client.lua
+6 shardpilot/crash/dump.lua
 4 shardpilot/experiments.lua
 4 shardpilot/remote_config.lua
 2 shardpilot/schema_revision.lua
 1 shardpilot/sdk.lua
 1 shardpilot/storage.lua
 1 shardpilot/transport.lua
-5 test/test_crash.lua
+9 test/test_crash.lua
 4 test/test_experiments.lua
 2 test/test_remote_config.lua
-25 test/test_sdk.lua
+28 test/test_sdk.lua
