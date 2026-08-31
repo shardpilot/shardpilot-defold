@@ -1446,7 +1446,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=51
+EXPECTED_CHECKS=52
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1508,87 +1508,105 @@ base_ref_case "a push to the trunk uses its previous tip" "cafe1234" -- \
 base_ref_case "a trunk push with no previous tip has no ancestry" "EMPTY" -- \
   --event push --before "$lane_b_zero" --sha aaaa --ref refs/heads/main --default-branch main
 
-# ⚠ A REAL REPOSITORY, BECAUSE THE REMAINING CASES ARE GIT QUESTIONS. The scene
-# is exactly the one review round 5 described: push A raises lane B material on a
-# branch and fails; push B is an empty commit whose `before` is A. Trusting
-# `before` compares B against A and sees no increase.
+# ⚠ A REAL REPOSITORY WITH A REAL BASELINE, BECAUSE THE REMAINING CASES ARE GIT
+# QUESTIONS AND THE ANSWERS DEPEND ON WHAT EACH REVISION CARRIES. The scene is the
+# one review round 1 of #69 described: from a merge base of 10, push A reduces to
+# 5 and passes, push B raises to 8 and FAILS, push C reduces to 7. Comparing C
+# against the merge base (10) and against its immediate predecessor B (8) passes
+# it -- while 7 sits above the last accepted value, 5, and the branch ratchets
+# there permanently. Every commit since the merge base was published on this ref,
+# so the count may rise against none of them.
 lane_b_brrepo="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 (
   cd "$lane_b_brrepo"
   git init -q .
-  git -c user.email=t@invalid -c user.name=t commit -q --allow-empty -m root
+  mkdir -p scripts
+  printf '# format-version: 3\n10 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
+  git add -A
+  git -c user.email=t@invalid -c user.name=t commit -qm "merge base: 10"
   git branch -M main
-  git -c user.email=t@invalid -c user.name=t commit -q --allow-empty -m "main moves on"
-  git checkout -q -b feature main~1
-  git -c user.email=t@invalid -c user.name=t commit -q --allow-empty -m "push A: raises lane B"
-  git -c user.email=t@invalid -c user.name=t commit -q --allow-empty -m "push B: empty"
+  git checkout -q -b feature
+  printf '# format-version: 3\n5 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
+  git -c user.email=t@invalid -c user.name=t commit -qam "A: 10 -> 5, accepted"
+  printf '# format-version: 3\n8 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
+  git -c user.email=t@invalid -c user.name=t commit -qam "B: 5 -> 8, rejected"
+  printf '# format-version: 3\n7 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
+  git -c user.email=t@invalid -c user.name=t commit -qam "C: 8 -> 7"
   git update-ref refs/remotes/origin/main main
 ) >/dev/null 2>&1
-lane_b_branchpoint="$(git -C "$lane_b_brrepo" rev-parse main~1)"
-lane_b_pushA="$(git -C "$lane_b_brrepo" rev-parse feature~1)"
+lane_b_mb="$(git -C "$lane_b_brrepo" rev-parse main)"
+lane_b_pushA="$(git -C "$lane_b_brrepo" rev-parse feature~2)"
+lane_b_pushB="$(git -C "$lane_b_brrepo" rev-parse feature~1)"
 lane_b_tip="$(git -C "$lane_b_brrepo" rev-parse feature)"
 
 lane_b_selector_out=""
 lane_b_selector_rc=0
 checks=$((checks + 1))
 lane_b_selector_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
-  --event push --before "$lane_b_pushA" --sha "$lane_b_tip" \
+  --event push --before "$lane_b_pushB" --sha "$lane_b_tip" \
   --ref refs/heads/feature --default-branch main) 2>&1 )" || lane_b_selector_rc=$?
 if [ "$lane_b_selector_rc" -ne 0 ]; then
-  echo "FAIL [a branch push is measured from where it left the trunk]: exit $lane_b_selector_rc" >&2
+  echo "FAIL [every published state since the branch point is a floor]: exit $lane_b_selector_rc" >&2
   failures=$((failures + 1))
-elif [ "$lane_b_selector_out" = "$lane_b_pushA" ]; then
-  echo "FAIL [a branch push is measured from where it left the trunk]: it chose" >&2
-  echo "  the previous tip, which is the push this gate may already have" >&2
-  echo "  rejected. An empty follow-up commit would then pass while carrying" >&2
-  echo "  exactly the material that failed." >&2
-  failures=$((failures + 1))
-elif [ "$lane_b_selector_out" != "$lane_b_branchpoint
+elif [ "$lane_b_selector_out" != "$lane_b_mb
+$lane_b_pushB
 $lane_b_pushA" ]; then
-  echo "FAIL [a branch push is measured from where it left the trunk]: chose" >&2
+  echo "FAIL [every published state since the branch point is a floor]: chose" >&2
   printf '%s\n' "$lane_b_selector_out" | sed 's/^/    /' >&2
-  echo "  expected BOTH, one per line: the merge base $lane_b_branchpoint" >&2
-  echo "  and the previous tip $lane_b_pushA. Each covers the other's gap --" >&2
-  echo "  the merge base alone turns a reduction into reusable slack, and the" >&2
-  echo "  previous tip alone carries a rejected tip's material through." >&2
+  echo "  expected the merge base, then B, then A -- one per line. Without A the" >&2
+  echo "  reduction A published is spendable again: C's 7 is under the merge" >&2
+  echo "  base's 10 and under B's 8, and only A's 5 refuses it." >&2
   failures=$((failures + 1))
 fi
 
-# ⚠ AND NOT TWICE ON A BRANCH'S FIRST PUSH, where the two answers coincide. A
-# caller running the same comparison twice reports one failure as two.
+# ⚠ AND NOT TWICE where two answers coincide: a caller running the same
+# comparison twice reports one failure as two.
 lane_b_dedup_out=""
-lane_b_dedup_rc=0
 checks=$((checks + 1))
 lane_b_dedup_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
-  --event push --before "$lane_b_branchpoint" --sha "$lane_b_tip" \
-  --ref refs/heads/feature --default-branch main) 2>&1 )" || lane_b_dedup_rc=$?
-if [ "$lane_b_dedup_rc" -ne 0 ] || [ "$lane_b_dedup_out" != "$lane_b_branchpoint" ]; then
-  echo "FAIL [coinciding bases are emitted once]: chose" >&2
+  --event push --before "$lane_b_pushA" --sha "$lane_b_pushA" \
+  --ref refs/heads/feature --default-branch main) 2>&1 )" || true
+if [ "$lane_b_dedup_out" != "$lane_b_mb" ]; then
+  echo "FAIL [coinciding states are emitted once]: chose" >&2
   printf '%s\n' "$lane_b_dedup_out" | sed 's/^/    /' >&2
-  echo "  expected the single rev $lane_b_branchpoint (exit $lane_b_dedup_rc)." >&2
+  echo "  expected the single rev $lane_b_mb." >&2
   failures=$((failures + 1))
 fi
 
-# An orphan branch shares no history with the trunk, so there is no accepted
-# ancestry to grandfather anything -- and borrowing the trunk's slack is the
-# defect this replaces.
-(
-  cd "$lane_b_brrepo"
-  git checkout -q --orphan orphan
-  git rm -rq --cached . 2>/dev/null || true
-  git -c user.email=t@invalid -c user.name=t commit -q --allow-empty -m orphan
+# ⚠ A REVISION THE TRUNK HAS OUTGROWN IS BLIND, NOT WEAK. With the baseline on the
+# trunk, an ancestor that predates it would otherwise be announced as a skip, and
+# the push could add material with a matching baseline that later pushes then
+# treat as published. It is EMPTY instead: every occurrence new.
+( cd "$lane_b_brrepo"
+  git checkout -q --orphan blind
+  git rm -rqf --cached . 2>/dev/null || true
+  rm -f scripts/public-surface-lane-b-baseline.txt
+  printf 'x\n' > unrelated.txt
+  git add -A
+  git -c user.email=t@invalid -c user.name=t commit -qm "no baseline here"
 ) >/dev/null 2>&1
-lane_b_orphan="$(git -C "$lane_b_brrepo" rev-parse orphan)"
-lane_b_orphan_out=""
-lane_b_orphan_rc=0
+lane_b_blind="$(git -C "$lane_b_brrepo" rev-parse blind)"
+checks=$((checks + 1))
+lane_b_blind_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --pr-base "$lane_b_blind" --default-branch main) 2>&1 )" || true
+if [ "$lane_b_blind_out" != EMPTY ]; then
+  echo "FAIL [a target without the baseline is EMPTY once the trunk has one]:" >&2
+  printf '%s\n' "$lane_b_blind_out" | sed 's/^/    /' >&2
+  echo "  expected EMPTY. Passing the revision through makes the gate announce a" >&2
+  echo "  skip, and a skipped comparison is where material is laundered in." >&2
+  failures=$((failures + 1))
+fi
+
+# A ref with no shared history at all: no ancestry, so no grandfathered debt.
 checks=$((checks + 1))
 lane_b_orphan_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
-  --event push --before "$lane_b_zero" --sha "$lane_b_orphan" \
-  --ref refs/heads/orphan --default-branch main) 2>&1 )" || lane_b_orphan_rc=$?
-if [ "$lane_b_orphan_rc" -ne 0 ] || [ "$lane_b_orphan_out" != EMPTY ]; then
+  --event push --before "$lane_b_zero" --sha "$lane_b_blind" \
+  --ref refs/heads/blind --default-branch main) 2>&1 )" || true
+if [ "$lane_b_orphan_out" != EMPTY ]; then
   echo "FAIL [a ref with no shared history compares against nothing]: chose" >&2
-  echo "  '$lane_b_orphan_out' (exit $lane_b_orphan_rc), expected EMPTY. Falling" >&2
-  echo "  back to the trunk lets an unrelated ref pass on the trunk's slack." >&2
+  printf '%s\n' "$lane_b_orphan_out" | sed 's/^/    /' >&2
+  echo "  expected EMPTY. Falling back to the trunk lets an unrelated ref pass" >&2
+  echo "  on the trunk's slack." >&2
   failures=$((failures + 1))
 fi
 rm -rf "$lane_b_brrepo"
