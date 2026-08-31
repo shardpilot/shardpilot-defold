@@ -484,7 +484,11 @@ expect() {
   judge "$label" "$rc" "$want" "$needle" "$out"
 }
 
-expect "clean tree holds"            0 "LANE B RATCHET — held at"
+# ⚠ THE NEEDLE IS THE PREFIX, NOT THE CLAIM. This runs with no comparison
+# target, and the summary now says which of two things the run established;
+# asserting the strong wording here would demand a sentence this run has not
+# earned -- which is what review round 7 found the gate printing.
+expect "clean tree holds"            0 "LANE B RATCHET —"
 mv "$BASELINE" "$BASELINE.bak"
 expect "a missing baseline refuses"  2 "is missing"
 mv "$BASELINE.bak" "$BASELINE"
@@ -1176,7 +1180,73 @@ fi
 mv "$BASELINE" "$BASELINE.real"
 mkdir "$BASELINE"
 expect_nostage "a directory at the baseline path refuses" 2 "is not a regular file"
+
 rmdir "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
+
+# ⚠ AND A SYMLINK TO A DIRECTORY IS NOT THAT SHAPE, THOUGH `-e`/`-f` cannot tell
+# them apart. Review round 7: the generic guard above still refused a link whose
+# target is a directory -- and refused it on the writer path, where the repair
+# lives -- because `-e` follows the link. `mv -fT` replaces the link itself; the
+# gate's own measured table says so two hundred lines down. This asserts the
+# repair happens and the target is untouched, which an exit code cannot.
+lane_b_symdir="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+mkdir -p "$lane_b_symdir/target.d"
+printf 'PRECIOUS INSIDE\n' > "$lane_b_symdir/target.d/keep.txt"
+mv "$BASELINE" "$BASELINE.real"
+ln -s "$lane_b_symdir/target.d" "$BASELINE"
+lane_b_symdir_rc=0
+checks=$((checks + 1))
+lane_b_symdir_out="$("$GATE" --write-baseline 2>&1)" || lane_b_symdir_rc=$?
+if [ "$lane_b_symdir_rc" -ne 0 ]; then
+  echo "FAIL [a symlink to a directory is repaired, not refused]: exit $lane_b_symdir_rc" >&2
+  printf '%s\n' "$lane_b_symdir_out" | sed 's/^/    /' >&2
+  failures=$((failures + 1))
+elif [ -L "$BASELINE" ]; then
+  echo "FAIL [a symlink to a directory is repaired, not refused]: the link is" >&2
+  echo "  still standing after a write that reported success." >&2
+  failures=$((failures + 1))
+fi
+checks=$((checks + 1))
+if [ ! -f "$lane_b_symdir/target.d/keep.txt" ]; then
+  echo "FAIL [nothing is written inside the linked directory]: the file that" >&2
+  echo "  stood in the link's target is gone -- the write went through the link" >&2
+  echo "  instead of replacing it." >&2
+  failures=$((failures + 1))
+fi
+rm -f "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
+rm -rf "$lane_b_symdir"
+restore
+
+# ⚠ AND THE SUMMARY MUST NOT CLAIM WHAT THE RUN DID NOT DO. With no comparison
+# target the gate establishes only that the baseline agrees with the tree; a
+# change raising both together satisfies that. Review round 7 found the run
+# printing "may not rise" on exactly those runs, and the skip line asserting "CI
+# sets it" on a path where CI deliberately does not.
+lane_b_nobase_rc=0
+checks=$((checks + 1))
+git add -A >/dev/null 2>&1 || true
+lane_b_nobase_out="$("$GATE" 2>&1)" || lane_b_nobase_rc=$?
+if [ "$lane_b_nobase_rc" -ne 0 ]; then
+  echo "FAIL [an uncompared run does not claim the number may not rise]: exit $lane_b_nobase_rc" >&2
+  failures=$((failures + 1))
+else
+  case "$lane_b_nobase_out" in
+    *"may fall and may not rise"*)
+      echo "FAIL [an uncompared run does not claim the number may not rise]: the" >&2
+      echo "  summary made a claim about another commit on a run that was given" >&2
+      echo "  no other commit to compare with." >&2
+      failures=$((failures + 1)) ;;
+  esac
+  case "$lane_b_nobase_out" in
+    *"NOT checked against another commit"*) ;;
+    *)
+      echo "FAIL [an uncompared run does not claim the number may not rise]: the" >&2
+      echo "  summary did not say that no comparison was made either. Silence" >&2
+      echo "  about it reads as the strong claim." >&2
+      failures=$((failures + 1)) ;;
+  esac
+fi
+restore
 
 # ⚠ THE INDEX DISAGREEING WITH THE WORKING TREE, which is the only state that
 # isolates the index-mode refusal: with a symlink in BOTH, the working-tree check
@@ -1376,7 +1446,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=48
+EXPECTED_CHECKS=51
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
