@@ -1224,6 +1224,40 @@ fi
 rm -f "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
 restore
 
+# ⚠ THE PAID PATH, WHICH NOTHING HERE HAD EVER RUN. When the last lane B
+# occurrence is gone the scan produces nothing, and round 7 lifted the file count
+# into an assignment of its own -- where `grep -c .` printing 0 and exiting 1
+# killed the gate under errexit before it could say anything. The one outcome
+# this ratchet exists to reach was the one it could not survive, and no control
+# noticed: the comments-only control exits earlier, on a deliberate mismatch.
+#
+# The scene is the debt paid: no Lua in the index at all, and a baseline with
+# nothing but its header. `git reset` puts the index back, because `restore` only
+# knows the paths it was told about.
+lane_b_paid_rc=0
+checks=$((checks + 1))
+git rm -q --cached -- '*.lua' >/dev/null 2>&1 || true
+printf '# format-version: 3\n' > "$BASELINE"
+git add -A >/dev/null 2>&1 || true
+lane_b_paid_out="$("$GATE" 2>&1)" || lane_b_paid_rc=$?
+if [ "$lane_b_paid_rc" -ne 0 ]; then
+  echo "FAIL [a fully paid tree finishes the run]: exit $lane_b_paid_rc" >&2
+  printf '%s\n' "$lane_b_paid_out" | tail -3 | sed 's/^/    /' >&2
+  failures=$((failures + 1))
+else
+  case "$lane_b_paid_out" in
+    *"0 occurrence(s)"*) ;;
+    *)
+      echo "FAIL [a fully paid tree finishes the run]: exit 0, but the summary" >&2
+      echo "  did not report zero occurrences -- so it finished describing" >&2
+      echo "  something other than the paid tree." >&2
+      failures=$((failures + 1)) ;;
+  esac
+fi
+git reset -q HEAD -- . >/dev/null 2>&1 || true
+git checkout -q HEAD -- . >/dev/null 2>&1 || true
+restore
+
 # ⚠ THE TARGET THAT PREDATES THE BASELINE -- which is this change's own CI case.
 # The comparison cannot run, and the summary must not claim it did. Review round
 # 8: the strong sentence was selected by the variable being SET rather than by
