@@ -1236,9 +1236,13 @@ restore
 # knows the paths it was told about.
 lane_b_paid_rc=0
 checks=$((checks + 1))
-git rm -q --cached -- '*.lua' >/dev/null 2>&1 || true
+# ⚠ ORDER: STAGE FIRST, THEN UNSTAGE THE LUA. `git add -A` re-adds everything,
+# including the files just removed from the index -- so doing it afterwards put
+# the whole corpus back and the scan found 97 occurrences against a header-only
+# baseline. The control failed, correctly, on a scene it had dismantled itself.
 printf '# format-version: 3\n' > "$BASELINE"
 git add -A >/dev/null 2>&1 || true
+git rm -q --cached -- '*.lua' >/dev/null 2>&1 || true
 lane_b_paid_out="$("$GATE" 2>&1)" || lane_b_paid_rc=$?
 if [ "$lane_b_paid_rc" -ne 0 ]; then
   echo "FAIL [a fully paid tree finishes the run]: exit $lane_b_paid_rc" >&2
