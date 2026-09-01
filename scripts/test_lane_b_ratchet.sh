@@ -1579,8 +1579,19 @@ EXPECTED_CHECKS=63
 # A second inventory is how the first one came to disagree with itself, and this
 # comment was the second inventory: it said six, named four, and concluded four.
 #
-# Each control below asserts WHICH ANSWER, not an exit code: these cases differ by
-# the rev they choose, and every wrong choice still exits 0.
+# Each control below asserts BOTH: that the selector exited 0, and WHICH
+# revision it chose. The second half is why they exist -- these cases differ by
+# the rev they choose and every wrong choice still exits 0 -- and the first half
+# was added after review found five of them discarding the status with `|| true`.
+# The caller assigns the selector's output under `set -e`, so a nonzero status
+# there stops the step and the gate never runs: a control reading only the
+# output would stay green while CI stopped.
+#
+# ⚠ AND A NEGATED PIPELINE IS NOT A STATUS CHECK. `! cmd | grep -q .` under
+# pipefail reports success both when the listing is empty and when the command
+# FAILED -- the conflation review found in the adoption scene's assertion.
+# Swept: the only surviving negation in this file is on a SIMPLE command, where
+# the status is one command's and the direction is the intended one.
 
 base_ref_case() {  # label want -- args...
   local label="$1" want="$2"; shift 2
