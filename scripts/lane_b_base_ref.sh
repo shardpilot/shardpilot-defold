@@ -225,7 +225,19 @@ fi
 
 if [ "$ref" = "refs/heads/$default" ]; then
   if [ -n "$before" ]; then
-    emit "$before" || exit $?
+    # ⚠ NOT THROUGH `emit`, AND THE ADOPTION PUSH IS WHY. `emit` decides whether a
+    # baseline-less revision is a fork from before adoption by asking the TRUNK --
+    # and on a trunk push the trunk has already been updated to the commit being
+    # pushed, so the question is circular. The change that INTRODUCES the baseline
+    # is exactly this shape: `before` legitimately lacks the file while the trunk,
+    # a moment old, has it. Classifying `before` against that trunk turns the one
+    # legal skip into EMPTY, and the push that lands the adoption fails with every
+    # existing occurrence reported as new.
+    #
+    # On the trunk, `before` IS the previous accepted state -- there is no third
+    # party to ask. If it lacks the baseline, adoption is happening in this push,
+    # which is the gate's own documented skip. So it is emitted as it stands.
+    printf '%s\n' "$before"
   else
     printf 'EMPTY\n'
   fi

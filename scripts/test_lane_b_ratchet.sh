@@ -1559,7 +1559,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=62
+EXPECTED_CHECKS=63
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1859,6 +1859,33 @@ elif [ "$lane_b_unknown_out" != EMPTY ]; then
   echo "  baseline-less base reaches the gate's legal skip." >&2
   failures=$((failures + 1))
 fi
+# ⚠ THE ADOPTION PUSH, WHICH IS THE MERGE OF THE CHANGE THAT INTRODUCES THE
+# BASELINE. On a trunk push the workflow has already pointed the trunk at the
+# commit being pushed, so asking the trunk whether adoption has happened is
+# circular: `before` legitimately lacks the file while the trunk, a moment old,
+# has it. Classifying `before` against that trunk turns the one legal skip into
+# EMPTY, and the push landing the adoption fails with every existing occurrence
+# reported as new. This is the scene that would have fired on the merge itself.
+( cd "$lane_b_brrepo"
+  git update-ref refs/remotes/origin/main "$lane_b_trunk"
+) >/dev/null 2>&1
+lane_b_adopt_rc=0
+checks=$((checks + 1))
+lane_b_adopt_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --before "$lane_b_blind" --sha "$lane_b_trunk" \
+  --ref refs/heads/main --default-branch main) 2>&1 )" || lane_b_adopt_rc=$?
+if [ "$lane_b_adopt_rc" -ne 0 ]; then
+  echo "FAIL [the adoption push keeps its legal skip]:" >&2
+  echo "  the selector exited $lane_b_adopt_rc rather than choosing." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_adopt_out" != "$lane_b_blind" ]; then
+  echo "FAIL [the adoption push keeps its legal skip]: chose" >&2
+  printf '%s\n' "$lane_b_adopt_out" | sed 's/^/    /' >&2
+  echo "  expected the previous tip $lane_b_blind. EMPTY here means the merge" >&2
+  echo "  that introduces the baseline fails on its own existing debt." >&2
+  failures=$((failures + 1))
+fi
+
 # ⚠ A TAG MAY BE CALLED `origin/main`, AND GIT PREFERS IT. Ambiguous short names
 # resolve refs/tags BEFORE refs/remotes, so on a tag push the checkout can hold
 # both and the shorthand names the TAG -- which is the commit under test. The

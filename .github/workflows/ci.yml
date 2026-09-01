@@ -242,7 +242,7 @@ jobs:
   #
   # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
   # FOURTEEN controls, which is what this harness had before the sibling's
-  # lineage was ported into it, and this harness is at 62 controls now. The
+  # lineage was ported into it, and this harness is at 63 controls now. The
   # bound is re-argued at the shipping count. ⚠ AND "RE-ARGUED" IS NOT
   # "RE-MEASURED": the figures on either side of this paragraph were taken at 14
   # and 35 controls, and the current budget is those extrapolated through the 55s
@@ -254,9 +254,9 @@ jobs:
   # Measured on this rig: 353.7s for 35 controls, 10.1s each (2026-08-31). The
   # slow review datum -- 55s per control -- stays a floor rather than a duration,
   # because that run did not finish. The budget is sized from the floor, not from
-  # the fast rig: 62 x 55s is 3410s, so the arithmetic demands 57 minutes.
+  # the fast rig: 63 x 55s is 3465s, so the arithmetic demands 58 minutes.
   #
-  # Shipping 60 against a floor of 57. The floor is what the control enforces;
+  # Shipping 60 against a floor of 58. The floor is what the control enforces;
   # the margin above it is a separate decision, and a bound one control from red
   # is a bound the next person raises in a hurry rather than argues.
   #
@@ -267,7 +267,7 @@ jobs:
   # prose describing a mechanism is a second edit, and it is never in the diff
   # that invalidates it.
   #
-  # ⚠ WHOEVER ADDS THE FOURTH CONTROL FROM 62 RE-DERIVES THIS PAIR. At 55s a
+  # ⚠ WHOEVER ADDS THE THIRD CONTROL FROM 63 RE-DERIVES THIS PAIR. At 55s a
   # control, 65 need 3575s and fit inside 60 minutes; 66 need 3630s and do not.
   # The arithmetic is written out so the next reader checks it in a line rather
   # than trusting the sentence -- an earlier version of it said the sixth, and an
