@@ -229,6 +229,8 @@ trap 'rm -f ${LANE_B_TMPFILES[@]+"${LANE_B_TMPFILES[@]}"}' EXIT
 
 
 GATE=scripts/check_public_surface.sh
+# ⚠ ABSOLUTE, because the selector controls run it from other directories.
+SELECTOR="$PWD/scripts/lane_b_base_ref.sh"
 BASELINE=scripts/public-surface-lane-b-baseline.txt
 # ⚠ THE PIN IS GONE WITH THE OVERRIDE. This used to unset and re-export
 # LANE_B_BASELINE so nothing could redirect the gate's writer at an arbitrary
@@ -438,7 +440,10 @@ lane_b_scratch="$(mktemp -d)"
 # that cannot fail: if the write does not happen, the old baseline stays, the
 # gate still disagrees with the tree, and the control observes exactly the exit
 # and message it wanted -- from a state it never established. Review found this
-# in two of the controls added for this very kind of defect.
+# in two of the controls added for this very kind of defect -- and an audit
+# for the same class found two MORE afterwards, both written by the hand
+# that wrote this helper, in the format-skew control and the SUBSEP one.
+# Having the remedy in the file is not the same as reaching for it.
 must_write_baseline() {
   local label="$1"
   if ! "$GATE" --write-baseline >/dev/null 2>&1; then
@@ -625,7 +630,7 @@ printf -- '\n-- See %s for the freeze this follows.\n' "$marker" >> shardpilot/c
 # baseline is regenerated from the unstaged tree, the count does not move, and the
 # control fails at the ordinary ratchet with exit 1 -- proving nothing about skew.
 git add -A >/dev/null 2>&1 || true
-"$GATE" --write-baseline >/dev/null 2>&1 || true
+must_write_baseline "a format skew may not carry a lane B source change"
 git add -A >/dev/null 2>&1 || true
 skew_commit="$(synth_target '/^# format-version:/d')"
 expect_ref "a format skew may not carry a lane B source change" "$skew_commit" 2 \
@@ -1554,7 +1559,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=53
+EXPECTED_CHECKS=66
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1567,11 +1572,51 @@ EXPECTED_CHECKS=53
 #
 # So the count is read out of the workflow and compared to the enforced one. It
 # is the same rule as EXPECTED_CHECKS itself, applied one file over.
-# ⚠ THE COMPARISON-BASE SELECTION AND ITS EIGHT CONTROLS LIVE IN A FOLLOW-UP.
-# That step had been wrong six times, and every fix produced the next defect; it
-# is split out so this ratchet can be judged on its own and that policy can churn
-# without holding it. What stays here is the gate's END of the contract, below:
-# what it does when it is told the target has no ancestry.
+# ⚠ THE COMPARISON BASE, WHICH NOTHING HERE USED TO EXECUTE. The choice of what a
+# change is compared against was wrong six times before it became a script, and
+# every one was found by reading. The distinct defects are enumerated ONCE, in
+# .github/workflows/ci.yml beside the step that calls the selector -- not here.
+# A second inventory is how the first one came to disagree with itself, and this
+# comment was the second inventory: it said six, named four, and concluded four.
+#
+# Each control below asserts BOTH: that the selector exited 0, and WHICH
+# revision it chose. The second half is why they exist -- these cases differ by
+# the rev they choose and every wrong choice still exits 0 -- and the first half
+# was added after review found five of them discarding the status with `|| true`.
+# The caller assigns the selector's output under `set -e`, so a nonzero status
+# there stops the step and the gate never runs: a control reading only the
+# output would stay green while CI stopped.
+#
+# ⚠ AND A NEGATED PIPELINE IS NOT A STATUS CHECK. `! cmd | grep -q .` under
+# pipefail reports success both when the listing is empty and when the command
+# FAILED -- the conflation review found in the adoption scene's assertion.
+#
+# Swept, and this claim is exactly what the sweep supports: NO EXECUTABLE
+# PIPELINE IS NEGATED in this file. Negation itself is common and fine here --
+# `[ ! -f ]` and friends are test operators, `! git clone` and `! "$GATE"` are
+# single commands, and two are brace groups wrapping one redirect. None can
+# conflate two failures, because none has a pipeline's several statuses to
+# choose between. An earlier version of this note said only ONE negation
+# survived -- the conclusion a narrower grep would have supported, not the one
+# the grep that ran was capable of reaching.
+
+base_ref_case() {  # label want -- args...
+  local label="$1" want="$2"; shift 2
+  [ "${1:-}" = -- ] && shift
+  local got rc=0
+  checks=$((checks + 1))
+  got="$("$SELECTOR" "$@" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL [$label]: the selector exited $rc rather than choosing" >&2
+    printf '%s\n' "$got" | sed 's/^/    /' >&2
+    failures=$((failures + 1))
+  elif [ "$got" != "$want" ]; then
+    echo "FAIL [$label]: chose '$got', expected '$want'" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+lane_b_zero=0000000000000000000000000000000000000000
 
 # ⚠ AND THE GATE'S END OF THE CONTRACT. The controls below drive the CHOICE;
 # this one drives what the gate does when the choice is EMPTY. Measuring that by
@@ -1630,7 +1675,7 @@ restore
 # edit. That is the round-1 defect re-entering through the encoding of the key.
 printf -- '-- See %s and\034 %s for the freeze.\nreturn {}\n' "$marker" "$marker" > "$NEW_FILE"
 git add -A >/dev/null 2>&1 || true
-"$GATE" --write-baseline >/dev/null 2>&1 || true
+must_write_baseline "two matches around a SUBSEP byte count as two"
 lane_b_subsep_n="$(awk -v f="$NEW_FILE" '$2 == f {print $1}' "$BASELINE")"
 checks=$((checks + 1))
 if [ "$lane_b_subsep_n" != 2 ]; then
@@ -1671,6 +1716,327 @@ else
   esac
 fi
 restore
+base_ref_case "a pull request uses its own base sha" "feedface" -- \
+  --event pull_request --pr-base feedface --before cafe1234 --sha aaaa \
+  --ref refs/heads/topic --default-branch main
+
+base_ref_case "an all-zero pr base is absence, not a rev" "cafe1234" -- \
+  --event push --pr-base "$lane_b_zero" --before cafe1234 --sha aaaa \
+  --ref refs/heads/main --default-branch main
+
+base_ref_case "a push to the trunk uses its previous tip" "cafe1234" -- \
+  --event push --before cafe1234 --sha aaaa --ref refs/heads/main --default-branch main
+
+base_ref_case "a trunk push with no previous tip has no ancestry" "EMPTY" -- \
+  --event push --before "$lane_b_zero" --sha aaaa --ref refs/heads/main --default-branch main
+
+# ⚠ A REAL REPOSITORY, BECAUSE THE REMAINING CASES ARE GIT QUESTIONS. The model
+# is the trunk as it stands: nothing published may carry more than the trunk
+# currently does. Seven repository-backed cases stand here -- a branch push, a tag
+# on an older commit, a missing trunk, a baseline-less target, an unreadable
+# trunk, the adoption push, and an ambiguous trunk name.
+#
+# Each requires BOTH: that the selector exited 0, and that it chose the
+# expected revision. Neither half alone is enough -- every wrong choice here
+# still exits 0, and the caller assigns the selector's output under `set -e`,
+# so a nonzero status stops the step and the gate never runs while a control
+# reading only the output stays green.
+lane_b_brrepo="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+(
+  cd "$lane_b_brrepo"
+  git init -q .
+  mkdir -p scripts
+  printf '# format-version: 3\n10 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
+  git add -A
+  git -c user.email=t@invalid -c user.name=t commit -qm "old: 10"
+  git branch -M main
+  printf '# format-version: 3\n5 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
+  git -c user.email=t@invalid -c user.name=t commit -qam "trunk pays down to 5"
+  git update-ref refs/remotes/origin/main main
+) >/dev/null 2>&1
+lane_b_old="$(git -C "$lane_b_brrepo" rev-parse main~1)"
+lane_b_trunk="$(git -C "$lane_b_brrepo" rev-parse main)"
+
+checks=$((checks + 1))
+lane_b_branch_rc=0
+lane_b_branch_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --before "$lane_b_old" --sha "$lane_b_trunk" \
+  --ref refs/heads/topic --default-branch main) 2>&1 )" || lane_b_branch_rc=$?
+if [ "$lane_b_branch_rc" -ne 0 ]; then
+  echo "FAIL [a branch push is measured against the trunk as it stands]:" >&2
+  echo "  the selector exited $lane_b_branch_rc rather than choosing. The caller's" >&2
+  echo "  assignment runs under set -e, so a nonzero status there aborts" >&2
+  echo "  the step and the gate never runs -- a control that reads only" >&2
+  echo "  the output stays green while CI stops." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_branch_out" != "refs/remotes/origin/main" ]; then
+  echo "FAIL [a branch push is measured against the trunk as it stands]: chose" >&2
+  printf '%s\n' "$lane_b_branch_out" | sed 's/^/    /' >&2
+  echo "  expected refs/remotes/origin/main. Measuring against the branch's own history lets" >&2
+  echo "  local commits set the floor, and lets a rejected tip launder material." >&2
+  failures=$((failures + 1))
+fi
+
+# ⚠ THE TAG ON AN OLDER COMMIT, which the previous model compared with ITSELF:
+# `git merge-base` of a commit already on the trunk is that commit, so cutting a
+# release tag at the value-10 commit republished ten occurrences after the trunk
+# had paid down to five -- and a tag's source archive is the distributed artifact.
+checks=$((checks + 1))
+lane_b_tag_rc=0
+lane_b_tag_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --before "$lane_b_zero" --sha "$lane_b_old" \
+  --ref refs/tags/v1 --default-branch main) 2>&1 )" || lane_b_tag_rc=$?
+if [ "$lane_b_tag_rc" -ne 0 ]; then
+  echo "FAIL [a tag on an older commit is measured against the trunk, not itself]:" >&2
+  echo "  the selector exited $lane_b_tag_rc rather than choosing. The caller's" >&2
+  echo "  assignment runs under set -e, so a nonzero status there aborts" >&2
+  echo "  the step and the gate never runs -- a control that reads only" >&2
+  echo "  the output stays green while CI stops." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_tag_out" = "$lane_b_old" ]; then
+  echo "FAIL [a tag on an older commit is measured against the trunk, not itself]:" >&2
+  echo "  it chose the tagged commit, so the comparison is the tree against" >&2
+  echo "  itself and any debt the trunk has since paid is republished." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_tag_out" != "refs/remotes/origin/main" ]; then
+  echo "FAIL [a tag on an older commit is measured against the trunk, not itself]:" >&2
+  printf '%s\n' "$lane_b_tag_out" | sed 's/^/    /' >&2
+  echo "  expected refs/remotes/origin/main." >&2
+  failures=$((failures + 1))
+fi
+
+# No trunk to appeal to: nothing is grandfathered.
+checks=$((checks + 1))
+lane_b_notrunk_rc=0
+lane_b_notrunk_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --before "$lane_b_zero" --sha "$lane_b_trunk" \
+  --ref refs/heads/topic --default-branch nosuchbranch) 2>&1 )" || lane_b_notrunk_rc=$?
+if [ "$lane_b_notrunk_rc" -ne 0 ]; then
+  echo "FAIL [no trunk to compare against means nothing is grandfathered]:" >&2
+  echo "  the selector exited $lane_b_notrunk_rc rather than choosing. The caller's" >&2
+  echo "  assignment runs under set -e, so a nonzero status there aborts" >&2
+  echo "  the step and the gate never runs -- a control that reads only" >&2
+  echo "  the output stays green while CI stops." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_notrunk_out" != EMPTY ]; then
+  echo "FAIL [no trunk to compare against means nothing is grandfathered]: chose" >&2
+  printf '%s\n' "$lane_b_notrunk_out" | sed 's/^/    /' >&2
+  echo "  expected EMPTY." >&2
+  failures=$((failures + 1))
+fi
+
+# ⚠ A TARGET THE TRUNK HAS OUTGROWN IS BLIND, NOT WEAK. A pull request based on a
+# commit from before the baseline existed would otherwise be announced as a skip,
+# and the change could add material with a matching baseline that later work then
+# treats as published.
+( cd "$lane_b_brrepo"
+  git checkout -q --orphan blind
+  git rm -rqf --cached . 2>/dev/null || true
+  rm -f scripts/public-surface-lane-b-baseline.txt
+  printf 'x\n' > unrelated.txt
+  git add -A
+  git -c user.email=t@invalid -c user.name=t commit -qm "no baseline here"
+) >/dev/null 2>&1
+lane_b_blind="$(git -C "$lane_b_brrepo" rev-parse blind)"
+checks=$((checks + 1))
+lane_b_blind_rc=0
+lane_b_blind_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event pull_request --pr-base "$lane_b_blind" --default-branch main) 2>&1 )" || lane_b_blind_rc=$?
+if [ "$lane_b_blind_rc" -ne 0 ]; then
+  echo "FAIL [a target without the baseline is EMPTY once the trunk has one]:" >&2
+  echo "  the selector exited $lane_b_blind_rc rather than choosing. The caller's" >&2
+  echo "  assignment runs under set -e, so a nonzero status there aborts" >&2
+  echo "  the step and the gate never runs -- a control that reads only" >&2
+  echo "  the output stays green while CI stops." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_blind_out" != EMPTY ]; then
+  echo "FAIL [a target without the baseline is EMPTY once the trunk has one]:" >&2
+  printf '%s\n' "$lane_b_blind_out" | sed 's/^/    /' >&2
+  echo "  expected EMPTY. Passing it through makes the gate announce a skip, and" >&2
+  echo "  a skipped comparison is where material is laundered in." >&2
+  failures=$((failures + 1))
+fi
+# ⚠ AND "I COULD NOT LOOK" MUST NOT READ AS "IT IS NOT THERE". The adoption test
+# asks whether the TRUNK carries the baseline; if it cannot be inspected, the old
+# default was "adoption has not happened", which passes a baseline-less revision
+# through to a gate that then takes its legal skip.
+#
+# ⚠ AND THE SCENE MUST FAIL THE LOOKUP, NOT THE RESOLUTION. An earlier version
+# pointed --default-branch at a name that does not exist, so `rev-parse` failed
+# and `ls-tree` was never reached: a regression that turned a failed ls-tree on a
+# RESOLVABLE trunk into "no" would have left it green. This builds a trunk whose
+# commit resolves and whose tree object has been deleted -- measured: rev-parse
+# rc 0, ls-tree rc 128.
+lane_b_btrepo="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+(
+  cd "$lane_b_btrepo"
+  git init -q .
+  mkdir -p scripts
+  printf '# format-version: 3\n1 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
+  git add -A
+  git -c user.email=t@invalid -c user.name=t commit -qm "trunk with a baseline"
+  git branch -M main
+  git update-ref refs/remotes/origin/main main
+  git checkout -q --orphan blind
+  git rm -rqf --cached . 2>/dev/null || true
+  rm -f scripts/public-surface-lane-b-baseline.txt
+  printf 'x\n' > unrelated.txt
+  git add -A
+  git -c user.email=t@invalid -c user.name=t commit -qm "no baseline here"
+  rm -f ".git/objects/$(git rev-parse main^{tree} | cut -c1-2)/$(git rev-parse main^{tree} | cut -c3-)"
+) >/dev/null 2>&1
+lane_b_bt_blind="$(git -C "$lane_b_btrepo" rev-parse blind)"
+checks=$((checks + 1))
+lane_b_bt_ok=yes
+( cd "$lane_b_btrepo" && git rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}' >/dev/null 2>&1 ) || lane_b_bt_ok=no
+( cd "$lane_b_btrepo" && ! git ls-tree --name-only refs/remotes/origin/main -- scripts/public-surface-lane-b-baseline.txt >/dev/null 2>&1 ) || lane_b_bt_ok=no
+if [ "$lane_b_bt_ok" != yes ]; then
+  echo "FAIL [an uninspectable trunk does not license a pass-through]: the scene" >&2
+  echo "  was not established -- the trunk must RESOLVE and its tree lookup must" >&2
+  echo "  FAIL, or this control drives the resolution path instead." >&2
+  failures=$((failures + 1))
+else
+  lane_b_unknown_rc=0
+  lane_b_unknown_out="$( (cd "$lane_b_btrepo" && "$SELECTOR" \
+    --event pull_request --pr-base "$lane_b_bt_blind" --default-branch main) 2>&1 )" || lane_b_unknown_rc=$?
+  if [ "$lane_b_unknown_rc" -ne 0 ]; then
+    echo "FAIL [an uninspectable trunk does not license a pass-through]:" >&2
+    echo "  the selector exited $lane_b_unknown_rc rather than choosing." >&2
+    failures=$((failures + 1))
+  elif [ "$lane_b_unknown_out" != EMPTY ]; then
+    echo "FAIL [an uninspectable trunk does not license a pass-through]: chose" >&2
+    printf '%s\n' "$lane_b_unknown_out" | sed 's/^/    /' >&2
+    echo "  expected EMPTY. Reading a failure to look as an answer is how a" >&2
+    echo "  baseline-less base reaches the gate's legal skip." >&2
+    failures=$((failures + 1))
+  fi
+fi
+rm -rf "$lane_b_btrepo"
+
+# ⚠ THE ADOPTION PUSH, WHICH IS THE MERGE OF THE CHANGE THAT INTRODUCES THE
+# BASELINE. On a trunk push the workflow has already pointed the trunk at the
+# commit being pushed, so asking the trunk whether adoption has happened is
+# circular: `before` legitimately lacks the file while the trunk, a moment old,
+# has it. Classifying `before` against that trunk turns the one legal skip into
+# EMPTY, and the push landing the adoption fails with every existing occurrence
+# reported as new. This is the scene that would have fired on the merge itself.
+#
+# ⚠ AND IT MUST BE A FAST-FORWARD, NOT A REPLACEMENT. An earlier version used an
+# ORPHAN commit as `before` against a trunk from unrelated history, which models a
+# force-push rather than a landing -- so a regression that preserved a
+# baseline-less predecessor only for unrelated pushes, while misclassifying a
+# genuine adoption, would have passed it. Here the baseline-bearing commit is a
+# CHILD of the baseline-less one, which is what a merge actually produces.
+lane_b_adrepo="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+(
+  cd "$lane_b_adrepo"
+  git init -q .
+  printf 'x\n' > unrelated.txt
+  git add -A
+  git -c user.email=t@invalid -c user.name=t commit -qm "before adoption: no baseline"
+  git branch -M main
+  mkdir -p scripts
+  printf '# format-version: 3\n7 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
+  git add -A
+  git -c user.email=t@invalid -c user.name=t commit -qm "the adoption commit"
+  git update-ref refs/remotes/origin/main main
+) >/dev/null 2>&1
+lane_b_ad_before="$(git -C "$lane_b_adrepo" rev-parse main~1)"
+lane_b_ad_sha="$(git -C "$lane_b_adrepo" rev-parse main)"
+checks=$((checks + 1))
+lane_b_ad_ok=yes
+( cd "$lane_b_adrepo" && git merge-base --is-ancestor "$lane_b_ad_before" "$lane_b_ad_sha" ) || lane_b_ad_ok=no
+# ⚠ THE STATUS, NOT A NEGATED PIPELINE. `! ls-tree | grep -q .` under pipefail
+# reports "established" for BOTH a readable tree with no baseline and a tree that
+# could not be read at all -- measured, the same answer in two different worlds.
+# That is the exact conflation fixed in the selector two rounds ago, written into
+# the assertion meant to prove the selector's fixture. Only rc 0 with empty
+# output means looked-and-absent.
+if lane_b_ad_ls="$( cd "$lane_b_adrepo" && git ls-tree --name-only "$lane_b_ad_before" -- scripts/public-surface-lane-b-baseline.txt 2>/dev/null )"; then
+  [ -z "$lane_b_ad_ls" ] || lane_b_ad_ok=no
+else
+  lane_b_ad_ok=no
+fi
+if [ "$lane_b_ad_ok" != yes ]; then
+  echo "FAIL [the adoption push keeps its legal skip]: the scene was not" >&2
+  echo "  established -- before must be an ANCESTOR of the pushed commit and must" >&2
+  echo "  itself carry no baseline, or this models a force-push instead." >&2
+  failures=$((failures + 1))
+else
+  lane_b_adopt_rc=0
+  lane_b_adopt_out="$( (cd "$lane_b_adrepo" && "$SELECTOR" \
+    --event push --before "$lane_b_ad_before" --sha "$lane_b_ad_sha" \
+    --ref refs/heads/main --default-branch main) 2>&1 )" || lane_b_adopt_rc=$?
+  if [ "$lane_b_adopt_rc" -ne 0 ]; then
+    echo "FAIL [the adoption push keeps its legal skip]:" >&2
+    echo "  the selector exited $lane_b_adopt_rc rather than choosing." >&2
+    failures=$((failures + 1))
+  elif [ "$lane_b_adopt_out" != "$lane_b_ad_before" ]; then
+    echo "FAIL [the adoption push keeps its legal skip]: chose" >&2
+    printf '%s\n' "$lane_b_adopt_out" | sed 's/^/    /' >&2
+    echo "  expected the previous tip $lane_b_ad_before. EMPTY here means the" >&2
+    echo "  merge that introduces the baseline fails on its own existing debt." >&2
+    failures=$((failures + 1))
+  fi
+fi
+rm -rf "$lane_b_adrepo"
+
+# ⚠ A TAG MAY BE CALLED `origin/main`, AND GIT PREFERS IT. Ambiguous short names
+# resolve refs/tags BEFORE refs/remotes, so on a tag push the checkout can hold
+# both and the shorthand names the TAG -- which is the commit under test. The
+# gate would then compare its tree with itself. The selector must emit the fully
+# qualified ref, and this plants exactly that collision.
+( cd "$lane_b_brrepo"
+  git update-ref refs/tags/origin/main "$lane_b_old"
+) >/dev/null 2>&1
+lane_b_amb_rc=0
+checks=$((checks + 1))
+lane_b_amb_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --before "$lane_b_zero" --sha "$lane_b_old" \
+  --ref refs/tags/origin/main --default-branch main) 2>&1 )" || lane_b_amb_rc=$?
+if [ "$lane_b_amb_rc" -ne 0 ]; then
+  echo "FAIL [the trunk is named by its fully qualified ref]:" >&2
+  echo "  the selector exited $lane_b_amb_rc rather than choosing." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_amb_out" != "refs/remotes/origin/main" ]; then
+  echo "FAIL [the trunk is named by its fully qualified ref]: chose" >&2
+  printf '%s\n' "$lane_b_amb_out" | sed 's/^/    /' >&2
+  echo "  expected refs/remotes/origin/main. A short name lets a tag of the same" >&2
+  echo "  name win, and that tag is the commit under test." >&2
+  failures=$((failures + 1))
+else
+  lane_b_amb_short="$(cd "$lane_b_brrepo" && git rev-parse --short origin/main 2>/dev/null)"
+  lane_b_amb_full="$(cd "$lane_b_brrepo" && git rev-parse --short refs/remotes/origin/main 2>/dev/null)"
+  if [ "$lane_b_amb_short" = "$lane_b_amb_full" ]; then
+    echo "FAIL [the trunk is named by its fully qualified ref]: the scene was not" >&2
+    echo "  established -- the short and qualified names resolve alike, so this" >&2
+    echo "  control would pass whatever the selector emitted." >&2
+    failures=$((failures + 1))
+  fi
+fi
+rm -rf "$lane_b_brrepo"
+
+# The refusals. A missing commit, and an argument this file has not been taught:
+# both are contract failures rather than answers, and both must exit 2 rather
+# than fall through to a rule meant for a different question.
+#
+# ⚠ THE SECOND ONE WAS PROMISED HERE AND NEVER DRIVEN. This sentence listed two
+# refusals while only the missing-commit control followed, which made the
+# unknown-argument refusal look protected by a control that did not exist -- an
+# inventory describing coverage rather than reporting it.
+lane_b_sel_rc=0
+checks=$((checks + 1))
+lane_b_sel_out="$("$SELECTOR" --event push --before cafe1234 --ref refs/heads/topic \
+  --default-branch main 2>&1)" || lane_b_sel_rc=$?
+judge "a push with no commit of its own refuses" "$lane_b_sel_rc" 2 \
+  "--sha is required" "$lane_b_sel_out"
+
+lane_b_flag_sel_rc=0
+checks=$((checks + 1))
+lane_b_flag_sel_out="$("$SELECTOR" --event push --before cafe1234 --sha aaaa \
+  --ref refs/heads/topic --default-branch main --nonsense x 2>&1)" || lane_b_flag_sel_rc=$?
+judge "an argument this file has not been taught refuses" "$lane_b_flag_sel_rc" 2 \
+  "unknown argument" "$lane_b_flag_sel_out"
 
 lane_b_ciyml=".github/workflows/ci.yml"
 checks=$((checks + 1))
