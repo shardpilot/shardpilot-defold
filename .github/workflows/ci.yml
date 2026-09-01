@@ -242,11 +242,11 @@ jobs:
   #
   # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
   # FOURTEEN controls, which is what this harness had before the sibling's
-  # lineage was ported into it, and this harness is at 63 controls now. The
+  # lineage was ported into it, and this harness is at 64 controls now. The
   # bound is re-argued at the shipping count. ⚠ AND "RE-ARGUED" IS NOT
   # "RE-MEASURED": the figures on either side of this paragraph were taken at 14
   # and 35 controls, and the current budget is those extrapolated through the 55s
-  # floor -- not a timed run at 63. Saying otherwise would be this paragraph's own
+  # floor -- not a timed run at 64. Saying otherwise would be this paragraph's own
   # warning committed inside it: a figure
   # derived for a different configuration is not a measurement of this one,
   # which is the mistake this comment already records the sibling making.
@@ -254,14 +254,14 @@ jobs:
   # Measured on this rig: 353.7s for 35 controls, 10.1s each (2026-08-31). The
   # slow review datum -- 55s per control -- stays a floor rather than a duration,
   # because that run did not finish. The budget is sized from the floor, not from
-  # the fast rig: 63 x 55s is 3465s, so the arithmetic demands 58 minutes.
+  # the fast rig: 64 x 55s is 3520s, so the arithmetic demands 59 minutes.
   #
-  # Shipping 60 minutes against a floor of 58. The floor is what the control
+  # Shipping 60 minutes against a floor of 59. The floor is what the control
   # enforces; the margin above it is a separate decision.
   #
   # ⚠ THE MARGIN IN CONTROLS, NOT IN MINUTES, BECAUSE MINUTES GO STALE. At 55s a
-  # control: 63 need 3465s, 65 need 3575s and still fit, 66 need 3630s and do
-  # not. So two more controls fit here and THE THIRD ONE TRIPS THE BOUND -- that
+  # control: 64 need 3520s, 65 need 3575s and still fit, 66 need 3630s and do
+  # not. So ONE more control fits here and THE SECOND ONE TRIPS THE BOUND -- that
   # person re-derives this pair rather than nudging it, and the arithmetic is
   # written out so they check it in a line instead of trusting this sentence.
   #

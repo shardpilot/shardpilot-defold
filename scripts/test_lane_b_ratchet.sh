@@ -1559,7 +1559,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=63
+EXPECTED_CHECKS=64
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1590,8 +1590,15 @@ EXPECTED_CHECKS=63
 # ⚠ AND A NEGATED PIPELINE IS NOT A STATUS CHECK. `! cmd | grep -q .` under
 # pipefail reports success both when the listing is empty and when the command
 # FAILED -- the conflation review found in the adoption scene's assertion.
-# Swept: the only surviving negation in this file is on a SIMPLE command, where
-# the status is one command's and the direction is the intended one.
+#
+# Swept, and this claim is exactly what the sweep supports: NO EXECUTABLE
+# PIPELINE IS NEGATED in this file. Negation itself is common and fine here --
+# `[ ! -f ]` and friends are test operators, `! git clone` and `! "$GATE"` are
+# single commands, and two are brace groups wrapping one redirect. None can
+# conflate two failures, because none has a pipeline's several statuses to
+# choose between. An earlier version of this note said only ONE negation
+# survived -- the conclusion a narrower grep would have supported, not the one
+# the grep that ran was capable of reaching.
 
 base_ref_case() {  # label want -- args...
   local label="$1" want="$2"; shift 2
@@ -1727,12 +1734,13 @@ base_ref_case "a trunk push with no previous tip has no ancestry" "EMPTY" -- \
 # is the trunk as it stands: nothing published may carry more than the trunk
 # currently does. Seven repository-backed cases stand here -- a branch push, a tag
 # on an older commit, a missing trunk, a baseline-less target, an unreadable
-# trunk, the adoption push, and an ambiguous trunk name. Each asserts WHICH
-# the selector's exit STATUS too, because the caller assigns its output under
-# `set -e`: a selector that prints the right revision and then exits nonzero stops
-# the step, and a control reading only the output would stay green while CI
-# stopped. These assert WHICH revision, because every wrong
-# choice here still exits 0.
+# trunk, the adoption push, and an ambiguous trunk name.
+#
+# Each requires BOTH: that the selector exited 0, and that it chose the
+# expected revision. Neither half alone is enough -- every wrong choice here
+# still exits 0, and the caller assigns the selector's output under `set -e`,
+# so a nonzero status stops the step and the gate never runs while a control
+# reading only the output stays green.
 lane_b_brrepo="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 (
   cd "$lane_b_brrepo"
@@ -2008,13 +2016,27 @@ else
 fi
 rm -rf "$lane_b_brrepo"
 
-# The refusals: a missing commit, and a flag the caller and this file disagree on.
+# The refusals. A missing commit, and an argument this file has not been taught:
+# both are contract failures rather than answers, and both must exit 2 rather
+# than fall through to a rule meant for a different question.
+#
+# ⚠ THE SECOND ONE WAS PROMISED HERE AND NEVER DRIVEN. This sentence listed two
+# refusals while only the missing-commit control followed, which made the
+# unknown-argument refusal look protected by a control that did not exist -- an
+# inventory describing coverage rather than reporting it.
 lane_b_sel_rc=0
 checks=$((checks + 1))
 lane_b_sel_out="$("$SELECTOR" --event push --before cafe1234 --ref refs/heads/topic \
   --default-branch main 2>&1)" || lane_b_sel_rc=$?
 judge "a push with no commit of its own refuses" "$lane_b_sel_rc" 2 \
   "--sha is required" "$lane_b_sel_out"
+
+lane_b_flag_sel_rc=0
+checks=$((checks + 1))
+lane_b_flag_sel_out="$("$SELECTOR" --event push --before cafe1234 --sha aaaa \
+  --ref refs/heads/topic --default-branch main --nonsense x 2>&1)" || lane_b_flag_sel_rc=$?
+judge "an argument this file has not been taught refuses" "$lane_b_flag_sel_rc" 2 \
+  "unknown argument" "$lane_b_flag_sel_out"
 
 lane_b_ciyml=".github/workflows/ci.yml"
 checks=$((checks + 1))
