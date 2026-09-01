@@ -17,6 +17,7 @@ ZERO=0000000000000000000000000000000000000000
 event=""; pr_base=""; before=""; sha=""; ref=""; default=""; remote=origin
 baseline=scripts/public-surface-lane-b-baseline.txt
 lane_b_trunk_rev=""
+lane_b_trunk_has=unknown
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -50,6 +51,24 @@ fi
 git rev-parse --verify --quiet "$remote/$default^{commit}" >/dev/null 2>&1 \
   && lane_b_trunk_rev="$remote/$default"
 
+# ⚠ ASKED ONCE, HERE, AND WITH `ls-tree`. Whether the trunk carries the baseline
+# decides how a baseline-less revision is read: a fork from before adoption
+# (EMPTY) or the adoption itself (pass through, so the gate's own skip applies).
+# `cat-file -e` cannot answer it -- it exits nonzero for an absent path and for
+# an unreadable one alike -- so a failed lookup used to be recorded as "the trunk
+# does not have it", which is the permissive answer. `ls-tree` separates them:
+# rc 0 with empty output is looked-and-absent, nonzero is could-not-look, and
+# could-not-look stays `unknown`, which licenses nothing.
+if [ -n "$lane_b_trunk_rev" ]; then
+  if lane_b_trunk_ls="$(git ls-tree --name-only "$lane_b_trunk_rev" -- "$baseline" 2>/dev/null)"; then
+    if [ -n "$lane_b_trunk_ls" ]; then
+      lane_b_trunk_has=yes
+    else
+      lane_b_trunk_has=no
+    fi
+  fi
+fi
+
 # ⚠ A REVISION WITHOUT THE BASELINE IS NOT ALWAYS A WEAKER TARGET -- IT DEPENDS
 # ON WHY. The gate skips a target that predates the baseline file, which is right
 # exactly once: the change that introduces it has a target without it, and that is
@@ -68,37 +87,46 @@ git rev-parse --verify --quiet "$remote/$default^{commit}" >/dev/null 2>&1 \
 # unresolvable comparison target with its own message, and turning "I could not
 # look" into EMPTY would replace a refusal with a verdict.
 emit() {  # $1 = newline-separated revisions -> deduplicated, EMPTY where blind
-  # ⚠ THE DEFAULT IS THE STRICT ONE, BECAUSE "I COULD NOT LOOK" IS NOT "IT IS NOT
-  # THERE". This asked whether the trunk carries the baseline and treated every
-  # non-answer -- an unfetched trunk, a transient failure, no default branch at
-  # all -- as "adoption has not happened", which passes a baseline-less revision
-  # through to a gate that then takes its legal skip. Pass-through is now reached
-  # only by seeing the trunk and seeing that it lacks the file too, which is the
-  # one state where a skip is correct: the change that adopts the baseline.
-  # ⚠ `ls-tree`, NOT `cat-file -e`, AND THE GATE ALREADY SAYS WHY. `cat-file -e`
-  # exits nonzero for an absent path AND for an unreadable one -- measured, both
-  # 128 -- so pairing it with a `rev-parse` that succeeds records "the trunk does
-  # not carry the baseline" for a lookup that never happened, and that answer
-  # licenses the pass-through. `ls-tree` separates them: rc 0 with empty output
-  # means looked-and-absent, nonzero means could-not-look.
-  lane_b_trunk_has=unknown
-  if lane_b_trunk_ls="$(git ls-tree --name-only "$remote/$default" -- "$baseline" 2>/dev/null)"; then
-    if [ -n "$lane_b_trunk_ls" ]; then
-      lane_b_trunk_has=yes
-    else
-      lane_b_trunk_has=no
-    fi
-  fi
-  printf '%s\n' "$1" | while IFS= read -r r; do
+  # ⚠ AND THE SAME `ls-tree` DISTINCTION HERE, NOT ONLY ON THE TRUNK. The trunk
+  # inspection was fixed to separate looked-and-absent from could-not-look, and
+  # this one -- the per-revision check that actually decides EMPTY -- was left on
+  # `cat-file -e`, which conflates them. A target whose tree cannot be read
+  # therefore became EMPTY: a verdict produced without inspecting anything, and
+  # one that passes outright when the current lane is empty. Fourth layer of one
+  # mistake, and the first three were each fixed while this one stood.
+  #
+  # A lookup that fails is a refusal. A revision that does not RESOLVE still
+  # passes through, deliberately: the gate refuses an unresolvable comparison
+  # target by name, and replacing its refusal with a silent EMPTY would be the
+  # same substitution in the other direction.
+  lane_b_emit_out=""
+  while IFS= read -r r; do
     [ -n "$r" ] || continue
-    if [ "$r" != EMPTY ] && [ "$lane_b_trunk_has" != no ] \
-       && git rev-parse --verify --quiet "$r^{commit}" >/dev/null 2>&1 \
-       && ! git cat-file -e "$r:$baseline" 2>/dev/null; then
-      echo EMPTY
-    else
-      echo "$r"
+    if [ "$r" = EMPTY ] || [ "$lane_b_trunk_has" = no ] \
+       || ! git rev-parse --verify --quiet "$r^{commit}" >/dev/null 2>&1; then
+      lane_b_emit_out="$lane_b_emit_out$r
+"
+      continue
     fi
-  done | awk '!seen[$0]++'
+    if lane_b_r_ls="$(git ls-tree --name-only "$r" -- "$baseline" 2>/dev/null)"; then
+      if [ -n "$lane_b_r_ls" ]; then
+        lane_b_emit_out="$lane_b_emit_out$r
+"
+      else
+        lane_b_emit_out="${lane_b_emit_out}EMPTY
+"
+      fi
+    else
+      echo "REFUSING: could not inspect $r for $baseline." >&2
+      echo "  The revision resolves but its tree could not be read, so whether" >&2
+      echo "  it carries a baseline is unknown. Calling that EMPTY would be a" >&2
+      echo "  verdict reached without looking." >&2
+      return 2
+    fi
+  done <<LANE_B_EMIT_INPUT
+$1
+LANE_B_EMIT_INPUT
+  printf '%s' "$lane_b_emit_out" | awk '!seen[$0]++'
 }
 
 # ⚠ THE EVENT DECIDES, NOT THE SHAPE OF THE ARGUMENTS. `--event` was accepted and
@@ -119,7 +147,7 @@ case "$event" in
     fi
     # 1. A pull request carries its own base, which is the tree the change will
     #    land on. Nothing else can be more accurate than that.
-    emit "$pr_base"
+    emit "$pr_base" || exit $?
     exit 0
     ;;
   push)
@@ -188,7 +216,7 @@ fi
 
 if [ "$ref" = "refs/heads/$default" ]; then
   if [ -n "$before" ]; then
-    emit "$before"
+    emit "$before" || exit $?
   else
     printf 'EMPTY\n'
   fi
@@ -224,7 +252,7 @@ fi
 #    it matters, at the pull request, whose base is the trunk's own tip and whose
 #    comparison is the strict one.
 if [ "$lane_b_trunk_rev" != "" ]; then
-  emit "$lane_b_trunk_rev"
+  emit "$lane_b_trunk_rev" || exit $?
   exit 0
 fi
 

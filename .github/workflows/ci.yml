@@ -265,13 +265,14 @@ jobs:
   # was 50 against 39. The number moved four times while the sentence did not,
   # which is the same staleness this file has now been caught in three times: the
   # prose describing a mechanism is a second edit, and it is never in the diff
-  # that invalidates it. Whoever adds the sixth control from here re-derives this
-  # pair rather than nudging it.
+  # that invalidates it.
   #
-  # ⚠ THE FIFTH ADDITION TRIPS IT, NOT THE SIXTH. At 55s a control, 65 controls
-  # need 3575s and fit inside 60 minutes; 66 need 3630s and do not. So the person
-  # adding the fifth control from 61 is the one who re-derives this pair -- an
-  # off-by-one in guidance that exists precisely to stop a hurried change.
+  # ⚠ WHOEVER ADDS THE FIFTH CONTROL FROM 61 RE-DERIVES THIS PAIR. At 55s a
+  # control, 65 need 3575s and fit inside 60 minutes; 66 need 3630s and do not.
+  # The arithmetic is written out so the next reader checks it in a line rather
+  # than trusting the sentence -- an earlier version of it said the sixth, and an
+  # off-by-one in guidance that exists to stop a hurried change is worse than
+  # no guidance.
   #
   # THIS NUMBER IS NOW CHECKED, not asserted. The harness reads timeout-minutes
   # for this job back out of this file and fails if it is under the count times

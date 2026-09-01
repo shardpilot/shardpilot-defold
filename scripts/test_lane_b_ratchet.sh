@@ -1569,14 +1569,16 @@ EXPECTED_CHECKS=61
 #
 # So the count is read out of the workflow and compared to the enforced one. It
 # is the same rule as EXPECTED_CHECKS itself, applied one file over.
-# ⚠ THE COMPARISON BASE, WHICH NOTHING HERE USED TO EXECUTE. Six defects lived
-# in three lines of workflow YAML: the variable never set, a new ref compared
-# against the default branch, the mutable `github.ref` making the base the commit
-# under test, and a previously FAILED tip trusted as an accepted base. All four
-# were found by reading. The choice is a script now, and these drive it.
+# ⚠ THE COMPARISON BASE, WHICH NOTHING HERE USED TO EXECUTE. The choice of what a
+# change is compared against was wrong six times before it became a script, and
+# every one was found by reading. The distinct defects are enumerated ONCE, in
+# .github/workflows/ci.yml beside the step that calls the selector -- not here.
+# A second inventory is how the first one came to disagree with itself, and this
+# comment was the second inventory: it said six, named four, and concluded four.
 #
-# Each control asserts WHICH ANSWER, not an exit code: these cases differ by the
-# rev they choose, and every wrong choice still exits 0.
+# Each control below asserts WHICH ANSWER, not an exit code: these cases differ by
+# the rev they choose, and every wrong choice still exits 0.
+
 base_ref_case() {  # label want -- args...
   local label="$1" want="$2"; shift 2
   [ "${1:-}" = -- ] && shift
