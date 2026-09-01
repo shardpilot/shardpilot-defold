@@ -1554,7 +1554,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=51
+EXPECTED_CHECKS=53
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1797,6 +1797,51 @@ else
     failures=$((failures + 1))
   fi
 fi
+# ⚠ A PROBE THAT COULD NOT LOOK MUST REFUSE, NOT ANSWER. This is #70's class,
+# and both of its instances are driven here.
+#
+# The first: the anchor's inode and the parent's inode were each read with
+# `ls -di | awk` and then compared. An `ls` that fails leaves BOTH sides empty,
+# and two empty strings are `=` -- so the guard that stops the baseline being
+# installed through a directory this run did not make held exactly while the
+# instrument worked and yielded the moment it broke.
+#
+# The second: `od` failing left the hex string empty, the `*)` arm was taken,
+# and a file whose header could not be read was recorded as NOT matching.
+#
+# Both controls assert a REFUSAL, so by the rule stated above they cannot go
+# quiet: an inert stub produces no refusal, the gate exits 0 where 2 is wanted,
+# and the control fails. Neither needs a fired marker.
+lane_b_lsstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+{
+  echo '#!/bin/sh'
+  printf 'REAL_LS=%q\n' "$(command -v ls)"
+  echo 'case " $* " in'
+  echo '  *" -di "*) exit 1 ;;'
+  echo 'esac'
+  echo 'exec "$REAL_LS" "$@"'
+} > "$lane_b_lsstub/ls"
+chmod +x "$lane_b_lsstub/ls"
+lane_b_ls_rc=0
+checks=$((checks + 1))
+lane_b_ls_out="$(env "PATH=$lane_b_lsstub:$PATH" "$GATE" --write-baseline 2>&1)" || lane_b_ls_rc=$?
+judge "an inode that could not be read refuses rather than matching another failure" \
+  "$lane_b_ls_rc" 2 "probe:lane_b_anchor" "$lane_b_ls_out"
+rm -rf "$lane_b_lsstub"
+
+lane_b_odstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+{
+  echo '#!/bin/sh'
+  echo 'exit 1'
+} > "$lane_b_odstub/od"
+chmod +x "$lane_b_odstub/od"
+lane_b_od_rc=0
+checks=$((checks + 1))
+lane_b_od_out="$(env "PATH=$lane_b_odstub:$PATH" "$GATE" 2>&1)" || lane_b_od_rc=$?
+judge "a header that could not be read refuses rather than reading as no match" \
+  "$lane_b_od_rc" 2 "probe:magic16" "$lane_b_od_out"
+rm -rf "$lane_b_odstub"
+
 
 # ⚠ EXACTLY, NOT AT LEAST, AND THE NUMBER LIVES ONLY ON THE NEXT LINE. A floor
 # accepts a stale count: add a control without touching it and the expected

@@ -787,6 +787,64 @@ CONTAINER_SIGS_TXT=""
 # edited into admitting a live record. Nothing in this organisation is numbered
 # all zeros, all nines or all f's, so that is the whole rule, and no reference
 # value needs to be written down here.
+# ⚠ A PROBE HAS THREE ANSWERS, NOT TWO. "It is not there" and "I could not
+# look" are different states of the world, and a probe that reports the second
+# as the first hands this gate a permissive answer it never established.
+#
+# That one substitution has now produced six review findings across this file
+# and the PR that split off its workflow: a base fetched after it was
+# classified; `|| true` on a fetch; `cat-file -e` used where its 128 covers both
+# an absent path and a bad revision; an inode read compared against itself; and
+# an `od` failure read as "not an executable". Six instances of one form, so it
+# gets one repair rather than six -- a form that has surfaced six times will not
+# stop at the sixth.
+#
+# The rule these three enforce: a probe returns 0 ONLY when it established an
+# answer. The command failing, a stage of its pipeline failing, and the answer
+# not being of the shape the caller can use are all could-not-establish, and the
+# caller then chooses between REFUSING and DECLINING TO ACT. Neither of those is
+# "pass", and that is the whole point.
+gate_probe_refused() {  # $1 = site id, $2 = what it was asked, $3 = extra line
+  # refusal:structural
+  echo "REFUSING: probe:$1 could not establish $2." >&2
+  echo "  A probe that FAILED has not answered. Reading its silence as a" >&2
+  echo "  negative would let a state nobody looked at pass as a checked one," >&2
+  echo "  which is the single outcome this gate must never produce." >&2
+  if [ -n "${3:-}" ]; then echo "  $3" >&2; fi
+  exit 2
+}
+
+# 0 only when EVERY stage of a pipeline succeeded. `$?` alone carries the LAST
+# stage's status, so `od ... | tr ...` reports success when od failed and tr
+# faithfully transformed nothing.
+gate_pipe_ok() {  # $@ = a captured PIPESTATUS array
+  local gpo_s
+  for gpo_s in "$@"; do
+    [ "$gpo_s" = 0 ] || return 1
+  done
+  return 0
+}
+
+# Prints the inode of $1, and returns 0 only when it ESTABLISHED one. `ls -di`
+# failing, and `ls -di` succeeding with a first field that is not a number, are
+# both could-not-establish -- and neither prints anything, so a caller cannot
+# compare two failures and find them equal.
+#
+# ⚠ THAT COMPARISON IS THE DEFECT #70 REPORTED. `[ "$(ls -di .. )" = "$anchor" ]`
+# is TRUE when both sides are empty, so the guard held exactly when it was not
+# needed and yielded the moment the instrument broke -- and it is the guard that
+# stops the baseline being installed through a directory this run did not make.
+gate_inode_of() {  # $1 = path
+  local gio_raw gio_first
+  gio_raw="$(ls -di -- "$1" 2>/dev/null)" || return 1
+  gio_raw="${gio_raw#"${gio_raw%%[![:space:]]*}"}"
+  gio_first="${gio_raw%%[[:space:]]*}"
+  case "$gio_first" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s' "$gio_first"
+}
+
 is_sentinel_run() {
   # ⚠ LENGTH IS PART OF THE SHAPE. A one-character run is uniformly valued by
   # definition, so a real identifier numbered 0 or 9 was vacuously a sentinel
@@ -1131,7 +1189,9 @@ scan_tree() {
         exit 2
         ;;
     esac
-    magic16="$(od -An -tx1 -N16 "$blob" 2>/dev/null | tr -d ' \n')"
+    magic16="$(od -An -tx1 -N16 -- "$blob" 2>/dev/null | tr -d ' \n'
+               gate_pipe_ok "${PIPESTATUS[@]}" || exit 3)" \
+      || gate_probe_refused magic16 "the first 16 bytes of '$f'"
     magic4="${magic16:0:8}"
     # The BINARY headers, which cannot be a string constant in readable source
     # and so apply to every file, and the PRINTABLE ones, which can and do not.
@@ -1185,7 +1245,10 @@ scan_tree() {
       # `MZ` does not. Read BYTE-ALIGNED: `00` also spans two neighbouring
       # bytes in a flat hex string, which is a match that means nothing.
       4d5a*)
-        magic_nul="$(od -An -tx1 -N64 "$blob" 2>/dev/null | tr -s ' \n' ' ')"
+        magic_nul="$(od -An -tx1 -N64 -- "$blob" 2>/dev/null | tr -s ' \n' ' '
+                     gate_pipe_ok "${PIPESTATUS[@]}" || exit 3)" \
+          || gate_probe_refused magic_nul "the first 64 bytes of '$f'" \
+               "The MZ header above is established; whether it is an executable is not."
         case " $magic_nul " in
           *" 00 "*) magic_hit="$printable_sigs" ;;
           *)        magic_hit=no ;;
@@ -2918,7 +2981,9 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # even after the name is swapped. The one state that defeats it is the whole
     # directory being MOVED to a different parent, which changes what `..` means.
     # That is checked by identity immediately before the install.
-    lane_b_anchor_ino="$(ls -di . 2>/dev/null | awk '{print $1}')"
+    lane_b_anchor_ino="$(gate_inode_of .)" \
+  || gate_probe_refused lane_b_anchor "the inode of the baseline's own directory" \
+       "Nothing was created and nothing was written."
     lane_b_workdir="$lane_b_leaf.write.d"
     if ! mkdir -m 700 "$lane_b_workdir" 2>/dev/null; then
       # refusal:structural
@@ -2943,7 +3008,9 @@ if [ "${1:-}" = "--write-baseline" ]; then
       rmdir "$lane_b_workdir" 2>/dev/null || true
       exit 2
     fi
-    lane_b_workdir_ino="$(ls -di . 2>/dev/null | awk '{print $1}')"
+    lane_b_workdir_ino="$(gate_inode_of .)" \
+  || gate_probe_refused lane_b_workdir "the inode of the private write directory" \
+       "It was created a moment ago and is left standing: $lane_b_workdir."
     # ⚠ THE CLEANUP RE-OPENED THE NAME THE REST OF THIS BLOCK REFUSES TO TRUST.
     # Review round 5: the parent check is not enough. Rename this directory aside
     # and put a DIFFERENT directory at the same name in the same parent, and the
@@ -2956,11 +3023,19 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # non-empty directory and a symlink alike, so anything standing at the name is
     # left where it is. The inode is checked too, but `rmdir` is what makes a
     # mistake harmless rather than merely unlikely.
+    # ⚠ HERE COULD-NOT-ESTABLISH DECLINES RATHER THAN REFUSES. This is cleanup, and
+    # it may run from a trap; exiting 2 out of it would replace a real refusal's
+    # exit code with this one. So an unreadable inode means REMOVE NOTHING, which
+    # is the fail-closed action for a delete -- the opposite of what the old
+    # comparison did, where two unreadable inodes matched and the rmdir went ahead.
     lane_b_scrub() {
+      local lane_b_sc_parent lane_b_sc_dir
       rm -f new probe probe.dst 2>/dev/null
-      [ "$(ls -di .. 2>/dev/null | awk '{print $1}')" = "$lane_b_anchor_ino" ] || return 0
+      lane_b_sc_parent="$(gate_inode_of ..)" || return 0
+      [ "$lane_b_sc_parent" = "$lane_b_anchor_ino" ] || return 0
       cd -P .. 2>/dev/null || return 0
-      [ "$(ls -di "$lane_b_workdir" 2>/dev/null | awk '{print $1}')" = "$lane_b_workdir_ino" ] || return 0
+      lane_b_sc_dir="$(gate_inode_of "$lane_b_workdir")" || return 0
+      [ "$lane_b_sc_dir" = "$lane_b_workdir_ino" ] || return 0
       rmdir "$lane_b_workdir" 2>/dev/null || true
     }
     lane_b_tmp=new
@@ -3124,7 +3199,14 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # directory is its real parent unless the directory itself was moved into a
     # different one. That is the single state the held cwd does not cover, and it
     # is cheap to name: the parent's inode must still be the one anchored above.
-    if [ "$(ls -di .. 2>/dev/null | awk '{print $1}')" != "$lane_b_anchor_ino" ]; then
+    # ⚠ TWO REFUSALS, NOT ONE TEST. "I could not read the parent's inode" and
+    # "the parent is not the one anchored" are different worlds, and the single
+    # comparison this replaces answered PASS to the first of them.
+    lane_b_now_parent="$(gate_inode_of ..)" \
+      || gate_probe_refused lane_b_install_parent \
+           "the inode of the private write directory's parent" \
+           "The serialised file is left where it is rather than moved."
+    if [ "$lane_b_now_parent" != "$lane_b_anchor_ino" ]; then
       # refusal:structural
       echo "REFUSING: the private write directory is no longer where it was made." >&2
       echo "  Its parent is not the directory this run anchored, so installing" >&2

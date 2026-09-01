@@ -154,7 +154,7 @@ jobs:
   #
   # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
   # FOURTEEN controls, which is what this harness had before the sibling's
-  # lineage was ported into it, and this harness is at 51 controls now. The
+  # lineage was ported into it, and this harness is at 53 controls now. The
   # bound is re-argued from a measurement taken at the SHIPPING count: a figure
   # derived for a different configuration is not a measurement of this one,
   # which is the mistake this comment already records the sibling making.
@@ -162,14 +162,22 @@ jobs:
   # Measured on this rig: 353.7s for 35 controls, 10.1s each (2026-08-31). The
   # slow review datum -- 55s per control -- stays a floor rather than a duration,
   # because that run did not finish. The budget is sized from the floor, not from
-  # the fast rig: 51 x 55s is 2805s, so the arithmetic demands 47 minutes.
+  # the fast rig: 53 x 55s is 2915s, so the arithmetic demands 49 minutes.
   #
-  # Shipping 50 rather than 39. The floor is what the control enforces; the
-  # margin above it is a separate decision, and 40 would have been one control
-  # from red -- a bound that has to be revisited by the next person to add a
-  # check is a bound that will be raised in a hurry rather than argued. Fifty
-  # carries eight more controls before the arithmetic speaks again. This is
-  # margin over a measured floor, not a guess in place of one.
+  # Shipping 50 against a floor of 49. The floor is what the control enforces;
+  # the margin above it is a separate decision.
+  #
+  # ⚠ THE MARGIN IN CONTROLS, NOT IN MINUTES, BECAUSE MINUTES GO STALE. At 55s a
+  # control: 53 need 2915s, 54 need 2970s and still fit, 55 need 3025s and do
+  # not. So ONE more control fits here and THE SECOND ONE TRIPS THE BOUND.
+  #
+  # This paragraph carried three figures derived at counts this branch had
+  # already passed -- a floor of 39, "40 would have been one control from red",
+  # and a margin of eight further controls. All three were true once and none was
+  # true here. They are rewritten whole rather than nudged, because nudging is how
+  # they drifted: each correction moved one number and left the sentence around
+  # it. #69 rewrites this same paragraph for its own count; whoever merges second
+  # re-derives the pair rather than keeping either version.
   #
   # THIS NUMBER IS NOW CHECKED, not asserted. The harness reads timeout-minutes
   # for this job back out of this file and fails if it is under the count times
