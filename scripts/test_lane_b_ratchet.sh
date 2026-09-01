@@ -1569,7 +1569,7 @@ EXPECTED_CHECKS=61
 #
 # So the count is read out of the workflow and compared to the enforced one. It
 # is the same rule as EXPECTED_CHECKS itself, applied one file over.
-# ⚠ THE COMPARISON BASE, WHICH NOTHING HERE USED TO EXECUTE. Four defects lived
+# ⚠ THE COMPARISON BASE, WHICH NOTHING HERE USED TO EXECUTE. Five defects lived
 # in three lines of workflow YAML: the variable never set, a new ref compared
 # against the default branch, the mutable `github.ref` making the base the commit
 # under test, and a previously FAILED tip trusted as an accepted base. All four
@@ -1709,7 +1709,11 @@ base_ref_case "a trunk push with no previous tip has no ancestry" "EMPTY" -- \
 
 # ⚠ A REAL REPOSITORY, BECAUSE THE REMAINING CASES ARE GIT QUESTIONS. The model
 # is the trunk as it stands: nothing published may carry more than the trunk
-# currently does. These four assert WHICH revision is chosen, because every wrong
+# currently does. These five assert WHICH revision is chosen -- and each asserts
+# the selector's exit STATUS too, because the caller assigns its output under
+# `set -e`: a selector that prints the right revision and then exits nonzero stops
+# the step, and a control reading only the output would stay green while CI
+# stopped. These assert WHICH revision, because every wrong
 # choice here still exits 0.
 lane_b_brrepo="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 (
@@ -1728,10 +1732,18 @@ lane_b_old="$(git -C "$lane_b_brrepo" rev-parse main~1)"
 lane_b_trunk="$(git -C "$lane_b_brrepo" rev-parse main)"
 
 checks=$((checks + 1))
+lane_b_branch_rc=0
 lane_b_branch_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
   --event push --before "$lane_b_old" --sha "$lane_b_trunk" \
-  --ref refs/heads/topic --default-branch main) 2>&1 )" || true
-if [ "$lane_b_branch_out" != "origin/main" ]; then
+  --ref refs/heads/topic --default-branch main) 2>&1 )" || lane_b_branch_rc=$?
+if [ "$lane_b_branch_rc" -ne 0 ]; then
+  echo "FAIL [a branch push is measured against the trunk as it stands]:" >&2
+  echo "  the selector exited $lane_b_branch_rc rather than choosing. The caller's" >&2
+  echo "  assignment runs under set -e, so a nonzero status there aborts" >&2
+  echo "  the step and the gate never runs -- a control that reads only" >&2
+  echo "  the output stays green while CI stops." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_branch_out" != "origin/main" ]; then
   echo "FAIL [a branch push is measured against the trunk as it stands]: chose" >&2
   printf '%s\n' "$lane_b_branch_out" | sed 's/^/    /' >&2
   echo "  expected origin/main. Measuring against the branch's own history lets" >&2
@@ -1744,10 +1756,18 @@ fi
 # release tag at the value-10 commit republished ten occurrences after the trunk
 # had paid down to five -- and a tag's source archive is the distributed artifact.
 checks=$((checks + 1))
+lane_b_tag_rc=0
 lane_b_tag_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
   --event push --before "$lane_b_zero" --sha "$lane_b_old" \
-  --ref refs/tags/v1 --default-branch main) 2>&1 )" || true
-if [ "$lane_b_tag_out" = "$lane_b_old" ]; then
+  --ref refs/tags/v1 --default-branch main) 2>&1 )" || lane_b_tag_rc=$?
+if [ "$lane_b_tag_rc" -ne 0 ]; then
+  echo "FAIL [a tag on an older commit is measured against the trunk, not itself]:" >&2
+  echo "  the selector exited $lane_b_tag_rc rather than choosing. The caller's" >&2
+  echo "  assignment runs under set -e, so a nonzero status there aborts" >&2
+  echo "  the step and the gate never runs -- a control that reads only" >&2
+  echo "  the output stays green while CI stops." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_tag_out" = "$lane_b_old" ]; then
   echo "FAIL [a tag on an older commit is measured against the trunk, not itself]:" >&2
   echo "  it chose the tagged commit, so the comparison is the tree against" >&2
   echo "  itself and any debt the trunk has since paid is republished." >&2
@@ -1761,10 +1781,18 @@ fi
 
 # No trunk to appeal to: nothing is grandfathered.
 checks=$((checks + 1))
+lane_b_notrunk_rc=0
 lane_b_notrunk_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
   --event push --before "$lane_b_zero" --sha "$lane_b_trunk" \
-  --ref refs/heads/topic --default-branch nosuchbranch) 2>&1 )" || true
-if [ "$lane_b_notrunk_out" != EMPTY ]; then
+  --ref refs/heads/topic --default-branch nosuchbranch) 2>&1 )" || lane_b_notrunk_rc=$?
+if [ "$lane_b_notrunk_rc" -ne 0 ]; then
+  echo "FAIL [no trunk to compare against means nothing is grandfathered]:" >&2
+  echo "  the selector exited $lane_b_notrunk_rc rather than choosing. The caller's" >&2
+  echo "  assignment runs under set -e, so a nonzero status there aborts" >&2
+  echo "  the step and the gate never runs -- a control that reads only" >&2
+  echo "  the output stays green while CI stops." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_notrunk_out" != EMPTY ]; then
   echo "FAIL [no trunk to compare against means nothing is grandfathered]: chose" >&2
   printf '%s\n' "$lane_b_notrunk_out" | sed 's/^/    /' >&2
   echo "  expected EMPTY." >&2
@@ -1785,9 +1813,17 @@ fi
 ) >/dev/null 2>&1
 lane_b_blind="$(git -C "$lane_b_brrepo" rev-parse blind)"
 checks=$((checks + 1))
+lane_b_blind_rc=0
 lane_b_blind_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
-  --event pull_request --pr-base "$lane_b_blind" --default-branch main) 2>&1 )" || true
-if [ "$lane_b_blind_out" != EMPTY ]; then
+  --event pull_request --pr-base "$lane_b_blind" --default-branch main) 2>&1 )" || lane_b_blind_rc=$?
+if [ "$lane_b_blind_rc" -ne 0 ]; then
+  echo "FAIL [a target without the baseline is EMPTY once the trunk has one]:" >&2
+  echo "  the selector exited $lane_b_blind_rc rather than choosing. The caller's" >&2
+  echo "  assignment runs under set -e, so a nonzero status there aborts" >&2
+  echo "  the step and the gate never runs -- a control that reads only" >&2
+  echo "  the output stays green while CI stops." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_blind_out" != EMPTY ]; then
   echo "FAIL [a target without the baseline is EMPTY once the trunk has one]:" >&2
   printf '%s\n' "$lane_b_blind_out" | sed 's/^/    /' >&2
   echo "  expected EMPTY. Passing it through makes the gate announce a skip, and" >&2
@@ -1801,9 +1837,17 @@ fi
 # gate that then takes its legal skip. Pass-through is now reached only by SEEING
 # the trunk and seeing it lacks the file too.
 checks=$((checks + 1))
+lane_b_unknown_rc=0
 lane_b_unknown_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
-  --event pull_request --pr-base "$lane_b_blind" --default-branch nosuchbranch) 2>&1 )" || true
-if [ "$lane_b_unknown_out" != EMPTY ]; then
+  --event pull_request --pr-base "$lane_b_blind" --default-branch nosuchbranch) 2>&1 )" || lane_b_unknown_rc=$?
+if [ "$lane_b_unknown_rc" -ne 0 ]; then
+  echo "FAIL [an uninspectable trunk does not license a pass-through]:" >&2
+  echo "  the selector exited $lane_b_unknown_rc rather than choosing. The caller's" >&2
+  echo "  assignment runs under set -e, so a nonzero status there aborts" >&2
+  echo "  the step and the gate never runs -- a control that reads only" >&2
+  echo "  the output stays green while CI stops." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_unknown_out" != EMPTY ]; then
   echo "FAIL [an uninspectable trunk does not license a pass-through]: chose" >&2
   printf '%s\n' "$lane_b_unknown_out" | sed 's/^/    /' >&2
   echo "  expected EMPTY. Reading a failure to look as an answer is how a" >&2

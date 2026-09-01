@@ -111,7 +111,8 @@ jobs:
       # it does not descend from; then the fix for that read the MUTABLE
       # `github.ref`, so a second push made the base the commit under test; then
       # a root ref fell back to the default branch again, and a previously FAILED
-      # tip was trusted as an accepted base. Four defects, three lines of YAML,
+      # tip was trusted as an accepted base; and a root ref fell back to the
+      # default branch. FIVE defects, three lines of YAML,
       # every one found by reading -- because nothing executed the choice.
       #
       # scripts/lane_b_base_ref.sh is that choice with inputs and one output, and
@@ -160,9 +161,15 @@ jobs:
           # could not see: it passed the revision through, the later fetch made it
           # resolvable, and the gate then found no baseline on it and skipped --
           # letting the change add lane B material with a matching raised
-          # baseline. Both fetches are best-effort; when one fails the revision
-          # stays unresolvable and the gate refuses it by name, which is the
-          # correct outcome and not this one.
+          # baseline. ⚠ THE TWO FETCHES ARE NOT ALIKE, AND THE ASYMMETRY IS THE
+          # SAFETY. The TRUNK fetch is REQUIRED -- its failure must stop the job,
+          # because the selector reads the trunk to decide whether a baseline-less
+          # revision is a fork from before adoption or adoption itself, and a
+          # silent failure answers that question wrongly and permissively. The
+          # PR-base fetch stays best-effort: when it fails the revision is simply
+          # unresolvable and the gate refuses it by name, which is a correct
+          # outcome. Restoring `|| true` on the first one reopens a fail-open
+          # path; the two lines look symmetrical and are not.
           # ⚠ THE TRUNK FETCH IS FATAL, THE OTHERS ARE NOT, AND THE ASYMMETRY IS
           # THE POINT. The selector decides whether a baseline-less revision is a
           # fork from before adoption (EMPTY) or adoption itself (pass through) by
@@ -231,7 +238,11 @@ jobs:
   # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
   # FOURTEEN controls, which is what this harness had before the sibling's
   # lineage was ported into it, and this harness is at 61 controls now. The
-  # bound is re-argued from a measurement taken at the SHIPPING count: a figure
+  # bound is re-argued at the shipping count. ⚠ AND "RE-ARGUED" IS NOT
+  # "RE-MEASURED": the figures on either side of this paragraph were taken at 14
+  # and 35 controls, and the current budget is those extrapolated through the 55s
+  # floor -- not a timed run at 61. Saying otherwise would be this paragraph's own
+  # warning committed inside it: a figure
   # derived for a different configuration is not a measurement of this one,
   # which is the mistake this comment already records the sibling making.
   #

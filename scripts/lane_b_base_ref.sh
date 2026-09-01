@@ -132,6 +132,19 @@ fi
 #    ever permitted, this line silently becomes the hole described above -- so the
 #    premise is written here, where the trust is taken, rather than in a commit
 #    message nobody reads twice.
+# ⚠ AN ABSENT REF IS NOT "SOME OTHER REF". Without this, an empty `--ref` on a
+# push to the trunk makes the comparison below false and the run falls through to
+# the non-trunk case -- which, after that very push, resolves origin/<default> to
+# the commit under test. The gate then compares the tree with itself and an
+# upward baseline edit sails through. The fallback was silent because it is the
+# LAST case, and a last case answers every question it is reached by.
+if [ -z "$ref" ]; then
+  echo "REFUSING: --ref is required for a push event." >&2
+  echo "  Without it this cannot tell the trunk from any other ref, and the" >&2
+  echo "  non-trunk answer would compare the pushed commit with itself." >&2
+  exit 2
+fi
+
 if [ "$ref" = "refs/heads/$default" ]; then
   if [ -n "$before" ]; then
     emit "$before"
@@ -141,9 +154,6 @@ if [ "$ref" = "refs/heads/$default" ]; then
   exit 0
 fi
 
-# 3. Any other ref: branch or tag. TWO bases, and the count may rise against
-#    neither.
-#
 # 3. Any other ref -- a branch or a tag. It is compared against the TRUNK AS IT
 #    STANDS, and nothing published may carry more than the trunk currently does.
 #
@@ -165,7 +175,11 @@ fi
 #
 #    ⚠ WHAT IT DOES NOT ENFORCE, SAID PLAINLY: monotonicity WITHIN a branch. A
 #    branch may go 5 -> 7 while the trunk sits at 10 and this will pass. That is
-#    deliberate -- the branch is not published to anyone -- and it is caught where
+#    deliberate. Not because the branch is unpublished -- this workflow runs on
+#    every branch push precisely because a public repository exposes that tree
+#    immediately -- but because the ceiling that matters is the trunk's: nothing
+#    reachable here may carry more than the trunk currently does. Per-branch
+#    monotonicity is a different rule, and it is caught where
 #    it matters, at the pull request, whose base is the trunk's own tip and whose
 #    comparison is the strict one.
 if [ "$lane_b_trunk_rev" != "" ]; then

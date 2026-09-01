@@ -3402,10 +3402,11 @@ else
   # accident. A message that explains away its own silence is worse than silence.
   # ⚠ AND THIS TEXT DESCRIBES CI, WHICH IS A THING IT CANNOT SEE. It has been
   # wrong twice for that reason: it said "CI sets it" when CI did not, and then
-  # "on a push it does not yet" while the change that made CI do so was in
-  # flight. A runtime diagnostic that narrates another component's roadmap goes
-  # stale on somebody else's merge. It now says what THIS run did and what to
-  # supply, which is true whatever CI is doing this week.
+  # described a gap on pushes that the very change carrying that sentence had
+  # closed. A runtime diagnostic that narrates another component's behaviour goes
+  # stale on somebody else's merge -- and both times the sentence outlived its
+  # subject by one commit. It now says what THIS run did and what to supply,
+  # which is true whatever the caller is doing.
   echo "  (baseline-vs-target check NOT RUN: no comparison target was given, so"
   echo "   nothing here compared this tree against another commit. Set"
   echo "   PUBLIC_SURFACE_BASE_REF to a revision to compare, or EMPTY to require"
