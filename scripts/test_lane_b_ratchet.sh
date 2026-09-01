@@ -1559,7 +1559,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=61
+EXPECTED_CHECKS=62
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1748,10 +1748,10 @@ if [ "$lane_b_branch_rc" -ne 0 ]; then
   echo "  the step and the gate never runs -- a control that reads only" >&2
   echo "  the output stays green while CI stops." >&2
   failures=$((failures + 1))
-elif [ "$lane_b_branch_out" != "origin/main" ]; then
+elif [ "$lane_b_branch_out" != "refs/remotes/origin/main" ]; then
   echo "FAIL [a branch push is measured against the trunk as it stands]: chose" >&2
   printf '%s\n' "$lane_b_branch_out" | sed 's/^/    /' >&2
-  echo "  expected origin/main. Measuring against the branch's own history lets" >&2
+  echo "  expected refs/remotes/origin/main. Measuring against the branch's own history lets" >&2
   echo "  local commits set the floor, and lets a rejected tip launder material." >&2
   failures=$((failures + 1))
 fi
@@ -1777,10 +1777,10 @@ elif [ "$lane_b_tag_out" = "$lane_b_old" ]; then
   echo "  it chose the tagged commit, so the comparison is the tree against" >&2
   echo "  itself and any debt the trunk has since paid is republished." >&2
   failures=$((failures + 1))
-elif [ "$lane_b_tag_out" != "origin/main" ]; then
+elif [ "$lane_b_tag_out" != "refs/remotes/origin/main" ]; then
   echo "FAIL [a tag on an older commit is measured against the trunk, not itself]:" >&2
   printf '%s\n' "$lane_b_tag_out" | sed 's/^/    /' >&2
-  echo "  expected origin/main." >&2
+  echo "  expected refs/remotes/origin/main." >&2
   failures=$((failures + 1))
 fi
 
@@ -1858,6 +1858,39 @@ elif [ "$lane_b_unknown_out" != EMPTY ]; then
   echo "  expected EMPTY. Reading a failure to look as an answer is how a" >&2
   echo "  baseline-less base reaches the gate's legal skip." >&2
   failures=$((failures + 1))
+fi
+# ⚠ A TAG MAY BE CALLED `origin/main`, AND GIT PREFERS IT. Ambiguous short names
+# resolve refs/tags BEFORE refs/remotes, so on a tag push the checkout can hold
+# both and the shorthand names the TAG -- which is the commit under test. The
+# gate would then compare its tree with itself. The selector must emit the fully
+# qualified ref, and this plants exactly that collision.
+( cd "$lane_b_brrepo"
+  git update-ref refs/tags/origin/main "$lane_b_old"
+) >/dev/null 2>&1
+lane_b_amb_rc=0
+checks=$((checks + 1))
+lane_b_amb_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event push --before "$lane_b_zero" --sha "$lane_b_old" \
+  --ref refs/tags/origin/main --default-branch main) 2>&1 )" || lane_b_amb_rc=$?
+if [ "$lane_b_amb_rc" -ne 0 ]; then
+  echo "FAIL [the trunk is named by its fully qualified ref]:" >&2
+  echo "  the selector exited $lane_b_amb_rc rather than choosing." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_amb_out" != "refs/remotes/origin/main" ]; then
+  echo "FAIL [the trunk is named by its fully qualified ref]: chose" >&2
+  printf '%s\n' "$lane_b_amb_out" | sed 's/^/    /' >&2
+  echo "  expected refs/remotes/origin/main. A short name lets a tag of the same" >&2
+  echo "  name win, and that tag is the commit under test." >&2
+  failures=$((failures + 1))
+else
+  lane_b_amb_short="$(cd "$lane_b_brrepo" && git rev-parse --short origin/main 2>/dev/null)"
+  lane_b_amb_full="$(cd "$lane_b_brrepo" && git rev-parse --short refs/remotes/origin/main 2>/dev/null)"
+  if [ "$lane_b_amb_short" = "$lane_b_amb_full" ]; then
+    echo "FAIL [the trunk is named by its fully qualified ref]: the scene was not" >&2
+    echo "  established -- the short and qualified names resolve alike, so this" >&2
+    echo "  control would pass whatever the selector emitted." >&2
+    failures=$((failures + 1))
+  fi
 fi
 rm -rf "$lane_b_brrepo"
 

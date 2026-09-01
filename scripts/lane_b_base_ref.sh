@@ -48,8 +48,17 @@ if [ -z "$default" ]; then
   echo "REFUSING: --default-branch is required." >&2
   exit 2
 fi
-git rev-parse --verify --quiet "$remote/$default^{commit}" >/dev/null 2>&1 \
-  && lane_b_trunk_rev="$remote/$default"
+# ⚠ FULLY QUALIFIED, BECAUSE `origin/main` IS A NAME A TAG MAY ALSO HAVE. Git
+# resolves an ambiguous short name by checking refs/tags BEFORE refs/remotes, and
+# a tag may legitimately be called `origin/main`. On a tag push the checkout then
+# holds both, and the shorthand resolves to the TAG -- which is the commit under
+# test, so the gate would compare its tree with itself and an upward baseline
+# edit would pass. Git says "warning: refname 'origin/main' is ambiguous" on
+# stderr, which this discards, and `rev-parse --verify --quiet` succeeds on the
+# wrong object without a word. Measured: with both refs present, the shorthand
+# named the tag's commit and refs/remotes/origin/main named the trunk's.
+git rev-parse --verify --quiet "refs/remotes/$remote/$default^{commit}" >/dev/null 2>&1 \
+  && lane_b_trunk_rev="refs/remotes/$remote/$default"
 
 # ⚠ ASKED ONCE, HERE, AND WITH `ls-tree`. Whether the trunk carries the baseline
 # decides how a baseline-less revision is read: a fork from before adoption
