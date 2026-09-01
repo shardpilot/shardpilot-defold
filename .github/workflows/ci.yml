@@ -242,11 +242,11 @@ jobs:
   #
   # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
   # FOURTEEN controls, which is what this harness had before the sibling's
-  # lineage was ported into it, and this harness is at 64 controls now. The
+  # lineage was ported into it, and this harness is at 66 controls now. The
   # bound is re-argued at the shipping count. ⚠ AND "RE-ARGUED" IS NOT
   # "RE-MEASURED": the figures on either side of this paragraph were taken at 14
   # and 35 controls, and the current budget is those extrapolated through the 55s
-  # floor -- not a timed run at 64. Saying otherwise would be this paragraph's own
+  # floor -- not a timed run at 66. Saying otherwise would be this paragraph's own
   # warning committed inside it: a figure
   # derived for a different configuration is not a measurement of this one,
   # which is the mistake this comment already records the sibling making.
@@ -254,14 +254,14 @@ jobs:
   # Measured on this rig: 353.7s for 35 controls, 10.1s each (2026-08-31). The
   # slow review datum -- 55s per control -- stays a floor rather than a duration,
   # because that run did not finish. The budget is sized from the floor, not from
-  # the fast rig: 64 x 55s is 3520s, so the arithmetic demands 59 minutes.
+  # the fast rig: 66 x 55s is 3630s, so the arithmetic demands 61 minutes.
   #
-  # Shipping 60 minutes against a floor of 59. The floor is what the control
+  # Shipping 65 minutes against a floor of 61. The floor is what the control
   # enforces; the margin above it is a separate decision.
   #
   # ⚠ THE MARGIN IN CONTROLS, NOT IN MINUTES, BECAUSE MINUTES GO STALE. At 55s a
-  # control: 64 need 3520s, 65 need 3575s and still fit, 66 need 3630s and do
-  # not. So ONE more control fits here and THE SECOND ONE TRIPS THE BOUND -- that
+  # control: 66 need 3630s, 70 need 3850s and still fit, 71 need 3905s and do
+  # not. So FOUR more controls fit here and THE FIFTH ONE TRIPS THE BOUND -- that
   # person re-derives this pair rather than nudging it, and the arithmetic is
   # written out so they check it in a line instead of trusting this sentence.
   #
@@ -270,6 +270,17 @@ jobs:
   # sixth addition would trip a bound the fifth already did. Each time the number
   # moved and the sentence did not. Rewriting it whole rather than appending
   # another correction, because the appended ones are how it got here.
+  #
+  # ⚠ AND THE BOUND WAS RAISED HERE, WHICH THE PARAGRAPH BELOW WARNS AGAINST --
+  # so the two cases are separated, because this is the first time they have
+  # met. #69 shipped 60 against a floor of 59 at 64 controls; #73 added two
+  # more, and 66 x 55s is 3630s, so the DERIVED FLOOR rose past the bound before
+  # any job ran. That is arithmetic, not a symptom: the floor is count x 55s by
+  # construction, so a growing count must move the bound or stop growing. The
+  # warning below is about a DIFFERENT event -- a job that actually hit the
+  # bound, where raising it hides a hang. Nothing here has timed out: the two
+  # merged runs cost 312s at 64 controls and 341s at 53, which is 4.8-6.4s each
+  # against a 55s constant kept deliberately pessimistic.
   # THIS NUMBER IS NOW CHECKED, not asserted. The harness reads timeout-minutes
   # for this job back out of this file and fails if it is under the count times
   # the slow constant, so adding a control raises the floor by itself. That
@@ -286,7 +297,7 @@ jobs:
   # built on purpose. It needs no network and no history depth.
   lane-b-ratchet-controls:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 65
 
     steps:
       - name: Checkout
