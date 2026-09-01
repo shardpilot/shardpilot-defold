@@ -1836,29 +1836,62 @@ elif [ "$lane_b_blind_out" != EMPTY ]; then
   failures=$((failures + 1))
 fi
 # ⚠ AND "I COULD NOT LOOK" MUST NOT READ AS "IT IS NOT THERE". The adoption test
-# asks whether the TRUNK carries the baseline. If the trunk cannot be inspected --
-# unfetched, a transient failure, no default branch at all -- the old default was
-# "adoption has not happened", which passes a baseline-less revision through to a
-# gate that then takes its legal skip. Pass-through is now reached only by SEEING
-# the trunk and seeing it lacks the file too.
+# asks whether the TRUNK carries the baseline; if it cannot be inspected, the old
+# default was "adoption has not happened", which passes a baseline-less revision
+# through to a gate that then takes its legal skip.
+#
+# ⚠ AND THE SCENE MUST FAIL THE LOOKUP, NOT THE RESOLUTION. An earlier version
+# pointed --default-branch at a name that does not exist, so `rev-parse` failed
+# and `ls-tree` was never reached: a regression that turned a failed ls-tree on a
+# RESOLVABLE trunk into "no" would have left it green. This builds a trunk whose
+# commit resolves and whose tree object has been deleted -- measured: rev-parse
+# rc 0, ls-tree rc 128.
+lane_b_btrepo="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+(
+  cd "$lane_b_btrepo"
+  git init -q .
+  mkdir -p scripts
+  printf '# format-version: 3\n1 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
+  git add -A
+  git -c user.email=t@invalid -c user.name=t commit -qm "trunk with a baseline"
+  git branch -M main
+  git update-ref refs/remotes/origin/main main
+  git checkout -q --orphan blind
+  git rm -rqf --cached . 2>/dev/null || true
+  rm -f scripts/public-surface-lane-b-baseline.txt
+  printf 'x\n' > unrelated.txt
+  git add -A
+  git -c user.email=t@invalid -c user.name=t commit -qm "no baseline here"
+  rm -f ".git/objects/$(git rev-parse main^{tree} | cut -c1-2)/$(git rev-parse main^{tree} | cut -c3-)"
+) >/dev/null 2>&1
+lane_b_bt_blind="$(git -C "$lane_b_btrepo" rev-parse blind)"
 checks=$((checks + 1))
-lane_b_unknown_rc=0
-lane_b_unknown_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
-  --event pull_request --pr-base "$lane_b_blind" --default-branch nosuchbranch) 2>&1 )" || lane_b_unknown_rc=$?
-if [ "$lane_b_unknown_rc" -ne 0 ]; then
-  echo "FAIL [an uninspectable trunk does not license a pass-through]:" >&2
-  echo "  the selector exited $lane_b_unknown_rc rather than choosing. The caller's" >&2
-  echo "  assignment runs under set -e, so a nonzero status there aborts" >&2
-  echo "  the step and the gate never runs -- a control that reads only" >&2
-  echo "  the output stays green while CI stops." >&2
+lane_b_bt_ok=yes
+( cd "$lane_b_btrepo" && git rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}' >/dev/null 2>&1 ) || lane_b_bt_ok=no
+( cd "$lane_b_btrepo" && ! git ls-tree --name-only refs/remotes/origin/main -- scripts/public-surface-lane-b-baseline.txt >/dev/null 2>&1 ) || lane_b_bt_ok=no
+if [ "$lane_b_bt_ok" != yes ]; then
+  echo "FAIL [an uninspectable trunk does not license a pass-through]: the scene" >&2
+  echo "  was not established -- the trunk must RESOLVE and its tree lookup must" >&2
+  echo "  FAIL, or this control drives the resolution path instead." >&2
   failures=$((failures + 1))
-elif [ "$lane_b_unknown_out" != EMPTY ]; then
-  echo "FAIL [an uninspectable trunk does not license a pass-through]: chose" >&2
-  printf '%s\n' "$lane_b_unknown_out" | sed 's/^/    /' >&2
-  echo "  expected EMPTY. Reading a failure to look as an answer is how a" >&2
-  echo "  baseline-less base reaches the gate's legal skip." >&2
-  failures=$((failures + 1))
+else
+  lane_b_unknown_rc=0
+  lane_b_unknown_out="$( (cd "$lane_b_btrepo" && "$SELECTOR" \
+    --event pull_request --pr-base "$lane_b_bt_blind" --default-branch main) 2>&1 )" || lane_b_unknown_rc=$?
+  if [ "$lane_b_unknown_rc" -ne 0 ]; then
+    echo "FAIL [an uninspectable trunk does not license a pass-through]:" >&2
+    echo "  the selector exited $lane_b_unknown_rc rather than choosing." >&2
+    failures=$((failures + 1))
+  elif [ "$lane_b_unknown_out" != EMPTY ]; then
+    echo "FAIL [an uninspectable trunk does not license a pass-through]: chose" >&2
+    printf '%s\n' "$lane_b_unknown_out" | sed 's/^/    /' >&2
+    echo "  expected EMPTY. Reading a failure to look as an answer is how a" >&2
+    echo "  baseline-less base reaches the gate's legal skip." >&2
+    failures=$((failures + 1))
+  fi
 fi
+rm -rf "$lane_b_btrepo"
+
 # ⚠ THE ADOPTION PUSH, WHICH IS THE MERGE OF THE CHANGE THAT INTRODUCES THE
 # BASELINE. On a trunk push the workflow has already pointed the trunk at the
 # commit being pushed, so asking the trunk whether adoption has happened is
@@ -1866,25 +1899,56 @@ fi
 # has it. Classifying `before` against that trunk turns the one legal skip into
 # EMPTY, and the push landing the adoption fails with every existing occurrence
 # reported as new. This is the scene that would have fired on the merge itself.
-( cd "$lane_b_brrepo"
-  git update-ref refs/remotes/origin/main "$lane_b_trunk"
+#
+# ⚠ AND IT MUST BE A FAST-FORWARD, NOT A REPLACEMENT. An earlier version used an
+# ORPHAN commit as `before` against a trunk from unrelated history, which models a
+# force-push rather than a landing -- so a regression that preserved a
+# baseline-less predecessor only for unrelated pushes, while misclassifying a
+# genuine adoption, would have passed it. Here the baseline-bearing commit is a
+# CHILD of the baseline-less one, which is what a merge actually produces.
+lane_b_adrepo="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+(
+  cd "$lane_b_adrepo"
+  git init -q .
+  printf 'x\n' > unrelated.txt
+  git add -A
+  git -c user.email=t@invalid -c user.name=t commit -qm "before adoption: no baseline"
+  git branch -M main
+  mkdir -p scripts
+  printf '# format-version: 3\n7 f.lua\n' > scripts/public-surface-lane-b-baseline.txt
+  git add -A
+  git -c user.email=t@invalid -c user.name=t commit -qm "the adoption commit"
+  git update-ref refs/remotes/origin/main main
 ) >/dev/null 2>&1
-lane_b_adopt_rc=0
+lane_b_ad_before="$(git -C "$lane_b_adrepo" rev-parse main~1)"
+lane_b_ad_sha="$(git -C "$lane_b_adrepo" rev-parse main)"
 checks=$((checks + 1))
-lane_b_adopt_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
-  --event push --before "$lane_b_blind" --sha "$lane_b_trunk" \
-  --ref refs/heads/main --default-branch main) 2>&1 )" || lane_b_adopt_rc=$?
-if [ "$lane_b_adopt_rc" -ne 0 ]; then
-  echo "FAIL [the adoption push keeps its legal skip]:" >&2
-  echo "  the selector exited $lane_b_adopt_rc rather than choosing." >&2
+lane_b_ad_ok=yes
+( cd "$lane_b_adrepo" && git merge-base --is-ancestor "$lane_b_ad_before" "$lane_b_ad_sha" ) || lane_b_ad_ok=no
+( cd "$lane_b_adrepo" && ! git ls-tree --name-only "$lane_b_ad_before" -- scripts/public-surface-lane-b-baseline.txt 2>/dev/null | grep -q . ) || lane_b_ad_ok=no
+if [ "$lane_b_ad_ok" != yes ]; then
+  echo "FAIL [the adoption push keeps its legal skip]: the scene was not" >&2
+  echo "  established -- before must be an ANCESTOR of the pushed commit and must" >&2
+  echo "  itself carry no baseline, or this models a force-push instead." >&2
   failures=$((failures + 1))
-elif [ "$lane_b_adopt_out" != "$lane_b_blind" ]; then
-  echo "FAIL [the adoption push keeps its legal skip]: chose" >&2
-  printf '%s\n' "$lane_b_adopt_out" | sed 's/^/    /' >&2
-  echo "  expected the previous tip $lane_b_blind. EMPTY here means the merge" >&2
-  echo "  that introduces the baseline fails on its own existing debt." >&2
-  failures=$((failures + 1))
+else
+  lane_b_adopt_rc=0
+  lane_b_adopt_out="$( (cd "$lane_b_adrepo" && "$SELECTOR" \
+    --event push --before "$lane_b_ad_before" --sha "$lane_b_ad_sha" \
+    --ref refs/heads/main --default-branch main) 2>&1 )" || lane_b_adopt_rc=$?
+  if [ "$lane_b_adopt_rc" -ne 0 ]; then
+    echo "FAIL [the adoption push keeps its legal skip]:" >&2
+    echo "  the selector exited $lane_b_adopt_rc rather than choosing." >&2
+    failures=$((failures + 1))
+  elif [ "$lane_b_adopt_out" != "$lane_b_ad_before" ]; then
+    echo "FAIL [the adoption push keeps its legal skip]: chose" >&2
+    printf '%s\n' "$lane_b_adopt_out" | sed 's/^/    /' >&2
+    echo "  expected the previous tip $lane_b_ad_before. EMPTY here means the" >&2
+    echo "  merge that introduces the baseline fails on its own existing debt." >&2
+    failures=$((failures + 1))
+  fi
 fi
+rm -rf "$lane_b_adrepo"
 
 # ⚠ A TAG MAY BE CALLED `origin/main`, AND GIT PREFERS IT. Ambiguous short names
 # resolve refs/tags BEFORE refs/remotes, so on a tag push the checkout can hold
