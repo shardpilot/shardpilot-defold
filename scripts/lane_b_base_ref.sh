@@ -72,11 +72,22 @@ git rev-parse --verify --quiet "$remote/$default^{commit}" >/dev/null 2>&1 \
 # unresolvable comparison target with its own message, and turning "I could not
 # look" into EMPTY would replace a refusal with a verdict.
 emit() {  # $1 = newline-separated revisions -> deduplicated, EMPTY where blind
-  lane_b_trunk_has=no
-  git cat-file -e "$remote/$default:$baseline" 2>/dev/null && lane_b_trunk_has=yes
+  # ⚠ THE DEFAULT IS THE STRICT ONE, BECAUSE "I COULD NOT LOOK" IS NOT "IT IS NOT
+  # THERE". This asked whether the trunk carries the baseline and treated every
+  # non-answer -- an unfetched trunk, a transient failure, no default branch at
+  # all -- as "adoption has not happened", which passes a baseline-less revision
+  # through to a gate that then takes its legal skip. Pass-through is now reached
+  # only by seeing the trunk and seeing that it lacks the file too, which is the
+  # one state where a skip is correct: the change that adopts the baseline.
+  lane_b_trunk_has=unknown
+  if git cat-file -e "$remote/$default:$baseline" 2>/dev/null; then
+    lane_b_trunk_has=yes
+  elif git rev-parse --verify --quiet "$remote/$default^{commit}" >/dev/null 2>&1; then
+    lane_b_trunk_has=no
+  fi
   printf '%s\n' "$1" | while IFS= read -r r; do
     [ -n "$r" ] || continue
-    if [ "$r" != EMPTY ] && [ "$lane_b_trunk_has" = yes ] \
+    if [ "$r" != EMPTY ] && [ "$lane_b_trunk_has" != no ] \
        && git rev-parse --verify --quiet "$r^{commit}" >/dev/null 2>&1 \
        && ! git cat-file -e "$r:$baseline" 2>/dev/null; then
       echo EMPTY
@@ -133,25 +144,6 @@ fi
 # 3. Any other ref: branch or tag. TWO bases, and the count may rise against
 #    neither.
 #
-#    ⚠ THE MERGE BASE ALONE TURNS EVERY REDUCTION INTO SLACK. Push A takes a file
-#    from the merge base's 10 down to 5 and passes; push B adds five back and
-#    raises its baseline to 10, and against the unchanged merge base that is not a
-#    rise either. The advertised rule -- the number may fall and may not rise --
-#    stops holding across published pushes, and the debt someone paid becomes
-#    reusable. The previous tip catches exactly that, because 5 -> 10 rises
-#    against it.
-#
-#    ⚠ AND THE PREVIOUS TIP ALONE IS THE HOLE THE MERGE BASE CLOSES: a tip this
-#    gate already rejected is not an accepted state, so an empty follow-up commit
-#    would carry the rejected material through. Each base covers the other's gap,
-#    so both are emitted and the caller must satisfy both.
-#
-#    ⚠ AND NOT `before`, WHICH CAN BE A TIP THIS GATE ALREADY REJECTED. Push A
-#    adds lane B material, raises its baseline and fails; push B is an empty
-#    commit whose `before` is A. Comparing B against A sees no increase, so B is
-#    green while carrying exactly the material that made A fail. The merge base
-#    is immune: it is a commit on the default branch, so the whole branch is
-#    measured against a state the project accepted.
 # 3. Any other ref -- a branch or a tag. It is compared against the TRUNK AS IT
 #    STANDS, and nothing published may carry more than the trunk currently does.
 #

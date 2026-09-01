@@ -115,8 +115,16 @@ jobs:
       # every one found by reading -- because nothing executed the choice.
       #
       # scripts/lane_b_base_ref.sh is that choice with inputs and one output, and
-      # the ratchet harness drives every case. This step only fetches what the
-      # script names. The rules it applies, and why, are documented there.
+      # the ratchet harness drives every case. The rules it applies, and why, are
+      # documented there.
+      #
+      # ⚠ THIS STEP FETCHES BEFORE IT ASKS, AND THEN AGAIN AFTERWARDS. The trunk
+      # and the pull-request base are fetched FIRST, because the selector inspects
+      # revisions -- it cannot classify what is not in the clone, and asking it
+      # about an absent object is how a baseline-less base was passed through
+      # instead of becoming EMPTY. What the selector then names is fetched second.
+      # A revision fetched here may not be emitted at all: the PR base can come
+      # back as EMPTY.
       # ⚠ A DELETION IS A PUSH EVENT WITH NO NEW TREE. Deleting a branch or tag
       # fires this workflow, `before` names the tip that was removed, and the
       # checkout resolves to a fallback commit -- so the selector would compute
@@ -155,8 +163,17 @@ jobs:
           # baseline. Both fetches are best-effort; when one fails the revision
           # stays unresolvable and the gate refuses it by name, which is the
           # correct outcome and not this one.
+          # ⚠ THE TRUNK FETCH IS FATAL, THE OTHERS ARE NOT, AND THE ASYMMETRY IS
+          # THE POINT. The selector decides whether a baseline-less revision is a
+          # fork from before adoption (EMPTY) or adoption itself (pass through) by
+          # asking whether the TRUNK carries the baseline. `|| true` turned a
+          # transient fetch failure into the answer "the trunk does not have it" --
+          # so a pull request based on a baseline-less branch would be passed
+          # through, the gate would take its legal skip, and new material could
+          # arrive with a matching raised baseline. A failure to look is not a
+          # finding, and hiding it made it into one.
           git fetch --no-tags origin \
-            "+refs/heads/$SP_DEFAULT:refs/remotes/origin/$SP_DEFAULT" || true
+            "+refs/heads/$SP_DEFAULT:refs/remotes/origin/$SP_DEFAULT"
           [ -n "$SP_PR_BASE" ] && git fetch --depth=1 origin "$SP_PR_BASE" || true
           bases="$(./scripts/lane_b_base_ref.sh \
             --event "$SP_EVENT" \
@@ -213,7 +230,7 @@ jobs:
   #
   # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
   # FOURTEEN controls, which is what this harness had before the sibling's
-  # lineage was ported into it, and this harness is at 60 controls now. The
+  # lineage was ported into it, and this harness is at 61 controls now. The
   # bound is re-argued from a measurement taken at the SHIPPING count: a figure
   # derived for a different configuration is not a measurement of this one,
   # which is the mistake this comment already records the sibling making.
@@ -221,14 +238,19 @@ jobs:
   # Measured on this rig: 353.7s for 35 controls, 10.1s each (2026-08-31). The
   # slow review datum -- 55s per control -- stays a floor rather than a duration,
   # because that run did not finish. The budget is sized from the floor, not from
-  # the fast rig: 60 x 55s is 3300s, so the arithmetic demands 55 minutes.
+  # the fast rig: 61 x 55s is 3355s, so the arithmetic demands 56 minutes.
   #
-  # Shipping 50 rather than 39. The floor is what the control enforces; the
-  # margin above it is a separate decision, and 40 would have been one control
-  # from red -- a bound that has to be revisited by the next person to add a
-  # check is a bound that will be raised in a hurry rather than argued. Fifty
-  # carries eight more controls before the arithmetic speaks again. This is
-  # margin over a measured floor, not a guess in place of one.
+  # Shipping 60 against a floor of 56. The floor is what the control enforces;
+  # the margin above it is a separate decision, and a bound one control from red
+  # is a bound the next person raises in a hurry rather than argues.
+  #
+  # ⚠ AND THE MARGIN IS NOW FOUR MINUTES, WHICH IS FOUR CONTROLS AT THE STATED
+  # COST -- not the eight this paragraph used to claim, from back when the pair
+  # was 50 against 39. The number moved four times while the sentence did not,
+  # which is the same staleness this file has now been caught in three times: the
+  # prose describing a mechanism is a second edit, and it is never in the diff
+  # that invalidates it. Whoever adds the sixth control from here re-derives this
+  # pair rather than nudging it.
   #
   # THIS NUMBER IS NOW CHECKED, not asserted. The harness reads timeout-minutes
   # for this job back out of this file and fails if it is under the count times

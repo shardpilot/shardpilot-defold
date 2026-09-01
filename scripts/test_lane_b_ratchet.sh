@@ -1556,7 +1556,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=60
+EXPECTED_CHECKS=61
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
@@ -1792,6 +1792,22 @@ if [ "$lane_b_blind_out" != EMPTY ]; then
   printf '%s\n' "$lane_b_blind_out" | sed 's/^/    /' >&2
   echo "  expected EMPTY. Passing it through makes the gate announce a skip, and" >&2
   echo "  a skipped comparison is where material is laundered in." >&2
+  failures=$((failures + 1))
+fi
+# ⚠ AND "I COULD NOT LOOK" MUST NOT READ AS "IT IS NOT THERE". The adoption test
+# asks whether the TRUNK carries the baseline. If the trunk cannot be inspected --
+# unfetched, a transient failure, no default branch at all -- the old default was
+# "adoption has not happened", which passes a baseline-less revision through to a
+# gate that then takes its legal skip. Pass-through is now reached only by SEEING
+# the trunk and seeing it lacks the file too.
+checks=$((checks + 1))
+lane_b_unknown_out="$( (cd "$lane_b_brrepo" && "$SELECTOR" \
+  --event pull_request --pr-base "$lane_b_blind" --default-branch nosuchbranch) 2>&1 )" || true
+if [ "$lane_b_unknown_out" != EMPTY ]; then
+  echo "FAIL [an uninspectable trunk does not license a pass-through]: chose" >&2
+  printf '%s\n' "$lane_b_unknown_out" | sed 's/^/    /' >&2
+  echo "  expected EMPTY. Reading a failure to look as an answer is how a" >&2
+  echo "  baseline-less base reaches the gate's legal skip." >&2
   failures=$((failures + 1))
 fi
 rm -rf "$lane_b_brrepo"
