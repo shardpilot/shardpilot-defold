@@ -72,10 +72,13 @@
 #
 # ── SCOPE, STATED SO A PASS IS NOT READ AS MORE THAN IT IS ──────────────────
 # LANE A is GATED at zero: every tracked file that is not Lua source.
-# LANE B is REPORTED, NOT GATED: Lua source (*.lua). Those comments are owned by
-#   another workstream (the SDK wire freeze) and editing them here would
-#   collide with it. Lane B prints its count on every run so the debt stays
-#   visible instead of being implied away by lane A's green.
+# LANE B is REPORTED AT ZERO, GATED ON CHANGE: Lua source (*.lua). Those comments
+#   are owned by another workstream (the SDK wire freeze) and editing them here
+#   would collide with it, so existing debt does not fail the run -- but the
+#   per-file counts are held against a baseline, and a count that RISES, or that
+#   FALLS without the baseline being updated, does fail. Two different things
+#   share the word "gated" and the distinction is the whole design: not gated at
+#   zero, gated on change.
 # Neither lane looks at git HISTORY. Deleting a line does not unpublish the
 # commit that carried it.
 #
@@ -300,7 +303,23 @@ GATE_TMPFILES=()
 # cleanup that reads as working and frees nothing. It was written that way
 # first, and the file count is what showed it.
 gate_tmp() {
-  GATE_TMP="$(mktemp)" || return 1
+  # ⚠ IT REFUSES RATHER THAN RETURNING. Every caller writes
+  # `gate_tmp; something="$GATE_TMP"` on one line, so a failure that merely
+  # returned non-zero would leave the PREVIOUS temporary path in GATE_TMP and
+  # the new name would alias the old file -- two logical files silently
+  # becoming one, with the second overwriting what the first still needs.
+  #
+  # Errexit does not save this: the scan takes its grep statuses under
+  # "set +e", and a call landing in that window would continue past the
+  # failure. Seven call sites would each need their own check; the function
+  # having no failing return is one place instead of seven.
+  GATE_TMP="$(mktemp)" || {
+    # refusal:structural
+    echo "REFUSING: could not create a temporary file." >&2
+    echo "  Callers take this path immediately, so continuing would alias the" >&2
+    echo "  previous temporary and let one file overwrite another." >&2
+    exit 2
+  }
   GATE_TMPFILES+=("$GATE_TMP")
 }
 # ⚠ AND A RUN THAT DID NOT REACH ITS OWN END EXITS NON-ZERO, whatever the
@@ -310,6 +329,21 @@ gate_tmp() {
 # having died mid-run. A flag set on the last line is the only thing that
 # distinguishes finishing from stopping, so that is what the trap reads.
 gate_finished=no
+# ⚠ AND EVERY OTHER INTERNAL FLAG IS INITIALISED HERE TOO, FOR THE REASON THE ONE
+# ABOVE ALWAYS WAS. A flag that is only ever ASSIGNED where its condition holds,
+# and READ with `${flag:-no}`, inherits whatever the environment exported. Review
+# round 10: `lane_b_compared=yes ./check_public_surface.sh` made an uncompared run
+# print "the number may fall and may not rise" -- the log attesting to work that
+# did not happen, which is the third round running that the defect was in what the
+# run SAYS. Measured: with the export, the strong sentence; without it, the weak
+# one. `gate_finished` was never exposed because it was initialised; these are.
+#
+# A default at the point of USE reads like a safety net and is the opposite: it
+# makes the ambient value the fallback. The initialisation is the safety net, and
+# the reads below no longer carry defaults, so re-introducing the pattern means
+# writing `${...:-}` again rather than merely forgetting a line.
+lane_b_compared=no
+lane_b_skip_said=no
 
 # ⚠ THE TRAP PRESERVES THE STATUS, and does not touch an EMPTY array.
 # Measured on bash 3.2: a `set -u` failure followed by an EXIT trap whose last
@@ -416,7 +450,7 @@ fi
 #
 # `$PATTERNS` and `$KNOWN_INNOCENT` carry no break: measured, neither matches
 # the classes, so they are written plainly.
-GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_ENTITY_BODY FIXTURE_ENTITY_NAME FIXTURE_AMPPROSE_BODY FIXTURE_AMPPROSE_NAME FIXTURE_NBSPPHRASE_BODY FIXTURE_NBSPPHRASE_NAME FIXTURE_RAWHTMLENT_BODY FIXTURE_RAWHTMLENT_NAME FIXTURE_LEGACYSECT_BODY FIXTURE_LEGACYSECT_NAME FIXTURE_ENTITYLANEB_BODY FIXTURE_ENTITYLANEB_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
+GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_ENTITY_BODY FIXTURE_ENTITY_NAME FIXTURE_AMPPROSE_BODY FIXTURE_AMPPROSE_NAME FIXTURE_NBSPPHRASE_BODY FIXTURE_NBSPPHRASE_NAME FIXTURE_RAWHTMLENT_BODY FIXTURE_RAWHTMLENT_NAME FIXTURE_LEGACYSECT_BODY FIXTURE_LEGACYSECT_NAME FIXTURE_ENTITYLANEB_BODY FIXTURE_ENTITYLANEB_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME FIXTURE_SPLITID_BODY FIXTURE_SPLITID_NAME'
 
 PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)*( [A-Za-z][A-Za-z-]*)? (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER='analytic[]s-service
@@ -452,8 +486,8 @@ The payment parser is not under t[]est.
 Without t[]ests for the parser this is a guess.
 The crash path is released without automated c[]overage.
 There aren'"'"'[][]t any tests for the payment parser.'
-KNOWN_INNOCENT='https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.0.zip
-ingest_url = "https://ingest.example.com"
+KNOWN_INNOCENT='go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
+IngestURL: os.Getenv("SHARDPILOT_INGEST_URL")
 POST {IngestURL}/v1/events:batch
 https://localhost:8080 during local development
 a documented per-platform adaptation, not drift
@@ -504,6 +538,9 @@ FIXTURE_FLAG_NAME=flag.md
 FIXTURE_LANEB_BODY='-- GAP[]-000 note
 return {}'
 FIXTURE_LANEB_NAME=lane_b.lua
+FIXTURE_SPLITID_BODY='-- see ADR-[]000**00** and EXAMPLE_SYNTH[]ETIC_FL[]AG_ENABLED
+return {}'
+FIXTURE_SPLITID_NAME=split_id.lua
 FIXTURE_NAMEHIT_BODY='nothing internal in the body'
 FIXTURE_NAMEHIT_NAME='ADR-[]9999-notes.md'
 for gate_var in $GATE_DATA_NAMES; do
@@ -877,11 +914,13 @@ done
 scan_lane_a=""      # "path:line:text" per hit, newline separated
 scan_lane_b_files=0
 scan_lane_b_lines=0
+scan_lane_b_counts=""
 scan_files=0
 
 scan_tree() {
   local root="$1" f hits status line list
   scan_lane_a=""; scan_lane_b_files=0; scan_lane_b_lines=0; scan_files=0
+  scan_lane_b_counts=""
 
   # `git ls-files -z` and PROCESS substitution, not a heredoc. A command
   # substitution used as a heredoc body is invisible to `set -e` and to
@@ -967,7 +1006,8 @@ scan_tree() {
     # writes a PDF, or names a compression header, holds those characters
     # legitimately — and a refusal ends the run before the lane split, so an
     # unconditional test on printable bytes silently outranks this file's own
-    # promise that source is REPORTED rather than gated. The refusals that rest
+    # promise that source is REPORTED AT ZERO rather than gated there. The
+    # refusals that rest
     # on NON-printable bytes are unambiguous and still apply everywhere; the
     # printable ones are skipped for the reported lane, which is the narrowest
     # place to draw the line.
@@ -975,7 +1015,7 @@ scan_tree() {
     # ⚠ DECIDED BEFORE THE FIRST REFUSAL THAT CONSULTS IT. Placed after one, it
     # was an unbound variable under `set -u` and the run died there — with the
     # probes reading that as a pass, because a dead run refuses nothing.
-    # ⚠ THE SAME PREDICATE THE lua SPLIT USES, deliberately case-SENSITIVE
+    # ⚠ THE SAME PREDICATE THE LANE SPLIT USES, deliberately case-SENSITIVE
     # and deliberately `$f`. Folding it here while the split reads `$f` made a
     # file named `logo.LUA` exempt from the printable checks and gated by
     # lane A at the same time — a raster renamed that way passed both the
@@ -1392,7 +1432,7 @@ scan_tree() {
     # The message says what to do, which is the whole reason this can be a
     # refusal instead of a miss: the remedy is one keystroke, so a false
     # refusal costs a contributor a character rather than an argument.
-    # ⚠ LANE B IS REPORTED, NOT GATED, and this refusal has to honour that or it
+    # ⚠ LANE B IS NOT GATED AT ZERO, and this refusal has to honour that or it
     # silently promotes a whole lane. A source file may legitimately carry the
     # bytes of a character reference inside a string literal, and a source
     # viewer shows those bytes rather than a decoded character — the hazard
@@ -1569,6 +1609,263 @@ scan_tree() {
         while IFS= read -r line; do
           [ -n "$line" ] && scan_lane_b_lines=$((scan_lane_b_lines + 1))
         done <<< "$hits"
+        # ⚠ OCCURRENCES, NOT MATCHING LINES, AND THAT WAS A REAL HOLE. The
+        # records above are deduplicated by LINE NUMBER -- necessarily, because
+        # one physical line can match the shape pass on its raw bytes and the
+        # roster pass on its marker-free copy -- and the per-file tally then
+        # ticked once per surviving record. So appending a SECOND identifier to
+        # an already-matching line moved no number, and the ratchet passed with
+        # no baseline edit, because that line's debt was already recorded. The
+        # stated rule is that a new occurrence fails; the unit being counted
+        # said otherwise, and the two had drifted apart unnoticed.
+        #
+        # The key that fixes it is (line, marker-free match text): the raw and
+        # the marker-free spelling of ONE identifier normalise to the same
+        # string and collapse, while two DIFFERENT identifiers on one line stay
+        # apart. -o gives the matched text rather than the line.
+        #
+        # ⚠ MAX ACROSS PASSES, NOT SUM. Every pass reads the same physical line,
+        # so summing would multiply one occurrence by however many passes saw
+        # it. Taking the largest count any single pass reports for a given
+        # (line, text) keeps a genuine repeat -- the same identifier twice on
+        # one line -- at two, without inventing copies out of the passes.
+        # ⚠ grep's 1 IS "NO MATCH"; ANYTHING ABOVE IT IS A BROKEN INSTRUMENT --
+        # the same rule the passes above already keep, and the first draft of
+        # this block broke it. `|| [ $? -eq 1 ]` flattens every status into 1,
+        # so an I/O error on a file that HAS matches would have produced an
+        # empty result, a count of zero, and a ratchet comparing against a
+        # number it never managed to compute.
+        # ⚠ COUNTED ON THE RAW TEXT, AND AMBIGUITY IS REFUSED RATHER THAN
+        # RESOLVED. Three attempts at a transformation policy died here, and the
+        # third died from three directions at once: in this pattern family the
+        # same marker character plays three incompatible roles --
+        #
+        #   _  inside the environment-flag class     a LITERAL that must survive
+        #   ** inside `n.{1,3}t`                     FILLER a wildcard consumes
+        #   *  between two adjacent flags            a BOUNDARY separating two
+        #
+        # -- so any single delete-or-keep rule is wrong about at least one of
+        # them, whichever way it is written. That is not a defect in a rule; it
+        # is a refutation of rules of that shape, and it is the fourth
+        # recurrence of the class #66 names in its own title.
+        #
+        # So counting does not normalise at all. It reads the raw text, and the
+        # spellings that would make the count ambiguous are REFUSED below --
+        # the move that closed the path class in #65: enumerate what is
+        # accepted, refuse the rest, canonicalise nothing.
+        #
+        # ⚠ AND `tr`'S STATUS IS READ. `exit "${PIPESTATUS[0]}"` carried grep's
+        # status out and dropped the rest of the pipeline: a `tr` killed after
+        # grep had produced matches handed back TRUNCATED output with a status
+        # of success, and a tally that still equalled the baseline passed on
+        # data it never fully read. The round-2 fix for the sibling defect
+        # landed on the instance; this is the class.
+        lane_b_count_pass() {  # $1 = grep flags, $2 = pattern, $3 = file
+          local lane_b_ps
+          grep "$1" -aon -- "$2" "$3" 2>/dev/null | tr -d '\000'
+          lane_b_ps=("${PIPESTATUS[@]}")
+          if [ "${lane_b_ps[1]}" -ne 0 ]; then return 2; fi
+          return "${lane_b_ps[0]}"
+        }
+        set +e
+        lane_b_occ_1="$(lane_b_count_pass -E "$PATTERNS" "$scan_src")"
+        lane_b_st_1=$?
+        lane_b_occ_2="$(lane_b_count_pass -iE "$ROSTER_RE" "$scan_src")"
+        lane_b_st_2=$?
+        lane_b_chk_1="$(lane_b_count_pass -E "$PATTERNS" "$strip_blob")"
+        lane_b_st_3=$?
+        lane_b_chk_2="$(lane_b_count_pass -iE "$ROSTER_RE" "$strip_blob")"
+        lane_b_st_4=$?
+        set -e
+        for st in "$lane_b_st_1" "$lane_b_st_2" "$lane_b_st_3" "$lane_b_st_4"; do
+          if [ "$st" -ge 2 ]; then
+            # refusal:structural
+            echo "REFUSING: grep could not count occurrences in '$f' (exit $st)." >&2
+            echo "  A file whose occurrences could not be counted is an UNCOUNTED" >&2
+            echo "  file, and this ratchet must not compare against a number it" >&2
+            echo "  failed to produce -- least of all the zero that a swallowed" >&2
+            echo "  error produces, which reads exactly like paid-off debt." >&2
+            exit 2
+          fi
+        done
+        # ⚠ THE ACCEPTED SPELLINGS, AND A REFUSAL FOR THE REST. Counting on the
+        # raw text is exact exactly when the raw and marker-free readings of a
+        # line agree. Where they disagree, a marker is participating in a match
+        # -- splitting an identifier, being eaten by a wildcard, or separating
+        # two occurrences -- and there is no reading of that line the tally can
+        # defend. So the gate stops instead of picking one.
+        #
+        # This compares; it does not canonicalise. Markers are deleted from the
+        # raw matches ONLY to put the two readings in the same alphabet for the
+        # comparison, and the result is never counted -- which is the whole
+        # difference between this and the three policies that failed.
+        #
+        # Measured before choosing it: on this tree, 11 lane B files carry
+        # matches and 0 disagree, so the refusal is satisfiable today with
+        # nothing grandfathered.
+        #
+        # ⚠ ITS PRICE, STATED. A line where the two readings differ becomes
+        # unwritable in Lua source -- including innocent ones, such as an
+        # environment-flag name in a doc comment, which the raw pass matches and
+        # the marker-free pass does not. Zero such lines exist today. The trade
+        # is deliberate: a refusal is visible and strict, and the alternative on
+        # offer was a tally that silently undercounts, which is the direction a
+        # ratchet must never err in.
+        # ⚠ `|| true` HERE WOULD HIDE THE FAILURE OF THE COMPARISON ITSELF, and
+        # this whole refusal is the comparison. I wrote one, to absorb `grep -v`
+        # exiting 1 when every line is filtered out -- which is "nothing
+        # matched", not an error -- and in absorbing it swallowed `tr` and
+        # `sort` as well. Measured: with a `tr` that fails, both sides come back
+        # empty, compare EQUAL, and the refusal does not fire on a file that
+        # must be refused.
+        #
+        # That is the swallowed-status class this same unit fixed two commits
+        # earlier in the counting passes, reappearing in the code written to fix
+        # it. So each stage is read separately: grep may say 1, nothing else may
+        # say anything but 0.
+        lane_b_compare() {  # $1 $2 = pass outputs -> the comparable form
+          local ps
+          printf '%s\n' "$1" "$2" | grep -v '^$' | tr -d '*_`~\\' | sort
+          ps=("${PIPESTATUS[@]}")
+          [ "${ps[0]}" -eq 0 ] || return 2
+          [ "${ps[1]}" -le 1 ] || return 2
+          [ "${ps[2]}" -eq 0 ] || return 2
+          [ "${ps[3]}" -eq 0 ] || return 2
+          return 0
+        }
+        set +e
+        lane_b_seen_raw="$(lane_b_compare "$lane_b_occ_1" "$lane_b_occ_2")"
+        lane_b_cmp_st_1=$?
+        lane_b_seen_strip="$(lane_b_compare "$lane_b_chk_1" "$lane_b_chk_2")"
+        lane_b_cmp_st_2=$?
+        set -e
+        if [ "$lane_b_cmp_st_1" -ne 0 ] || [ "$lane_b_cmp_st_2" -ne 0 ]; then
+          # refusal:structural
+          echo "REFUSING: could not compare the two readings of '$f'." >&2
+          echo "  The comparison IS the refusal below, so a comparison that did" >&2
+          echo "  not complete cannot be read as agreement -- two empty results" >&2
+          echo "  are equal, and equality here means 'nothing to refuse'." >&2
+          exit 2
+        fi
+        # ⚠ ONE DIRECTION, NOT EQUALITY, AND THE PORT IS WHAT PROVED IT. The
+        # sibling repository ships equality here, and equality was satisfiable
+        # there because no line in its corpus tripped the safe direction. It is
+        # not satisfiable here: two of thirteen lane B files are refused by it,
+        # among them a doc comment naming an environment flag whose underscores
+        # the marker-free reading must destroy, since deleting markers is what
+        # that reading does. (The flag is not spelled here: this file's own audit
+        # refuses a live identifier written in its prose, and the obvious break
+        # placement still left the class matching -- checked, not assumed.)
+        #
+        # The two directions are not symmetric in consequence, and only one can
+        # hurt:
+        #
+        #   the stripped reading sees a match the raw one does not
+        #     -> an identifier hidden by markers; the tally reads RAW, so it
+        #        undercounts, and that is the direction a ratchet must never err
+        #        in. REFUSE.
+        #
+        #   the raw reading sees a match the stripped one does not
+        #     -> the identifier holds a literal the stripping destroys, which is
+        #        exactly the environment-flag class. The tally reads raw and is
+        #        therefore RIGHT. Nothing to refuse.
+        #
+        # Measured on both corpora before changing it: this rule refuses 0 of 13
+        # files here and 0 of 11 there, while still refusing every spelling the
+        # sibling's three P1 findings were about — the underscore-hidden word and
+        # the emphasis-split identifier — and admitting the two that only ever
+        # made the raw reading see MORE.
+        #
+        # `comm` needs both sides sorted, which they are, and its own status is
+        # read rather than assumed: a comparison that did not run cannot be read
+        # as "nothing to refuse".
+        set +e
+        lane_b_hidden="$(comm -13 <(printf '%s\n' "$lane_b_seen_raw") \
+                                  <(printf '%s\n' "$lane_b_seen_strip"))"
+        lane_b_comm_st=$?
+        set -e
+        if [ "$lane_b_comm_st" -ne 0 ]; then
+          # refusal:structural
+          echo "REFUSING: could not compare the two readings of '$f'." >&2
+          echo "  The comparison IS the refusal below, so one that did not run" >&2
+          echo "  must not be read as agreement." >&2
+          exit 2
+        fi
+        if [ -n "$lane_b_hidden" ]; then
+          # refusal:structural
+          echo "REFUSING: '$f' hides a match from the raw text." >&2
+          echo "  The marker-free reading of this file matches something the raw" >&2
+          echo "  text does not, which means an emphasis or quoting marker sits" >&2
+          echo "  inside an identifier. The tally is taken from the raw text, so" >&2
+          echo "  it would count too few -- the one direction this ratchet must" >&2
+          echo "  never err in. Write the identifier without a marker inside it." >&2
+          exit 2
+        fi
+        scan_lane_b_this_file="$(
+          for pass in 1 2; do
+            eval "printf '%s\n' \"\$lane_b_occ_$pass\"" | sed "s/^/$pass:/"
+          done | awk -F: '
+            NF > 2 {
+              pass = $1; n = $2
+              m = substr($0, index($0, ":") + 1)
+              m = substr(m, index(m, ":") + 1)
+              # ⚠ NO SECOND CLEANING HERE. This used to gsub the marker set out
+              # of the captured match, which was the OTHER approximation: the
+              # text arrived from one copy and was cleaned by a different rule,
+              # and the two disagreeing is the whole defect. The text now comes
+              # from the counting normal form already, so cleaning it again
+              # would only re-introduce a disagreement -- and would strip the
+              # underscores that normal form deliberately keeps, collapsing two
+              # distinct identifiers on one line into one key.
+              # ⚠ THE KEY IS REMEMBERED, NOT RE-PARSED. It used to be split back
+              # apart on SUBSEP in END -- and SUBSEP is 0x1c, a byte a wildcard
+              # match can contain. Two distinct matches on one line whose text
+              # agrees up to that byte then produced the SAME a[2], so `best`
+              # took their maximum instead of their sum: adding the second one
+              # to an already-baselined line left the count unchanged and passed
+              # the ratchet with no baseline edit. That is the round-1 defect --
+              # an occurrence hiding on a counted line -- re-entering through
+              # the encoding of the key. Measured: the split form counts two
+              # such matches as 1, this form as 2.
+              #
+              # A joined key that must be taken apart again is a parser, and
+              # this file has paid for parsers. Storing the part END needs
+              # removes the split, so no byte in the match is special.
+              if (m != "") { k = pass SUBSEP n ":" m; seen[k]++; keyof[k] = n ":" m }
+            }
+            END {
+              for (k in seen) {
+                kk = keyof[k]
+                if (seen[k] > best[kk]) best[kk] = seen[k]
+              }
+              total = 0
+              for (k in best) total += best[k]
+              print total
+            }'
+        )"
+        # PER-FILE tally, for the ratchet below. Counting per file rather than
+        # one grand total is what makes the baseline diffable and the failure
+        # legible: a reviewer sees WHICH file grew, not that a number moved.
+        #
+        # ⚠ COUNT FIRST, PATH LAST, and that order is the point. git permits a
+        # path to contain spaces, and `read -r path count` on "a.lua 1 b.lua 1"
+        # would bind count to "1 b.lua 1"; the later `-gt` then errors, evaluates
+        # FALSE inside its `if`, and the gate passes over a real increase. With
+        # the count leading, `read -r count path` gives the rest of the line to
+        # the path and the arithmetic always sees a number.
+        # $'\n' and not "$(printf '\n')": command substitution STRIPS trailing
+        # newlines, so the latter is the empty string and the pattern *""*
+        # matches every path. Caught by this gate refusing on a perfectly
+        # ordinary filename, which is the failure mode fail-closed buys you.
+        case "$f" in
+          *$'\n'*)
+            # refusal:structural — a newline in a path breaks any line-oriented
+            # record, and silently mis-parsing one is how this gate would lie.
+            echo "REFUSING: tracked path contains a newline: $f" >&2
+            exit 2
+            ;;
+        esac
+        scan_lane_b_counts="${scan_lane_b_counts}${scan_lane_b_this_file} ${f}"$'\n'
         ;;
       *)
         # No `sed "s|^|$f:|"`: the filename lands in the s-command's delimiter
@@ -2153,7 +2450,7 @@ EOF
   fixture_checks=$((fixture_checks + 1))
   case "$scanned_a" in
     *"$FIXTURE_ENTITYLANEB_NAME"*)
-      echo "SELFTEST: a lane-B source file was reported on the gated lane" >&2
+      echo "SELFTEST: a lane-B source file was reported on lane A, gated at zero" >&2
       fixture_fail=1 ;;
   esac
   # The NUL fixture gets its own tree: a refusal ends the run it happens in,
@@ -2230,12 +2527,61 @@ EOF
   fixture_checks=$((fixture_checks + 1))
   [ "$scan_lane_b_files" -eq 2 ] || {
     echo "SELFTEST: lane B counted $scan_lane_b_files files, expected 2" >&2; fixture_fail=1; }
+  # The ratchet reads scan_lane_b_counts, so the fixture pins that it is
+  # actually populated. A tally that silently stayed empty would make the
+  # ratchet compare nothing against nothing and report "held" forever -- a gate
+  # passing by looking at zero occurrences, which is the failure this script
+  # refuses elsewhere by name.
+  fixture_checks=$((fixture_checks + 1))
+  [ "$(printf '%s' "$scan_lane_b_counts" | grep -c .)" -eq 2 ] || {
+    echo "SELFTEST: the per-file lane B tally holds $(printf '%s' "$scan_lane_b_counts" | grep -c .) row(s), expected 2" >&2
+    fixture_fail=1; }
+  fixture_checks=$((fixture_checks + 1))
+  [ "$(printf '%s' "$scan_lane_b_counts" | awk '{n += $1} END {print n + 0}')" -eq "$scan_lane_b_lines" ] || {
+    echo "SELFTEST: the per-file tally does not sum to the lane B line count" >&2; fixture_fail=1; }
+  # ⚠ THE AMBIGUOUS SPELLING IS REFUSED, AND IT NEEDS ITS OWN TREE. A refusal
+  # ends the run it happens in, so this fixture cannot sit beside the ones whose
+  # results are read afterwards -- the same reason the NUL and character-
+  # reference fixtures each get a tree of their own.
+  #
+  # It carries an emphasis-split identifier next to an underscore identifier:
+  # `ADR-[]000**00**` reads as `ADR-[]000` raw and `ADR-[]00000` marker-free,
+  # and no reading of that line is defensible. Under the counting policies this
+  # unit tried before, the same file tallied 3, then 2, and both were guesses.
+  splitid_tmp="$(mktemp -d)"
+  (
+    cd "$splitid_tmp"
+    git init -q .
+    git config user.email t@t; git config user.name t
+    printf '%s\n' "$FIXTURE_SPLITID_BODY" > "$FIXTURE_SPLITID_NAME"
+    git add -A >/dev/null 2>&1
+  )
+  splitid_status=0
+  ( GATE_TMPFILES=(); trap 'gate_rc=$?; rm -f ${GATE_TMPFILES[@]+"${GATE_TMPFILES[@]}"}; exit "$gate_rc"' EXIT
+    scan_tree "$splitid_tmp" ) >/dev/null 2>&1 || splitid_status=$?
+  fixture_checks=$((fixture_checks + 1))
+  [ "$splitid_status" -eq 2 ] || {
+    echo "SELFTEST: the ambiguous spelling was not refused (status $splitid_status)" >&2
+    fixture_fail=1; }
+  rm -rf "$splitid_tmp"
   # ⚠ A COUNT THAT MUST BE REACHED. Every assertion above is invisible when it
   # is deleted, and a run that asserts nothing prints the same closing line as
-  # a run that asserted everything. The floor moves up when assertions are
-  # added and refuses when they go.
-  [ "$fixture_checks" -ge 15 ] || {
-    echo "SELFTEST: only $fixture_checks scan assertion(s) ran, expected at least 15" >&2
+  # a run that asserted everything.
+  #
+  # ⚠ EQUALITY, NOT A FLOOR, AND THE FLOOR PROVED THE POINT ON ITS OWN. It read
+  # `-ge 17` while eighteen assertions ran: this unit added one and left the
+  # bound alone, so any single assertion -- including the one just added --
+  # could be deleted and the remaining seventeen would still satisfy it. A floor
+  # accepts a stale count by construction, which is the silently-lost-check
+  # failure this guard exists to detect, reproduced inside the detector.
+  #
+  # The control harness one file over already settled this shape for its own
+  # count, for the same reason and in the same words. Equality forces the number
+  # to move when an assertion is added, so a later removal cannot hide behind a
+  # bound nobody updated.
+  FIXTURE_CHECKS_EXPECTED=18
+  [ "$fixture_checks" -eq "$FIXTURE_CHECKS_EXPECTED" ] || {
+    echo "SELFTEST: $fixture_checks scan assertion(s) ran, expected exactly $FIXTURE_CHECKS_EXPECTED" >&2
     fixture_fail=1; }
   if [ "$fixture_fail" -ne 0 ]; then
     # refusal:structural
@@ -2266,24 +2612,829 @@ if [ "$scan_files" -eq 0 ]; then
 fi
 
 echo
-echo "LANE B (REPORTED, NOT GATED) — Lua source: ${scan_lane_b_files} file(s) WITH A MATCH, ${scan_lane_b_lines} matching line(s). Not a count of Lua files scanned: a clean one is not counted here."
+echo "LANE B (REPORTED AT ZERO, GATED ON CHANGE) — Lua source: ${scan_lane_b_files} file(s) WITH A MATCH, ${scan_lane_b_lines} matching line(s). The RATCHET holds occurrences, which is the larger number when a line carries more than one; both are printed because only one of them is gated. Not a count of Lua files scanned: a clean one is not counted here."
 if [ "$scan_lane_b_files" -eq 0 ]; then
   echo "  LANE B IS EMPTY. The debt this lane tracked is paid: fold *.lua into lane A"
   echo "  and delete this section, so the scope note stops describing a gap that"
   echo "  no longer exists."
 else
   echo "  These comments ship inside the library every consuming project pulls in. They are owed work, not"
-  echo "  accepted risk, and they are not gated HERE because this repository's Lua"
+  echo "  accepted risk, and they are not gated AT ZERO here because this repository's Lua"
   echo "  sources are owned by the SDK wire-freeze workstream. The count is lines"
   echo "  MATCHING THE PATTERNS ABOVE — not a total of internal material, which the"
   echo "  scope note above says these shapes cannot bound."
 fi
 
 echo
+echo
+# ⚠ LANE A IS JUDGED FIRST, and the ratchet below depends on that ordering.
+# --write-baseline exits early on success, so running it here rather than above
+# means the command recommended for paying lane B debt can no longer report
+# success over an unreported lane A violation on the gated surface.
 if [ -n "$scan_lane_a" ]; then
   echo "FAIL — internal material in the published non-source surface:" >&2
   printf '%s' "$scan_lane_a" >&2
   exit 1
 fi
+
+# ── LANE B RATCHET ────────────────────────────────────────────────────────────
+# Lane B cannot be gated AT ZERO today: 33 matching lines already exist, and
+# failing on them would break every build until that debt is paid. That is why
+# this lane reports. But a report is only useful if someone can see it, and a
+# 34th line arriving among 33 existing ones is invisible — not because nobody
+# looked, but because there is nothing there to see. That is the actual
+# mechanism by which internal paths reached this public SDK twice.
+#
+# So the lane is gated on CHANGE instead of on zero. The number may fall and may
+# not rise. Existing debt costs nothing; a new occurrence fails immediately.
+#
+# ⚠ WHAT THIS DOES NOT CATCH, stated rather than implied: the counts are PER
+# FILE, so removing one matching line and adding another in the SAME file in the
+# same change nets to zero and passes. Identity pinning (hash per occurrence)
+# would close that, at the price of failing every reword of an already-grandfathered
+# line. The swap is a deliberate act visible in the diff; the reword is an
+# accident that would train people to edit the baseline. This trades the rarer
+# hole for the commoner false alarm, on purpose.
+#
+# ⚠ THE BASELINE IS NOT AN ESCAPE HATCH. Raising a number in it is checked
+# against the merge target below, because a ratchet whose baseline can be edited
+# upward in the same change is not a ratchet — it is a comment.
+# ⚠ A CONSTANT, NOT AN INPUT, AND THAT IS THE WHOLE OF THE HARDENING. This was
+# `${LANE_B_BASELINE:-...}` -- an override nothing outside the control harness
+# ever set. Measured before removing it: zero assignments in .github, zero in a
+# Makefile, zero across five sibling SDK repositories, and the harness's own use
+# was a pin to this very path.
+#
+# Six review rounds went into defending that override: containment against the
+# resolved worktree, a canonical-path derivation with an outer-repository
+# anchor, exclusions for both administrative directories, working-tree and
+# index symlink checks, a hard-link count, and a rename that could not be raced.
+# Every P1 among them -- a truncated .git/index, an escape through a symlinked
+# parent, a hard-linked target -- was reachable ONLY by someone who set the
+# variable. Removing the variable removes the reachability, and the guards with
+# it. What is deleted here is not coverage; it is refusals whose subject can no
+# longer be constructed.
+#
+# WHAT SURVIVES, and why each is about the repository rather than the override:
+#   the write-aside and its status check -- a partial serialisation renamed into
+#     place is a truncated baseline the next run reads as paid debt;
+#   the private write directory -- created atomically and then ENTERED, so every
+#     later path is a bare name resolved against a held inode;
+#   the directory refusal on the writer -- the one working-tree shape `mv -fT`
+#     cannot install over.
+#
+# ⚠ AND THIS LIST NAMED THREE GUARDS THAT NO LONGER EXIST: the index-mode check,
+# the working-tree symlink check and the hard-link check. All three rested on the
+# writer redirecting ONTO the baseline; it installs by rename now, so each was
+# refusing a shape it could not be harmed by, and two of them blocked the very
+# repair. An inventory of protections is exactly the text a later audit trusts
+# instead of reading the code, so a stale one is worse than none -- it is where
+# someone concludes they are covered.
+# ⚠ A SETTER IS TOLD, NOT IGNORED -- AND THIS RUNS BEFORE THE ASSIGNMENT, since
+# afterwards the name is always set. Removing the override left one thing worse
+# than before: whoever exports this now gets SILENCE. Their baseline goes to the
+# constant rather than where they asked, and nothing says so. A removed input
+# that fails quietly is a worse interface than one that fails loudly.
+#
+# It also turns "nothing sets it" from a claim resting on a grep -- which cannot
+# see a wrapper script, a runner image or a shell profile -- into something this
+# gate asserts on every run. The premise the whole deletion rests on stops being
+# a search result and becomes a check.
+if [ -n "${LANE_B_BASELINE+set}" ]; then
+  # refusal:structural
+  echo "REFUSING: LANE_B_BASELINE is set, and is no longer an input." >&2
+  echo "  The baseline path is fixed at scripts/public-surface-lane-b-baseline.txt." >&2
+  echo "  Refusing rather than ignoring you: a value that is silently discarded" >&2
+  echo "  is worse than one that is turned away." >&2
+  exit 2
+fi
+LANE_B_BASELINE=scripts/public-surface-lane-b-baseline.txt
+
+# ⚠ A SYMLINK IS NOT A BASELINE, and `-f` cannot tell you so -- it FOLLOWS the
+# link. Replace this file with a link to another tracked baseline and every
+# current-tree read follows it, so the change passes; but `git show <ref>:<path>`
+# on the merge target returns the LINK BLOB, the target's pathname, and every
+# later PR is then reported as adding paths the target does not have. The two
+# sides must read the same kind of object, so the index entry's mode is checked
+# rather than the filesystem's answer about what it points at.
+#
+# ⚠ AND IT RUNS BEFORE THE WRITER, because --write-baseline exits early: a check
+# placed after that branch is not late for the writing path, it is unreachable
+# from it. That lesson cost this file four review rounds and is the one piece of
+# the removed machinery worth carrying forward.
+# ⚠ AND THE WORKING TREE, WHICH THE CONSTANT DOES NOT SETTLE. Removing the
+# override removed every state reachable by POINTING the gate elsewhere. It did
+# not remove the states reachable at this fixed path: a symlink or a second hard
+# link put there needs no variable, only a filesystem, and --write-baseline
+# would write through either. I deleted both of these with the rest and the
+# control harness refused within one run -- which is the whole argument for
+# keeping controls for guards whose subject survives.
+# ⚠ THE WORKING-TREE SYMLINK REFUSAL IS GONE, FOR THE SAME REASON THE HARD-LINK
+# ONE WAS. It said "--write-baseline would follow it and write through to its
+# target", which stopped being true when the writer stopped redirecting onto the
+# baseline. Measured on this tree, with the index holding the regular blob and
+# the working tree holding a link to a file outside the repository:
+#
+#   before   index 100644, worktree a symlink   outside reads PRECIOUS OUTSIDE
+#   mv -fT   worktree is a regular file          outside reads PRECIOUS OUTSIDE
+#
+# So the gate refused a shape it could not be harmed by -- and worse, refused it
+# on the WRITER path too, which is the one thing that repairs it. The reads all
+# go through the index, so the link is not followed there either.
+#
+# I found the stale premise myself, in an audit of all fifty refusals, and drew
+# the wrong conclusion from it: keep the refusal, correct its wording. Review
+# round 5 pointed out what that misses -- a refusal blocking its own remedy is
+# not a refusal with a bad sentence, it is one that should not fire. The index
+# symlink refusal below stays: there the two sides genuinely disagree.
+# ⚠ AND A SYMLINK IS EXEMPT, because `-e` follows it. A link to a DIRECTORY or a
+# FIFO answers no to `-f` and yes to `-e`, so this generic guard was still
+# refusing the two shapes the working-tree symlink removal was meant to release --
+# and refusing them on the writer path, which is where the repair lives. The
+# rename handles exactly this: the file's own measured table records `leaf ->
+# DIRECTORY` with `-T` as "link replaced, the outside copy intact". A real
+# directory or FIFO at the path is still refused, because `-L` is false there and
+# `mv -fT` genuinely cannot install a file over a directory.
+# The writer's own mode, named once. The guard below is about what `mv -fT` can
+# install over, which is a question only the writing path asks.
+LANE_B_WRITING=no
+[ "${1:-}" = "--write-baseline" ] && LANE_B_WRITING=yes
+
+# ⚠ AND ONLY A DIRECTORY, AND ONLY WHEN WRITING. Two safe shapes were still being
+# refused. A run that does not write reads the STAGED blob and never touches the
+# working-tree entry at all, so whatever stands there is irrelevant to it. And
+# `mv -fT` replaces a FIFO or a socket the same way it replaces a symlink --
+# measured: `mv -fT src fifo` returned 0, left a regular file with the new
+# contents, and never opened the FIFO. A real DIRECTORY is the one shape the
+# rename cannot install over, and that only matters to the writer.
+if [ "$LANE_B_WRITING" = yes ] && [ -d "$LANE_B_BASELINE" ] \
+   && [ ! -L "$LANE_B_BASELINE" ]; then
+  # refusal:structural
+  # ⚠ A DIRECTORY HERE PASSES EVERY OTHER CHECK. Its link count is 1, it is not
+  # a symlink, and `mv` then moves the temporary INSIDE it rather than replacing
+  # the baseline -- while the gate prints WROTE and exits 0. Reachable with no
+  # variable at all, only a filesystem, which is why it survived the removal of
+  # the override and should not have been deleted with it.
+  echo "REFUSING: $LANE_B_BASELINE is a directory, and cannot be written." >&2
+  echo "  A rename installs a file over a link, a FIFO or a socket; it cannot" >&2
+  echo "  install one over a directory. Reading is unaffected -- that goes" >&2
+  echo "  through the index -- so this refuses the write, not the run." >&2
+  exit 2
+fi
+# ⚠ THE HARD-LINK REFUSAL IS GONE, BECAUSE THE PREMISE IT RESTED ON IS.
+# It used to read: "a hard link is a second name for one inode, and a redirect
+# writes THROUGH it: the other name changes too, and nothing here can put it
+# back." That was true while the writer redirected onto the baseline. It does
+# not redirect onto the baseline any more -- it serialises into a private
+# directory and installs the result with `mv -fT`, and a rename replaces the
+# DIRECTORY ENTRY, leaving every other link to the old inode untouched.
+# Measured, with a second link to the baseline standing:
+#
+#   before   link count 2   other name reads ORIGINAL
+#   mv -fT   baseline reads NEW   other name still reads ORIGINAL   count 1
+#
+# So the guard turned a safe shape -- a checkout or cache that materialises the
+# baseline with a second link -- into exit 2 for a hazard that no longer exists.
+# A refusal whose reason has been repaired away is not conservative; it is a
+# false failure with a confident message. Removed with its two controls.
+#
+# The probe it used, `ls -ld` on the baseline, was also the hook a different
+# control used to swap the parent directory mid-run. That control now hooks the
+# `git ls-files` below instead: a hook living inside a step does not survive
+# that step being replaced, and this is the second time that rule has been paid.
+# ⚠ AND THE INDEX SYMLINK REFUSAL IS GONE TOO -- the third of this class, and the
+# one I had checked and KEPT. Its argument was that the two sides read different
+# objects. They do not any more: the gate reads the index entry with `git
+# cat-file`, which for mode 120000 returns the LINK TARGET AS TEXT, and that text
+# carries no format marker. Measured with the guard removed:
+#
+#   REFUSING: scripts/public-surface-lane-b-baseline.txt is format 1, this script reads 3.
+#
+# So the refusal still happens, one check later and for a true reason, while the
+# pre-writer guard blocked --write-baseline from installing a regular file that
+# would have repaired the entry on the next `git add`. Same shape as the hard-link
+# and working-tree-symlink guards: a refusal that outlived its premise and stood
+# between the operator and the remedy.
+#
+# ⚠ THIS ONE MATTERS MORE THAN THE OTHER TWO, because I audited all fifty
+# refusals after round 4, examined this one, and recorded it as still earned. The
+# audit's instrument was my own reading of each stated reason, and it got this
+# wrong in the direction that keeps code: a guard I did not have to defend.
+
+
+lane_b_now="$(printf '%s' "$scan_lane_b_counts" | { grep -v '^$' || [ $? -eq 1 ]; } | sort -k2)"
+
+
+
+lane_b_root="$(cd -P "$(git rev-parse --show-toplevel)" && pwd -P)"
+if [ "${1:-}" = "--write-baseline" ]; then
+  # ⚠ THE PARENT IS HELD, NOT NAMED. A constant leaf does not fix its parent:
+  # another process can rename `scripts/` and put a symlink there, and a relative
+  # temporary path is then re-resolved through the replacement -- so both the
+  # write and the rename land outside the repository. `cd -P` makes the process's
+  # own working directory the anchor, a kernel reference rather than a name, and
+  # only the leaf is handed to the redirect afterwards.
+  #
+  # This survived the override's removal and I deleted it anyway, because it
+  # lived inside the function that carried the containment checks. A mechanism
+  # with no refusal message of its own leaves no trace in a diff of refusals,
+  # which is how it left without being noticed.
+  (
+    cd -P "$(dirname "$LANE_B_BASELINE")" || {
+      echo "REFUSING: could not enter the directory holding $LANE_B_BASELINE." >&2
+      exit 2
+    }
+    # ⚠ AND CHECK WHERE WE LANDED. Anchoring and containment are ONE property in
+    # two halves: the cwd defends against a swap AFTER `cd`, and this defends
+    # against a swap BEFORE it -- `cd -P` would otherwise follow a replacement
+    # and anchor the subshell permanently to the wrong directory, after which
+    # every later check is asking about the attacker's choice.
+    #
+    # I restored the anchor and deleted this half, and each looked whole on its
+    # own. A pair whose halves are individually plausible is invisible to an
+    # audit that enumerates guards one at a time, which is exactly how the
+    # fifteen-line audit missed it.
+    if [ "$(pwd -P)" != "$lane_b_root/$(dirname "$LANE_B_BASELINE")" ]; then
+      # refusal:structural
+      echo "REFUSING: $(dirname "$LANE_B_BASELINE") is not where it should be." >&2
+      echo "  Entered:  $(pwd -P)" >&2
+      echo "  Expected: $lane_b_root/$(dirname "$LANE_B_BASELINE")" >&2
+      exit 2
+    fi
+    lane_b_leaf="$(basename "$LANE_B_BASELINE")"
+    # ⚠ THE WRITE-ASIDE IS A PATH TOO, AND NOTHING ABOVE CHECKS IT. Every guard
+    # so far inspects the BASELINE leaf -- symlink, regular file, link count. The
+    # temporary had a predictable name and was opened with an ordinary redirect,
+    # so a symlink planted at that name is followed: the redirect truncates
+    # whatever it points at, and the rename then installs the symlink as the
+    # baseline while the gate prints WROTE. Measured, by what stands at the path:
+    #
+    #   plain  > t   with t -> outside.txt     the outside file was TRUNCATED
+    #   set -C > t   nothing at the path       rc 0
+    #   set -C > t   regular / symlink-to-file / symlink-to-dir / dangling
+    #                                          rc 1, outside file intact
+    #   set -C > t   with t a FIFO             BLOCKS FOREVER
+    #
+    # ⚠ THAT LAST ROW IS WHY THIS NO LONGER USES `set -C`, AND THE ROW ABOVE IT
+    # IS WHY THE CLAIM SURVIVED SO LONG. This file used to say "`set -C` makes
+    # bash open with O_CREAT|O_EXCL, so the open IS the check". That is true of
+    # regular files and symlinks, and the four shapes measured were all of those.
+    # noclobber is specified for REGULAR files: against a FIFO bash opens the
+    # existing entry and waits for a reader, so the exclusive-create refusal is
+    # never reached and the job hangs until its CI timeout. Measured on bash 5.2:
+    # `set -C; : > fifo` had not returned after five seconds. An enumeration that
+    # omits a case is not a proof about the case it omits.
+    #
+    # ⚠ SO THE PRIMITIVE IS `mkdir`, WHICH HAS NO SUCH CARVE-OUT. It is atomic,
+    # it never follows a symlink for the final component, and it fails EEXIST
+    # against every shape. Measured, all six: directory, regular file,
+    # symlink-to-directory, symlink-to-file, dangling symlink, FIFO -- rc 1,
+    # "File exists", no hang and nothing followed.
+    #
+    # Both temporaries then live INSIDE a directory this run created and owns at
+    # mode 700. That removes the check-then-create race rather than narrowing it:
+    # there is no window in which another process can plant anything at either
+    # path, because neither path exists until the directory does, and the
+    # directory cannot be entered by anyone else. Two refusals and their two
+    # pre-existence checks go away with it -- the states they enumerated are no
+    # longer reachable.
+    # ⚠ MODE 700 PROTECTS THE DIRECTORY, NOT ITS NAME. Review round 4: after
+    # `mkdir` returns, a process with the same uid -- or anyone able to rename
+    # entries in a group-writable scripts/ -- can move this directory aside and
+    # leave a symlink standing at the name. Every later use of the NAME would then
+    # resolve elsewhere, and the write-aside redirect would follow a planted
+    # `new`. The mode answers "who may enter"; it says nothing about "which
+    # directory this name means, one instruction later".
+    #
+    # So the name is used exactly once. The run ENTERS the directory it created
+    # and holds it as its working directory: from there `new` and `probe` resolve
+    # against a held inode, which a rename of the name cannot reach. Measured --
+    # the directory renamed away and a symlink to elsewhere planted at the name,
+    # mid-run: the bare-name write landed in the renamed directory and the
+    # symlink's target was untouched.
+    #
+    # The install crosses back with `../<leaf>`, and `..` resolves from the held
+    # directory's own inode rather than from any path, so it is the real parent
+    # even after the name is swapped. The one state that defeats it is the whole
+    # directory being MOVED to a different parent, which changes what `..` means.
+    # That is checked by identity immediately before the install.
+    lane_b_anchor_ino="$(ls -di . 2>/dev/null | awk '{print $1}')"
+    lane_b_workdir="$lane_b_leaf.write.d"
+    if ! mkdir -m 700 "$lane_b_workdir" 2>/dev/null; then
+      # refusal:structural
+      echo "REFUSING: could not create the private write directory." >&2
+      echo "  Expected to create $(dirname "$LANE_B_BASELINE")/$lane_b_workdir" >&2
+      echo "  and own it. Something already stands there -- a leftover from a" >&2
+      echo "  killed run, or something planted -- or the directory is not" >&2
+      echo "  writable. Nothing was followed and nothing was written." >&2
+      exit 2
+    fi
+    if ! cd -P "$lane_b_workdir"; then
+      # refusal:structural
+      echo "REFUSING: could not enter the private write directory." >&2
+      echo "  This run created it a moment ago. Failing to enter it means the" >&2
+      echo "  name no longer refers to it, so nothing is written." >&2
+      # ⚠ AND THE CLEANUP HERE IS `rmdir`, FOR THE REASON THE ENTRY FAILED. The
+      # scrub below is careful because it runs from inside a held inode; this
+      # path is the one where the name is already known to be untrustworthy, and
+      # it used `rm -rf` on it. `rmdir` refuses a non-empty directory and a
+      # symlink alike, so a replacement is left standing rather than deleted --
+      # the same rule, applied to the path that needs it most.
+      rmdir "$lane_b_workdir" 2>/dev/null || true
+      exit 2
+    fi
+    lane_b_workdir_ino="$(ls -di . 2>/dev/null | awk '{print $1}')"
+    # ⚠ THE CLEANUP RE-OPENED THE NAME THE REST OF THIS BLOCK REFUSES TO TRUST.
+    # Review round 5: the parent check is not enough. Rename this directory aside
+    # and put a DIFFERENT directory at the same name in the same parent, and the
+    # parent inode still matches -- so `rm -rf <name>` deleted whatever now stood
+    # there. Every write above was careful to resolve against a held inode, and
+    # then the last line spelled the name out again and recursed over it.
+    #
+    # So the contents go from INSIDE, where names resolve against an inode nothing
+    # can swap, and the directory itself goes by `rmdir` -- which refuses a
+    # non-empty directory and a symlink alike, so anything standing at the name is
+    # left where it is. The inode is checked too, but `rmdir` is what makes a
+    # mistake harmless rather than merely unlikely.
+    lane_b_scrub() {
+      rm -f new probe probe.dst 2>/dev/null
+      [ "$(ls -di .. 2>/dev/null | awk '{print $1}')" = "$lane_b_anchor_ino" ] || return 0
+      cd -P .. 2>/dev/null || return 0
+      [ "$(ls -di "$lane_b_workdir" 2>/dev/null | awk '{print $1}')" = "$lane_b_workdir_ino" ] || return 0
+      rmdir "$lane_b_workdir" 2>/dev/null || true
+    }
+    lane_b_tmp=new
+    #
+    # Opened ONCE, in this shell, and its status read. A probe in a subshell
+    # would create the file and then make the real open fail on its own probe --
+    # and a failed `exec` redirect does not abort the shell when its status is
+    # taken (measured: the check below is reached, rc 0), so this needs no
+    # errexit gymnastics.
+    #
+    # ⚠ AND NO `2>/dev/null` ON THIS LINE. `exec` applies its redirections to the
+    # SHELL, not to a command, so `exec 9>tmp 2>/dev/null` opens the write-aside
+    # and silences this gate's stderr for the rest of the run. Every refusal
+    # after it went to /dev/null: the rename failure below exited 2 with no
+    # message at all, which is precisely the silent write this block exists to
+    # prevent, introduced by the block itself. The harness caught it because
+    # judge() separates "wrong exit" from "right exit, wrong reason" -- the exit
+    # was 2, exactly as expected, and only the reason showed the damage.
+    # ⚠ AND MODE 700 DOES NOT KEEP OUT A PROCESS THAT IS ALREADY US. Measured: a
+    # second shell with the same uid enters this directory and plants `new` as a
+    # symlink, and an ordinary redirect follows it -- the outside file read back
+    # the baseline body. Holding the inode stops the DIRECTORY being swapped; it
+    # says nothing about what appears inside it.
+    #
+    # `set -C` closes the plant, because O_EXCL refuses an existing regular file
+    # and an existing symlink. It does NOT close a planted FIFO, which bash opens
+    # and waits on -- the carve-out this file already documents. That residue is
+    # named rather than fixed: there is no primitive here that creates a file and
+    # refuses every shape, and the honest boundary is stated below.
+    #
+    # ⚠ AND THE CLAIM ABOVE IS NARROWER THAN THE ONE I MADE IN REVIEW. I said
+    # same-uid races were inside this block's threat model. They are not, and
+    # cannot be: a process running as this one can rewrite the baseline after the
+    # gate exits. What this defends is the gate never WRITING THROUGH a path it
+    # did not choose. Anything else was overclaimed.
+    lane_b_aside=yes
+    set -C
+    exec 9>"$lane_b_tmp" || lane_b_aside=no
+    set +C
+    if [ "$lane_b_aside" = no ]; then
+      # refusal:structural
+      # ⚠ ITS OWN MESSAGE, BECAUSE SHARING ONE HID A COVERAGE GAP. This said
+      # "serialisation failed" so that the existing control -- whose lever makes
+      # the directory unwritable, and therefore fails HERE -- would keep matching.
+      # That convenience made one control look like it covered two handlers: the
+      # partial-write handler below could be deleted with every control green.
+      # A shared message is a shared alibi.
+      echo "REFUSING: could not create the write-aside for the baseline." >&2
+      echo "  The private directory was created a moment ago and is empty, so" >&2
+      echo "  nothing stands at this path: the filesystem refused a new file." >&2
+      lane_b_scrub
+      exit 2
+    fi
+  {
+    echo "# Lane B occurrences per file, as of the commit that wrote this."
+    echo "# Written by: scripts/check_public_surface.sh --write-baseline"
+    echo "#"
+    echo "# THIS FILE ONLY EVER SHRINKS. The scan fails when a count here rises,"
+    echo "# when a file appears that is not here, and when a number here is higher"
+    echo "# than the same number on the merge target. It also fails when a count"
+    echo "# FALLS without this file being updated, so paying debt is recorded"
+    echo "# rather than silently banked as slack."
+    echo "#"
+    echo "# format-version: 3"
+    echo "# Format: <occurrences> <path> -- count FIRST so a path may contain spaces"
+    echo "#"
+    echo "# format 3 counts OCCURRENCES; format 2 counted MATCHING LINES. Two"
+    echo "# identifiers on one line were one tick in format 2, so a second one"
+    echo "# could be added to an existing line without any number moving. The"
+    echo "# version moved because the numbers mean something different, not"
+    echo "# because the layout changed -- reading a format-2 file with this"
+    echo "# parser would understate every count that has such a line."
+    printf '%s\n' "$lane_b_now"
+  } >&9 || {
+    # ⚠ WRITTEN ASIDE AND CHECKED, NOT REDIRECTED STRAIGHT AT THE BASELINE. A
+    # serialisation that dies partway -- ENOSPC, a quota, a full pipe -- leaves a
+    # SHORT file, and a rename succeeds on it just as happily as on a whole one.
+    # The gate would print WROTE and exit 0 over a truncated baseline, which is
+    # worse than any refusal it can print: the next run compares against a number
+    # nobody computed, and the missing rows read as debt that was paid.
+    #
+    # Checked explicitly rather than left to errexit. When this lived inside a
+    # function invoked on the left of `||`, errexit was suspended for the whole
+    # body and every statement in it merely LOOKED protected; the function is
+    # gone, and the explicit check stays, because a redirect's status is worth
+    # naming where the failure is silent and the consequence is a wrong number.
+    # ⚠ NOT DRIVEN, AND THE LEVER SEARCH IS RECORDED RATHER THAN OMITTED. This
+    # fires when the open SUCCEEDED and the writes then failed -- ENOSPC, a
+    # quota, a full pipe. Every lever available to an unprivileged control fails
+    # the OPEN instead: measured, this gate writes temporaries of up to 299158
+    # bytes during a run while the baseline is 1195, so no `ulimit -f` threshold
+    # lets the scan through and stops this write. A filesystem genuinely full at
+    # this instant needs privileges CI does not have. Named, not implied.
+    echo "REFUSING: could not write the baseline (serialisation failed)." >&2
+    echo "  The partial file is removed rather than renamed into place." >&2
+    exec 9>&-
+    lane_b_scrub
+    exit 2
+  }
+  exec 9>&-
+    # ⚠ -T, AND THE REASON IS AN AXIS I MEASURED WITHOUT VARYING. Last round I
+    # recorded that `mv` renames over the destination NAME and does not follow a
+    # symlink standing there. That was measured on two filesystems and ONE shape
+    # of target -- a symlink to a regular file. Varying the shape:
+    #
+    #   leaf -> regular file   rc 0   link replaced        outside intact
+    #   leaf -> DIRECTORY      rc 0   link still standing  temp moved INSIDE it
+    #   leaf -> dangling       rc 0   link replaced        outside intact
+    #
+    # so with a symlink to a directory the gate printed WROTE and exited 0 while
+    # the baseline was never written. `-T` treats the destination as a normal
+    # file in all three shapes. Measured with -T: link replaced every time, the
+    # outside copy intact every time.
+    #
+    # And the option is PROBED rather than assumed, because it is a GNU
+    # extension: a real rename in the held directory, not a scrape of --help.
+    # Where it is missing the gate refuses instead of falling back to semantics
+    # it has just measured to be unsafe.
+    # ⚠ AND THE PROBE LIVES IN THAT DIRECTORY TOO. Round 2 found it built its
+    # evidence file with an ordinary redirect at a predictable name; round 3
+    # found that the exclusive create which replaced it still let a FIFO block,
+    # and that `mv -fT` would happily replace a destination planted between the
+    # check and the move. Both were races against paths anyone could reach.
+    # Inside a directory created atomically at mode 700, neither path is
+    # reachable, so both races are gone and the two checks that guarded them are
+    # deleted rather than hardened. The rename is still measured on the real
+    # filesystem, which is what the probe is for: this is a subdirectory of the
+    # baseline's own directory, not a temporary somewhere else.
+    lane_b_tprobe=probe
+    lane_b_tprobe_dst=probe.dst
+    set -C
+    : 2>/dev/null > "$lane_b_tprobe" || {
+      set +C
+      # refusal:structural
+      echo "REFUSING: could not create the rename probe." >&2
+      echo "  Its directory was created by this run and is private, so this is" >&2
+      echo "  the filesystem refusing a new file, or something planted inside" >&2
+      echo "  it by a process sharing this one's uid." >&2
+      lane_b_scrub
+      exit 2
+    }
+    set +C
+    lane_b_have_T=no
+    if mv -fT "$lane_b_tprobe" "$lane_b_tprobe_dst" 2>/dev/null; then
+      lane_b_have_T=yes
+      rm -f "$lane_b_tprobe_dst"
+    else
+      rm -f "$lane_b_tprobe"
+    fi
+    if [ "$lane_b_have_T" != yes ]; then
+      # refusal:structural
+      echo "REFUSING: this mv has no --no-target-directory." >&2
+      echo "  Without it, a symlink to a directory at the baseline path makes" >&2
+      echo "  the rename move the new baseline INSIDE that directory while this" >&2
+      echo "  gate reports success. Refusing to write rather than report a write" >&2
+      echo "  that did not happen." >&2
+      lane_b_scrub
+      exit 2
+    fi
+    # ⚠ IDENTITY, NOT A PATH, IMMEDIATELY BEFORE THE INSTALL. `..` from the held
+    # directory is its real parent unless the directory itself was moved into a
+    # different one. That is the single state the held cwd does not cover, and it
+    # is cheap to name: the parent's inode must still be the one anchored above.
+    if [ "$(ls -di .. 2>/dev/null | awk '{print $1}')" != "$lane_b_anchor_ino" ]; then
+      # refusal:structural
+      echo "REFUSING: the private write directory is no longer where it was made." >&2
+      echo "  Its parent is not the directory this run anchored, so installing" >&2
+      echo "  through it would put the baseline somewhere this gate did not" >&2
+      echo "  choose. The serialised file is left where it is rather than moved." >&2
+      exit 2
+    fi
+    mv -fT "$lane_b_tmp" "../$lane_b_leaf" || {
+      echo "REFUSING: could not put the new baseline in place." >&2
+      lane_b_scrub
+      exit 2
+    }
+    lane_b_scrub
+  ) || exit $?
+  echo "WROTE $LANE_B_BASELINE"
+  # The EXIT trap treats rc=0 without this as a run that died mid-flight, which
+  # is exactly right for every other early return here. Writing the baseline is
+  # the one legitimate short path, so it says so rather than tripping the
+  # dead-run detector and printing a refusal over a success.
+  gate_finished=yes
+  exit 0
+fi
+
+# ⚠ READ FROM THE INDEX, LIKE EVERY OTHER INPUT THIS GATE COMPARES. scan_tree
+# lists paths from `git write-tree` and reads each blob with
+# `git cat-file blob :<path>` -- deliberately, because the question this file
+# asks is what a commit would PUBLISH. The baseline was the one input still read
+# from the working tree, so staging a source change while leaving the matching
+# baseline edit unstaged compared a staged tree against an unstaged baseline and
+# passed -- while the commit being built still carried the stale one. Two sides,
+# two universes, and the gate reported on neither.
+gate_tmp; lane_b_base_blob="$GATE_TMP"
+if ! git cat-file blob ":$LANE_B_BASELINE" > "$lane_b_base_blob" 2>/dev/null; then
+  # refusal:structural — fail closed. An absent baseline is indistinguishable
+  # from a deleted one, and treating it as "nothing to compare" would let anyone
+  # disable this gate with rm. Absent FROM THE INDEX is the reading that matters
+  # now: a baseline written but never staged is not yet the file this commit
+  # would carry, and saying so is more useful than comparing against it.
+  echo "REFUSING: $LANE_B_BASELINE is missing from the index." >&2
+  echo "  Regenerate it with: $0 --write-baseline" >&2
+  echo "  If you just regenerated it, stage it: the gate reads what would be" >&2
+  echo "  committed, not what is sitting in the working tree." >&2
+  exit 2
+fi
+
+# Same rule, and this is the read the P2 above is really about: `-f` passed, so
+# the file exists; a failure here is permission or I/O, not absence.
+# ⚠ THE TARGET'S COPY IS FROM AN EARLIER COMMIT, so it can predate a change to
+# this format. Version 1 was "<path> <occurrences>"; reading one of those with
+# the version 2 parser binds the PATH to the count field and reports about the
+# wrong file -- observed, not imagined, while testing this very change. A
+# marker turns that into a refusal instead of a confident wrong answer.
+LANE_B_FORMAT=3
+# Same rule as above: grep's 1 is "no such line" and is legitimate (a format-1
+# file has no marker); anything higher is a read failure and must not arrive
+# here disguised as an old format.
+lane_b_version="$(grep -m1 '^# format-version:' "$lane_b_base_blob" || [ $? -eq 1 ])"
+lane_b_version="$(printf '%s' "$lane_b_version" | tr -dc '0-9')"
+if [ "${lane_b_version:-1}" != "$LANE_B_FORMAT" ]; then
+  # refusal:structural
+  echo "REFUSING: $LANE_B_BASELINE is format ${lane_b_version:-1}, this script reads $LANE_B_FORMAT." >&2
+  echo "  Regenerate it with: $0 --write-baseline" >&2
+  exit 2
+fi
+
+# ⚠ BOTH GREPS, NOT JUST THE SECOND. A comments-only baseline -- the paid state
+# this lane exists to reach -- makes the FIRST filter exit 1, and pipefail kills
+# the assignment before the second one's careful handling is ever reached. Fixing
+# the downstream filter and leaving the upstream one was fixing the half I was
+# looking at.
+lane_b_base="$({ grep -v '^#' "$lane_b_base_blob" || [ $? -eq 1 ]; } \
+  | { grep -v '^$' || [ $? -eq 1 ]; } | sort -k2)"
+
+if [ "$lane_b_now" != "$lane_b_base" ]; then
+  echo "FAIL — lane B moved and the baseline did not agree:" >&2
+  # Two directions, named separately, because the fix differs.
+  diff <(printf '%s\n' "$lane_b_base") <(printf '%s\n' "$lane_b_now") \
+    | grep -E '^[<>]' >&2 || true
+  echo "  '>' is what the scan found now; '<' is what the baseline expects." >&2
+  echo "  A count that ROSE, or a file that is new here, is new internal material" >&2
+  echo "  in a public SDK: remove the reference. Do not re-baseline it." >&2
+  echo "  A count that FELL is debt you paid: rerun with --write-baseline and" >&2
+  echo "  commit the smaller file in this same change." >&2
+  exit 1
+fi
+
+# The anti-cheat. Without this, the two rules above are satisfiable by editing
+# the baseline upward in the same commit that adds the occurrence.
+if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
+  # ⚠ A THIRD ANSWER, BECAUSE "NO ANCESTRY" IS NOT "NOTHING TO COMPARE". A push
+  # that creates an orphan branch, or tags a root commit, has no parent and no
+  # merge base -- and the workflow used to answer that by comparing against the
+  # DEFAULT BRANCH, which the commit does not descend from. Review round 5: such
+  # a ref can then add occurrences, write matching counts, and pass on whatever
+  # slack the default branch's baseline happens to carry.
+  #
+  # A commit with no ancestry has no grandfathered debt either, so the honest
+  # target is an empty baseline: every occurrence is new. Nothing special is
+  # needed downstream -- the comparison already treats a path absent from the
+  # target as zero and fails, which is the "ABSENT IS ZERO" rule above -- so this
+  # supplies a baseline with a header and no rows and lets that rule speak.
+  #
+  # It is a WORD rather than the empty-tree hash on purpose. `git show <empty
+  # tree>:<path>` fails exactly like a target that predates this file, and the
+  # gate would announce a legal skip: the hole again, wearing the costume of a
+  # correct answer.
+  if [ "${PUBLIC_SURFACE_BASE_REF}" = EMPTY ]; then
+    base_copy="# format-version: $LANE_B_FORMAT"
+    echo "  (baseline-vs-target check: the pushed ref has no ancestry, so the"
+    echo "   target baseline is EMPTY -- every lane B occurrence counts as new)"
+  else
+    # ⚠ TWO REASONS THE COMPARISON CAN BE UNAVAILABLE, and they are not the same
+    # fact. A ref that does not RESOLVE is a broken instrument -- a shallow clone
+    # that never fetched the base -- and reporting "skipped" for it would let the
+    # anti-cheat evaporate exactly where it is needed. A ref that resolves but
+    # carries no baseline is a true statement about the world: the target predates
+    # this file, which is the case on the change that introduces it.
+    if ! git rev-parse --verify --quiet "${PUBLIC_SURFACE_BASE_REF}^{commit}" >/dev/null; then
+      # refusal:structural
+      echo "REFUSING: PUBLIC_SURFACE_BASE_REF=${PUBLIC_SURFACE_BASE_REF} does not resolve." >&2
+      echo "  The baseline-vs-target check cannot run, and skipping it silently is" >&2
+      echo "  how a ratchet becomes a comment. Fetch the base ref, or unset the" >&2
+      echo "  variable deliberately if there is genuinely nothing to compare." >&2
+      exit 2
+    fi
+    # ⚠ SET BEFORE ASKED. `set -u` makes an unassigned base_copy fatal at the
+    # first expansion, and the branch that leaves it unassigned is precisely the
+    # advertised legal skip -- a target that predates this file. So the skip
+    # aborted the run instead of skipping, on every change that introduces the
+    # baseline, this one included. Observed as a red `public-surface` on the merge
+    # run while the branch run stayed green, because only the merge run has a base.
+    base_copy=""
+
+    # ⚠ THE PROBE ITSELF MUST BE UNAMBIGUOUS -- this is the sixth time on this
+    # change that a "nothing came back" was read as "there is nothing". Patching
+    # each site was not working, so the SHAPE of the question changed instead.
+    #
+    # `cat-file -e` fails for BOTH a missing path and a broken lookup, so its
+    # nonzero says nothing on its own. `ls-tree <ref> -- <path>` separates them:
+    # it exits 0 whether or not the path is there and prints a line only when it
+    # is, so success-with-empty-output IS absence and a nonzero IS an instrument
+    # failure. One question, one meaning per answer.
+    if ! base_listing="$(git ls-tree --name-only "${PUBLIC_SURFACE_BASE_REF}" -- "${LANE_B_BASELINE}")"; then
+      # refusal:structural
+      echo "REFUSING: could not list ${LANE_B_BASELINE} on ${PUBLIC_SURFACE_BASE_REF}." >&2
+      echo "  That is a broken object store or an unreadable tree, not an absent" >&2
+      echo "  baseline, and skipping the anti-cheat on it is how this gate stops" >&2
+      echo "  being one." >&2
+      exit 2
+    fi
+    if [ -n "$base_listing" ]; then
+      if ! base_copy="$(git show "${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE}")"; then
+        # refusal:structural
+        echo "REFUSING: ${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE} is listed but could not be read." >&2
+        exit 2
+      fi
+    fi
+  fi
+  # ⚠ THE TARGET'S FORMAT, ASKED BEFORE ITS ROWS ARE READ. I had this check and
+  # lost it while restructuring the probe: a format-1 target parsed by the
+  # format-2 reader binds every path to the count field, so every current path
+  # looks absent and an untouched PR fails. A skew is not a finding about the
+  # code; it is announced and skipped, which is the same treatment a target that
+  # predates the file gets.
+  if [ -n "$base_copy" ]; then
+    base_version="$(printf '%s' "$base_copy" | { grep -m1 '^# format-version:' || [ $? -eq 1 ]; } | tr -dc '0-9')"
+    if [ "${base_version:-1}" != "$LANE_B_FORMAT" ]; then
+      # ⚠ AND THE SKIP IS THE ANTI-CHEAT'S OFF SWITCH, WHICH IS WHY IT IS NOT
+      # FREE. Skipping is right -- a format-1 target read by the format-3 reader
+      # binds every path to the count field, so every current path looks absent
+      # and an untouched PR fails. But a change that BUMPS the format also makes
+      # the target's format old, and can then raise lane B counts in the same
+      # commit: the comparison is discarded, the only surviving check is the
+      # current baseline against the current tree, and the raised baseline
+      # agrees with the raised tree. Green, with the ratchet switched off by the
+      # very change it was meant to measure.
+      #
+      # So a skew is allowed to skip only when it carries nothing else. A format
+      # migration that also touches lane B source is refused and told to split;
+      # a pure migration passes, because then there is nothing for the skipped
+      # comparison to have caught. The index tree is the current side, matching
+      # every other read in this gate.
+      lane_b_skew_src=""
+      if ! lane_b_skew_src="$(git diff --cached --name-only \
+             "${PUBLIC_SURFACE_BASE_REF}" -- '*.lua')"; then
+        # refusal:structural
+        echo "REFUSING: could not compare lane B source against ${PUBLIC_SURFACE_BASE_REF}." >&2
+        echo "  The target's baseline is an older format, which is only safe to" >&2
+        echo "  skip when nothing else moved -- and that is what could not be" >&2
+        echo "  established. Refusing rather than skipping on an unread answer." >&2
+        exit 2
+      fi
+      if [ -n "$lane_b_skew_src" ]; then
+        # refusal:structural
+        echo "REFUSING: a baseline format change may not carry lane B source changes." >&2
+        echo "  The target baseline is format ${base_version:-1} and this script reads" >&2
+        echo "  $LANE_B_FORMAT, so the baseline-vs-target comparison cannot be made." >&2
+        echo "  These lane B source file(s) also differ from the target:" >&2
+        printf '%s\n' "$lane_b_skew_src" | sed 's/^/    /' >&2
+        echo "  Land the format migration on its own, then the source change." >&2
+        exit 2
+      fi
+      echo "  (baseline-vs-target check skipped: target baseline is format ${base_version:-1}, this script reads $LANE_B_FORMAT)"
+      # ⚠ AND THE REASON IS RECORDED, BECAUSE THE NEXT BRANCH SHARES A VARIABLE
+      # WITH IT. Clearing `base_copy` is how this branch stands down -- and the
+      # branch below reads the same emptiness as "the target carries no
+      # baseline", so a format migration printed BOTH explanations and a reader
+      # got two contradictory accounts of one successful run. An empty value is
+      # not a reason; it is the absence of one, and two causes sharing it means
+      # the second speaks for the first.
+      lane_b_skip_said=yes
+      base_copy=""
+    fi
+  fi
+  if [ -n "$base_copy" ]; then
+    # ⚠ SET HERE, WHERE THE WORK HAPPENS, and nowhere else. Every earlier place
+    # that could have set it -- the variable being present, the ref resolving, the
+    # target carrying a file -- is a statement about the INPUT, and the summary
+    # was overstating precisely by reading one of those.
+    lane_b_compared=yes
+    # ⚠ IFS= AND A MANUAL SPLIT. `read -r count path` uses the default
+    # whitespace IFS, which strips LEADING spaces from the last field: a file
+    # named " client.lua" serializes as "7  client.lua" and would be read as
+    # path "client.lua", matching the ordinary file's target entry and passing.
+    # git permits that filename. The count is everything before the first
+    # space; the path is everything after it, byte for byte.
+    while IFS= read -r row; do
+      [ -n "$row" ] || continue
+      count="${row%% *}"
+      path="${row#* }"
+      [ -n "$path" ] || continue
+      # ⚠ NO awk -v FOR THE PATH. A -v assignment PROCESSES BACKSLASH ESCAPES,
+      # so a tracked `foo\141.lua` would be decoded to `fooa.lua` and borrow that
+      # file's count -- an increase passing as an existing entry. The comparison
+      # is done in the shell instead, where the two strings are compared byte
+      # for byte and nothing interprets anything.
+      was=""
+      while IFS= read -r brow; do
+        case "$brow" in '#'*|'') continue ;; esac
+        if [ "${brow#* }" = "$path" ]; then
+          was="${brow%% *}"
+          break
+        fi
+      done <<< "$base_copy"
+      if [ -z "$was" ]; then
+        # ⚠ ABSENT IS ZERO, NOT "NOTHING TO COMPARE". Skipping here was the hole:
+        # a change that puts the first matching line into a previously CLEAN file
+        # and regenerates the baseline produces an entry with no counterpart, so
+        # the scan agrees with the baseline and the target check had nothing to
+        # object to. That is the same cheat this block exists to stop, entering
+        # by a different door. A renamed file lands here too, and that is right:
+        # carrying internal material to a new path is a decision, not a move.
+        echo "FAIL — $path carries $count lane B occurrence(s) and is absent from" >&2
+        echo "  the target's baseline. A file with no entry there had none: this is" >&2
+        echo "  new internal material in a public SDK, however the baseline reads." >&2
+        exit 1
+      fi
+      if [ "$count" -gt "$was" ]; then
+        echo "FAIL — the baseline was raised for $path ($was -> $count)." >&2
+        echo "  Editing this file upward is not a way to introduce internal material." >&2
+        exit 1
+      fi
+    done <<< "$lane_b_base"
+  else
+    # Named, not swallowed: the target may predate the baseline.
+    [ "$lane_b_skip_said" = yes ] \
+      || echo "  (baseline-vs-target check skipped: ${PUBLIC_SURFACE_BASE_REF} carries no $LANE_B_BASELINE)"
+  fi
+else
+  # ⚠ AND THIS LINE USED TO SAY "CI sets it", WHICH WAS FALSE TWICE. In round 1 it
+  # was false because the workflow never set the variable at all -- a reassurance
+  # printed on exactly the runs where nothing was compared. It became false again
+  # when the comparison for push events was split out: CI now leaves this unset on
+  # a push deliberately, and the old wording reported a designed gap as an
+  # accident. A message that explains away its own silence is worse than silence.
+  echo "  (baseline-vs-target check NOT RUN: no comparison target was given."
+  echo "   On a pull request CI supplies one. On a push it does not yet -- that"
+  echo "   selection is a separate change -- so nothing here compared this tree"
+  echo "   against another commit.)"
+fi
+
+# ⚠ TWO SENTENCES, BECAUSE THE RUN ESTABLISHES TWO DIFFERENT THINGS. "May not
+# rise" is a claim about this tree versus ANOTHER COMMIT, and it is earned only
+# when a comparison target was given. Without one, all that was established is
+# that the baseline agrees with the tree -- and a change raising the count and the
+# baseline together satisfies that agreement perfectly. Printing the strong
+# sentence on a run that did not do the work is how a log becomes a false record.
+# ⚠ NOT `grep -c .`, WHICH EXITS 1 WHEN THE ANSWER IS ZERO. That was harmless
+# while the count sat inside an `echo` argument -- the echo's status was what
+# errexit saw -- and fatal the moment round 7 lifted it into an assignment of its
+# own: on a tree whose lane B debt is fully PAID, `lane_b_now` is empty, grep
+# prints 0, exits 1, and the gate dies there without setting the dead-run marker
+# and without printing a summary. The one path this whole ratchet exists to reach
+# was the one path that killed it, and no control noticed, because the
+# comments-only control exits earlier on a deliberate baseline mismatch.
+#
+# awk counts and exits 0 whether the answer is zero or not.
+lane_b_files="$(printf '%s\n' "$lane_b_now" | awk 'NF {c++} END {print c + 0}')"
+lane_b_total="$(printf '%s\n' "$lane_b_now" | awk '{n += $1} END {print n + 0}')"
+# ⚠ AND THE FLAG IS WHAT RAN, NOT WHAT WAS ASKED FOR. Keying this off the
+# variable was a second-order version of the same overstatement: a target that
+# predates the baseline, and a format skew that carries nothing else, both leave
+# the comparison unmade with the variable set -- and the first of those is the
+# change that introduces this file, so the strong sentence printed on exactly the
+# run that established least. The comparison sets the flag where it happens.
+if [ "$lane_b_compared" = yes ]; then
+  echo "LANE B RATCHET — held at ${lane_b_files} file(s), ${lane_b_total} occurrence(s). The number may fall and may not rise."
+else
+  echo "LANE B RATCHET — the baseline agrees with the tree at ${lane_b_files} file(s), ${lane_b_total} occurrence(s). NOT checked against another commit on this run: a change that raised both together would satisfy this line."
+fi
+
 gate_finished=yes
 echo "LANE A (GATED) — clean. ${scan_files} tracked file(s) were read; a run that scanned none refuses above rather than reporting this line."
