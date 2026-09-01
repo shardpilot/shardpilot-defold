@@ -246,7 +246,7 @@ jobs:
   # bound is re-argued at the shipping count. ⚠ AND "RE-ARGUED" IS NOT
   # "RE-MEASURED": the figures on either side of this paragraph were taken at 14
   # and 35 controls, and the current budget is those extrapolated through the 55s
-  # floor -- not a timed run at 61. Saying otherwise would be this paragraph's own
+  # floor -- not a timed run at 63. Saying otherwise would be this paragraph's own
   # warning committed inside it: a figure
   # derived for a different configuration is not a measurement of this one,
   # which is the mistake this comment already records the sibling making.

@@ -1714,7 +1714,9 @@ base_ref_case "a trunk push with no previous tip has no ancestry" "EMPTY" -- \
 
 # ⚠ A REAL REPOSITORY, BECAUSE THE REMAINING CASES ARE GIT QUESTIONS. The model
 # is the trunk as it stands: nothing published may carry more than the trunk
-# currently does. These five assert WHICH revision is chosen -- and each asserts
+# currently does. Seven repository-backed cases stand here -- a branch push, a tag
+# on an older commit, a missing trunk, a baseline-less target, an unreadable
+# trunk, the adoption push, and an ambiguous trunk name. Each asserts WHICH
 # the selector's exit STATUS too, because the caller assigns its output under
 # `set -e`: a selector that prints the right revision and then exits nonzero stops
 # the step, and a control reading only the output would stay green while CI
@@ -1925,7 +1927,17 @@ lane_b_ad_sha="$(git -C "$lane_b_adrepo" rev-parse main)"
 checks=$((checks + 1))
 lane_b_ad_ok=yes
 ( cd "$lane_b_adrepo" && git merge-base --is-ancestor "$lane_b_ad_before" "$lane_b_ad_sha" ) || lane_b_ad_ok=no
-( cd "$lane_b_adrepo" && ! git ls-tree --name-only "$lane_b_ad_before" -- scripts/public-surface-lane-b-baseline.txt 2>/dev/null | grep -q . ) || lane_b_ad_ok=no
+# ⚠ THE STATUS, NOT A NEGATED PIPELINE. `! ls-tree | grep -q .` under pipefail
+# reports "established" for BOTH a readable tree with no baseline and a tree that
+# could not be read at all -- measured, the same answer in two different worlds.
+# That is the exact conflation fixed in the selector two rounds ago, written into
+# the assertion meant to prove the selector's fixture. Only rc 0 with empty
+# output means looked-and-absent.
+if lane_b_ad_ls="$( cd "$lane_b_adrepo" && git ls-tree --name-only "$lane_b_ad_before" -- scripts/public-surface-lane-b-baseline.txt 2>/dev/null )"; then
+  [ -z "$lane_b_ad_ls" ] || lane_b_ad_ok=no
+else
+  lane_b_ad_ok=no
+fi
 if [ "$lane_b_ad_ok" != yes ]; then
   echo "FAIL [the adoption push keeps its legal skip]: the scene was not" >&2
   echo "  established -- before must be an ANCESTOR of the pushed commit and must" >&2
