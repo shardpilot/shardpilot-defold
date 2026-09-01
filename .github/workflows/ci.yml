@@ -105,37 +105,125 @@ jobs:
       # false in this repository: a check that never runs is worse than an
       # absent one, because it manufactures the appearance of a check.
       #
-      # ⚠ EVERY PULL REQUEST IS COMPARED; PUSH EVENTS ARE THE FOLLOW-UP. A pull
-      # request carries its own base sha, which is the tree the change lands on
-      # and the most accurate target available -- so the anti-cheat runs on every
-      # PR, which is how changes reach this repository.
+      # ⚠ THE CHOICE LIVES IN A SCRIPT NOW, BECAUSE IT WAS WRONG SIX TIMES. Each
+      # distinct, listed once here and nowhere else, so the count and the list
+      # cannot drift apart again:
       #
-      # Push events (branches, tags, refs with no shared history) need a choice
-      # rather than a field, and that choice had been wrong six times in three
-      # lines of YAML -- never set, the default branch, a mutable ref, a failed
-      # tip, a root ref, and reductions turned into reusable slack. It is a
-      # driven unit in its own change rather than a seventh guess here.
+      #   1. never set, so the comparison never ran while the gate printed
+      #      "CI sets it";
+      #   2. a newly created ref compared against the DEFAULT BRANCH, which it
+      #      does not descend from;
+      #   3. the mutable `github.ref`, making the base the commit under test;
+      #   4. a root ref falling back to the default branch again;
+      #   5. a previously FAILED tip trusted as an accepted base;
+      #   6. the merge base alone, turning every reduction into reusable slack.
       #
-      # ⚠ SO THIS IS A STATED GAP, NOT AN OVERSIGHT: a push to a branch with no
-      # open pull request is not compared against anything. The gate still runs
-      # and still holds the baseline against the tree; what it cannot do on that
-      # path is catch a baseline edited upward in the same commit.
+      # The first four happened while this was three lines of YAML and every one
+      # was found by reading, because nothing executed the choice.
+      # scripts/lane_b_base_ref.sh is that choice with inputs and one output, and
+      # the ratchet harness drives every case. The rules it applies, and why, are
+      # documented there.
+      #
+      # ⚠ THIS STEP FETCHES BEFORE IT ASKS, AND THEN AGAIN AFTERWARDS. The trunk
+      # and the pull-request base are fetched FIRST, because the selector inspects
+      # revisions -- it cannot classify what is not in the clone, and asking it
+      # about an absent object is how a baseline-less base was passed through
+      # instead of becoming EMPTY. What the selector then names is fetched second.
+      # A revision fetched here may not be emitted at all: the PR base can come
+      # back as EMPTY.
+      # ⚠ A DELETION IS A PUSH EVENT WITH NO NEW TREE. Deleting a branch or tag
+      # fires this workflow, `before` names the tip that was removed, and the
+      # checkout resolves to a fallback commit -- so the selector would compute
+      # bases for one history while the gate scanned another, and deleting a
+      # branch whose count sits below the fallback tree would fail for a
+      # publication that never happened. Nothing is published by a deletion, so
+      # nothing is compared.
       - name: Fetch the comparison base for the lane B ratchet
+        if: github.event.deleted != true
+        # ⚠ EVERY VALUE THROUGH `env`, BECAUSE A REF NAME IS ATTACKER TEXT. A
+        # `${{ }}` expression is pasted into the shell program before bash sees
+        # it, and git accepts quotes, semicolons, parentheses and `$(...)` in ref
+        # names -- verified with `git check-ref-format --branch`, which accepts
+        # `a'b`, `x$(id)`, `y;z` and `p(q)`. So a writer could push a branch whose
+        # NAME closes the quote and runs commands here, and an ordinary apostrophe
+        # would corrupt the command by accident. Through `env` the value is data
+        # bash reads, never program text it parses.
+        env:
+          SP_EVENT: ${{ github.event_name }}
+          SP_PR_BASE: ${{ github.event.pull_request.base.sha }}
+          SP_BEFORE: ${{ github.event.before }}
+          SP_SHA: ${{ github.sha }}
+          SP_REF: ${{ github.ref }}
+          SP_DEFAULT: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          base='${{ github.event.pull_request.base.sha }}'
-          if [ -n "$base" ]; then
-            git fetch --depth=1 origin "$base"
-            echo "SP_LANE_B_BASE=$base" >> "$GITHUB_ENV"
-          fi
+          # ⚠ FETCH BEFORE CLASSIFYING, NOT AFTER. The selector INSPECTS the
+          # revisions it is given -- a target that does not carry the baseline is
+          # EMPTY rather than a skip -- and it can only inspect what is present.
+          # A depth-one checkout of a pull request whose base is outside the
+          # default branch's history does not contain that base, so classifying
+          # first and fetching afterwards asked the selector about an object it
+          # could not see: it passed the revision through, the later fetch made it
+          # resolvable, and the gate then found no baseline on it and skipped --
+          # letting the change add lane B material with a matching raised
+          # baseline. ⚠ THE TWO FETCHES ARE NOT ALIKE, AND THE ASYMMETRY IS THE
+          # SAFETY. The TRUNK fetch is REQUIRED -- its failure must stop the job,
+          # because the selector reads the trunk to decide whether a baseline-less
+          # revision is a fork from before adoption or adoption itself, and a
+          # silent failure answers that question wrongly and permissively. The
+          # PR-base fetch stays best-effort: when it fails the revision is simply
+          # unresolvable and the gate refuses it by name, which is a correct
+          # outcome. Restoring `|| true` on the first one reopens a fail-open
+          # path; the two lines look symmetrical and are not.
+          # ⚠ THE TRUNK FETCH IS FATAL, THE OTHERS ARE NOT, AND THE ASYMMETRY IS
+          # THE POINT. The selector decides whether a baseline-less revision is a
+          # fork from before adoption (EMPTY) or adoption itself (pass through) by
+          # asking whether the TRUNK carries the baseline. `|| true` turned a
+          # transient fetch failure into the answer "the trunk does not have it" --
+          # so a pull request based on a baseline-less branch would be passed
+          # through, the gate would take its legal skip, and new material could
+          # arrive with a matching raised baseline. A failure to look is not a
+          # finding, and hiding it made it into one.
+          git fetch --no-tags origin \
+            "+refs/heads/$SP_DEFAULT:refs/remotes/origin/$SP_DEFAULT"
+          [ -n "$SP_PR_BASE" ] && git fetch --depth=1 origin "$SP_PR_BASE" || true
+          bases="$(./scripts/lane_b_base_ref.sh \
+            --event "$SP_EVENT" \
+            --pr-base "$SP_PR_BASE" \
+            --before "$SP_BEFORE" \
+            --sha "$SP_SHA" \
+            --ref "$SP_REF" \
+            --default-branch "$SP_DEFAULT")"
+          for base in $bases; do
+            [ "$base" = EMPTY ] && continue
+            git fetch --depth=1 origin "$base" 2>/dev/null || true
+          done
+          echo "SP_LANE_B_BASES=$(printf '%s ' $bases)" >> "$GITHUB_ENV"
 
       # This repository is already public, so it is NOT in the org's
       # publication-candidate list and nothing else scans it. The script's
       # header states which lane is gated and which is only reported.
+      # ⚠ ONCE PER BASE, AND ZERO RUNS IS A REFUSAL. The selector emits one or
+      # more accepted states and the count may rise against none of them; a rise
+      # against any of them is a rise. An empty list would run the gate no times
+      # at all and report success, which is the shape of every defect this step
+      # has produced -- so it is refused rather than treated as "nothing to do".
       - name: No internal material in the published non-source surface
-        run: ./scripts/check_public_surface.sh
-        env:
-          PUBLIC_SURFACE_BASE_REF: ${{ env.SP_LANE_B_BASE }}
+        if: github.event.deleted != true
+        run: |
+          set -euo pipefail
+          ran=0
+          for base in ${SP_LANE_B_BASES:-}; do
+            echo "== lane B comparison base: $base"
+            PUBLIC_SURFACE_BASE_REF="$base" ./scripts/check_public_surface.sh
+            ran=$((ran + 1))
+          done
+          if [ "$ran" -eq 0 ]; then
+            echo "REFUSING: no lane B comparison base was selected." >&2
+            echo "  The gate did not run. A step that checks nothing must not" >&2
+            echo "  report success." >&2
+            exit 2
+          fi
 
   # ⚠ ITS OWN JOB, AND THE SHARED CLOCK IS WHY. This ran inside `static`, whose
   # budget is ten minutes shared with checkout, syntax, the library and version
@@ -154,23 +242,34 @@ jobs:
   #
   # ⚠ AND THE COUNT MOVED UNDER THE ARGUMENT. That reasoning was written for
   # FOURTEEN controls, which is what this harness had before the sibling's
-  # lineage was ported into it, and this harness is at 51 controls now. The
-  # bound is re-argued from a measurement taken at the SHIPPING count: a figure
+  # lineage was ported into it, and this harness is at 64 controls now. The
+  # bound is re-argued at the shipping count. ⚠ AND "RE-ARGUED" IS NOT
+  # "RE-MEASURED": the figures on either side of this paragraph were taken at 14
+  # and 35 controls, and the current budget is those extrapolated through the 55s
+  # floor -- not a timed run at 64. Saying otherwise would be this paragraph's own
+  # warning committed inside it: a figure
   # derived for a different configuration is not a measurement of this one,
   # which is the mistake this comment already records the sibling making.
   #
   # Measured on this rig: 353.7s for 35 controls, 10.1s each (2026-08-31). The
   # slow review datum -- 55s per control -- stays a floor rather than a duration,
   # because that run did not finish. The budget is sized from the floor, not from
-  # the fast rig: 51 x 55s is 2805s, so the arithmetic demands 47 minutes.
+  # the fast rig: 64 x 55s is 3520s, so the arithmetic demands 59 minutes.
   #
-  # Shipping 50 rather than 39. The floor is what the control enforces; the
-  # margin above it is a separate decision, and 40 would have been one control
-  # from red -- a bound that has to be revisited by the next person to add a
-  # check is a bound that will be raised in a hurry rather than argued. Fifty
-  # carries eight more controls before the arithmetic speaks again. This is
-  # margin over a measured floor, not a guess in place of one.
+  # Shipping 60 minutes against a floor of 59. The floor is what the control
+  # enforces; the margin above it is a separate decision.
   #
+  # ⚠ THE MARGIN IN CONTROLS, NOT IN MINUTES, BECAUSE MINUTES GO STALE. At 55s a
+  # control: 64 need 3520s, 65 need 3575s and still fit, 66 need 3630s and do
+  # not. So ONE more control fits here and THE SECOND ONE TRIPS THE BOUND -- that
+  # person re-derives this pair rather than nudging it, and the arithmetic is
+  # written out so they check it in a line instead of trusting this sentence.
+  #
+  # This paragraph has been wrong three times: it claimed a margin of eight
+  # controls from back when the pair was 50 against 39, then four, then said the
+  # sixth addition would trip a bound the fifth already did. Each time the number
+  # moved and the sentence did not. Rewriting it whole rather than appending
+  # another correction, because the appended ones are how it got here.
   # THIS NUMBER IS NOW CHECKED, not asserted. The harness reads timeout-minutes
   # for this job back out of this file and fails if it is under the count times
   # the slow constant, so adding a control raises the floor by itself. That
@@ -187,7 +286,7 @@ jobs:
   # built on purpose. It needs no network and no history depth.
   lane-b-ratchet-controls:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
