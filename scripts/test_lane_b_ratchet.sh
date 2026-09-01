@@ -440,7 +440,10 @@ lane_b_scratch="$(mktemp -d)"
 # that cannot fail: if the write does not happen, the old baseline stays, the
 # gate still disagrees with the tree, and the control observes exactly the exit
 # and message it wanted -- from a state it never established. Review found this
-# in two of the controls added for this very kind of defect.
+# in two of the controls added for this very kind of defect -- and an audit
+# for the same class found two MORE afterwards, both written by the hand
+# that wrote this helper, in the format-skew control and the SUBSEP one.
+# Having the remedy in the file is not the same as reaching for it.
 must_write_baseline() {
   local label="$1"
   if ! "$GATE" --write-baseline >/dev/null 2>&1; then
@@ -627,7 +630,7 @@ printf -- '\n-- See %s for the freeze this follows.\n' "$marker" >> shardpilot/c
 # baseline is regenerated from the unstaged tree, the count does not move, and the
 # control fails at the ordinary ratchet with exit 1 -- proving nothing about skew.
 git add -A >/dev/null 2>&1 || true
-"$GATE" --write-baseline >/dev/null 2>&1 || true
+must_write_baseline "a format skew may not carry a lane B source change"
 git add -A >/dev/null 2>&1 || true
 skew_commit="$(synth_target '/^# format-version:/d')"
 expect_ref "a format skew may not carry a lane B source change" "$skew_commit" 2 \
@@ -1654,7 +1657,7 @@ restore
 # edit. That is the round-1 defect re-entering through the encoding of the key.
 printf -- '-- See %s and\034 %s for the freeze.\nreturn {}\n' "$marker" "$marker" > "$NEW_FILE"
 git add -A >/dev/null 2>&1 || true
-"$GATE" --write-baseline >/dev/null 2>&1 || true
+must_write_baseline "two matches around a SUBSEP byte count as two"
 lane_b_subsep_n="$(awk -v f="$NEW_FILE" '$2 == f {print $1}' "$BASELINE")"
 checks=$((checks + 1))
 if [ "$lane_b_subsep_n" != 2 ]; then
