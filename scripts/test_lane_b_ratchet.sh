@@ -1569,7 +1569,7 @@ EXPECTED_CHECKS=61
 #
 # So the count is read out of the workflow and compared to the enforced one. It
 # is the same rule as EXPECTED_CHECKS itself, applied one file over.
-# ⚠ THE COMPARISON BASE, WHICH NOTHING HERE USED TO EXECUTE. Five defects lived
+# ⚠ THE COMPARISON BASE, WHICH NOTHING HERE USED TO EXECUTE. Six defects lived
 # in three lines of workflow YAML: the variable never set, a new ref compared
 # against the default branch, the mutable `github.ref` making the base the commit
 # under test, and a previously FAILED tip trusted as an accepted base. All four

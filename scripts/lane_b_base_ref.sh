@@ -5,14 +5,10 @@
 # run the comparison against every line and require all of them to hold: a rise
 # against any accepted state is a rise.
 #
-# ⚠ THIS EXISTS BECAUSE THE CHOICE WAS WRONG FOUR TIMES IN THREE LINES OF YAML.
-# It was never set at all, so the comparison never ran while the gate printed
-# "CI sets it"; then a new ref was compared against the DEFAULT BRANCH, which it
-# does not descend from; then the fix for that used the MUTABLE `github.ref`, so
-# a second push made the base the very commit under test; then a root ref fell
-# back to the default branch again, and a previously FAILED tip was trusted as an
-# accepted base. Every one of those was found by reading, because nothing
-# executed the choice. A decision with inputs and one output can be driven.
+# ⚠ THIS EXISTS BECAUSE THE CHOICE WAS WRONG SIX TIMES. The distinct defects are
+# enumerated once, in .github/workflows/ci.yml beside the step that calls this --
+# one list, one total, in one place, because three inventories of the same history
+# is how they came to disagree.
 #
 # The workflow performs the fetching this names; this file only decides.
 set -euo pipefail
@@ -79,11 +75,19 @@ emit() {  # $1 = newline-separated revisions -> deduplicated, EMPTY where blind
   # through to a gate that then takes its legal skip. Pass-through is now reached
   # only by seeing the trunk and seeing that it lacks the file too, which is the
   # one state where a skip is correct: the change that adopts the baseline.
+  # ⚠ `ls-tree`, NOT `cat-file -e`, AND THE GATE ALREADY SAYS WHY. `cat-file -e`
+  # exits nonzero for an absent path AND for an unreadable one -- measured, both
+  # 128 -- so pairing it with a `rev-parse` that succeeds records "the trunk does
+  # not carry the baseline" for a lookup that never happened, and that answer
+  # licenses the pass-through. `ls-tree` separates them: rc 0 with empty output
+  # means looked-and-absent, nonzero means could-not-look.
   lane_b_trunk_has=unknown
-  if git cat-file -e "$remote/$default:$baseline" 2>/dev/null; then
-    lane_b_trunk_has=yes
-  elif git rev-parse --verify --quiet "$remote/$default^{commit}" >/dev/null 2>&1; then
-    lane_b_trunk_has=no
+  if lane_b_trunk_ls="$(git ls-tree --name-only "$remote/$default" -- "$baseline" 2>/dev/null)"; then
+    if [ -n "$lane_b_trunk_ls" ]; then
+      lane_b_trunk_has=yes
+    else
+      lane_b_trunk_has=no
+    fi
   fi
   printf '%s\n' "$1" | while IFS= read -r r; do
     [ -n "$r" ] || continue
@@ -97,12 +101,49 @@ emit() {  # $1 = newline-separated revisions -> deduplicated, EMPTY where blind
   done | awk '!seen[$0]++'
 }
 
-# 1. A pull request carries its own base, which is the tree the change will land
-#    on. Nothing else can be more accurate than that.
-if [ -n "$pr_base" ]; then
-  emit "$pr_base"
-  exit 0
-fi
+# ⚠ THE EVENT DECIDES, NOT THE SHAPE OF THE ARGUMENTS. `--event` was accepted and
+# never read: the dispatch keyed off `pr_base` alone, so a PUSH carrying a
+# non-empty `--pr-base` would use that arbitrary revision, and a PULL REQUEST
+# without one fell through to the push logic and could end up on `before`. The
+# workflow populates these consistently today, which is exactly the kind of fact
+# a unit must not rely on -- an input the contract names and the code ignores is
+# a promise nothing keeps.
+case "$event" in
+  pull_request)
+    if [ -z "$pr_base" ]; then
+      echo "REFUSING: --pr-base is required for a pull_request event." >&2
+      echo "  Without it there is no base to compare against, and falling" >&2
+      echo "  through to the push rules would pick one meant for a different" >&2
+      echo "  question." >&2
+      exit 2
+    fi
+    # 1. A pull request carries its own base, which is the tree the change will
+    #    land on. Nothing else can be more accurate than that.
+    emit "$pr_base"
+    exit 0
+    ;;
+  push)
+    if [ -n "$pr_base" ]; then
+      echo "REFUSING: --pr-base must not be set for a push event." >&2
+      echo "  A push has no pull-request base. Accepting one here would let a" >&2
+      echo "  caller regression choose an arbitrary revision to compare with." >&2
+      exit 2
+    fi
+    ;;
+  "")
+    echo "REFUSING: --event is required." >&2
+    echo "  The event decides which rules apply; inferring it from which other" >&2
+    echo "  arguments happen to be set is how a pull request ended up on the" >&2
+    echo "  push rules." >&2
+    exit 2
+    ;;
+  *)
+    echo "REFUSING: unsupported event '$event'." >&2
+    echo "  Only pull_request and push have rules here. An unrecognised event" >&2
+    echo "  is a caller this file has not been taught, not a default." >&2
+    exit 2
+    ;;
+esac
 
 if [ -z "$sha" ]; then
   echo "REFUSING: --sha is required for a push event." >&2

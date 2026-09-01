@@ -105,16 +105,21 @@ jobs:
       # false in this repository: a check that never runs is worse than an
       # absent one, because it manufactures the appearance of a check.
       #
-      # ⚠ THE CHOICE LIVES IN A SCRIPT NOW, BECAUSE IT WAS WRONG FOUR TIMES.
-      # It was never set, so the comparison never ran while the gate printed "CI
-      # sets it"; then a new ref was compared against the DEFAULT BRANCH, which
-      # it does not descend from; then the fix for that read the MUTABLE
-      # `github.ref`, so a second push made the base the commit under test; then
-      # a root ref fell back to the default branch again, and a previously FAILED
-      # tip was trusted as an accepted base; and a root ref fell back to the
-      # default branch. FIVE defects, three lines of YAML,
-      # every one found by reading -- because nothing executed the choice.
+      # ⚠ THE CHOICE LIVES IN A SCRIPT NOW, BECAUSE IT WAS WRONG SIX TIMES. Each
+      # distinct, listed once here and nowhere else, so the count and the list
+      # cannot drift apart again:
       #
+      #   1. never set, so the comparison never ran while the gate printed
+      #      "CI sets it";
+      #   2. a newly created ref compared against the DEFAULT BRANCH, which it
+      #      does not descend from;
+      #   3. the mutable `github.ref`, making the base the commit under test;
+      #   4. a root ref falling back to the default branch again;
+      #   5. a previously FAILED tip trusted as an accepted base;
+      #   6. the merge base alone, turning every reduction into reusable slack.
+      #
+      # The first four happened while this was three lines of YAML and every one
+      # was found by reading, because nothing executed the choice.
       # scripts/lane_b_base_ref.sh is that choice with inputs and one output, and
       # the ratchet harness drives every case. The rules it applies, and why, are
       # documented there.
@@ -262,6 +267,11 @@ jobs:
   # prose describing a mechanism is a second edit, and it is never in the diff
   # that invalidates it. Whoever adds the sixth control from here re-derives this
   # pair rather than nudging it.
+  #
+  # ⚠ THE FIFTH ADDITION TRIPS IT, NOT THE SIXTH. At 55s a control, 65 controls
+  # need 3575s and fit inside 60 minutes; 66 need 3630s and do not. So the person
+  # adding the fifth control from 61 is the one who re-derives this pair -- an
+  # off-by-one in guidance that exists precisely to stop a hurried change.
   #
   # THIS NUMBER IS NOW CHECKED, not asserted. The harness reads timeout-minutes
   # for this job back out of this file and fails if it is under the count times

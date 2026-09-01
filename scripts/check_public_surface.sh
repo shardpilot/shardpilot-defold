@@ -3233,8 +3233,15 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
   # correct answer.
   if [ "${PUBLIC_SURFACE_BASE_REF}" = EMPTY ]; then
     base_copy="# format-version: $LANE_B_FORMAT"
-    echo "  (baseline-vs-target check: the pushed ref has no ancestry, so the"
-    echo "   target baseline is EMPTY -- every lane B occurrence counts as new)"
+    # ⚠ THREE CAUSES, ONE SENTINEL. EMPTY means "nothing is grandfathered", and a
+    # caller reaches it by a ref with no shared history, by a target that predates
+    # the baseline's adoption, or by a trunk that could not be inspected at all.
+    # Naming only the first sent an investigation toward orphan-history handling
+    # for a failure that was about adoption.
+    echo "  (baseline-vs-target check: the target is EMPTY -- no accepted state to"
+    echo "   grandfather anything, so every lane B occurrence counts as new. The"
+    echo "   caller chooses this for a ref with no shared history, for a target"
+    echo "   that predates the baseline, and when the trunk cannot be inspected.)"
   else
     # ⚠ TWO REASONS THE COMPARISON CAN BE UNAVAILABLE, and they are not the same
     # fact. A ref that does not RESOLVE is a broken instrument -- a shallow clone
@@ -3394,12 +3401,6 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
       || echo "  (baseline-vs-target check skipped: ${PUBLIC_SURFACE_BASE_REF} carries no $LANE_B_BASELINE)"
   fi
 else
-  # ⚠ AND THIS LINE USED TO SAY "CI sets it", WHICH WAS FALSE TWICE. In round 1 it
-  # was false because the workflow never set the variable at all -- a reassurance
-  # printed on exactly the runs where nothing was compared. It became false again
-  # when the comparison for push events was split out: CI now leaves this unset on
-  # a push deliberately, and the old wording reported a designed gap as an
-  # accident. A message that explains away its own silence is worse than silence.
   # ⚠ AND THIS TEXT DESCRIBES CI, WHICH IS A THING IT CANNOT SEE. It has been
   # wrong twice for that reason: it said "CI sets it" when CI did not, and then
   # described a gap on pushes that the very change carrying that sentence had
