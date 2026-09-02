@@ -2929,6 +2929,99 @@ function Client:track_level_fail(level_id, attempt, duration_ms, fail_reason, pr
 	return self:track("level_fail", out)
 end
 
+-- analytics.ad_impression_revenue.v1's bounds. That schema sets
+-- additionalProperties to FALSE, so this verb takes no props table at all:
+-- any undeclared key makes the ingest reject the event.
+local MAX_IMPRESSION_ID = 256
+local MAX_NETWORK = 128
+local CURRENCY_LENGTH = 3
+local MAX_REVENUE_PRECISION = 64
+local MAX_AD_UNIT = 256
+local MAX_AD_FORMAT = 64
+local MAX_PLACEMENT = 256
+
+-- A trimmed string within its bound, or nil for anything the schema would
+-- refuse: a non-string, an empty one, or one too long.
+local function bounded_string(value, max_length)
+	if type(value) ~= "string" then
+		return nil
+	end
+	local trimmed = value:match("^%s*(.-)%s*$")
+	if trimmed == "" or #trimmed > max_length then
+		return nil
+	end
+	return trimmed
+end
+
+-- Typed ad verb: the canonical ad_impression_revenue. impression_id
+-- (1..256), network (1..128), revenue_micros (an integer at or above 0,
+-- revenue in millionths of a currency unit) and currency (exactly three
+-- characters, upper-cased to the ISO 4217 form because the fact layer groups
+-- by the exact string) are required; the four optional strings are bounded
+-- and omitted when empty.
+--
+-- Consent has two gates and this SDK owns one. The consent-first gate is
+-- track's, unchanged, and the client-source pin applies. Beyond them the
+-- ingest requires the workspace's ad_revenue consent posture (ADR-0231 §5)
+-- and suppresses the event per event, inside an ACCEPTED batch, with status
+-- suppressed_ad_revenue_consent when that grant is missing; this SDK cannot
+-- see or set that grant.
+function Client:track_ad_impression_revenue(
+	impression_id,
+	network,
+	revenue_micros,
+	currency,
+	revenue_precision,
+	ad_unit,
+	ad_format,
+	placement
+)
+	if not self:_require_client_source() then
+		return false, "source_not_client"
+	end
+	local impression = bounded_string(impression_id, MAX_IMPRESSION_ID)
+	if not impression then
+		return false, "invalid_impression_id"
+	end
+	local ad_network = bounded_string(network, MAX_NETWORK)
+	if not ad_network then
+		return false, "invalid_network"
+	end
+	if not is_integer(revenue_micros) or revenue_micros < 0 then
+		return false, "invalid_revenue_micros"
+	end
+	if type(currency) ~= "string" then
+		return false, "invalid_currency"
+	end
+	local code = currency:match("^%s*(.-)%s*$")
+	if #code ~= CURRENCY_LENGTH then
+		return false, "invalid_currency"
+	end
+	local out = {
+		impression_id = impression,
+		network = ad_network,
+		revenue_micros = revenue_micros,
+		currency = code:upper(),
+	}
+	local optionals = {
+		{ "revenue_precision", revenue_precision, MAX_REVENUE_PRECISION },
+		{ "ad_unit", ad_unit, MAX_AD_UNIT },
+		{ "ad_format", ad_format, MAX_AD_FORMAT },
+		{ "placement", placement, MAX_PLACEMENT },
+	}
+	for _, optional in ipairs(optionals) do
+		local key, value, max_length = optional[1], optional[2], optional[3]
+		if value ~= nil and value ~= "" then
+			local bounded = bounded_string(value, max_length)
+			if not bounded then
+				return false, "invalid_" .. key
+			end
+			out[key] = bounded
+		end
+	end
+	return self:track("ad_impression_revenue", out)
+end
+
 function Client:track(event_name, props, context)
 	return self:enqueue_event(event_name, props, context, nil)
 end

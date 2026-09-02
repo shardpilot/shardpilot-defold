@@ -245,6 +245,29 @@ function M.track_level_fail(level_id, attempt, duration_ms, fail_reason, props)
 	return with_default("track_level_fail", level_id, attempt, duration_ms, fail_reason, props)
 end
 
+function M.track_ad_impression_revenue(
+	impression_id,
+	network,
+	revenue_micros,
+	currency,
+	revenue_precision,
+	ad_unit,
+	ad_format,
+	placement
+)
+	return with_default(
+		"track_ad_impression_revenue",
+		impression_id,
+		network,
+		revenue_micros,
+		currency,
+		revenue_precision,
+		ad_unit,
+		ad_format,
+		placement
+	)
+end
+
 function M.update(dt)
 	return with_default("update", dt)
 end

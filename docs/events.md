@@ -26,6 +26,7 @@ where it differs):
 
 - `level_start`, `level_complete`, `level_fail` (from the typed progression
   verbs `track_level_start()`, `track_level_complete()`, `track_level_fail()`)
+- `ad_impression_revenue` (from `track_ad_impression_revenue()`)
 - `app.session_started` (from the `session_start()` helper)
 - `app.session_ended` (from the `session_end()` helper)
 - `app.screen_view` (from the `screen_view()` helper)

@@ -647,6 +647,127 @@ function progression_tests.refuse_a_non_client_source()
 	assert_contains(requests[1].body, '"event_name":"custom_event"')
 end
 
+-- ── C3 typed ad verb (in the progression table: Lua 5.1 caps a function
+-- at 200 locals and this file sits at the ceiling) ──────────────────────
+function progression_tests.ad_emits_the_canonical_event()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	assert_true(
+		client:track_ad_impression_revenue(
+			" imp-91 ", " admob ", 4200, " usd ", "publisher_provided", "banner-bottom", "banner", "main_menu"
+		)
+	)
+	assert_true(client:flush())
+
+	assert_equal(#requests, 1)
+	local body = requests[1].body
+	assert_contains(body, '"event_name":"ad_impression_revenue"')
+	assert_contains(body, '"impression_id":"imp-91"')
+	assert_contains(body, '"network":"admob"')
+	assert_contains(body, '"revenue_micros":4200')
+	assert_contains(body, '"currency":"USD"')
+	assert_contains(body, '"revenue_precision":"publisher_provided"')
+	assert_contains(body, '"ad_unit":"banner-bottom"')
+	assert_contains(body, '"ad_format":"banner"')
+	assert_contains(body, '"placement":"main_menu"')
+end
+
+function progression_tests.ad_omits_the_empty_optional_strings()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	-- additionalProperties is false on this schema: exactly the four required
+	-- keys reach the wire when the optionals are absent.
+	assert_true(client:track_ad_impression_revenue("imp-92", "applovin", 0, "EUR"))
+	assert_true(client:flush())
+
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"revenue_micros":0')
+	assert_not_contains(requests[1].body, '"revenue_precision"')
+	assert_not_contains(requests[1].body, '"ad_unit"')
+	assert_not_contains(requests[1].body, '"ad_format"')
+	assert_not_contains(requests[1].body, '"placement"')
+end
+
+function progression_tests.ad_refuses_the_schema_bounds()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	local ok, err = client:track_ad_impression_revenue("", "admob", 1, "USD")
+	assert_true(not ok)
+	assert_equal(err, "invalid_impression_id")
+	ok, err = client:track_ad_impression_revenue(string.rep("i", 257), "admob", 1, "USD")
+	assert_true(not ok)
+	assert_equal(err, "invalid_impression_id")
+	ok, err = client:track_ad_impression_revenue("imp-93", 42, 1, "USD")
+	assert_true(not ok)
+	assert_equal(err, "invalid_network")
+	ok, err = client:track_ad_impression_revenue("imp-93", "admob", -1, "USD")
+	assert_true(not ok)
+	assert_equal(err, "invalid_revenue_micros")
+	ok, err = client:track_ad_impression_revenue("imp-93", "admob", 1.5, "USD")
+	assert_true(not ok)
+	assert_equal(err, "invalid_revenue_micros")
+	ok, err = client:track_ad_impression_revenue("imp-93", "admob", 1, "US")
+	assert_true(not ok)
+	assert_equal(err, "invalid_currency")
+	ok, err = client:track_ad_impression_revenue("imp-93", "admob", 1, "USDD")
+	assert_true(not ok)
+	assert_equal(err, "invalid_currency")
+	ok, err = client:track_ad_impression_revenue("imp-93", "admob", 1, "USD", string.rep("p", 65))
+	assert_true(not ok)
+	assert_equal(err, "invalid_revenue_precision")
+	ok, err = client:track_ad_impression_revenue("imp-93", "admob", 1, "USD", "", string.rep("u", 257))
+	assert_true(not ok)
+	assert_equal(err, "invalid_ad_unit")
+	assert_true(client:flush())
+	assert_equal(#requests, 0)
+
+	-- Precondition for the empty wire above.
+	assert_true(client:track_ad_impression_revenue("imp-93", "admob", 1, "USD"))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"event_name":"ad_impression_revenue"')
+end
+
+function progression_tests.ad_inherits_the_consent_gate_and_the_source_pin()
+	storage.reset()
+	reset()
+	local client = assert(sdk.new(config()))
+	local ok, err = client:track_ad_impression_revenue("imp-94", "admob", 1, "USD")
+	assert_true(not ok)
+	assert_equal(err, "consent_unknown")
+	assert_true(client:set_consent(false))
+	ok, err = client:track_ad_impression_revenue("imp-94", "admob", 1, "USD")
+	assert_true(not ok)
+	assert_equal(err, "consent_denied")
+	reset()
+	assert_true(client:set_consent(true))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track_ad_impression_revenue("imp-94", "admob", 1, "USD"))
+	assert_true(client:flush())
+	local found = false
+	for _, request in ipairs(requests) do
+		if string.find(request.body, '"event_name":"ad_impression_revenue"', 1, true) then
+			found = true
+		end
+	end
+	assert_true(found)
+
+	-- The client-source pin covers this verb too.
+	reset()
+	seed_granted_consent()
+	local server = assert(sdk.new(config_mode_a({ source = "server" })))
+	assert_true(server:identify("user-example"))
+	ok, err = server:track_ad_impression_revenue("imp-95", "admob", 1, "USD")
+	assert_true(not ok)
+	assert_equal(err, "source_not_client")
+end
+
 local function test_screen_view_does_not_mutate_caller_props()
 	reset()
 	seed_granted_consent()
@@ -7878,6 +7999,10 @@ local tests = {
 	progression_tests.refuse_the_schema_bounds,
 	progression_tests.inherit_the_consent_gate,
 	progression_tests.refuse_a_non_client_source,
+	progression_tests.ad_emits_the_canonical_event,
+	progression_tests.ad_omits_the_empty_optional_strings,
+	progression_tests.ad_refuses_the_schema_bounds,
+	progression_tests.ad_inherits_the_consent_gate_and_the_source_pin,
 	test_session_start_renews_session_and_resets_sequence,
 	test_session_start_rolls_back_on_enqueue_failure,
 	test_session_start_rolls_back_on_invalid_props,
