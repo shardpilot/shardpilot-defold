@@ -21,7 +21,11 @@
   consent-first gate the ingest requires the workspace's `ad_revenue` consent
   posture and suppresses the event per event, inside an ACCEPTED batch, with
   `suppressed_ad_revenue_consent` when that grant is missing. This SDK can
-  neither see nor set it: read the batch's per-event statuses.
+  neither see nor set it, and it hands back no per-event array. What carries
+  the outcome is `stats.last_event_issue` — the most recent non-accepted
+  per-event result as `status` or `status:code`. Note that `stats.suppressed`
+  does NOT count it: that counter increments for `suppressed_no_consent` only
+  (shardpilot-defold#77).
 
 - **Typed progression verbs: `track_level_start`, `track_level_complete`,
   `track_level_fail`.** The canonical `level_start`, `level_complete` and
