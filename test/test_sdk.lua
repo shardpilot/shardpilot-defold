@@ -3094,7 +3094,15 @@ local spool_scope = { workspace_id = "workspace-example", app_id = "app-example"
 -- A transiently failed batch is spooled durably with its envelopes verbatim; a
 -- later launch re-sends it byte-for-byte (same event_id / event_ts) through the
 -- normal publish machinery and clears the record only after the 2xx ack.
-local function test_spool_persists_transient_failure_and_resends_next_launch()
+-- The six spool scenes live on ONE table rather than as six top-level
+-- locals. Lua caps a chunk at 200 locals and this file sits ON that ceiling:
+-- Lua 5.4's generic `for` needs registers the 5.1 one does not, so the CI leg
+-- for 5.4 refused the file outright (`too many local variables`) while 5.1 and
+-- LuaJIT loaded it. Folding a cohesive family costs nothing at runtime and
+-- buys the headroom back; the C3 scenes below use the same shape.
+local spool_tests = {}
+
+function spool_tests.persists_transient_failure_and_resends_next_launch()
 	reset()
 	storage.reset()
 	seed_granted_consent()
@@ -3142,7 +3150,7 @@ end
 
 -- Over the caps the OLDEST entries are evicted first (FIFO), for both the
 -- entry-count cap and the approximate serialized-bytes cap.
-local function test_spool_overflow_evicts_oldest_first()
+function spool_tests.overflow_evicts_oldest_first()
 	reset()
 	storage.reset()
 	seed_granted_consent()
@@ -3175,7 +3183,7 @@ end
 
 -- A failed or garbled durable read discards the record and starts clean; the
 -- spool never errors into game code.
-local function test_spool_corrupted_record_starts_clean()
+function spool_tests.corrupted_record_starts_clean()
 	reset()
 	storage.reset()
 	sys.get_save_file = function(application_id, file_name)
@@ -3233,7 +3241,7 @@ end
 
 -- Consent recheck: a persisted denial clears the spool at load without
 -- sending; a runtime set_consent(false) purges a live spool the same way.
-local function test_spool_cleared_by_denied_consent()
+function spool_tests.cleared_by_denied_consent()
 	reset()
 	storage.reset()
 	assert_true(storage.save_spool(spool_scope, {
@@ -3473,7 +3481,7 @@ end
 
 -- A permanent reject on a spooled batch removes the entries (they would fail
 -- forever), surfaces the durable drop via diagnostics, and never retries.
-local function test_spool_permanent_reject_removes_entry_and_diagnoses()
+function spool_tests.permanent_reject_removes_entry_and_diagnoses()
 	reset()
 	storage.reset()
 	seed_granted_consent()
@@ -4854,7 +4862,7 @@ end
 -- while this install's persisted grant restores — under Mode B the historic
 -- envelopes could never send (the minted token binds the CURRENT anon) and
 -- drop at load; Mode A has no token binding and re-sends them verbatim.
-local function test_spool_identity_mismatch_dropped_mode_b_kept_mode_a()
+function spool_tests.identity_mismatch_dropped_mode_b_kept_mode_a()
 	reset()
 	storage.reset()
 	seed_granted_consent()
@@ -7915,9 +7923,9 @@ local tests = {
 	test_client_source_keeps_anonymous_id_both_modes,
 	test_get_anonymous_id_matches_wire,
 	test_track_before_session_start_lazily_opens_session,
-	test_spool_persists_transient_failure_and_resends_next_launch,
-	test_spool_overflow_evicts_oldest_first,
-	test_spool_corrupted_record_starts_clean,
+	spool_tests.persists_transient_failure_and_resends_next_launch,
+	spool_tests.overflow_evicts_oldest_first,
+	spool_tests.corrupted_record_starts_clean,
 	-- ⚠ INLINE, not a `local function`, and that is load-bearing: this file sits
 	-- exactly at Lua 5.4's ceiling of 200 locals for a main chunk, so the NEXT
 	-- `local function test_*` added here fails to compile under lua5.4 while
@@ -8150,12 +8158,12 @@ local tests = {
 
 		sys.get_save_file = nil; sys.save = nil; sys.load = nil
 	end,
-	test_spool_cleared_by_denied_consent,
+	spool_tests.cleared_by_denied_consent,
 	test_consent_unknown_blocks_all_analytics_egress,
 	test_blocked_period_samples_never_summarized,
 	test_consent_unknown_purges_unproven_spool_at_init,
 	test_identity_read_failure_purges_spool,
-	test_spool_permanent_reject_removes_entry_and_diagnoses,
+	spool_tests.permanent_reject_removes_entry_and_diagnoses,
 	test_shutdown_spools_undelivered_and_finalizes,
 	test_shutdown_full_queue_spools_session_end_and_summaries,
 	test_persist_snapshots_queue_while_running,
@@ -8526,7 +8534,7 @@ local tests = {
 	test_shutdown_refuses_denial_with_no_durable_witness,
 	test_set_anonymous_id_rejected_while_spool_pending_mode_b,
 	test_shutdown_fails_when_remnant_evicted_by_caps,
-	test_spool_identity_mismatch_dropped_mode_b_kept_mode_a,
+	spool_tests.identity_mismatch_dropped_mode_b_kept_mode_a,
 	test_shutdown_without_durable_backend_keeps_old_contract,
 	test_disabled_spool_clears_persisted_record_at_init,
 	test_set_consent_denied_reports_failed_spool_purge_and_retries,
