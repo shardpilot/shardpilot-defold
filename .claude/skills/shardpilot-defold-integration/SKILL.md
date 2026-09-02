@@ -337,7 +337,17 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
   (integral, 0..4294967295),
   `invalid_fail_reason`, and `source_not_client` — these schemas are
   client-source only. An absent `score` or empty `fail_reason` is omitted from
-  the wire even when `props` carries that key. The observer calls
+  the wire even when `props` carries that key.
+- The typed ad verb `sdk.track_ad_impression_revenue(impression_id, network,
+  revenue_micros, currency[, revenue_precision, ad_unit, ad_format,
+  placement])` emits `ad_impression_revenue`. It takes NO props table — that
+  schema forbids undeclared keys — and revenue rides as an integer in
+  millionths of a currency unit. Its own codes: `invalid_impression_id`,
+  `invalid_network`, `invalid_revenue_micros`, `invalid_currency`, one per
+  optional field, and `source_not_client`. Beyond the SDK's own gate the
+  ingest applies the workspace's `ad_revenue` posture (ADR-0231 §5) and can
+  suppress the event per event inside an ACCEPTED batch with
+  `suppressed_ad_revenue_consent`; this SDK cannot see that grant. The observer calls
   (`observe_ping_ms`, `observe_disconnect`) return **nothing** — they feed the
   samplers only while consent is granted and are silent no-ops otherwise; do
   not wrap them in `ok, err` handling.
