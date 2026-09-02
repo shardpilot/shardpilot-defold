@@ -326,8 +326,10 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
   props])`, `sdk.track_level_fail(level_id, attempt, duration_ms[, fail_reason][,
   props])` — emit the canonical `level_start` / `level_complete` / `level_fail`
   and validate the schema's bounds before anything is queued. Their own codes,
-  on top of `track`'s: `level_id_required`, `invalid_attempt` (an integer in
-  1..65535), `invalid_duration` and `invalid_score` (0..4294967295),
+  on top of `track`'s: `level_id_required`, `invalid_attempt` (an integral
+  number in 1..65535 — `2.5` is refused; `2.0` is the integer 2, because Lua
+  5.1 has one number type), `invalid_duration` and `invalid_score`
+  (integral, 0..4294967295),
   `invalid_fail_reason`, and `source_not_client` — these schemas are
   client-source only. An absent `score` or empty `fail_reason` is omitted from
   the wire even when `props` carries that key. The observer calls

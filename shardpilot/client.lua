@@ -2801,6 +2801,12 @@ end
 local MAX_LEVEL_ATTEMPT = 65535
 local MAX_LEVEL_UNSIGNED_32 = 4294967295
 
+-- Integral, not "spelled as an integer": Lua 5.1 has ONE number type and no
+-- lexical memory, so 2.0 and 2 are the same value by the time any validator
+-- sees them and json.decode("2.0") is indistinguishable from json.decode("2").
+-- The check is therefore mathematical -- 2.5 is refused, 2.0 is the integer 2
+-- -- and the docs say exactly that rather than promising a rejection this
+-- language cannot deliver (review round 1).
 local function is_integer(value)
 	return type(value) == "number" and value == math.floor(value) and value == value
 end

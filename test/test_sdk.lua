@@ -534,6 +534,10 @@ function progression_tests.refuse_the_schema_bounds()
 	ok, err = client:track_level_start("forest-3", 2.5)
 	assert_true(not ok)
 	assert_equal(err, "invalid_attempt")
+	-- Review round 1: 2.0 is NOT a rejection case. Lua 5.1 has one number
+	-- type, so an integral float IS the integer and the check is
+	-- mathematical; the docs promise that and no more.
+	assert_true(client:track_level_start("forest-3", 2.0))
 	ok, err = client:track_level_complete("forest-3", 1, -1)
 	assert_true(not ok)
 	assert_equal(err, "invalid_duration")

@@ -9,9 +9,11 @@
   table, on the client and on the `shardpilot.sdk` singleton. Each validates
   the schema's bounds before anything is queued and answers the SDK's
   `false, code` convention: `level_id_required` (a non-empty string),
-  `invalid_attempt` (an integer in 1..65535 — a float is refused, not
-  truncated), `invalid_duration` and `invalid_score` (integers in
-  0..4294967295), `invalid_fail_reason` (a string), and `source_not_client`
+  `invalid_attempt` (an integral number in 1..65535 — `2.5` is refused, while
+  `2.0` IS the integer 2: Lua 5.1 has one number type and no lexical memory,
+  so a validator cannot tell `json.decode("2.0")` from `json.decode("2")`),
+  `invalid_duration` and `invalid_score` (integral, 0..4294967295),
+  `invalid_fail_reason` (a string), and `source_not_client`
   when the SDK is configured as a server or backend, because these schemas pin
   `source` to the constant `client` and the envelope carries the configured
   one. An absent `score` or an empty `fail_reason` omits its key AND erases an
