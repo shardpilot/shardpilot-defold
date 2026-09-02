@@ -734,6 +734,48 @@ function progression_tests.ad_refuses_the_schema_bounds()
 	assert_contains(requests[1].body, '"event_name":"ad_impression_revenue"')
 end
 
+function progression_tests.ad_refuses_non_finite_revenue()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	-- Round 1: math.floor(math.huge) == math.huge, so an infinity passed the
+	-- integrality test and json.encode then failed on it, dropping the WHOLE
+	-- batch with terminal json_encode_failed.
+	local ok, err = client:track_ad_impression_revenue("imp-99", "admob", math.huge, "USD")
+	assert_true(not ok)
+	assert_equal(err, "invalid_revenue_micros")
+	ok, err = client:track_ad_impression_revenue("imp-99", "admob", -math.huge, "USD")
+	assert_true(not ok)
+	assert_equal(err, "invalid_revenue_micros")
+	ok, err = client:track_ad_impression_revenue("imp-99", "admob", 0 / 0, "USD")
+	assert_true(not ok)
+	assert_equal(err, "invalid_revenue_micros")
+	assert_true(client:flush())
+	assert_equal(#requests, 0)
+end
+
+function progression_tests.ad_measures_lengths_in_code_points()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	-- Round 1: # counts BYTES in Lua 5.1 while the schema counts code points.
+	-- 100 CJK characters are 300 bytes and inside the schema's 128-code-point
+	-- network bound.
+	local cjk_network = string.rep("\228\184\173", 100)
+	assert_equal(#cjk_network, 300)
+	assert_true(client:track_ad_impression_revenue("imp-100", cjk_network, 4200, "USD"))
+	-- And one code point past the bound is still refused.
+	local too_long = string.rep("\228\184\173", 129)
+	local ok, err = client:track_ad_impression_revenue("imp-100", too_long, 4200, "USD")
+	assert_true(not ok)
+	assert_equal(err, "invalid_network")
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"event_name":"ad_impression_revenue"')
+end
+
 function progression_tests.ad_whitespace_optional_is_absent_not_fatal()
 	reset()
 	seed_granted_consent()
@@ -8018,6 +8060,8 @@ local tests = {
 	progression_tests.ad_emits_the_canonical_event,
 	progression_tests.ad_omits_the_empty_optional_strings,
 	progression_tests.ad_refuses_the_schema_bounds,
+	progression_tests.ad_refuses_non_finite_revenue,
+	progression_tests.ad_measures_lengths_in_code_points,
 	progression_tests.ad_whitespace_optional_is_absent_not_fatal,
 	progression_tests.ad_inherits_the_consent_gate_and_the_source_pin,
 	test_session_start_renews_session_and_resets_sequence,

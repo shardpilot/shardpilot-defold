@@ -2808,7 +2808,15 @@ local MAX_LEVEL_UNSIGNED_32 = 4294967295
 -- -- and the docs say exactly that rather than promising a rejection this
 -- language cannot deliver (review round 1).
 local function is_integer(value)
-	return type(value) == "number" and value == math.floor(value) and value == value
+	-- Finite, too: math.floor(math.huge) == math.huge, so an infinity passes
+	-- an integrality test and json.encode then fails on it, dropping the
+	-- WHOLE batch with terminal json_encode_failed — unrelated events
+	-- included (shardpilot-defold#76 round 1). NaN fails value == value.
+	return type(value) == "number"
+		and value == math.floor(value)
+		and value == value
+		and value > -math.huge
+		and value < math.huge
 end
 
 -- Validates what every progression event requires and shapes the props: the
@@ -2940,14 +2948,24 @@ local MAX_AD_UNIT = 256
 local MAX_AD_FORMAT = 64
 local MAX_PLACEMENT = 256
 
+-- JSON Schema's maxLength counts CODE POINTS; Lua 5.1's # counts BYTES. A
+-- 100-character CJK network name is 300 bytes, so a byte-length check
+-- refused an impression the schema accepts and lost the revenue event
+-- (shardpilot-defold#76 round 1). Continuation bytes are 0x80..0xBF; every
+-- other byte starts a code point.
+local function code_point_length(value)
+	local _, count = value:gsub("[^\128-\191]", "")
+	return count
+end
+
 -- A trimmed string within its bound, or nil for anything the schema would
--- refuse: a non-string, an empty one, or one too long.
+-- refuse: a non-string, an empty one, or one too long IN CODE POINTS.
 local function bounded_string(value, max_length)
 	if type(value) ~= "string" then
 		return nil
 	end
 	local trimmed = value:match("^%s*(.-)%s*$")
-	if trimmed == "" or #trimmed > max_length then
+	if trimmed == "" or code_point_length(trimmed) > max_length then
 		return nil
 	end
 	return trimmed
@@ -2994,7 +3012,7 @@ function Client:track_ad_impression_revenue(
 		return false, "invalid_currency"
 	end
 	local code = currency:match("^%s*(.-)%s*$")
-	if #code ~= CURRENCY_LENGTH then
+	if code_point_length(code) ~= CURRENCY_LENGTH then
 		return false, "invalid_currency"
 	end
 	local out = {
@@ -3021,7 +3039,7 @@ function Client:track_ad_impression_revenue(
 			end
 			local trimmed = value:match("^%s*(.-)%s*$")
 			if trimmed ~= "" then
-				if #trimmed > max_length then
+				if code_point_length(trimmed) > max_length then
 					return false, "invalid_" .. key
 				end
 				out[key] = trimmed
