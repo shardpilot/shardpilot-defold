@@ -734,6 +734,22 @@ function progression_tests.ad_refuses_the_schema_bounds()
 	assert_contains(requests[1].body, '"event_name":"ad_impression_revenue"')
 end
 
+function progression_tests.ad_whitespace_optional_is_absent_not_fatal()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	-- shardpilot-godot#23 round 1, carried here: a whitespace placeholder in
+	-- an optional field must omit the field, not refuse the impression.
+	assert_true(client:track_ad_impression_revenue("imp-97", "admob", 4200, "USD", " ", "  ", "", "\t"))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_not_contains(requests[1].body, '"revenue_precision"')
+	assert_not_contains(requests[1].body, '"ad_unit"')
+	assert_not_contains(requests[1].body, '"ad_format"')
+	assert_not_contains(requests[1].body, '"placement"')
+end
+
 function progression_tests.ad_inherits_the_consent_gate_and_the_source_pin()
 	storage.reset()
 	reset()
@@ -8002,6 +8018,7 @@ local tests = {
 	progression_tests.ad_emits_the_canonical_event,
 	progression_tests.ad_omits_the_empty_optional_strings,
 	progression_tests.ad_refuses_the_schema_bounds,
+	progression_tests.ad_whitespace_optional_is_absent_not_fatal,
 	progression_tests.ad_inherits_the_consent_gate_and_the_source_pin,
 	test_session_start_renews_session_and_resets_sequence,
 	test_session_start_rolls_back_on_enqueue_failure,

@@ -3011,12 +3011,21 @@ function Client:track_ad_impression_revenue(
 	}
 	for _, optional in ipairs(optionals) do
 		local key, value, max_length = optional[1], optional[2], optional[3]
-		if value ~= nil and value ~= "" then
-			local bounded = bounded_string(value, max_length)
-			if not bounded then
+		if value ~= nil then
+			-- Emptiness is judged AFTER trimming: a mediation network's
+			-- whitespace placeholder (" ") is an ABSENT field, not a fatal
+			-- one. The raw check that preceded this refused the whole
+			-- impression over a space (shardpilot-godot#23 round 1).
+			if type(value) ~= "string" then
 				return false, "invalid_" .. key
 			end
-			out[key] = bounded
+			local trimmed = value:match("^%s*(.-)%s*$")
+			if trimmed ~= "" then
+				if #trimmed > max_length then
+					return false, "invalid_" .. key
+				end
+				out[key] = trimmed
+			end
 		end
 	end
 	return self:track("ad_impression_revenue", out)
