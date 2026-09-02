@@ -43,7 +43,11 @@ not the platform boundary.
   later launch with their original `event_id`, so the ingest service
   de-duplicates re-sends. See [Offline durability](#offline-durability-event-spool).
 - Emits canonical helpers: `session_start()` → `app.session_started`,
-  `screen_view(name)` → `app.screen_view`, plus arbitrary `track(name, props)`.
+  `screen_view(name)` → `app.screen_view`, the typed progression verbs
+  `track_level_start(level_id, attempt)` → `level_start`,
+  `track_level_complete(level_id, attempt, duration_ms[, score])` →
+  `level_complete` and `track_level_fail(level_id, attempt, duration_ms[,
+  fail_reason])` → `level_fail`, plus arbitrary `track(name, props)`.
 - Generates and persists a UUIDv7 anonymous ID per configured app and supports
   `identify(user_id)` to upgrade attribution to a known user.
 - **Consent-first analytics.** Records an explicit consent decision over the

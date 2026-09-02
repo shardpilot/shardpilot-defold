@@ -2,6 +2,29 @@
 
 ### Unreleased
 
+- **Typed progression verbs: `track_level_start`, `track_level_complete`,
+  `track_level_fail`.** The canonical `level_start`, `level_complete` and
+  `level_fail` events (analytics.level_start.v1 / level_complete.v1 /
+  level_fail.v1) built from typed arguments rather than a hand-assembled props
+  table, on the client and on the `shardpilot.sdk` singleton. Each validates
+  the schema's bounds before anything is queued and answers the SDK's
+  `false, code` convention: `level_id_required` (a non-empty string),
+  `invalid_attempt` (an integer in 1..65535 — a float is refused, not
+  truncated), `invalid_duration` and `invalid_score` (integers in
+  0..4294967295), `invalid_fail_reason` (a string), and `source_not_client`
+  when the SDK is configured as a server or backend, because these schemas pin
+  `source` to the constant `client` and the envelope carries the configured
+  one. An absent `score` or an empty `fail_reason` omits its key AND erases an
+  extra spelling it, so nothing rides under a key the schema types otherwise.
+  Extras ride along with the canonical keys written after them and the caller's
+  own table is never mutated. Everything else is `track()`'s, unchanged: the
+  consent-first gate and its codes, the lazy session, the queue, the spool.
+
+  This does not reopen the 2026-08-29 removal of `tutorial_start` /
+  `tutorial_step_complete` / `tutorial_complete`: those names had no registered
+  schema, which was the reason they went. `docs/events.md` now says so where
+  the removal is recorded.
+
 <!-- Folded into the next "## vX.Y.Z" heading at release time; kept at a
      deeper heading level so scripts/check_versions.sh keeps reading the
      topmost RELEASED version from the first "## " heading. -->
