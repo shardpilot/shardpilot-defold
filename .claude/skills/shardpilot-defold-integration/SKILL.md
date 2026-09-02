@@ -320,7 +320,17 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
 - The event-enqueue helpers (`track`, `screen_view`, `session_start`) return
   `ok, err`. `track` failure codes: `consent_unknown`, `consent_denied`,
   `event_name_required`, `identity_required`, `invalid_props`,
-  `invalid_context`, `queue_full`, `shutdown`. The observer calls
+  `invalid_context`, `queue_full`, `shutdown`.
+- The typed progression verbs — `sdk.track_level_start(level_id, attempt[,
+  props])`, `sdk.track_level_complete(level_id, attempt, duration_ms[, score][,
+  props])`, `sdk.track_level_fail(level_id, attempt, duration_ms[, fail_reason][,
+  props])` — emit the canonical `level_start` / `level_complete` / `level_fail`
+  and validate the schema's bounds before anything is queued. Their own codes,
+  on top of `track`'s: `level_id_required`, `invalid_attempt` (an integer in
+  1..65535), `invalid_duration` and `invalid_score` (0..4294967295),
+  `invalid_fail_reason`, and `source_not_client` — these schemas are
+  client-source only. An absent `score` or empty `fail_reason` is omitted from
+  the wire even when `props` carries that key. The observer calls
   (`observe_ping_ms`, `observe_disconnect`) return **nothing** — they feed the
   samplers only while consent is granted and are silent no-ops otherwise; do
   not wrap them in `ok, err` handling.
