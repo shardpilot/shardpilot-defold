@@ -514,6 +514,32 @@ function progression_tests.optional_keys_are_absent_not_zero()
 	assert_not_contains(requests[1].body, '"fail_reason"')
 end
 
+function progression_tests.props_in_the_optional_slot_are_props()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	-- Round 3: score and fail_reason are INDEPENDENTLY optional in the
+	-- documented signature, and Lua cannot skip a positional argument, so a
+	-- call written exactly as the skill shows it put the props table in the
+	-- typed slot and was refused as invalid_score / invalid_fail_reason.
+	assert_true(client:track_level_complete("forest-3", 1, 900, { mode = "hard" }))
+	assert_true(client:track_level_fail("forest-4", 2, 1200, { mode = "hard" }))
+	assert_true(client:flush())
+
+	assert_equal(#requests, 1)
+	-- The extras rode along and neither typed key was invented.
+	assert_contains(requests[1].body, '"mode":"hard"')
+	assert_not_contains(requests[1].body, '"score"')
+	assert_not_contains(requests[1].body, '"fail_reason"')
+
+	-- The shift happens ONLY when props is absent: an explicit props argument
+	-- keeps the typed slot typed, and a bad value there is still refused.
+	local ok, err = client:track_level_complete("forest-3", 1, 900, { mode = "hard" }, { extra = 1 })
+	assert_true(not ok)
+	assert_equal(err, "invalid_score")
+end
+
 function progression_tests.refuse_the_schema_bounds()
 	reset()
 	seed_granted_consent()
@@ -7848,6 +7874,7 @@ local tests = {
 	test_screen_view_does_not_mutate_caller_props,
 	progression_tests.emit_the_canonical_events,
 	progression_tests.optional_keys_are_absent_not_zero,
+	progression_tests.props_in_the_optional_slot_are_props,
 	progression_tests.refuse_the_schema_bounds,
 	progression_tests.inherit_the_consent_gate,
 	progression_tests.refuse_a_non_client_source,

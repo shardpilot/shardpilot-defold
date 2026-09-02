@@ -2872,6 +2872,16 @@ function Client:track_level_complete(level_id, attempt, duration_ms, score, prop
 	if not self:_require_client_source() then
 		return false, "source_not_client"
 	end
+	-- score and props are INDEPENDENTLY optional, as the signature in the
+	-- README and the integration skill says, and Lua has no way to skip a
+	-- positional argument. A table in the score slot with no props argument
+	-- is therefore the props table: shift it, rather than refusing a call
+	-- written exactly as documented (round 3). score is always a number, so
+	-- the two can never be confused.
+	if props == nil and type(score) == "table" then
+		props = score
+		score = nil
+	end
 	local out, err = build_level_props(level_id, attempt, props)
 	if not out then
 		return false, err
@@ -2893,6 +2903,12 @@ end
 function Client:track_level_fail(level_id, attempt, duration_ms, fail_reason, props)
 	if not self:_require_client_source() then
 		return false, "source_not_client"
+	end
+	-- As in track_level_complete: fail_reason is always a string, so a table
+	-- in its slot with no props argument is the props table (round 3).
+	if props == nil and type(fail_reason) == "table" then
+		props = fail_reason
+		fail_reason = nil
 	end
 	local out, err = build_level_props(level_id, attempt, props)
 	if not out then
