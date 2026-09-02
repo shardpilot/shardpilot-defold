@@ -534,10 +534,6 @@ function progression_tests.refuse_the_schema_bounds()
 	ok, err = client:track_level_start("forest-3", 2.5)
 	assert_true(not ok)
 	assert_equal(err, "invalid_attempt")
-	-- Review round 1: 2.0 is NOT a rejection case. Lua 5.1 has one number
-	-- type, so an integral float IS the integer and the check is
-	-- mathematical; the docs promise that and no more.
-	assert_true(client:track_level_start("forest-3", 2.0))
 	ok, err = client:track_level_complete("forest-3", 1, -1)
 	assert_true(not ok)
 	assert_equal(err, "invalid_duration")
@@ -559,6 +555,16 @@ function progression_tests.refuse_the_schema_bounds()
 	assert_true(client:flush())
 	assert_equal(#requests, 1)
 	assert_contains(requests[1].body, '"event_name":"level_start"')
+
+	-- Review round 1: 2.0 is NOT a rejection case, and the assertion lives
+	-- here rather than among the refusals because it ENQUEUES. Lua 5.1 has
+	-- one number type, so an integral float IS the integer and the check is
+	-- mathematical; the docs promise that and no more.
+	reset()
+	assert_true(client:track_level_start("forest-3", 2.0))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"attempt":2')
 end
 
 function progression_tests.inherit_the_consent_gate()
