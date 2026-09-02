@@ -2,6 +2,27 @@
 
 ### Unreleased
 
+- **Typed ad verb: `track_ad_impression_revenue`.** The canonical
+  `ad_impression_revenue` event (analytics.ad_impression_revenue.v1) on the
+  client and the `shardpilot.sdk` singleton: `impression_id` (1..256),
+  `network` (1..128), `revenue_micros` (an integer at or above 0 — revenue in
+  millionths of a currency unit) and `currency` (exactly three characters,
+  upper-cased to the ISO 4217 form) required; `revenue_precision`, `ad_unit`,
+  `ad_format` and `placement` optional, bounded by the schema's lengths and
+  omitted when empty. Refusals: `invalid_impression_id`, `invalid_network`,
+  `invalid_revenue_micros`, `invalid_currency`, one per optional field, and
+  `source_not_client`.
+
+  **It takes no props table, unlike the progression verbs:** that schema sets
+  `additionalProperties: false`, so an undeclared key makes the ingest reject
+  the event.
+
+  **Consent has two gates and this SDK owns one.** Beyond `track`'s
+  consent-first gate the ingest requires the workspace's `ad_revenue` consent
+  posture (ADR-0231 §5) and suppresses the event per event, inside an ACCEPTED
+  batch, with `suppressed_ad_revenue_consent` when that grant is missing. This
+  SDK can neither see nor set it: read the batch's per-event statuses.
+
 - **Typed progression verbs: `track_level_start`, `track_level_complete`,
   `track_level_fail`.** The canonical `level_start`, `level_complete` and
   `level_fail` events (analytics.level_start.v1 / level_complete.v1 /

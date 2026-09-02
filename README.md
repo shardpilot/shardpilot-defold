@@ -48,7 +48,10 @@ not the platform boundary.
   `track_level_start(level_id, attempt)` → `level_start`,
   `track_level_complete(level_id, attempt, duration_ms[, score])` →
   `level_complete` and `track_level_fail(level_id, attempt, duration_ms[,
-  fail_reason])` → `level_fail`, plus arbitrary `track(name, props)`.
+  fail_reason])` → `level_fail`, the typed ad verb
+  `track_ad_impression_revenue(impression_id, network, revenue_micros,
+  currency[, revenue_precision, ad_unit, ad_format, placement])` →
+  `ad_impression_revenue`, plus arbitrary `track(name, props)`.
 - Generates and persists a UUIDv7 anonymous ID per configured app and supports
   `identify(user_id)` to upgrade attribution to a known user.
 - **Consent-first analytics.** Records an explicit consent decision over the
