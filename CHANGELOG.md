@@ -19,9 +19,9 @@
 
   **Consent has two gates and this SDK owns one.** Beyond `track`'s
   consent-first gate the ingest requires the workspace's `ad_revenue` consent
-  posture (ADR-0231 §5) and suppresses the event per event, inside an ACCEPTED
-  batch, with `suppressed_ad_revenue_consent` when that grant is missing. This
-  SDK can neither see nor set it: read the batch's per-event statuses.
+  posture and suppresses the event per event, inside an ACCEPTED batch, with
+  `suppressed_ad_revenue_consent` when that grant is missing. This SDK can
+  neither see nor set it: read the batch's per-event statuses.
 
 - **Typed progression verbs: `track_level_start`, `track_level_complete`,
   `track_level_fail`.** The canonical `level_start`, `level_complete` and

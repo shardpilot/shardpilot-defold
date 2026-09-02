@@ -345,7 +345,7 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
   millionths of a currency unit. Its own codes: `invalid_impression_id`,
   `invalid_network`, `invalid_revenue_micros`, `invalid_currency`, one per
   optional field, and `source_not_client`. Beyond the SDK's own gate the
-  ingest applies the workspace's `ad_revenue` posture (ADR-0231 §5) and can
+  ingest applies the workspace's `ad_revenue` consent posture and can
   suppress the event per event inside an ACCEPTED batch with
   `suppressed_ad_revenue_consent`; this SDK cannot see that grant. The observer calls
   (`observe_ping_ms`, `observe_disconnect`) return **nothing** — they feed the

@@ -2980,7 +2980,7 @@ end
 --
 -- Consent has two gates and this SDK owns one. The consent-first gate is
 -- track's, unchanged, and the client-source pin applies. Beyond them the
--- ingest requires the workspace's ad_revenue consent posture (ADR-0231 §5)
+-- ingest requires the workspace's ad_revenue consent posture
 -- and suppresses the event per event, inside an ACCEPTED batch, with status
 -- suppressed_ad_revenue_consent when that grant is missing; this SDK cannot
 -- see or set that grant.
