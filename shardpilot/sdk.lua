@@ -233,6 +233,18 @@ function M.track(event_name, props, context)
 	return with_default("track", event_name, props, context)
 end
 
+function M.track_level_start(level_id, attempt, props)
+	return with_default("track_level_start", level_id, attempt, props)
+end
+
+function M.track_level_complete(level_id, attempt, duration_ms, score, props)
+	return with_default("track_level_complete", level_id, attempt, duration_ms, score, props)
+end
+
+function M.track_level_fail(level_id, attempt, duration_ms, fail_reason, props)
+	return with_default("track_level_fail", level_id, attempt, duration_ms, fail_reason, props)
+end
+
 function M.update(dt)
 	return with_default("update", dt)
 end

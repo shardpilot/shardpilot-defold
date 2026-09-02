@@ -2796,6 +2796,117 @@ function Client:screen_view(screen_name, props)
 	return self:track("app.screen_view", out)
 end
 
+-- The progression schemas' bounds: attempt is a count from 1 that fits 16
+-- bits; duration_ms and score are unsigned 32-bit integers.
+local MAX_LEVEL_ATTEMPT = 65535
+local MAX_LEVEL_UNSIGNED_32 = 4294967295
+
+local function is_integer(value)
+	return type(value) == "number" and value == math.floor(value) and value == value
+end
+
+-- Validates what every progression event requires and shapes the props: the
+-- caller's extras first (a shallow copy, screen_view's shape -- the caller's
+-- own table is never mutated), the canonical keys after them, so a typed
+-- field cannot be contradicted through the map.
+local function build_level_props(level_id, attempt, props)
+	if type(level_id) ~= "string" or level_id == "" then
+		return nil, "level_id_required"
+	end
+	if not is_integer(attempt) or attempt < 1 or attempt > MAX_LEVEL_ATTEMPT then
+		return nil, "invalid_attempt"
+	end
+	local out = {}
+	if type(props) == "table" then
+		for key, value in pairs(props) do
+			out[key] = value
+		end
+	end
+	out.level_id = level_id
+	out.attempt = attempt
+	return out
+end
+
+local function valid_unsigned_32(value)
+	return is_integer(value) and value >= 0 and value <= MAX_LEVEL_UNSIGNED_32
+end
+
+-- The progression schemas pin source to the constant "client" and the
+-- envelope carries the CONFIGURED source, so a dedicated server's events
+-- could never satisfy the schema: they would be rejected per event inside an
+-- accepted batch and the fact lost. The verbs refuse instead, as the Go SDK's
+-- backend-lane verbs refuse a non-backend source (shardpilot-godot#20 round 1).
+function Client:_require_client_source()
+	if self.config and self.config.source and self.config.source ~= "client" then
+		return false
+	end
+	return true
+end
+
+-- Typed progression verb: the canonical level_start. level_id is a non-empty
+-- string and attempt an integer in 1..65535; extras in props ride along with
+-- the canonical keys winning. Delivery is track's -- the consent gate and its
+-- codes, the lazy session, the queue and the spool are unchanged.
+function Client:track_level_start(level_id, attempt, props)
+	if not self:_require_client_source() then
+		return false, "source_not_client"
+	end
+	local out, err = build_level_props(level_id, attempt, props)
+	if not out then
+		return false, err
+	end
+	return self:track("level_start", out)
+end
+
+-- Typed progression verb: the canonical level_complete. duration_ms is an
+-- integer in 0..4294967295 and score the same or nil; an absent score omits
+-- the key -- and erases an extra spelling it, so nothing rides under a key
+-- the schema types as an integer.
+function Client:track_level_complete(level_id, attempt, duration_ms, score, props)
+	if not self:_require_client_source() then
+		return false, "source_not_client"
+	end
+	local out, err = build_level_props(level_id, attempt, props)
+	if not out then
+		return false, err
+	end
+	if not valid_unsigned_32(duration_ms) then
+		return false, "invalid_duration"
+	end
+	if score ~= nil and not valid_unsigned_32(score) then
+		return false, "invalid_score"
+	end
+	out.duration_ms = duration_ms
+	out.score = score
+	return self:track("level_complete", out)
+end
+
+-- Typed progression verb: the canonical level_fail. fail_reason is an
+-- optional string; nil or an empty one omits the key and erases an extra
+-- spelling it.
+function Client:track_level_fail(level_id, attempt, duration_ms, fail_reason, props)
+	if not self:_require_client_source() then
+		return false, "source_not_client"
+	end
+	local out, err = build_level_props(level_id, attempt, props)
+	if not out then
+		return false, err
+	end
+	if not valid_unsigned_32(duration_ms) then
+		return false, "invalid_duration"
+	end
+	if fail_reason ~= nil and type(fail_reason) ~= "string" then
+		return false, "invalid_fail_reason"
+	end
+	out.duration_ms = duration_ms
+	if fail_reason == nil or fail_reason == "" then
+		out.fail_reason = nil
+	else
+		out.fail_reason = fail_reason
+	end
+	return self:track("level_fail", out)
+end
+
 function Client:track(event_name, props, context)
 	return self:enqueue_event(event_name, props, context, nil)
 end

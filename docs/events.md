@@ -24,6 +24,8 @@ Do not use legacy public SDK fields: `project_id`, `game_id`, `env`,
 Built-in helpers enqueue (wire `event_name`, with the helper in parentheses
 where it differs):
 
+- `level_start`, `level_complete`, `level_fail` (from the typed progression
+  verbs `track_level_start()`, `track_level_complete()`, `track_level_fail()`)
 - `app.session_started` (from the `session_start()` helper)
 - `app.session_ended` (from the `session_end()` helper)
 - `app.screen_view` (from the `screen_view()` helper)
@@ -47,6 +49,16 @@ They were not renamed, because no registered equivalent exists, and no schema wa
 minted for them: game-specific names and tracking helpers belong in a game's own
 adapter rather than in a universal telemetry SDK, and the other four ShardPilot
 SDKs already work that way — Defold was the only one shipping typed game verbs.
+
+**That reasoning does not cover the progression verbs added in 2026-09-02**, and
+the sentence above should be read with this paragraph. `level_start`,
+`level_complete` and `level_fail` are REGISTERED canonical schemas
+(analytics.level_start.v1 / level_complete.v1 / level_fail.v1) with facts behind
+them, which is exactly what the tutorial names lacked; and every ShardPilot SDK
+now ships the same three typed verbs, so the parity argument now points the
+other way. A verb is worth having when it builds a registered event and
+validates the schema's own bounds before anything is queued — not when it wraps
+a name the platform never heard of.
 
 **Migration:** call `track()` directly with whatever name your analytics contract
 registers — `client:track("your_event", { … })`. The removed helpers did nothing

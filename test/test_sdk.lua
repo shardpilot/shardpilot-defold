@@ -465,6 +465,152 @@ local function test_app_first_payload()
 	assert_not_contains(request.body, '"build_version"')
 end
 
+-- ── C3 typed progression verbs ──────────────────────────────────────────
+local progression_tests = {}
+
+function progression_tests.emit_the_canonical_events()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	local extras = { mode = "hard", attempt = "not-the-attempt" }
+	assert_true(client:track_level_start("forest-3", 2, extras))
+	assert_true(client:track_level_complete("forest-3", 2, 45210, 1200))
+	assert_true(client:track_level_fail("forest-4", 1, 12000, "out_of_moves"))
+	assert_true(client:flush())
+
+	assert_equal(#requests, 1)
+	local body = requests[1].body
+	assert_contains(body, '"event_name":"level_start"')
+	assert_contains(body, '"event_name":"level_complete"')
+	assert_contains(body, '"event_name":"level_fail"')
+	assert_contains(body, '"level_id":"forest-3"')
+	assert_contains(body, '"attempt":2')
+	assert_contains(body, '"duration_ms":45210')
+	assert_contains(body, '"score":1200')
+	assert_contains(body, '"fail_reason":"out_of_moves"')
+	assert_contains(body, '"mode":"hard"')
+	assert_not_contains(body, "not-the-attempt")
+	-- The caller's own table is never mutated.
+	assert_equal(extras.level_id, nil)
+	assert_equal(extras.attempt, "not-the-attempt")
+end
+
+function progression_tests.optional_keys_are_absent_not_zero()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	-- An extra spelling a reserved optional key must not ride under it when
+	-- the typed argument says the key is absent: the schema types score as an
+	-- integer, so an inherited string is rejected per event inside an accepted
+	-- batch (shardpilot-godot#20 round 1).
+	assert_true(client:track_level_complete("forest-3", 1, 900, nil, { score = "high" }))
+	assert_true(client:track_level_fail("forest-3", 1, 900, nil, { fail_reason = "inherited" }))
+	assert_true(client:flush())
+
+	assert_equal(#requests, 1)
+	assert_not_contains(requests[1].body, '"score"')
+	assert_not_contains(requests[1].body, '"fail_reason"')
+end
+
+function progression_tests.refuse_the_schema_bounds()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	local ok, err = client:track_level_start("", 1)
+	assert_true(not ok)
+	assert_equal(err, "level_id_required")
+	ok, err = client:track_level_start(nil, 1)
+	assert_true(not ok)
+	assert_equal(err, "level_id_required")
+	ok, err = client:track_level_start("forest-3", 0)
+	assert_true(not ok)
+	assert_equal(err, "invalid_attempt")
+	ok, err = client:track_level_start("forest-3", 65536)
+	assert_true(not ok)
+	assert_equal(err, "invalid_attempt")
+	ok, err = client:track_level_start("forest-3", 2.5)
+	assert_true(not ok)
+	assert_equal(err, "invalid_attempt")
+	ok, err = client:track_level_complete("forest-3", 1, -1)
+	assert_true(not ok)
+	assert_equal(err, "invalid_duration")
+	ok, err = client:track_level_complete("forest-3", 1, 4294967296)
+	assert_true(not ok)
+	assert_equal(err, "invalid_duration")
+	ok, err = client:track_level_complete("forest-3", 1, 10, -1)
+	assert_true(not ok)
+	assert_equal(err, "invalid_score")
+	ok, err = client:track_level_fail("forest-3", 1, 10, 42)
+	assert_true(not ok)
+	assert_equal(err, "invalid_fail_reason")
+	assert_true(client:flush())
+	assert_equal(#requests, 0)
+
+	-- Precondition for the empty wire above: the same client accepts a valid
+	-- call, so the silence is the refusal and not a dead pipeline.
+	assert_true(client:track_level_start("forest-3", 1))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"event_name":"level_start"')
+end
+
+function progression_tests.inherit_the_consent_gate()
+	storage.reset()
+	reset()
+	-- No identify() here: it is itself consent-gated, and this scene starts
+	-- from an undecided decision on purpose (storage.reset drops any consent
+	-- an earlier scene persisted).
+	local client = assert(sdk.new(config()))
+	local ok, err = client:track_level_start("forest-3", 1)
+	assert_true(not ok)
+	assert_equal(err, "consent_unknown")
+	assert_true(client:set_consent(false))
+	ok, err = client:track_level_complete("forest-3", 1, 10)
+	assert_true(not ok)
+	assert_equal(err, "consent_denied")
+	ok, err = client:track_level_fail("forest-3", 1, 10)
+	assert_true(not ok)
+	assert_equal(err, "consent_denied")
+	reset()
+	assert_true(client:set_consent(true))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track_level_start("forest-3", 1))
+	assert_true(client:flush())
+	local found = false
+	for _, request in ipairs(requests) do
+		if string.find(request.body, '"event_name":"level_start"', 1, true) then
+			found = true
+		end
+	end
+	assert_true(found)
+end
+
+function progression_tests.refuse_a_non_client_source()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a({ source = "server" })))
+	assert_true(client:identify("user-example"))
+	local ok, err = client:track_level_start("forest-3", 1)
+	assert_true(not ok)
+	assert_equal(err, "source_not_client")
+	ok, err = client:track_level_complete("forest-3", 1, 10)
+	assert_true(not ok)
+	assert_equal(err, "source_not_client")
+	ok, err = client:track_level_fail("forest-3", 1, 10)
+	assert_true(not ok)
+	assert_equal(err, "source_not_client")
+	assert_true(client:flush())
+	assert_equal(#requests, 0)
+	-- The refusal is the source, not the arguments: a plain track still rides.
+	assert_true(client:track("custom_event"))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"event_name":"custom_event"')
+end
+
 local function test_screen_view_does_not_mutate_caller_props()
 	reset()
 	seed_granted_consent()
@@ -7682,6 +7828,11 @@ local tests = {
 	test_platform_maps_html5_to_web,
 	test_app_first_payload,
 	test_screen_view_does_not_mutate_caller_props,
+	progression_tests.emit_the_canonical_events,
+	progression_tests.optional_keys_are_absent_not_zero,
+	progression_tests.refuse_the_schema_bounds,
+	progression_tests.inherit_the_consent_gate,
+	progression_tests.refuse_a_non_client_source,
 	test_session_start_renews_session_and_resets_sequence,
 	test_session_start_rolls_back_on_enqueue_failure,
 	test_session_start_rolls_back_on_invalid_props,
