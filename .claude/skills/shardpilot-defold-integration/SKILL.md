@@ -52,7 +52,7 @@ Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.1`.
 
 ⚠ **This skill is written against `main`, which is AHEAD of that tag**, because
 `v0.10.1` is a deletion-only patch on top of `v0.10.0` and carries no source
-change. THREE things documented below are NOT in it, and are marked
+change. FOUR things documented below are NOT in it, and are marked
 *(unreleased)* where they appear:
 
 * `request_compression_enabled` and the whole request-compression path — the
@@ -61,6 +61,10 @@ change. THREE things documented below are NOT in it, and are marked
 * retry pacing on its own clock — `Client:retry_due` does not exist at the tag
   (0 occurrences against 10 on `main`), so a retryable failure there waits for
   the flush tick instead of its own backoff deadline.
+* the typed progression verbs — `track_level_start` / `track_level_complete` /
+  `track_level_fail` and their codes are absent from the tag, so an
+  integration that pins `v0.10.1` and calls one gets a nil value; they land
+  with the next tag, and until then depend on a commit from `main`.
 
 Everything else describes the pinned release. A tag cut from the fully cleaned,
 current tree is the real fix and is sequenced after the source scrub.
@@ -321,7 +325,8 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
   `ok, err`. `track` failure codes: `consent_unknown`, `consent_denied`,
   `event_name_required`, `identity_required`, `invalid_props`,
   `invalid_context`, `queue_full`, `shutdown`.
-- The typed progression verbs — `sdk.track_level_start(level_id, attempt[,
+- The typed progression verbs *(unreleased — absent at `v0.10.1`)* —
+  `sdk.track_level_start(level_id, attempt[,
   props])`, `sdk.track_level_complete(level_id, attempt, duration_ms[, score][,
   props])`, `sdk.track_level_fail(level_id, attempt, duration_ms[, fail_reason][,
   props])` — emit the canonical `level_start` / `level_complete` / `level_fail`
