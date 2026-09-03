@@ -52,7 +52,7 @@ Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.1`.
 
 ⚠ **This skill is written against `main`, which is AHEAD of that tag**, because
 `v0.10.1` is a deletion-only patch on top of `v0.10.0` and carries no source
-change. THREE things documented below are NOT in it, and are marked
+change. FOUR things documented below are NOT in it, and are marked
 *(unreleased)* where they appear:
 
 * `request_compression_enabled` and the whole request-compression path — the
@@ -61,6 +61,10 @@ change. THREE things documented below are NOT in it, and are marked
 * retry pacing on its own clock — `Client:retry_due` does not exist at the tag
   (0 occurrences against 10 on `main`), so a retryable failure there waits for
   the flush tick instead of its own backoff deadline.
+* the typed progression verbs — `track_level_start` / `track_level_complete` /
+  `track_level_fail` and their codes are absent from the tag, so an
+  integration that pins `v0.10.1` and calls one gets a nil value; they land
+  with the next tag, and until then depend on a commit from `main`.
 
 Everything else describes the pinned release. A tag cut from the fully cleaned,
 current tree is the real fix and is sequenced after the source scrub.
@@ -320,7 +324,20 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
 - The event-enqueue helpers (`track`, `screen_view`, `session_start`) return
   `ok, err`. `track` failure codes: `consent_unknown`, `consent_denied`,
   `event_name_required`, `identity_required`, `invalid_props`,
-  `invalid_context`, `queue_full`, `shutdown`. The observer calls
+  `invalid_context`, `queue_full`, `shutdown`.
+- The typed progression verbs *(unreleased — absent at `v0.10.1`)* —
+  `sdk.track_level_start(level_id, attempt[,
+  props])`, `sdk.track_level_complete(level_id, attempt, duration_ms[, score][,
+  props])`, `sdk.track_level_fail(level_id, attempt, duration_ms[, fail_reason][,
+  props])` — emit the canonical `level_start` / `level_complete` / `level_fail`
+  and validate the schema's bounds before anything is queued. Their own codes,
+  on top of `track`'s: `level_id_required`, `invalid_attempt` (an integral
+  number in 1..65535 — `2.5` is refused; `2.0` is the integer 2, because Lua
+  5.1 has one number type), `invalid_duration` and `invalid_score`
+  (integral, 0..4294967295),
+  `invalid_fail_reason`, and `source_not_client` — these schemas are
+  client-source only. An absent `score` or empty `fail_reason` is omitted from
+  the wire even when `props` carries that key. The observer calls
   (`observe_ping_ms`, `observe_disconnect`) return **nothing** — they feed the
   samplers only while consent is granted and are silent no-ops otherwise; do
   not wrap them in `ok, err` handling.

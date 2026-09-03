@@ -465,6 +465,188 @@ local function test_app_first_payload()
 	assert_not_contains(request.body, '"build_version"')
 end
 
+-- ── C3 typed progression verbs ──────────────────────────────────────────
+local progression_tests = {}
+
+function progression_tests.emit_the_canonical_events()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	local extras = { mode = "hard", attempt = "not-the-attempt" }
+	assert_true(client:track_level_start("forest-3", 2, extras))
+	assert_true(client:track_level_complete("forest-3", 2, 45210, 1200))
+	assert_true(client:track_level_fail("forest-4", 1, 12000, "out_of_moves"))
+	assert_true(client:flush())
+
+	assert_equal(#requests, 1)
+	local body = requests[1].body
+	assert_contains(body, '"event_name":"level_start"')
+	assert_contains(body, '"event_name":"level_complete"')
+	assert_contains(body, '"event_name":"level_fail"')
+	assert_contains(body, '"level_id":"forest-3"')
+	assert_contains(body, '"attempt":2')
+	assert_contains(body, '"duration_ms":45210')
+	assert_contains(body, '"score":1200')
+	assert_contains(body, '"fail_reason":"out_of_moves"')
+	assert_contains(body, '"mode":"hard"')
+	assert_not_contains(body, "not-the-attempt")
+	-- The caller's own table is never mutated.
+	assert_equal(extras.level_id, nil)
+	assert_equal(extras.attempt, "not-the-attempt")
+end
+
+function progression_tests.optional_keys_are_absent_not_zero()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	-- An extra spelling a reserved optional key must not ride under it when
+	-- the typed argument says the key is absent: the schema types score as an
+	-- integer, so an inherited string is rejected per event inside an accepted
+	-- batch (shardpilot-godot#20 round 1).
+	assert_true(client:track_level_complete("forest-3", 1, 900, nil, { score = "high" }))
+	assert_true(client:track_level_fail("forest-3", 1, 900, nil, { fail_reason = "inherited" }))
+	assert_true(client:flush())
+
+	assert_equal(#requests, 1)
+	assert_not_contains(requests[1].body, '"score"')
+	assert_not_contains(requests[1].body, '"fail_reason"')
+end
+
+function progression_tests.props_in_the_optional_slot_are_props()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	-- Round 3: score and fail_reason are INDEPENDENTLY optional in the
+	-- documented signature, and Lua cannot skip a positional argument, so a
+	-- call written exactly as the skill shows it put the props table in the
+	-- typed slot and was refused as invalid_score / invalid_fail_reason.
+	assert_true(client:track_level_complete("forest-3", 1, 900, { mode = "hard" }))
+	assert_true(client:track_level_fail("forest-4", 2, 1200, { mode = "hard" }))
+	assert_true(client:flush())
+
+	assert_equal(#requests, 1)
+	-- The extras rode along and neither typed key was invented.
+	assert_contains(requests[1].body, '"mode":"hard"')
+	assert_not_contains(requests[1].body, '"score"')
+	assert_not_contains(requests[1].body, '"fail_reason"')
+
+	-- The shift happens ONLY when props is absent: an explicit props argument
+	-- keeps the typed slot typed, and a bad value there is still refused.
+	local ok, err = client:track_level_complete("forest-3", 1, 900, { mode = "hard" }, { extra = 1 })
+	assert_true(not ok)
+	assert_equal(err, "invalid_score")
+end
+
+function progression_tests.refuse_the_schema_bounds()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a()))
+	assert_true(client:identify("user-example"))
+	local ok, err = client:track_level_start("", 1)
+	assert_true(not ok)
+	assert_equal(err, "level_id_required")
+	ok, err = client:track_level_start(nil, 1)
+	assert_true(not ok)
+	assert_equal(err, "level_id_required")
+	ok, err = client:track_level_start("forest-3", 0)
+	assert_true(not ok)
+	assert_equal(err, "invalid_attempt")
+	ok, err = client:track_level_start("forest-3", 65536)
+	assert_true(not ok)
+	assert_equal(err, "invalid_attempt")
+	ok, err = client:track_level_start("forest-3", 2.5)
+	assert_true(not ok)
+	assert_equal(err, "invalid_attempt")
+	ok, err = client:track_level_complete("forest-3", 1, -1)
+	assert_true(not ok)
+	assert_equal(err, "invalid_duration")
+	ok, err = client:track_level_complete("forest-3", 1, 4294967296)
+	assert_true(not ok)
+	assert_equal(err, "invalid_duration")
+	ok, err = client:track_level_complete("forest-3", 1, 10, -1)
+	assert_true(not ok)
+	assert_equal(err, "invalid_score")
+	ok, err = client:track_level_fail("forest-3", 1, 10, 42)
+	assert_true(not ok)
+	assert_equal(err, "invalid_fail_reason")
+	assert_true(client:flush())
+	assert_equal(#requests, 0)
+
+	-- Precondition for the empty wire above: the same client accepts a valid
+	-- call, so the silence is the refusal and not a dead pipeline.
+	assert_true(client:track_level_start("forest-3", 1))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"event_name":"level_start"')
+
+	-- Review round 1: 2.0 is NOT a rejection case, and the assertion lives
+	-- here rather than among the refusals because it ENQUEUES. Lua 5.1 has
+	-- one number type, so an integral float IS the integer and the check is
+	-- mathematical; the docs promise that and no more.
+	reset()
+	assert_true(client:track_level_start("forest-3", 2.0))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"attempt":2')
+end
+
+function progression_tests.inherit_the_consent_gate()
+	storage.reset()
+	reset()
+	-- No identify() here: it is itself consent-gated, and this scene starts
+	-- from an undecided decision on purpose (storage.reset drops any consent
+	-- an earlier scene persisted).
+	local client = assert(sdk.new(config()))
+	local ok, err = client:track_level_start("forest-3", 1)
+	assert_true(not ok)
+	assert_equal(err, "consent_unknown")
+	assert_true(client:set_consent(false))
+	ok, err = client:track_level_complete("forest-3", 1, 10)
+	assert_true(not ok)
+	assert_equal(err, "consent_denied")
+	ok, err = client:track_level_fail("forest-3", 1, 10)
+	assert_true(not ok)
+	assert_equal(err, "consent_denied")
+	reset()
+	assert_true(client:set_consent(true))
+	assert_true(client:identify("user-example"))
+	assert_true(client:track_level_start("forest-3", 1))
+	assert_true(client:flush())
+	local found = false
+	for _, request in ipairs(requests) do
+		if string.find(request.body, '"event_name":"level_start"', 1, true) then
+			found = true
+		end
+	end
+	assert_true(found)
+end
+
+function progression_tests.refuse_a_non_client_source()
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config_mode_a({ source = "server" })))
+	assert_true(client:identify("user-example"))
+	local ok, err = client:track_level_start("forest-3", 1)
+	assert_true(not ok)
+	assert_equal(err, "source_not_client")
+	ok, err = client:track_level_complete("forest-3", 1, 10)
+	assert_true(not ok)
+	assert_equal(err, "source_not_client")
+	ok, err = client:track_level_fail("forest-3", 1, 10)
+	assert_true(not ok)
+	assert_equal(err, "source_not_client")
+	assert_true(client:flush())
+	assert_equal(#requests, 0)
+	-- The refusal is the source, not the arguments: a plain track still rides.
+	assert_true(client:track("custom_event"))
+	assert_true(client:flush())
+	assert_equal(#requests, 1)
+	assert_contains(requests[1].body, '"event_name":"custom_event"')
+end
+
 local function test_screen_view_does_not_mutate_caller_props()
 	reset()
 	seed_granted_consent()
@@ -2938,7 +3120,15 @@ local spool_scope = { workspace_id = "workspace-example", app_id = "app-example"
 -- A transiently failed batch is spooled durably with its envelopes verbatim; a
 -- later launch re-sends it byte-for-byte (same event_id / event_ts) through the
 -- normal publish machinery and clears the record only after the 2xx ack.
-local function test_spool_persists_transient_failure_and_resends_next_launch()
+-- The six spool scenes live on ONE table rather than as six top-level
+-- locals. Lua caps a chunk at 200 locals and this file sits ON that ceiling:
+-- Lua 5.4's generic `for` needs registers the 5.1 one does not, so the CI leg
+-- for 5.4 refused the file outright (`too many local variables`) while 5.1 and
+-- LuaJIT loaded it. Folding a cohesive family costs nothing at runtime and
+-- buys the headroom back; the C3 scenes below use the same shape.
+local spool_tests = {}
+
+function spool_tests.persists_transient_failure_and_resends_next_launch()
 	reset()
 	storage.reset()
 	seed_granted_consent()
@@ -2986,7 +3176,7 @@ end
 
 -- Over the caps the OLDEST entries are evicted first (FIFO), for both the
 -- entry-count cap and the approximate serialized-bytes cap.
-local function test_spool_overflow_evicts_oldest_first()
+function spool_tests.overflow_evicts_oldest_first()
 	reset()
 	storage.reset()
 	seed_granted_consent()
@@ -3019,7 +3209,7 @@ end
 
 -- A failed or garbled durable read discards the record and starts clean; the
 -- spool never errors into game code.
-local function test_spool_corrupted_record_starts_clean()
+function spool_tests.corrupted_record_starts_clean()
 	reset()
 	storage.reset()
 	sys.get_save_file = function(application_id, file_name)
@@ -3077,7 +3267,7 @@ end
 
 -- Consent recheck: a persisted denial clears the spool at load without
 -- sending; a runtime set_consent(false) purges a live spool the same way.
-local function test_spool_cleared_by_denied_consent()
+function spool_tests.cleared_by_denied_consent()
 	reset()
 	storage.reset()
 	assert_true(storage.save_spool(spool_scope, {
@@ -3317,7 +3507,7 @@ end
 
 -- A permanent reject on a spooled batch removes the entries (they would fail
 -- forever), surfaces the durable drop via diagnostics, and never retries.
-local function test_spool_permanent_reject_removes_entry_and_diagnoses()
+function spool_tests.permanent_reject_removes_entry_and_diagnoses()
 	reset()
 	storage.reset()
 	seed_granted_consent()
@@ -4698,7 +4888,7 @@ end
 -- while this install's persisted grant restores — under Mode B the historic
 -- envelopes could never send (the minted token binds the CURRENT anon) and
 -- drop at load; Mode A has no token binding and re-sends them verbatim.
-local function test_spool_identity_mismatch_dropped_mode_b_kept_mode_a()
+function spool_tests.identity_mismatch_dropped_mode_b_kept_mode_a()
 	reset()
 	storage.reset()
 	seed_granted_consent()
@@ -7682,6 +7872,12 @@ local tests = {
 	test_platform_maps_html5_to_web,
 	test_app_first_payload,
 	test_screen_view_does_not_mutate_caller_props,
+	progression_tests.emit_the_canonical_events,
+	progression_tests.optional_keys_are_absent_not_zero,
+	progression_tests.props_in_the_optional_slot_are_props,
+	progression_tests.refuse_the_schema_bounds,
+	progression_tests.inherit_the_consent_gate,
+	progression_tests.refuse_a_non_client_source,
 	test_session_start_renews_session_and_resets_sequence,
 	test_session_start_rolls_back_on_enqueue_failure,
 	test_session_start_rolls_back_on_invalid_props,
@@ -7754,9 +7950,9 @@ local tests = {
 	test_client_source_keeps_anonymous_id_both_modes,
 	test_get_anonymous_id_matches_wire,
 	test_track_before_session_start_lazily_opens_session,
-	test_spool_persists_transient_failure_and_resends_next_launch,
-	test_spool_overflow_evicts_oldest_first,
-	test_spool_corrupted_record_starts_clean,
+	spool_tests.persists_transient_failure_and_resends_next_launch,
+	spool_tests.overflow_evicts_oldest_first,
+	spool_tests.corrupted_record_starts_clean,
 	-- ⚠ INLINE, not a `local function`, and that is load-bearing: this file sits
 	-- exactly at Lua 5.4's ceiling of 200 locals for a main chunk, so the NEXT
 	-- `local function test_*` added here fails to compile under lua5.4 while
@@ -7989,12 +8185,12 @@ local tests = {
 
 		sys.get_save_file = nil; sys.save = nil; sys.load = nil
 	end,
-	test_spool_cleared_by_denied_consent,
+	spool_tests.cleared_by_denied_consent,
 	test_consent_unknown_blocks_all_analytics_egress,
 	test_blocked_period_samples_never_summarized,
 	test_consent_unknown_purges_unproven_spool_at_init,
 	test_identity_read_failure_purges_spool,
-	test_spool_permanent_reject_removes_entry_and_diagnoses,
+	spool_tests.permanent_reject_removes_entry_and_diagnoses,
 	test_shutdown_spools_undelivered_and_finalizes,
 	test_shutdown_full_queue_spools_session_end_and_summaries,
 	test_persist_snapshots_queue_while_running,
@@ -8365,7 +8561,7 @@ local tests = {
 	test_shutdown_refuses_denial_with_no_durable_witness,
 	test_set_anonymous_id_rejected_while_spool_pending_mode_b,
 	test_shutdown_fails_when_remnant_evicted_by_caps,
-	test_spool_identity_mismatch_dropped_mode_b_kept_mode_a,
+	spool_tests.identity_mismatch_dropped_mode_b_kept_mode_a,
 	test_shutdown_without_durable_backend_keeps_old_contract,
 	test_disabled_spool_clears_persisted_record_at_init,
 	test_set_consent_denied_reports_failed_spool_purge_and_retries,
