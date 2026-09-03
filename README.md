@@ -48,7 +48,11 @@ not the platform boundary.
   `track_level_start(level_id, attempt)` → `level_start`,
   `track_level_complete(level_id, attempt, duration_ms[, score])` →
   `level_complete` and `track_level_fail(level_id, attempt, duration_ms[,
-  fail_reason])` → `level_fail`, plus arbitrary `track(name, props)`.
+  fail_reason])` → `level_fail`, the typed ad verb
+  *(unreleased — absent at `v0.10.1`)*
+  `track_ad_impression_revenue(impression_id, network, revenue_micros,
+  currency[, revenue_precision, ad_unit, ad_format, placement])` →
+  `ad_impression_revenue`, plus arbitrary `track(name, props)`.
 - Generates and persists a UUIDv7 anonymous ID per configured app and supports
   `identify(user_id)` to upgrade attribution to a known user.
 - **Consent-first analytics.** Records an explicit consent decision over the
@@ -127,7 +131,7 @@ most of what this README documents. This paragraph used to say "pin the previous
 tag until the new one is published", which after `v0.10.1` pointed at exactly
 the artifact being withdrawn.
 
-**Four behaviours documented below are NOT in `v0.10.1`**, because it is a
+**Five behaviours documented below are NOT in `v0.10.1`**, because it is a
 deletion-only patch and carries no source change. Measured at the tag:
 `flush_interval_seconds` defaults to **1**, not 15; there is no
 `shardpilot/compression.lua` at all, so `request_compression_enabled` and the
@@ -136,8 +140,9 @@ absent (0 occurrences against 10 on `main`), so a retryable failure waits for
 the flush tick rather than its own backoff deadline; and the typed
 progression verbs — `track_level_start`, `track_level_complete`,
 `track_level_fail` — were added after the tag's base, so calling one on
-`v0.10.1` reaches a nil value. Each is marked *(unreleased)* where it
-appears.
+`v0.10.1` reaches a nil value, and the typed ad verb
+`track_ad_impression_revenue` is absent for the same reason. Each is marked
+*(unreleased)* where it appears.
 
 **What `v0.10.1` does and does not contain.** It is `v0.10.0` plus eight file
 deletions and nothing else — that is what makes it verifiable as carrying only

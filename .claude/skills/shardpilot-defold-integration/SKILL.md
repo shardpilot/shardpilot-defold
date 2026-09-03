@@ -52,7 +52,7 @@ Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.1`.
 
 ⚠ **This skill is written against `main`, which is AHEAD of that tag**, because
 `v0.10.1` is a deletion-only patch on top of `v0.10.0` and carries no source
-change. FOUR things documented below are NOT in it, and are marked
+change. FIVE things documented below are NOT in it, and are marked
 *(unreleased)* where they appear:
 
 * `request_compression_enabled` and the whole request-compression path — the
@@ -65,6 +65,8 @@ change. FOUR things documented below are NOT in it, and are marked
   `track_level_fail` and their codes are absent from the tag, so an
   integration that pins `v0.10.1` and calls one gets a nil value; they land
   with the next tag, and until then depend on a commit from `main`.
+* the typed ad verb — `track_ad_impression_revenue` is absent from the tag
+  for the same reason, and lands with the same next tag.
 
 Everything else describes the pinned release. A tag cut from the fully cleaned,
 current tree is the real fix and is sequenced after the source scrub.
@@ -337,7 +339,18 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
   (integral, 0..4294967295),
   `invalid_fail_reason`, and `source_not_client` — these schemas are
   client-source only. An absent `score` or empty `fail_reason` is omitted from
-  the wire even when `props` carries that key. The observer calls
+  the wire even when `props` carries that key.
+- The typed ad verb *(unreleased — absent at `v0.10.1`)*
+  `sdk.track_ad_impression_revenue(impression_id, network,
+  revenue_micros, currency[, revenue_precision, ad_unit, ad_format,
+  placement])` emits `ad_impression_revenue`. It takes NO props table — that
+  schema forbids undeclared keys — and revenue rides as an integer in
+  millionths of a currency unit. Its own codes: `invalid_impression_id`,
+  `invalid_network`, `invalid_revenue_micros`, `invalid_currency`, one per
+  optional field, and `source_not_client`. Beyond the SDK's own gate the
+  ingest applies the workspace's `ad_revenue` consent posture and can
+  suppress the event per event inside an ACCEPTED batch with
+  `suppressed_ad_revenue_consent`; this SDK cannot see that grant. The observer calls
   (`observe_ping_ms`, `observe_disconnect`) return **nothing** — they feed the
   samplers only while consent is granted and are silent no-ops otherwise; do
   not wrap them in `ok, err` handling.

@@ -2808,7 +2808,15 @@ local MAX_LEVEL_UNSIGNED_32 = 4294967295
 -- -- and the docs say exactly that rather than promising a rejection this
 -- language cannot deliver (review round 1).
 local function is_integer(value)
-	return type(value) == "number" and value == math.floor(value) and value == value
+	-- Finite, too: math.floor(math.huge) == math.huge, so an infinity passes
+	-- an integrality test and json.encode then fails on it, dropping the
+	-- WHOLE batch with terminal json_encode_failed — unrelated events
+	-- included (shardpilot-defold#76 round 1). NaN fails value == value.
+	return type(value) == "number"
+		and value == math.floor(value)
+		and value == value
+		and value > -math.huge
+		and value < math.huge
 end
 
 -- Validates what every progression event requires and shapes the props: the
@@ -2927,6 +2935,118 @@ function Client:track_level_fail(level_id, attempt, duration_ms, fail_reason, pr
 		out.fail_reason = fail_reason
 	end
 	return self:track("level_fail", out)
+end
+
+-- analytics.ad_impression_revenue.v1's bounds. That schema sets
+-- additionalProperties to FALSE, so this verb takes no props table at all:
+-- any undeclared key makes the ingest reject the event.
+local MAX_IMPRESSION_ID = 256
+local MAX_NETWORK = 128
+local CURRENCY_LENGTH = 3
+local MAX_REVENUE_PRECISION = 64
+local MAX_AD_UNIT = 256
+local MAX_AD_FORMAT = 64
+local MAX_PLACEMENT = 256
+
+-- JSON Schema's maxLength counts CODE POINTS; Lua 5.1's # counts BYTES. A
+-- 100-character CJK network name is 300 bytes, so a byte-length check
+-- refused an impression the schema accepts and lost the revenue event
+-- (shardpilot-defold#76 round 1). Continuation bytes are 0x80..0xBF; every
+-- other byte starts a code point.
+local function code_point_length(value)
+	local _, count = value:gsub("[^\128-\191]", "")
+	return count
+end
+
+-- A trimmed string within its bound, or nil for anything the schema would
+-- refuse: a non-string, an empty one, or one too long IN CODE POINTS.
+local function bounded_string(value, max_length)
+	if type(value) ~= "string" then
+		return nil
+	end
+	local trimmed = value:match("^%s*(.-)%s*$")
+	if trimmed == "" or code_point_length(trimmed) > max_length then
+		return nil
+	end
+	return trimmed
+end
+
+-- Typed ad verb: the canonical ad_impression_revenue. impression_id
+-- (1..256), network (1..128), revenue_micros (an integer at or above 0,
+-- revenue in millionths of a currency unit) and currency (exactly three
+-- characters, upper-cased to the ISO 4217 form because the fact layer groups
+-- by the exact string) are required; the four optional strings are bounded
+-- and omitted when empty.
+--
+-- Consent has two gates and this SDK owns one. The consent-first gate is
+-- track's, unchanged, and the client-source pin applies. Beyond them the
+-- ingest requires the workspace's ad_revenue consent posture
+-- and suppresses the event per event, inside an ACCEPTED batch, with status
+-- suppressed_ad_revenue_consent when that grant is missing; this SDK cannot
+-- see or set that grant.
+function Client:track_ad_impression_revenue(
+	impression_id,
+	network,
+	revenue_micros,
+	currency,
+	revenue_precision,
+	ad_unit,
+	ad_format,
+	placement
+)
+	if not self:_require_client_source() then
+		return false, "source_not_client"
+	end
+	local impression = bounded_string(impression_id, MAX_IMPRESSION_ID)
+	if not impression then
+		return false, "invalid_impression_id"
+	end
+	local ad_network = bounded_string(network, MAX_NETWORK)
+	if not ad_network then
+		return false, "invalid_network"
+	end
+	if not is_integer(revenue_micros) or revenue_micros < 0 then
+		return false, "invalid_revenue_micros"
+	end
+	if type(currency) ~= "string" then
+		return false, "invalid_currency"
+	end
+	local code = currency:match("^%s*(.-)%s*$")
+	if code_point_length(code) ~= CURRENCY_LENGTH then
+		return false, "invalid_currency"
+	end
+	local out = {
+		impression_id = impression,
+		network = ad_network,
+		revenue_micros = revenue_micros,
+		currency = code:upper(),
+	}
+	local optionals = {
+		{ "revenue_precision", revenue_precision, MAX_REVENUE_PRECISION },
+		{ "ad_unit", ad_unit, MAX_AD_UNIT },
+		{ "ad_format", ad_format, MAX_AD_FORMAT },
+		{ "placement", placement, MAX_PLACEMENT },
+	}
+	for _, optional in ipairs(optionals) do
+		local key, value, max_length = optional[1], optional[2], optional[3]
+		if value ~= nil then
+			-- Emptiness is judged AFTER trimming: a mediation network's
+			-- whitespace placeholder (" ") is an ABSENT field, not a fatal
+			-- one. The raw check that preceded this refused the whole
+			-- impression over a space (shardpilot-godot#23 round 1).
+			if type(value) ~= "string" then
+				return false, "invalid_" .. key
+			end
+			local trimmed = value:match("^%s*(.-)%s*$")
+			if trimmed ~= "" then
+				if code_point_length(trimmed) > max_length then
+					return false, "invalid_" .. key
+				end
+				out[key] = trimmed
+			end
+		end
+	end
+	return self:track("ad_impression_revenue", out)
 end
 
 function Client:track(event_name, props, context)
