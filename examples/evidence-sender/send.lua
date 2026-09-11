@@ -6,7 +6,7 @@ return function(c)
 	local client = assert(sdk.new({
 		ingest_url = c.ingest_url, api_key = c.ingest_key,
 		workspace_id = c.workspace_id, app_id = c.app_id,
-		environment_id = c.environment_id, platform = "linux",
+		environment_id = c.environment_id, platform = "linux", source = "client",
 		batch_size = 100, spool_enabled = false,
 		request_compression_enabled = false, publish_timeout_seconds = 15,
 	}))
@@ -20,17 +20,16 @@ return function(c)
 	stage("consent")
 	assert(client:set_consent(true))
 	stage("minimal")
-	assert(client:screen_view("sender_minimal"))
+	assert(client:track(c.event_name, {}))
 	assert(client:flush({ include_summaries = false }))
 	stage("batch")
-	assert(client:session_start())
-	assert(client:screen_view("sender_menu"))
-	assert(client:track_level_start("sender_level", 1))
-	assert(client:track_level_complete("sender_level", 1, 12000, 100))
+	for i = 1, 4 do
+		assert(client:track(c.event_name, { synthetic_step = i }))
+	end
 	assert(client:flush({ include_summaries = false }))
 	stage("mixed_size")
-	assert(client:screen_view("sender_small"))
-	assert(client:screen_view("sender_large", { sample_padding = string.rep("x", 2500) }))
+	assert(client:track(c.event_name, {}))
+	assert(client:track(c.event_name, { sample_padding = string.rep("x", 2500) }))
 	assert(client:flush({ include_summaries = false }))
 	local function lua_error()
 		return { exception = { type = "lua_error", reason = "Synthetic sender failure" },
@@ -44,7 +43,7 @@ return function(c)
 	stage("native_frame")
 	assert(crashes:emit_fatal({
 		exception = { type = "SIGSEGV", reason = "Synthetic native frame; no process crash" },
-		modules = {{ name = "sender.so", debug_id = "ABC123", load_address = "0x1000" }},
+		modules = {{ name = "sender.so", debug_id = "ABC123", load_address = "0x1000", size = "0x2000" }},
 		threads = {{ id = "main", crashed = true, frames = {{ instruction_addr = "0x1010" }} }},
 	}))
 end

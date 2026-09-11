@@ -34,6 +34,9 @@ def configuration():
                 or (u.scheme == "http" and u.hostname not in ("localhost", "127.0.0.1", "::1"))):
             raise ValueError("SP_" + name.upper() + " must be an HTTPS base URL (HTTP only on loopback)")
         values[name] = values[name].rstrip("/")
+    values["event_name"] = os.environ.get("SP_EVENT_NAME", "play_cta_click").strip()
+    if not values["event_name"]:
+        raise ValueError("SP_EVENT_NAME must name a registered event")
     return values
 
 
@@ -74,14 +77,18 @@ def check_reply(stage, sent, status, body):
         for event in events:
             row = by_id[event["event_id"]]
             oversized = stage == "mixed_size" and len(encode(event).encode()) > 2048
-            if oversized:
+            if stage == "duplicate":
+                if row.get("status") != "duplicate" or row.get("code") != "duplicate_event_id":
+                    return False
+            elif oversized:
                 if row.get("status") != "rejected" or row.get("code") != "event_too_large":
                     return False
             elif row.get("status") not in ("accepted", "observed"):
                 return False
         rejected = 1 if stage == "mixed_size" else 0
-        return (reply.get("accepted") == len(events) - rejected
-                and reply.get("rejected") == rejected and reply.get("duplicates") == 0
+        duplicates = len(events) if stage == "duplicate" else 0
+        return (reply.get("accepted") == len(events) - rejected - duplicates
+                and reply.get("rejected") == rejected and reply.get("duplicates") == duplicates
                 and reply.get("suppressed") == 0)
     except (ValueError, KeyError, TypeError):
         return False
@@ -92,6 +99,7 @@ class Sender:
         self.config = config
         self.stage = "setup"
         self.records = []
+        self.rejected_events = 0
         self.lua = LuaRuntime(unpack_returned_tuples=True)
         self.opener = request.build_opener(request.ProxyHandler({}), RefuseRedirect())
 
@@ -131,9 +139,19 @@ class Sender:
         except (OSError, ValueError) as exc:
             status, received = 0, str(exc)
         passed = check_reply(self.stage, sent, status, received)
+        event_result = None
+        try:
+            reply = json.loads(received)
+            if isinstance(reply, dict) and "events" in sent:
+                event_result = {k: reply.get(k) for k in ("accepted", "rejected", "duplicates", "suppressed", "events")}
+                if type(reply.get("rejected")) is int and reply["rejected"] > 0:
+                    self.rejected_events += reply["rejected"]
+        except ValueError:
+            pass
         self.log({"stage": self.stage, "status": status, "body": received,
                   "request_id": response_headers.get("x-request-id", "MISSING"),
-                  "latency_ms": round((time.perf_counter() - started) * 1000, 3), "pass": passed})
+                  "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+                  "event_result": event_result, "contract_match": passed})
         self.records.append((self.stage, passed, url, method, headers, body))
         return {"status": status, "response": received, "headers": response_headers}
 
@@ -160,17 +178,21 @@ class Sender:
                   "lua": self.lua.lua_implementation, "sdk": str(ROOT / "shardpilot"),
                   "coverage": "headless SDK + HTTP; no Defold engine, persistence or real native crash"})
         self.lua.execute((HERE / "send.lua").read_text())(self.lua.table_from(self.config))
-        # Replay the real minimal SDK body without Authorization. SDK init itself
-        # requires a credential, so this negative probe is intentionally outside it.
+        # Replay the actual SDK wire bytes, first authenticated to measure
+        # idempotency, then without Authorization to measure admission.
         minimal = next(r for r in self.records if r[0] == "minimal")
+        self.stage = "duplicate"
+        self.exchange(minimal[2], minimal[3], minimal[4], minimal[5])
         self.stage = "unauthenticated"
         self.exchange(minimal[2], minimal[3], {k: v for k, v in minimal[4].items()
                                              if k.lower() != "authorization"}, minimal[5])
         expected = {"consent", "minimal", "batch", "mixed_size", "lua_nonfatal",
-                    "lua_fatal", "native_frame", "unauthenticated"}
-        passed = len(self.records) == 8 and {r[0] for r in self.records} == expected and all(r[1] for r in self.records)
-        self.log({"requests": len(self.records), "pass": passed, "exit_code": 0 if passed else 1})
-        return 0 if passed else 1
+                    "lua_fatal", "native_frame", "duplicate", "unauthenticated"}
+        passed = len(self.records) == 9 and {r[0] for r in self.records} == expected and all(r[1] for r in self.records)
+        exit_code = 1 if not passed or self.rejected_events else 0
+        self.log({"requests": len(self.records), "contract_match": passed,
+                  "rejected_events": self.rejected_events, "exit_code": exit_code})
+        return exit_code
 
 
 def main():

@@ -30,6 +30,7 @@ The operator must supply these **exported environment variables** before running
 | `SP_CRASH_URL` | Crash ingest base URL; this can differ from ingest and symbols-upload origins |
 | `SP_CRASH_KEY` | Separate key with `crash:write` for the synthetic app |
 | `SP_CRASH_APP_ID` | App identity expected by the crash key; verify its mapping explicitly |
+| `SP_EVENT_NAME` | Optional registered tracking-plan name; defaults to `play_cta_click` |
 
 Do not paste credentials into commands, files, reports or shell history. The
 sender reads them from its process environment. Both URLs require HTTPS except
@@ -43,16 +44,21 @@ Exact run command, without a pipe:
 ```
 
 The sequence is: grant analytics consent for the new synthetic anonymous actor;
-send one `app.screen_view`; send a four-event session/screen/level-start/level-complete
-batch; send a small screen-view beside one with 2,500 padding characters; send
-three crash reports; replay the minimal SDK body with Authorization removed.
-That last probe uses the captured SDK bytes directly because SDK initialization
-requires a credential. Compression is disabled so the printed byte counts describe
-the sent event elements. No automatic polling, retry loop or shutdown event is added.
+send one event through the SDK's `track` API; send a batch of four synthetic clicks;
+send a small event beside one with 2,500 padding characters; send three crash
+reports; replay the minimal SDK body with its original Authorization and event ID;
+then replay it without Authorization. All events use `SP_EVENT_NAME` and source
+`client`. The target must register that name and permit the synthetic properties.
+An unregistered name can reject the whole batch with 400, unlike an oversize
+element's rejection within 202. The two replays use captured SDK bytes directly;
+they demonstrate the HTTP contracts, not the SDK's retry scheduler. Compression
+is disabled so the byte counts describe sent elements. No automatic retry loop,
+polling or shutdown event is added.
 
 Each request prints its URL, method, complete synthetic body and element sizes;
 each response prints HTTP status, body, request ID (`MISSING` when absent), latency
-and the measured outcome. Authorization values are never printed; configured keys
+and `contract_match`, plus parsed counters and per-event status/code/message.
+Authorization values are never printed; configured keys
 are scrubbed from echoed response/error text. Output is newline-delimited JSON.
 
 The size check expects **202 with one accepted/observed small event and one
@@ -62,7 +68,9 @@ measurement to explain, not an automatic flag change. Other batches require
 matching per-event rows and aggregate counts, zero duplicates/suppressions, and
 no `validation_only` result. `observed` is admitted under the tracking-plan
 observation posture and remains visible in the evidence. Unauthenticated must
-return 401 or 403. Consent must report `recorded: true`. Crashes require 202,
+return 401 or 403. The authenticated replay requires one `duplicate` with
+`duplicate_event_id` and zero accepted/rejected/suppressed. Consent must report
+`recorded: true`. Crashes require 202,
 a returned crash ID and no suppression; warnings remain printed, and do not prove
 symbolication. A successful ingest reply alone does not prove downstream storage.
 
@@ -70,16 +78,25 @@ symbolication. A successful ingest reply alone does not prove downstream storage
 | --- | --- |
 | Lua nonfatal | SDK `emit`, with sampling set to send every report |
 | Lua fatal | SDK `emit_fatal`, pre-symbolicated Lua frame |
-| Native frame | SDK `emit_fatal`, synthetic SIGSEGV address plus module/debug identity |
+| Native frame | SDK `emit_fatal`, synthetic SIGSEGV address plus module/debug identity, `load_address` and `size` |
 | Previous-session engine dump / script-error hook | SDK supports these, but this sender does not crash an engine, load a real dump or exercise `sys.set_error_handler` |
 | ANR/hang watchdog, minidump upload, Android tombstone upload, UE crash-context upload | No dedicated producer in this pure-Lua SDK; not emulated or claimed |
 
-Exit **0** means all eight expected HTTP measurements matched; **1** means an
-unexpected response, transport/SDK failure, incomplete evidence or missing request;
-**2** means missing/invalid environment configuration. An unavailable Python/Lupa
-installation fails before the sender starts. Read every result, not only the exit
-code. Each run creates fresh synthetic IDs and sends real mutations when given
-live endpoints. Only an authorized operator runs it against production.
+The full nine-request demonstration deliberately rejects one oversized event and
+therefore exits **1**, even when every expected contract matches. Its final record
+then has `contract_match: true`, `rejected_events: 1`, `exit_code: 1`. A 202 with
+rejected events never produces a zero exit. Unexpected responses, transport/SDK
+failures, incomplete evidence or missing requests also exit **1**, with a false
+contract match or a `sender_error`. Exit **2** means invalid/missing environment
+configuration. The runner permits exit **0** only with all contracts matching and
+no rejected events; that is not the expected full-demo outcome. The test command
+below exits zero when these positive and negative controls behave correctly.
+
+An unavailable Python/Lupa installation fails before the sender starts. Each run
+creates fresh synthetic IDs and sends real mutations when given live endpoints.
+Only an authorized operator runs it against production. The live ingest/crash
+contract observations supplied by the coordinator on 2026-09-11 are inputs to
+these fixtures, not production results reproduced by this example's author.
 
 Local verification (synthetic loopback only, no production credentials):
 
