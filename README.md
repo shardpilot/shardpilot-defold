@@ -160,6 +160,10 @@ local shardpilot = require "shardpilot.sdk"
 
 ## Quick start
 
+For a command-line sender using the checked-in SDK, see the
+[headless evidence sender](examples/evidence-sender/README.md). With its environment
+configured, run `.venv-evidence-sender/bin/python examples/evidence-sender/send.py`.
+
 Minimal Defold script (see [`examples/minimal/`](examples/minimal)):
 
 ```lua
