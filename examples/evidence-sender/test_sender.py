@@ -12,9 +12,11 @@ HERE = Path(__file__).resolve().parent
 
 
 class SenderTest(unittest.TestCase):
-    def run_sender(self, mode="good", omit=None, event_name="play_cta_click"):
+    def run_sender(self, mode="good", omit=None, event_name="play_cta_click", overrides=None):
         requests = []
         seen = set()
+        # Opaque per-run transport marker; never a signed or usable credential.
+        verified_marker = os.urandom(32).hex()
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -28,25 +30,36 @@ class SenderTest(unittest.TestCase):
                     status = 202 if mode == "unauth_allowed" else 401
                     reply = {"error": {"code": "unauthorized"}}
                 elif self.path == "/v1/consent":
-                    reply = {"recorded": True, "replayed": False}
+                    verified = (self.headers.get("Authorization") == "Bearer " + verified_marker
+                                and body.get("kind") == "user_verified"
+                                and body.get("actor_identifier") == "sender-user")
+                    if mode == "verified_grant" and not verified:
+                        status, reply = 403, {"code": "consent_grant_requires_verified_credential"}
+                    else:
+                        reply = {"recorded": True, "replayed": False}
                 elif self.path == "/api/v1/crashes/ingest":
-                    reply = {"crash_id": body["crash_id"], "suppressed": mode == "crash_suppressed"}
+                    reply = {"crash_id": "stale-crash-id" if mode == "stale_crash" else body["crash_id"],
+                             "suppressed": mode == "crash_suppressed"}
                     if mode != "legacy" and any(not m.get("load_address") or not m.get("size") for m in body.get("modules", [])):
                         status, reply = 400, {"code": "invalid_request", "message": "module bounds required"}
                 else:
                     rows = []
-                    for event in body["events"]:
+                    for index, event in enumerate(body["events"]):
                         oversized = len(json.dumps(event, separators=(",", ":")).encode()) > 2048
                         duplicate = event["event_id"] in seen and mode != "duplicate_accepted"
+                        observed = mode in ("observed", "observed_wrong_count") or (mode == "mixed_observed" and index % 2 == 0)
                         rows.append({"event_id": event["event_id"],
-                                     "status": "rejected" if oversized else "duplicate" if duplicate else "accepted",
+                                     "status": "rejected" if oversized else "duplicate" if duplicate else "observed" if observed else "accepted",
                                      "code": ("wrong_reason" if mode == "wrong_reason" else "event_too_large") if oversized else "duplicate_event_id" if duplicate else "",
                                      "message": "synthetic fixture result"})
                         if not oversized:
                             seen.add(event["event_id"])
                     rejected = sum(r["status"] == "rejected" for r in rows)
                     duplicates = sum(r["status"] == "duplicate" for r in rows)
-                    reply = {"accepted": len(rows) - rejected - duplicates, "rejected": rejected,
+                    accepted = sum(r["status"] == "accepted" for r in rows)
+                    if mode == "observed_wrong_count":
+                        accepted = len(rows) - rejected - duplicates
+                    reply = {"accepted": accepted, "rejected": rejected,
                              "duplicates": duplicates, "suppressed": 0, "events": rows}
                     if mode != "legacy" and any(e["event_name"] not in ("play_cta_click", "fixture_registered_click") for e in body["events"]):
                         status, reply = 400, {"code": "validation_error", "message": "schema_not_found"}
@@ -73,7 +86,10 @@ class SenderTest(unittest.TestCase):
                    "SP_CRASH_URL": endpoint, "SP_INGEST_KEY": "synthetic-ingest-key",
                    "SP_CRASH_KEY": "synthetic-crash-key", "SP_WORKSPACE_ID": "senderworkspace",
                    "SP_APP_ID": "senderapp", "SP_ENVIRONMENT_ID": "test", "SP_CRASH_APP_ID": "senderapp",
-                   "SP_EVENT_NAME": event_name}
+                   "SP_EVENT_NAME": event_name, "SP_INGEST_TOKEN": verified_marker,
+                   "SP_USER_ID": "sender-user", "SP_ANONYMOUS_ID": "sender-anonymous"}
+            if overrides:
+                env.update(overrides)
             if omit:
                 del env[omit]
             result = subprocess.run([sys.executable, str(HERE / "send.py")], env=env,
@@ -82,7 +98,59 @@ class SenderTest(unittest.TestCase):
             thread.join()
         self.assertNotIn("synthetic-ingest-key", result.stdout + result.stderr)
         self.assertNotIn("synthetic-crash-key", result.stdout + result.stderr)
+        self.assertFalse(verified_marker in result.stdout + result.stderr, "transport marker leaked")
         return result, requests
+
+    def test_observed_counts_match_actual_accepted_rows(self):
+        for mode in ("observed", "mixed_observed"):
+            with self.subTest(mode=mode):
+                result, requests = self.run_sender(mode)
+                self.assertEqual(len(requests), 9)
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue(json.loads(result.stdout.splitlines()[-1])["contract_match"])
+        result, requests = self.run_sender("observed_wrong_count")
+        self.assertFalse(json.loads(result.stdout.splitlines()[-1])["contract_match"])
+
+    def test_stale_crash_ids_fail_each_crash_stage(self):
+        result, requests = self.run_sender("stale_crash")
+        replies = [json.loads(line) for line in result.stdout.splitlines() if '"latency_ms"' in line]
+        crashes = [r for r in replies if r["stage"] in ("lua_nonfatal", "lua_fatal", "native_frame")]
+        self.assertEqual(len(crashes), 3)
+        for reply in crashes:
+            with self.subTest(stage=reply["stage"]):
+                self.assertFalse(reply["contract_match"])
+        self.assertEqual(result.returncode, 1)
+
+    def test_invalid_ports_fail_before_http(self):
+        for field in ("SP_INGEST_URL", "SP_CRASH_URL"):
+            for port in ("nope", "65536", "-1", "0"):
+                with self.subTest(field=field, port=port):
+                    result, requests = self.run_sender(overrides={field: "http://127.0.0.1:" + port})
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(requests, [])
+                    self.assertIn(field, result.stdout)
+
+    def test_missing_verified_configuration_never_uses_publishable_fallback(self):
+        for field in ("SP_INGEST_TOKEN", "SP_USER_ID", "SP_ANONYMOUS_ID"):
+            with self.subTest(field=field):
+                result, requests = self.run_sender(omit=field)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(requests, [])
+                self.assertIn(field, result.stdout)
+        self.assertIn("Mode B", self.run_sender(omit="SP_INGEST_TOKEN")[0].stdout)
+
+    def test_grant_and_events_share_verified_identity(self):
+        result, requests = self.run_sender("verified_grant")
+        self.assertEqual(len(requests), 9)
+        self.assertTrue(json.loads(result.stdout.splitlines()[-1])["contract_match"])
+        self.assertEqual(requests[0][1]["actor_identifier"], "sender-user")
+        self.assertEqual(requests[0][1]["kind"], "user_verified")
+        for path, body, authorization in requests:
+            if "events" in body and authorization:
+                self.assertTrue(authorization == requests[0][2], "grant/event authority differs")
+                for event in body["events"]:
+                    self.assertEqual(event["user_id"], "sender-user")
+                    self.assertEqual(event["anonymous_id"], "sender-anonymous")
 
     def test_actual_sdk_and_all_nine_requests(self):
         result, requests = self.run_sender()

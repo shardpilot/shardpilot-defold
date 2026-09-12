@@ -13,8 +13,8 @@ import lupa
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-FIELDS = ("ingest_url", "ingest_key", "workspace_id", "app_id", "environment_id",
-          "crash_url", "crash_key", "crash_app_id")
+FIELDS = ("ingest_url", "ingest_token", "user_id", "anonymous_id",
+          "workspace_id", "app_id", "environment_id", "crash_url", "crash_key", "crash_app_id")
 
 
 class RefuseRedirect(request.HTTPRedirectHandler):
@@ -25,10 +25,18 @@ class RefuseRedirect(request.HTTPRedirectHandler):
 def configuration():
     values = {name: os.environ.get("SP_" + name.upper(), "") for name in FIELDS}
     missing = ["SP_" + name.upper() for name, value in values.items() if not value.strip()]
+    if "SP_INGEST_TOKEN" in missing:
+        raise ValueError("SP_INGEST_TOKEN is required: an OWNER-SUPPLIED Mode B credential must record the grant; a publishable key cannot grant consent")
     if missing:
         raise ValueError("missing environment variables: " + ", ".join(missing))
     for name in ("ingest_url", "crash_url"):
-        u = parse.urlsplit(values[name])
+        try:
+            u = parse.urlsplit(values[name])
+            port = u.port
+        except ValueError:
+            raise ValueError("SP_" + name.upper() + " has an invalid base URL or port") from None
+        if port is not None and port < 1:
+            raise ValueError("SP_" + name.upper() + " port must be between 1 and 65535")
         if (u.scheme not in ("http", "https") or not u.hostname or u.username or u.password
                 or u.query or u.fragment or u.path not in ("", "/")
                 or (u.scheme == "http" and u.hostname not in ("localhost", "127.0.0.1", "::1"))):
@@ -65,7 +73,8 @@ def check_reply(stage, sent, status, body):
         if stage == "consent":
             return 200 <= status < 300 and reply.get("recorded") is True
         if stage in ("lua_nonfatal", "lua_fatal", "native_frame"):
-            return isinstance(reply.get("crash_id"), str) and bool(reply["crash_id"].strip()) and reply.get("suppressed") is not True
+            return (isinstance(reply.get("crash_id"), str) and bool(reply["crash_id"].strip())
+                    and reply["crash_id"] == sent["crash_id"] and reply.get("suppressed") is not True)
         events = sent["events"]
         rows = reply["events"]
         if (reply.get("validation_only") or not isinstance(rows, list) or len(rows) != len(events)
@@ -87,7 +96,8 @@ def check_reply(stage, sent, status, body):
                 return False
         rejected = 1 if stage == "mixed_size" else 0
         duplicates = len(events) if stage == "duplicate" else 0
-        return (reply.get("accepted") == len(events) - rejected - duplicates
+        accepted = sum(row.get("status") == "accepted" for row in rows)
+        return (reply.get("accepted") == accepted
                 and reply.get("rejected") == rejected and reply.get("duplicates") == duplicates
                 and reply.get("suppressed") == 0)
     except (ValueError, KeyError, TypeError):
@@ -105,7 +115,7 @@ class Sender:
 
     def log(self, value):
         line = encode(value)
-        for name in ("ingest_key", "crash_key"):
+        for name in ("ingest_token", "crash_key"):
             # Also scrub JSON-escaped echoes in a server body or an exception.
             for secret in (self.config[name], encode(self.config[name])[1:-1]):
                 line = line.replace(secret, "[REDACTED]")

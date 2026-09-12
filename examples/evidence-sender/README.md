@@ -23,8 +23,10 @@ The operator must supply these **exported environment variables** before running
 | Variable | Value the operator supplies |
 | --- | --- |
 | `SP_INGEST_URL` | Ingest base URL, without a route, query or credential |
-| `SP_INGEST_KEY` | Publishable ingest key for the synthetic app |
-| `SP_WORKSPACE_ID` | Canonical workspace key matching that key |
+| `SP_INGEST_TOKEN` | **OWNER-SUPPLIED** short-lived Mode B ingest credential, authorized for the synthetic app and consent grant |
+| `SP_USER_ID` | Synthetic verified user matching that credential's subject |
+| `SP_ANONYMOUS_ID` | Synthetic anonymous identifier matching its signed `bind_anon` claim |
+| `SP_WORKSPACE_ID` | Canonical workspace key matching that credential |
 | `SP_APP_ID` | Canonical analytics app key |
 | `SP_ENVIRONMENT_ID` | Analytics environment key |
 | `SP_CRASH_URL` | Crash ingest base URL; this can differ from ingest and symbols-upload origins |
@@ -36,6 +38,20 @@ Do not paste credentials into commands, files, reports or shell history. The
 sender reads them from its process environment. Both URLs require HTTPS except
 on loopback; redirects and ambient HTTP proxies are disabled. No endpoint is
 built in. Configure **both** planes first: missing configuration exits before HTTP.
+Both explicit URL ports must be numeric and between 1 and 65535; an invalid port
+is configuration error 2 before either plane sends.
+
+The owner obtains the trusted credential through the authorized backend path.
+This example never mints, installs, refreshes or prints one. `SP_INGEST_KEY` cannot
+substitute for `SP_INGEST_TOKEN`: publishable-key grants are rejected by the
+[consent contract](../../docs/privacy.md). Missing Mode B configuration exits 2
+and sends nothing. Consent and analytics use the same SDK `token_provider`;
+the SDK identifies the configured user before granting consent, and each event
+carries that user and the configured anonymous binding. The owner must verify
+the signed subject, binding, tenant/app/environment scope and sufficient remaining
+lifetime for this run. The example supplies the same credential if the SDK asks
+again; it cannot renew an expired credential. Local fixtures do not validate a
+signature or prove live grant authority.
 
 Exact run command, without a pipe:
 
@@ -43,7 +59,7 @@ Exact run command, without a pipe:
 .venv-evidence-sender/bin/python examples/evidence-sender/send.py
 ```
 
-The sequence is: grant analytics consent for the new synthetic anonymous actor;
+The sequence is: grant analytics consent for the configured synthetic verified user;
 send one event through the SDK's `track` API; send a batch of four synthetic clicks;
 send a small event beside one with 2,500 padding characters; send three crash
 reports; replay the minimal SDK body with its original Authorization and event ID;
@@ -67,11 +83,12 @@ enforcement at **2,048 bytes** in the target; a different policy is a failed
 measurement to explain, not an automatic flag change. Other batches require
 matching per-event rows and aggregate counts, zero duplicates/suppressions, and
 no `validation_only` result. `observed` is admitted under the tracking-plan
-observation posture and remains visible in the evidence. Unauthenticated must
+observation posture and remains visible in the evidence; only rows with status
+`accepted` count toward the accepted aggregate. Unauthenticated must
 return 401 or 403. The authenticated replay requires one `duplicate` with
 `duplicate_event_id` and zero accepted/rejected/suppressed. Consent must report
 `recorded: true`. Crashes require 202,
-a returned crash ID and no suppression; warnings remain printed, and do not prove
+the exact submitted crash ID and no suppression; warnings remain printed, and do not prove
 symbolication. A successful ingest reply alone does not prove downstream storage.
 
 | Crash case | What runs |
@@ -93,7 +110,8 @@ no rejected events; that is not the expected full-demo outcome. The test command
 below exits zero when these positive and negative controls behave correctly.
 
 An unavailable Python/Lupa installation fails before the sender starts. Each run
-creates fresh synthetic IDs and sends real mutations when given live endpoints.
+creates fresh event/crash IDs under the configured synthetic identity and sends
+real mutations when given live endpoints.
 Only an authorized operator runs it against production. The live ingest/crash
 contract observations supplied by the coordinator on 2026-09-11 are inputs to
 these fixtures, not production results reproduced by this example's author.

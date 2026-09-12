@@ -4,12 +4,15 @@ local crash = require "shardpilot.crash"
 
 return function(c)
 	local client = assert(sdk.new({
-		ingest_url = c.ingest_url, api_key = c.ingest_key,
+		ingest_url = c.ingest_url, anonymous_id = c.anonymous_id,
+		-- The owner supplies this credential; the example never mints or refreshes it.
+		token_provider = function(callback) callback(c.ingest_token, nil, nil) end,
 		workspace_id = c.workspace_id, app_id = c.app_id,
 		environment_id = c.environment_id, platform = "linux", source = "client",
 		batch_size = 100, spool_enabled = false,
 		request_compression_enabled = false, publish_timeout_seconds = 15,
 	}))
+	assert(client:identify(c.user_id))
 	local crashes = assert(crash.new({
 		crash_ingest_url = c.crash_url, crash_api_key = c.crash_key,
 		app_id = c.crash_app_id, platform = "linux",
