@@ -1,5 +1,7 @@
 """Synthetic loopback contract fixtures; no production service or database."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -7,11 +9,67 @@ import subprocess
 import sys
 import threading
 import unittest
+from unittest import mock
+
+import send
 
 HERE = Path(__file__).resolve().parent
 
 
 class SenderTest(unittest.TestCase):
+    def run_without_network(self, field, url):
+        calls = []
+        output = io.StringIO()
+        env = {"SP_" + name.upper(): "synthetic-fixture" for name in send.FIELDS}
+        env.update(SP_INGEST_URL="https://ingest.example.test",
+                   SP_CRASH_URL="https://crash.example.test",
+                   SP_INGEST_TOKEN=os.urandom(32).hex())
+        env[field] = url
+
+        def fake_transport(req, **kwargs):
+            calls.append(req.full_url)
+            response = io.BytesIO(b'{"recorded":true}')
+            response.code, response.headers = 202, {"X-Request-ID": "synthetic-fixture"}
+            return response
+
+        with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(output):
+            with mock.patch.object(send.request.OpenerDirector, "open", side_effect=fake_transport):
+                result = send.main()
+        self.assertFalse(env["SP_INGEST_TOKEN"] in output.getvalue(), "transport marker leaked")
+        return result, calls, output.getvalue()
+
+    def test_invalid_hostnames_fail_before_transport(self):
+        for field in ("SP_INGEST_URL", "SP_CRASH_URL"):
+            for host in ("bad%zz", "bad%", "bad%2", "bad%25zz", "bad%20host",
+                         "bad%2fhost", "bad%40host", "bad%3ahost", "bad%00host",
+                         "bad%ff", "bad host", "bad\\host", "bad\thost", "bad\nhost",
+                         "[not-an-ip]", "[::1]junk", "[::1]:", "[fe80::1%25en0]"):
+                with self.subTest(field=field, host=host):
+                    result, calls, output = self.run_without_network(field, "https://" + host)
+                    self.assertEqual(len(calls), 0)
+                    self.assertEqual(result, 2)
+                    self.assertIn(field, output)
+
+    def test_valid_hostname_controls_reach_actual_sdk_transport(self):
+        for field in ("SP_INGEST_URL", "SP_CRASH_URL"):
+            for host in ("example.test", "one-two.example.test.", "under_score.test",
+                         "127.0.0.1", "[2001:db8::1]", "%65xample.test"):
+                with self.subTest(field=field, host=host):
+                    result, calls, output = self.run_without_network(field, "https://" + host)
+                    self.assertEqual(result, 1)
+                    self.assertGreater(len(calls), 0)
+                    self.assertIn('"lua":', output)
+
+    def test_encoded_hostname_is_validated_and_used_decoded(self):
+        for field in ("SP_INGEST_URL", "SP_CRASH_URL"):
+            for encoded, decoded in (("%65xample.test", "example.test"),
+                                     ("%c3%a9xample.test", "xn--xample-9ua.test")):
+                with self.subTest(field=field, encoded=encoded):
+                    result, calls, output = self.run_without_network(field, "https://" + encoded + ":443")
+                    self.assertEqual(result, 1)
+                    self.assertTrue(any(url.startswith("https://" + decoded + ":443/") for url in calls))
+                    self.assertFalse(any("%" in url for url in calls))
+
     def run_sender(self, mode="good", omit=None, event_name="play_cta_click", overrides=None):
         requests = []
         seen = set()

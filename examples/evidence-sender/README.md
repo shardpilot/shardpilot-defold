@@ -40,6 +40,13 @@ on loopback; redirects and ambient HTTP proxies are disabled. No endpoint is
 built in. Configure **both** planes first: missing configuration exits before HTTP.
 Both explicit URL ports must be numeric and between 1 and 65535; an invalid port
 is configuration error 2 before either plane sends.
+Both hostnames are validated before constructing either client: ASCII registered
+names (including IDNA names) or bracketed IPv6 literals. Percent escapes must be
+well formed, decode as UTF-8, and yield a valid name after IDNA conversion; that
+decoded name is used for requests. Whitespace, control characters, malformed
+escapes, decoded delimiters and malformed IP literals exit 2 with zero HTTP.
+Scoped IPv6 and IPvFuture literals are unsupported. This is syntax validation,
+not a DNS, TLS or service-availability check.
 
 The owner obtains the trusted credential through the authorized backend path.
 This example never mints, installs, refreshes or prints one. `SP_INGEST_KEY` cannot

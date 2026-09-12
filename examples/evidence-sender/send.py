@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Headless Lua SDK sender. Network use happens only in main()/run()."""
 import json
+import ipaddress
 import os
 from pathlib import Path
 import platform
+import re
 import sys
 import time
 from urllib import error, parse, request
@@ -22,6 +24,22 @@ class RefuseRedirect(request.HTTPRedirectHandler):
         return None
 
 
+def checked_hostname(url):
+    host = url.hostname or ""
+    if url.netloc.startswith("["):
+        if "%" in host or not re.fullmatch(r"\[[^\]]+\](?::[0-9]+)?", url.netloc):
+            raise ValueError("invalid or unsupported IP literal")
+        return "[" + str(ipaddress.IPv6Address(host)) + "]"
+    # RFC 3986 reg-name spelling, then the decoded name used by the resolver.
+    chars = r"[A-Za-z0-9._~!$&'()*+,;=-]"
+    if not re.fullmatch(r"(?:" + chars + r"|%[0-9A-Fa-f]{2})+", host):
+        raise ValueError("invalid registered name")
+    host = parse.unquote(host, errors="strict").encode("idna").decode("ascii")
+    if not re.fullmatch(chars + "+", host):
+        raise ValueError("invalid decoded registered name")
+    return host
+
+
 def configuration():
     values = {name: os.environ.get("SP_" + name.upper(), "") for name in FIELDS}
     missing = ["SP_" + name.upper() for name, value in values.items() if not value.strip()]
@@ -31,17 +49,21 @@ def configuration():
         raise ValueError("missing environment variables: " + ", ".join(missing))
     for name in ("ingest_url", "crash_url"):
         try:
+            if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in values[name]):
+                raise ValueError("URL contains whitespace or control characters")
             u = parse.urlsplit(values[name])
             port = u.port
+            host = checked_hostname(u)
         except ValueError:
-            raise ValueError("SP_" + name.upper() + " has an invalid base URL or port") from None
+            raise ValueError("SP_" + name.upper() + " has an invalid base URL, hostname or port") from None
         if port is not None and port < 1:
             raise ValueError("SP_" + name.upper() + " port must be between 1 and 65535")
         if (u.scheme not in ("http", "https") or not u.hostname or u.username or u.password
                 or u.query or u.fragment or u.path not in ("", "/")
                 or (u.scheme == "http" and u.hostname not in ("localhost", "127.0.0.1", "::1"))):
             raise ValueError("SP_" + name.upper() + " must be an HTTPS base URL (HTTP only on loopback)")
-        values[name] = values[name].rstrip("/")
+        authority = host + (":" + str(port) if port is not None else "")
+        values[name] = parse.urlunsplit((u.scheme, authority, "", "", ""))
     values["event_name"] = os.environ.get("SP_EVENT_NAME", "play_cta_click").strip()
     if not values["event_name"]:
         raise ValueError("SP_EVENT_NAME must name a registered event")
