@@ -198,6 +198,8 @@ class Sender:
 
     def run(self):
         g = self.lua.globals()
+        # Keep embedded Lua warnings inside the redacted JSON evidence stream.
+        g.print = lambda *values: self.log({"sdk_warning": "\t".join(str(v) for v in values)})
         g.bridge_encode = lambda v: encode(from_lua(v))
         g.bridge_decode = lambda v: self.lua.table_from(json.loads(v), recursive=True)
         g.bridge_http = self.http

@@ -302,6 +302,10 @@ function M.shutdown(reason)
 	return ok, err
 end
 
+function M.get_rejections()
+	return with_default("get_rejections")
+end
+
 function M.snapshot()
 	return with_default("snapshot")
 end

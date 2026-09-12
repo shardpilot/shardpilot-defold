@@ -11921,4 +11921,260 @@ end)()
 	restore(); storage.reset()
 end)()
 
+;(function()
+	local function with_scene(overrides, run)
+		reset()
+		storage.reset()
+		seed_granted_consent()
+		local stores, restore = install_stub_sys_storage()
+		local warnings, saved_print = {}, print
+		print = function(message) warnings[#warnings + 1] = tostring(message) end
+		local ok, failure = pcall(function()
+			local settings = { flush_interval_seconds = 9999, batch_size = 100 }
+			for key, value in pairs(overrides or {}) do settings[key] = value end
+			local client = assert(sdk.new(config(settings)))
+			assert_true(client:identify("user-example"))
+			local function publish(total, rejected, options)
+				options = options or {}
+				for i = 1, total do assert_true(client:track("rejection_fixture_" .. i)) end
+				assert_true(client:persist())
+				local record = stored_spool_record(stores)
+				assert_equal(#record.events, total, "every submitted event was persisted before its verdict")
+				local outcomes, ids = {}, {}
+				for i, event in ipairs(record.events) do
+					ids[i] = event.event_id
+					outcomes[i] = { event_id = event.event_id, status = i <= rejected and (options.status or "rejected") or "accepted",
+						code = options.code and options.code(i) or "event_too_large", message = "configured size limit exceeded" }
+				end
+				next_response_body = encode_value({ accepted = (options.status == "accepted" or options.status == "observed") and total or total - rejected,
+					rejected = options.status and 0 or rejected,
+					duplicates = options.status == "duplicate" and rejected or 0, events = outcomes })
+				local before = #requests
+				assert_true(client:flush())
+				assert_equal(#requests, before + 1, "the fake endpoint received the mixed batch")
+				local sent = json_decode(requests[#requests].body).events
+				assert_equal(#sent, total)
+				for i, event in ipairs(sent) do assert_equal(event.event_id, ids[i]) end
+				return ids
+			end
+			run(client, warnings, publish, settings)
+		end)
+		print = saved_print
+		restore()
+		storage.reset()
+		if not ok then error(failure, 0) end
+	end
+
+	local cases = {}
+	function cases.mixed_batch_retains_rejected_entry()
+		with_scene(nil, function(client, warnings, publish)
+			local ids = publish(2, 1)
+			assert_equal(client:snapshot().accepted, 1)
+			assert_equal(client:snapshot().rejected, 1)
+			assert_equal(type(client.get_rejections), "function", "client must expose rejection history")
+			local entries = client:get_rejections()
+			assert_equal(#entries, 1)
+			assert_equal(entries[1].event_id, ids[1])
+			assert_equal(entries[1].status, "rejected")
+			assert_equal(entries[1].code, "event_too_large")
+			assert_equal(entries[1].message, "configured size limit exceeded")
+		end)
+	end
+
+	function cases.default_warning_without_hook()
+		with_scene(nil, function(client, warnings, publish)
+			local ids = publish(2, 1)
+			assert_equal(#warnings, 1, "one default warning for the rejected event")
+			assert_contains(warnings[1], ids[1])
+			assert_contains(warnings[1], "event_too_large")
+			assert_contains(warnings[1], "configured size limit exceeded")
+		end)
+	end
+
+	function cases.ring_is_bounded_and_counter_is_cumulative()
+		with_scene({ rejection_capacity = 2 }, function(client, warnings, publish)
+			assert_equal(client.config.rejection_capacity, 2, "configured rejection capacity is retained")
+			local ids = publish(4, 3)
+			local entries = client:get_rejections()
+			assert_equal(#entries, 2, "oldest rejection must be evicted")
+			assert_equal(entries[1].event_id, ids[2])
+			assert_equal(entries[2].event_id, ids[3])
+			assert_equal(client:snapshot().rejected, 3)
+			publish(2, 1)
+			assert_equal(#client:get_rejections(), 2)
+			assert_equal(client:snapshot().rejected, 4)
+		end)
+	end
+
+	function cases.terminal_rejection_and_sibling_do_not_resend()
+		with_scene(nil, function(client, warnings, publish, settings)
+			publish(2, 1)
+			local before = #requests
+			assert_true(client:flush())
+			assert_equal(#requests, before, "settled events must not resend in this client")
+			local restarted = assert(sdk.new(config(settings)))
+			assert_true(restarted:flush())
+			assert_equal(#requests, before, "terminal rejection and accepted sibling must not resend after restart")
+		end)
+	end
+
+	function cases.default_capacity_and_snapshot_copy()
+		with_scene(nil, function(client, warnings, publish)
+			assert_equal(client.config.rejection_capacity, 64)
+			local ids = publish(66, 65)
+			local entries = client:get_rejections()
+			assert_equal(#entries, 64)
+			assert_equal(entries[1].event_id, ids[2])
+			assert_equal(entries[64].event_id, ids[65])
+			entries[1].event_id = "host mutation"
+			entries[1].message = "host mutation"
+			entries[2] = nil
+			assert_equal(#client:get_rejections(), 64)
+			assert_equal(client:get_rejections()[1].event_id, ids[2])
+			assert_equal(client:get_rejections()[1].message, "configured size limit exceeded")
+			assert_equal(client:snapshot().rejected, 65)
+		end)
+	end
+
+	function cases.host_diagnostics_replaces_default_without_mutating_ring()
+		local delivered = {}
+		with_scene({ diagnostics = function(issue)
+			if issue.scope == "event" then
+				delivered[#delivered + 1] = issue.event_id
+				issue.event_id, issue.code, issue.message = "mutated", "mutated", "mutated"
+			end
+		end }, function(client, warnings, publish)
+			local ids = publish(2, 1)
+			assert_equal(#delivered, 1)
+			assert_equal(delivered[1], ids[1])
+			assert_equal(#warnings, 0, "the configured host hook replaces the default channel")
+			assert_equal(client:get_rejections()[1].event_id, ids[1])
+			assert_equal(client:get_rejections()[1].code, "event_too_large")
+			assert_equal(client:get_rejections()[1].message, "configured size limit exceeded")
+		end)
+	end
+
+	function cases.throwing_diagnostics_keeps_ring_and_settles_batch()
+		with_scene({ diagnostics = function() error("host hook failure") end }, function(client, warnings, publish)
+			publish(2, 1)
+			assert_equal(#client:get_rejections(), 1)
+			assert_equal(#warnings, 0)
+			assert_equal(client:snapshot().rejected, 1)
+			local before = #requests
+			assert_true(client:flush())
+			assert_equal(#requests, before)
+		end)
+	end
+
+	function cases.other_outcomes_do_not_enter_rejection_channel()
+		for _, status in ipairs({ "accepted", "duplicate", "observed", "suppressed_no_consent" }) do
+			with_scene(nil, function(client, warnings, publish)
+				publish(2, 1, { status = status })
+				assert_equal(#client:get_rejections(), 0, status .. " is not a rejection")
+				assert_equal(#warnings, 0)
+				assert_equal(client:snapshot().rejected, 0)
+			end)
+		end
+	end
+
+	function cases.warning_dedup_keeps_first_ten_and_all_ring_entries()
+		with_scene(nil, function(client, warnings, publish)
+			local ids = publish(13, 12)
+			assert_equal(#warnings, 10)
+			assert_contains(warnings[10], ids[10])
+			assert_equal(#client:get_rejections(), 12)
+			assert_equal(client:snapshot().rejected, 12)
+		end)
+	end
+
+	function cases.warning_code_budget_bounds_memory_and_output()
+		with_scene(nil, function(client, warnings, publish)
+			publish(91, 90, { code = function(i) return i <= 12 and "same_code" or "code_" .. i end })
+			assert_equal(#warnings, 73, "ten initial warnings plus 63 new codes")
+			assert_contains(warnings[11], "code_13")
+			assert_contains(warnings[73], "code_75")
+			local keys = 0
+			for _ in pairs(client.rejection_warning_codes) do keys = keys + 1 end
+			assert_equal(keys, 64)
+			assert_equal(#client:get_rejections(), 64)
+			assert_equal(client:snapshot().rejected, 90)
+		end)
+	end
+
+	function cases.invalid_capacity_is_refused()
+		for _, value in ipairs({ 0, -1, 1.5, "2", false, math.huge, -math.huge, 0 / 0 }) do
+			local client, err = sdk.new(config({ rejection_capacity = value }))
+			assert_equal(client, nil)
+			assert_equal(err, "invalid_rejection_capacity")
+		end
+	end
+
+	function cases.singleton_accessor_follows_client_lifetime()
+		with_scene(nil, function(client, warnings, publish, settings)
+			local singleton = assert(loadfile("shardpilot/sdk.lua"))()
+			local history, err = singleton.get_rejections()
+			assert_equal(history, false)
+			assert_equal(err, "not_initialized")
+			assert_true(singleton.init(config(settings)))
+			assert_true(singleton.identify("user-example"))
+			assert_true(singleton.track("singleton_fixture"))
+			local held, restore_http = hold_http_requests()
+			local ok, failure = pcall(function()
+				assert_equal(singleton.flush(), false, "the asynchronous verdict is still pending")
+				assert_equal(#held, 1)
+				local events = json_decode(requests[#requests].body).events
+				assert_equal(#events, 1)
+				held[1](nil, nil, { status = 202, response = encode_value({ accepted = 0, rejected = 1, events = {
+					{ event_id = events[1].event_id, status = "rejected", code = "event_too_large", message = "too large" } } }) })
+				assert_true(singleton.flush())
+				assert_equal(singleton.get_rejections()[1].event_id, events[1].event_id)
+				assert_equal(singleton.snapshot().rejected, 1)
+			end)
+			restore_http()
+			if not ok then error(failure, 0) end
+			assert_true(singleton.init(config(settings)))
+			assert_equal(#singleton.get_rejections(), 0, "a new client starts fresh diagnostic history")
+			assert_equal(singleton.snapshot().rejected, 0)
+		end)
+	end
+
+	function cases.automatic_async_publish_retains_before_next_flush()
+		with_scene(nil, function(client, warnings)
+			assert_true(client:track("async_rejection"))
+			assert_true(client:track("async_sibling"))
+			assert_true(client:persist())
+			local held, restore_http = hold_http_requests()
+			local ok, failure = pcall(function()
+				client:update(10000)
+				assert_equal(#held, 1, "automatic update dispatched a real request into the held transport")
+				assert_equal(#client:get_rejections(), 0, "there is no verdict before callback")
+				local events = json_decode(requests[#requests].body).events
+				assert_equal(#events, 2)
+				held[1](nil, nil, { status = 202, response = encode_value({ accepted = 1, rejected = 1, events = {
+					{ event_id = events[1].event_id, status = "rejected", code = "event_too_large", message = "too large" },
+					{ event_id = events[2].event_id, status = "accepted" } } }) })
+				assert_equal(client:get_rejections()[1].event_id, events[1].event_id)
+				assert_equal(client:snapshot().rejected, 1)
+				assert_equal(client:snapshot().accepted, 1)
+				assert_equal(#warnings, 1)
+				local before = #requests
+				assert_true(client:flush({ include_summaries = false }))
+				assert_equal(#requests, before)
+			end)
+			restore_http()
+			if not ok then error(failure, 0) end
+		end)
+	end
+
+	local names, failed = {}, 0
+	for name in pairs(cases) do names[#names + 1] = name end
+	table.sort(names)
+	for _, name in ipairs(names) do
+		local ok, failure = pcall(cases[name])
+		print("rejection scene " .. name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(failure)))
+		if not ok then failed = failed + 1 end
+	end
+	assert_equal(failed, 0, "rejection scene failures")
+end)()
+
 print("shardpilot defold lua tests passed")

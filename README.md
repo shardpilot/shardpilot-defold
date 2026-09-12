@@ -266,6 +266,7 @@ README, `docs/`, and the skill above are the reference.
 | `anonymous_id` | generated | UUIDv7 generated on first init if not provided |
 | `user_id` | `nil` | Initial known-user attribution |
 | `batch_size` | `25` | Flush trigger, 1–100 |
+| `rejection_capacity` | `64` *(unreleased)* | Retained per-event rejection entries (positive integer); see [Batch verdicts](#batch-verdicts). |
 | `buffer_size` | `1000` | Max queued events (≥1); cross-SDK canonical default |
 | `flush_interval_seconds` | `15` (was `1`) *(unreleased — 1 at `v0.10.1`)* | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value *(the own-clock pacing is unreleased — `Client:retry_due` is absent at `v0.10.1`, where a retryable failure waits for the flush tick)*. |
 | `publish_timeout_seconds` | `2` | Per-request timeout (>0) |
@@ -279,6 +280,26 @@ README, `docs/`, and the skill above are the reference.
 > `ingest.shardpilot.com` is a **planned** public domain and is not provisioned.
 > Use local/develop endpoints until a release explicitly publishes production
 > infrastructure. See [`docs/configuration.md`](docs/configuration.md).
+
+## Batch verdicts
+
+A `202` batch response is a transport completion, not confirmation that every event was accepted. The SDK retains each rejected event's ID, status, code, and message in an in-memory rejection ring (default 64 entries, configurable, oldest evicted first), while the rejection counter remains cumulative. A configured logger or observer handles diagnostics; otherwise the default channel warns for the first ten rejected events, then once per previously unseen code, retaining at most 64 code keys to bound both memory and session output. Logging limits never suppress the ring. Terminal rejections leave the retry spool and are not resent; accepted siblings settle once. Where a flush result is available, inspect its rejected count and retained entries even when transport completion succeeded. Use the public ring accessor for automatic publishes too. The ring is diagnostic history for this client instance, not durable storage or a retry queue; restarting the client clears it.
+
+For the [ingest batch contract](https://docs.shardpilot.com/api/ingest/#batch-verdicts),
+read `client:get_rejections()` or the initialized singleton's
+`shardpilot.get_rejections()`. They return oldest-first copies containing
+`event_id`, `status`, `code`, and `message`. Set `rejection_capacity` to a
+finite positive integer (default `64`); invalid values fail initialization with
+`invalid_rejection_capacity`. This surface is unreleased and absent at `v0.10.1`.
+
+Defold keeps its Boolean `flush()` contract: `true` means transport work has
+settled, even when a parsed `202` contains rejections. `snapshot().rejected`
+counts the server's cumulative rejected totals; `last_event_issue` retains the
+latest non-accepted status and code. The ring also records automatic publishes.
+Only per-event `rejected` entries enter it; whole-batch errors and other statuses
+continue through their existing counters and diagnostics. Configure
+`diagnostics = function(issue) ... end` to replace the default `print` warnings.
+Even if this hook mutates its issue or throws, the retained copy survives.
 
 ## Authentication
 

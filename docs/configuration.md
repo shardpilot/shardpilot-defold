@@ -544,6 +544,18 @@ unknown states alike, because a receipt documents the decision itself. See
   publishable `api_key` where configured; `user_verified` receipts only
   under the minted Mode B token).
 
+Per-event rejections are retained without opting into diagnostics. Set
+`rejection_capacity` to a finite positive integer (default `64`); invalid values return
+`invalid_rejection_capacity` from initialization. `client:get_rejections()` and
+`shardpilot.get_rejections()` return oldest-first copies of `event_id`, `status`,
+`code`, and `message`. Eviction never resets `snapshot().rejected`. With no
+`diagnostics` hook, rejected entries produce bounded default `print` warnings;
+a configured hook replaces that channel while retention remains mandatory.
+The ring belongs to the client instance and clears on reinitialization; it is
+neither persisted nor retried. These additions are unreleased and absent at
+`v0.10.1`. See [Batch verdicts](../README.md#batch-verdicts) for the warning limits
+and the unchanged Boolean `flush()` contract.
+
 The optional `diagnostics` hook is invoked with each non-accepted ingest
 outcome the server reports, and with the one issue this SDK can see before
 any request is made: a configured `platform` it did not recognise, reported as
