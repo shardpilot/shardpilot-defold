@@ -6,6 +6,8 @@ build/
 dist/
 .internal/
 .ci-cache/
+.venv-evidence-sender/
+examples/evidence-sender/__pycache__/
 
 *.zip
 *.log
