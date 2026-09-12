@@ -2,6 +2,13 @@
 
 ### Unreleased
 
+- Retain per-event `202` rejections in a configurable in-memory ring (default
+  `64`), exposed as copies through `client:get_rejections()` and the singleton
+  `shardpilot.get_rejections()`. Without a diagnostics hook, emit bounded
+  default warnings identifying rejected events. Rejection totals remain
+  cumulative, terminal entries leave the retry spool, and Boolean `flush()`
+  behavior is unchanged. See [Batch verdicts](README.md#batch-verdicts).
+
 - **Typed ad verb: `track_ad_impression_revenue`.** The canonical
   `ad_impression_revenue` event (analytics.ad_impression_revenue.v1) on the
   client and the `shardpilot.sdk` singleton: `impression_id` (1..256),

@@ -659,6 +659,11 @@ local function validate_config(config)
 	if token_refresh_lead_ms == nil then
 		return nil, token_refresh_lead_err
 	end
+	local rejection_capacity =
+		normalize_integer(config.rejection_capacity, 64, 1, nil, "invalid_rejection_capacity")
+	if not rejection_capacity or rejection_capacity == math.huge then
+		return nil, "invalid_rejection_capacity"
+	end
 	if config.diagnostics ~= nil and type(config.diagnostics) ~= "function" then
 		return nil, "invalid_diagnostics"
 	end
@@ -734,6 +739,7 @@ local function validate_config(config)
 		experiments_enabled = experiments_enabled,
 		remote_config_attributes_enabled = remote_config_attributes_enabled,
 		diagnostics = config.diagnostics,
+		rejection_capacity = rejection_capacity,
 		batch_size = batch_size,
 		buffer_size = buffer_size,
 		flush_interval_seconds = flush_interval_seconds,
@@ -953,6 +959,10 @@ function M.new(config)
 	end
 	local client = setmetatable({
 		config = normalized,
+		rejection_records = {},
+		rejection_warning_codes = {},
+		rejection_warning_code_count = 0,
+		rejection_warnings = 0,
 		queue = queue.new(normalized.buffer_size),
 		stats = {
 			enqueued = 0,
@@ -3559,6 +3569,43 @@ function Client:diagnose(issue)
 	end
 end
 
+-- Return oldest-first copies so callers cannot mutate retained records.
+function Client:get_rejections()
+	local out = {}
+	for i, record in ipairs(self.rejection_records) do
+		out[i] = { event_id = record.event_id, status = record.status, code = record.code, message = record.message }
+	end
+	return out
+end
+
+-- Retain a copy before calling host diagnostics: the host may mutate its issue
+-- table or throw. Ring eviction and warning throttling never reset stats.rejected.
+function Client:retain_rejection(issue)
+	local record = {
+		event_id = diag_field(issue.event_id), status = diag_field(issue.status),
+		code = diag_field(issue.code), message = diag_field(issue.message),
+	}
+	self.rejection_records[#self.rejection_records + 1] = record
+	while #self.rejection_records > self.config.rejection_capacity do
+		table.remove(self.rejection_records, 1)
+	end
+	if type(self.config.diagnostics) == "function" then
+		return
+	end
+
+	local emit = self.rejection_warnings < 10
+	if not self.rejection_warning_codes[record.code] and self.rejection_warning_code_count < 64 then
+		self.rejection_warning_codes[record.code] = true
+		self.rejection_warning_code_count = self.rejection_warning_code_count + 1
+		emit = true
+	end
+	if emit then
+		self.rejection_warnings = self.rejection_warnings + 1
+		pcall(print, string.format("ShardPilot warning: event rejected id=%s code=%s message=%s",
+			record.event_id, record.code, record.message))
+	end
+end
+
 -- Parse a 202 batch body: keep the aggregate counters and surface every
 -- non-accepted per-event outcome (observed / duplicate / rejected /
 -- suppressed_no_consent). A 202 is NOT treated as full per-event success.
@@ -3590,13 +3637,17 @@ function Client:apply_batch_response(body, batch_count)
 				self.stats.suppressed = self.stats.suppressed + 1
 			end
 			if status ~= nil and status ~= "accepted" then
-				self:diagnose({
+				local issue = {
 					scope = "event",
 					event_id = entry.event_id,
 					status = status,
 					code = entry.code,
 					message = entry.message,
-				})
+				}
+				if status == "rejected" then
+					self:retain_rejection(issue)
+				end
+				self:diagnose(issue)
 			end
 		end
 	end

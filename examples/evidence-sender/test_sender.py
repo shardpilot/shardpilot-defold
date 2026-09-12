@@ -278,6 +278,11 @@ class SenderTest(unittest.TestCase):
         mixed = next(r for r in replies if r["stage"] == "mixed_size")
         self.assertEqual(mixed["event_result"]["rejected"], 1)
         self.assertEqual(mixed["event_result"]["events"][1]["code"], "event_too_large")
+        warnings = [json.loads(line)["sdk_warning"] for line in result.stdout.splitlines()
+                    if "sdk_warning" in json.loads(line)]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(mixed["event_result"]["events"][1]["event_id"], warnings[0])
+        self.assertIn("event_too_large", warnings[0])
 
     def test_registered_event_override(self):
         result, requests = self.run_sender(event_name="fixture_registered_click")
