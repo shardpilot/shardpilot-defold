@@ -38,37 +38,81 @@ class SenderTest(unittest.TestCase):
         self.assertFalse(env["SP_INGEST_TOKEN"] in output.getvalue(), "transport marker leaked")
         return result, calls, output.getvalue()
 
-    def test_invalid_hostnames_fail_before_transport(self):
+    def test_url_grammar_preflight(self):
+        # One grammar table for both planes; None means a configuration refusal.
+        cases = [
+            ("https", "https://example.test", "https://example.test/"),
+            ("case", "HTTPS://EXAMPLE.TEST", "https://example.test/"),
+            ("root_path", "https://example.test/", "https://example.test/"),
+            ("trailing_dot", "https://one-two.example.test.", "https://one-two.example.test./"),
+            ("underscore", "https://under_score.test", "https://under_score.test/"),
+            ("ipv4", "https://127.0.0.1", "https://127.0.0.1/"),
+            ("ipv6", "https://[2001:DB8::1]", "https://[2001:db8::1]/"),
+            ("loopback_name", "http://localhost", "http://localhost/"),
+            ("loopback_ipv4", "http://127.0.0.1", "http://127.0.0.1/"),
+            ("loopback_ipv6", "http://[::1]", "http://[::1]/"),
+            ("port_min", "https://example.test:1", "https://example.test:1/"),
+            ("port_max", "https://example.test:65535", "https://example.test:65535/"),
+            ("port_leading_zero", "https://example.test:00443", "https://example.test:443/"),
+            ("encoded_ascii", "https://%65xample.test:443", "https://example.test:443/"),
+            ("encoded_utf8", "https://%c3%a9xample.test", "https://xn--xample-9ua.test/"),
+            ("idna", "https://xn--xample-9ua.test", "https://xn--xample-9ua.test/"),
+            ("scheme_missing", "//example.test", None),
+            ("scheme_other", "ftp://example.test", None),
+            ("http_remote", "http://example.test", None),
+            ("host_missing", "https://", None),
+            ("host_extra_slash", "https:///example.test", None),
+            ("route_path", "https://example.test/api", None),
+            ("double_path", "https://example.test//", None),
+            ("query", "https://example.test?view=1", None),
+            ("empty_query", "https://example.test?", None),
+            ("fragment", "https://example.test#part", None),
+            ("empty_fragment", "https://example.test#", None),
+            ("userinfo", "https://user@example.test", None),
+            ("empty_userinfo", "https://@example.test", None),
+            ("empty_password", "https://:@example.test", None),
+            ("leading_space", " https://example.test", None),
+            ("raw_control", "https://bad\x01host", None),
+            ("raw_del", "https://bad\x7fhost", None),
+        ]
+        for port in ("", "nope", "-1", "0", "65536"):
+            for host in ("example.test", "[::1]"):
+                cases.append(("port_" + host + "_" + port, "https://" + host + ":" + port, None))
+        for host in ("bad%zz", "bad%", "bad%2", "bad%25zz", "bad%20host",
+                     "bad%2fhost", "bad%40host", "bad%3ahost", "bad%00host",
+                     "bad%ff", "bad host", "bad\\host", "bad\thost", "bad\nhost",
+                     "[not-an-ip]", "[::1]junk", "[::1]:", "[fe80::1%25en0]", "[v1.future]"):
+            cases.append(("host_" + host, "https://" + host, None))
         for field in ("SP_INGEST_URL", "SP_CRASH_URL"):
-            for host in ("bad%zz", "bad%", "bad%2", "bad%25zz", "bad%20host",
-                         "bad%2fhost", "bad%40host", "bad%3ahost", "bad%00host",
-                         "bad%ff", "bad host", "bad\\host", "bad\thost", "bad\nhost",
-                         "[not-an-ip]", "[::1]junk", "[::1]:", "[fe80::1%25en0]"):
-                with self.subTest(field=field, host=host):
-                    result, calls, output = self.run_without_network(field, "https://" + host)
-                    self.assertEqual(len(calls), 0)
-                    self.assertEqual(result, 2)
-                    self.assertIn(field, output)
+            for name, url, canonical in cases:
+                with self.subTest(field=field, case=name):
+                    result, calls, output = self.run_without_network(field, url)
+                    if canonical is None:
+                        self.assertEqual(len(calls), 0)
+                        self.assertEqual(result, 2)
+                        self.assertIn(field, output)
+                    else:
+                        self.assertEqual(result, 1)
+                        self.assertEqual(len(calls), 9)
+                        self.assertTrue(any(call.startswith(canonical) for call in calls))
+                        self.assertIn('"lua":', output)
 
-    def test_valid_hostname_controls_reach_actual_sdk_transport(self):
-        for field in ("SP_INGEST_URL", "SP_CRASH_URL"):
-            for host in ("example.test", "one-two.example.test.", "under_score.test",
-                         "127.0.0.1", "[2001:db8::1]", "%65xample.test"):
-                with self.subTest(field=field, host=host):
-                    result, calls, output = self.run_without_network(field, "https://" + host)
-                    self.assertEqual(result, 1)
-                    self.assertGreater(len(calls), 0)
-                    self.assertIn('"lua":', output)
-
-    def test_encoded_hostname_is_validated_and_used_decoded(self):
-        for field in ("SP_INGEST_URL", "SP_CRASH_URL"):
-            for encoded, decoded in (("%65xample.test", "example.test"),
-                                     ("%c3%a9xample.test", "xn--xample-9ua.test")):
-                with self.subTest(field=field, encoded=encoded):
-                    result, calls, output = self.run_without_network(field, "https://" + encoded + ":443")
-                    self.assertEqual(result, 1)
-                    self.assertTrue(any(url.startswith("https://" + decoded + ":443/") for url in calls))
-                    self.assertFalse(any("%" in url for url in calls))
+    def test_optional_suppression_aggregate_and_row_controls(self):
+        for mode in ("good", "missing_suppressed", "missing_suppressed_observed"):
+            with self.subTest(mode=mode):
+                result, requests = self.run_sender(mode)
+                self.assertEqual(len(requests), 9)
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue(json.loads(result.stdout.splitlines()[-1])["contract_match"])
+        for mode in ("counter_null", "counter_string", "counter_bool", "counter_negative",
+                     "counter_positive", "suppressed_row"):
+            with self.subTest(mode=mode):
+                result, requests = self.run_sender(mode)
+                self.assertEqual(len(requests), 9)
+                self.assertEqual(result.returncode, 1)
+                self.assertFalse(json.loads(result.stdout.splitlines()[-1])["contract_match"])
+                if mode == "suppressed_row":
+                    self.assertIn("suppressed_no_consent", result.stdout)
 
     def run_sender(self, mode="good", omit=None, event_name="play_cta_click", overrides=None):
         requests = []
@@ -105,20 +149,28 @@ class SenderTest(unittest.TestCase):
                     for index, event in enumerate(body["events"]):
                         oversized = len(json.dumps(event, separators=(",", ":")).encode()) > 2048
                         duplicate = event["event_id"] in seen and mode != "duplicate_accepted"
-                        observed = mode in ("observed", "observed_wrong_count") or (mode == "mixed_observed" and index % 2 == 0)
+                        observed = mode in ("observed", "observed_wrong_count", "missing_suppressed_observed") or (mode == "mixed_observed" and index % 2 == 0)
                         rows.append({"event_id": event["event_id"],
                                      "status": "rejected" if oversized else "duplicate" if duplicate else "observed" if observed else "accepted",
                                      "code": ("wrong_reason" if mode == "wrong_reason" else "event_too_large") if oversized else "duplicate_event_id" if duplicate else "",
                                      "message": "synthetic fixture result"})
                         if not oversized:
                             seen.add(event["event_id"])
-                    rejected = sum(r["status"] == "rejected" for r in rows)
+                    if mode == "suppressed_row" and rows:
+                        rows[0].update(status="suppressed_no_consent", code="suppressed_no_consent")
+                    rejected = sum(r["status"] in ("rejected", "suppressed_no_consent") for r in rows)
                     duplicates = sum(r["status"] == "duplicate" for r in rows)
                     accepted = sum(r["status"] == "accepted" for r in rows)
                     if mode == "observed_wrong_count":
                         accepted = len(rows) - rejected - duplicates
                     reply = {"accepted": accepted, "rejected": rejected,
                              "duplicates": duplicates, "suppressed": 0, "events": rows}
+                    if mode in ("missing_suppressed", "missing_suppressed_observed", "suppressed_row"):
+                        del reply["suppressed"]
+                    if mode.startswith("counter_"):
+                        reply["suppressed"] = {"counter_null": None, "counter_string": "0",
+                                               "counter_bool": False, "counter_negative": -1,
+                                               "counter_positive": 1}[mode]
                     if mode != "legacy" and any(e["event_name"] not in ("play_cta_click", "fixture_registered_click") for e in body["events"]):
                         status, reply = 400, {"code": "validation_error", "message": "schema_not_found"}
                     if mode == "empty_202":

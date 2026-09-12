@@ -52,14 +52,17 @@ def configuration():
             if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in values[name]):
                 raise ValueError("URL contains whitespace or control characters")
             u = parse.urlsplit(values[name])
+            if u.netloc.endswith(":"):
+                raise ValueError("empty explicit port")
             port = u.port
             host = checked_hostname(u)
         except ValueError:
             raise ValueError("SP_" + name.upper() + " has an invalid base URL, hostname or port") from None
         if port is not None and port < 1:
             raise ValueError("SP_" + name.upper() + " port must be between 1 and 65535")
-        if (u.scheme not in ("http", "https") or not u.hostname or u.username or u.password
-                or u.query or u.fragment or u.path not in ("", "/")
+        if (u.scheme not in ("http", "https") or not u.hostname
+                or u.username is not None or u.password is not None
+                or "?" in values[name] or "#" in values[name] or u.path not in ("", "/")
                 or (u.scheme == "http" and u.hostname not in ("localhost", "127.0.0.1", "::1"))):
             raise ValueError("SP_" + name.upper() + " must be an HTTPS base URL (HTTP only on loopback)")
         authority = host + (":" + str(port) if port is not None else "")
@@ -99,8 +102,10 @@ def check_reply(stage, sent, status, body):
                     and reply["crash_id"] == sent["crash_id"] and reply.get("suppressed") is not True)
         events = sent["events"]
         rows = reply["events"]
+        suppressed = reply.get("suppressed", 0)
         if (reply.get("validation_only") or not isinstance(rows, list) or len(rows) != len(events)
-                or not all(type(reply.get(k)) is int for k in ("accepted", "rejected", "duplicates", "suppressed"))):
+                or type(suppressed) is not int
+                or not all(type(reply.get(k)) is int for k in ("accepted", "rejected", "duplicates"))):
             return False
         by_id = {row["event_id"]: row for row in rows}
         if len(by_id) != len(events) or set(by_id) != {e["event_id"] for e in events}:
@@ -121,7 +126,7 @@ def check_reply(stage, sent, status, body):
         accepted = sum(row.get("status") == "accepted" for row in rows)
         return (reply.get("accepted") == accepted
                 and reply.get("rejected") == rejected and reply.get("duplicates") == duplicates
-                and reply.get("suppressed") == 0)
+                and suppressed == 0)
     except (ValueError, KeyError, TypeError):
         return False
 
