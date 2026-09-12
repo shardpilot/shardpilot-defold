@@ -39,7 +39,9 @@ sender reads them from its process environment. Both URLs require HTTPS except
 on loopback; redirects and ambient HTTP proxies are disabled. No endpoint is
 built in. Configure **both** planes first: missing configuration exits before HTTP.
 Both explicit URL ports must be numeric and between 1 and 65535; an invalid port
-is configuration error 2 before either plane sends.
+is configuration error 2 before either plane sends. An explicit port delimiter
+must have a value. User information, queries and fragments are forbidden even
+when their delimiters have empty values; paths may only be empty or `/`.
 Both hostnames are validated before constructing either client: ASCII registered
 names (including IDNA names) or bracketed IPv6 literals. Percent escapes must be
 well formed, decode as UTF-8, and yield a valid name after IDNA conversion; that
@@ -91,7 +93,10 @@ measurement to explain, not an automatic flag change. Other batches require
 matching per-event rows and aggregate counts, zero duplicates/suppressions, and
 no `validation_only` result. `observed` is admitted under the tracking-plan
 observation posture and remains visible in the evidence; only rows with status
-`accepted` count toward the accepted aggregate. Unauthenticated must
+`accepted` count toward the accepted aggregate. The aggregate `suppressed`
+member may be absent; when supplied it must be the integer zero. Per-event
+`suppressed_no_consent` remains visible and does not match this demonstration's
+expected outcomes after its verified grant. Unauthenticated must
 return 401 or 403. The authenticated replay requires one `duplicate` with
 `duplicate_event_id` and zero accepted/rejected/suppressed. Consent must report
 `recorded: true`. Crashes require 202,
