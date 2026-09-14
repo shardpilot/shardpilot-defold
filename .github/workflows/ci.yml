@@ -85,6 +85,34 @@ jobs:
           GIT_CONFIG_VALUE_0: /github/workspace
         with:
           args: git --verbose --redact --log-opts=--all /github/workspace
+  # Independent of the public scanner's result, not of this workflow's author:
+  # a branch-controlled workflow can delete or hollow out this job. Required
+  # check names do not close that whole class; trusted-workflow enforcement is
+  # an owner settings decision, outside this change (shardpilot-go issue 97).
+  # Red by design ONLY for exit 1: "alters the gate that judges it" and
+  # "a change may not supply its own judge". The coordinator/owner ACK_RED_CHECK
+  # route applies only within scripts/** and .github/workflows/**;
+  # structural refusals (exit 2) and all other failed checks remain blockers.
+  gate-integrity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect a change that alters the gate that judges it
+        # Expected refusal: a change may not supply its own judge.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_DELETED: ${{ github.event.deleted == true }}
+          HEAD_SHA: ${{ github.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python3 scripts/check_gate_integrity.py
+
   static:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -101,6 +129,9 @@ jobs:
 
       - name: Shell syntax
         run: bash -n scripts/*.sh
+
+      - name: Gate-integrity controls
+        run: python3 scripts/test_gate_integrity.py
 
       - name: Static library checks
         run: ./scripts/check_library.sh
