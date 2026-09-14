@@ -3557,15 +3557,15 @@ fi
 # comments-only control exits earlier on a deliberate baseline mismatch.
 #
 # awk counts and exits 0 whether the answer is zero or not.
+lane_b_files="$(printf '%s\n' "$lane_b_now" | awk 'NF {c++} END {print c + 0}')"
+lane_b_total="$(printf '%s\n' "$lane_b_now" | awk '{n += $1} END {print n + 0}')"
+# ⚠ AND THE FLAG IS WHAT RAN, NOT WHAT WAS ASKED FOR. Keying this off the
+# variable was a second-order version of the same overstatement: a target that
+# predates the baseline, and a format skew that carries nothing else, both leave
+# the comparison unmade with the variable set -- and the first of those is the
+# change that introduces this file, so the strong sentence printed on exactly the
+# run that established least. The comparison sets the flag where it happens.
 if [ "$public_gate_status" -eq 0 ]; then
-  lane_b_files="$(printf '%s\n' "$lane_b_now" | awk 'NF {c++} END {print c + 0}')"
-  lane_b_total="$(printf '%s\n' "$lane_b_now" | awk '{n += $1} END {print n + 0}')"
-  # ⚠ AND THE FLAG IS WHAT RAN, NOT WHAT WAS ASKED FOR. Keying this off the
-  # variable was a second-order version of the same overstatement: a target that
-  # predates the baseline, and a format skew that carries nothing else, both leave
-  # the comparison unmade with the variable set -- and the first of those is the
-  # change that introduces this file, so the strong sentence printed on exactly the
-  # run that established least. The comparison sets the flag where it happens.
   if [ "$lane_b_compared" = yes ]; then
     echo "LANE B RATCHET — held at ${lane_b_files} file(s), ${lane_b_total} occurrence(s). The number may fall and may not rise."
   else
