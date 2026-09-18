@@ -124,6 +124,99 @@ Tokens are memory-only in the SDK — auth material is never written to disk.
 
 ## Init
 
+⚠ **`shardpilot.init` is NOT the first call. `consent_policy.prepare` is, and
+`init` belongs inside its callback.** Requiring the SDK only loads code; `init`
+builds the client, which loads the persisted scope record and **mints an
+anonymous identifier** — an identity created for a player whose consent regime
+has not been established yet. Resolve the policy first, and initialise only
+when the decision permits it:
+
+```lua
+local consent_policy = require "shardpilot.consent_policy"
+local platform = require "shardpilot.platform"
+local shardpilot = require "shardpilot.sdk"
+
+-- ONE context, used by every resolution. Two copies is how they drift apart.
+local function policy_context()
+  return {
+    endpoint       = "<YOUR-POLICY-BASE-URL>", -- a third service; https, or http only for loopback
+    workspace_id   = "<YOUR-WORKSPACE-ID>",
+    app_id         = "<YOUR-APP-ID>",
+    environment_id = "develop",
+    app_version    = "1.2.3",
+    locale         = "en",
+    platform       = platform.detect(),
+  }
+end
+
+local answered = nil -- the player's answer and the notice it was given against
+
+local function start(granted, fresh)
+  local ok, err = shardpilot.init({ --[[ the configuration below ]] })
+  if not ok then
+    print("shardpilot init failed: " .. tostring(err))
+    return
+  end
+  shardpilot.identify("<YOUR-USER-ID>")
+  -- set_consent returns false, err too (a full or unwritable consent outbox).
+  -- Starting the session anyway would emit events under a grant that was never
+  -- recorded, so the answer stays pending and is retried on the next trigger.
+  local recorded, consent_err = shardpilot.set_consent(granted)
+  if not recorded then
+    print("shardpilot consent not recorded: " .. tostring(consent_err) .. "; owed")
+    return
+  end
+  answered = { text_version = fresh.consent_text_version,
+               language = fresh.presented_language, granted = granted }
+  if granted then
+    shardpilot.session_start()
+  end
+end
+
+consent_policy.prepare(policy_context(), function(decision)
+  if decision.optional_processing_closed then
+    -- Nothing a player could grant, so nothing is asked and the SDK is not
+    -- initialised. This is what the resolver emits today.
+    return
+  end
+  present_your_consent_notice(decision, function(granted)
+    -- ⚠ RE-RESOLVE BEFORE ACTING ON THE ANSWER, and invalidate first: the
+    -- player was reading the screen, the plan may have expired or the policy
+    -- may have been revoked meanwhile, and without the invalidation this
+    -- resolution is answered by the private cache entry the first call wrote —
+    -- the very decision you are checking for staleness.
+    consent_policy.invalidate()
+    consent_policy.prepare(policy_context(), function(fresh)
+      -- Act only on the FRESH decision, and only when it still permits the
+      -- lane, still has life left, and still describes the notice the player
+      -- actually answered.
+      if fresh.optional_processing_closed then return end
+      if not fresh.valid_for_seconds or fresh.valid_for_seconds <= 0 then
+        return -- no window in which the lane could run; re-resolve later
+      end
+      if fresh.consent_text_version ~= decision.consent_text_version
+        or fresh.presented_language ~= decision.presented_language then
+        return -- the text changed: present the new notice, do not carry the answer over
+      end
+      start(granted, fresh)
+    end)
+  end)
+end)
+```
+
+A decision is **not** consent: it says which regime applies and whether the
+optional lane is closed whatever the player answers. `decision.crash_profile`
+decides the crash lane **separately** — crash reporting is ON by default, so an
+unconditional `crash.init` is how a closed lane gets opened — and
+`decision.valid_for_seconds` is how long the verdict is good for; re-resolve by
+it, and on resume, and when `consent_text_version` or `presented_language`
+changes. A lane the policy later closes is stopped with `shutdown()`, **never**
+with `set_consent(false)` or `crash.set_enabled(false)`: those record a
+player's decision, and a policy change is not one. See the repository README's
+**Consent regime** section and `examples/minimal/main.script`.
+
+The configuration itself:
+
 ```lua
 local ok, err = shardpilot.init({
   ingest_url     = "<YOUR-INGEST-BASE-URL>",   -- https required outside localhost; no path/query
@@ -467,20 +560,23 @@ Run this checklist in-game (or in a host with `http.request` available)
 against a reachable ingest endpoint. Every observation below is the SDK's real
 surface — no guessing from logs.
 
-1. **Init**: `shardpilot.init(cfg)` returns `true`. A `false, err` here is a
-   config mistake; the `err` code names the field.
-2. **Consent-first sanity**: before any grant, `shardpilot.track("t")` returns
+1. **Policy first**: `consent_policy.prepare(context, cb)` calls back exactly
+   once. If `decision.optional_processing_closed` is true — which is what the
+   resolver emits today — nothing is asked and `init` is not reached at all.
+2. **Init**: inside that callback, `shardpilot.init(cfg)` returns `true`. A
+   `false, err` here is a config mistake; the `err` code names the field.
+3. **Consent-first sanity**: before any grant, `shardpilot.track("t")` returns
    `false, "consent_unknown"` — if it returns `true`, you are not on the
    consent-first pipeline you think you are.
-3. **Grant**: `shardpilot.set_consent(true)` returns `true`.
-4. **Emit a test event**: `shardpilot.track("integration_test", { ok = true })`
+4. **Grant**: `shardpilot.set_consent(true)` returns `true`.
+5. **Emit a test event**: `shardpilot.track("integration_test", { ok = true })`
    returns `true` (enqueued).
-5. **Deliver**: keep calling `shardpilot.update(dt)` from your script's
+6. **Deliver**: keep calling `shardpilot.update(dt)` from your script's
    `update` (or call `shardpilot.flush()`); HTTP is async, so completion lands
    on a later frame. `flush()` returning `false, "pending"` (batch in flight)
    or `false, "consent_receipt_pending"` (grant receipt awaiting handoff) is
    normal mid-cycle; `true` means the pipeline is drained.
-6. **Confirm acceptance** via `local s = shardpilot.snapshot()` (a copy of the
+7. **Confirm acceptance** via `local s = shardpilot.snapshot()` (a copy of the
    client counters):
    - `s.enqueued` ≥ 1, `s.published` ≥ 1, and **`s.accepted` ≥ 1** — the
      server 202 body is parsed per event, so `accepted` counts events the
@@ -500,10 +596,10 @@ surface — no guessing from logs.
      (e.g. `unauthorized`, `http_0`, `transient_429`) — `unauthorized` in
      Mode A means a wrong/revoked publishable key and is terminal for the
      batch.
-7. **Remote config** (if configured): `fetch_remote_config(cb)` calls back
+8. **Remote config** (if configured): `fetch_remote_config(cb)` calls back
    with `result.ok = true` and your published `values`; a second fetch
    typically serves the ETag-revalidated cache (`from_cache = true`).
-8. **Crash plane** (if configured): `crash.emit_fatal({ exception = { type =
+9. **Crash plane** (if configured): `crash.emit_fatal({ exception = { type =
    "lua_error", reason = "integration test" }, threads = { { id = "main",
    crashed = true, frames = { { ["function"] = "test.verify" } } } } })`
    returns `true`; then `crash.snapshot()` shows `emitted` ≥ 1 and, after the
@@ -512,14 +608,14 @@ surface — no guessing from logs.
    Outside the Defold engine, set `platform` explicitly in `crash.init` first
    — auto-detection fails there and `crash.init` returns
    `platform_required`.
-9. **Offline durability**: go offline, `track` a granted event, then make it
+10. **Offline durability**: go offline, `track` a granted event, then make it
    durable **before** killing the app — a kill right after `track` alone
    loses the event, because `track` only queues it in memory. Either call
    `persist()` (or run `shutdown()`), or keep pumping `update` until the
    failed offline publish spools the batch (`snapshot().spooled` ≥ 1). Then
    kill, relaunch, come back online — `snapshot()` shows `spool_resent` ≥ 1
    and the event arrives with its original `event_id`.
-10. **Shutdown**: `shardpilot.shutdown("app_final")` returns `true` (or
+11. **Shutdown**: `shardpilot.shutdown("app_final")` returns `true` (or
     retry it while pumping `update`; see the shutdown notes above).
 
 ## Known limitations (2026-07-19 audit)
