@@ -117,7 +117,10 @@ the id while clearing the active flag, so the cases after `realistic-batch`
 landed their events on an **already ended** session with its sequence running
 on. The receipt now reports `sessions_ok` and the session count, and requires:
 every session id has a start as its first fact with sequence 1, at most one end
-with no fact after it, and a per-session sequence with no gaps. The `duplicate`
+with no fact after it, a per-session sequence with no gaps, four sessions in the
+run of which exactly **three are ended** — the one around `single` and
+realistic-batch's two — and a `session-close` exchange that really carries
+`app.session_ended` for the session `single` used. The `duplicate`
 case is exempt — it replays the single event's captured bytes, built and sent
 before that session was closed, so its place in the log is a replay and not a
 new fact. The resumed session is deliberately left **open**: ending it would
@@ -180,7 +183,10 @@ row a transport-only witness cannot close. The sender installs the SDK's
 documented `diagnostics` hook and reads `client:get_rejections()` after the
 flush, so the rejected event ID and its `event_too_large` reason are recorded
 from the SDK's own surfaces rather than inferred from the HTTP body the host
-already holds; the accepted sibling must be acknowledged in the same reply. A
+already holds. Both must name a per-**event** **rejection** — the retained
+record's status and the hook issue's status and scope, not an ID and a code
+alone, which would also match an issue the SDK raised about something else —
+and the accepted sibling must be acknowledged in the same reply. A
 second flush then follows with nothing to publish, which is how the evidence
 shows the rejected event was not re-queued: the rejected ID appears in exactly
 one request body for the whole run, and every case has exactly one attempt.
@@ -202,8 +208,12 @@ batch is **dropped** and nothing is owed. Measured on the loopback fixture:
 `dropped` stays `0` for the 401 and becomes `1` for the 403, and both leave one
 attempt and a failed batch. `probe_terminal` is true only when the SDK did not
 claim delivery, the recorded status is one of those two, the printed settlement
-matches that status, the SDK's own counters agree with it, the case had exactly
-one attempt, and no other exchange carries the probe's event ID.
+matches that status, the SDK's own counters agree with it — `dropped` for the
+settlement, one failed batch and **nothing spooled**, since a durable remnant
+would make the refusal an obligation for the next run — the request really went
+out with **no Authorization header** (a 401 over a request that still carried
+the credential measures something else), the case had exactly one attempt, and
+no other exchange carries the probe's event ID.
 
 For the 401 settlement the retry itself is **not taken**: a further `flush`
 re-attempts the batch, and `shutdown()` re-attempts it and then refuses

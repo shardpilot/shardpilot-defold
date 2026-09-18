@@ -35,8 +35,14 @@ SESSION_START, SESSION_END = "app.session_started", "app.session_ended"
 # self and pass.
 PLANNED = {"single": {"accepted": 1, "rejected": 0},
            "realistic-batch": {"accepted": 4, "rejected": 0, "sessions": 2},
-           "mixed-size": {"accepted": 1, "rejected": 1}}
+           "mixed-size": {"accepted": 1, "rejected": 1},
+           "session-open": {"accepted": 1, "rejected": 0, "carries": SESSION_START},
+           "session-close": {"accepted": 1, "rejected": 0, "carries": SESSION_END},
+           "session-resume": {"accepted": 1, "rejected": 0, "carries": SESSION_START}}
 PLANNED_SESSIONS = 4
+# Three of those sessions are ENDED in the run — the one around `single` and
+# realistic-batch's two — and only the resumed one is left open.
+PLANNED_ENDED_SESSIONS = 3
 # How the SDK settles a refused admission probe, per status. 401 reaches the
 # client as unauthorized+retryable (transport.lua), and Mode B keeps such a
 # batch for a re-minted retry; 403 falls through as a terminal http_403 —
@@ -333,10 +339,17 @@ class Sender:
         retained = [r for r in self.rejections if r.get("event_id") == self.oversize_event_id]
         told = [i for i in self.issues if i.get("event_id") == self.oversize_event_id]
         carried = sum(self.oversize_event_id in encode(r["request_body"]) for r in self.records)
-        return (len(self.rejections) == 1 and len(retained) == 1
-                and retained[0].get("code") == "event_too_large"
-                and len(told) == 1 and told[0].get("code") == "event_too_large"
-                and carried == 1)
+        if len(self.rejections) != 1 or len(retained) != 1 or len(told) != 1 or carried != 1:
+            return False
+        # WHAT the caller was told, not merely that it was told something: the
+        # retained record and the hook issue must both name a per-EVENT
+        # REJECTION. An id and a code alone would also match an issue the SDK
+        # raised about something else.
+        return (retained[0].get("code") == "event_too_large"
+                and retained[0].get("status") == "rejected"
+                and told[0].get("code") == "event_too_large"
+                and told[0].get("status") == "rejected"
+                and told[0].get("scope") == "event")
 
     def session_lifecycle_holds(self):
         """Every analytics fact rides a session this sender OPENED, and nothing
@@ -365,7 +378,8 @@ class Sender:
                     return False
         # Exactly the planned number of sessions: a run that lost one of the
         # lifecycle exchanges must not pass against its own shorter log.
-        if len(opened) != PLANNED_SESSIONS or set(ended) - set(opened):
+        if (len(opened) != PLANNED_SESSIONS or set(ended) - set(opened)
+                or len(ended) != PLANNED_ENDED_SESSIONS):
             return False
         for session, seen in sequences.items():
             # A start is always the session's first fact, and the sequence is a
@@ -392,8 +406,18 @@ class Sender:
             return False
         # 401: the batch is kept, so nothing is dropped. 403: it is dropped
         # exactly once, and nothing stays pending.
-        dropped = self.probe["snapshot"].get("dropped")
-        if dropped != (0 if status == 401 else 1):
+        snapshot = self.probe["snapshot"]
+        if snapshot.get("dropped") != (0 if status == 401 else 1):
+            return False
+        # One failed batch, and NOTHING durable: a spooled envelope would
+        # outlive the process and make the refusal an obligation for the next
+        # run, which is the opposite of what this case reports.
+        if snapshot.get("failed_batches") != 1 or snapshot.get("spooled") != 0:
+            return False
+        # The credential really was gone from the request. A 401 or 403 over a
+        # request that still carried Authorization measures something else
+        # entirely, and would pass as an admission refusal.
+        if attempts[0].get("authorization_present") is not False:
             return False
         events = attempts[0]["request_body"].get("events") or []
         if len(events) != 1:
@@ -412,6 +436,20 @@ class Sender:
             events = records[0]["request_body"].get("events") or []
             if len(events) != plan["accepted"] + plan["rejected"]:
                 return False
+            if plan.get("carries"):
+                # The lifecycle exchange carries the event it exists for, for
+                # the session the neighbouring case used: a `session-close`
+                # that shipped a start would leave the run with an unended
+                # session and the same exchange count.
+                if [e.get("event_name") for e in events] != [plan["carries"]]:
+                    return False
+                if plan["carries"] == SESSION_END:
+                    single = [r for r in self.records if r["case"] == "single"]
+                    if len(single) != 1:
+                        return False
+                    facts = single[0]["request_body"].get("events") or []
+                    if len(facts) != 1 or facts[0].get("session_id") != events[0].get("session_id"):
+                        return False
             if not plan.get("sessions"):
                 continue
             sessions = {}

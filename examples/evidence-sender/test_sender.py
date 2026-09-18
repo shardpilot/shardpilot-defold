@@ -560,9 +560,16 @@ class SenderTest(unittest.TestCase):
             batch.append({"session_id": session, "event_name": send.SESSION_END,
                           "session_sequence": 2})
         sender.records = [
-            {"case": "single", "request_body": {"events": [{"event_id": "e%d" % i}
+            {"case": "session-open",
+             "request_body": {"events": [{"event_name": send.SESSION_START, "session_id": "a"}]}},
+            {"case": "single", "request_body": {"events": [{"event_id": "e%d" % i,
+                                                            "session_id": "a"}
                                                            for i in range(single)]}},
+            {"case": "session-close",
+             "request_body": {"events": [{"event_name": send.SESSION_END, "session_id": "a"}]}},
             {"case": "realistic-batch", "request_body": {"events": batch}},
+            {"case": "session-resume",
+             "request_body": {"events": [{"event_name": send.SESSION_START, "session_id": "d"}]}},
             {"case": "mixed-size", "request_body": {"events": [{"event_id": "small"},
                                                                {"event_id": "big"}]}},
         ]
@@ -586,6 +593,22 @@ class SenderTest(unittest.TestCase):
         twice = self.planned_state()
         twice.records.append(dict(twice.records[0]))
         self.assertFalse(twice.planned_shape_holds())
+        # A `session-close` that shipped a START would leave the run with an
+        # unended session and the same exchange count.
+        swapped = self.planned_state()
+        close = next(r for r in swapped.records if r["case"] == "session-close")
+        close["request_body"]["events"][0]["event_name"] = send.SESSION_START
+        self.assertFalse(swapped.planned_shape_holds())
+        # Or closed SOME OTHER session than the one `single` used.
+        elsewhere = self.planned_state()
+        close = next(r for r in elsewhere.records if r["case"] == "session-close")
+        close["request_body"]["events"][0]["session_id"] = "other"
+        self.assertFalse(elsewhere.planned_shape_holds())
+        # And an open exchange that carried an end.
+        inverted = self.planned_state()
+        opened = next(r for r in inverted.records if r["case"] == "session-open")
+        opened["request_body"]["events"][0]["event_name"] = send.SESSION_END
+        self.assertFalse(inverted.planned_shape_holds())
 
     def session_state(self, *facts):
         """An in-memory sender whose wire log is the given (case, name,
@@ -598,22 +621,30 @@ class SenderTest(unittest.TestCase):
         return sender
 
     def four_sessions(self, *facts):
-        """The three lifecycle pairs a healthy run carries beside `facts`, so a
-        scene exercises one rule at a time against the planned session count."""
+        """The rest of a healthy run's lifecycle beside `facts` — two ended
+        pairs and one session left open — so a scene exercises one rule at a
+        time against the planned counts."""
         filler = []
-        for index in ("b", "c", "d"):
+        for index in ("b", "c"):
             filler.append(("realistic-batch", send.SESSION_START, index, 1))
             filler.append(("realistic-batch", send.SESSION_END, index, 2))
+        filler.append(("session-resume", send.SESSION_START, "d", 1))
         return self.session_state(*(list(facts) + filler))
 
     def test_session_check_fails_on_an_orphan_or_a_fact_after_an_end(self):
         opened = ("session-open", send.SESSION_START, "a", 1)
         self.assertTrue(self.four_sessions(opened, ("single", "play_cta_click", "a", 2),
                                            ("session-close", send.SESSION_END, "a", 3)).session_lifecycle_holds())
-        # Exactly the planned number of sessions: a lost lifecycle exchange
-        # must not pass against its own shorter log.
+        # Exactly the planned number of sessions, and exactly three of them
+        # ended: a lost lifecycle exchange must not pass against its own
+        # shorter log, and a run that ended the resumed session too would have
+        # flushed after the admission probe.
         self.assertFalse(self.session_state(opened, ("single", "play_cta_click", "a", 2),
                                             ("session-close", send.SESSION_END, "a", 3)).session_lifecycle_holds())
+        self.assertFalse(self.four_sessions(
+            opened, ("single", "play_cta_click", "a", 2),
+            ("session-close", send.SESSION_END, "a", 3),
+            ("session-close", send.SESSION_END, "d", 2)).session_lifecycle_holds())
         # The defect this replaces: a fact on a session that was already ended.
         self.assertFalse(self.four_sessions(
             opened, ("session-close", send.SESSION_END, "a", 2),
@@ -631,14 +662,17 @@ class SenderTest(unittest.TestCase):
         self.assertFalse(self.four_sessions(("session-open", send.SESSION_START, "a", 2)).session_lifecycle_holds())
         self.assertFalse(self.four_sessions(opened, ("single", "play_cta_click", "a", 3)).session_lifecycle_holds())
 
-    def probe_state(self, status=401, settlement="retained", dropped=0):
+    def probe_state(self, status=401, settlement="retained", dropped=0, **snapshot):
         """An in-memory sender whose probe settled cleanly."""
         sender = send.Sender({name: "synthetic-" + name for name in send.FIELDS})
         sender.records = [{"case": "unauthenticated", "status": status,
+                           "authorization_present": False,
                            "request_body": {"events": [{"event_id": "probe"}]},
                            "event_result": None}]
+        counters = {"dropped": dropped, "failed_batches": 1, "spooled": 0}
+        counters.update(snapshot)
         sender.probe = {"flush_ok": False, "flush_error": None, "status": status,
-                        "settlement": settlement, "snapshot": {"dropped": dropped}}
+                        "settlement": settlement, "snapshot": counters}
         return sender
 
     def test_probe_check_fails_when_delivery_is_claimed_or_the_id_returns(self):
@@ -653,6 +687,20 @@ class SenderTest(unittest.TestCase):
         self.assertFalse(self.probe_state(403, "dropped", 0).probe_is_terminal())
         # A status that takes no admission measurement at all.
         self.assertFalse(self.probe_state(500, "unknown", 0).probe_is_terminal())
+        # No failed batch recorded at all, and a DURABLE remnant: a spooled
+        # envelope would outlive the process and make the refusal an obligation
+        # for the next run.
+        self.assertFalse(self.probe_state(failed_batches=0).probe_is_terminal())
+        self.assertFalse(self.probe_state(failed_batches=2).probe_is_terminal())
+        self.assertFalse(self.probe_state(spooled=1).probe_is_terminal())
+        # A refusal over a request that still carried the credential measures
+        # something else entirely.
+        present = self.probe_state()
+        present.records[0]["authorization_present"] = True
+        self.assertFalse(present.probe_is_terminal())
+        stripped = self.probe_state()
+        del stripped.records[0]["authorization_present"]
+        self.assertFalse(stripped.probe_is_terminal())
         # flush() reporting success for a batch the door refused.
         claimed = self.probe_state()
         claimed.probe["flush_ok"] = True
@@ -680,8 +728,9 @@ class SenderTest(unittest.TestCase):
                            "request_body": {"events": [{"event_id": "small"}, {"event_id": "big"}]},
                            "event_result": {"events": [{"event_id": "small", "status": "accepted"},
                                                        {"event_id": "big", "status": "rejected"}]}}]
-        sender.rejections = [{"event_id": "big", "code": "event_too_large"}]
-        sender.issues = [{"event_id": "big", "code": "event_too_large"}]
+        sender.rejections = [{"event_id": "big", "code": "event_too_large", "status": "rejected"}]
+        sender.issues = [{"event_id": "big", "code": "event_too_large", "status": "rejected",
+                          "scope": "event"}]
         return sender
 
     def test_caller_view_check_fails_on_a_resend_or_an_unread_queue(self):
@@ -711,6 +760,23 @@ class SenderTest(unittest.TestCase):
         twice = self.caller_view_state()
         twice.records.append(dict(twice.records[0]))
         self.assertFalse(twice.caller_view_holds())
+        # An id and a code alone are not the verdict: the retained record and
+        # the hook issue must both name a per-EVENT REJECTION, or they would
+        # also match an issue the SDK raised about something else.
+        for field in ("status",):
+            silent = self.caller_view_state()
+            del silent.rejections[0][field]
+            self.assertFalse(silent.caller_view_holds())
+        mislabelled = self.caller_view_state()
+        mislabelled.rejections[0]["status"] = "observed"
+        self.assertFalse(mislabelled.caller_view_holds())
+        for field, value in (("status", "observed"), ("scope", "batch"), ("scope", None)):
+            drifted = self.caller_view_state()
+            if value is None:
+                del drifted.issues[0][field]
+            else:
+                drifted.issues[0][field] = value
+            self.assertFalse(drifted.caller_view_holds())
 
 
 if __name__ == "__main__":
