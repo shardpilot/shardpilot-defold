@@ -1,7 +1,35 @@
+-- ⚠ POLICY FIRST, SDK SECOND. consent_policy.prepare is the first
+-- integration call, and this file is the executable statement of that
+-- ordering: shardpilot.init() is not reached until the decision has arrived.
+--
+-- The requires below are not the barrier — requiring shardpilot.sdk loads
+-- code and creates nothing (sdk.lua:1-4). init() is: it builds the client,
+-- which loads the persisted scope record and mints an anonymous identifier
+-- (client.lua:763-787). Calling it before the policy decision would create an
+-- identity for a player whose regime had not yet been established.
+local consent_policy = require "shardpilot.consent_policy"
+local platform = require "shardpilot.platform"
 local shardpilot = require "shardpilot.sdk"
 local crash = require "shardpilot.crash"
 
-function init(self)
+-- Set once the decision has arrived and the SDK has been started. update()
+-- and final() check it, because before that there is no SDK to drive.
+local started = false
+
+-- Where this example parks a remote-config value; your game reads it wherever
+-- it needs the tuned number.
+local spawn_rate = 1.0
+
+local function start_shardpilot(decision)
+	-- ⚠ A DECISION IS NOT CONSENT. It says which regime applies and whether
+	-- the optional lane is closed whatever the player answers; the player
+	-- still has to be asked, with the notice that regime requires.
+	-- decision.plan_used = false means the strict fallback was taken (the
+	-- resolver was unreachable, or answered something this build would not
+	-- accept) — that path tightens, it never relaxes.
+	print("shardpilot consent regime: " .. tostring(decision.regime) ..
+		(decision.plan_used and "" or " (strict fallback: " .. tostring(decision.reason) .. ")"))
+
 	shardpilot.init({
 		ingest_url = "http://localhost:8080",
 		workspace_id = "workspace-example",
@@ -39,7 +67,7 @@ function init(self)
 			print("shardpilot remote config unavailable: " .. tostring(result.error))
 		end
 	end)
-	self.spawn_rate = shardpilot.remote_config_number("spawn_rate", 1.0)
+	spawn_rate = shardpilot.remote_config_number("spawn_rate", 1.0)
 
 	-- Crash reporting. A separate module, endpoint, and crash:write
 	-- key — see docs/crash.md. It is ON by default (independent of the
@@ -69,13 +97,42 @@ function init(self)
 			end
 		end)
 	end
+
+	started = true
+end
+
+function init(self)
+	-- The policy endpoint is a third service of its own, separate from
+	-- ingest_url and remote_config_url.
+	--
+	-- platform.detect() is the HOST mapping its own system name into the
+	-- closed vocabulary the policy accepts; consent_policy itself imports
+	-- nothing from this SDK, and platform.lua only reads sys info
+	-- (platform.lua:19-29). On a system it cannot map it returns nil, the
+	-- context is refused as invalid_request without a request leaving the
+	-- device, and the callback receives the strict decision — which is the
+	-- conservative answer, not a failure to handle.
+	consent_policy.prepare({
+		endpoint = "http://localhost:8082",
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		app_version = "1.0.0",
+		locale = "en",
+		platform = platform.detect(),
+	}, start_shardpilot)
 end
 
 function update(self, dt)
-	shardpilot.update(dt)
+	if started then
+		shardpilot.update(dt) -- drives flush timer + frame sampling
+	end
 end
 
 function final(self)
+	if not started then
+		return -- the decision never arrived; there is no SDK to shut down
+	end
 	-- shutdown() starts a final flush. Events it cannot deliver are written to
 	-- the durable offline spool and re-sent on the next launch, so shutdown
 	-- returns true even when the network is down. An undelivered consent

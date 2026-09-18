@@ -68,6 +68,7 @@ local MAX_ENTRY = 64
 local MAX_ENTRIES = 64
 local MAX_SIGNALS = 16
 local MAX_BODY = 16 * 1024
+local MAX_ENDPOINT = 256
 
 local STORES = { steam = true, apple = true, google_play = true, standalone = true }
 local PLATFORMS = {
@@ -79,6 +80,119 @@ local SIGNAL_REASONS = {
 
 -- The private cache: one entry, in memory, for this session only.
 local cached = nil
+
+-- ⚠ THE INVALIDATION COUNTER. invalidate() clearing the cache was not enough
+-- on its own: a request already in flight could still complete inside its
+-- deadline, deliver the decision the invalidation was meant to discard, and
+-- write it back into the cache. The trigger would be undone by the very
+-- request it fired against. A response is now refused unless the generation
+-- it was dispatched under is still current.
+local generation = 0
+
+-- ⚠ AN OBJECT IS NOT AN EMPTY LIST. A JSON object decodes to a Lua table
+-- whose length is zero and over which ipairs yields nothing, so a roster
+-- supplied as {"a": 1} read as "no operation blocks" — a malformed plan
+-- presenting as a permissive one.
+--
+-- HONEST LIMIT: an empty JSON object and an empty JSON array decode to the
+-- SAME Lua table, and nothing here can separate them; `{}` passes as an empty
+-- list. Only a decoder that marked arrays would close that, and this module
+-- does not own the decoder.
+local function is_sequence(list)
+	local length = #list
+	local count = 0
+	for key in pairs(list) do
+		if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > length then
+			return false
+		end
+		count = count + 1
+	end
+	return count == length
+end
+
+-- Days since 1970-01-01 from a civil date, so expiry is evaluated by
+-- arithmetic rather than by os.time — which reads its table as LOCAL time and
+-- would have the same plan expire at different instants on two machines.
+local function days_from_civil(y, m, d)
+	if m <= 2 then
+		y = y - 1
+	end
+	local era = math.floor(y / 400)
+	local yoe = y - era * 400
+	local doy = math.floor((153 * ((m + 9) % 12) + 2) / 5) + d - 1
+	local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+	return era * 146097 + doe - 719468
+end
+
+local DAYS_IN_MONTH = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+
+local function days_in_month(y, m)
+	if m == 2 and y % 4 == 0 and (y % 100 ~= 0 or y % 400 == 0) then
+		return 29
+	end
+	return DAYS_IN_MONTH[m]
+end
+
+-- RFC 3339 to seconds since the epoch, or nil. Unreadable is refused, not
+-- treated as "no expiry": a timestamp this build cannot compare is a plan
+-- whose life it cannot confirm.
+local function parse_timestamp(value)
+	if type(value) ~= "string" then
+		return nil
+	end
+	local y, mo, d, h, mi, sec, rest =
+		value:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)[Tt](%d%d):(%d%d):(%d%d)(.*)$")
+	if not y then
+		return nil
+	end
+	y, mo, d = tonumber(y), tonumber(mo), tonumber(d)
+	h, mi, sec = tonumber(h), tonumber(mi), tonumber(sec)
+	if mo < 1 or mo > 12 or d < 1 or d > days_in_month(y, mo) then
+		return nil
+	end
+	-- 60 is the leap second the grammar allows, not a 61st second.
+	if h > 23 or mi > 59 or sec > 60 then
+		return nil
+	end
+	rest = rest:gsub("^%.%d+", "")
+	local offset = 0
+	if rest ~= "Z" and rest ~= "z" then
+		local sign, oh, om = rest:match("^([%+%-])(%d%d):?(%d%d)$")
+		if not sign then
+			return nil
+		end
+		oh, om = tonumber(oh), tonumber(om)
+		if oh > 23 or om > 59 then
+			return nil
+		end
+		offset = (oh * 3600 + om * 60) * (sign == "-" and -1 or 1)
+	end
+	return days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec - offset
+end
+
+-- ⚠ THE CACHE KEY IS THE WHOLE CONTEXT. One in-memory entry is shared by
+-- every caller in the process, and serving it on liveness alone applied one
+-- app's, environment's or endpoint's plan to another — past the scope check
+-- in parse_plan, which only ever saw the context that produced the entry.
+-- Length-prefixed, so no two different contexts can spell the same key.
+local function context_key(context)
+	local parts = {}
+	local function field(value)
+		value = value or ""
+		parts[#parts + 1] = string.format("%d:%s", #value, value)
+	end
+	field(context.workspace_id)
+	field(context.app_id)
+	field(context.environment_id)
+	field(context.app_version)
+	field(context.locale)
+	field(context.platform)
+	field(context.store)
+	field(context.endpoint)
+	field(context.age_band and context.age_band.vocabulary)
+	field(context.age_band and context.age_band.band)
+	return table.concat(parts, "|")
+end
 
 local function now_seconds()
 	if socket and socket.gettime then
@@ -123,6 +237,20 @@ function M.validate_context(context)
 	end
 	if not version_ok(context.app_version) then
 		return false, "app_version is missing, over 64 bytes, or outside the permitted characters"
+	end
+	-- ⚠ THE ENDPOINT IS VALIDATED, NOT ASSUMED. It is concatenated with the
+	-- route in prepare, so an absent or non-string one raised a Lua error out
+	-- of prepare rather than taking the strict path: the single callback this
+	-- module promises was never invoked at all, leaving the caller with no
+	-- decision to fail closed on.
+	if not bounded_string(context.endpoint, MAX_ENDPOINT) then
+		return false, "endpoint is missing or over its bound"
+	end
+	if context.endpoint:match("^https?://[^%s]+$") == nil then
+		return false, "endpoint is not an http(s) base URL"
+	end
+	if context.endpoint:sub(-1) == "/" then
+		return false, "endpoint must not end in a slash; the route is appended to it"
 	end
 	if context.store ~= nil and not STORES[context.store] then
 		return false, "store is not one of the permitted kinds"
@@ -172,7 +300,10 @@ end
 -- Reads a plan. It REFUSES rather than repairs: a plan the SDK cannot fully
 -- read is a plan it cannot act on, and "use the parts I understood" is how a
 -- permissive default gets in.
-function M.parse_plan(plan, context)
+-- `now` is seconds since the epoch. It is what makes expiry enforceable here
+-- rather than merely described; a caller with no clock passes nothing and
+-- prepare refuses before it ever reaches this point.
+function M.parse_plan(plan, context, now)
 	if type(plan) ~= "table" then
 		return nil, "the plan is not an object"
 	end
@@ -199,8 +330,17 @@ function M.parse_plan(plan, context)
 		or scope.app_id ~= context.app_id or scope.environment_id ~= context.environment_id then
 		return nil, "the plan is scoped to another app, environment or workspace"
 	end
+	-- ⚠ A STRING IS NOT A BOOLEAN. "true" was coerced to false below, and the
+	-- objection requirement it carried vanished into a plan marked USED. An
+	-- ABSENT field is not false either: the requirement stands unless the plan
+	-- says, as a boolean, that it does not.
+	if plan.server_analytics_objection_required ~= nil
+		and type(plan.server_analytics_objection_required) ~= "boolean" then
+		return nil, "server_analytics_objection_required is not a boolean"
+	end
 	if plan.signals_used ~= nil then
-		if type(plan.signals_used) ~= "table" or #plan.signals_used > MAX_SIGNALS then
+		if type(plan.signals_used) ~= "table" or #plan.signals_used > MAX_SIGNALS
+			or not is_sequence(plan.signals_used) then
 			return nil, "signals_used is malformed or over its bound"
 		end
 		for _, signal in ipairs(plan.signals_used) do
@@ -217,7 +357,7 @@ function M.parse_plan(plan, context)
 	for _, name in ipairs({ "prohibited_purposes", "operation_blocks" }) do
 		local list = plan[name]
 		if list ~= nil then
-			if type(list) ~= "table" or #list > MAX_ENTRIES then
+			if type(list) ~= "table" or #list > MAX_ENTRIES or not is_sequence(list) then
 				return nil, name .. " is malformed or over its bound"
 			end
 			for _, entry in ipairs(list) do
@@ -230,17 +370,33 @@ function M.parse_plan(plan, context)
 	if not bounded_string(plan.expires_at, MAX_ENTRY) then
 		return nil, "the plan carries no expires_at"
 	end
+	local expires_at = parse_timestamp(plan.expires_at)
+	if not expires_at then
+		return nil, "expires_at is not a readable timestamp"
+	end
+	-- ⚠ EXPIRED IS MALFORMED. The conservative rule names expiry beside
+	-- missing and unreadable for a reason: a plan whose life has run out is
+	-- not a weaker plan, it is no plan. It used to be READ for its shape and
+	-- then used, so an expired SOFT_OPT_OUT went on reporting optional
+	-- processing open.
+	if type(now) == "number" and expires_at <= now then
+		return nil, "the plan has already expired"
+	end
 	if plan.max_age_seconds ~= nil
-		and (type(plan.max_age_seconds) ~= "number" or plan.max_age_seconds < 0) then
+		and (type(plan.max_age_seconds) ~= "number" or plan.max_age_seconds < 0
+			or plan.max_age_seconds % 1 ~= 0) then
 		return nil, "max_age_seconds is not a whole non-negative number"
 	end
 	-- The signature is reserved and absent in the resolver's initial release.
 	-- If one is PRESENT, this build cannot verify it — and an unverifiable
 	-- signature must not admit, or the field's arrival becomes a downgrade.
-	if plan.signature ~= nil and plan.signature ~= "" then
+	-- ⚠ AN EMPTY SIGNATURE IS STILL A SIGNATURE. `""` was waved through as
+	-- though the field were absent, which is the downgrade path itself: a
+	-- signed response whose signature failed to serialise would admit.
+	if plan.signature ~= nil then
 		return nil, "the plan carries a signature this build cannot verify"
 	end
-	return plan
+	return plan, nil, expires_at
 end
 
 local function decision_from_plan(plan)
@@ -248,7 +404,9 @@ local function decision_from_plan(plan)
 		regime = plan.regime,
 		crash_profile = plan.crash_profile,
 		server_analytics = plan.server_analytics,
-		server_analytics_objection_required = plan.server_analytics_objection_required == true,
+		-- Absence is not false. Only an explicit boolean false lifts it, and
+		-- parse_plan has already refused anything that is not a boolean.
+		server_analytics_objection_required = plan.server_analytics_objection_required ~= false,
 		-- ⚠ FALSE IS NOT PERMISSION. It says only that the regime is not what
 		-- closed the door: SOFT still waits for the final notice barrier and
 		-- for the backend admission bound to this session, which this module
@@ -270,6 +428,7 @@ end
 -- policy revocation, and before the first optional admission.
 function M.invalidate()
 	cached = nil
+	generation = generation + 1
 end
 
 -- prepare(context, callback) — the first integration call, before the
@@ -286,7 +445,17 @@ function M.prepare(context, callback)
 	end
 
 	local at = now_seconds()
-	if cached and at and cached.until_at > at then
+	-- ⚠ NO CLOCK, NO PLAN. Expiry is enforced by comparing the plan's
+	-- expires_at against this reading, so without it an expired plan could not
+	-- be recognised as expired — and "used because we could not check" is the
+	-- permissive default the conservative rule exists to forbid.
+	if not at then
+		callback(strict("clock_unavailable", "no clock is available to evaluate the plan's expiry"))
+		return
+	end
+
+	local key = context_key(context)
+	if cached and cached.key == key and cached.until_at > at then
 		callback(cached.decision)
 		return
 	end
@@ -308,7 +477,9 @@ function M.prepare(context, callback)
 	end
 
 	local settled = false
-	local deadline = at and (at + DEADLINE_SECONDS) or nil
+	local deadline = at + DEADLINE_SECONDS
+	-- The invalidation this request is dispatched under; see `generation`.
+	local dispatched_under = generation
 	local function settle(decision)
 		-- ⚠ ONE CALLBACK, EVER. A response that arrives after the deadline is
 		-- dropped here: the screen it would change has already been presented.
@@ -321,7 +492,19 @@ function M.prepare(context, callback)
 
 	http.request(context.endpoint .. ROUTE, "POST", function(_, _, response)
 		local arrived = now_seconds()
-		if deadline and arrived and arrived > deadline then
+		if not arrived then
+			settle(strict("clock_unavailable", "no clock is available to evaluate the plan's expiry"))
+			return
+		end
+		-- ⚠ AN INVALIDATED REQUEST CANNOT ANSWER. A policy revocation or a
+		-- workspace change fired while this was in flight; its answer describes
+		-- the world the host has just declared gone, so it is refused here
+		-- rather than delivered — and, crucially, never written to the cache.
+		if dispatched_under ~= generation then
+			settle(strict("invalidated", "the policy was invalidated while this request was in flight"))
+			return
+		end
+		if arrived > deadline then
 			settle(strict("deadline_exceeded", "the response arrived after the total deadline"))
 			return
 		end
@@ -346,18 +529,31 @@ function M.prepare(context, callback)
 			settle(strict(tostring(decoded.reason or "policy_unavailable"), "the resolver refused"))
 			return
 		end
-		local plan, refusal = M.parse_plan(decoded, context)
+		local plan, refusal, expires_at = M.parse_plan(decoded, context, arrived)
 		if not plan then
 			settle(strict("invalid_response", refusal))
 			return
 		end
 		local decision = decision_from_plan(plan)
-		-- ⚠ ONLY A LIVE, VERIFIED PLAN IS EVER CACHED, and only for the shorter
-		-- of the cache ceiling and its own life. An error or offline state
-		-- reaches this line never, which is what stops a cached permission
-		-- being reused when the network is gone.
-		if arrived then
-			cached = { decision = decision, until_at = arrived + CACHE_SECONDS }
+		-- ⚠ ONLY A LIVE, VERIFIED PLAN IS EVER CACHED, and never past the
+		-- SHORTEST of the cache ceiling, the plan's own expiry and its
+		-- max_age_seconds. The ceiling used to win outright, so a plan with ten
+		-- seconds of life left was served from memory for five minutes. An
+		-- error or offline state reaches this line never, which is what stops a
+		-- cached permission being reused when the network is gone.
+		local lifetime = CACHE_SECONDS
+		if expires_at - arrived < lifetime then
+			lifetime = expires_at - arrived
+		end
+		if plan.max_age_seconds ~= nil and plan.max_age_seconds < lifetime then
+			lifetime = plan.max_age_seconds
+		end
+		if lifetime > 0 then
+			cached = { key = key, decision = decision, until_at = arrived + lifetime }
+		else
+			-- max_age_seconds = 0 says "do not reuse this". The plan is still
+			-- live for this one answer; it is simply not cacheable.
+			cached = nil
 		end
 		settle(decision)
 	end, { ["Content-Type"] = "application/json" }, encoded, { timeout = DEADLINE_SECONDS })

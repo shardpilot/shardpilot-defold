@@ -166,10 +166,27 @@ configured, run `.venv-evidence-sender/bin/python examples/evidence-sender/send.
 
 Minimal Defold script (see [`examples/minimal/`](examples/minimal)):
 
+> **Policy first.** `consent_policy.prepare` is the first integration call and
+> `shardpilot.init` runs **inside its callback**. Requiring the SDK is not the
+> barrier — that only loads code; `init` is, because it builds the client,
+> which loads the persisted scope record and mints an anonymous identifier.
+> Calling it before the decision would create an identity for a player whose
+> consent regime had not been established yet. A decision is **not** consent:
+> it says which regime applies and whether the optional lane stays closed
+> whatever the player answers — you still have to ask them. When the resolver
+> is unreachable or answers something this build will not accept, the callback
+> receives the strict fallback (`plan_used = false`), which tightens and never
+> relaxes. See [Consent regime](#consent-regime).
+
 ```lua
+local consent_policy = require "shardpilot.consent_policy"
+local platform = require "shardpilot.platform"
 local shardpilot = require "shardpilot.sdk"
 
-function init(self)
+local started = false
+
+local function start_shardpilot(decision)
+  print("consent regime: " .. tostring(decision.regime))
   shardpilot.init({
     ingest_url = "http://localhost:8080",
     workspace_id = "workspace-example",
@@ -189,13 +206,36 @@ function init(self)
   shardpilot.session_start()     -- emits app.session_started
   shardpilot.screen_view("menu") -- emits app.screen_view
   shardpilot.track("play_cta_click", { cta_source = "main_menu" })
+  started = true
+end
+
+function init(self)
+  -- The policy endpoint is a third service of its own, separate from
+  -- ingest_url and remote_config_url. platform.detect() folds this system's
+  -- name into the closed vocabulary the policy accepts; an unmappable system
+  -- is refused locally, without a request leaving the device, and the
+  -- callback receives the strict decision.
+  consent_policy.prepare({
+    endpoint = "http://localhost:8082",
+    workspace_id = "workspace-example",
+    app_id = "app-example",
+    environment_id = "develop",
+    app_version = "1.0.0",
+    locale = "en",
+    platform = platform.detect(),
+  }, start_shardpilot)
 end
 
 function update(self, dt)
-  shardpilot.update(dt) -- drives flush timer + frame sampling
+  if started then
+    shardpilot.update(dt) -- drives flush timer + frame sampling
+  end
 end
 
 function final(self)
+  if not started then
+    return -- the decision never arrived; there is no SDK to shut down
+  end
   -- shutdown() starts a final flush. When the flush cannot deliver everything,
   -- the undelivered events are written to the durable offline spool and
   -- shutdown returns true — they re-send on the next launch. An undelivered
@@ -910,6 +950,60 @@ to a bounded per-app sidecar (exact wire bytes, re-sent verbatim and
 de-duplicated by `crash_id`; a `429 Retry-After` window persists across
 relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.md).
 
+## Consent regime
+
+`shardpilot/consent_policy.lua` answers one question before the SDK exists:
+**which consent regime applies to this player**. It is a standalone module —
+it imports nothing from this SDK, so preparing a regime cannot mint an
+identifier, load a spool or install a capture hook.
+
+```lua
+local consent_policy = require "shardpilot.consent_policy"
+
+consent_policy.prepare(context, function(decision) ... end)
+```
+
+`context` is validated locally before anything is sent, and a value outside
+its closed vocabulary **costs no request**: `endpoint` (an `http(s)` base URL
+with no trailing slash), `workspace_id`, `app_id`, `environment_id`,
+`app_version`, `locale`, `platform` (use `platform.detect()`), and optionally
+`store` and `age_band`. `store_region` is **not accepted** in this release: a
+non-null value carries a country claim, and refusing it here is what stops it
+travelling.
+
+The callback receives **exactly one decision, exactly once**:
+
+| Field | Meaning |
+|---|---|
+| `regime` | `STRICT_OPT_IN`, `SOFT_OPT_OUT` or `UNKNOWN` |
+| `crash_profile` | `OFF` or `MINIMAL` |
+| `server_analytics` | `DENIED` or `ELIGIBLE` |
+| `server_analytics_objection_required` | Stands unless the plan says, as a boolean, that it does not |
+| `optional_processing_closed` | `false` is **not permission** — only that the regime is not what closed the door |
+| `plan_used` | `false` means the strict fallback was taken; `reason` says why |
+
+**The conservative rule.** A plan that is missing, unreadable, out of scope,
+**expired**, or carrying anything outside its bounded vocabulary resolves to
+`STRICT_OPT_IN` with optional processing closed. An error or an offline state
+can preserve or add restrictions; it can never relax one, and it can never
+reuse a cached permissive result.
+
+**Caching** is in memory, for this session only, never written to disk, and
+scoped to the *whole* context — a different app, environment or endpoint is
+re-resolved rather than served the previous one's answer. An entry never
+outlives the shorter of five minutes, the plan's own `expires_at` and its
+`max_age_seconds`.
+
+`consent_policy.invalidate()` is what the host calls on the named
+re-resolution triggers — launch and resume, a network or permitted storefront
+change, an age correction, a language or text change, a workspace or app
+change, a policy revocation, and before the first optional admission. A
+request already in flight when it fires can no longer answer.
+
+> `SOFT_OPT_OUT` parses but is **not reachable today**: every row of the
+> jurisdiction matrix is pending counsel confirmation, so the resolver's
+> initial release has no path that emits it.
+
 ## Privacy & consent
 
 - **Tokens are memory-only.** Auth material is never written to disk. The live
@@ -1109,6 +1203,7 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 | `shardpilot/experiments.lua` | Experiment-assignment consumer (off by default): assignment fetch, durable cache, revalidation, exposure/outcome facts |
 | `shardpilot/storage.lua` | The **only** module allowed to call `sys.save`/`sys.load` |
 | `shardpilot/clock.lua` · `id.lua` · `platform.lua` · `sampling.lua` | Time, UUIDv7, platform detect, runtime sampling |
+| `shardpilot/consent_policy.lua` | Consent-regime preparation before SDK init; imports nothing from this SDK |
 | `shardpilot/version.lua` | Version string constant |
 | `shardpilot/crash.lua` | Public crash entrypoint: singleton API + `new()` factory |
 | `shardpilot/crash/client.lua` | Crash client: config, sampling, emit/emit_fatal/capture_previous |
@@ -1119,7 +1214,7 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 | `shardpilot/crash/dump.lua` | Previous-session native dump → crash event |
 | `game.project` | Defold library metadata (`[library] include_dirs = shardpilot`) |
 | `examples/minimal/` | Copy-pasteable usage example |
-| `test/` | Lua test harness (`test_sdk.lua`, `test_crash.lua`, `test_remote_config.lua`, `test_experiments.lua`) + Defold collection/script |
+| `test/` | Lua test harness: every `test/test_*.lua`, which is also exactly what CI runs + Defold collection/script |
 | `docs/` | configuration · events · crash · privacy · release |
 | `scripts/` | `check_library.sh` (content guard), `package_release.sh` |
 

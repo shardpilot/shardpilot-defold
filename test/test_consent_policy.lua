@@ -453,6 +453,206 @@ local function test_the_cache_is_private_and_invalidatable()
 	assert_equal(#requests, 2, "invalidation forces a re-resolution")
 end
 
+-- ⚠ EXPIRY IS ENFORCED, NOT MERELY DESCRIBED. The shape of expires_at was
+-- checked and then the plan was used and cached for the full five minutes
+-- regardless — so an expired SOFT_OPT_OUT went on reporting optional
+-- processing open, and a plan with seconds of life left was served for
+-- minutes.
+local function test_expiry_is_enforced_before_use_and_before_caching()
+	-- (a) An already-expired permissive plan is not used AT ALL.
+	reset()
+	next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT, expires_at = "1970-01-01T00:00:00Z" })
+	local expired = prepare()
+	assert_true(not expired.plan_used, "an expired plan must not be used")
+	assert_equal(expired.regime, consent_policy.STRICT_OPT_IN, "an expired plan is STRICT")
+	assert_true(expired.optional_processing_closed, "an expired plan closes optional processing")
+
+	-- (b) max_age_seconds = 0 says DO NOT REUSE. The answer stands; the cache
+	-- entry does not exist.
+	reset()
+	next_response_body = plan({ max_age_seconds = 0 })
+	local once = prepare()
+	assert_true(once.plan_used, "max_age_seconds = 0 is still a live plan for this one answer")
+	prepare()
+	assert_equal(#requests, 2, "max_age_seconds = 0 must not be cached")
+
+	-- (c) The cache never outlives max_age_seconds.
+	reset()
+	next_response_body = plan({ max_age_seconds = 1 })
+	prepare()
+	assert_equal(#requests, 1)
+	for _ = 1, 20 do
+		socket.gettime() -- 0.1 per reading: past a one-second life
+	end
+	prepare()
+	assert_equal(#requests, 2, "the cache must not outlive max_age_seconds")
+
+	-- (d) ...and never outlives expires_at either, whatever max_age says.
+	reset()
+	socket.now = 0
+	next_response_body = plan({ expires_at = "1970-01-01T00:00:03Z", max_age_seconds = 300 })
+	local live = prepare()
+	assert_true(live.plan_used, "three seconds of life is still life: " .. tostring(live.reason))
+	prepare()
+	assert_equal(#requests, 1, "inside its life it is served privately")
+	socket.now = socket.now + 5
+	local stale = prepare()
+	assert_equal(#requests, 2, "the cache must not outlive expires_at")
+	assert_true(not stale.plan_used, "and the re-resolved plan is now expired")
+	socket.now = 1000
+
+	-- The control: an unreadable timestamp is refused rather than treated as
+	-- "no expiry", and a valid one is still accepted.
+	reset()
+	next_response_body = plan({ expires_at = "2099-13-01T00:00:00Z" })
+	assert_true(not prepare().plan_used, "an impossible month is not a timestamp")
+	reset()
+	next_response_body = plan({ expires_at = "2099-01-01T00:00:00+02:00" })
+	assert_true(prepare().plan_used, "a valid offset timestamp is still a timestamp")
+end
+
+-- ⚠ A STRING IS NOT A BOOLEAN, AND ABSENCE IS NOT FALSE. `"true"` was coerced
+-- to false, silently lifting an objection requirement inside a plan marked
+-- used.
+local function test_objection_required_must_be_a_json_boolean()
+	reset()
+	next_response_body = plan({ server_analytics_objection_required = "true" })
+	local coerced = prepare()
+	assert_true(not coerced.plan_used, 'the string "true" must not be accepted')
+	assert_true(coerced.server_analytics_objection_required, "and the requirement stands")
+
+	reset()
+	next_response_body = plan({ server_analytics_objection_required = "__nil__" })
+	local absent = prepare()
+	assert_true(absent.plan_used, "an omitted optional field is still a readable plan")
+	assert_true(absent.server_analytics_objection_required,
+		"an omitted objection requirement stands rather than lifting")
+
+	-- The control: an explicit boolean false is the ONLY thing that lifts it,
+	-- or the two assertions above would pass on a module that never lifts it.
+	reset()
+	next_response_body = plan({ server_analytics_objection_required = false })
+	local lifted = prepare()
+	assert_true(lifted.plan_used, "an explicit false is a readable plan")
+	assert_true(not lifted.server_analytics_objection_required, "and it lifts the requirement")
+end
+
+-- ⚠ AN INVALIDATED REQUEST CANNOT ANSWER. Clearing the cache alone left the
+-- in-flight request free to complete inside its deadline, deliver the stale
+-- decision and write it back — the named trigger undone by the very request
+-- it fired against.
+local function test_an_invalidated_request_cannot_answer()
+	reset()
+	next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT })
+	local decisions = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers, body = body, options = options }
+		consent_policy.invalidate() -- a policy revocation, mid-flight
+		callback(nil, nil, { status = 200, response = next_response_body })
+	end
+	consent_policy.prepare(context(), function(decision)
+		decisions[#decisions + 1] = decision
+	end)
+	http.request = saved_request
+	assert_equal(#decisions, 1, "exactly one callback")
+	assert_equal(decisions[1].reason, "invalidated", "an invalidated request takes the strict path")
+	assert_true(not decisions[1].plan_used, "it must not deliver the plan it was carrying")
+	assert_true(decisions[1].optional_processing_closed, "and closes optional processing")
+
+	-- And the cache must still be empty: repopulating it was the defect.
+	next_response_body = plan()
+	local after = prepare()
+	assert_equal(#requests, 2, "the invalidated response must not have repopulated the cache")
+	assert_equal(after.regime, consent_policy.STRICT_OPT_IN, "and the fresh resolution stands")
+end
+
+-- ⚠ A JSON OBJECT IS NOT AN EMPTY LIST. It decodes to a Lua table of length
+-- zero over which ipairs yields nothing, so a roster of operation blocks
+-- supplied as an object read as "no blocks" — a malformed plan wearing a
+-- permissive one's clothes.
+local function test_a_json_object_is_not_an_empty_list()
+	for _, case in ipairs({
+		{ "operation_blocks", plan({ operation_blocks = { policy_selection = "blocked" } }) },
+		{ "prohibited_purposes", plan({ prohibited_purposes = { advertising = true } }) },
+		{ "signals_used", plan({ signals_used = { server_country = "absent" } }) },
+	}) do
+		reset()
+		next_response_body = case[2]
+		local decision = prepare()
+		assert_true(not decision.plan_used,
+			case[1] .. " supplied as an object must not read as an empty list")
+		assert_true(decision.optional_processing_closed, case[1] .. " must close optional processing")
+	end
+
+	-- The control: a genuine array of the same fields is still accepted, or
+	-- the refusals above would pass on a module that refuses both shapes.
+	reset()
+	next_response_body = plan({ operation_blocks = { "profiling" }, prohibited_purposes = { "advertising" } })
+	local accepted = prepare()
+	assert_true(accepted.plan_used, "a genuine array must still be accepted: " .. tostring(accepted.reason))
+	assert_equal(accepted.operation_blocks[1], "profiling", "and it is carried through")
+end
+
+-- ⚠ THE CACHE IS SCOPED TO THE WHOLE CONTEXT. One process-wide entry served
+-- on liveness alone handed one app's, environment's or endpoint's permission
+-- to another, past the scope check that only ever saw the first context.
+local function test_the_cache_is_scoped_to_the_whole_context()
+	-- The control first: the SAME context is still served privately.
+	reset()
+	next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT })
+	local first = prepare()
+	assert_equal(first.regime, consent_policy.SOFT_OPT_OUT, "the fixture must cache a permissive plan")
+	local again = prepare()
+	assert_equal(#requests, 1, "the same context is served from the cache")
+	assert_equal(again.regime, consent_policy.SOFT_OPT_OUT, "with the decision that was cached")
+
+	for _, override in ipairs({
+		{ app_id = "app-other" }, { workspace_id = "ws-other" }, { environment_id = "env-other" },
+		{ endpoint = "https://policy.other.example" }, { locale = "de" },
+		{ platform = "macos" }, { app_version = "9.9.9" },
+		{ age_band = { vocabulary = "coarse.v1", band = "adult" } },
+	}) do
+		reset()
+		next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT })
+		prepare()
+		assert_equal(#requests, 1, "the cache is primed")
+		prepare(context(override))
+		assert_equal(#requests, 2, "a changed context field must re-resolve, not reuse the permission")
+	end
+end
+
+-- ⚠ THE ENDPOINT IS PART OF THE CONTEXT CONTRACT. An absent one was
+-- concatenated with the route and raised a Lua error out of prepare, so the
+-- single callback this module promises never arrived and the caller had
+-- nothing to fail closed on.
+local function test_an_invalid_endpoint_is_an_invalid_request()
+	for _, override in ipairs({
+		{ endpoint = "__nil__" }, { endpoint = 8080 }, { endpoint = "policy.example" },
+		{ endpoint = "https://policy.example/" }, { endpoint = "https://" .. string.rep("h", 300) },
+	}) do
+		reset()
+		next_response_body = plan()
+		local decision, calls = prepare(context(override))
+		assert_equal(calls, 1, "exactly one callback, even for a malformed endpoint")
+		assert_equal(#requests, 0, "a refused endpoint must cost zero requests")
+		assert_equal(decision.reason, "invalid_request")
+		assert_true(decision.optional_processing_closed, "and the verdict is closed")
+	end
+end
+
+-- ⚠ AN EMPTY SIGNATURE IS STILL A SIGNATURE. Treating "" as absence is a
+-- downgrade path: a signed response whose signature failed to serialise would
+-- have been admitted by a build that cannot verify signatures at all.
+local function test_an_empty_signature_is_still_a_signature()
+	reset()
+	next_response_body = plan({ signature = "" })
+	local decision = prepare()
+	assert_true(not decision.plan_used, "an empty signature is not an absent one")
+	assert_equal(decision.regime, consent_policy.STRICT_OPT_IN, "it takes the strict path")
+	assert_true(decision.optional_processing_closed, "and closes optional processing")
+end
+
 local tests = {
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,
@@ -462,6 +662,13 @@ local tests = {
 	test_every_malformed_plan_is_strict,
 	test_unknown_closes_optional_processing,
 	test_the_cache_is_private_and_invalidatable,
+	test_expiry_is_enforced_before_use_and_before_caching,
+	test_objection_required_must_be_a_json_boolean,
+	test_an_invalidated_request_cannot_answer,
+	test_a_json_object_is_not_an_empty_list,
+	test_the_cache_is_scoped_to_the_whole_context,
+	test_an_invalid_endpoint_is_an_invalid_request,
+	test_an_empty_signature_is_still_a_signature,
 }
 
 for _, test in ipairs(tests) do
