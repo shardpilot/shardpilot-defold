@@ -110,15 +110,156 @@ local latest_dispatch = {}
 -- is read there: a schema list key followed by `{` is malformed. That is the
 -- ONLY container-type signal available in this SDK, which is why this looks
 -- like string matching in a parser rather than a type check.
-local LIST_KEYS = { "operation_blocks", "prohibited_purposes", "signals_used" }
+local LIST_KEYS = { operation_blocks = true, prohibited_purposes = true, signals_used = true }
 
-local function list_keys_are_not_objects(body)
-	for _, name in ipairs(LIST_KEYS) do
-		if body:find('"' .. name .. '"%s*:%s*{') then
-			return false, name .. " is a JSON object where the schema says a list"
+-- ⚠ AND THE SCAN HAS TO BE JSON-AWARE, NOT A SEARCH FOR THE LITERAL NAME. The
+-- first cut looked for `"operation_blocks"%s*:%s*{` in the raw text, which a
+-- valid response spells past in one character: "operation\u005fblocks" decodes
+-- to the same key, json.decode restores it, and the literal search never saw
+-- it. So this walks the document's TOP LEVEL with a tokenizer — unescaping
+-- each key before comparing it, and skipping every value whole, so a key of
+-- the same name nested inside another object is not mistaken for this one.
+local MAX_SCAN_DEPTH = 32
+
+local function skip_space(text, pos)
+	local _, stop = text:find("^[ \t\r\n]*", pos)
+	return stop + 1
+end
+
+-- Reads one JSON string starting at `pos` (which must be the opening quote)
+-- and returns its DECODED value and the index after the closing quote, or nil.
+-- A \u escape outside ASCII is folded to a byte that cannot appear in a schema
+-- name: the point here is to compare key names, not to decode text.
+local function read_string(text, pos)
+	local parts = {}
+	pos = pos + 1
+	while pos <= #text do
+		local c = text:sub(pos, pos)
+		if c == '"' then
+			return table.concat(parts), pos + 1
+		elseif c == "\\" then
+			local escape = text:sub(pos + 1, pos + 1)
+			if escape == "u" then
+				local hex = text:sub(pos + 2, pos + 5)
+				if not hex:match("^%x%x%x%x$") then
+					return nil
+				end
+				local code = tonumber(hex, 16)
+				parts[#parts + 1] = code < 128 and string.char(code) or "\1"
+				pos = pos + 6
+			else
+				local simple = {
+					n = "\n", t = "\t", r = "\r", b = "\b", f = "\f",
+					['"'] = '"', ["\\"] = "\\", ["/"] = "/",
+				}
+				if not simple[escape] then
+					return nil
+				end
+				parts[#parts + 1] = simple[escape]
+				pos = pos + 2
+			end
+		else
+			parts[#parts + 1] = c
+			pos = pos + 1
 		end
 	end
-	return true
+	return nil
+end
+
+local skip_value
+
+-- Skips one complete JSON value and returns the index after it, or nil.
+skip_value = function(text, pos, depth)
+	if depth > MAX_SCAN_DEPTH then
+		return nil
+	end
+	local c = text:sub(pos, pos)
+	if c == '"' then
+		local _, after = read_string(text, pos)
+		return after
+	elseif c == "{" or c == "[" then
+		local close = c == "{" and "}" or "]"
+		pos = skip_space(text, pos + 1)
+		if text:sub(pos, pos) == close then
+			return pos + 1
+		end
+		while true do
+			if c == "{" then
+				if text:sub(pos, pos) ~= '"' then
+					return nil
+				end
+				local _, after = read_string(text, pos)
+				if not after then
+					return nil
+				end
+				pos = skip_space(text, after)
+				if text:sub(pos, pos) ~= ":" then
+					return nil
+				end
+				pos = skip_space(text, pos + 1)
+			end
+			local next_pos = skip_value(text, pos, depth + 1)
+			if not next_pos then
+				return nil
+			end
+			pos = skip_space(text, next_pos)
+			local delimiter = text:sub(pos, pos)
+			if delimiter == close then
+				return pos + 1
+			end
+			if delimiter ~= "," then
+				return nil
+			end
+			pos = skip_space(text, pos + 1)
+		end
+	end
+	local _, stop = text:find("^[^,%]}%s]+", pos)
+	if not stop then
+		return nil
+	end
+	return stop + 1
+end
+
+local function list_keys_are_not_objects(body)
+	local pos = skip_space(body, 1)
+	if body:sub(pos, pos) ~= "{" then
+		-- Not an object at all; the decode refuses it on its own terms.
+		return true
+	end
+	pos = skip_space(body, pos + 1)
+	if body:sub(pos, pos) == "}" then
+		return true
+	end
+	while true do
+		if body:sub(pos, pos) ~= '"' then
+			return false, "a plan key is not a string"
+		end
+		local key, after = read_string(body, pos)
+		if not key then
+			return false, "a plan key is not readable"
+		end
+		pos = skip_space(body, after)
+		if body:sub(pos, pos) ~= ":" then
+			return false, "a plan key carries no value"
+		end
+		pos = skip_space(body, pos + 1)
+		if LIST_KEYS[key] and body:sub(pos, pos) == "{" then
+			return false, key .. " is a JSON object where the schema says a list"
+		end
+		local next_pos = skip_value(body, pos, 1)
+		if not next_pos then
+			return false, "the plan is not readable"
+		end
+		pos = skip_space(body, next_pos)
+		local delimiter = body:sub(pos, pos)
+		if delimiter == "}" then
+			return true
+		end
+		if delimiter ~= "," then
+			return false, "the plan is not readable"
+		end
+		pos = skip_space(body, pos + 1)
+	end
 end
 
 -- ⚠ AN OBJECT IS NOT AN EMPTY LIST. A JSON object decodes to a Lua table
@@ -179,8 +320,14 @@ local function parse_timestamp(value)
 	if mo < 1 or mo > 12 or d < 1 or d > days_in_month(y, mo) then
 		return nil
 	end
-	-- 60 is the leap second the grammar allows, not a 61st second.
-	if h > 23 or mi > 59 or sec > 60 then
+	-- ⚠ SECOND 60 IS REFUSED. The grammar allows it, but a UTC leap second can
+	-- only ever be inserted at 23:59:60 on a date the IERS announced — so an
+	-- arbitrary ":00:60" is not a leap second, it is a malformed timestamp, and
+	-- normalising it arithmetically to the next minute quietly moved a plan's
+	-- expiry. Validating it against the real insertion dates would mean
+	-- shipping and maintaining that table in an SDK; refusing is the honest
+	-- answer this module can actually keep.
+	if h > 23 or mi > 59 or sec > 59 then
 		return nil
 	end
 	rest = rest:gsub("^%.%d+", "")
@@ -572,6 +719,13 @@ local function decision_from_plan(plan)
 		optional_processing_closed = plan.regime ~= M.SOFT_OPT_OUT,
 		plan_used = true,
 		reason = nil,
+		-- ⚠ HOW LONG THIS VERDICT IS GOOD FOR, in seconds, set by prepare
+		-- rather than here because it depends on when the answer ARRIVED. The
+		-- host needs it: cache expiry protects the next lookup and stops
+		-- nothing that is already running, so a lane opened on a permissive
+		-- plan would otherwise stay open long past the plan's life. A fallback
+		-- carries no validity at all — it established nothing to be valid.
+		valid_for_seconds = nil,
 		policy_version = plan.policy_version,
 		consent_text_version = plan.consent_text_version,
 		presented_language = plan.presented_language,
@@ -639,7 +793,9 @@ function M.prepare(context, callback)
 		-- kept, so a caller that wrote a field on the decision it was given —
 		-- or that read prohibited_purposes and sorted it in place — edited what
 		-- every later prepare would serve for the next five minutes.
-		callback(copy_value(cached.decision, 0))
+		local served = copy_value(cached.decision, 0)
+		served.valid_for_seconds = cached.until_at - at
+		callback(served)
 		return
 	end
 
@@ -744,6 +900,7 @@ function M.prepare(context, callback)
 		if plan.max_age_seconds ~= nil and plan.max_age_seconds < lifetime then
 			lifetime = plan.max_age_seconds
 		end
+		decision.valid_for_seconds = lifetime
 		if lifetime > 0 then
 			-- The entry gets its OWN copy too, so the table delivered below and
 			-- the table kept here are never the same object.

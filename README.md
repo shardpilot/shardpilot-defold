@@ -154,131 +154,190 @@ Minimal Defold script (see [`examples/minimal/`](examples/minimal)):
 > there is nothing to grant, so nothing is asked and the SDK is not started;
 > `crash_profile` decides the crash lane on its own, and crash reporting is ON
 > by default, so an unconditional `crash.init` is how a closed lane gets
-> opened; `server_analytics` gates only your backend's lane. See
-> [Consent regime](#consent-regime).
+> opened; `server_analytics` gates only your backend's lane.
+>
+> **And resolve again on every named trigger** — after the player answers, on
+> resume, at `valid_for_seconds`, and when the notice text or language changes
+> — then make the running lanes match the fresh answer. A lane that is now
+> closed is **suspended with `shutdown()`, never with `set_consent(false)` or
+> `crash.set_enabled(false)`**: those record a player's decision, and nobody
+> decided anything — the policy changed. See [Consent regime](#consent-regime).
 
 ```lua
+-- The same shape as examples/minimal/main.script, which is the executable
+-- copy of this. ONE reconcile path: every trigger resolves the policy again
+-- and then makes the running lanes match the answer.
 local consent_policy = require "shardpilot.consent_policy"
 local platform = require "shardpilot.platform"
 local shardpilot = require "shardpilot.sdk"
 local crash = require "shardpilot.crash"
 
-local started = false       -- the analytics SDK was initialised
-local crash_started = false -- the crash reporter was initialised: SEPARATE state
+-- Lifecycle state: an initialised client that has not been shut down.
+local analytics_running, crash_running = false, false
+-- The standing answer and the notice text it was given against. It survives a
+-- suspension; it is discarded only when the text or language changes.
+local answered, notice_open = nil, false
+local elapsed, revalidate_at = 0, nil
 
-local function on_decision(decision)
-  print("consent regime: " .. tostring(decision.regime))
-
-  -- ⚠ ONE FINAL-CHOICE GATE, AND BOTH LANES ARE INSIDE IT. No capture hook, no
-  -- identity and no buffered event may exist before the player's final choice
-  -- — and the crash reporter IS a capture hook. Your notice answers many
-  -- frames later, so anything started outside this callback is started while
-  -- the notice is still on screen.
-  present_consent_notice(decision, function(granted)  -- your consent UI
-    -- ⚠ EACH LANE BRANCHES ON ITS OWN FIELD. The flags are orthogonal:
-    -- analytics being closed does not close the crash lane, and a permitted
-    -- crash lane does not open analytics.
-    if decision.optional_processing_closed then
-      -- Nothing a player could grant — and the SDK is not initialised at all,
-      -- because init builds the client, which loads the persisted scope record
-      -- and mints an anonymous identifier.
-      print("optional processing is closed by this regime; analytics not started")
-    else
-      shardpilot.init({
-        ingest_url = "http://localhost:8080",
-        workspace_id = "workspace-example",
-        app_id = "app-example",
-        environment_id = "develop",
-        -- Auth: configure exactly one of token_provider (Mode B) or api_key (Mode A).
-        token_provider = function(callback)
-          callback("client-token-placeholder", nil, nil)
-        end,
-        -- api_key = "sp_ingest_...", -- Mode A alternative (publishable key)
-      })
-      shardpilot.identify("user-example")
-      shardpilot.set_consent(granted) -- a DECLINE is recorded the same way
-      if granted then
-        shardpilot.session_start()     -- emits app.session_started
-        shardpilot.screen_view("menu") -- emits app.screen_view
-      end
-      started = true
-    end
-
-    -- The crash lane, decided separately. Crash reporting is ON by default, so
-    -- leaving crash.init unconditional is how a closed lane gets opened.
-    if decision.crash_profile == consent_policy.CRASH_MINIMAL then
-      -- crash.init returns false, err — an empty config fails with
-      -- crash_ingest_url_required, so the required keys are here and the flag
-      -- is set from the RESULT. A crash_started that lies means final() calls
-      -- shutdown on a reporter that was never created.
-      local crash_ok, crash_err = crash.init({
-        crash_ingest_url = "http://localhost:8080",
-        crash_api_key = "sp_crash_write_placeholder",
-        app_id = "app-example",
-        crash_source = "game-client",
-      })
-      crash_started = crash_ok
-      if not crash_ok then
-        print("shardpilot crash init failed: " .. tostring(crash_err))
-      end
-    end
-
-    -- Server-side analytics is a BASIS, not a toggle. If your backend sends on
-    -- it, gate that on decision.server_analytics == SERVER_ANALYTICS_ELIGIBLE
-    -- and honour decision.server_analytics_objection_required out of band.
-  end)
-end
-
-function init(self)
-  -- The policy endpoint is a third service of its own, separate from
-  -- ingest_url and remote_config_url, and it obeys the same URL rule they do:
-  -- https anywhere, http only for a loopback host. platform.detect() folds
-  -- this system's name into the closed vocabulary the policy accepts; an
-  -- unmappable system is refused locally, without a request leaving the
-  -- device, and the callback receives the strict decision.
-  consent_policy.prepare({
-    endpoint = "http://localhost:8082",
-    workspace_id = "workspace-example",
-    app_id = "app-example",
-    environment_id = "develop",
+local function policy_context()
+  return {
+    endpoint = "http://localhost:8082", -- a third service, separate from the
+    workspace_id = "workspace-example", -- ingest and remote-config endpoints;
+    app_id = "app-example",             -- https anywhere, http only for
+    environment_id = "develop",         -- a loopback host
     app_version = "1.0.0",
     locale = "en",
     platform = platform.detect(),
-  }, on_decision)
+  }
+end
+
+-- Your consent UI. It must present the notice this regime requires and call
+-- back with the player's answer, from wherever it lives.
+local function present_consent_notice(decision, callback) --[[ ... ]] end
+
+-- ⚠ SUSPENDING A LANE IS NOT A PLAYER DECISION. set_consent(false) records and
+-- persists an explicit denial and queues its receipt; crash.set_enabled(false)
+-- persists an opt_out that outlives the launch. Nobody chose anything here —
+-- the policy changed. shutdown() stops the client and writes no choice.
+local function suspend_analytics(reason)
+  if analytics_running then
+    shardpilot.shutdown("policy_" .. reason)
+    analytics_running = false
+  end
+end
+
+local function suspend_crash()
+  if crash_running then
+    crash.shutdown()
+    crash_running = false
+  end
+end
+
+local function start_analytics(granted)
+  shardpilot.init({
+    ingest_url = "http://localhost:8080",
+    workspace_id = "workspace-example",
+    app_id = "app-example",
+    environment_id = "develop",
+    -- Auth: configure exactly one of token_provider (Mode B) or api_key (Mode A).
+    token_provider = function(callback)
+      callback("client-token-placeholder", nil, nil)
+    end,
+  })
+  shardpilot.identify("user-example")
+  shardpilot.set_consent(granted) -- a DECLINE is recorded the same way
+  if granted then
+    shardpilot.session_start()
+  end
+  analytics_running = true
+end
+
+local function start_crash()
+  -- crash.init returns false, err — an empty config fails with
+  -- crash_ingest_url_required, so the flag comes from the RESULT.
+  local ok = crash.init({
+    crash_ingest_url = "http://localhost:8080",
+    crash_api_key = "sp_crash_write_placeholder",
+    app_id = "app-example",
+    crash_source = "game-client",
+  })
+  crash_running = ok and true or false
+end
+
+local reconcile
+local function resolve_and_reconcile()
+  consent_policy.prepare(policy_context(), reconcile)
+end
+
+-- ⚠ THE ONE PATH. It CLOSES on its own authority and OPENS only on the
+-- player's: a lane the new decision permits still needs an answer.
+reconcile = function(fresh)
+  -- (a) A changed notice text means the running grant belongs to a notice this
+  -- player never saw.
+  if answered and (fresh.consent_text_version ~= answered.text_version
+    or fresh.presented_language ~= answered.language) then
+    suspend_analytics("consent_text_changed")
+    answered = nil
+  end
+
+  -- (b) Whatever this decision closes, closes now. The flags are orthogonal:
+  -- analytics being closed does not close the crash lane, and a permitted
+  -- crash lane does not open analytics.
+  if fresh.optional_processing_closed then suspend_analytics("optional_processing_closed") end
+  if fresh.crash_profile ~= consent_policy.CRASH_MINIMAL then suspend_crash() end
+
+  -- (c) The plan's own life. Cache expiry protects the next lookup and stops
+  -- nothing that is already running. A fallback carries no validity.
+  revalidate_at = fresh.valid_for_seconds and (elapsed + fresh.valid_for_seconds) or nil
+
+  -- (d) Analytics. NOTHING IS ASKED when the regime closes optional
+  -- processing: there is nothing a player could grant.
+  if not fresh.optional_processing_closed and not analytics_running then
+    if answered then
+      start_analytics(answered.granted)
+    elseif not notice_open then
+      notice_open = true
+      present_consent_notice(fresh, function(granted)
+        notice_open = false
+        answered = { text_version = fresh.consent_text_version,
+                     language = fresh.presented_language, granted = granted }
+        resolve_and_reconcile() -- the plan may have expired while the UI was open
+      end)
+      return -- nothing starts while a choice is pending
+    else
+      return
+    end
+  end
+
+  -- (e) Crash, reached only once no choice is pending: the reporter is a
+  -- capture hook, and none may exist before the player's final choice. With
+  -- the optional lane closed there is no pending choice, so the decision is
+  -- final.
+  if fresh.crash_profile == consent_policy.CRASH_MINIMAL and not crash_running then
+    start_crash()
+  end
+end
+
+function init(self)
+  resolve_and_reconcile()
+  -- Installed here, not inside a lane: resume must be observed whether or not
+  -- a lane was ever started. Defold keeps ONE window listener, so put these
+  -- branches inside your game's existing one.
+  if window and window.set_listener then
+    window.set_listener(function(self, event, data)
+      if event == window.WINDOW_EVENT_ICONFIED or event == window.WINDOW_EVENT_FOCUS_LOST then
+        if analytics_running then shardpilot.persist() end
+      elseif event == window.WINDOW_EVENT_FOCUS_GAINED then
+        consent_policy.invalidate() -- resume must not be answered from the cache
+        resolve_and_reconcile()
+      end
+    end)
+  end
 end
 
 function update(self, dt)
-  if started then
-    shardpilot.update(dt) -- drives flush timer + frame sampling
+  elapsed = elapsed + (dt or 0)
+  -- ⚠ THE PLAN'S DEADLINE, AND THE LANES STOP FIRST. A lane authorised by a
+  -- plan that has run out does not keep running while the replacement is
+  -- fetched.
+  if revalidate_at and elapsed >= revalidate_at then
+    revalidate_at = nil
+    suspend_analytics("plan_expired")
+    suspend_crash()
+    consent_policy.invalidate()
+    resolve_and_reconcile()
   end
+  if analytics_running then shardpilot.update(dt) end
 end
 
 function final(self)
-  -- ⚠ THE TWO LANES SHUT DOWN SEPARATELY. A crash reporter that was started
-  -- while analytics stayed closed still has to be stopped, so returning early
-  -- on `not started` would have skipped crash.shutdown() in exactly the case
-  -- the crash lane exists for.
-  if crash_started then
-    local crash_ok, crash_err = crash.shutdown()
-    if not crash_ok then
-      print("shardpilot crash shutdown not complete: " .. tostring(crash_err))
-    end
-  end
-  if not started then
-    return -- analytics was never started; there is no SDK to shut down
-  end
-  -- shutdown() starts a final flush. When the flush cannot deliver everything,
-  -- the undelivered events are written to the durable offline spool and
-  -- shutdown returns true — they re-send on the next launch. An undelivered
-  -- consent receipt behaves the same way: durably retained in the consent
-  -- outbox, it re-sends next launch and shutdown completes. It returns
-  -- false, "consent_pending" only when the receipt could NOT be durably
-  -- captured (no save-file backend, or the write keeps failing) — retry
-  -- shutdown then — and with spool_enabled = false it returns false, err
-  -- whenever events remain undelivered (retry shutdown until it returns true).
-  local ok, err = shardpilot.shutdown("app_final")
-  if not ok then
-    print("shardpilot shutdown not complete: " .. tostring(err))
+  if crash_running then crash.shutdown() end
+  if analytics_running then
+    -- shutdown() starts a final flush; undelivered events go to the durable
+    -- spool and re-send next launch. It returns false, "consent_pending" only
+    -- when a receipt could not be durably captured — retry shutdown then.
+    local ok, err = shardpilot.shutdown("app_final")
+    if not ok then print("shardpilot shutdown not complete: " .. tostring(err)) end
   end
 end
 ```
@@ -1012,6 +1071,7 @@ The callback receives **exactly one decision, exactly once**:
 | `server_analytics_objection_required` | Stands unless the plan says, as a boolean, that it does not |
 | `optional_processing_closed` | `false` is **not permission** — only that the regime is not what closed the door |
 | `plan_used` | `false` means the strict fallback was taken; `reason` says why |
+| `valid_for_seconds` | How long this verdict is good for — the shortest of the cache ceiling, the plan's `expires_at` and its `max_age_seconds`. **Schedule your own re-resolution by it:** cache expiry protects the next lookup and stops nothing that is already running. `nil` on a fallback, which established nothing that could expire |
 
 **The conservative rule.** A plan that is missing, unreadable, out of scope,
 **expired**, or carrying anything outside its bounded vocabulary resolves to
@@ -1030,6 +1090,15 @@ re-resolution triggers — launch and resume, a network or permitted storefront
 change, an age correction, a language or text change, a workspace or app
 change, a policy revocation, and before the first optional admission. A
 request already in flight when it fires can no longer answer.
+
+**Plan text is read before it is decoded.** Defold's `json.decode` returns a
+plain table for both `{}` and `[]` and marks neither, so the container type is
+erased by the decode — an object supplied where the schema says a list would
+read as an empty list. The raw response is therefore scanned first, with a
+JSON-aware walk that unescapes each key before comparing it (a literal search
+is bypassed by `"operation\u005fblocks"`) and skips every value whole, so a
+key of the same name nested in another object is not mistaken for the
+top-level one.
 
 > `SOFT_OPT_OUT` parses but is **not reachable today**: every row of the
 > jurisdiction matrix is pending counsel confirmation, so the resolver's

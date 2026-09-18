@@ -771,7 +771,7 @@ end
 -- replaced in package.loaded and the chunk is loaded, which defines init().
 -- `between` runs after init() and before update(), i.e. while the notice is
 -- still on screen. `window_events` are fired after update().
-local function run_example(between, window_events)
+local function run_example(between, window_events, dts)
 	local seen = {}
 	local function record(name)
 		return function(...)
@@ -799,7 +799,8 @@ local function run_example(between, window_events)
 		end,
 		update = function() end,
 		persist = function() end,
-		shutdown = function()
+		shutdown = function(reason)
+			seen[#seen + 1] = "sdk.shutdown:" .. tostring(reason)
 			return true
 		end,
 	}
@@ -812,6 +813,7 @@ local function run_example(between, window_events)
 			seen[#seen + 1] = "crash.set_enabled:" .. tostring(enabled)
 		end,
 		shutdown = function()
+			seen[#seen + 1] = "crash.shutdown"
 			return true
 		end,
 	}
@@ -856,6 +858,9 @@ local function run_example(between, window_events)
 			window.listener(nil, event, nil)
 			update(nil, 0)
 		end
+		for _, dt in ipairs(dts or {}) do
+			update(nil, dt)
+		end
 		after_update = table.concat(seen, " | ")
 	end)
 	window = saved_window
@@ -883,7 +888,8 @@ end
 
 local function test_the_published_example_branches_on_the_decision()
 	-- (a) The regime this release actually emits: STRICT, crash OFF, server
-	-- analytics DENIED. Nothing may be granted, so nothing is initialised.
+	-- analytics DENIED. Nothing may be granted, so nothing is asked and
+	-- nothing is initialised.
 	reset()
 	next_response_body = example_plan()
 	local calls, before_choice = run_example()
@@ -896,47 +902,50 @@ local function test_the_published_example_branches_on_the_decision()
 		"the example read a fallback, not the fixture's plan: " .. calls)
 	assert_true(calls:find("sdk.init", 1, true) == nil,
 		"a closed lane must not initialise the SDK (identity + spool): " .. calls)
-	assert_true(calls:find("set_consent:true", 1, true) == nil,
-		"the example granted consent under a closed regime: " .. calls)
-	assert_true(calls:find("sdk.session_start", 1, true) == nil,
-		"the example started a session under a closed regime: " .. calls)
+	assert_true(calls:find("set_consent", 1, true) == nil,
+		"a closed lane leaves nothing to grant, so no consent decision is written: " .. calls)
 	assert_true(calls:find("crash.init", 1, true) == nil,
 		"the example enabled default-on crash reporting under crash_profile OFF: " .. calls)
-
-	-- ⚠ AND NOTHING AT ALL BEFORE THE PLAYER ANSWERS. The notice is still on
-	-- screen at the end of init(); the first-run guarantee is that no hook, no
-	-- identity and no buffered event exists yet.
-	assert_true(before_choice:find("sdk.", 1, true) == nil and before_choice:find("crash.", 1, true) == nil,
-		"the example touched the SDK before the notice was answered: " .. before_choice)
 
 	-- (b) The CRASH lane is decided separately, so a permitted crash profile
 	-- opens it even though analytics stays closed. Without this the assertions
 	-- above would be satisfied by an example that does nothing at all.
+	--
+	-- ⚠ AND IT OPENS AT ONCE HERE, WHICH IS A CHANGE FROM THE PREVIOUS ROUND.
+	-- The rule is "no capture hook before the player's FINAL CHOICE"; with the
+	-- optional lane closed there is nothing to grant, no notice is presented
+	-- (a question whose answer is discarded is worse than not asking), and so no
+	-- choice is pending — the decision itself is final. The waiting property
+	-- is asked in (c), where a choice really is pending.
 	reset()
 	next_response_body = example_plan({ crash_profile = consent_policy.CRASH_MINIMAL })
 	calls, before_choice = run_example()
-	-- ⚠ THE P1: the crash reporter is a capture hook, and it must not exist
-	-- while the notice is still on screen. This is the assertion that fails on
-	-- the previous cut, where crash.init sat outside the notice's callback.
-	assert_true(before_choice:find("crash.init", 1, true) == nil,
-		"the crash reporter was started before the player's final choice: " .. before_choice)
 	assert_true(calls:find("crash.init", 1, true) ~= nil,
-		"a permitted crash profile must open the crash lane once answered: " .. calls)
+		"a permitted crash profile must open the crash lane: " .. calls)
 	assert_true(calls:find("sdk.init", 1, true) == nil,
 		"and it must not open analytics: " .. calls)
+	assert_true(calls:find("present", 1, true) == nil and calls:find("set_consent", 1, true) == nil,
+		"a closed optional lane must not be asked about: " .. calls)
 
-	-- (c) An OPEN optional lane reaches the consent UI, and the example's
-	-- placeholder declines — so the SDK is initialised and the DECLINE is
-	-- recorded, which is the documented path, and no session starts.
+	-- (c) An OPEN optional lane. A choice IS pending, so NEITHER lane may have
+	-- started by the end of init() — the crash reporter is a capture hook and
+	-- this is where that rule bites. After the answer both lanes act, and the
+	-- placeholder's DECLINE is recorded, which is the documented path.
 	reset()
-	next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT })
-	calls = run_example()
+	next_response_body = example_plan({
+		regime = consent_policy.SOFT_OPT_OUT, crash_profile = consent_policy.CRASH_MINIMAL,
+	})
+	calls, before_choice = run_example()
+	assert_true(before_choice:find("sdk.", 1, true) == nil and before_choice:find("crash.", 1, true) == nil,
+		"nothing may exist while the notice is still on screen: " .. before_choice)
 	assert_true(calls:find("sdk.init", 1, true) ~= nil,
 		"an open lane must reach the SDK once the player has answered: " .. calls)
 	assert_true(calls:find("set_consent:false", 1, true) ~= nil,
 		"a declined answer must be recorded, not dropped: " .. calls)
 	assert_true(calls:find("sdk.session_start", 1, true) == nil,
 		"a decline must not start a session: " .. calls)
+	assert_true(calls:find("crash.init", 1, true) ~= nil,
+		"and the crash lane opens once the choice is no longer pending: " .. calls)
 end
 
 -- ⚠ TWO REQUESTS FOR THE SAME CONTEXT SHARE A GENERATION, so neither
@@ -1100,14 +1109,23 @@ end
 -- a verdict that is no longer true.
 local function test_the_example_re_resolves_after_the_answer()
 	reset()
-	-- max_age_seconds = 0 means the first answer is not cached, so the
-	-- re-resolution actually reaches the wire and this scene can see it.
-	next_response_body = example_plan({ crash_profile = consent_policy.CRASH_MINIMAL, max_age_seconds = 0 })
+	-- The optional lane must be OPEN, or no notice is presented and there is
+	-- no answer to be stale about. max_age_seconds = 0 means the first answer
+	-- is not cached, so the re-resolution reaches the wire and is visible.
+	next_response_body = example_plan({
+		regime = consent_policy.SOFT_OPT_OUT,
+		crash_profile = consent_policy.CRASH_MINIMAL,
+		max_age_seconds = 0,
+	})
 	local calls = run_example(function()
 		-- While the notice is on screen the policy changes: the crash lane closes.
-		next_response_body = example_plan({ crash_profile = consent_policy.CRASH_OFF, max_age_seconds = 0 })
+		next_response_body = example_plan({
+			regime = consent_policy.SOFT_OPT_OUT,
+			crash_profile = consent_policy.CRASH_OFF,
+			max_age_seconds = 0,
+		})
 	end)
-	assert_equal(#requests, 2, "the example must resolve again after the answer")
+	assert_true(#requests >= 2, "the example must resolve again after the answer")
 	assert_true(calls:find("crash.init", 1, true) == nil,
 		"the example acted on the stale decision and opened a lane the fresh one closes: " .. calls)
 end
@@ -1128,9 +1146,8 @@ local function test_the_example_closes_lanes_on_resume()
 	assert_true(calls:find("sdk.init", 1, true) ~= nil and calls:find("crash.init", 1, true) ~= nil,
 		"both lanes must be open, or this scene proves nothing: " .. calls)
 	-- The placeholder notice declines, so set_consent:false appears either way;
-	-- what only the RESUME produces is these two lines.
-	assert_true(calls:find("closed on resume", 1, true) == nil
-		and calls:find("crash.set_enabled:false", 1, true) == nil,
+	-- what only a CLOSURE produces is the suspension lines.
+	assert_true(calls:find("suspended", 1, true) == nil,
 		"an unchanged policy must not close anything on resume: " .. calls)
 
 	-- Now the policy closes both lanes while the app is backgrounded. The
@@ -1153,10 +1170,176 @@ local function test_the_example_closes_lanes_on_resume()
 	calls = run_example(nil, { "focus_gained" })
 	http.request = saved_request
 	assert_true(resumed, "resume must re-resolve rather than answer from the cache")
-	assert_true(calls:find("optional processing closed on resume", 1, true) ~= nil,
+	assert_true(calls:find("analytics suspended (optional_processing_closed)", 1, true) ~= nil,
 		"resume must close the analytics lane the new decision closes: " .. calls)
-	assert_true(calls:find("crash.set_enabled:false", 1, true) ~= nil,
+	assert_true(calls:find("crash reporting suspended (crash_profile_off)", 1, true) ~= nil,
 		"resume must stop the crash lane the new decision closes: " .. calls)
+	-- ⚠ AND IT MUST NOT WRITE A PLAYER DECISION. set_consent(false) records and
+	-- persists an explicit denial and queues its receipt; crash.set_enabled
+	-- persists an opt_out that outlives the launch. Nobody chose anything here
+	-- — the policy changed. The only set_consent in this run is the one the
+	-- placeholder notice produced, before the resume.
+	assert_true(calls:find("crash.set_enabled", 1, true) == nil,
+		"a policy closure must not persist a crash opt-out: " .. calls)
+	assert_true(calls:find("sdk.shutdown", 1, true) ~= nil and calls:find("crash.shutdown", 1, true) ~= nil,
+		"suspension is a shutdown, which writes no choice: " .. calls)
+end
+
+-- ⚠ A LITERAL SEARCH FOR THE KEY NAME IS BYPASSED BY ONE ESCAPE.
+-- "operation_blocks" decodes to the same key, json.decode restores it,
+-- and the raw-text search never saw it — so the scan has to unescape the key
+-- before comparing, and skip every value whole so a nested key of the same
+-- name is not mistaken for the top-level one.
+local function test_an_escaped_key_cannot_hide_an_object()
+	local escaped = {
+		operation_blocks = '"operation\\u005fblocks"',
+		prohibited_purposes = '"prohibited\\u005fpurposes"',
+		signals_used = '"signals\\u005fused"',
+	}
+	for name, spelling in pairs(escaped) do
+		reset()
+		local body = plan()
+		next_response_body = body:sub(1, 1) .. spelling .. ":{}," .. body:sub(2)
+		local decision = prepare()
+		assert_true(not decision.plan_used,
+			name .. " spelled with an escape must not hide an object: " .. tostring(decision.reason))
+
+		-- The control: the SAME escaped spelling with an ARRAY still parses,
+		-- so the rule is about the container and not about the escape.
+		reset()
+		body = plan()
+		next_response_body = body:sub(1, 1) .. spelling .. ":[]," .. body:sub(2)
+		assert_true(prepare().plan_used, name .. " spelled with an escape must still parse as a list")
+	end
+
+	-- ⚠ AND A NESTED KEY OF THE SAME NAME IS NOT THE TOP-LEVEL ONE. The scan
+	-- skips each value whole; a scope object carrying its own "operation_blocks"
+	-- would otherwise refuse a perfectly good plan.
+	reset()
+	local body = plan()
+	next_response_body = body:gsub('"scope":{', '"scope":{"operation_blocks":{},', 1)
+	local nested = prepare()
+	-- This reader validates the scope's named fields and ignores anything else
+	-- nested inside it, so the plan is USED — which is exactly what makes this
+	-- a control for the scan: a scan that matched the name anywhere in the
+	-- document would refuse a plan the schema permits.
+	assert_true(nested.plan_used,
+		"a same-named key nested inside another object was mistaken for the top-level one: "
+			.. tostring(nested.reason) .. " / " .. tostring(nested.detail))
+end
+
+-- ⚠ SECOND 60 IS NOT A LEAP SECOND UNLESS IT IS 23:59:60 ON AN ANNOUNCED DATE.
+-- Accepting it anywhere normalised the timestamp arithmetically to the next
+-- minute, quietly moving a plan's expiry.
+local function test_second_sixty_is_refused()
+	reset()
+	next_response_body = plan({ expires_at = "2099-01-01T00:00:60Z" })
+	assert_true(not prepare().plan_used, "second 60 must not be normalised into the next minute")
+	reset()
+	next_response_body = plan({ expires_at = "2099-01-01T00:00:59Z" })
+	assert_true(prepare().plan_used, "second 59 is still a second")
+end
+
+-- ⚠ CACHE EXPIRY PROTECTS THE NEXT LOOKUP AND STOPS NOTHING THAT IS RUNNING.
+-- A lane opened on a permissive plan would otherwise stay open indefinitely
+-- while the app is foregrounded, until an unrelated trigger happened to fire.
+local function test_the_example_revalidates_at_the_plans_deadline()
+	reset()
+	next_response_body = example_plan({
+		regime = consent_policy.SOFT_OPT_OUT, crash_profile = consent_policy.CRASH_MINIMAL,
+		max_age_seconds = 2,
+	})
+	local swapped = false
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url }
+		if #requests >= 2 then
+			next_response_body = example_plan({
+				regime = consent_policy.STRICT_OPT_IN, crash_profile = consent_policy.CRASH_OFF,
+			})
+			swapped = true
+		end
+		callback(nil, nil, { status = 200, response = next_response_body })
+	end
+	-- Three seconds of frames, past the two-second plan.
+	local calls = run_example(nil, nil, { 1, 1, 1 })
+	http.request = saved_request
+	assert_true(swapped, "the deadline must re-resolve rather than answer from the cache")
+	-- ⚠ SUSPENDED FIRST, then replaced. A lane whose plan has run out does not
+	-- keep running while the replacement is fetched.
+	assert_true(calls:find("analytics suspended (plan_expired)", 1, true) ~= nil,
+		"the analytics lane must stop when its plan expires: " .. calls)
+	assert_true(calls:find("crash reporting suspended (plan_expired)", 1, true) ~= nil,
+		"the crash lane must stop when its plan expires: " .. calls)
+
+	-- The control: inside the plan's life, nothing is suspended.
+	reset()
+	next_response_body = example_plan({
+		regime = consent_policy.SOFT_OPT_OUT, crash_profile = consent_policy.CRASH_MINIMAL,
+		max_age_seconds = 300,
+	})
+	calls = run_example(nil, nil, { 1, 1, 1 })
+	assert_true(calls:find("suspended", 1, true) == nil,
+		"a live plan must not be revalidated out from under its lanes: " .. calls)
+end
+
+-- ⚠ A GRANT BELONGS TO THE NOTICE THE PLAYER SAW. A new plan with a different
+-- consent_text_version or presented_language means the running grant was given
+-- against text nobody read, so processing stops and the notice is presented
+-- again — closing on the policy's authority, reopening on the player's.
+local function test_the_example_re_presents_when_the_notice_text_changes()
+	for _, changed in ipairs({
+		{ consent_text_version = "ff-v2.0" },
+		{ presented_language = "de" },
+	}) do
+		reset()
+		next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT })
+		local saved_request = http.request
+		http.request = function(url, method, callback, headers, body, options)
+			requests[#requests + 1] = { url = url }
+			if #requests >= 2 then
+				local overrides = { regime = consent_policy.SOFT_OPT_OUT }
+				for key, value in pairs(changed) do
+					overrides[key] = value
+				end
+				next_response_body = example_plan(overrides)
+			end
+			callback(nil, nil, { status = 200, response = next_response_body })
+		end
+		local calls = run_example(nil, { "focus_gained" }, { 0, 0 })
+		http.request = saved_request
+		assert_true(calls:find("analytics suspended (consent_text_changed)", 1, true) ~= nil,
+			"a changed notice text must suspend the running grant: " .. calls)
+		-- And it comes back only through a NEW answer: two init calls, because
+		-- the notice was presented a second time.
+		local inits = 0
+		for _ in calls:gmatch("sdk%.init") do
+			inits = inits + 1
+		end
+		assert_equal(inits, 2, "the notice must be presented again and the lane restarted: " .. calls)
+	end
+end
+
+-- ⚠ A VERDICT SAYS HOW LONG IT IS GOOD FOR, because cache expiry protects the
+-- next lookup and stops nothing that is already running. Without this the host
+-- cannot schedule the revalidation that closes a lane whose plan has run out.
+local function test_a_verdict_carries_its_validity_window()
+	reset()
+	next_response_body = plan({ max_age_seconds = 7 })
+	local fresh = prepare()
+	assert_equal(fresh.valid_for_seconds, 7, "a fresh verdict must carry the shortest of its bounds")
+
+	local served = prepare()
+	assert_equal(#requests, 1, "the second call is a cache hit")
+	assert_true(served.valid_for_seconds ~= nil and served.valid_for_seconds < 7,
+		"a cache hit must count DOWN rather than restate the original window: "
+			.. tostring(served.valid_for_seconds))
+
+	-- A fallback established nothing that could expire, so it schedules nothing.
+	reset()
+	next_status = 500
+	next_response_body = encode_value({ reason = "policy_unavailable" })
+	assert_true(prepare().valid_for_seconds == nil, "a fallback carries no validity window")
 end
 
 local tests = {
@@ -1187,6 +1370,11 @@ local tests = {
 	test_an_offset_needs_its_colon,
 	test_the_example_re_resolves_after_the_answer,
 	test_the_example_closes_lanes_on_resume,
+	test_an_escaped_key_cannot_hide_an_object,
+	test_second_sixty_is_refused,
+	test_the_example_revalidates_at_the_plans_deadline,
+	test_the_example_re_presents_when_the_notice_text_changes,
+	test_a_verdict_carries_its_validity_window,
 }
 
 for _, test in ipairs(tests) do
