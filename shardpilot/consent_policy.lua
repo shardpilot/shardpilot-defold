@@ -193,7 +193,10 @@ end
 local skip_value
 
 -- Skips one complete JSON value and returns the index after it, or nil.
-skip_value = function(text, pos, depth)
+-- `collect`, when given, receives the keys of THIS object (only this one; the
+-- recursion below passes nil, so a nested object's names are not folded into
+-- its parent's set).
+skip_value = function(text, pos, depth, collect)
 	if depth > MAX_SCAN_DEPTH then
 		return nil
 	end
@@ -226,6 +229,9 @@ skip_value = function(text, pos, depth)
 					return nil
 				end
 				seen[nested_key] = true
+				if collect then
+					collect[nested_key] = true
+				end
 				pos = skip_space(text, after)
 				if text:sub(pos, pos) ~= ":" then
 					return nil
@@ -265,42 +271,43 @@ end
 -- "no signature at all" and admitted.
 local function scan_plan_text(body)
 	local present = {}
+	local present_signals = {}
 	local pos = skip_space(body, 1)
 	if body:sub(pos, pos) ~= "{" then
 		-- Not an object at all; the decode refuses it on its own terms.
-		return true, nil, present
+		return true, nil, present, present_signals
 	end
 	pos = skip_space(body, pos + 1)
 	if body:sub(pos, pos) == "}" then
-		return true, nil, present
+		return true, nil, present, present_signals
 	end
 	while true do
 		if body:sub(pos, pos) ~= '"' then
-			return false, "a plan key is not a string", present
+			return false, "a plan key is not a string", present, present_signals
 		end
 		local key, after = read_string(body, pos)
 		if not key then
-			return false, "a plan key is not readable", present
+			return false, "a plan key is not readable", present, present_signals
 		end
 		-- ⚠ A DUPLICATE TOP-LEVEL KEY IS AMBIGUOUS, AND THE DECODER RESOLVES
 		-- IT SILENTLY — last one wins. The plan carrying both a strict and a
 		-- permissive spelling of the same field is not a plan with a value, it
 		-- is two plans, and this build does not get to pick.
 		if present[key] then
-			return false, "the plan carries the key " .. key .. " twice", present
+			return false, "the plan carries the key " .. key .. " twice", present, present_signals
 		end
 		-- ⚠ AND A KEY THAT IS NOT IN THE SCHEMA MEANS WE DID NOT FULLY READ IT.
 		if not SCHEMA_KEYS[key] then
-			return false, "the plan carries an unknown key", present
+			return false, "the plan carries an unknown key", present, present_signals
 		end
 		present[key] = true
 		pos = skip_space(body, after)
 		if body:sub(pos, pos) ~= ":" then
-			return false, "a plan key carries no value", present
+			return false, "a plan key carries no value", present, present_signals
 		end
 		pos = skip_space(body, pos + 1)
 		if LIST_KEYS[key] and body:sub(pos, pos) == "{" then
-			return false, key .. " is a JSON object where the schema says a list", present
+			return false, key .. " is a JSON object where the schema says a list", present, present_signals
 		end
 		-- ⚠ AND A null ELEMENT INSIDE ONE OF THOSE LISTS. Lua drops it: the
 		-- decoded array simply comes back one entry shorter, so a roster of
@@ -309,33 +316,47 @@ local function scan_plan_text(body)
 		-- is again the only place that still knows.
 		if LIST_KEYS[key] and body:sub(pos, pos) == "[" then
 			local scan = skip_space(body, pos + 1)
+			local index = 0
 			while body:sub(scan, scan) ~= "]" do
 				if body:sub(scan, scan + 3) == "null" then
-					return false, key .. " carries a null entry", present
+					return false, key .. " carries a null entry", present, present_signals
 				end
-				local element_end = skip_value(body, scan, 1)
+				index = index + 1
+				-- ⚠ AND THE SIGNAL ENTRIES NEED THEIR OWN PRESENCE MAP. A
+				-- signal's `reason` present-and-null decodes to the same nil as
+				-- an absent one, and an unavailable signal with no reason is
+				-- the shape that hides a prohibited source — so the entry would
+				-- be refused for the right reason by luck, or accepted if the
+				-- nulled field were one the entry did not need. The nullability
+				-- rule has to reach inside the list, not stop at its name.
+				local collect = nil
+				if key == "signals_used" and body:sub(scan, scan) == "{" then
+					collect = {}
+					present_signals[index] = collect
+				end
+				local element_end = skip_value(body, scan, 1, collect)
 				if not element_end then
-					return false, "the plan is not readable", present
+					return false, "the plan is not readable", present, present_signals
 				end
 				scan = skip_space(body, element_end)
 				if body:sub(scan, scan) == "," then
 					scan = skip_space(body, scan + 1)
 				elseif body:sub(scan, scan) ~= "]" then
-					return false, "the plan is not readable", present
+					return false, "the plan is not readable", present, present_signals
 				end
 			end
 		end
 		local next_pos = skip_value(body, pos, 1)
 		if not next_pos then
-			return false, "the plan is not readable", present
+			return false, "the plan is not readable", present, present_signals
 		end
 		pos = skip_space(body, next_pos)
 		local delimiter = body:sub(pos, pos)
 		if delimiter == "}" then
-			return true, nil, present
+			return true, nil, present, present_signals
 		end
 		if delimiter ~= "," then
-			return false, "the plan is not readable", present
+			return false, "the plan is not readable", present, present_signals
 		end
 		pos = skip_space(body, pos + 1)
 	end
@@ -1030,7 +1051,7 @@ function M.prepare(context, callback)
 			settle(strict(error_envelope_reason(decoded), "the resolver refused"))
 			return
 		end
-		local shapes_ok, shape_refusal, present = scan_plan_text(body)
+		local shapes_ok, shape_refusal, present, present_signals = scan_plan_text(body)
 		if not shapes_ok then
 			settle(strict("invalid_response", shape_refusal))
 			return
@@ -1048,6 +1069,20 @@ function M.prepare(context, callback)
 			if decoded[key] == nil then
 				settle(strict("invalid_response", key .. " is present and null"))
 				return
+			end
+		end
+		-- The same rule inside each signal entry.
+		for index, keys in pairs(present_signals) do
+			local entry = type(decoded.signals_used) == "table" and decoded.signals_used[index] or nil
+			if type(entry) ~= "table" then
+				settle(strict("invalid_response", "a signal entry is not an object"))
+				return
+			end
+			for key in pairs(keys) do
+				if entry[key] == nil then
+					settle(strict("invalid_response", "a signal entry carries " .. key .. " present and null"))
+					return
+				end
 			end
 		end
 		local plan, refusal, expires_at = M.parse_plan(decoded, context, arrived)

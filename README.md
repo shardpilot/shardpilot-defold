@@ -1164,6 +1164,13 @@ implement all three.
   it, and never `init()` over a live client.** The analytics client has the
   same pending posture, and a re-`init` while one is still settling produces
   two clients over one spool.
+- **Retry a pending grant only against a fresh decision that still permits
+  analytics and still matches the answered notice.** The example retries an
+  owed `set_consent` on the next trigger using the standing answer; a
+  production integration must first confirm that the newest decision still
+  opens the lane and still carries the `consent_text_version` and
+  `presented_language` the player answered, or a write owed under one policy
+  lands under another.
 - **Fence superseded same-context resolutions in the host.** The module
   refuses a response from an older dispatch for the same context, so a stale
   *policy* cannot deliver — but the host's own callbacks are not fenced: two

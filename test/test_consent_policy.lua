@@ -1861,6 +1861,54 @@ local function test_an_unknown_context_field_is_refused()
 	})).plan_used, "a context using every optional field must be accepted")
 end
 
+-- ⚠ THE NULLABILITY RULE HAS TO REACH INSIDE THE LIST, NOT STOP AT ITS NAME.
+--
+-- Being honest about what this adds: a null `name`, a null `available`, or a
+-- null `reason` on an UNAVAILABLE signal were already refused — by the name
+-- bound, the boolean check and the needs-a-reason rule. They were refused BY
+-- LUCK, in the sense that nothing was checking the thing that was actually
+-- wrong. The cases below are the ones nothing reached at all: a field the
+-- entry does not need, nulled.
+local function test_a_null_field_inside_a_signal_is_refused()
+	local cases = {
+		-- An AVAILABLE signal needs no reason, so a null one was simply
+		-- ignored: the plan said "reason: null" and was used as though it had
+		-- not mentioned it.
+		{ "a null reason on an available signal",
+			'[{"name":"server_country","available":true,"reason":null}]' },
+		-- And any other field the entry carries. Nothing validates names
+		-- inside a signal entry, so this was accepted outright.
+		{ "a null field the entry does not need",
+			'[{"name":"server_country","available":false,"reason":"source_unavailable","source":null}]' },
+		-- ⚠ THE SECOND ENTRY IS CHECKED TOO, or the rule would only ever see
+		-- the first signal a plan happens to list.
+		{ "a null in the SECOND entry",
+			'[{"name":"server_country","available":false,"reason":"source_unavailable"},' ..
+			'{"name":"store_region","available":true,"reason":null}]' },
+	}
+	for _, case in ipairs(cases) do
+		reset()
+		next_response_body = raw_field('"signals_used"', case[2], { signals_used = "__nil__" })
+		local decision = prepare()
+		assert_true(not decision.plan_used,
+			case[1] .. " must not be used: " .. tostring(decision.reason))
+		assert_true(decision.optional_processing_closed, "and the verdict is closed")
+	end
+
+	-- The controls: the same entries without the nulls still parse — an
+	-- available signal with no reason mentioned at all, and two unavailable
+	-- ones with reasons.
+	reset()
+	next_response_body = plan({ signals_used = { { name = "server_country", available = true } } })
+	assert_true(prepare().plan_used, "an available signal that mentions no reason must parse")
+	reset()
+	next_response_body = plan({ signals_used = {
+		{ name = "server_country", available = false, reason = "source_unavailable" },
+		{ name = "store_region", available = false, reason = "source_not_permitted" },
+	} })
+	assert_true(prepare().plan_used, "well-formed signal entries must parse")
+end
+
 local tests = {
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,
@@ -1911,6 +1959,7 @@ local tests = {
 	test_a_zero_window_does_not_spin,
 	test_nested_duplicate_keys_are_refused,
 	test_an_unknown_context_field_is_refused,
+	test_a_null_field_inside_a_signal_is_refused,
 }
 
 for _, test in ipairs(tests) do

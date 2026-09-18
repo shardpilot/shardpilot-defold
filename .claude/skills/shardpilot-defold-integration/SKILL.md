@@ -150,12 +150,24 @@ consent_policy.prepare({
     return
   end
   present_your_consent_notice(decision, function(granted)
-    -- Re-resolve before acting: the plan may have expired while the notice
-    -- was on screen. `consent_policy.invalidate()` first, or the private
-    -- cache answers with the decision you are checking for staleness.
-    local ok, err = shardpilot.init({ --[[ config below ]] })
-    if not ok then return end
-    shardpilot.set_consent(granted)
+    -- ⚠ RE-RESOLVE BEFORE ACTING ON THE ANSWER, and invalidate first: the
+    -- player was reading the screen, the plan may have expired or the policy
+    -- may have been revoked meanwhile, and without the invalidation this
+    -- resolution is answered by the private cache entry the launch wrote —
+    -- the very decision you are checking for staleness.
+    consent_policy.invalidate()
+    consent_policy.prepare(context, function(fresh)
+      -- Act only on the FRESH decision, and only when it still permits the
+      -- lane AND still describes the notice the player actually answered.
+      if fresh.optional_processing_closed then return end
+      if fresh.consent_text_version ~= decision.consent_text_version
+        or fresh.presented_language ~= decision.presented_language then
+        return -- the text changed: present the new notice, do not carry the answer over
+      end
+      local ok, err = shardpilot.init({ --[[ config below ]] })
+      if not ok then return end
+      shardpilot.set_consent(granted)
+    end)
   end)
 end)
 ```
