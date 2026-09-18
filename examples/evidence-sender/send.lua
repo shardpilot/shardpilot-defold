@@ -79,10 +79,21 @@ return function(c)
 	}))
 	-- A FRESH event whose credential the host removes at the transport seam.
 	-- Reusing an accepted event's id would make the run plan's "no facts from
-	-- the unauthenticated ID" readback unjudgeable. The SDK's own publish
-	-- fails by design here, so the refusal is measured in the exchange
-	-- record rather than in flush's return value.
+	-- the unauthenticated ID" readback unjudgeable.
+	--
+	-- The SDK's own publish FAILS here by design, and its result is evidence,
+	-- not noise: `false` is what a refused batch must report, and a `true`
+	-- would be the SDK claiming delivery of a batch the door turned away. In
+	-- Mode B (a token_provider is configured) a 401 is classified RETRYABLE by
+	-- is_retryable_publish_failure, so the SDK RETAINS this batch and owes a
+	-- resend. Measured against this SDK: a second flush re-attempts it, and
+	-- shutdown() re-attempts it and then refuses teardown — there is no public
+	-- surface that drops it. A witness that allows one attempt per case
+	-- therefore REPORTS the owed retry rather than taking it, and the run ends:
+	-- spool_enabled is false, so nothing durable survives the process and the
+	-- obligation cannot reach a later run.
 	stage("unauthenticated")
 	assert(client:track(c.event_name, { synthetic_admission_probe = true }))
-	client:flush({ include_summaries = false })
+	local published, publish_err = client:flush({ include_summaries = false })
+	report_probe(published, publish_err, client:snapshot())
 end

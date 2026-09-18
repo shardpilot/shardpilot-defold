@@ -99,7 +99,7 @@ witness's case names so one aggregate checker reads either sender's log:
 | `lua-fatal` | `emit_fatal`, pre-symbolicated Lua frame | `go-panic` |
 | `native-json` | `emit_fatal`, synthetic SIGSEGV address plus module/debug identity | `native-json` |
 | `raw-text` | `emit_fatal` with `raw_text` and no frames | `raw-text` |
-| `unauthenticated` | a FRESH `track` whose Authorization the host removes at the transport seam | `unauthenticated` |
+| `unauthenticated` | a FRESH `track` whose Authorization the host removes at the transport seam; `flush`'s own result is recorded as evidence | `unauthenticated` |
 | `duplicate` | the `single` event's captured bytes replayed once, authenticated | none |
 
 Analytics events other than the session pair use `SP_EVENT_NAME`; every event
@@ -131,12 +131,15 @@ The size check expects **202 with one accepted/observed small event and one
 enforcement at **2,048 bytes** in the target; a different policy is a failed
 measurement to explain, not an automatic flag change. Other batches require
 matching per-event rows and aggregate counts, zero duplicates/suppressions, and
-no `validation_only` result. `observed` is admitted under the tracking-plan
-observation posture and remains visible in the evidence; only rows with status
-`accepted` count toward the accepted aggregate. The aggregate `suppressed`
-member may be absent; when supplied it must be the integer zero. Per-event
-`suppressed_no_consent` remains visible and does not match this demonstration's
-expected outcomes after its verified grant. Unauthenticated must
+no `validation_only` result. **Every event in a normal admission case must carry
+exactly one verdict, and that verdict is `accepted`**: observed-only, duplicate,
+suppressed, unknown and missing verdicts fail the case. `observed` is not a
+softer pass — it appears in none of the four aggregate counters, so admitting it
+would let a run exit 0 while the counters an aggregate check reads say nothing
+was accepted. The `duplicate` case is the one place a duplicate verdict is the
+expectation. The aggregate `suppressed` member may be absent; when supplied it
+must be the integer zero. Per-event `suppressed_no_consent` remains visible in
+the evidence and fails the case after a verified grant. Unauthenticated must
 return 401 or 403. The authenticated replay requires one `duplicate` with
 `duplicate_event_id` and zero accepted/rejected/suppressed. Consent must report
 `recorded: true`. Crashes require 202, the exact submitted crash ID, a
@@ -157,6 +160,22 @@ one request body for the whole run, and every case has exactly one attempt.
 Installing the hook replaces the SDK's default `print` warnings, so those
 warnings no longer appear in a healthy run.
 
+The admission probe is measured the same way. `flush` returns **false** for it —
+that is what a refused batch must report, and a `true` would be the SDK claiming
+delivery of a batch the door turned away — so the result is recorded in a
+`probe-settlement` line together with `snapshot()`'s counters, and a `true`
+fails the run. In **Mode B a 401 is retryable** (the configured `token_provider`
+can mint a fresh credential), so the SDK retains that batch and owes a resend.
+Measured against this SDK: a further `flush` re-attempts it, and `shutdown()`
+re-attempts it and then refuses teardown, so no public surface drops it. A
+witness that allows one attempt per case therefore **reports the owed retry
+instead of taking it** — it is on the printed not-exercised list — and the run
+ends there; `spool_enabled` is false, so nothing durable survives the process
+and the obligation cannot reach a later run. The receipt says so rather than
+claiming a settled SDK: `probe_terminal` is true only when the SDK did not claim
+delivery, the case had exactly one attempt, and no other exchange carries the
+probe's event ID.
+
 | Crash case | What runs |
 | --- | --- |
 | Lua nonfatal | SDK `emit`, with sampling set to send every report |
@@ -169,7 +188,7 @@ warnings no longer appear in a healthy run.
 The deliberate oversize rejection is a **passing** rejection — it is the
 measurement the `mixed-size` case exists to take — so a complete demonstration
 exits **0** with `contract_match: true`, `rejected_events: 1`, `exit_code: 0`,
-and `caller_view_ok: true`. A rejection in any other case fails that case's
+`caller_view_ok: true` and `probe_terminal: true`. A rejection in any other case fails that case's
 contract and exits **1**. Unexpected responses, a missing case, a second attempt
 at one, transport/SDK failures or incomplete caller-visible evidence also exit
 **1**, with a false contract match or a `sender_error`. Exit **2** means

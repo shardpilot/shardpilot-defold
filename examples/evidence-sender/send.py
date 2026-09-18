@@ -34,6 +34,9 @@ NOT_EXERCISED = (
     "ANR/hang watchdog", "minidump upload", "Android tombstone upload",
     "Unreal crash-context upload", "symbolication of the native fixture",
     "session_ended duration_ms property (session_end carries only a reason)",
+    "the SDK's own Mode B retry of the refused admission probe: a 401 is retryable when a "
+    "token_provider is configured, so the batch stays retained and this witness reports it "
+    "instead of taking a second attempt",
 )
 
 
@@ -143,7 +146,14 @@ def check_reply(case, sent, status, body):
             elif oversized:
                 if row.get("status") != "rejected" or row.get("code") != "event_too_large":
                     return False
-            elif row.get("status") not in ("accepted", "observed"):
+            elif row.get("status") != "accepted":
+                # EXACTLY ONE verdict, and it is `accepted`. `observed` is in
+                # none of the four aggregate counters, so admitting it here let
+                # a run exit 0 while the counters the run plan checks read
+                # 0/0/0/0 — a receipt that disagreed with itself. Observed-only,
+                # duplicate, suppressed, unknown and missing verdicts all fail a
+                # normal admission case; `duplicate` is the one case where a
+                # duplicate verdict is the expectation.
                 return False
         rejected = 1 if case == "mixed-size" else 0
         duplicates = len(events) if case == "duplicate" else 0
@@ -167,6 +177,8 @@ class Sender:
         self.issues = []
         self.rejections = []
         self.oversize_event_id = ""
+        # What the SDK reported about the refused admission probe.
+        self.probe = None
         self.lua = LuaRuntime(unpack_returned_tuples=True)
         self.opener = request.build_opener(request.ProxyHandler({}), RefuseRedirect())
 
@@ -181,6 +193,18 @@ class Sender:
     def record_issue(self, issue):
         self.issues.append(issue)
         self.log({"case": "sdk-issue", "issue": issue})
+
+    def record_probe(self, published, error, snapshot):
+        self.probe = {"flush_ok": published is True, "flush_error": error,
+                      "snapshot": snapshot if isinstance(snapshot, dict) else {}}
+        self.log({"case": "probe-settlement", "flush_ok": self.probe["flush_ok"],
+                  "flush_error": self.probe["flush_error"], "snapshot": self.probe["snapshot"],
+                  "retained_retry": "Mode B classifies a 401 as retryable, so the SDK retains this "
+                                    "batch and owes a resend. No public surface drops it: a further "
+                                    "flush re-attempts it and shutdown() re-attempts it and then "
+                                    "refuses teardown. This witness takes one attempt per case, so "
+                                    "the retry is NOT EXERCISED; spool_enabled is false, so the "
+                                    "obligation does not survive the process."})
 
     def record_rejections(self, rows):
         self.rejections = rows if isinstance(rows, list) else []
@@ -257,7 +281,7 @@ class Sender:
             return False
         rows = (mixed[0].get("event_result") or {}).get("events") or []
         sibling = [row for row in rows if row.get("event_id") != self.oversize_event_id]
-        if len(sibling) != 1 or sibling[0].get("status") not in ("accepted", "observed"):
+        if len(sibling) != 1 or sibling[0].get("status") != "accepted":
             return False
         retained = [r for r in self.rejections if r.get("event_id") == self.oversize_event_id]
         told = [i for i in self.issues if i.get("event_id") == self.oversize_event_id]
@@ -266,6 +290,19 @@ class Sender:
                 and retained[0].get("code") == "event_too_large"
                 and len(told) == 1 and told[0].get("code") == "event_too_large"
                 and carried == 1)
+
+    def probe_is_terminal(self):
+        """The admission probe leaves nothing behind: the SDK did not claim
+        delivery of a batch the door refused, the witness took exactly one
+        attempt, and no other exchange carries the probe's event id."""
+        attempts = [r for r in self.records if r["case"] == "unauthenticated"]
+        if len(attempts) != 1 or self.probe is None or self.probe["flush_ok"]:
+            return False
+        events = attempts[0]["request_body"].get("events") or []
+        if len(events) != 1:
+            return False
+        probe_id = events[0]["event_id"]
+        return sum(probe_id in encode(record["request_body"]) for record in self.records) == 1
 
     def run(self):
         g = self.lua.globals()
@@ -279,6 +316,8 @@ class Sender:
         g.bridge_stage = lambda value: setattr(self, "case", value)
         g.bridge_issue = lambda value: self.record_issue(from_lua(value))
         g.bridge_rejections = lambda value: self.record_rejections(from_lua(value))
+        g.bridge_probe = lambda published, error, snapshot: self.record_probe(
+            published, from_lua(error), from_lua(snapshot))
         g.package.path = str(ROOT / "?.lua") + ";" + str(ROOT / "?" / "init.lua")
         self.lua.execute("""
             json = { encode = function(v) return bridge_encode(v) end,
@@ -288,6 +327,7 @@ class Sender:
             stage = function(v) bridge_stage(v) end
             report_issue = function(v) bridge_issue(v) end
             report_rejections = function(v) bridge_rejections(v) end
+            report_probe = function(ok, err, snap) bridge_probe(ok, err, snap) end
         """)
         self.log({"case": "runtime", "python": platform.python_version(), "lupa": lupa.__version__,
                   "lua": self.lua.lua_implementation, "sdk": str(ROOT / "shardpilot"),
@@ -305,7 +345,8 @@ class Sender:
             by_case.setdefault(record["case"], []).append(record)
         one_attempt = all(len(attempts) == 1 for attempts in by_case.values())
         caller_view = self.caller_view_holds()
-        passed = (set(by_case) == set(CASES) and one_attempt and caller_view
+        probe_terminal = self.probe_is_terminal()
+        passed = (set(by_case) == set(CASES) and one_attempt and caller_view and probe_terminal
                   and all(record["contract_match"] for record in self.records))
         # The deliberate oversize rejection is a PASSING rejection: it is the
         # measurement the mixed-size case exists to take. A rejection in any
@@ -313,8 +354,8 @@ class Sender:
         exit_code = 0 if passed else 1
         self.log({"case": "summary", "requests": len(self.records), "contract_match": passed,
                   "cases": sorted(by_case), "one_attempt_per_case": one_attempt,
-                  "caller_view_ok": caller_view, "rejected_events": self.rejected_events,
-                  "exit_code": exit_code})
+                  "caller_view_ok": caller_view, "probe_terminal": probe_terminal,
+                  "rejected_events": self.rejected_events, "exit_code": exit_code})
         return exit_code
 
 

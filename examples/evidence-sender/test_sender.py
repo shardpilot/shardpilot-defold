@@ -98,14 +98,14 @@ class SenderTest(unittest.TestCase):
                         self.assertIn('"lua":', output)
 
     def test_optional_suppression_aggregate_and_row_controls(self):
-        for mode in ("good", "missing_suppressed", "missing_suppressed_observed"):
+        for mode in ("good", "missing_suppressed"):
             with self.subTest(mode=mode):
                 result, requests = self.run_sender(mode)
                 self.assertEqual(len(requests), 10)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(json.loads(result.stdout.splitlines()[-1])["contract_match"])
         for mode in ("counter_null", "counter_string", "counter_bool", "counter_negative",
-                     "counter_positive", "suppressed_row"):
+                     "counter_positive", "suppressed_row", "missing_suppressed_observed"):
             with self.subTest(mode=mode):
                 result, requests = self.run_sender(mode)
                 self.assertEqual(len(requests), 10)
@@ -231,15 +231,26 @@ class SenderTest(unittest.TestCase):
         self.assertFalse(verified_marker in result.stdout + result.stderr, "transport marker leaked")
         return result, requests
 
-    def test_observed_counts_match_actual_accepted_rows(self):
-        for mode in ("observed", "mixed_observed"):
+    def test_an_observed_verdict_is_not_an_accepted_one(self):
+        """`observed` is in none of the four aggregate counters the run plan
+        checks, so a run that treated it as success would exit 0 carrying a log
+        that says nothing was accepted."""
+        for mode in ("observed", "mixed_observed", "observed_wrong_count"):
             with self.subTest(mode=mode):
                 result, requests = self.run_sender(mode)
-                self.assertEqual(len(requests), 10)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertTrue(json.loads(result.stdout.splitlines()[-1])["contract_match"])
-        result, requests = self.run_sender("observed_wrong_count")
-        self.assertFalse(json.loads(result.stdout.splitlines()[-1])["contract_match"])
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertFalse(json.loads(result.stdout.splitlines()[-1])["contract_match"])
+                replies = [json.loads(line) for line in result.stdout.splitlines()
+                           if '"latency_ms"' in line]
+                self.assertFalse(next(r for r in replies if r["case"] == "single")["contract_match"])
+        # And the aggregate check the run plan runs agrees with that verdict on
+        # a healthy run: every accepted id is counted.
+        result, requests = self.run_sender()
+        single = next(json.loads(line) for line in result.stdout.splitlines()
+                      if line.startswith("{") and json.loads(line).get("case") == "single")
+        body = json.loads(single["response_body"])
+        self.assertEqual([row["status"] for row in body["events"]], ["accepted"])
+        self.assertEqual(body["accepted"], 1)
 
     def test_stale_crash_ids_fail_each_crash_stage(self):
         result, requests = self.run_sender("stale_crash")
@@ -302,7 +313,8 @@ class SenderTest(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout.splitlines()[-1]),
                          {"case": "summary", "requests": 10, "contract_match": True,
                           "cases": sorted(send.CASES), "one_attempt_per_case": True,
-                          "caller_view_ok": True, "rejected_events": 1, "exit_code": 0})
+                          "caller_view_ok": True, "probe_terminal": True,
+                          "rejected_events": 1, "exit_code": 0})
         # Two synthetic sessions, each a start and an end, in one batch.
         batch = next(r for r in replies if r["case"] == "realistic-batch")["request_body"]["events"]
         self.assertEqual([e["event_name"] for e in batch],
@@ -448,6 +460,57 @@ class SenderTest(unittest.TestCase):
         self.assertEqual(sum(r.get("case") == "mixed-size" for r in lines), 1)
         self.assertEqual(sum(rejected_id in json.dumps(r[1]) for r in requests), 1)
         self.assertTrue(json.loads(result.stdout.splitlines()[-1])["caller_view_ok"])
+
+    def test_the_admission_probe_leaves_nothing_owed(self):
+        result, requests = self.run_sender()
+        lines = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+        probe = next(r for r in lines if r.get("case") == "probe-settlement")
+        # The SDK reported the refused batch as NOT published, and the witness
+        # recorded that rather than ignoring it.
+        self.assertFalse(probe["flush_ok"])
+        self.assertEqual(probe["snapshot"]["failed_batches"], 1)
+        self.assertEqual(probe["snapshot"]["spooled"], 0)
+        self.assertIn("NOT EXERCISED", probe["retained_retry"])
+        # One attempt, and the probe id is nowhere else in the run.
+        attempts = [r for r in lines if r.get("case") == "unauthenticated"]
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]["status"], 401)
+        probe_id = attempts[0]["request_body"]["events"][0]["event_id"]
+        self.assertEqual(sum(probe_id in json.dumps(r[1]) for r in requests), 1)
+        self.assertTrue(json.loads(result.stdout.splitlines()[-1])["probe_terminal"])
+        # The owed Mode B retry is named on the printed list, not left to be
+        # inferred from a short log.
+        absent = next(r for r in lines if r.get("case") == "not-exercised")["captures"]
+        self.assertTrue(any("Mode B retry" in item for item in absent))
+
+    def probe_state(self):
+        """An in-memory sender whose probe settled cleanly."""
+        sender = send.Sender({name: "synthetic-" + name for name in send.FIELDS})
+        sender.records = [{"case": "unauthenticated",
+                           "request_body": {"events": [{"event_id": "probe"}]},
+                           "event_result": None}]
+        sender.probe = {"flush_ok": False, "flush_error": None, "snapshot": {}}
+        return sender
+
+    def test_probe_check_fails_when_delivery_is_claimed_or_the_id_returns(self):
+        self.assertTrue(self.probe_state().probe_is_terminal())
+        # flush() reporting success for a batch the door refused.
+        claimed = self.probe_state()
+        claimed.probe["flush_ok"] = True
+        self.assertFalse(claimed.probe_is_terminal())
+        # flush()'s result never read at all.
+        ignored = self.probe_state()
+        ignored.probe = None
+        self.assertFalse(ignored.probe_is_terminal())
+        # The retained batch resent under any case.
+        resent = self.probe_state()
+        resent.records.append({"case": "single", "request_body": {"events": [{"event_id": "probe"}]},
+                               "event_result": None})
+        self.assertFalse(resent.probe_is_terminal())
+        # A second attempt at the case itself.
+        twice = self.probe_state()
+        twice.records.append(dict(twice.records[0]))
+        self.assertFalse(twice.probe_is_terminal())
 
     def caller_view_state(self):
         """An in-memory sender whose row-4.5 evidence is complete. No network,
