@@ -2,6 +2,11 @@
 
 ### Unreleased
 
+## v0.10.2 — 2026-09-18
+
+- Release the SDK evidence witness (#90), terminal batch rejections, typed progression/ad events, request compression, and consent/spool repairs.
+- The misplaced off-main `v0.10.1` tag points to `32e5589e` and still declares `0.10.0`; `v0.10.2` returns to tagging the version-bump merge on `main`.
+
 - Retain per-event `202` rejections in a configurable in-memory ring (default
   `64`), exposed as copies through `client:get_rejections()` and the singleton
   `shardpilot.get_rejections()`. Without a diagnostics hook, emit bounded
