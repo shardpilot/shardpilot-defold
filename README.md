@@ -18,16 +18,9 @@ not the platform boundary.
   a local stack you run yourself. Which endpoints are available today is stated
   under Configuration below and in [`docs/configuration.md`](docs/configuration.md);
   read that before configuring a hosted deployment.
-- **Version `0.10.1`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.10.1`; the `v0.10.1` tag
-  ALREADY EXISTS, and it is an exception to the normal ordering.
-  The usual rule — cut the tag from the version-bump merge, per
-  [docs/release.md](docs/release.md) — did not apply: it was cut as a
-  deletion-only patch directly on top of `v0.10.0` so that the diff between
-  the two tags would be nothing but the removal, and its tree therefore still
-  declares `0.10.0`. This commit is what brings the declaration into line.
-  Nothing reads that constant at runtime. The next release returns to the
-  normal ordering.
+- **Version `0.10.2`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.10.2`; the `v0.10.2` tag
+  is created by the owner after the version-bump merge (pending until then).
 
 ## What it does
 
@@ -44,12 +37,12 @@ not the platform boundary.
   de-duplicates re-sends. See [Offline durability](#offline-durability-event-spool).
 - Emits canonical helpers: `session_start()` → `app.session_started`,
   `screen_view(name)` → `app.screen_view`, the typed progression verbs
-  *(unreleased — absent at `v0.10.1`)*
+  *(new in `v0.10.2`)*
   `track_level_start(level_id, attempt)` → `level_start`,
   `track_level_complete(level_id, attempt, duration_ms[, score])` →
   `level_complete` and `track_level_fail(level_id, attempt, duration_ms[,
   fail_reason])` → `level_fail`, the typed ad verb
-  *(unreleased — absent at `v0.10.1`)*
+  *(new in `v0.10.2`)*
   `track_ad_impression_revenue(impression_id, network, revenue_micros,
   currency[, revenue_precision, ad_unit, ad_format, placement])` →
   `ad_impression_revenue`, plus arbitrary `track(name, props)`.
@@ -109,11 +102,11 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — the latest tag is `v0.10.1`:
+published tag's source archive — after owner tagging, the latest tag is `v0.10.2`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.1.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.2.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
@@ -131,26 +124,7 @@ most of what this README documents. This paragraph used to say "pin the previous
 tag until the new one is published", which after `v0.10.1` pointed at exactly
 the artifact being withdrawn.
 
-**Five behaviours documented below are NOT in `v0.10.1`**, because it is a
-deletion-only patch and carries no source change. Measured at the tag:
-`flush_interval_seconds` defaults to **1**, not 15; there is no
-`shardpilot/compression.lua` at all, so `request_compression_enabled` and the
-whole request-compression section do not exist; `Client:retry_due` is
-absent (0 occurrences against 10 on `main`), so a retryable failure waits for
-the flush tick rather than its own backoff deadline; and the typed
-progression verbs — `track_level_start`, `track_level_complete`,
-`track_level_fail` — were added after the tag's base, so calling one on
-`v0.10.1` reaches a nil value, and the typed ad verb
-`track_ad_impression_revenue` is absent for the same reason. Each is marked
-*(unreleased)* where it appears.
-
-**What `v0.10.1` does and does not contain.** It is `v0.10.0` plus eight file
-deletions and nothing else — that is what makes it verifiable as carrying only
-the removal, and it is why its tree still declares `M.VERSION = "0.10.0"`. It
-therefore does NOT include the other internal identifiers removed on `main`
-after it was cut. Those go out in the next tag, which is cut from the fully
-cleaned tree; until then this pin is the correct one because it is the only tag
-that stops the actively-distributed disclosure.
+The historical `v0.10.1` tag lacks request compression, the 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history. These are included in `v0.10.2`.
 
 Then require the module:
 
@@ -333,11 +307,11 @@ README, `docs/`, and the skill above are the reference.
 | `anonymous_id` | generated | UUIDv7 generated on first init if not provided |
 | `user_id` | `nil` | Initial known-user attribution |
 | `batch_size` | `25` | Flush trigger, 1–100 |
-| `rejection_capacity` | `64` *(unreleased)* | Retained per-event rejection entries (positive integer); see [Batch verdicts](#batch-verdicts). |
+| `rejection_capacity` | `64` *(new in `v0.10.2`)* | Retained per-event rejection entries (positive integer); see [Batch verdicts](#batch-verdicts). |
 | `buffer_size` | `1000` | Max queued events (≥1); cross-SDK canonical default |
-| `flush_interval_seconds` | `15` (was `1`) *(unreleased — 1 at `v0.10.1`)* | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value *(the own-clock pacing is unreleased — `Client:retry_due` is absent at `v0.10.1`, where a retryable failure waits for the flush tick)*. |
+| `flush_interval_seconds` | `15` (was `1`) *(new in `v0.10.2`)* | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value *(new in `v0.10.2`)*. |
 | `publish_timeout_seconds` | `2` | Per-request timeout (>0) |
-| `request_compression_enabled` | `true` *(unreleased — absent at `v0.10.1`)* | Compress analytics batch bodies over 1 KiB with `Content-Encoding: deflate` (RFC 1950 zlib — see [Request compression](#request-compression)). Sub-threshold bodies go uncompressed: zlib framing makes a single-event batch bigger, not smaller. No-op on engine versions without the `zlib` module. |
+| `request_compression_enabled` | `true` *(new in `v0.10.2`)* | Compress analytics batch bodies over 1 KiB with `Content-Encoding: deflate` (RFC 1950 zlib — see [Request compression](#request-compression)). Sub-threshold bodies go uncompressed: zlib framing makes a single-event batch bigger, not smaller. No-op on engine versions without the `zlib` module. |
 | `token_refresh_lead_ms` | `60000` | Refresh lead before token expiry (≥0) |
 | `spool_enabled` | `true` | Durable offline event spool ([details](#offline-durability-event-spool)); `false` also clears a previously persisted record at init |
 | `spool_max_events` | `500` | Max spooled entries (≥1); oldest evicted first |
@@ -357,7 +331,7 @@ read `client:get_rejections()` or the initialized singleton's
 `shardpilot.get_rejections()`. They return oldest-first copies containing
 `event_id`, `status`, `code`, and `message`. Set `rejection_capacity` to a
 finite positive integer (default `64`); invalid values fail initialization with
-`invalid_rejection_capacity`. This surface is unreleased and absent at `v0.10.1`.
+`invalid_rejection_capacity`. This surface is new in `v0.10.2`.
 
 Defold keeps its Boolean `flush()` contract: `true` means transport work has
 settled, even when a parsed `202` contains rejections. `snapshot().rejected`
@@ -570,8 +544,7 @@ running.
 
 ## Request compression
 
-*(This whole section is unreleased: `v0.10.1` has no `shardpilot/compression.lua`,
-so at the pinned tag every body is sent uncompressed.)*
+*(New in `v0.10.2`; `v0.10.1` sends every body uncompressed.)*
 
 Analytics batch bodies over 1 KiB are compressed with
 `Content-Encoding: deflate`. A batch body is the same envelope keys repeated

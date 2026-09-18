@@ -451,20 +451,45 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.package }}
 
-      - name: Lua tests
-        run: ${{ matrix.interpreter }} test/test_sdk.lua
-
-      - name: Lua crash tests
-        run: ${{ matrix.interpreter }} test/test_crash.lua
-
-      - name: Lua remote-config tests
-        run: ${{ matrix.interpreter }} test/test_remote_config.lua
-
-      - name: Lua experiments tests
-        run: ${{ matrix.interpreter }} test/test_experiments.lua
-
-      - name: Lua platform-fold conformance tests
-        run: ${{ matrix.interpreter }} test/test_platform_fold.lua
+      # ⚠ EVERY SUITE, DISCOVERED — NOT A ROSTER OF NAMES. The five steps
+      # this replaces named `test/test_sdk.lua`, `test_crash.lua`,
+      # `test_remote_config.lua`, `test_experiments.lua` and
+      # `test_platform_fold.lua`, which was exactly the set present when they
+      # were written. The defect is not that the roster is wrong today — it is
+      # that a sixth suite joins the repository UNRUN and SILENT: the author
+      # sees a green `lua-tests` and has no way to learn their file was never
+      # the subject of it. Registering a suite must not be a second, separate
+      # thing to remember.
+      #
+      # `test/test_*.lua` is the whole contract. `test/bench_*.lua` are
+      # benchmarks, not assertions, and stay out of it by not matching — that
+      # is a decision, not an oversight.
+      #
+      # The loop runs EVERY suite and fails afterwards if any of them failed,
+      # rather than stopping at the first: one run then names every broken
+      # suite instead of hiding the rest behind the earliest. It also REFUSES
+      # an empty match instead of passing, because a glob that matched nothing
+      # would otherwise be a green run that tested nothing — the same silence
+      # in a different costume.
+      - name: Lua tests (every test/test_*.lua)
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          suites=(test/test_*.lua)
+          if [ ${#suites[@]} -eq 0 ]; then
+            echo "REFUSING: no test/test_*.lua matched; a suite-less run is not a pass" >&2
+            exit 1
+          fi
+          echo "running ${#suites[@]} suite(s) under ${{ matrix.interpreter }}"
+          status=0
+          for suite in "${suites[@]}"; do
+            echo "--- $suite"
+            if ! ${{ matrix.interpreter }} "$suite"; then
+              echo "FAILED: $suite under ${{ matrix.interpreter }}" >&2
+              status=1
+            fi
+          done
+          exit "$status"
 
       # A5: allocation bytes per track(), the metric that matters on a game
       # client — a per-frame allocation is somebody's GC pause, and it is the

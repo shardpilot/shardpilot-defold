@@ -48,28 +48,9 @@ the deeper reference.
 
 ## Install
 
-Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.1`.
+Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.2`.
 
-⚠ **This skill is written against `main`, which is AHEAD of that tag**, because
-`v0.10.1` is a deletion-only patch on top of `v0.10.0` and carries no source
-change. FIVE things documented below are NOT in it, and are marked
-*(unreleased)* where they appear:
-
-* `request_compression_enabled` and the whole request-compression path — the
-  tag has no `shardpilot/compression.lua` at all;
-* `flush_interval_seconds` defaulting to 15 — at the tag the default is **1**;
-* retry pacing on its own clock — `Client:retry_due` does not exist at the tag
-  (0 occurrences against 10 on `main`), so a retryable failure there waits for
-  the flush tick instead of its own backoff deadline.
-* the typed progression verbs — `track_level_start` / `track_level_complete` /
-  `track_level_fail` and their codes are absent from the tag, so an
-  integration that pins `v0.10.1` and calls one gets a nil value; they land
-  with the next tag, and until then depend on a commit from `main`.
-* the typed ad verb — `track_ad_impression_revenue` is absent from the tag
-  for the same reason, and lands with the same next tag.
-
-Everything else describes the pinned release. A tag cut from the fully cleaned,
-current tree is the real fix and is sequenced after the source scrub.
+This version includes request compression, a 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history; these were absent from `v0.10.1`.
 
 Two supported paths:
 
@@ -82,21 +63,13 @@ Two supported paths:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.1.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.2.zip
 ```
 
-`v0.10.1` is the version this skill matches, and it is the same pin the
+`v0.10.2` is the version this skill matches, and it is the same pin the
 README's Installation section carries.
 
-Its provenance is EXCEPTIONAL, and worth knowing because it explains something
-that otherwise looks like a mistake: `v0.10.1` was not cut from a version-bump
-merge the way every other tag here is. It is a deletion-only patch applied
-directly on top of `v0.10.0` — eight files removed, nothing added, nothing
-modified, no Lua source touched — so its tree still declares
-`M.VERSION = "0.10.0"`. That is deliberate. The constant is read by the
-version-check scripts and the README and reaches nothing at runtime, and moving
-it would have meant putting content into a tag whose entire purpose was to
-carry a removal and be verifiable as carrying only that.
+The earlier off-main `v0.10.1` tag still declares `0.10.0`; see the [changelog](../../../CHANGELOG.md).
 
 Ordinary tags DO come from the merge of the matching version-bump commit, never
 before it, so for those there is a short window right after the merge in which
@@ -169,19 +142,11 @@ auth credential. `init` returns `true`, or `false, err` with a specific code
 (`ingest_url_required`, `invalid_ingest_url`, `auth_required`,
 `auth_mode_conflict`, `remote_config_api_key_required`, …). Useful defaults:
 `batch_size = 25` (1–100), `buffer_size = 1000`,
-`flush_interval_seconds = 15` *(unreleased — the default is 1 at `v0.10.1`)* (how long a PARTIAL batch waits — not a
-heartbeat: an empty queue publishes nothing, a full `batch_size` publishes
-immediately, `flush()` on demand *(retry pacing on its own clock is unreleased —
-`Client:retry_due` is absent at `v0.10.1`)*, and retry pacing runs on its own clock
-*(unreleased — at `v0.10.1` there is no `retry_due`, so a retryable failure
-waits for the flush tick)*),
+`flush_interval_seconds = 15` (partial batches wait; empty queues send nothing),
+full batches publish immediately, `flush()` runs on demand, and retries use their own clock,
 `publish_timeout_seconds = 2`, `spool_enabled = true`,
 `spool_max_events = 500`, `spool_max_bytes = 262144` (max 393216),
-`request_compression_enabled = true`. *(unreleased — `v0.10.1` has no
-compression module; the tag always sends uncompressed.)*
-
-*(This whole subsection is unreleased: `v0.10.1` has no `shardpilot/compression.lua`,
-so at the pin every body is sent uncompressed.)*
+`request_compression_enabled = true`.
 
 **Batch bodies over 1 KiB are compressed**, with `Content-Encoding: deflate`
 (RFC 1950 zlib) rather than gzip: the engine's `zlib` module produces that
@@ -199,8 +164,7 @@ buys. Three things follow when you integrate:
   feature-detected; its absence is an ordinary uncompressed publish, never an
   error.
 
-Set `request_compression_enabled = false` to opt out. *(unreleased — absent at
-`v0.10.1`.)*
+Set `request_compression_enabled = false` to opt out.
 
 Wire the frame loop and teardown:
 
@@ -327,7 +291,7 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
   `ok, err`. `track` failure codes: `consent_unknown`, `consent_denied`,
   `event_name_required`, `identity_required`, `invalid_props`,
   `invalid_context`, `queue_full`, `shutdown`.
-- The typed progression verbs *(unreleased — absent at `v0.10.1`)* —
+- The typed progression verbs *(new in `v0.10.2`)* —
   `sdk.track_level_start(level_id, attempt[,
   props])`, `sdk.track_level_complete(level_id, attempt, duration_ms[, score][,
   props])`, `sdk.track_level_fail(level_id, attempt, duration_ms[, fail_reason][,
@@ -340,7 +304,7 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
   `invalid_fail_reason`, and `source_not_client` — these schemas are
   client-source only. An absent `score` or empty `fail_reason` is omitted from
   the wire even when `props` carries that key.
-- The typed ad verb *(unreleased — absent at `v0.10.1`)*
+- The typed ad verb *(new in `v0.10.2`)*
   `sdk.track_ad_impression_revenue(impression_id, network,
   revenue_micros, currency[, revenue_precision, ad_unit, ad_format,
   placement])` emits `ad_impression_revenue`. It takes NO props table — that

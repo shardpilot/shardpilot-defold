@@ -26,7 +26,7 @@ ShardPilot Defold SDK v0 is configured with a Lua table:
   -- api_key = "sp_ingest_...",
   batch_size = 25,
   buffer_size = 1000,
-  -- flush_interval_seconds defaults to 15 on main; at the pinned tag v0.10.1 the
+  -- flush_interval_seconds defaults to 15; at the historical tag v0.10.1 the
   -- default is 1, because that tag carries no source change. It is the longest a PARTIAL batch
   -- waits before publishing, not a heartbeat: update(dt) publishes nothing
   -- when the queue is empty. Set it explicitly only if you want a different
@@ -552,8 +552,8 @@ Per-event rejections are retained without opting into diagnostics. Set
 `diagnostics` hook, rejected entries produce bounded default `print` warnings;
 a configured hook replaces that channel while retention remains mandatory.
 The ring belongs to the client instance and clears on reinitialization; it is
-neither persisted nor retried. These additions are unreleased and absent at
-`v0.10.1`. See [Batch verdicts](../README.md#batch-verdicts) for the warning limits
+neither persisted nor retried. These additions are new in
+`v0.10.2`. See [Batch verdicts](../README.md#batch-verdicts) for the warning limits
 and the unchanged Boolean `flush()` contract.
 
 The optional `diagnostics` hook is invoked with each non-accepted ingest
