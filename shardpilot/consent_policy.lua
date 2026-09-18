@@ -112,6 +112,30 @@ local latest_dispatch = {}
 -- like string matching in a parser rather than a type check.
 local LIST_KEYS = { operation_blocks = true, prohibited_purposes = true, signals_used = true }
 
+-- ⚠ THE COMPLETE TOP-LEVEL VOCABULARY, and it is CLOSED. Every other bounded
+-- value in this module is checked against a closed set; the set of FIELD NAMES
+-- was the one that was not, so a plan could carry anything at all beside the
+-- ones we read and still be used. A key we do not understand is a plan we
+-- cannot say we fully read, and "use the parts I understood" is how a
+-- permissive default gets in.
+local SCHEMA_KEYS = {
+	regime = true,
+	crash_profile = true,
+	server_analytics = true,
+	server_analytics_objection_required = true,
+	prohibited_purposes = true,
+	operation_blocks = true,
+	policy_version = true,
+	consent_text_version = true,
+	presented_language = true,
+	scope = true,
+	signals_used = true,
+	age_band = true,
+	expires_at = true,
+	max_age_seconds = true,
+	signature = true,
+}
+
 -- ⚠ AND THE SCAN HAS TO BE JSON-AWARE, NOT A SEARCH FOR THE LITERAL NAME. The
 -- first cut looked for `"operation_blocks"%s*:%s*{` in the raw text, which a
 -- valid response spells past in one character: "operation\u005fblocks" decodes
@@ -247,6 +271,17 @@ local function scan_plan_text(body)
 		local key, after = read_string(body, pos)
 		if not key then
 			return false, "a plan key is not readable", present
+		end
+		-- ⚠ A DUPLICATE TOP-LEVEL KEY IS AMBIGUOUS, AND THE DECODER RESOLVES
+		-- IT SILENTLY — last one wins. The plan carrying both a strict and a
+		-- permissive spelling of the same field is not a plan with a value, it
+		-- is two plans, and this build does not get to pick.
+		if present[key] then
+			return false, "the plan carries the key " .. key .. " twice", present
+		end
+		-- ⚠ AND A KEY THAT IS NOT IN THE SCHEMA MEANS WE DID NOT FULLY READ IT.
+		if not SCHEMA_KEYS[key] then
+			return false, "the plan carries an unknown key", present
 		end
 		present[key] = true
 		pos = skip_space(body, after)
@@ -857,6 +892,16 @@ function M.prepare(context, callback)
 			settle(strict("clock_unavailable", "no clock is available to evaluate the plan's expiry"))
 			return
 		end
+		-- ⚠ THE CLOCK MOVED BACKWARDS WHILE THIS REQUEST WAS IN FLIGHT. Every
+		-- judgement below is a comparison against `arrived` — the deadline, the
+		-- expiry, the cache lifetime — and a reading earlier than the one this
+		-- request was dispatched with makes all of them meaningless in the
+		-- permissive direction: a plan looks fresher and an entry lives longer.
+		-- It is refused before anything is parsed or cached.
+		if arrived < at then
+			settle(strict("clock_regressed", "the clock moved backwards while the request was in flight"))
+			return
+		end
 		-- ⚠ AN INVALIDATED REQUEST CANNOT ANSWER. A policy revocation or a
 		-- workspace change fired while this was in flight; its answer describes
 		-- the world the host has just declared gone, so it is refused here
@@ -913,6 +958,18 @@ function M.prepare(context, callback)
 		if present.signature and decoded.signature == nil then
 			settle(strict("invalid_response", "the plan carries a signature this build cannot verify"))
 			return
+		end
+		-- ⚠ PRESENT-AND-NULL IS PRESENT HERE TOO, and for the list fields it is
+		-- worse than for the signature: a null roster of operation blocks
+		-- decodes to the same nil as an absent one, so a plan that explicitly
+		-- says "the blocks are null" read as a plan that simply carries none —
+		-- and those blocks govern transfer, age/capacity, localisation and
+		-- safety, which no consent choice lifts.
+		for name in pairs(LIST_KEYS) do
+			if present[name] and decoded[name] == nil then
+				settle(strict("invalid_response", name .. " is present and null"))
+				return
+			end
 		end
 		local plan, refusal, expires_at = M.parse_plan(decoded, context, arrived)
 		if not plan then

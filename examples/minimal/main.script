@@ -186,9 +186,21 @@ reconcile = function(fresh)
 	-- (a) The notice the standing answer was given against. A different text
 	-- version or language means the running grant belongs to a notice this
 	-- player never saw, so it stops and the notice is presented again.
-	if answered and (fresh.consent_text_version ~= answered.text_version
-		or fresh.presented_language ~= answered.language) then
+	-- ⚠ ONLY A PLAN CAN CHANGE THE NOTICE. A strict fallback carries no
+	-- consent_text_version at all, so comparing against it read every outage as
+	-- "the text changed" and threw away an answer the player really did give. A
+	-- fallback still CLOSES — that is (b) below — it just does not erase the
+	-- standing answer.
+	if fresh.plan_used and answered
+		and (fresh.consent_text_version ~= answered.text_version
+			or fresh.presented_language ~= answered.language) then
 		suspend_analytics("consent_text_changed")
+		-- ⚠ AND THE CRASH LANE GOES WITH IT. The notice the player read is what
+		-- the session rests on; a crash reporter left running under text nobody
+		-- saw is the same defect as an analytics client left running under it.
+		-- It restarts only after the new answer, through the pending-choice
+		-- gate in (e).
+		suspend_crash("consent_text_changed")
 		answered = nil
 	end
 

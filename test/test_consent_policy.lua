@@ -103,9 +103,18 @@ local function json_decode(text)
 				return table.concat(parts)
 			elseif ch == "\\" then
 				local esc = string.sub(text, pos + 1, pos + 1)
-				local map = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", n = "\n", t = "\t", r = "\r", b = "\b", f = "\f" }
-				parts[#parts + 1] = map[esc] or esc
-				pos = pos + 2
+				if esc == "u" then
+					-- Real Defold json.decode resolves \uXXXX; the harness has
+					-- to as well, or a scene about escaped key names would be
+					-- testing the harness rather than the module.
+					local code = tonumber(string.sub(text, pos + 2, pos + 5), 16)
+					parts[#parts + 1] = code and code < 128 and string.char(code) or "?"
+					pos = pos + 6
+				else
+					local map = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", n = "\n", t = "\t", r = "\r", b = "\b", f = "\f" }
+					parts[#parts + 1] = map[esc] or esc
+					pos = pos + 2
+				end
 			else
 				parts[#parts + 1] = ch
 				pos = pos + 1
@@ -271,6 +280,15 @@ local function plan(overrides)
 		end
 	end
 	return encode_value(body)
+end
+
+-- Splices a field into the fixture as RAW TEXT — the encoder cannot produce
+-- an empty object, a null, or an escaped key name. The field is dropped from
+-- the fixture first, because a duplicate top-level key is now malformed in its
+-- own right and the scene would pass for that reason instead.
+local function raw_field(name, raw_value, overrides)
+	local body = plan(overrides)
+	return body:sub(1, 1) .. name .. ":" .. raw_value .. "," .. body:sub(2)
 end
 
 local function prepare(ctx)
@@ -1083,12 +1101,9 @@ end
 -- only place the distinction survives.
 local function test_an_empty_object_is_not_an_empty_list()
 	for _, name in ipairs({ "operation_blocks", "prohibited_purposes", "signals_used" }) do
-		for _, spacing in ipairs({ '"%s":{}', '"%s" : { }', '"%s":\t{"a":1}' }) do
+		for _, spacing in ipairs({ "{}", " { }", "\t{\"a\":1}" }) do
 			reset()
-			-- Spliced into the raw body, because the encoder cannot produce it:
-			-- an empty Lua table encodes as an array.
-			local body = plan()
-			next_response_body = body:sub(1, 1) .. string.format(spacing, name) .. "," .. body:sub(2)
+			next_response_body = raw_field('"' .. name .. '"', spacing, { [name] = "__nil__" })
 			local decision = prepare()
 			assert_true(not decision.plan_used,
 				name .. " as a JSON object must not be used (" .. spacing .. ")")
@@ -1099,9 +1114,7 @@ local function test_an_empty_object_is_not_an_empty_list()
 	-- The controls: an empty ARRAY still parses for all three, or this rule
 	-- would be refusing the resolver's own output.
 	reset()
-	local body = plan()
-	next_response_body = body:sub(1, 1) ..
-		'"operation_blocks":[],"prohibited_purposes":[],"signals_used":[],' .. body:sub(2)
+	next_response_body = plan({ operation_blocks = {}, prohibited_purposes = {}, signals_used = {} })
 	assert_true(prepare().plan_used, "empty arrays must still parse")
 end
 
@@ -1214,8 +1227,7 @@ local function test_an_escaped_key_cannot_hide_an_object()
 	}
 	for name, spelling in pairs(escaped) do
 		reset()
-		local body = plan()
-		next_response_body = body:sub(1, 1) .. spelling .. ":{}," .. body:sub(2)
+		next_response_body = raw_field(spelling, "{}", { [name] = "__nil__" })
 		local decision = prepare()
 		assert_true(not decision.plan_used,
 			name .. " spelled with an escape must not hide an object: " .. tostring(decision.reason))
@@ -1223,8 +1235,7 @@ local function test_an_escaped_key_cannot_hide_an_object()
 		-- The control: the SAME escaped spelling with an ARRAY still parses,
 		-- so the rule is about the container and not about the escape.
 		reset()
-		body = plan()
-		next_response_body = body:sub(1, 1) .. spelling .. ":[]," .. body:sub(2)
+		next_response_body = raw_field(spelling, "[]", { [name] = "__nil__" })
 		assert_true(prepare().plan_used, name .. " spelled with an escape must still parse as a list")
 	end
 
@@ -1310,12 +1321,17 @@ local function test_the_example_re_presents_when_the_notice_text_changes()
 		{ presented_language = "de" },
 	}) do
 		reset()
-		next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT })
+		next_response_body = example_plan({
+			regime = consent_policy.SOFT_OPT_OUT, crash_profile = consent_policy.CRASH_MINIMAL,
+		})
 		local saved_request = http.request
 		http.request = function(url, method, callback, headers, body, options)
 			requests[#requests + 1] = { url = url }
 			if #requests >= 3 then
-				local overrides = { regime = consent_policy.SOFT_OPT_OUT }
+				local overrides = {
+					regime = consent_policy.SOFT_OPT_OUT,
+					crash_profile = consent_policy.CRASH_MINIMAL,
+				}
 				for key, value in pairs(changed) do
 					overrides[key] = value
 				end
@@ -1327,6 +1343,11 @@ local function test_the_example_re_presents_when_the_notice_text_changes()
 		http.request = saved_request
 		assert_true(calls:find("analytics suspended (consent_text_changed)", 1, true) ~= nil,
 			"a changed notice text must suspend the running grant: " .. calls)
+		-- ⚠ AND THE CRASH LANE GOES WITH IT. A reporter left running under text
+		-- nobody saw is the same defect as an analytics client left running
+		-- under it.
+		assert_true(calls:find("crash reporting suspended (consent_text_changed)", 1, true) ~= nil,
+			"a changed notice text must suspend the crash lane too: " .. calls)
 		-- And it comes back only through a NEW answer: two init calls, because
 		-- the notice was presented a second time.
 		local inits = 0
@@ -1406,8 +1427,7 @@ end
 -- present signature precisely because it cannot check one.
 local function test_a_null_signature_is_still_a_signature()
 	reset()
-	local body = plan()
-	next_response_body = body:sub(1, 1) .. '"signature":null,' .. body:sub(2)
+	next_response_body = raw_field('"signature"', "null")
 	local decision = prepare()
 	assert_true(not decision.plan_used, "a null signature is not an absent one")
 	assert_true(decision.optional_processing_closed, "and the verdict is closed")
@@ -1477,6 +1497,142 @@ local function test_a_restored_answer_writes_no_consent()
 	assert_equal(writes, 1, "only the newly completed notice may write consent: " .. calls)
 end
 
+-- ⚠ A PRESENT-AND-NULL LIST IS NOT AN ABSENT ONE, and for these three fields
+-- it is worse than for the signature: a null roster of operation blocks
+-- decodes to the same nil as no roster at all, and those blocks govern
+-- transfer, age/capacity, localisation and safety — restrictions no consent
+-- choice lifts.
+local function test_a_null_list_is_not_an_absent_one()
+	for _, name in ipairs({ "operation_blocks", "prohibited_purposes", "signals_used" }) do
+		reset()
+		next_response_body = raw_field('"' .. name .. '"', "null", { [name] = "__nil__" })
+		local decision = prepare()
+		assert_true(not decision.plan_used, name .. " present and null must not be used")
+		assert_true(decision.optional_processing_closed, "and the verdict is closed")
+
+		-- The control: genuinely absent still parses, so the rule is about
+		-- presence rather than about the field being optional.
+		reset()
+		next_response_body = plan({ [name] = "__nil__" })
+		assert_true(prepare().plan_used, name .. " genuinely absent must still parse")
+	end
+end
+
+-- ⚠ THE FIELD NAMES ARE A CLOSED VOCABULARY TOO. Every other bounded value in
+-- this module is checked against a closed set; the set of names was the one
+-- that was not, so a plan could carry anything beside the fields we read and
+-- still be used. A key we do not understand is a plan we cannot say we fully
+-- read.
+local function test_an_unknown_top_level_key_is_refused()
+	reset()
+	next_response_body = raw_field('"tenant_override"', '"other"')
+	local decision = prepare()
+	assert_true(not decision.plan_used, "an unknown top-level key must not be used")
+	assert_true(decision.optional_processing_closed, "and the verdict is closed")
+
+	-- The controls: every key the schema DOES have must still parse, or this
+	-- rule would refuse the resolver's own output. Asked with the optional
+	-- ones present, which are the easiest to forget in a roster.
+	reset()
+	next_response_body = plan({
+		operation_blocks = { "transfer_review" },
+		prohibited_purposes = { "advertising" },
+		age_band = { vocabulary = "coarse.v1", band = "adult" },
+	})
+	assert_true(prepare().plan_used, "a plan using every optional schema field must parse")
+end
+
+-- ⚠ A DUPLICATE TOP-LEVEL KEY IS AMBIGUOUS AND THE DECODER RESOLVES IT
+-- SILENTLY — last one wins. A body carrying both a strict and a permissive
+-- spelling of the same field is not a plan with a value, it is two plans, and
+-- this build does not get to pick.
+local function test_a_duplicate_top_level_key_is_refused()
+	reset()
+	-- The fixture keeps its own "regime"; this adds a second, permissive one.
+	next_response_body = raw_field('"regime"', '"' .. consent_policy.SOFT_OPT_OUT .. '"')
+	local decision = prepare()
+	assert_true(not decision.plan_used, "a duplicated key must not be used")
+	assert_true(decision.regime == consent_policy.STRICT_OPT_IN,
+		"and certainly not with the permissive spelling: " .. tostring(decision.regime))
+
+	-- The same key spelled with an escape is the same key.
+	reset()
+	next_response_body = raw_field('"regi\\u006de"', '"' .. consent_policy.SOFT_OPT_OUT .. '"')
+	assert_true(not prepare().plan_used, "an escaped duplicate is still a duplicate")
+end
+
+-- ⚠ A CLOCK THAT MOVED BACKWARDS WHILE THE REQUEST WAS IN FLIGHT makes every
+-- judgement below it meaningless in the permissive direction: the deadline,
+-- the expiry and the cache lifetime are all comparisons against the arrival
+-- reading, and an earlier one makes a plan look fresher and an entry live
+-- longer.
+local function test_a_clock_rollback_during_the_request_is_refused()
+	reset()
+	next_response_body = plan()
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url }
+		socket.now = socket.now - 30
+		callback(nil, nil, { status = 200, response = next_response_body })
+	end
+	local decision, calls = prepare()
+	http.request = saved_request
+	socket.now = 1000
+	assert_equal(calls, 1, "exactly one callback")
+	assert_equal(decision.reason, "clock_regressed", "a rollback in flight is refused by name")
+	assert_true(not decision.plan_used, "and no plan is used")
+	assert_true(decision.optional_processing_closed, "and the verdict is closed")
+
+	-- And it is refused BEFORE anything is cached: the next call goes to the
+	-- wire rather than being served a plan that was never accepted.
+	next_response_body = plan()
+	prepare()
+	assert_equal(#requests, 2, "a refused response must not have been cached")
+end
+
+-- ⚠ A STRICT FALLBACK IS NOT A NOTICE CHANGE. A fallback carries no
+-- consent_text_version at all, so comparing the standing answer against one
+-- read every outage as "the text changed" and threw away an answer the player
+-- really did give — meaning the next good plan asked them again for no reason.
+-- A fallback CLOSES; it does not erase.
+local function test_a_fallback_does_not_erase_the_standing_answer()
+	reset()
+	next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT })
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url }
+		if #requests == 3 then
+			-- The resume resolution fails: a fallback, carrying no plan.
+			callback(nil, nil, { status = 500, response = encode_value({ reason = "policy_unavailable" }) })
+			return
+		end
+		callback(nil, nil, { status = 200, response = next_response_body })
+	end
+	-- Resume once into the outage, then again into a good plan.
+	local calls = run_example(nil, { "focus_gained", "focus_gained" })
+	http.request = saved_request
+
+	assert_true(calls:find("strict fallback", 1, true) ~= nil,
+		"the fixture must produce a fallback: " .. calls)
+	assert_true(calls:find("consent_text_changed", 1, true) == nil,
+		"an outage is not a notice change: " .. calls)
+	assert_true(calls:find("analytics suspended (optional_processing_closed)", 1, true) ~= nil,
+		"a fallback still closes the lane: " .. calls)
+
+	-- The answer survived: the lane comes back WITHOUT a second notice, so
+	-- exactly one consent write across the whole run.
+	local writes = 0
+	for _ in calls:gmatch("sdk%.set_consent") do
+		writes = writes + 1
+	end
+	assert_equal(writes, 1, "the standing answer must survive an outage: " .. calls)
+	local inits = 0
+	for _ in calls:gmatch("sdk%.init") do
+		inits = inits + 1
+	end
+	assert_true(inits >= 2, "and the lane must come back after the outage: " .. calls)
+end
+
 local tests = {
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,
@@ -1514,6 +1670,11 @@ local tests = {
 	test_a_null_signature_is_still_a_signature,
 	test_a_backwards_clock_invalidates_the_cache,
 	test_a_restored_answer_writes_no_consent,
+	test_a_null_list_is_not_an_absent_one,
+	test_an_unknown_top_level_key_is_refused,
+	test_a_duplicate_top_level_key_is_refused,
+	test_a_clock_rollback_during_the_request_is_refused,
+	test_a_fallback_does_not_erase_the_standing_answer,
 }
 
 for _, test in ipairs(tests) do

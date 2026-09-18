@@ -213,7 +213,12 @@ local function suspend_crash()
   end
 end
 
-local function start_analytics(granted)
+-- `newly_answered` is true only for a notice just completed. A RESTORED answer
+-- re-initialises and stops: client.new reads the persisted consent decision
+-- back, so calling set_consent again re-persists a decision nobody made twice
+-- and enqueues a second receipt — a policy change appearing in the consent
+-- trail as a player changing their mind.
+local function start_analytics(granted, newly_answered)
   shardpilot.init({
     ingest_url = "http://localhost:8080",
     workspace_id = "workspace-example",
@@ -225,11 +230,14 @@ local function start_analytics(granted)
     end,
   })
   shardpilot.identify("user-example")
+  analytics_running = true
+  if not newly_answered then
+    return
+  end
   shardpilot.set_consent(granted) -- a DECLINE is recorded the same way
   if granted then
     shardpilot.session_start()
   end
-  analytics_running = true
 end
 
 local function start_crash()
@@ -253,10 +261,15 @@ end
 -- player's: a lane the new decision permits still needs an answer.
 reconcile = function(fresh)
   -- (a) A changed notice text means the running grant belongs to a notice this
-  -- player never saw.
-  if answered and (fresh.consent_text_version ~= answered.text_version
-    or fresh.presented_language ~= answered.language) then
+  -- player never saw. Only a PLAN can change it: a fallback carries no
+  -- consent_text_version, so comparing against one would read every outage as
+  -- a text change. The crash lane goes with it — a reporter running under text
+  -- nobody saw is the same defect.
+  if fresh.plan_used and answered
+    and (fresh.consent_text_version ~= answered.text_version
+      or fresh.presented_language ~= answered.language) then
     suspend_analytics("consent_text_changed")
+    suspend_crash()
     answered = nil
   end
 
@@ -274,14 +287,19 @@ reconcile = function(fresh)
   -- processing: there is nothing a player could grant.
   if not fresh.optional_processing_closed and not analytics_running then
     if answered then
-      start_analytics(answered.granted)
+      start_analytics(answered.granted, answered.fresh_answer == true)
+      answered.fresh_answer = nil
     elseif not notice_open then
       notice_open = true
       present_consent_notice(fresh, function(granted)
         notice_open = false
         answered = { text_version = fresh.consent_text_version,
-                     language = fresh.presented_language, granted = granted }
-        resolve_and_reconcile() -- the plan may have expired while the UI was open
+                     language = fresh.presented_language, granted = granted,
+                     fresh_answer = true }
+        -- Invalidate FIRST, or this resolution is answered by the cache entry
+        -- the launch wrote — the very decision being checked for staleness.
+        consent_policy.invalidate()
+        resolve_and_reconcile()
       end)
       return -- nothing starts while a choice is pending
     else
@@ -1084,6 +1102,30 @@ scoped to the *whole* context — a different app, environment or endpoint is
 re-resolved rather than served the previous one's answer. An entry never
 outlives the shorter of five minutes, the plan's own `expires_at` and its
 `max_age_seconds`.
+
+### What the minimal example does not do — host requirements
+
+[`examples/minimal/main.script`](examples/minimal) is a **quick start**, not a
+production integration. Three lifecycle obligations are deliberately left to
+the host, because they belong to an application's own teardown discipline
+rather than to a twenty-line illustration. A production integration must
+implement all three.
+
+- **Retry `crash.shutdown()` until it succeeds before treating a `CRASH_OFF`
+  closure as enforced.** It returns `false, "pending"` while a crash POST is in
+  flight, and the host must keep pumping `http.update` and retrying; until it
+  returns true the reporter is still live, so the lane is not actually closed.
+  The example keeps the state and retries at teardown, which is enough to show
+  the shape and not enough to guarantee the closure.
+- **Keep `analytics_running` until `shardpilot.shutdown()` returns true, retry
+  it, and never `init()` over a live client.** The analytics client has the
+  same pending posture, and a re-`init` while one is still settling produces
+  two clients over one spool.
+- **Fence asynchronous callbacks and remove the window listener in
+  `final()`.** A policy resolution or a notice answer that arrives after
+  teardown will happily start a lane on a torn-down script; the host needs a
+  generation or a disposed flag that every callback checks, and must clear the
+  listener it installed.
 
 `consent_policy.invalidate()` is what the host calls on the named
 re-resolution triggers — launch and resume, a network or permitted storefront
