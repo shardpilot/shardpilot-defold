@@ -769,7 +769,9 @@ end
 -- "we asked, and then ignored the answer". The example is the integration path
 -- users copy, so the branches are exercised headlessly: the SDK modules are
 -- replaced in package.loaded and the chunk is loaded, which defines init().
-local function run_example()
+-- `between` runs after init() and before update(), i.e. while the notice is
+-- still on screen. `window_events` are fired after update().
+local function run_example(between, window_events)
 	local seen = {}
 	local function record(name)
 		return function(...)
@@ -802,9 +804,24 @@ local function run_example()
 		end,
 	}
 	package.loaded["shardpilot.crash"] = {
-		init = record("crash.init"),
+		init = function()
+			seen[#seen + 1] = "crash.init"
+			return true
+		end,
+		set_enabled = function(enabled)
+			seen[#seen + 1] = "crash.set_enabled:" .. tostring(enabled)
+		end,
 		shutdown = function()
 			return true
+		end,
+	}
+	local saved_window = window
+	window = {
+		WINDOW_EVENT_ICONFIED = "iconified",
+		WINDOW_EVENT_FOCUS_LOST = "focus_lost",
+		WINDOW_EVENT_FOCUS_GAINED = "focus_gained",
+		set_listener = function(listener)
+			window.listener = listener
 		end,
 	}
 	package.loaded["shardpilot.platform"] = { detect = function() return "windows" end }
@@ -830,9 +847,18 @@ local function run_example()
 		chunk()
 		init(nil)
 		after_init = table.concat(seen, " | ")
+		if between then
+			between()
+		end
 		update(nil, 0)
 		after_update = table.concat(seen, " | ")
+		for _, event in ipairs(window_events or {}) do
+			window.listener(nil, event, nil)
+			update(nil, 0)
+		end
+		after_update = table.concat(seen, " | ")
 	end)
+	window = saved_window
 
 	print = saved_print
 	for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform" }) do
@@ -1028,6 +1054,111 @@ local function test_the_clock_falls_back_to_os_time()
 	assert_equal(#requests, 0, "and it costs no request")
 end
 
+-- ⚠ AN EMPTY JSON OBJECT AND AN EMPTY ARRAY DECODE TO THE SAME LUA TABLE, so
+-- after the decode the container type is gone. `"operation_blocks": {}` read
+-- as "no operation blocks" and the plan was USED. The raw response text is the
+-- only place the distinction survives.
+local function test_an_empty_object_is_not_an_empty_list()
+	for _, name in ipairs({ "operation_blocks", "prohibited_purposes", "signals_used" }) do
+		for _, spacing in ipairs({ '"%s":{}', '"%s" : { }', '"%s":\t{"a":1}' }) do
+			reset()
+			-- Spliced into the raw body, because the encoder cannot produce it:
+			-- an empty Lua table encodes as an array.
+			local body = plan()
+			next_response_body = body:sub(1, 1) .. string.format(spacing, name) .. "," .. body:sub(2)
+			local decision = prepare()
+			assert_true(not decision.plan_used,
+				name .. " as a JSON object must not be used (" .. spacing .. ")")
+			assert_true(decision.optional_processing_closed, "and the verdict is closed")
+		end
+	end
+
+	-- The controls: an empty ARRAY still parses for all three, or this rule
+	-- would be refusing the resolver's own output.
+	reset()
+	local body = plan()
+	next_response_body = body:sub(1, 1) ..
+		'"operation_blocks":[],"prohibited_purposes":[],"signals_used":[],' .. body:sub(2)
+	assert_true(prepare().plan_used, "empty arrays must still parse")
+end
+
+-- ⚠ AN OFFSET IS SPELLED WITH THE COLON. Accepting "+0200" as well was being
+-- generous with someone else's grammar, and a parser that accepts more than
+-- the spec disagrees with every other reader of the same field.
+local function test_an_offset_needs_its_colon()
+	reset()
+	next_response_body = plan({ expires_at = "2099-01-01T00:00:00+0200" })
+	assert_true(not prepare().plan_used, '"+0200" is not an RFC 3339 offset')
+	reset()
+	next_response_body = plan({ expires_at = "2099-01-01T00:00:00+02:00" })
+	assert_true(prepare().plan_used, '"+02:00" is')
+end
+
+-- ⚠ THE DECISION THAT OPENED THE NOTICE IS NOT THE ONE TO ACT ON. The player
+-- was reading the screen; the plan may have expired or the policy may have
+-- been revoked meanwhile, and acting on the captured decision starts a lane on
+-- a verdict that is no longer true.
+local function test_the_example_re_resolves_after_the_answer()
+	reset()
+	-- max_age_seconds = 0 means the first answer is not cached, so the
+	-- re-resolution actually reaches the wire and this scene can see it.
+	next_response_body = example_plan({ crash_profile = consent_policy.CRASH_MINIMAL, max_age_seconds = 0 })
+	local calls = run_example(function()
+		-- While the notice is on screen the policy changes: the crash lane closes.
+		next_response_body = example_plan({ crash_profile = consent_policy.CRASH_OFF, max_age_seconds = 0 })
+	end)
+	assert_equal(#requests, 2, "the example must resolve again after the answer")
+	assert_true(calls:find("crash.init", 1, true) == nil,
+		"the example acted on the stale decision and opened a lane the fresh one closes: " .. calls)
+end
+
+-- ⚠ RESUME IS A NAMED RE-RESOLUTION TRIGGER, and one that cannot CLOSE
+-- anything is not one. An app can sit in the background for days.
+local function test_the_example_closes_lanes_on_resume()
+	local function open_plan()
+		return example_plan({
+			regime = consent_policy.SOFT_OPT_OUT, crash_profile = consent_policy.CRASH_MINIMAL,
+		})
+	end
+
+	-- The control: with the policy unchanged, a resume closes nothing.
+	reset()
+	next_response_body = open_plan()
+	local calls = run_example(nil, { "focus_gained" })
+	assert_true(calls:find("sdk.init", 1, true) ~= nil and calls:find("crash.init", 1, true) ~= nil,
+		"both lanes must be open, or this scene proves nothing: " .. calls)
+	-- The placeholder notice declines, so set_consent:false appears either way;
+	-- what only the RESUME produces is these two lines.
+	assert_true(calls:find("closed on resume", 1, true) == nil
+		and calls:find("crash.set_enabled:false", 1, true) == nil,
+		"an unchanged policy must not close anything on resume: " .. calls)
+
+	-- Now the policy closes both lanes while the app is backgrounded. The
+	-- resume resolution is the SECOND request: launch is the first, and the
+	-- one after the player's answer is a private cache hit.
+	reset()
+	next_response_body = open_plan()
+	local resumed = false
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url }
+		if #requests >= 2 then
+			next_response_body = example_plan({
+				regime = consent_policy.STRICT_OPT_IN, crash_profile = consent_policy.CRASH_OFF,
+			})
+			resumed = true
+		end
+		callback(nil, nil, { status = 200, response = next_response_body })
+	end
+	calls = run_example(nil, { "focus_gained" })
+	http.request = saved_request
+	assert_true(resumed, "resume must re-resolve rather than answer from the cache")
+	assert_true(calls:find("optional processing closed on resume", 1, true) ~= nil,
+		"resume must close the analytics lane the new decision closes: " .. calls)
+	assert_true(calls:find("crash.set_enabled:false", 1, true) ~= nil,
+		"resume must stop the crash lane the new decision closes: " .. calls)
+end
+
 local tests = {
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,
@@ -1052,6 +1183,10 @@ local tests = {
 	test_an_encoder_failure_still_answers,
 	test_a_lost_transport_beats_a_cached_permission,
 	test_the_clock_falls_back_to_os_time,
+	test_an_empty_object_is_not_an_empty_list,
+	test_an_offset_needs_its_colon,
+	test_the_example_re_resolves_after_the_answer,
+	test_the_example_closes_lanes_on_resume,
 }
 
 for _, test in ipairs(tests) do

@@ -99,15 +99,34 @@ local generation = 0
 local dispatch_counter = 0
 local latest_dispatch = {}
 
+-- ⚠ THE EMPTY OBJECT IS CAUGHT BEFORE THE DECODE, BECAUSE AFTER IT THERE IS
+-- NOTHING LEFT TO CATCH IT WITH. Defold's json.decode returns a plain Lua
+-- table for both `{}` and `[]` and marks neither, so by the time the plan is a
+-- table the container type has been ERASED — the previous note here said that
+-- and stopped, which left `"operation_blocks": {}` reading as "no operation
+-- blocks" and being used.
+--
+-- The raw response text is the only place the distinction still exists, so it
+-- is read there: a schema list key followed by `{` is malformed. That is the
+-- ONLY container-type signal available in this SDK, which is why this looks
+-- like string matching in a parser rather than a type check.
+local LIST_KEYS = { "operation_blocks", "prohibited_purposes", "signals_used" }
+
+local function list_keys_are_not_objects(body)
+	for _, name in ipairs(LIST_KEYS) do
+		if body:find('"' .. name .. '"%s*:%s*{') then
+			return false, name .. " is a JSON object where the schema says a list"
+		end
+	end
+	return true
+end
+
 -- ⚠ AN OBJECT IS NOT AN EMPTY LIST. A JSON object decodes to a Lua table
 -- whose length is zero and over which ipairs yields nothing, so a roster
 -- supplied as {"a": 1} read as "no operation blocks" — a malformed plan
--- presenting as a permissive one.
---
--- HONEST LIMIT: an empty JSON object and an empty JSON array decode to the
--- SAME Lua table, and nothing here can separate them; `{}` passes as an empty
--- list. Only a decoder that marked arrays would close that, and this module
--- does not own the decoder.
+-- presenting as a permissive one. This check stays for the NON-empty case and
+-- for a caller that hands parse_plan a table directly; the raw check above is
+-- what covers the empty one.
 local function is_sequence(list)
 	local length = #list
 	local count = 0
@@ -167,7 +186,11 @@ local function parse_timestamp(value)
 	rest = rest:gsub("^%.%d+", "")
 	local offset = 0
 	if rest ~= "Z" and rest ~= "z" then
-		local sign, oh, om = rest:match("^([%+%-])(%d%d):?(%d%d)$")
+		-- RFC 3339 spells an offset with the colon. Accepting "+0200" as well
+		-- was me being generous with someone else's grammar, and a parser that
+		-- accepts more than the spec is a parser that disagrees with every
+		-- other reader of the same field.
+		local sign, oh, om = rest:match("^([%+%-])(%d%d):(%d%d)$")
 		if not sign then
 			return nil
 		end
@@ -683,6 +706,11 @@ function M.prepare(context, callback)
 		local body = response.response
 		if type(body) ~= "string" or #body == 0 or #body > MAX_BODY then
 			settle(strict("invalid_response", "the response body is empty or over its bound"))
+			return
+		end
+		local shapes_ok, shape_refusal = list_keys_are_not_objects(body)
+		if not shapes_ok then
+			settle(strict("invalid_response", shape_refusal))
 			return
 		end
 		local decoded_ok, decoded = pcall(json.decode, body)

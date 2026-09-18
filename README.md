@@ -207,8 +207,20 @@ local function on_decision(decision)
     -- The crash lane, decided separately. Crash reporting is ON by default, so
     -- leaving crash.init unconditional is how a closed lane gets opened.
     if decision.crash_profile == consent_policy.CRASH_MINIMAL then
-      crash.init({ --[[ see docs/crash.md ]] })
-      crash_started = true
+      -- crash.init returns false, err — an empty config fails with
+      -- crash_ingest_url_required, so the required keys are here and the flag
+      -- is set from the RESULT. A crash_started that lies means final() calls
+      -- shutdown on a reporter that was never created.
+      local crash_ok, crash_err = crash.init({
+        crash_ingest_url = "http://localhost:8080",
+        crash_api_key = "sp_crash_write_placeholder",
+        app_id = "app-example",
+        crash_source = "game-client",
+      })
+      crash_started = crash_ok
+      if not crash_ok then
+        print("shardpilot crash init failed: " .. tostring(crash_err))
+      end
     end
 
     -- Server-side analytics is a BASIS, not a toggle. If your backend sends on
