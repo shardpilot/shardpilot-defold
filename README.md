@@ -161,22 +161,29 @@ Minimal Defold script (see [`examples/minimal/`](examples/minimal)):
 local consent_policy = require "shardpilot.consent_policy"
 local platform = require "shardpilot.platform"
 local shardpilot = require "shardpilot.sdk"
+local crash = require "shardpilot.crash"
 
-local started = false
+local started = false       -- the analytics SDK was initialised
+local crash_started = false -- the crash reporter was initialised: SEPARATE state
 
 local function on_decision(decision)
   print("consent regime: " .. tostring(decision.regime))
 
-  -- ⚠ EACH LANE BRANCHES ON ITS OWN FIELD. The flags are orthogonal: analytics
-  -- being closed does not close the crash lane, and a permitted crash lane
-  -- does not open analytics.
-  if decision.optional_processing_closed then
-    -- Nothing a player could grant, so nothing is asked — and the SDK is not
-    -- initialised at all, because init builds the client, which loads the
-    -- persisted scope record and mints an anonymous identifier.
-    print("optional processing is closed by this regime; analytics not started")
-  else
-    present_consent_notice(decision, function(granted)  -- your consent UI
+  -- ⚠ ONE FINAL-CHOICE GATE, AND BOTH LANES ARE INSIDE IT. No capture hook, no
+  -- identity and no buffered event may exist before the player's final choice
+  -- — and the crash reporter IS a capture hook. Your notice answers many
+  -- frames later, so anything started outside this callback is started while
+  -- the notice is still on screen.
+  present_consent_notice(decision, function(granted)  -- your consent UI
+    -- ⚠ EACH LANE BRANCHES ON ITS OWN FIELD. The flags are orthogonal:
+    -- analytics being closed does not close the crash lane, and a permitted
+    -- crash lane does not open analytics.
+    if decision.optional_processing_closed then
+      -- Nothing a player could grant — and the SDK is not initialised at all,
+      -- because init builds the client, which loads the persisted scope record
+      -- and mints an anonymous identifier.
+      print("optional processing is closed by this regime; analytics not started")
+    else
       shardpilot.init({
         ingest_url = "http://localhost:8080",
         workspace_id = "workspace-example",
@@ -195,18 +202,19 @@ local function on_decision(decision)
         shardpilot.screen_view("menu") -- emits app.screen_view
       end
       started = true
-    end)
-  end
+    end
 
-  -- The crash lane, decided separately. Crash reporting is ON by default, so
-  -- leaving crash.init unconditional is how a closed lane gets opened.
-  if decision.crash_profile == consent_policy.CRASH_MINIMAL then
-    crash.init({ --[[ see docs/crash.md ]] })
-  end
+    -- The crash lane, decided separately. Crash reporting is ON by default, so
+    -- leaving crash.init unconditional is how a closed lane gets opened.
+    if decision.crash_profile == consent_policy.CRASH_MINIMAL then
+      crash.init({ --[[ see docs/crash.md ]] })
+      crash_started = true
+    end
 
-  -- Server-side analytics is a BASIS, not a toggle. If your backend sends on
-  -- it, gate that on decision.server_analytics == SERVER_ANALYTICS_ELIGIBLE
-  -- and honour decision.server_analytics_objection_required out of band.
+    -- Server-side analytics is a BASIS, not a toggle. If your backend sends on
+    -- it, gate that on decision.server_analytics == SERVER_ANALYTICS_ELIGIBLE
+    -- and honour decision.server_analytics_objection_required out of band.
+  end)
 end
 
 function init(self)
@@ -234,8 +242,18 @@ function update(self, dt)
 end
 
 function final(self)
+  -- ⚠ THE TWO LANES SHUT DOWN SEPARATELY. A crash reporter that was started
+  -- while analytics stayed closed still has to be stopped, so returning early
+  -- on `not started` would have skipped crash.shutdown() in exactly the case
+  -- the crash lane exists for.
+  if crash_started then
+    local crash_ok, crash_err = crash.shutdown()
+    if not crash_ok then
+      print("shardpilot crash shutdown not complete: " .. tostring(crash_err))
+    end
+  end
   if not started then
-    return -- the decision never arrived; there is no SDK to shut down
+    return -- analytics was never started; there is no SDK to shut down
   end
   -- shutdown() starts a final flush. When the flush cannot deliver everything,
   -- the undelivered events are written to the durable offline spool and

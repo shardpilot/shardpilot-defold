@@ -821,10 +821,17 @@ local function run_example()
 		seen[#seen + 1] = "print:" .. table.concat(parts, " ")
 	end
 
+	-- ⚠ TWO SNAPSHOTS, BECAUSE THE ORDERING IS THE PROPERTY. The example's
+	-- placeholder notice answers from update(), so what happened by the end of
+	-- init() is exactly "everything that ran BEFORE the player's final choice".
+	local after_init, after_update
 	local ok, err = pcall(function()
 		local chunk = assert(loadfile("examples/minimal/main.script"))
 		chunk()
 		init(nil)
+		after_init = table.concat(seen, " | ")
+		update(nil, 0)
+		after_update = table.concat(seen, " | ")
 	end)
 
 	print = saved_print
@@ -832,7 +839,7 @@ local function run_example()
 		package.loaded[name] = saved[name]
 	end
 	assert_true(ok, "the example must run: " .. tostring(err))
-	return table.concat(seen, " | ")
+	return after_update, after_init
 end
 
 -- The example's own context, so the fixture's plan is IN SCOPE for it. Without
@@ -853,7 +860,7 @@ local function test_the_published_example_branches_on_the_decision()
 	-- analytics DENIED. Nothing may be granted, so nothing is initialised.
 	reset()
 	next_response_body = example_plan()
-	local calls = run_example()
+	local calls, before_choice = run_example()
 	-- ⚠ THE CONTROL FIRST: the example must have USED the plan. Otherwise it is
 	-- reading a strict fallback and every assertion below is satisfied by a
 	-- refusal rather than by a branch.
@@ -870,14 +877,25 @@ local function test_the_published_example_branches_on_the_decision()
 	assert_true(calls:find("crash.init", 1, true) == nil,
 		"the example enabled default-on crash reporting under crash_profile OFF: " .. calls)
 
+	-- ⚠ AND NOTHING AT ALL BEFORE THE PLAYER ANSWERS. The notice is still on
+	-- screen at the end of init(); the first-run guarantee is that no hook, no
+	-- identity and no buffered event exists yet.
+	assert_true(before_choice:find("sdk.", 1, true) == nil and before_choice:find("crash.", 1, true) == nil,
+		"the example touched the SDK before the notice was answered: " .. before_choice)
+
 	-- (b) The CRASH lane is decided separately, so a permitted crash profile
 	-- opens it even though analytics stays closed. Without this the assertions
 	-- above would be satisfied by an example that does nothing at all.
 	reset()
 	next_response_body = example_plan({ crash_profile = consent_policy.CRASH_MINIMAL })
-	calls = run_example()
+	calls, before_choice = run_example()
+	-- ⚠ THE P1: the crash reporter is a capture hook, and it must not exist
+	-- while the notice is still on screen. This is the assertion that fails on
+	-- the previous cut, where crash.init sat outside the notice's callback.
+	assert_true(before_choice:find("crash.init", 1, true) == nil,
+		"the crash reporter was started before the player's final choice: " .. before_choice)
 	assert_true(calls:find("crash.init", 1, true) ~= nil,
-		"a permitted crash profile must open the crash lane: " .. calls)
+		"a permitted crash profile must open the crash lane once answered: " .. calls)
 	assert_true(calls:find("sdk.init", 1, true) == nil,
 		"and it must not open analytics: " .. calls)
 
@@ -893,6 +911,121 @@ local function test_the_published_example_branches_on_the_decision()
 		"a declined answer must be recorded, not dropped: " .. calls)
 	assert_true(calls:find("sdk.session_start", 1, true) == nil,
 		"a decline must not start a session: " .. calls)
+end
+
+-- ⚠ TWO REQUESTS FOR THE SAME CONTEXT SHARE A GENERATION, so neither
+-- supersedes the other and whichever answers LAST writes the cache. An older
+-- permissive response landing after a newer restrictive one therefore reopened
+-- what the newer one had just closed — purely by arriving second.
+local function test_an_older_response_cannot_overwrite_a_newer_one()
+	reset()
+	-- A transport that holds every request until this scene releases it.
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url }
+		held[#held + 1] = { callback = callback, body = next_response_body }
+	end
+
+	local first, second = {}, {}
+	next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT })
+	consent_policy.prepare(context(), function(d) first[#first + 1] = d end)
+	next_response_body = plan({ regime = consent_policy.STRICT_OPT_IN })
+	consent_policy.prepare(context(), function(d) second[#second + 1] = d end)
+	assert_equal(#held, 2, "both requests must be in flight")
+
+	-- The NEWER one answers first; then the older, permissive one arrives.
+	held[2].callback(nil, nil, { status = 200, response = held[2].body })
+	held[1].callback(nil, nil, { status = 200, response = held[1].body })
+	http.request = saved_request
+
+	assert_equal(#second, 1, "the newer caller is answered exactly once")
+	assert_equal(second[1].regime, consent_policy.STRICT_OPT_IN, "and with its own plan")
+	assert_equal(#first, 1, "the older caller is answered exactly once, not dropped")
+	assert_equal(first[1].reason, "superseded", "and told why")
+	assert_true(first[1].optional_processing_closed, "a superseded answer is closed")
+
+	-- ⚠ AND THE CACHE KEEPS THE NEWER ANSWER. This is the whole point: the
+	-- older response must not reopen what the newer one closed.
+	local served = prepare()
+	assert_equal(#requests, 2, "the third call must be served from the cache")
+	assert_equal(served.regime, consent_policy.STRICT_OPT_IN,
+		"an older permissive response overwrote the cache")
+end
+
+-- ⚠ AN ENCODER THAT RAISES IS NOT A STRICT DECISION, IT IS NO DECISION. The
+-- error left prepare without ever invoking the one callback it promises, so
+-- the caller had nothing to fail closed on — the same shape as the endpoint
+-- concatenation defect.
+local function test_an_encoder_failure_still_answers()
+	reset()
+	next_response_body = plan()
+	local saved_encode = json.encode
+	json.encode = function()
+		error("synthetic encoder failure")
+	end
+	local decision, calls = prepare()
+	json.encode = saved_encode
+	assert_equal(calls, 1, "exactly one callback when the encoder raises")
+	assert_equal(decision.reason, "encoder_failed")
+	assert_equal(#requests, 0, "a body that could not be encoded must cost zero requests")
+	assert_true(decision.optional_processing_closed, "and the verdict is closed")
+end
+
+-- ⚠ AN OUTAGE CAN TIGHTEN, NEVER RELAX — INCLUDING OVER A WARM CACHE. The
+-- cache was read before the transport was checked, so losing the network
+-- served the last permissive answer for the rest of the window, and it read as
+-- a cache hit rather than as an outage.
+local function test_a_lost_transport_beats_a_cached_permission()
+	reset()
+	next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT })
+	local first = prepare()
+	assert_equal(first.regime, consent_policy.SOFT_OPT_OUT, "the fixture must cache a permissive plan")
+
+	local saved_http = http
+	http = nil
+	local decision, calls = prepare()
+	http = saved_http
+	assert_equal(calls, 1, "exactly one callback")
+	assert_equal(decision.reason, "transport_unavailable", "the outage wins over the cache")
+	assert_true(not decision.plan_used, "and no plan is reported as used")
+	assert_true(decision.optional_processing_closed, "and optional processing is closed")
+
+	-- The control: with the transport back, the cache is still there — so the
+	-- assertion above is about the outage, not about the entry having expired.
+	local restored = prepare()
+	assert_equal(restored.regime, consent_policy.SOFT_OPT_OUT, "the entry survived the outage")
+	assert_equal(#requests, 1, "and was served without a new request")
+end
+
+-- ⚠ NO socket IS NOT A REASON TO BE PERMANENTLY STRICT. Returning nil made
+-- prepare refuse outright on every target without the socket module — not
+-- failing closed on a doubt, but never asking the question. clock.lua already
+-- falls back to os.time(); second resolution is ample for an expiry measured
+-- in minutes.
+local function test_the_clock_falls_back_to_os_time()
+	reset()
+	next_response_body = plan()
+	local saved_socket = socket
+	socket = nil
+	local decision, calls = prepare()
+	socket = saved_socket
+	assert_equal(calls, 1, "exactly one callback")
+	assert_equal(#requests, 1, "a target without socket must still reach the wire")
+	assert_true(decision.plan_used, "and use the plan: " .. tostring(decision.reason))
+
+	-- The control: with NEITHER clock the refusal stands, so the fallback did
+	-- not simply delete the rule.
+	reset()
+	next_response_body = plan()
+	socket = nil
+	local saved_time = os.time
+	os.time = nil
+	local blind = prepare()
+	os.time = saved_time
+	socket = saved_socket
+	assert_equal(blind.reason, "clock_unavailable", "with no clock at all the refusal stands")
+	assert_equal(#requests, 0, "and it costs no request")
 end
 
 local tests = {
@@ -915,6 +1048,10 @@ local tests = {
 	test_a_signal_must_state_its_availability_as_a_boolean,
 	test_a_returned_decision_is_a_copy,
 	test_the_published_example_branches_on_the_decision,
+	test_an_older_response_cannot_overwrite_a_newer_one,
+	test_an_encoder_failure_still_answers,
+	test_a_lost_transport_beats_a_cached_permission,
+	test_the_clock_falls_back_to_os_time,
 }
 
 for _, test in ipairs(tests) do

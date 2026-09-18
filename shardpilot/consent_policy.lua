@@ -89,6 +89,16 @@ local cached = nil
 -- it was dispatched under is still current.
 local generation = 0
 
+-- ⚠ THE GENERATION IS NOT ENOUGH ON ITS OWN. Two prepare calls for the SAME
+-- context can be in flight together — they share a generation, so neither
+-- supersedes the other, and whichever answers LAST writes the cache. An older
+-- permissive response landing after a newer restrictive one therefore reopened
+-- what the newer one had just closed. Each dispatch takes a number, the newest
+-- number for a context key is remembered, and a response from an older
+-- dispatch is refused rather than delivered or cached.
+local dispatch_counter = 0
+local latest_dispatch = {}
+
 -- ⚠ AN OBJECT IS NOT AN EMPTY LIST. A JSON object decodes to a Lua table
 -- whose length is zero and over which ipairs yields nothing, so a roster
 -- supplied as {"a": 1} read as "no operation blocks" — a malformed plan
@@ -299,9 +309,18 @@ local function context_key(context)
 	return table.concat(parts, "|")
 end
 
+-- ⚠ THE SAME FALLBACK clock.lua ALREADY USES (clock.lua:4-9), and for the same
+-- reason. Returning nil when socket is absent looked conservative and was not:
+-- prepare refuses outright with no clock, so every target without the socket
+-- module was PERMANENTLY strict — not failing closed on a doubt, but never
+-- asking the question at all. os.time() is second-resolution, which is ample
+-- for an expiry measured in minutes.
 local function now_seconds()
 	if socket and socket.gettime then
 		return socket.gettime()
+	end
+	if os and os.time then
+		return os.time()
 	end
 	return nil
 end
@@ -545,6 +564,9 @@ end
 function M.invalidate()
 	cached = nil
 	generation = generation + 1
+	-- Nothing in flight may answer after this, so the per-key records go too;
+	-- they are the only thing that grows, and this is what bounds them.
+	latest_dispatch = {}
 end
 
 -- prepare(context, callback) — the first integration call, before the
@@ -570,6 +592,24 @@ function M.prepare(context, callback)
 		return
 	end
 
+	-- ⚠ THE TRANSPORT IS CHECKED BEFORE THE CACHE IS READ, AND THE ORDER IS THE
+	-- RULE. With the cache first, losing the network served the last permissive
+	-- answer for the rest of the window — the one thing "an offline state can
+	-- tighten but never relax" forbids, and it read as a cache hit rather than
+	-- as an outage. A missing transport is a fallback, and a fallback wins.
+	if not http or not http.request then
+		callback(strict("transport_unavailable", "no http transport is available"))
+		return
+	end
+	if not json or not json.decode then
+		callback(strict("decoder_unavailable", "no json decoder is available"))
+		return
+	end
+	if not json.encode then
+		callback(strict("encoder_unavailable", "no json encoder is available"))
+		return
+	end
+
 	local key = context_key(context)
 	if cached and cached.key == key and cached.until_at > at then
 		-- ⚠ A COPY, NOT THE ENTRY. The cache used to hand out the very table it
@@ -580,19 +620,13 @@ function M.prepare(context, callback)
 		return
 	end
 
-	if not http or not http.request then
-		callback(strict("transport_unavailable", "no http transport is available"))
-		return
-	end
-	if not json or not json.decode then
-		callback(strict("decoder_unavailable", "no json decoder is available"))
-		return
-	end
-	local encoded
-	if json.encode then
-		encoded = json.encode(request_body(context))
-	else
-		callback(strict("encoder_unavailable", "no json encoder is available"))
+	-- ⚠ AND THE ENCODER IS CALLED THROUGH pcall. json.encode raises on a value
+	-- it cannot represent, and an error thrown out of prepare is not a strict
+	-- decision — it is NO decision, so the one callback this module promises
+	-- never arrives and the caller has nothing to fail closed on.
+	local encoded_ok, encoded = pcall(json.encode, request_body(context))
+	if not encoded_ok or type(encoded) ~= "string" then
+		callback(strict("encoder_failed", "the request body could not be encoded"))
 		return
 	end
 
@@ -600,6 +634,10 @@ function M.prepare(context, callback)
 	local deadline = at + DEADLINE_SECONDS
 	-- The invalidation this request is dispatched under; see `generation`.
 	local dispatched_under = generation
+	-- ...and its place in the order of dispatches for THIS context key.
+	dispatch_counter = dispatch_counter + 1
+	local dispatch = dispatch_counter
+	latest_dispatch[key] = dispatch
 	local function settle(decision)
 		-- ⚠ ONE CALLBACK, EVER. A response that arrives after the deadline is
 		-- dropped here: the screen it would change has already been presented.
@@ -624,6 +662,16 @@ function M.prepare(context, callback)
 			settle(strict("invalidated", "the policy was invalidated while this request was in flight"))
 			return
 		end
+		-- ⚠ A LATER DISPATCH FOR THIS CONTEXT HAS ALREADY BEEN MADE, so this
+		-- answer describes an older question. It is still ANSWERED — exactly
+		-- one callback, strict — but it does not reach the cache, which is
+		-- where an older permissive plan used to overwrite a newer restrictive
+		-- one purely by arriving second.
+		if latest_dispatch[key] ~= dispatch then
+			settle(strict("superseded", "a later request for this context was dispatched first"))
+			return
+		end
+		latest_dispatch[key] = nil
 		if arrived > deadline then
 			settle(strict("deadline_exceeded", "the response arrived after the total deadline"))
 			return
