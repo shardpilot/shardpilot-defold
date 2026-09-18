@@ -221,6 +221,8 @@ end
 
 local function reset()
 	crash_shutdown_pending = 0
+	sdk_init_failures = 0
+	sdk_consent_refusals = 0
 	requests = {}
 	next_status = 200
 	next_response_body = nil
@@ -794,6 +796,11 @@ end
 -- times before succeeding — the real one does exactly that while a POST is in
 -- flight (crash/client.lua:1175-1188).
 local crash_shutdown_pending = 0
+-- The real SDK returns false, err from init (a bad config) and from
+-- set_consent (a full or unwritable consent outbox); the fakes do too, on
+-- demand, because the example is supposed to notice.
+local sdk_init_failures = 0
+local sdk_consent_refusals = 0
 
 local function run_example(between, window_events, dts, finalize)
 	local seen = {}
@@ -808,10 +815,22 @@ local function run_example(between, window_events, dts, finalize)
 		saved[name] = package.loaded[name]
 	end
 	package.loaded["shardpilot.sdk"] = {
-		init = record("sdk.init"),
+		init = function()
+			seen[#seen + 1] = "sdk.init"
+			if sdk_init_failures > 0 then
+				sdk_init_failures = sdk_init_failures - 1
+				return false, "ingest_url_required"
+			end
+			return true
+		end,
 		identify = record("sdk.identify"),
 		set_consent = function(value)
 			seen[#seen + 1] = "sdk.set_consent:" .. tostring(value)
+			if sdk_consent_refusals > 0 then
+				sdk_consent_refusals = sdk_consent_refusals - 1
+				return false, "consent_outbox_full"
+			end
+			return true
 		end,
 		session_start = record("sdk.session_start"),
 		fetch_remote_config = function(callback)
@@ -1633,6 +1652,158 @@ local function test_a_fallback_does_not_erase_the_standing_answer()
 	assert_true(inits >= 2, "and the lane must come back after the outage: " .. calls)
 end
 
+-- ⚠ NO FIELD IN THIS SCHEMA IS NULLABLE, AND THAT IS ONE RULE. Lua has no
+-- null, so every present-and-null key decodes to exactly the nil an absent key
+-- decodes to — and this module reads absence as a MEANING everywhere: absent
+-- signature is unsigned, absent objection requirement stands, absent list is
+-- no restrictions. Asked over the whole schema rather than field by field,
+-- because patching them one at a time is how the next added field arrives with
+-- the same hole.
+local function test_no_schema_field_is_nullable()
+	local nullable = {
+		"regime", "crash_profile", "server_analytics",
+		"server_analytics_objection_required", "prohibited_purposes",
+		"operation_blocks", "policy_version", "consent_text_version",
+		"presented_language", "scope", "signals_used", "age_band",
+		"expires_at", "max_age_seconds", "signature",
+	}
+	for _, name in ipairs(nullable) do
+		reset()
+		next_response_body = raw_field('"' .. name .. '"', "null", { [name] = "__nil__" })
+		local decision = prepare()
+		assert_true(not decision.plan_used, name .. " present and null must not be used")
+		assert_true(decision.optional_processing_closed, name .. " must close optional processing")
+	end
+
+	-- The control: the same plan with every one of those keys carrying a real
+	-- value parses, so the rule is about null rather than about the roster.
+	reset()
+	next_response_body = plan({
+		operation_blocks = { "transfer_review" },
+		prohibited_purposes = { "advertising" },
+		age_band = { vocabulary = "coarse.v1", band = "adult" },
+	})
+	assert_true(prepare().plan_used, "a plan with every schema field populated must parse")
+end
+
+-- ⚠ AND A null ELEMENT INSIDE A LIST. Lua drops it: the decoded array comes
+-- back one entry SHORTER, so a roster of three operation blocks with the
+-- middle one nulled reads as a roster of two, with nothing anywhere saying a
+-- third was sent.
+local function test_a_null_list_entry_is_refused()
+	for _, name in ipairs({ "operation_blocks", "prohibited_purposes", "signals_used" }) do
+		reset()
+		next_response_body = raw_field('"' .. name .. '"', '["a",null,"b"]', { [name] = "__nil__" })
+		assert_true(not prepare().plan_used, name .. " with a null entry must not be used")
+	end
+	-- The control: the same lists without the null still parse.
+	reset()
+	next_response_body = plan({
+		operation_blocks = { "transfer_review", "age_capacity" },
+		prohibited_purposes = { "advertising" },
+	})
+	assert_true(prepare().plan_used, "a dense list must still parse")
+end
+
+-- ⚠ THE PLAN'S age_band WAS NEVER CHECKED. validate_context checks the band
+-- the CALLER sends; nothing checked the one the resolver sends back, so a plan
+-- could echo an age_band of any shape at all and be used.
+local function test_the_plans_age_band_is_shape_checked()
+	for _, band in ipairs({
+		{ vocabulary = "coarse.v1" },
+		{ band = "adult" },
+		{ vocabulary = "coarse.v1", band = string.rep("x", 33) },
+		{ vocabulary = "", band = "adult" },
+	}) do
+		reset()
+		next_response_body = plan({ age_band = band })
+		assert_true(not prepare().plan_used, "a malformed age_band must not be used")
+	end
+	reset()
+	next_response_body = plan({ age_band = { vocabulary = "coarse.v1", band = "adult" } })
+	assert_true(prepare().plan_used, "a well-formed age_band must parse")
+end
+
+-- ⚠ AN ERROR BODY IS AN ERROR ENVELOPE, NOT A PLAN. Running the plan-key
+-- allowlist over it refused a perfectly well-formed {"reason": ...} for
+-- carrying a key that is not a plan field — a regression the allowlist
+-- introduced, which turned every resolver refusal into "unreadable" and lost
+-- the reason the resolver gave.
+local function test_an_error_envelope_keeps_its_reason()
+	reset()
+	next_status = 503
+	next_response_body = encode_value({ reason = "policy_unavailable" })
+	local decision = prepare()
+	assert_equal(decision.reason, "policy_unavailable", "the resolver's reason must survive")
+	assert_true(not decision.plan_used, "and no plan is used")
+	assert_true(decision.optional_processing_closed, "and the verdict is closed")
+
+	-- ⚠ BUT NOT WHATEVER ARRIVES. decision.reason travels into a caller's
+	-- control flow and its log lines, so an unrecognisable one is reported as
+	-- the generic reason rather than echoed.
+	for _, hostile in ipairs({ "Policy Unavailable", string.rep("x", 65), "reason\ninjected", 42 }) do
+		reset()
+		next_status = 500
+		next_response_body = encode_value({ reason = hostile })
+		assert_equal(prepare().reason, "policy_unavailable",
+			"an unrecognisable reason must not be echoed: " .. tostring(hostile))
+	end
+end
+
+-- ⚠ init AND set_consent BOTH RETURN false, err, AND THE EXAMPLE IGNORED BOTH.
+-- A lane marked running on a client that was never built is one final() will
+-- try to shut down; a session started on a grant that was never recorded is
+-- the exact ordering the consent outbox exists to prevent.
+local function test_the_example_notices_a_failed_write()
+	-- (a) A failed init must not mark the lane running.
+	reset()
+	sdk_init_failures = 1
+	next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT })
+	local calls = run_example(nil, nil, nil, true)
+	assert_true(calls:find("init failed", 1, true) ~= nil, "the fixture must fail init: " .. calls)
+	assert_true(calls:find("sdk.set_consent", 1, true) == nil,
+		"a failed init must not be followed by a consent write: " .. calls)
+	assert_true(calls:find("sdk.shutdown", 1, true) == nil,
+		"and final() must not shut down a client that was never built: " .. calls)
+
+	-- (b) A refused consent write is OWED: the answer stays pending and the
+	-- next trigger retries it.
+	reset()
+	sdk_consent_refusals = 1
+	next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT })
+	calls = run_example(nil, { "focus_gained" })
+	assert_true(calls:find("consent not recorded", 1, true) ~= nil,
+		"the fixture must refuse the first write: " .. calls)
+	local writes = 0
+	for _ in calls:gmatch("sdk%.set_consent") do
+		writes = writes + 1
+	end
+	assert_equal(writes, 2, "an owed consent write must be retried on the next trigger: " .. calls)
+end
+
+-- ⚠ A VERDICT WITH NO LIFE IS NOT RUNNABLE, and scheduling by it directly is a
+-- spin: max_age_seconds = 0 makes valid_for_seconds 0, so the example
+-- re-resolved every single frame — a flood against the resolver dressed up as
+-- diligence.
+local function test_a_zero_window_does_not_spin()
+	reset()
+	next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT, max_age_seconds = 0 })
+	-- Ten seconds of frames. The floor is thirty, so nothing may re-resolve.
+	local calls = run_example(nil, nil, { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 })
+	assert_true(#requests <= 2, "a zero window must not re-resolve per frame: " .. #requests .. " requests")
+	assert_true(calls:find("no validity window; no lane started", 1, true) ~= nil,
+		"a verdict with no life must say so: " .. calls)
+	assert_true(calls:find("sdk.init", 1, true) == nil and calls:find("crash.init", 1, true) == nil,
+		"and must run no lane at all: " .. calls)
+
+	-- The control: the same plan with a real window DOES run, so the rule is
+	-- about the zero and not about the example refusing everything.
+	reset()
+	next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT, max_age_seconds = 300 })
+	calls = run_example(nil, nil, { 1, 1, 1 })
+	assert_true(calls:find("sdk.init", 1, true) ~= nil, "a live window must run the lane: " .. calls)
+end
+
 local tests = {
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,
@@ -1675,6 +1846,12 @@ local tests = {
 	test_a_duplicate_top_level_key_is_refused,
 	test_a_clock_rollback_during_the_request_is_refused,
 	test_a_fallback_does_not_erase_the_standing_answer,
+	test_no_schema_field_is_nullable,
+	test_a_null_list_entry_is_refused,
+	test_the_plans_age_band_is_shape_checked,
+	test_an_error_envelope_keeps_its_reason,
+	test_the_example_notices_a_failed_write,
+	test_a_zero_window_does_not_spin,
 }
 
 for _, test in ipairs(tests) do

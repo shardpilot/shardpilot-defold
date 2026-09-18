@@ -292,6 +292,29 @@ local function scan_plan_text(body)
 		if LIST_KEYS[key] and body:sub(pos, pos) == "{" then
 			return false, key .. " is a JSON object where the schema says a list", present
 		end
+		-- ⚠ AND A null ELEMENT INSIDE ONE OF THOSE LISTS. Lua drops it: the
+		-- decoded array simply comes back one entry shorter, so a roster of
+		-- three operation blocks with the middle one nulled reads as a roster
+		-- of two, with nothing anywhere saying a third was sent. The raw text
+		-- is again the only place that still knows.
+		if LIST_KEYS[key] and body:sub(pos, pos) == "[" then
+			local scan = skip_space(body, pos + 1)
+			while body:sub(scan, scan) ~= "]" do
+				if body:sub(scan, scan + 3) == "null" then
+					return false, key .. " carries a null entry", present
+				end
+				local element_end = skip_value(body, scan, 1)
+				if not element_end then
+					return false, "the plan is not readable", present
+				end
+				scan = skip_space(body, element_end)
+				if body:sub(scan, scan) == "," then
+					scan = skip_space(body, scan + 1)
+				elseif body:sub(scan, scan) ~= "]" then
+					return false, "the plan is not readable", present
+				end
+			end
+		end
 		local next_pos = skip_value(body, pos, 1)
 		if not next_pos then
 			return false, "the plan is not readable", present
@@ -541,6 +564,22 @@ local function now_seconds()
 	return nil
 end
 
+-- The reason an error envelope carries, or the generic one.
+--
+-- ⚠ IT IS BOUNDED AND PATTERN-CHECKED BECAUSE IT TRAVELS INTO decision.reason,
+-- which hosts branch on and log. Echoing whatever arrived would let a body put
+-- arbitrary text — or a great deal of it — into a caller's control flow and log
+-- lines; a reason this build cannot recognise is reported as the generic one
+-- rather than repeated.
+local function error_envelope_reason(decoded)
+	local reason = decoded.reason
+	if type(reason) == "string" and #reason > 0 and #reason <= MAX_ENTRY
+		and reason:match("^[a-z0-9_]+$") then
+		return reason
+	end
+	return "policy_unavailable"
+end
+
 -- ⚠ STRICT IS BUILT IN ONE PLACE, so no path can invent a partial permissive
 -- result. Every failure comes through here.
 local function strict(reason, detail)
@@ -666,6 +705,17 @@ function M.parse_plan(plan, context, now)
 	-- required to echo the requested locale.
 	if not bounded_string(plan.presented_language, MAX_LANGUAGE) then
 		return nil, "presented_language is missing or over its bound"
+	end
+	-- ⚠ THE BAND IS THE ONLY AGE SHAPE THAT TRAVELS, so its shape is checked
+	-- rather than assumed. validate_context checks the band the CALLER sends;
+	-- nothing checked the one the resolver sends back, so a plan could echo an
+	-- age_band of any shape at all and be used.
+	if plan.age_band ~= nil then
+		local band = plan.age_band
+		if type(band) ~= "table" or not bounded_string(band.vocabulary, MAX_BAND)
+			or not bounded_string(band.band, MAX_BAND) then
+			return nil, "age_band is malformed or over its bound"
+		end
 	end
 	local scope = plan.scope
 	if type(scope) ~= "table" or scope.workspace_id ~= context.workspace_id
@@ -933,41 +983,38 @@ function M.prepare(context, callback)
 			settle(strict("invalid_response", "the response body is empty or over its bound"))
 			return
 		end
-		local shapes_ok, shape_refusal, present = scan_plan_text(body)
-		if not shapes_ok then
-			settle(strict("invalid_response", shape_refusal))
-			return
-		end
 		local decoded_ok, decoded = pcall(json.decode, body)
 		if not decoded_ok or type(decoded) ~= "table" then
 			settle(strict("invalid_response", "the response body is not readable"))
 			return
 		end
+		-- ⚠ THE STATUS DECIDES WHICH DOCUMENT THIS IS, AND IT HAS TO BE ASKED
+		-- FIRST. An error body is an ERROR ENVELOPE, not a plan, so running the
+		-- plan-key allowlist over it refused a perfectly well-formed
+		-- {"reason": ...} for carrying a key that is not a plan field — a
+		-- regression I introduced with the allowlist, which turned every
+		-- resolver refusal into "unreadable" and lost the reason it gave.
 		if response.status < 200 or response.status >= 300 then
-			-- Every error still carries a complete strict plan, so there is
-			-- nothing to synthesise; the reason is reported as the server gave
-			-- it when it is one this build knows.
-			settle(strict(tostring(decoded.reason or "policy_unavailable"), "the resolver refused"))
+			settle(strict(error_envelope_reason(decoded), "the resolver refused"))
 			return
 		end
-		-- ⚠ PRESENT-AND-NULL IS PRESENT. Lua cannot tell `"signature": null`
-		-- from an absent key once decoded, and this build refuses every
-		-- present signature because it cannot verify one — so a response that
-		-- spells the field as null would have been read as unsigned and
-		-- admitted. The raw scan is what still knows.
-		if present.signature and decoded.signature == nil then
-			settle(strict("invalid_response", "the plan carries a signature this build cannot verify"))
+		local shapes_ok, shape_refusal, present = scan_plan_text(body)
+		if not shapes_ok then
+			settle(strict("invalid_response", shape_refusal))
 			return
 		end
-		-- ⚠ PRESENT-AND-NULL IS PRESENT HERE TOO, and for the list fields it is
-		-- worse than for the signature: a null roster of operation blocks
-		-- decodes to the same nil as an absent one, so a plan that explicitly
-		-- says "the blocks are null" read as a plan that simply carries none —
-		-- and those blocks govern transfer, age/capacity, localisation and
-		-- safety, which no consent choice lifts.
-		for name in pairs(LIST_KEYS) do
-			if present[name] and decoded[name] == nil then
-				settle(strict("invalid_response", name .. " is present and null"))
+		-- ⚠ NO FIELD IN THIS SCHEMA IS NULLABLE, AND THAT IS ONE RULE RATHER
+		-- THAN A LIST OF FIELDS. Lua has no null, so every present-and-null key
+		-- decodes to exactly the nil an absent key decodes to — and this module
+		-- reads absence as a meaning everywhere: an absent signature is
+		-- unsigned, an absent objection requirement stands, an absent list is
+		-- no restrictions. Each of those was a separate hole, and patching them
+		-- one at a time is how the next added field arrives with the same one.
+		-- The raw scan knows which keys were present; anything present whose
+		-- decoded value is nil is malformed, whatever it is.
+		for key in pairs(present) do
+			if decoded[key] == nil then
+				settle(strict("invalid_response", key .. " is present and null"))
 				return
 			end
 		end

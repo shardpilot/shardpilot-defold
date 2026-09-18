@@ -32,6 +32,20 @@ local notice_open = false
 local elapsed = 0
 local revalidate_at = nil
 
+-- ⚠ A VERDICT WITH NO LIFE IS NOT RUNNABLE, and scheduling by it directly is a
+-- spin. max_age_seconds = 0 means "do not reuse this": it authorises the one
+-- answer and nothing after it, so valid_for_seconds is 0 and there is no
+-- window in which a lane could run. Re-resolving every frame is a flood
+-- against the resolver dressed up as diligence, so the retry is bounded and
+-- backs off.
+local MIN_REVALIDATE_SECONDS = 30
+local MAX_REVALIDATE_SECONDS = 300
+local revalidate_backoff = MIN_REVALIDATE_SECONDS
+
+-- A consent write that failed is OWED. Until it lands, the session has not
+-- started and the answer is still pending.
+local consent_pending = false
+
 -- Where this example parks a remote-config value; your game reads it wherever
 -- it needs the tuned number.
 local spawn_rate = 1.0
@@ -106,8 +120,13 @@ end
 -- set_consent again would re-persist a decision nobody made twice and enqueue
 -- a second receipt for it — a policy suspension would show up in the consent
 -- trail as a player changing their mind.
+-- Returns whether the fresh answer was CONSUMED — false means the write is
+-- owed and the caller must keep it pending.
 local function start_analytics(granted, decision, newly_answered)
-	shardpilot.init({
+	-- ⚠ init CAN FAIL, and a lane marked running on a client that was never
+	-- built is a lane final() will try to shut down and update() will try to
+	-- drive.
+	local started_ok, start_err = shardpilot.init({
 		ingest_url = "http://localhost:8080",
 		workspace_id = "workspace-example",
 		app_id = "app-example",
@@ -121,10 +140,14 @@ local function start_analytics(granted, decision, newly_answered)
 		remote_config_url = "http://localhost:8081",
 		api_key = "sp_ingest_publishable_placeholder",
 	})
+	if not started_ok then
+		print("shardpilot init failed: " .. tostring(start_err))
+		return false
+	end
 	shardpilot.identify("user-example")
+	analytics_running = true
 	if not newly_answered then
-		analytics_running = true
-		return
+		return true
 	end
 	-- Each explicit decision posts a consent receipt kept in a durable outbox
 	-- until the server acknowledges it, so a decision made offline still
@@ -132,11 +155,20 @@ local function start_analytics(granted, decision, newly_answered)
 	-- way — or set_consent("denied_forced_minor") when your age gate forces it
 	-- (feature-detect with
 	-- shardpilot.supports("consent_state_denied_forced_minor")).
-	shardpilot.set_consent(granted)
+	-- ⚠ set_consent CAN FAIL TOO — a full consent outbox, a failed durable
+	-- write. Starting the session anyway would emit events under a grant that
+	-- was never recorded, which is the one ordering the consent outbox exists
+	-- to prevent. The answer stays pending and is retried on the next trigger.
+	local recorded, consent_err = shardpilot.set_consent(granted)
+	if not recorded then
+		print("shardpilot consent not recorded: " .. tostring(consent_err) .. "; owed")
+		consent_pending = true
+		return false
+	end
+	consent_pending = false
 	if granted then
 		shardpilot.session_start()
 	end
-	analytics_running = true
 
 	-- Remote config: fetch explicitly (the SDK never fetches on its own).
 	-- Getters serve the durable last-known-good snapshot immediately —
@@ -148,6 +180,7 @@ local function start_analytics(granted, decision, newly_answered)
 		end
 	end)
 	spawn_rate = shardpilot.remote_config_number("spawn_rate", 1.0)
+	return true
 end
 
 local function start_crash()
@@ -180,6 +213,20 @@ end
 -- new decision permits still needs an answer, and a resume that could open a
 -- lane would be a grant issued by a focus event.
 reconcile = function(fresh)
+	-- A consent write that failed is owed; retry it before anything else.
+	if consent_pending and analytics_running and answered then
+		local recorded, consent_err = shardpilot.set_consent(answered.granted)
+		if recorded then
+			consent_pending = false
+			answered.fresh_answer = nil
+			if answered.granted then
+				shardpilot.session_start()
+			end
+		else
+			print("shardpilot consent still not recorded: " .. tostring(consent_err))
+		end
+	end
+
 	print("shardpilot consent regime: " .. tostring(fresh.regime) ..
 		(fresh.plan_used and "" or " (strict fallback: " .. tostring(fresh.reason) .. ")"))
 
@@ -214,6 +261,15 @@ reconcile = function(fresh)
 
 	-- (c) The plan's own life. A fallback carries no validity and schedules
 	-- nothing: it established nothing that could expire.
+	if fresh.valid_for_seconds and fresh.valid_for_seconds <= 0 then
+		print("shardpilot: the verdict has no validity window; no lane started")
+		suspend_analytics("no_validity_window")
+		suspend_crash("no_validity_window")
+		revalidate_at = elapsed + revalidate_backoff
+		revalidate_backoff = math.min(revalidate_backoff * 2, MAX_REVALIDATE_SECONDS)
+		return
+	end
+	revalidate_backoff = MIN_REVALIDATE_SECONDS
 	revalidate_at = fresh.valid_for_seconds and (elapsed + fresh.valid_for_seconds) or nil
 
 	-- (d) The ANALYTICS lane. Nothing is ASKED when the regime closes optional
@@ -221,8 +277,9 @@ reconcile = function(fresh)
 	-- answer is discarded would be worse than not asking.
 	if not fresh.optional_processing_closed and not analytics_running then
 		if answered then
-			start_analytics(answered.granted, fresh, answered.fresh_answer == true)
-			answered.fresh_answer = nil
+			if start_analytics(answered.granted, fresh, answered.fresh_answer == true) then
+				answered.fresh_answer = nil
+			end
 		elseif not notice_open then
 			notice_open = true
 			present_consent_notice(fresh, function(granted)

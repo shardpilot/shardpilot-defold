@@ -174,6 +174,9 @@ local crash = require "shardpilot.crash"
 
 -- Lifecycle state: an initialised client that has not been shut down.
 local analytics_running, crash_running = false, false
+local consent_pending = false -- a consent write that failed is OWED
+-- A verdict with no life is not runnable; the retry is bounded and backs off.
+local MIN_REVALIDATE, MAX_REVALIDATE, revalidate_backoff = 30, 300, 30
 -- The standing answer and the notice text it was given against. It survives a
 -- suspension; it is discarded only when the text or language changes.
 local answered, notice_open = nil, false
@@ -218,8 +221,13 @@ end
 -- back, so calling set_consent again re-persists a decision nobody made twice
 -- and enqueues a second receipt — a policy change appearing in the consent
 -- trail as a player changing their mind.
+-- Returns whether the fresh answer was CONSUMED; false means the write is owed.
 local function start_analytics(granted, newly_answered)
-  shardpilot.init({
+  -- init and set_consent BOTH return false, err. A lane marked running on a
+  -- client that was never built is one final() will try to shut down; a session
+  -- started on a grant that was never recorded is the ordering the consent
+  -- outbox exists to prevent.
+  local started_ok, start_err = shardpilot.init({
     ingest_url = "http://localhost:8080",
     workspace_id = "workspace-example",
     app_id = "app-example",
@@ -229,15 +237,26 @@ local function start_analytics(granted, newly_answered)
       callback("client-token-placeholder", nil, nil)
     end,
   })
+  if not started_ok then
+    print("shardpilot init failed: " .. tostring(start_err))
+    return false
+  end
   shardpilot.identify("user-example")
   analytics_running = true
   if not newly_answered then
-    return
+    return true
   end
-  shardpilot.set_consent(granted) -- a DECLINE is recorded the same way
+  local recorded, consent_err = shardpilot.set_consent(granted) -- a DECLINE is recorded the same way
+  if not recorded then
+    print("shardpilot consent not recorded: " .. tostring(consent_err) .. "; owed")
+    consent_pending = true
+    return false
+  end
+  consent_pending = false
   if granted then
     shardpilot.session_start()
   end
+  return true
 end
 
 local function start_crash()
@@ -260,6 +279,15 @@ end
 -- ⚠ THE ONE PATH. It CLOSES on its own authority and OPENS only on the
 -- player's: a lane the new decision permits still needs an answer.
 reconcile = function(fresh)
+  -- An owed consent write is retried before anything else.
+  if consent_pending and analytics_running and answered then
+    local recorded = shardpilot.set_consent(answered.granted)
+    if recorded then
+      consent_pending, answered.fresh_answer = false, nil
+      if answered.granted then shardpilot.session_start() end
+    end
+  end
+
   -- (a) A changed notice text means the running grant belongs to a notice this
   -- player never saw. Only a PLAN can change it: a fallback carries no
   -- consent_text_version, so comparing against one would read every outage as
@@ -281,14 +309,26 @@ reconcile = function(fresh)
 
   -- (c) The plan's own life. Cache expiry protects the next lookup and stops
   -- nothing that is already running. A fallback carries no validity.
+  -- valid_for_seconds == 0 means "do not reuse this": there is no window in
+  -- which a lane could run, and scheduling by it directly re-resolves every
+  -- frame.
+  if fresh.valid_for_seconds and fresh.valid_for_seconds <= 0 then
+    suspend_analytics("no_validity_window")
+    suspend_crash()
+    revalidate_at = elapsed + revalidate_backoff
+    revalidate_backoff = math.min(revalidate_backoff * 2, MAX_REVALIDATE)
+    return
+  end
+  revalidate_backoff = MIN_REVALIDATE
   revalidate_at = fresh.valid_for_seconds and (elapsed + fresh.valid_for_seconds) or nil
 
   -- (d) Analytics. NOTHING IS ASKED when the regime closes optional
   -- processing: there is nothing a player could grant.
   if not fresh.optional_processing_closed and not analytics_running then
     if answered then
-      start_analytics(answered.granted, answered.fresh_answer == true)
-      answered.fresh_answer = nil
+      if start_analytics(answered.granted, answered.fresh_answer == true) then
+        answered.fresh_answer = nil
+      end
     elseif not notice_open then
       notice_open = true
       present_consent_notice(fresh, function(granted)
