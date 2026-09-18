@@ -170,6 +170,111 @@ local function parse_timestamp(value)
 	return days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec - offset
 end
 
+-- ⚠ COPIED VERBATIM FROM client.lua, NOT REQUIRED FROM IT. The endpoint obeys
+-- the SAME rule as ingest_url and crash_ingest_url — https anywhere, http only
+-- for a loopback host, no userinfo, no query, no fragment, no path beyond a
+-- single trailing slash — and there is exactly one way for this module to obey
+-- it: copy the predicate. Requiring shardpilot.client would pull in storage and
+-- id, creating the persisted scope record and minting an anonymous identifier,
+-- which is the one thing this module exists not to do.
+--
+-- The function keeps the original's NAME so the copy is byte-for-byte and a
+-- test can compare the two texts. A duplicated rule that drifts is worse than
+-- one that was never shared, so the drift is what the test watches.
+-- BEGIN COPY FROM client.lua
+local function local_http_host(host)
+	return host == "localhost" or host == "127.0.0.1" or host == "::1"
+end
+
+local function parse_authority(authority)
+	if authority == "" or authority:find("@", 1, true) then
+		return nil
+	end
+	local host = nil
+	if authority:sub(1, 1) == "[" then
+		local rest = nil
+		host, rest = authority:match("^%[([^%]]+)%](.*)$")
+		if not host then
+			return nil
+		end
+		if rest ~= "" and not rest:match("^:%d+$") then
+			return nil
+		end
+	else
+		local colon = authority:find(":", 1, true)
+		if colon then
+			host = authority:sub(1, colon - 1)
+			local port = authority:sub(colon + 1)
+			if port == "" or not port:match("^%d+$") then
+				return nil
+			end
+		else
+			host = authority
+		end
+		if host:find(":", 1, true) then
+			return nil
+		end
+	end
+	if not host or host == "" or host:match("%s") then
+		return nil
+	end
+	return host
+end
+
+local function valid_ingest_url(value)
+	if type(value) ~= "string" or value == "" then
+		return false
+	end
+	if value:find("?", 1, true) or value:find("#", 1, true) then
+		return false
+	end
+	local scheme, rest = value:match("^(https?)://(.+)$")
+	if not scheme then
+		return false
+	end
+	local authority = rest
+	local path = nil
+	local slash = rest:find("/", 1, true)
+	if slash then
+		authority = rest:sub(1, slash - 1)
+		path = rest:sub(slash)
+	end
+	if path and path ~= "/" then
+		return false
+	end
+	local host = parse_authority(authority or "")
+	if not host then
+		return false
+	end
+	if scheme == "https" then
+		return true
+	end
+	return local_http_host(host)
+end
+-- END COPY FROM client.lua
+
+local function trim_slash(value)
+	return (value:gsub("/+$", ""))
+end
+
+-- Depth-bounded copy, the same shape the remote-config and experiments caches
+-- use, so a decision handed to game code can be mutated freely without
+-- corrupting the entry the next prepare serves. Decisions are acyclic; the cap
+-- only bounds the walk.
+local function copy_value(value, depth)
+	if type(value) ~= "table" then
+		return value
+	end
+	if depth >= 16 then
+		return nil
+	end
+	local out = {}
+	for key, child in pairs(value) do
+		out[key] = copy_value(child, depth + 1)
+	end
+	return out
+end
+
 -- ⚠ THE CACHE KEY IS THE WHOLE CONTEXT. One in-memory entry is shared by
 -- every caller in the process, and serving it on liveness alone applied one
 -- app's, environment's or endpoint's plan to another — past the scope check
@@ -246,11 +351,13 @@ function M.validate_context(context)
 	if not bounded_string(context.endpoint, MAX_ENDPOINT) then
 		return false, "endpoint is missing or over its bound"
 	end
-	if context.endpoint:match("^https?://[^%s]+$") == nil then
-		return false, "endpoint is not an http(s) base URL"
-	end
-	if context.endpoint:sub(-1) == "/" then
-		return false, "endpoint must not end in a slash; the route is appended to it"
+	-- ⚠ AND PLAIN http OFF LOOPBACK IS REFUSED, by the SDK's own predicate
+	-- rather than by a second opinion. A consent-regime request carries this
+	-- app's scope and this player's locale and age band; sending that in the
+	-- clear to a remote host is the kind of exception nobody revisits. An
+	-- earlier cut here accepted any `^https?://`, which is exactly that hole.
+	if not valid_ingest_url(context.endpoint) then
+		return false, "endpoint must be https, or http only for a loopback host"
 	end
 	if context.store ~= nil and not STORES[context.store] then
 		return false, "store is not one of the permitted kinds"
@@ -347,9 +454,18 @@ function M.parse_plan(plan, context, now)
 			if type(signal) ~= "table" or not bounded_string(signal.name, MAX_ENTRY) then
 				return nil, "a signal is malformed"
 			end
+			-- ⚠ available IS A BOOLEAN OR THE PLAN IS MALFORMED, the same rule
+			-- the objection field gets. `available ~= true` quietly folded the
+			-- string "yes", the number 0 and an absent key into "unavailable" —
+			-- an answer the resolver never gave, written into the provenance
+			-- record as though it had. Unreadable and unavailable are different
+			-- facts and this record exists to keep them apart.
+			if type(signal.available) ~= "boolean" then
+				return nil, "a signal does not state whether it was available"
+			end
 			-- An unavailable signal must say WHY, from the closed vocabulary. A
 			-- bare "not available" is the shape that hides a prohibited source.
-			if signal.available ~= true and not SIGNAL_REASONS[signal.reason] then
+			if not signal.available and not SIGNAL_REASONS[signal.reason] then
 				return nil, "an unavailable signal carries no known reason"
 			end
 		end
@@ -456,7 +572,11 @@ function M.prepare(context, callback)
 
 	local key = context_key(context)
 	if cached and cached.key == key and cached.until_at > at then
-		callback(cached.decision)
+		-- ⚠ A COPY, NOT THE ENTRY. The cache used to hand out the very table it
+		-- kept, so a caller that wrote a field on the decision it was given —
+		-- or that read prohibited_purposes and sorted it in place — edited what
+		-- every later prepare would serve for the next five minutes.
+		callback(copy_value(cached.decision, 0))
 		return
 	end
 
@@ -490,7 +610,7 @@ function M.prepare(context, callback)
 		callback(decision)
 	end
 
-	http.request(context.endpoint .. ROUTE, "POST", function(_, _, response)
+	http.request(trim_slash(context.endpoint) .. ROUTE, "POST", function(_, _, response)
 		local arrived = now_seconds()
 		if not arrived then
 			settle(strict("clock_unavailable", "no clock is available to evaluate the plan's expiry"))
@@ -549,7 +669,9 @@ function M.prepare(context, callback)
 			lifetime = plan.max_age_seconds
 		end
 		if lifetime > 0 then
-			cached = { key = key, decision = decision, until_at = arrived + lifetime }
+			-- The entry gets its OWN copy too, so the table delivered below and
+			-- the table kept here are never the same object.
+			cached = { key = key, decision = copy_value(decision, 0), until_at = arrived + lifetime }
 		else
 			-- max_age_seconds = 0 says "do not reuse this". The plan is still
 			-- live for this one answer; it is simply not cacheable.

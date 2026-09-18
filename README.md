@@ -176,7 +176,12 @@ Minimal Defold script (see [`examples/minimal/`](examples/minimal)):
 > whatever the player answers — you still have to ask them. When the resolver
 > is unreachable or answers something this build will not accept, the callback
 > receives the strict fallback (`plan_used = false`), which tightens and never
-> relaxes. See [Consent regime](#consent-regime).
+> relaxes. **Branch on the decision** — `optional_processing_closed` means
+> there is nothing to grant, so nothing is asked and the SDK is not started;
+> `crash_profile` decides the crash lane on its own, and crash reporting is ON
+> by default, so an unconditional `crash.init` is how a closed lane gets
+> opened; `server_analytics` gates only your backend's lane. See
+> [Consent regime](#consent-regime).
 
 ```lua
 local consent_policy = require "shardpilot.consent_policy"
@@ -185,36 +190,58 @@ local shardpilot = require "shardpilot.sdk"
 
 local started = false
 
-local function start_shardpilot(decision)
+local function on_decision(decision)
   print("consent regime: " .. tostring(decision.regime))
-  shardpilot.init({
-    ingest_url = "http://localhost:8080",
-    workspace_id = "workspace-example",
-    app_id = "app-example",
-    environment_id = "develop",
-    -- Auth: configure exactly one of token_provider (Mode B) or api_key (Mode A).
-    token_provider = function(callback)
-      callback("client-token-placeholder", nil, nil)
-    end,
-    -- api_key = "sp_ingest_...", -- Mode A alternative (publishable key)
-  })
-  shardpilot.identify("user-example")
-  -- Consent-first: NOTHING transmits until an explicit grant. Wire this to
-  -- your consent UX; while consent is undecided every track/session call
-  -- returns false, "consent_unknown" and the event is dropped, not held.
-  shardpilot.set_consent(true)   -- analytics consent: granted
-  shardpilot.session_start()     -- emits app.session_started
-  shardpilot.screen_view("menu") -- emits app.screen_view
-  shardpilot.track("play_cta_click", { cta_source = "main_menu" })
-  started = true
+
+  -- ⚠ EACH LANE BRANCHES ON ITS OWN FIELD. The flags are orthogonal: analytics
+  -- being closed does not close the crash lane, and a permitted crash lane
+  -- does not open analytics.
+  if decision.optional_processing_closed then
+    -- Nothing a player could grant, so nothing is asked — and the SDK is not
+    -- initialised at all, because init builds the client, which loads the
+    -- persisted scope record and mints an anonymous identifier.
+    print("optional processing is closed by this regime; analytics not started")
+  else
+    present_consent_notice(decision, function(granted)  -- your consent UI
+      shardpilot.init({
+        ingest_url = "http://localhost:8080",
+        workspace_id = "workspace-example",
+        app_id = "app-example",
+        environment_id = "develop",
+        -- Auth: configure exactly one of token_provider (Mode B) or api_key (Mode A).
+        token_provider = function(callback)
+          callback("client-token-placeholder", nil, nil)
+        end,
+        -- api_key = "sp_ingest_...", -- Mode A alternative (publishable key)
+      })
+      shardpilot.identify("user-example")
+      shardpilot.set_consent(granted) -- a DECLINE is recorded the same way
+      if granted then
+        shardpilot.session_start()     -- emits app.session_started
+        shardpilot.screen_view("menu") -- emits app.screen_view
+      end
+      started = true
+    end)
+  end
+
+  -- The crash lane, decided separately. Crash reporting is ON by default, so
+  -- leaving crash.init unconditional is how a closed lane gets opened.
+  if decision.crash_profile == consent_policy.CRASH_MINIMAL then
+    crash.init({ --[[ see docs/crash.md ]] })
+  end
+
+  -- Server-side analytics is a BASIS, not a toggle. If your backend sends on
+  -- it, gate that on decision.server_analytics == SERVER_ANALYTICS_ELIGIBLE
+  -- and honour decision.server_analytics_objection_required out of band.
 end
 
 function init(self)
   -- The policy endpoint is a third service of its own, separate from
-  -- ingest_url and remote_config_url. platform.detect() folds this system's
-  -- name into the closed vocabulary the policy accepts; an unmappable system
-  -- is refused locally, without a request leaving the device, and the
-  -- callback receives the strict decision.
+  -- ingest_url and remote_config_url, and it obeys the same URL rule they do:
+  -- https anywhere, http only for a loopback host. platform.detect() folds
+  -- this system's name into the closed vocabulary the policy accepts; an
+  -- unmappable system is refused locally, without a request leaving the
+  -- device, and the callback receives the strict decision.
   consent_policy.prepare({
     endpoint = "http://localhost:8082",
     workspace_id = "workspace-example",
@@ -223,7 +250,7 @@ function init(self)
     app_version = "1.0.0",
     locale = "en",
     platform = platform.detect(),
-  }, start_shardpilot)
+  }, on_decision)
 end
 
 function update(self, dt)
@@ -964,8 +991,9 @@ consent_policy.prepare(context, function(decision) ... end)
 ```
 
 `context` is validated locally before anything is sent, and a value outside
-its closed vocabulary **costs no request**: `endpoint` (an `http(s)` base URL
-with no trailing slash), `workspace_id`, `app_id`, `environment_id`,
+its closed vocabulary **costs no request**: `endpoint` (the same URL rule
+`ingest_url` and `crash_ingest_url` obey — **https anywhere, plain http only
+for a loopback host**, no userinfo, query, fragment or path), `workspace_id`, `app_id`, `environment_id`,
 `app_version`, `locale`, `platform` (use `platform.detect()`), and optionally
 `store` and `age_band`. `store_region` is **not accepted** in this release: a
 non-null value carries a country claim, and refusing it here is what stops it

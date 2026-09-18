@@ -629,7 +629,18 @@ end
 local function test_an_invalid_endpoint_is_an_invalid_request()
 	for _, override in ipairs({
 		{ endpoint = "__nil__" }, { endpoint = 8080 }, { endpoint = "policy.example" },
-		{ endpoint = "https://policy.example/" }, { endpoint = "https://" .. string.rep("h", 300) },
+		{ endpoint = "https://" .. string.rep("h", 300) },
+		-- ⚠ PLAIN http OFF LOOPBACK. The request carries this app's scope and
+		-- this player's locale and age band; in the clear to a remote host is
+		-- not a development convenience.
+		{ endpoint = "http://policy.example" },
+		{ endpoint = "http://198.51.100.7:8082" },
+		-- The rest of the SDK's URL rule, which the copied predicate brings
+		-- with it: no userinfo, no query, no fragment, no path.
+		{ endpoint = "https://user@policy.example" },
+		{ endpoint = "https://policy.example?a=1" },
+		{ endpoint = "https://policy.example#f" },
+		{ endpoint = "https://policy.example/v2" },
 	}) do
 		reset()
 		next_response_body = plan()
@@ -639,6 +650,105 @@ local function test_an_invalid_endpoint_is_an_invalid_request()
 		assert_equal(decision.reason, "invalid_request")
 		assert_true(decision.optional_processing_closed, "and the verdict is closed")
 	end
+
+	-- The controls: https anywhere, http on loopback, and a single trailing
+	-- slash accepted and trimmed rather than refused — the SAME verdicts the
+	-- SDK gives ingest_url and crash_ingest_url, which is the point of copying
+	-- its predicate instead of writing a second opinion.
+	for _, endpoint in ipairs({
+		"https://policy.example", "https://policy.example/", "https://policy.example:8443",
+		"http://localhost:8082", "http://127.0.0.1:8082", "http://[::1]:8082",
+	}) do
+		reset()
+		next_response_body = plan()
+		local decision = prepare(context({ endpoint = endpoint }))
+		assert_true(decision.plan_used, endpoint .. " must be accepted: " .. tostring(decision.reason))
+		assert_equal(#requests, 1, endpoint .. " must reach the wire")
+		assert_true(requests[1].url:find("//api/cp", 1, true) == nil,
+			"a trailing slash must be trimmed, not doubled: " .. requests[1].url)
+	end
+end
+
+-- ⚠ THE URL PREDICATE IS A COPY, AND A COPY THAT DRIFTS IS WORSE THAN NO
+-- SHARING AT ALL. consent_policy cannot require shardpilot.client — that would
+-- pull in storage and id, creating the persisted scope record and minting an
+-- anonymous identifier before the player has chosen anything — so the rule is
+-- duplicated on purpose. This asserts the duplicate is still byte-for-byte the
+-- original.
+--
+-- HONEST LIMIT: it compares TEXT. It catches the copy falling behind an edit to
+-- client.lua; it cannot catch a divergence introduced somewhere else in either
+-- module.
+local function test_the_url_predicate_is_a_verbatim_copy()
+	local client = io.open("shardpilot/client.lua"):read("*a")
+	local policy = io.open("shardpilot/consent_policy.lua"):read("*a")
+	local first = client:find("local function local_http_host(host)", 1, true)
+	local last = client:find("local max_snapshot_depth = 4", 1, true)
+	assert_true(first ~= nil and last ~= nil and last > first,
+		"client.lua no longer has the predicate this copy was taken from")
+	local original = client:sub(first, last - 1):gsub("%s+$", "")
+	assert_true(policy:find(original, 1, true) ~= nil,
+		"consent_policy.lua no longer carries client.lua's URL predicate verbatim; " ..
+		"re-copy it rather than letting the two rules drift")
+end
+
+-- ⚠ available IS A BOOLEAN OR THE PLAN IS MALFORMED. `available ~= true`
+-- folded a string, a number and an absent key into "unavailable" — an answer
+-- the resolver never gave, written into the provenance record as though it had.
+local function test_a_signal_must_state_its_availability_as_a_boolean()
+	for _, signal in ipairs({
+		{ name = "server_country", reason = "not_enabled_in_release" },
+		{ name = "server_country", available = "false", reason = "not_enabled_in_release" },
+		{ name = "server_country", available = 0, reason = "not_enabled_in_release" },
+		{ name = "server_country", available = "true" },
+	}) do
+		reset()
+		next_response_body = plan({ signals_used = { signal } })
+		local decision = prepare()
+		assert_true(not decision.plan_used, "a signal that does not state a boolean must not be used")
+		assert_true(decision.optional_processing_closed, "and the verdict is closed")
+	end
+
+	-- The controls: a stated false WITH a reason and a stated true WITHOUT one
+	-- both parse, or the rule would be satisfied by a parser that refuses every
+	-- signal.
+	reset()
+	next_response_body = plan({ signals_used = { { name = "server_country", available = false, reason = "source_unavailable" } } })
+	assert_true(prepare().plan_used, "a stated false with a reason must parse")
+	reset()
+	next_response_body = plan({ signals_used = { { name = "server_country", available = true } } })
+	assert_true(prepare().plan_used, "a stated true must parse")
+end
+
+-- ⚠ THE CALLER GETS A COPY, NOT THE CACHE ENTRY. The same table was handed to
+-- every caller and kept as the entry, so a caller that wrote a field on its
+-- decision — or sorted prohibited_purposes in place — edited what the next five
+-- minutes of prepare calls would serve.
+local function test_a_returned_decision_is_a_copy()
+	reset()
+	next_response_body = plan({ operation_blocks = { "transfer_review" }, prohibited_purposes = { "advertising" } })
+	local first = prepare()
+	assert_equal(first.operation_blocks[1], "transfer_review", "the fixture must carry a block")
+
+	-- Mutate everything a caller could reach.
+	first.regime = "PERMISSIVE"
+	first.optional_processing_closed = false
+	first.server_analytics_objection_required = false
+	first.operation_blocks[1] = "removed"
+	first.prohibited_purposes[1] = "removed"
+
+	local second = prepare()
+	assert_equal(#requests, 1, "the second call must be served from the cache, or this proves nothing")
+	assert_equal(second.regime, consent_policy.STRICT_OPT_IN, "a caller mutated the cached regime")
+	assert_true(second.optional_processing_closed, "a caller reopened optional processing in the cache")
+	assert_true(second.server_analytics_objection_required, "a caller lifted the cached objection requirement")
+	assert_equal(second.operation_blocks[1], "transfer_review", "a caller mutated the cached block list")
+	assert_equal(second.prohibited_purposes[1], "advertising", "a caller mutated the cached purpose list")
+
+	-- And two cache hits do not share an array with each other either.
+	second.operation_blocks[1] = "removed"
+	local third = prepare()
+	assert_equal(third.operation_blocks[1], "transfer_review", "two cache hits shared one array")
 end
 
 -- ⚠ AN EMPTY SIGNATURE IS STILL A SIGNATURE. Treating "" as absence is a
@@ -651,6 +761,138 @@ local function test_an_empty_signature_is_still_a_signature()
 	assert_true(not decision.plan_used, "an empty signature is not an absent one")
 	assert_equal(decision.regime, consent_policy.STRICT_OPT_IN, "it takes the strict path")
 	assert_true(decision.optional_processing_closed, "and closes optional processing")
+end
+
+-- ⚠ THE PUBLISHED EXAMPLE IS PART OF THE CONTRACT, AND IT IS RUN HERE RATHER
+-- THAN READ. An earlier cut logged the regime and then called set_consent(true),
+-- started a session and initialised default-on crash reporting regardless —
+-- "we asked, and then ignored the answer". The example is the integration path
+-- users copy, so the branches are exercised headlessly: the SDK modules are
+-- replaced in package.loaded and the chunk is loaded, which defines init().
+local function run_example()
+	local seen = {}
+	local function record(name)
+		return function(...)
+			seen[#seen + 1] = name
+			return ...
+		end
+	end
+	local saved = {}
+	for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform" }) do
+		saved[name] = package.loaded[name]
+	end
+	package.loaded["shardpilot.sdk"] = {
+		init = record("sdk.init"),
+		identify = record("sdk.identify"),
+		set_consent = function(value)
+			seen[#seen + 1] = "sdk.set_consent:" .. tostring(value)
+		end,
+		session_start = record("sdk.session_start"),
+		fetch_remote_config = function(callback)
+			seen[#seen + 1] = "sdk.fetch_remote_config"
+			callback({ ok = true })
+		end,
+		remote_config_number = function(_, default)
+			return default
+		end,
+		update = function() end,
+		persist = function() end,
+		shutdown = function()
+			return true
+		end,
+	}
+	package.loaded["shardpilot.crash"] = {
+		init = record("crash.init"),
+		shutdown = function()
+			return true
+		end,
+	}
+	package.loaded["shardpilot.platform"] = { detect = function() return "windows" end }
+
+	-- The example's own print() is the only place it reports the decision, so
+	-- it is captured rather than left on stdout: it is what tells this scene
+	-- the plan was USED, not merely that the branches were taken.
+	local saved_print = print
+	print = function(...)
+		local parts = {}
+		for i = 1, select("#", ...) do
+			parts[#parts + 1] = tostring((select(i, ...)))
+		end
+		seen[#seen + 1] = "print:" .. table.concat(parts, " ")
+	end
+
+	local ok, err = pcall(function()
+		local chunk = assert(loadfile("examples/minimal/main.script"))
+		chunk()
+		init(nil)
+	end)
+
+	print = saved_print
+	for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform" }) do
+		package.loaded[name] = saved[name]
+	end
+	assert_true(ok, "the example must run: " .. tostring(err))
+	return table.concat(seen, " | ")
+end
+
+-- The example's own context, so the fixture's plan is IN SCOPE for it. Without
+-- this every scene below would be reading a scope-mismatch fallback and would
+-- pass for the wrong reason — which is what the first draft did.
+local function example_plan(overrides)
+	local body = overrides or {}
+	body.scope = {
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+	}
+	return plan(body)
+end
+
+local function test_the_published_example_branches_on_the_decision()
+	-- (a) The regime this release actually emits: STRICT, crash OFF, server
+	-- analytics DENIED. Nothing may be granted, so nothing is initialised.
+	reset()
+	next_response_body = example_plan()
+	local calls = run_example()
+	-- ⚠ THE CONTROL FIRST: the example must have USED the plan. Otherwise it is
+	-- reading a strict fallback and every assertion below is satisfied by a
+	-- refusal rather than by a branch.
+	assert_true(calls:find("consent regime: STRICT_OPT_IN", 1, true) ~= nil,
+		"the example must report the plan's regime: " .. calls)
+	assert_true(calls:find("strict fallback", 1, true) == nil,
+		"the example read a fallback, not the fixture's plan: " .. calls)
+	assert_true(calls:find("sdk.init", 1, true) == nil,
+		"a closed lane must not initialise the SDK (identity + spool): " .. calls)
+	assert_true(calls:find("set_consent:true", 1, true) == nil,
+		"the example granted consent under a closed regime: " .. calls)
+	assert_true(calls:find("sdk.session_start", 1, true) == nil,
+		"the example started a session under a closed regime: " .. calls)
+	assert_true(calls:find("crash.init", 1, true) == nil,
+		"the example enabled default-on crash reporting under crash_profile OFF: " .. calls)
+
+	-- (b) The CRASH lane is decided separately, so a permitted crash profile
+	-- opens it even though analytics stays closed. Without this the assertions
+	-- above would be satisfied by an example that does nothing at all.
+	reset()
+	next_response_body = example_plan({ crash_profile = consent_policy.CRASH_MINIMAL })
+	calls = run_example()
+	assert_true(calls:find("crash.init", 1, true) ~= nil,
+		"a permitted crash profile must open the crash lane: " .. calls)
+	assert_true(calls:find("sdk.init", 1, true) == nil,
+		"and it must not open analytics: " .. calls)
+
+	-- (c) An OPEN optional lane reaches the consent UI, and the example's
+	-- placeholder declines — so the SDK is initialised and the DECLINE is
+	-- recorded, which is the documented path, and no session starts.
+	reset()
+	next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT })
+	calls = run_example()
+	assert_true(calls:find("sdk.init", 1, true) ~= nil,
+		"an open lane must reach the SDK once the player has answered: " .. calls)
+	assert_true(calls:find("set_consent:false", 1, true) ~= nil,
+		"a declined answer must be recorded, not dropped: " .. calls)
+	assert_true(calls:find("sdk.session_start", 1, true) == nil,
+		"a decline must not start a session: " .. calls)
 end
 
 local tests = {
@@ -669,6 +911,10 @@ local tests = {
 	test_the_cache_is_scoped_to_the_whole_context,
 	test_an_invalid_endpoint_is_an_invalid_request,
 	test_an_empty_signature_is_still_a_signature,
+	test_the_url_predicate_is_a_verbatim_copy,
+	test_a_signal_must_state_its_availability_as_a_boolean,
+	test_a_returned_decision_is_a_copy,
+	test_the_published_example_branches_on_the_decision,
 }
 
 for _, test in ipairs(tests) do
