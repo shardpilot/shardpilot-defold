@@ -36,8 +36,23 @@ return function(c)
 	}))
 	stage("consent")
 	assert(client:set_consent(true))
+	-- EVERY analytics fact rides a session this sender opened. Without an
+	-- explicit start the first track opens one lazily (client.lua:3120-3126 —
+	-- a fresh id, sequence 0, active) whose app.session_started never reaches
+	-- the wire, so the facts carry a session id that no start in the log
+	-- explains. The lifecycle gets its own exchanges because `single` must
+	-- carry exactly one event and `mixed-size` exactly two for any reader that
+	-- counts verdicts per case.
+	stage("session-open")
+	assert(client:session_start({ entry_point = "synthetic_sender_open" }))
+	assert(client:flush({ include_summaries = false }))
 	stage("single")
 	assert(client:track(c.event_name, {}))
+	assert(client:flush({ include_summaries = false }))
+	-- Ended explicitly rather than replaced: the next session_start would renew
+	-- the session and leave this one with a start and no end.
+	stage("session-close")
+	assert(client:session_end("finished"))
 	assert(client:flush({ include_summaries = false }))
 	-- Two synthetic sessions, each with a start and an end, in ONE batch:
 	-- session_start resets the per-session sequence, so each session carries
@@ -47,6 +62,13 @@ return function(c)
 	assert(client:session_end("completed"))
 	assert(client:session_start({ entry_point = "synthetic_sender_second" }))
 	assert(client:session_end("backgrounded"))
+	assert(client:flush({ include_summaries = false }))
+	-- realistic-batch left its second session ENDED, and session_end keeps the
+	-- id while clearing session_active (client.lua:2790-2794), so tracking here
+	-- would land facts on an ended session id with its sequence running on.
+	-- Begin a fresh session for the remaining analytics cases.
+	stage("session-resume")
+	assert(client:session_start({ entry_point = "synthetic_sender_resume" }))
 	assert(client:flush({ include_summaries = false }))
 	stage("mixed-size")
 	assert(client:track(c.event_name, {}))
@@ -92,6 +114,11 @@ return function(c)
 	-- therefore REPORTS the owed retry rather than taking it, and the run ends:
 	-- spool_enabled is false, so nothing durable survives the process and the
 	-- obligation cannot reach a later run.
+	-- The resumed session is deliberately left OPEN: ending it would need a
+	-- flush after the probe below, and that flush would re-attempt the batch
+	-- the SDK retains for its Mode B retry — a second attempt at a case that
+	-- allows one. A game process that exits without a shutdown leaves its
+	-- session open the same way.
 	stage("unauthenticated")
 	assert(client:track(c.event_name, { synthetic_admission_probe = true }))
 	local published, publish_err = client:flush({ include_summaries = false })

@@ -86,14 +86,20 @@ Exact run command, without a pipe:
 .venv-evidence-sender/bin/python examples/evidence-sender/send.py
 ```
 
-The run is **ten exchanges, one HTTP attempt each**, named with the Go protocol
-witness's case names so one aggregate checker reads either sender's log:
+The run is **thirteen exchanges, one HTTP attempt each**, named with the Go
+protocol witness's case names so one aggregate checker reads either sender's
+log. Three of them carry only session lifecycle events: a counted case must
+carry exactly the events a reader expects verdicts for, so the housekeeping
+cannot ride with them.
 
 | Case | What the SDK does | Go witness case |
 | --- | --- | --- |
 | `consent` | `set_consent(true)` for the configured verified user | none (the Go sender grants nothing) |
+| `session-open` | `session_start` — every fact below rides a session this sender opened | none |
 | `single` | one `track` of `SP_EVENT_NAME` | `single` |
+| `session-close` | `session_end` — ended, not replaced | none |
 | `realistic-batch` | two `session_start`/`session_end` pairs in ONE batch: four events, two sessions, each carrying sequence 1 for its start and 2 for its end, with an entry point and an end reason (finished, then backgrounded) | `realistic-batch` |
+| `session-resume` | `session_start` — realistic-batch left its second session ended | none |
 | `mixed-size` | one small `track` beside one with 2,500 padding characters, in ONE batch | `mixed-size` |
 | `lua-nonfatal` | `emit` | none (Go has no nonfatal form) |
 | `lua-fatal` | `emit_fatal`, pre-symbolicated Lua frame | `go-panic` |
@@ -102,7 +108,24 @@ witness's case names so one aggregate checker reads either sender's log:
 | `unauthenticated` | a FRESH `track` whose Authorization the host removes at the transport seam; `flush`'s own result is recorded as evidence | `unauthenticated` |
 | `duplicate` | the `single` event's captured bytes replayed once, authenticated | none |
 
-Analytics events other than the session pair use `SP_EVENT_NAME`; every event
+**Every analytics fact rides a session this sender opened, and nothing follows
+that session's end.** Both halves are checked on the wire log, and both were
+real defects: with no explicit start the first `track` opens a session *lazily*
+(a fresh id whose `app.session_started` never reaches the wire), so the facts
+carried a session id that no start in the log explained; and `session_end` keeps
+the id while clearing the active flag, so the cases after `realistic-batch`
+landed their events on an **already ended** session with its sequence running
+on. The receipt now reports `sessions_ok` and the session count, and requires:
+every session id has a start as its first fact with sequence 1, at most one end
+with no fact after it, and a per-session sequence with no gaps. The `duplicate`
+case is exempt — it replays the single event's captured bytes, built and sent
+before that session was closed, so its place in the log is a replay and not a
+new fact. The resumed session is deliberately left **open**: ending it would
+need a flush after the admission probe, and that flush would re-attempt the
+batch the SDK retains for its Mode B retry. A game process that exits without a
+shutdown leaves its session open the same way.
+
+Analytics events other than the session events use `SP_EVENT_NAME`; every event
 uses source `client`. The target must register that name, the two
 `app.session_*` names and the synthetic properties. An unregistered name can
 reject the whole batch with 400, unlike an oversize element's rejection within
@@ -137,8 +160,12 @@ suppressed, unknown and missing verdicts fail the case. `observed` is not a
 softer pass — it appears in none of the four aggregate counters, so admitting it
 would let a run exit 0 while the counters an aggregate check reads say nothing
 was accepted. The `duplicate` case is the one place a duplicate verdict is the
-expectation. The aggregate `suppressed` member may be absent; when supplied it
-must be the integer zero. Per-event `suppressed_no_consent` remains visible in
+expectation. **All four aggregate counters must be present non-negative
+integers** (`accepted`, `rejected`, `duplicates`, `suppressed`), and together
+they must account for every verdict row and nothing else; `suppressed` must be
+zero. A missing counter fails like a malformed one: a reader that indexes all
+four raises on such a body, so defaulting one here would let the run exit 0 over
+a log that cannot be read. Per-event `suppressed_no_consent` remains visible in
 the evidence and fails the case after a verified grant. Unauthenticated must
 return 401 or 403. The authenticated replay requires one `duplicate` with
 `duplicate_event_id` and zero accepted/rejected/suppressed. Consent must report
@@ -188,7 +215,8 @@ probe's event ID.
 The deliberate oversize rejection is a **passing** rejection — it is the
 measurement the `mixed-size` case exists to take — so a complete demonstration
 exits **0** with `contract_match: true`, `rejected_events: 1`, `exit_code: 0`,
-`caller_view_ok: true` and `probe_terminal: true`. A rejection in any other case fails that case's
+`caller_view_ok: true`, `probe_terminal: true`, `sessions_ok: true` and
+`sessions: 4`. A rejection in any other case fails that case's
 contract and exits **1**. Unexpected responses, a missing case, a second attempt
 at one, transport/SDK failures or incomplete caller-visible evidence also exit
 **1**, with a false contract match or a `sender_error`. Exit **2** means

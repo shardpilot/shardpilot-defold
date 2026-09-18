@@ -93,22 +93,26 @@ class SenderTest(unittest.TestCase):
                         self.assertIn(field, output)
                     else:
                         self.assertEqual(result, 1)
-                        self.assertEqual(len(calls), 10)
+                        self.assertEqual(len(calls), 13)
                         self.assertTrue(any(call.startswith(canonical) for call in calls))
                         self.assertIn('"lua":', output)
 
-    def test_optional_suppression_aggregate_and_row_controls(self):
-        for mode in ("good", "missing_suppressed"):
+    def test_all_four_counters_must_be_present_integers(self):
+        for mode in ("good",):
             with self.subTest(mode=mode):
                 result, requests = self.run_sender(mode)
-                self.assertEqual(len(requests), 10)
+                self.assertEqual(len(requests), 13)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(json.loads(result.stdout.splitlines()[-1])["contract_match"])
+        # A MISSING counter fails like a malformed one: an aggregate reader
+        # indexes all four, so a defaulted `suppressed` would have let this
+        # sender exit 0 over a body that raises on the reader.
         for mode in ("counter_null", "counter_string", "counter_bool", "counter_negative",
-                     "counter_positive", "suppressed_row", "missing_suppressed_observed"):
+                     "counter_positive", "suppressed_row", "missing_suppressed",
+                     "missing_suppressed_observed"):
             with self.subTest(mode=mode):
                 result, requests = self.run_sender(mode)
-                self.assertEqual(len(requests), 10)
+                self.assertEqual(len(requests), 13)
                 self.assertEqual(result.returncode, 1)
                 self.assertFalse(json.loads(result.stdout.splitlines()[-1])["contract_match"])
                 if mode == "suppressed_row":
@@ -168,10 +172,11 @@ class SenderTest(unittest.TestCase):
                         rows[0].update(status="suppressed_no_consent", code="suppressed_no_consent")
                     # A rejection OUTSIDE mixed-size: only the deliberate
                     # oversize one is a passing rejection.
-                    if mode == "reject_in_single" and len(batches) == 1:
+                    # Batch 1 is the session-open exchange; batch 2 is `single`.
+                    if mode == "reject_in_single" and len(batches) == 2:
                         rows[0].update(status="rejected", code="event_too_large")
                     # A verdict the sender cannot match to anything it sent.
-                    if mode == "renamed_row" and len(batches) == 1:
+                    if mode == "renamed_row" and len(batches) == 2:
                         rows[0]["event_id"] = rows[0]["event_id"] + "-renamed"
                     rejected = sum(r["status"] in ("rejected", "suppressed_no_consent") for r in rows)
                     duplicates = sum(r["status"] == "duplicate" for r in rows)
@@ -282,7 +287,7 @@ class SenderTest(unittest.TestCase):
 
     def test_grant_and_events_share_verified_identity(self):
         result, requests = self.run_sender("verified_grant")
-        self.assertEqual(len(requests), 10)
+        self.assertEqual(len(requests), 13)
         self.assertTrue(json.loads(result.stdout.splitlines()[-1])["contract_match"])
         self.assertEqual(requests[0][1]["actor_identifier"], "sender-user")
         self.assertEqual(requests[0][1]["kind"], "user_verified")
@@ -296,12 +301,10 @@ class SenderTest(unittest.TestCase):
     def test_actual_sdk_and_all_ten_exchanges(self):
         result, requests = self.run_sender()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(len(requests), 10)
-        self.assertEqual(requests[1][1]["events"][0]["event_name"], "play_cta_click")
+        self.assertEqual(len(requests), 13)
         self.assertTrue(all(e["source"] == "client" for r in requests for e in r[1].get("events", [])))
-        self.assertEqual(len(requests[2][1]["events"]), 4)
         replies = [json.loads(line) for line in result.stdout.splitlines() if '"latency_ms"' in line]
-        self.assertEqual(len(replies), 10)
+        self.assertEqual(len(replies), 13)
         # ONE line per exchange, each carrying the fields a reader keys on.
         self.assertEqual([r["case"] for r in replies], list(send.CASES))
         for reply in replies:
@@ -311,10 +314,13 @@ class SenderTest(unittest.TestCase):
                 self.assertTrue(reply["route"].startswith("/"))
         self.assertTrue(all(r["request_id"].startswith("fixture-") for r in replies))
         self.assertEqual(json.loads(result.stdout.splitlines()[-1]),
-                         {"case": "summary", "requests": 10, "contract_match": True,
+                         {"case": "summary", "requests": 13, "contract_match": True,
                           "cases": sorted(send.CASES), "one_attempt_per_case": True,
-                          "caller_view_ok": True, "probe_terminal": True,
-                          "rejected_events": 1, "exit_code": 0})
+                          "caller_view_ok": True, "probe_terminal": True, "sessions_ok": True,
+                          "sessions": 4, "rejected_events": 1, "exit_code": 0})
+        self.assertEqual(next(r for r in replies if r["case"] == "single")["request_body"]["events"][0]["event_name"],
+                         "play_cta_click")
+        self.assertEqual(len(next(r for r in replies if r["case"] == "realistic-batch")["request_body"]["events"]), 4)
         # Two synthetic sessions, each a start and an end, in one batch.
         batch = next(r for r in replies if r["case"] == "realistic-batch")["request_body"]["events"]
         self.assertEqual([e["event_name"] for e in batch],
@@ -337,12 +343,11 @@ class SenderTest(unittest.TestCase):
         # credential is gone at the seam.
         unauth = next(r for r in replies if r["case"] == "unauthenticated")
         self.assertFalse(unauth["authorization_present"])
-        self.assertIsNone(requests[-2][2])
         probe = unauth["request_body"]["events"][0]["event_id"]
         self.assertEqual(sum(probe in json.dumps(r[1]) for r in requests), 1)
         # The authenticated replay is the single event's bytes, unchanged.
-        self.assertEqual(requests[-1][1], requests[1][1])
         single = next(r for r in replies if r["case"] == "single")
+        self.assertEqual(requests[-1][1], single["request_body"])
         self.assertEqual(next(r for r in replies if r["case"] == "duplicate")["request_body"],
                          single["request_body"])
         # The sender names what it cannot capture instead of leaving the gap
@@ -373,7 +378,8 @@ class SenderTest(unittest.TestCase):
 
     def test_duplicate_replays_identical_sdk_body(self):
         result, requests = self.run_sender("legacy")
-        original = requests[1]
+        original = requests[2]  # consent, session-open, single
+        self.assertEqual([e["event_name"] for e in original[1]["events"]], ["play_cta_click"])
         self.assertEqual(sum(r == original for r in requests), 2)
 
     def test_native_module_has_bounds(self):
@@ -408,7 +414,7 @@ class SenderTest(unittest.TestCase):
     def test_server_echo_of_key_is_redacted(self):
         result, requests = self.run_sender("echo_key")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(len(requests), 10)
+        self.assertEqual(len(requests), 13)
         self.assertTrue(json.loads(result.stdout.splitlines()[-1])["contract_match"])
         self.assertIn("[REDACTED]", result.stdout)
 
@@ -482,6 +488,76 @@ class SenderTest(unittest.TestCase):
         # inferred from a short log.
         absent = next(r for r in lines if r.get("case") == "not-exercised")["captures"]
         self.assertTrue(any("Mode B retry" in item for item in absent))
+
+    def test_every_fact_rides_a_session_this_sender_opened(self):
+        result, requests = self.run_sender()
+        lines = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+        replies = [r for r in lines if r.get("latency_ms") is not None]
+        wire = [(r["case"], event["session_id"], event["event_name"], event["session_sequence"])
+                for r in replies for event in (r["request_body"].get("events") or [])]
+        sessions, order = {}, []
+        for case, session, name, sequence in wire:
+            if session not in sessions:
+                sessions[session] = []
+                order.append(session)
+            sessions[session].append((case, name, sequence))
+        # Four sessions: one around `single`, two paired inside
+        # realistic-batch, one for the cases after them.
+        self.assertEqual(len(order), 4)
+        self.assertEqual(json.loads(result.stdout.splitlines()[-1])["sessions"], 4)
+        first, second, third, fourth = (sessions[key] for key in order)
+        self.assertEqual(first, [("session-open", send.SESSION_START, 1),
+                                 ("single", "play_cta_click", 2),
+                                 ("session-close", send.SESSION_END, 3),
+                                 # The replay of the single event's captured
+                                 # bytes, sent before that end and exempt.
+                                 ("duplicate", "play_cta_click", 2)])
+        for pair in (second, third):
+            self.assertEqual([(name, sequence) for _, name, sequence in pair],
+                             [(send.SESSION_START, 1), (send.SESSION_END, 2)])
+            self.assertEqual({case for case, _, _ in pair}, {"realistic-batch"})
+        self.assertEqual(fourth, [("session-resume", send.SESSION_START, 1),
+                                  ("mixed-size", "play_cta_click", 2),
+                                  ("mixed-size", "play_cta_click", 3),
+                                  ("unauthenticated", "play_cta_click", 4)])
+        # No fact carries a session id after that id's end, and no session is
+        # opened lazily: every id has a start on the wire.
+        for key, facts in sessions.items():
+            names = [name for _, name, _ in facts]
+            self.assertEqual(names[0], send.SESSION_START, key)
+            self.assertLessEqual(names.count(send.SESSION_END), 1)
+        self.assertTrue(json.loads(result.stdout.splitlines()[-1])["sessions_ok"])
+
+    def session_state(self, *facts):
+        """An in-memory sender whose wire log is the given (case, name,
+        session, sequence) facts, one exchange each."""
+        sender = send.Sender({name: "synthetic-" + name for name in send.FIELDS})
+        sender.records = [{"case": case,
+                           "request_body": {"events": [{"session_id": session, "event_name": name,
+                                                        "session_sequence": sequence}]}}
+                          for case, name, session, sequence in facts]
+        return sender
+
+    def test_session_check_fails_on_an_orphan_or_a_fact_after_an_end(self):
+        opened = ("session-open", send.SESSION_START, "a", 1)
+        self.assertTrue(self.session_state(opened, ("single", "play_cta_click", "a", 2),
+                                           ("session-close", send.SESSION_END, "a", 3)).session_lifecycle_holds())
+        # The defect this replaces: a fact on a session that was already ended.
+        self.assertFalse(self.session_state(
+            opened, ("session-close", send.SESSION_END, "a", 2),
+            ("mixed-size", "play_cta_click", "a", 3)).session_lifecycle_holds())
+        # A lazily opened session — a fact whose session has no start on the
+        # wire, which is what dropping the session_start produces.
+        self.assertFalse(self.session_state(
+            ("single", "play_cta_click", "lazy", 1)).session_lifecycle_holds())
+        self.assertFalse(self.session_state(
+            opened, ("single", "play_cta_click", "a", 2),
+            ("mixed-size", "play_cta_click", "lazy", 1)).session_lifecycle_holds())
+        # Two starts for one id, a start that is not the session's first fact,
+        # and a gap in the per-session sequence.
+        self.assertFalse(self.session_state(opened, ("session-resume", send.SESSION_START, "a", 2)).session_lifecycle_holds())
+        self.assertFalse(self.session_state(("session-open", send.SESSION_START, "a", 2)).session_lifecycle_holds())
+        self.assertFalse(self.session_state(opened, ("single", "play_cta_click", "a", 3)).session_lifecycle_holds())
 
     def probe_state(self):
         """An in-memory sender whose probe settled cleanly."""

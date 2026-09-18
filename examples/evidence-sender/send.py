@@ -24,7 +24,11 @@ FIELDS = ("ingest_url", "ingest_token", "user_id", "anonymous_id",
 LEGACY_STAGES = {"single": "minimal", "realistic-batch": "batch", "mixed-size": "mixed_size",
                  "lua-nonfatal": "lua_nonfatal", "lua-fatal": "lua_fatal", "native-json": "native_frame"}
 CRASH_CASES = ("lua-nonfatal", "lua-fatal", "native-json", "raw-text")
-CASES = ("consent", "single", "realistic-batch", "mixed-size") + CRASH_CASES + ("unauthenticated", "duplicate")
+# The session lifecycle rides its own exchanges so the counted cases carry
+# exactly the events a reader expects to see verdicts for.
+CASES = ("consent", "session-open", "single", "session-close", "realistic-batch",
+         "session-resume", "mixed-size") + CRASH_CASES + ("unauthenticated", "duplicate")
+SESSION_START, SESSION_END = "app.session_started", "app.session_ended"
 # Captures this pure-Lua SDK cannot produce headlessly. Printed as absent
 # rather than simulated: a fabricated platform capture would read exactly like
 # a real one in the evidence.
@@ -129,11 +133,14 @@ def check_reply(case, sent, status, body):
                     and reply.get("suppressed") is not True)
         events = sent["events"]
         rows = reply["events"]
-        suppressed = reply.get("suppressed", 0)
+        # ALL FOUR counters, present and non-negative. A defaulted `suppressed`
+        # let a run exit 0 over a body that an aggregate reader indexing all
+        # four raises on — the receipt would contradict the log it points at.
         if (reply.get("validation_only") or not isinstance(rows, list) or len(rows) != len(events)
-                or type(suppressed) is not int
-                or not all(type(reply.get(k)) is int for k in ("accepted", "rejected", "duplicates"))):
+                or not all(type(reply.get(k)) is int and reply[k] >= 0
+                           for k in ("accepted", "rejected", "duplicates", "suppressed"))):
             return False
+        suppressed = reply["suppressed"]
         by_id = {row["event_id"]: row for row in rows}
         if len(by_id) != len(events) or set(by_id) != {e["event_id"] for e in events}:
             return False
@@ -158,9 +165,13 @@ def check_reply(case, sent, status, body):
         rejected = 1 if case == "mixed-size" else 0
         duplicates = len(events) if case == "duplicate" else 0
         accepted = sum(row.get("status") == "accepted" for row in rows)
-        return (reply.get("accepted") == accepted
-                and reply.get("rejected") == rejected and reply.get("duplicates") == duplicates
-                and suppressed == 0)
+        counters = (reply["accepted"], rejected, duplicates, 0)
+        return (reply["accepted"] == accepted
+                and reply["rejected"] == rejected and reply["duplicates"] == duplicates
+                and suppressed == 0
+                # The invariant an aggregate reader checks: the four disjoint
+                # counters account for every row and nothing else.
+                and sum(counters) == len(rows))
     except (ValueError, KeyError, TypeError):
         return False
 
@@ -179,6 +190,7 @@ class Sender:
         self.oversize_event_id = ""
         # What the SDK reported about the refused admission probe.
         self.probe = None
+        self.sessions = []
         self.lua = LuaRuntime(unpack_returned_tuples=True)
         self.opener = request.build_opener(request.ProxyHandler({}), RefuseRedirect())
 
@@ -291,6 +303,43 @@ class Sender:
                 and len(told) == 1 and told[0].get("code") == "event_too_large"
                 and carried == 1)
 
+    def session_lifecycle_holds(self):
+        """Every analytics fact rides a session this sender OPENED, and nothing
+        follows that session's end. `duplicate` is exempt: it replays the single
+        event's captured bytes, which were built and sent before that session
+        was closed, so its position in the log is a replay and not a new fact."""
+        opened, ended, sequences = {}, {}, {}
+        for record in self.records:
+            if record["case"] == "duplicate":
+                continue
+            for event in record["request_body"].get("events") or []:
+                session, name = event.get("session_id"), event.get("event_name")
+                sequence = event.get("session_sequence")
+                if not isinstance(session, str) or not session or type(sequence) is not int:
+                    return False
+                if session in ended:
+                    return False
+                sequences.setdefault(session, []).append(sequence)
+                if name == SESSION_START:
+                    if session in opened:
+                        return False
+                    opened[session] = sequence
+                elif name == SESSION_END:
+                    ended[session] = sequence
+                elif session not in opened:
+                    return False
+        if not opened or set(ended) - set(opened):
+            return False
+        for session, seen in sequences.items():
+            # A start is always the session's first fact, and the sequence is a
+            # per-session counter with no gaps; an end is its last.
+            if opened.get(session) != 1 or seen != list(range(1, len(seen) + 1)):
+                return False
+            if session in ended and ended[session] != seen[-1]:
+                return False
+        self.sessions = sorted(opened)
+        return True
+
     def probe_is_terminal(self):
         """The admission probe leaves nothing behind: the SDK did not claim
         delivery of a batch the door refused, the witness took exactly one
@@ -346,8 +395,9 @@ class Sender:
         one_attempt = all(len(attempts) == 1 for attempts in by_case.values())
         caller_view = self.caller_view_holds()
         probe_terminal = self.probe_is_terminal()
+        sessions_ok = self.session_lifecycle_holds()
         passed = (set(by_case) == set(CASES) and one_attempt and caller_view and probe_terminal
-                  and all(record["contract_match"] for record in self.records))
+                  and sessions_ok and all(record["contract_match"] for record in self.records))
         # The deliberate oversize rejection is a PASSING rejection: it is the
         # measurement the mixed-size case exists to take. A rejection in any
         # other case fails that case's contract above, so it still exits 1.
@@ -355,6 +405,7 @@ class Sender:
         self.log({"case": "summary", "requests": len(self.records), "contract_match": passed,
                   "cases": sorted(by_case), "one_attempt_per_case": one_attempt,
                   "caller_view_ok": caller_view, "probe_terminal": probe_terminal,
+                  "sessions_ok": sessions_ok, "sessions": len(self.sessions),
                   "rejected_events": self.rejected_events, "exit_code": exit_code})
         return exit_code
 
