@@ -134,7 +134,11 @@ class SenderTest(unittest.TestCase):
                 requests.append((self.path, body, self.headers.get("Authorization")))
                 status = 202
                 if self.headers.get("Authorization") is None:
-                    status = 202 if mode == "unauth_allowed" else 401
+                    # 401 and 403 are both a passing refusal for the probe, and
+                    # the SDK classifies them differently (transport.lua): 401
+                    # is unauthorized+retryable, 403 falls through as a terminal
+                    # http_403. Both statuses get a scene.
+                    status = {"unauth_allowed": 202, "unauth_403": 403}.get(mode, 401)
                     reply = {"error": {"code": "unauthorized"}}
                 elif self.path == "/v1/consent":
                     verified = (self.headers.get("Authorization") == "Bearer " + verified_marker
@@ -317,7 +321,8 @@ class SenderTest(unittest.TestCase):
                          {"case": "summary", "requests": 13, "contract_match": True,
                           "cases": sorted(send.CASES), "one_attempt_per_case": True,
                           "caller_view_ok": True, "probe_terminal": True, "sessions_ok": True,
-                          "sessions": 4, "rejected_events": 1, "exit_code": 0})
+                          "sessions": 4, "plan_ok": True, "probe_settlement": "retained",
+                          "rejected_events": 1, "exit_code": 0})
         self.assertEqual(next(r for r in replies if r["case"] == "single")["request_body"]["events"][0]["event_name"],
                          "play_cta_click")
         self.assertEqual(len(next(r for r in replies if r["case"] == "realistic-batch")["request_body"]["events"]), 4)
@@ -468,15 +473,31 @@ class SenderTest(unittest.TestCase):
         self.assertTrue(json.loads(result.stdout.splitlines()[-1])["caller_view_ok"])
 
     def test_the_admission_probe_leaves_nothing_owed(self):
+        """Both refusals pass the case, and the receipt states which settlement
+        the SDK actually performed: 401 is retryable so the batch is kept, 403
+        is terminal so it is dropped."""
+        for mode, status, settlement, dropped in (("good", 401, "retained", 0),
+                                                  ("unauth_403", 403, "dropped", 1)):
+            with self.subTest(status=status):
+                result, requests = self.run_sender(mode)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                lines = [json.loads(line) for line in result.stdout.splitlines()
+                         if line.startswith("{")]
+                probe = next(r for r in lines if r.get("case") == "probe-settlement")
+                attempt = next(r for r in lines if r.get("case") == "unauthenticated"
+                               and r.get("latency_ms") is not None)
+                self.assertEqual(attempt["status"], status)
+                self.assertEqual((probe["status"], probe["settlement"]), (status, settlement))
+                self.assertEqual(probe["snapshot"]["dropped"], dropped)
+                self.assertFalse(probe["flush_ok"])
+                self.assertEqual(probe["snapshot"]["failed_batches"], 1)
+                self.assertEqual(probe["snapshot"]["spooled"], 0)
+                self.assertEqual(json.loads(result.stdout.splitlines()[-1])["probe_settlement"],
+                                 settlement)
         result, requests = self.run_sender()
         lines = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
         probe = next(r for r in lines if r.get("case") == "probe-settlement")
-        # The SDK reported the refused batch as NOT published, and the witness
-        # recorded that rather than ignoring it.
-        self.assertFalse(probe["flush_ok"])
-        self.assertEqual(probe["snapshot"]["failed_batches"], 1)
-        self.assertEqual(probe["snapshot"]["spooled"], 0)
-        self.assertIn("NOT EXERCISED", probe["retained_retry"])
+        self.assertIn("NOT EXERCISED", probe["sdk_classification"])
         # One attempt, and the probe id is nowhere else in the run.
         attempts = [r for r in lines if r.get("case") == "unauthenticated"]
         self.assertEqual(len(attempts), 1)
@@ -487,7 +508,7 @@ class SenderTest(unittest.TestCase):
         # The owed Mode B retry is named on the printed list, not left to be
         # inferred from a short log.
         absent = next(r for r in lines if r.get("case") == "not-exercised")["captures"]
-        self.assertTrue(any("Mode B retry" in item for item in absent))
+        self.assertTrue(any("401-refused admission probe" in item for item in absent))
 
     def test_every_fact_rides_a_session_this_sender_opened(self):
         result, requests = self.run_sender()
@@ -528,6 +549,44 @@ class SenderTest(unittest.TestCase):
             self.assertLessEqual(names.count(send.SESSION_END), 1)
         self.assertTrue(json.loads(result.stdout.splitlines()[-1])["sessions_ok"])
 
+    def planned_state(self, single=1, pairs=2, shared=False):
+        """An in-memory sender whose counted cases carry the given shapes."""
+        sender = send.Sender({name: "synthetic-" + name for name in send.FIELDS})
+        batch = []
+        for index in range(pairs):
+            session = "s" if shared else "s%d" % index
+            batch.append({"session_id": session, "event_name": send.SESSION_START,
+                          "session_sequence": 1})
+            batch.append({"session_id": session, "event_name": send.SESSION_END,
+                          "session_sequence": 2})
+        sender.records = [
+            {"case": "single", "request_body": {"events": [{"event_id": "e%d" % i}
+                                                           for i in range(single)]}},
+            {"case": "realistic-batch", "request_body": {"events": batch}},
+            {"case": "mixed-size", "request_body": {"events": [{"event_id": "small"},
+                                                               {"event_id": "big"}]}},
+        ]
+        return sender
+
+    def test_planned_cardinality_is_not_derived_from_what_was_sent(self):
+        self.assertTrue(self.planned_state().planned_shape_holds())
+        # Two events in `single`: a len(rows)-derived expectation would judge
+        # this batch against itself and pass it.
+        self.assertFalse(self.planned_state(single=2).planned_shape_holds())
+        self.assertFalse(self.planned_state(single=0).planned_shape_holds())
+        # One pair in realistic-batch instead of two, and two pairs sharing one
+        # session id instead of two distinct ones.
+        self.assertFalse(self.planned_state(pairs=1).planned_shape_holds())
+        self.assertFalse(self.planned_state(pairs=3).planned_shape_holds())
+        self.assertFalse(self.planned_state(shared=True).planned_shape_holds())
+        # A counted case missing from the run, or attempted twice.
+        missing = self.planned_state()
+        missing.records = missing.records[1:]
+        self.assertFalse(missing.planned_shape_holds())
+        twice = self.planned_state()
+        twice.records.append(dict(twice.records[0]))
+        self.assertFalse(twice.planned_shape_holds())
+
     def session_state(self, *facts):
         """An in-memory sender whose wire log is the given (case, name,
         session, sequence) facts, one exchange each."""
@@ -538,38 +597,62 @@ class SenderTest(unittest.TestCase):
                           for case, name, session, sequence in facts]
         return sender
 
+    def four_sessions(self, *facts):
+        """The three lifecycle pairs a healthy run carries beside `facts`, so a
+        scene exercises one rule at a time against the planned session count."""
+        filler = []
+        for index in ("b", "c", "d"):
+            filler.append(("realistic-batch", send.SESSION_START, index, 1))
+            filler.append(("realistic-batch", send.SESSION_END, index, 2))
+        return self.session_state(*(list(facts) + filler))
+
     def test_session_check_fails_on_an_orphan_or_a_fact_after_an_end(self):
         opened = ("session-open", send.SESSION_START, "a", 1)
-        self.assertTrue(self.session_state(opened, ("single", "play_cta_click", "a", 2),
+        self.assertTrue(self.four_sessions(opened, ("single", "play_cta_click", "a", 2),
                                            ("session-close", send.SESSION_END, "a", 3)).session_lifecycle_holds())
+        # Exactly the planned number of sessions: a lost lifecycle exchange
+        # must not pass against its own shorter log.
+        self.assertFalse(self.session_state(opened, ("single", "play_cta_click", "a", 2),
+                                            ("session-close", send.SESSION_END, "a", 3)).session_lifecycle_holds())
         # The defect this replaces: a fact on a session that was already ended.
-        self.assertFalse(self.session_state(
+        self.assertFalse(self.four_sessions(
             opened, ("session-close", send.SESSION_END, "a", 2),
             ("mixed-size", "play_cta_click", "a", 3)).session_lifecycle_holds())
         # A lazily opened session — a fact whose session has no start on the
         # wire, which is what dropping the session_start produces.
-        self.assertFalse(self.session_state(
+        self.assertFalse(self.four_sessions(
             ("single", "play_cta_click", "lazy", 1)).session_lifecycle_holds())
-        self.assertFalse(self.session_state(
+        self.assertFalse(self.four_sessions(
             opened, ("single", "play_cta_click", "a", 2),
             ("mixed-size", "play_cta_click", "lazy", 1)).session_lifecycle_holds())
         # Two starts for one id, a start that is not the session's first fact,
         # and a gap in the per-session sequence.
-        self.assertFalse(self.session_state(opened, ("session-resume", send.SESSION_START, "a", 2)).session_lifecycle_holds())
-        self.assertFalse(self.session_state(("session-open", send.SESSION_START, "a", 2)).session_lifecycle_holds())
-        self.assertFalse(self.session_state(opened, ("single", "play_cta_click", "a", 3)).session_lifecycle_holds())
+        self.assertFalse(self.four_sessions(opened, ("session-resume", send.SESSION_START, "a", 2)).session_lifecycle_holds())
+        self.assertFalse(self.four_sessions(("session-open", send.SESSION_START, "a", 2)).session_lifecycle_holds())
+        self.assertFalse(self.four_sessions(opened, ("single", "play_cta_click", "a", 3)).session_lifecycle_holds())
 
-    def probe_state(self):
+    def probe_state(self, status=401, settlement="retained", dropped=0):
         """An in-memory sender whose probe settled cleanly."""
         sender = send.Sender({name: "synthetic-" + name for name in send.FIELDS})
-        sender.records = [{"case": "unauthenticated",
+        sender.records = [{"case": "unauthenticated", "status": status,
                            "request_body": {"events": [{"event_id": "probe"}]},
                            "event_result": None}]
-        sender.probe = {"flush_ok": False, "flush_error": None, "snapshot": {}}
+        sender.probe = {"flush_ok": False, "flush_error": None, "status": status,
+                        "settlement": settlement, "snapshot": {"dropped": dropped}}
         return sender
 
     def test_probe_check_fails_when_delivery_is_claimed_or_the_id_returns(self):
         self.assertTrue(self.probe_state().probe_is_terminal())
+        self.assertTrue(self.probe_state(403, "dropped", 1).probe_is_terminal())
+        # An UNCONDITIONAL settlement sentence: "retained" over a 403 the SDK
+        # dropped, and "dropped" over a 401 it kept.
+        self.assertFalse(self.probe_state(403, "retained", 1).probe_is_terminal())
+        self.assertFalse(self.probe_state(401, "dropped", 0).probe_is_terminal())
+        # The statement right but the SDK's own counters disagreeing with it.
+        self.assertFalse(self.probe_state(401, "retained", 1).probe_is_terminal())
+        self.assertFalse(self.probe_state(403, "dropped", 0).probe_is_terminal())
+        # A status that takes no admission measurement at all.
+        self.assertFalse(self.probe_state(500, "unknown", 0).probe_is_terminal())
         # flush() reporting success for a batch the door refused.
         claimed = self.probe_state()
         claimed.probe["flush_ok"] = True

@@ -29,6 +29,31 @@ CRASH_CASES = ("lua-nonfatal", "lua-fatal", "native-json", "raw-text")
 CASES = ("consent", "session-open", "single", "session-close", "realistic-batch",
          "session-resume", "mixed-size") + CRASH_CASES + ("unauthenticated", "duplicate")
 SESSION_START, SESSION_END = "app.session_started", "app.session_ended"
+# The PLANNED shape of each counted case and of the run's session lifecycle,
+# stated here instead of derived from whatever the sender happened to send. A
+# batch that lost an event would otherwise be judged against its own smaller
+# self and pass.
+PLANNED = {"single": {"accepted": 1, "rejected": 0},
+           "realistic-batch": {"accepted": 4, "rejected": 0, "sessions": 2},
+           "mixed-size": {"accepted": 1, "rejected": 1}}
+PLANNED_SESSIONS = 4
+# How the SDK settles a refused admission probe, per status. 401 reaches the
+# client as unauthorized+retryable (transport.lua), and Mode B keeps such a
+# batch for a re-minted retry; 403 falls through as a terminal http_403 —
+# neither unauthorized nor retryable — so the batch is dropped and nothing is
+# owed. Measured on the loopback fixture: dropped stays 0 for 401 and becomes 1
+# for 403.
+PROBE_SETTLEMENT = {
+    401: ("retained", "401 is unauthorized and retryable, and a token_provider is configured, so the "
+                      "SDK RETAINS this batch for a re-minted retry. No public surface drops it: a "
+                      "further flush re-attempts it and shutdown() re-attempts it and then refuses "
+                      "teardown. This witness allows one attempt per case, so that retry is NOT "
+                      "EXERCISED; spool_enabled is false, so the obligation does not survive the "
+                      "process."),
+    403: ("dropped", "403 is neither unauthorized nor retryable to the SDK (a terminal http_403), so "
+                     "the batch is DROPPED at the failure and nothing is owed: the SDK's own counters "
+                     "show it dropped and no retry is pending."),
+}
 # Captures this pure-Lua SDK cannot produce headlessly. Printed as absent
 # rather than simulated: a fabricated platform capture would read exactly like
 # a real one in the evidence.
@@ -38,9 +63,10 @@ NOT_EXERCISED = (
     "ANR/hang watchdog", "minidump upload", "Android tombstone upload",
     "Unreal crash-context upload", "symbolication of the native fixture",
     "session_ended duration_ms property (session_end carries only a reason)",
-    "the SDK's own Mode B retry of the refused admission probe: a 401 is retryable when a "
-    "token_provider is configured, so the batch stays retained and this witness reports it "
-    "instead of taking a second attempt",
+    "the SDK's own retry of a 401-refused admission probe: the status is retryable when a "
+    "token_provider is configured, so the batch stays retained and this witness reports that "
+    "settlement instead of taking a second attempt (a 403 refusal is dropped by the SDK and "
+    "leaves nothing owed)",
 )
 
 
@@ -165,6 +191,12 @@ def check_reply(case, sent, status, body):
         rejected = 1 if case == "mixed-size" else 0
         duplicates = len(events) if case == "duplicate" else 0
         accepted = sum(row.get("status") == "accepted" for row in rows)
+        plan = PLANNED.get(case)
+        if plan is not None and (len(events) != plan["accepted"] + plan["rejected"]
+                                 or reply["accepted"] != plan["accepted"]
+                                 or reply["rejected"] != plan["rejected"]):
+            # The PLANNED cardinality, not one derived from this batch.
+            return False
         counters = (reply["accepted"], rejected, duplicates, 0)
         return (reply["accepted"] == accepted
                 and reply["rejected"] == rejected and reply["duplicates"] == duplicates
@@ -207,16 +239,19 @@ class Sender:
         self.log({"case": "sdk-issue", "issue": issue})
 
     def record_probe(self, published, error, snapshot):
-        self.probe = {"flush_ok": published is True, "flush_error": error,
+        # The settlement STATEMENT is derived from the status the door actually
+        # returned, because the SDK settles the two refusals differently. An
+        # unconditional sentence would misdescribe one of them.
+        attempts = [r for r in self.records if r["case"] == "unauthenticated"]
+        status = attempts[-1]["status"] if attempts else 0
+        settlement, reason = PROBE_SETTLEMENT.get(status, ("unknown",
+            "the door answered neither 401 nor 403, so this case took no admission measurement"))
+        self.probe = {"flush_ok": published is True, "flush_error": error, "status": status,
+                      "settlement": settlement,
                       "snapshot": snapshot if isinstance(snapshot, dict) else {}}
-        self.log({"case": "probe-settlement", "flush_ok": self.probe["flush_ok"],
-                  "flush_error": self.probe["flush_error"], "snapshot": self.probe["snapshot"],
-                  "retained_retry": "Mode B classifies a 401 as retryable, so the SDK retains this "
-                                    "batch and owes a resend. No public surface drops it: a further "
-                                    "flush re-attempts it and shutdown() re-attempts it and then "
-                                    "refuses teardown. This witness takes one attempt per case, so "
-                                    "the retry is NOT EXERCISED; spool_enabled is false, so the "
-                                    "obligation does not survive the process."})
+        self.log({"case": "probe-settlement", "status": status, "settlement": settlement,
+                  "flush_ok": self.probe["flush_ok"], "flush_error": self.probe["flush_error"],
+                  "snapshot": self.probe["snapshot"], "sdk_classification": reason})
 
     def record_rejections(self, rows):
         self.rejections = rows if isinstance(rows, list) else []
@@ -328,7 +363,9 @@ class Sender:
                     ended[session] = sequence
                 elif session not in opened:
                     return False
-        if not opened or set(ended) - set(opened):
+        # Exactly the planned number of sessions: a run that lost one of the
+        # lifecycle exchanges must not pass against its own shorter log.
+        if len(opened) != PLANNED_SESSIONS or set(ended) - set(opened):
             return False
         for session, seen in sequences.items():
             # A start is always the session's first fact, and the sequence is a
@@ -341,17 +378,53 @@ class Sender:
         return True
 
     def probe_is_terminal(self):
-        """The admission probe leaves nothing behind: the SDK did not claim
-        delivery of a batch the door refused, the witness took exactly one
-        attempt, and no other exchange carries the probe's event id."""
+        """The admission probe leaves nothing behind, and the receipt says which
+        of the two settlements happened: the SDK did not claim delivery of a
+        batch the door refused, the SDK's own counters match the classification
+        for that status, the witness took exactly one attempt, and no other
+        exchange carries the probe's event id."""
         attempts = [r for r in self.records if r["case"] == "unauthenticated"]
         if len(attempts) != 1 or self.probe is None or self.probe["flush_ok"]:
+            return False
+        status = attempts[0]["status"]
+        expected = PROBE_SETTLEMENT.get(status)
+        if expected is None or self.probe["status"] != status or self.probe["settlement"] != expected[0]:
+            return False
+        # 401: the batch is kept, so nothing is dropped. 403: it is dropped
+        # exactly once, and nothing stays pending.
+        dropped = self.probe["snapshot"].get("dropped")
+        if dropped != (0 if status == 401 else 1):
             return False
         events = attempts[0]["request_body"].get("events") or []
         if len(events) != 1:
             return False
         probe_id = events[0]["event_id"]
         return sum(probe_id in encode(record["request_body"]) for record in self.records) == 1
+
+    def planned_shape_holds(self):
+        """Each counted case carries the cardinality this run PLANNED, and
+        realistic-batch's four events are two start/end pairs with distinct
+        session ids."""
+        for case, plan in PLANNED.items():
+            records = [r for r in self.records if r["case"] == case]
+            if len(records) != 1:
+                return False
+            events = records[0]["request_body"].get("events") or []
+            if len(events) != plan["accepted"] + plan["rejected"]:
+                return False
+            if not plan.get("sessions"):
+                continue
+            sessions = {}
+            for event in events:
+                sessions.setdefault(event.get("session_id"), []).append(event)
+            if len(sessions) != plan["sessions"]:
+                return False
+            for facts in sessions.values():
+                if [f.get("event_name") for f in facts] != [SESSION_START, SESSION_END]:
+                    return False
+                if [f.get("session_sequence") for f in facts] != [1, 2]:
+                    return False
+        return True
 
     def run(self):
         g = self.lua.globals()
@@ -396,8 +469,10 @@ class Sender:
         caller_view = self.caller_view_holds()
         probe_terminal = self.probe_is_terminal()
         sessions_ok = self.session_lifecycle_holds()
+        plan_ok = self.planned_shape_holds()
         passed = (set(by_case) == set(CASES) and one_attempt and caller_view and probe_terminal
-                  and sessions_ok and all(record["contract_match"] for record in self.records))
+                  and sessions_ok and plan_ok
+                  and all(record["contract_match"] for record in self.records))
         # The deliberate oversize rejection is a PASSING rejection: it is the
         # measurement the mixed-size case exists to take. A rejection in any
         # other case fails that case's contract above, so it still exits 1.
@@ -406,6 +481,7 @@ class Sender:
                   "cases": sorted(by_case), "one_attempt_per_case": one_attempt,
                   "caller_view_ok": caller_view, "probe_terminal": probe_terminal,
                   "sessions_ok": sessions_ok, "sessions": len(self.sessions),
+                  "plan_ok": plan_ok, "probe_settlement": self.probe["settlement"] if self.probe else "none",
                   "rejected_events": self.rejected_events, "exit_code": exit_code})
         return exit_code
 

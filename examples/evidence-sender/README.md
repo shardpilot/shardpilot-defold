@@ -191,17 +191,34 @@ The admission probe is measured the same way. `flush` returns **false** for it �
 that is what a refused batch must report, and a `true` would be the SDK claiming
 delivery of a batch the door turned away — so the result is recorded in a
 `probe-settlement` line together with `snapshot()`'s counters, and a `true`
-fails the run. In **Mode B a 401 is retryable** (the configured `token_provider`
-can mint a fresh credential), so the SDK retains that batch and owes a resend.
-Measured against this SDK: a further `flush` re-attempts it, and `shutdown()`
-re-attempts it and then refuses teardown, so no public surface drops it. A
-witness that allows one attempt per case therefore **reports the owed retry
-instead of taking it** — it is on the printed not-exercised list — and the run
-ends there; `spool_enabled` is false, so nothing durable survives the process
-and the obligation cannot reach a later run. The receipt says so rather than
-claiming a settled SDK: `probe_terminal` is true only when the SDK did not claim
-delivery, the case had exactly one attempt, and no other exchange carries the
-probe's event ID.
+fails the run.
+
+**The two passing refusals settle differently inside the SDK, so the receipt
+states which one happened rather than asserting one of them.** A `401` reaches
+the client as unauthorized *and* retryable, and with a `token_provider`
+configured the SDK **retains** that batch for a re-minted retry; a `403` falls
+through as a terminal `http_403` — neither unauthorized nor retryable — so the
+batch is **dropped** and nothing is owed. Measured on the loopback fixture:
+`dropped` stays `0` for the 401 and becomes `1` for the 403, and both leave one
+attempt and a failed batch. `probe_terminal` is true only when the SDK did not
+claim delivery, the recorded status is one of those two, the printed settlement
+matches that status, the SDK's own counters agree with it, the case had exactly
+one attempt, and no other exchange carries the probe's event ID.
+
+For the 401 settlement the retry itself is **not taken**: a further `flush`
+re-attempts the batch, and `shutdown()` re-attempts it and then refuses
+teardown, so no public surface drops it. A witness that allows one attempt per
+case therefore reports the owed retry — it is on the printed not-exercised list
+— and the run ends there; `spool_enabled` is false, so nothing durable survives
+the process and the obligation cannot reach a later run.
+
+Every counted case is judged against the cardinality this run **planned**, not
+one derived from the batch it happens to have sent: `single` exactly one
+accepted event, `realistic-batch` exactly four accepted forming exactly two
+start/end pairs with distinct session ids, `mixed-size` exactly one accepted
+beside one `event_too_large` rejection, and the run exactly four sessions. A
+batch that lost an event would otherwise be measured against its own smaller
+self and pass; the receipt reports `plan_ok`.
 
 | Crash case | What runs |
 | --- | --- |
@@ -215,8 +232,8 @@ probe's event ID.
 The deliberate oversize rejection is a **passing** rejection — it is the
 measurement the `mixed-size` case exists to take — so a complete demonstration
 exits **0** with `contract_match: true`, `rejected_events: 1`, `exit_code: 0`,
-`caller_view_ok: true`, `probe_terminal: true`, `sessions_ok: true` and
-`sessions: 4`. A rejection in any other case fails that case's
+`caller_view_ok: true`, `probe_terminal: true`, `sessions_ok: true`,
+`sessions: 4`, `plan_ok: true` and the probe's settlement. A rejection in any other case fails that case's
 contract and exits **1**. Unexpected responses, a missing case, a second attempt
 at one, transport/SDK failures or incomplete caller-visible evidence also exit
 **1**, with a false contract match or a `sender_error`. Exit **2** means
