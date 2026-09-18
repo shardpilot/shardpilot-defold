@@ -93,7 +93,7 @@ class SenderTest(unittest.TestCase):
                         self.assertIn(field, output)
                     else:
                         self.assertEqual(result, 1)
-                        self.assertEqual(len(calls), 9)
+                        self.assertEqual(len(calls), 10)
                         self.assertTrue(any(call.startswith(canonical) for call in calls))
                         self.assertIn('"lua":', output)
 
@@ -101,14 +101,14 @@ class SenderTest(unittest.TestCase):
         for mode in ("good", "missing_suppressed", "missing_suppressed_observed"):
             with self.subTest(mode=mode):
                 result, requests = self.run_sender(mode)
-                self.assertEqual(len(requests), 9)
-                self.assertEqual(result.returncode, 1)
+                self.assertEqual(len(requests), 10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(json.loads(result.stdout.splitlines()[-1])["contract_match"])
         for mode in ("counter_null", "counter_string", "counter_bool", "counter_negative",
                      "counter_positive", "suppressed_row"):
             with self.subTest(mode=mode):
                 result, requests = self.run_sender(mode)
-                self.assertEqual(len(requests), 9)
+                self.assertEqual(len(requests), 10)
                 self.assertEqual(result.returncode, 1)
                 self.assertFalse(json.loads(result.stdout.splitlines()[-1])["contract_match"])
                 if mode == "suppressed_row":
@@ -116,6 +116,7 @@ class SenderTest(unittest.TestCase):
 
     def run_sender(self, mode="good", omit=None, event_name="play_cta_click", overrides=None):
         requests = []
+        batches = []
         seen = set()
         # Opaque per-run transport marker; never a signed or usable credential.
         verified_marker = os.urandom(32).hex()
@@ -142,12 +143,19 @@ class SenderTest(unittest.TestCase):
                 elif self.path == "/api/v1/crashes/ingest":
                     reply = {"crash_id": "stale-crash-id" if mode == "stale_crash" else body["crash_id"],
                              "suppressed": mode == "crash_suppressed"}
+                    # A grouped acknowledgement carries a fingerprint; the two
+                    # mutants below answer with a blank one and with none.
+                    if mode != "crash_missing_fingerprint":
+                        reply["fingerprint"] = "   " if mode == "crash_blank_fingerprint" else "fixture-fingerprint"
                     if mode != "legacy" and any(not m.get("load_address") or not m.get("size") for m in body.get("modules", [])):
                         status, reply = 400, {"code": "invalid_request", "message": "module bounds required"}
                 else:
+                    batches.append(self.path)
                     rows = []
                     for index, event in enumerate(body["events"]):
                         oversized = len(json.dumps(event, separators=(",", ":")).encode()) > 2048
+                        if mode == "oversize_accepted":
+                            oversized = False
                         duplicate = event["event_id"] in seen and mode != "duplicate_accepted"
                         observed = mode in ("observed", "observed_wrong_count", "missing_suppressed_observed") or (mode == "mixed_observed" and index % 2 == 0)
                         rows.append({"event_id": event["event_id"],
@@ -158,6 +166,13 @@ class SenderTest(unittest.TestCase):
                             seen.add(event["event_id"])
                     if mode == "suppressed_row" and rows:
                         rows[0].update(status="suppressed_no_consent", code="suppressed_no_consent")
+                    # A rejection OUTSIDE mixed-size: only the deliberate
+                    # oversize one is a passing rejection.
+                    if mode == "reject_in_single" and len(batches) == 1:
+                        rows[0].update(status="rejected", code="event_too_large")
+                    # A verdict the sender cannot match to anything it sent.
+                    if mode == "renamed_row" and len(batches) == 1:
+                        rows[0]["event_id"] = rows[0]["event_id"] + "-renamed"
                     rejected = sum(r["status"] in ("rejected", "suppressed_no_consent") for r in rows)
                     duplicates = sum(r["status"] == "duplicate" for r in rows)
                     accepted = sum(r["status"] == "accepted" for r in rows)
@@ -171,7 +186,12 @@ class SenderTest(unittest.TestCase):
                         reply["suppressed"] = {"counter_null": None, "counter_string": "0",
                                                "counter_bool": False, "counter_negative": -1,
                                                "counter_positive": 1}[mode]
-                    if mode != "legacy" and any(e["event_name"] not in ("play_cta_click", "fixture_registered_click") for e in body["events"]):
+                    # The SDK's own session lifecycle names are registered like
+                    # any other plan entry; only the operator-supplied name is
+                    # under test for registration.
+                    registered = ("play_cta_click", "fixture_registered_click",
+                                  "app.session_started", "app.session_ended")
+                    if mode != "legacy" and any(e["event_name"] not in registered for e in body["events"]):
                         status, reply = 400, {"code": "validation_error", "message": "schema_not_found"}
                     if mode == "empty_202":
                         reply = {}
@@ -215,8 +235,8 @@ class SenderTest(unittest.TestCase):
         for mode in ("observed", "mixed_observed"):
             with self.subTest(mode=mode):
                 result, requests = self.run_sender(mode)
-                self.assertEqual(len(requests), 9)
-                self.assertEqual(result.returncode, 1)
+                self.assertEqual(len(requests), 10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(json.loads(result.stdout.splitlines()[-1])["contract_match"])
         result, requests = self.run_sender("observed_wrong_count")
         self.assertFalse(json.loads(result.stdout.splitlines()[-1])["contract_match"])
@@ -224,10 +244,10 @@ class SenderTest(unittest.TestCase):
     def test_stale_crash_ids_fail_each_crash_stage(self):
         result, requests = self.run_sender("stale_crash")
         replies = [json.loads(line) for line in result.stdout.splitlines() if '"latency_ms"' in line]
-        crashes = [r for r in replies if r["stage"] in ("lua_nonfatal", "lua_fatal", "native_frame")]
-        self.assertEqual(len(crashes), 3)
+        crashes = [r for r in replies if r["case"] in send.CRASH_CASES]
+        self.assertEqual(len(crashes), 4)
         for reply in crashes:
-            with self.subTest(stage=reply["stage"]):
+            with self.subTest(case=reply["case"]):
                 self.assertFalse(reply["contract_match"])
         self.assertEqual(result.returncode, 1)
 
@@ -251,7 +271,7 @@ class SenderTest(unittest.TestCase):
 
     def test_grant_and_events_share_verified_identity(self):
         result, requests = self.run_sender("verified_grant")
-        self.assertEqual(len(requests), 9)
+        self.assertEqual(len(requests), 10)
         self.assertTrue(json.loads(result.stdout.splitlines()[-1])["contract_match"])
         self.assertEqual(requests[0][1]["actor_identifier"], "sender-user")
         self.assertEqual(requests[0][1]["kind"], "user_verified")
@@ -262,38 +282,82 @@ class SenderTest(unittest.TestCase):
                     self.assertEqual(event["user_id"], "sender-user")
                     self.assertEqual(event["anonymous_id"], "sender-anonymous")
 
-    def test_actual_sdk_and_all_nine_requests(self):
+    def test_actual_sdk_and_all_ten_exchanges(self):
         result, requests = self.run_sender()
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(len(requests), 9)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(requests), 10)
         self.assertEqual(requests[1][1]["events"][0]["event_name"], "play_cta_click")
         self.assertTrue(all(e["source"] == "client" for r in requests for e in r[1].get("events", [])))
         self.assertEqual(len(requests[2][1]["events"]), 4)
-        self.assertIsNone(requests[-1][2])
-        self.assertEqual(requests[-1][1], requests[1][1])
         replies = [json.loads(line) for line in result.stdout.splitlines() if '"latency_ms"' in line]
-        self.assertEqual(len(replies), 9)
+        self.assertEqual(len(replies), 10)
+        # ONE line per exchange, each carrying the fields a reader keys on.
+        self.assertEqual([r["case"] for r in replies], list(send.CASES))
+        for reply in replies:
+            with self.subTest(case=reply["case"]):
+                for field in ("case", "method", "route", "status", "response_body", "request_id"):
+                    self.assertIn(field, reply)
+                self.assertTrue(reply["route"].startswith("/"))
         self.assertTrue(all(r["request_id"].startswith("fixture-") for r in replies))
-        self.assertEqual(json.loads(result.stdout.splitlines()[-1]), {"requests": 9, "contract_match": True, "rejected_events": 1, "exit_code": 1})
-        mixed = next(r for r in replies if r["stage"] == "mixed_size")
+        self.assertEqual(json.loads(result.stdout.splitlines()[-1]),
+                         {"case": "summary", "requests": 10, "contract_match": True,
+                          "cases": sorted(send.CASES), "one_attempt_per_case": True,
+                          "caller_view_ok": True, "rejected_events": 1, "exit_code": 0})
+        # Two synthetic sessions, each a start and an end, in one batch.
+        batch = next(r for r in replies if r["case"] == "realistic-batch")["request_body"]["events"]
+        self.assertEqual([e["event_name"] for e in batch],
+                         ["app.session_started", "app.session_ended"] * 2)
+        self.assertEqual([e["session_sequence"] for e in batch], [1, 2, 1, 2])
+        self.assertEqual(len({e["session_id"] for e in batch}), 2)
+        self.assertEqual(len({e["event_id"] for e in batch}), 4)
+        self.assertEqual(batch[0]["props"]["entry_point"], "synthetic_sender_first")
+        self.assertEqual([batch[1]["props"]["reason"], batch[3]["props"]["reason"]],
+                         ["completed", "backgrounded"])
+        mixed = next(r for r in replies if r["case"] == "mixed-size")
+        self.assertEqual(mixed["stage"], "mixed_size")
         self.assertEqual(mixed["event_result"]["rejected"], 1)
         self.assertEqual(mixed["event_result"]["events"][1]["code"], "event_too_large")
-        warnings = [json.loads(line)["sdk_warning"] for line in result.stdout.splitlines()
-                    if "sdk_warning" in json.loads(line)]
-        self.assertEqual(len(warnings), 1)
-        self.assertIn(mixed["event_result"]["events"][1]["event_id"], warnings[0])
-        self.assertIn("event_too_large", warnings[0])
+        # The frameless crash form travels on raw_text alone.
+        raw = next(r for r in replies if r["case"] == "raw-text")["request_body"]
+        self.assertNotIn("threads", raw)
+        self.assertIn("stack traceback:", raw["raw_text"])
+        # The admission probe is a FRESH event, never an accepted id, and its
+        # credential is gone at the seam.
+        unauth = next(r for r in replies if r["case"] == "unauthenticated")
+        self.assertFalse(unauth["authorization_present"])
+        self.assertIsNone(requests[-2][2])
+        probe = unauth["request_body"]["events"][0]["event_id"]
+        self.assertEqual(sum(probe in json.dumps(r[1]) for r in requests), 1)
+        # The authenticated replay is the single event's bytes, unchanged.
+        self.assertEqual(requests[-1][1], requests[1][1])
+        single = next(r for r in replies if r["case"] == "single")
+        self.assertEqual(next(r for r in replies if r["case"] == "duplicate")["request_body"],
+                         single["request_body"])
+        # The sender names what it cannot capture instead of leaving the gap
+        # to be inferred from a short log.
+        absent = next(json.loads(line) for line in result.stdout.splitlines()
+                      if json.loads(line).get("case") == "not-exercised")["captures"]
+        self.assertIn("ANR/hang watchdog", absent)
+        self.assertTrue(any("capture_previous" in item for item in absent))
 
     def test_registered_event_override(self):
         result, requests = self.run_sender(event_name="fixture_registered_click")
         names = {e["event_name"] for r in requests for e in r[1].get("events", [])}
-        self.assertEqual(names, {"fixture_registered_click"})
+        self.assertEqual(names, {"fixture_registered_click", "app.session_started", "app.session_ended"})
         self.assertTrue(json.loads(result.stdout.splitlines()[-1])["contract_match"])
 
-    def test_rejected_event_is_nonzero_even_when_contract_matches(self):
+    def test_only_the_mixed_size_rejection_is_a_passing_rejection(self):
+        # The deliberate oversize rejection is the measurement the case exists
+        # to take, so a complete run exits 0 while still recording it.
         result, requests = self.run_sender("legacy")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        summary = json.loads(result.stdout.splitlines()[-1])
+        self.assertEqual((summary["rejected_events"], summary["exit_code"]), (1, 0))
+        # A rejection anywhere else is not.
+        result, requests = self.run_sender("reject_in_single")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertGreater(len(requests), 0)
+        replies = [json.loads(line) for line in result.stdout.splitlines() if '"latency_ms"' in line]
+        self.assertFalse(next(r for r in replies if r["case"] == "single")["contract_match"])
 
     def test_duplicate_replays_identical_sdk_body(self):
         result, requests = self.run_sender("legacy")
@@ -308,7 +372,9 @@ class SenderTest(unittest.TestCase):
         self.assertEqual(modules[0].get("size"), "0x2000")
 
     def test_failure_responses_are_nonzero(self):
-        for mode in ("unauth_allowed", "wrong_reason", "empty_202", "crash_suppressed", "redirect", "duplicate_accepted"):
+        for mode in ("unauth_allowed", "wrong_reason", "empty_202", "crash_suppressed", "redirect",
+                     "duplicate_accepted", "oversize_accepted", "renamed_row",
+                     "crash_blank_fingerprint", "crash_missing_fingerprint", "reject_in_single"):
             with self.subTest(mode=mode):
                 result, requests = self.run_sender(mode)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -329,10 +395,100 @@ class SenderTest(unittest.TestCase):
 
     def test_server_echo_of_key_is_redacted(self):
         result, requests = self.run_sender("echo_key")
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(len(requests), 9)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(requests), 10)
         self.assertTrue(json.loads(result.stdout.splitlines()[-1])["contract_match"])
         self.assertIn("[REDACTED]", result.stdout)
+
+    def test_run_plan_aggregate_checker_reads_the_log(self):
+        """The production run plan checks the four disjoint counters from this
+        log with its own script. That script keys on `case`, one line per
+        exchange, with the Go witness's case names — so it is reproduced here
+        verbatim against a real run instead of being trusted to still fit."""
+        result, requests = self.run_sender()
+        expected = {'single': (1, 0, 0, 0), 'realistic-batch': (4, 0, 0, 0),
+                    'mixed-size': (1, 1, 0, 0)}
+        seen = set()
+        for line in result.stdout.splitlines():
+            if not line.startswith('{'):
+                continue
+            exchange = json.loads(line)
+            case = exchange['case']
+            if case not in expected:
+                continue
+            self.assertNotIn(case, seen, 'duplicate exchange')
+            seen.add(case)
+            self.assertEqual(exchange['status'], 202, case)
+            body = json.loads(exchange['response_body'])
+            got = tuple(body[k] for k in ('accepted', 'rejected', 'duplicates', 'suppressed'))
+            self.assertTrue(all(type(n) is int and n >= 0 for n in got), case)
+            self.assertEqual(got, expected[case], case)
+            self.assertEqual(sum(got), len(body['events']), case)
+        self.assertEqual(seen, set(expected))
+
+    def test_caller_sees_the_mixed_outcome_through_the_sdk(self):
+        result, requests = self.run_sender()
+        lines = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+        mixed = next(r for r in lines if r.get("case") == "mixed-size")
+        rejected_id = mixed["event_result"]["events"][1]["event_id"]
+        # The retained queue, read through the public API.
+        view = next(r for r in lines if r.get("case") == "caller-view")
+        self.assertEqual(view["source"], "client:get_rejections()")
+        self.assertEqual([(row["event_id"], row["code"]) for row in view["sdk_rejections"]],
+                         [(rejected_id, "event_too_large")])
+        # The documented hook, which is how an integrator learns it inside a 202.
+        told = [r["issue"] for r in lines if r.get("case") == "sdk-issue"
+                and r["issue"].get("event_id") == rejected_id]
+        self.assertEqual([issue["code"] for issue in told], ["event_too_large"])
+        # Installing the hook replaces the SDK's default print warnings.
+        self.assertNotIn('"sdk-warning"', result.stdout)
+        # The accepted sibling is acknowledged, and the rejected event is not
+        # resent although a second flush followed it.
+        self.assertEqual(mixed["event_result"]["events"][0]["status"], "accepted")
+        self.assertEqual(sum(r.get("case") == "mixed-size" for r in lines), 1)
+        self.assertEqual(sum(rejected_id in json.dumps(r[1]) for r in requests), 1)
+        self.assertTrue(json.loads(result.stdout.splitlines()[-1])["caller_view_ok"])
+
+    def caller_view_state(self):
+        """An in-memory sender whose row-4.5 evidence is complete. No network,
+        no Lua run: the point is what the CHECK does, one field at a time."""
+        sender = send.Sender({name: "synthetic-" + name for name in send.FIELDS})
+        sender.oversize_event_id = "big"
+        sender.records = [{"case": "mixed-size",
+                           "request_body": {"events": [{"event_id": "small"}, {"event_id": "big"}]},
+                           "event_result": {"events": [{"event_id": "small", "status": "accepted"},
+                                                       {"event_id": "big", "status": "rejected"}]}}]
+        sender.rejections = [{"event_id": "big", "code": "event_too_large"}]
+        sender.issues = [{"event_id": "big", "code": "event_too_large"}]
+        return sender
+
+    def test_caller_view_check_fails_on_a_resend_or_an_unread_queue(self):
+        self.assertTrue(self.caller_view_state().caller_view_holds())
+        # A resend of the rejected event: the same id in a second request body.
+        resent = self.caller_view_state()
+        resent.records.append({"case": "single", "request_body": {"events": [{"event_id": "big"}]},
+                               "event_result": None})
+        self.assertFalse(resent.caller_view_holds())
+        # The queue never read, or the hook never called: the evidence that the
+        # caller was told is missing, so the row does not hold.
+        unread = self.caller_view_state()
+        unread.rejections = []
+        self.assertFalse(unread.caller_view_holds())
+        untold = self.caller_view_state()
+        untold.issues = []
+        self.assertFalse(untold.caller_view_holds())
+        # A queue that names an event this run never sent.
+        foreign = self.caller_view_state()
+        foreign.rejections = [{"event_id": "other", "code": "event_too_large"}]
+        self.assertFalse(foreign.caller_view_holds())
+        # The accepted sibling unacknowledged.
+        silent = self.caller_view_state()
+        silent.records[0]["event_result"]["events"][0]["status"] = "rejected"
+        self.assertFalse(silent.caller_view_holds())
+        # A second attempt at the case at all.
+        twice = self.caller_view_state()
+        twice.records.append(dict(twice.records[0]))
+        self.assertFalse(twice.caller_view_holds())
 
 
 if __name__ == "__main__":

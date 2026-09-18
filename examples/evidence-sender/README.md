@@ -34,6 +34,24 @@ The operator must supply these **exported environment variables** before running
 | `SP_CRASH_APP_ID` | App identity expected by the crash key; verify its mapping explicitly |
 | `SP_EVENT_NAME` | Optional registered tracking-plan name; defaults to `play_cta_click` |
 
+These `SP_*` names are this repository's own convention and are unchanged. The
+Go protocol witness (`shardpilot-go`, `examples/evidence`) reads the same facts
+under `SHARDPILOT_*` names; an operator injecting both senders in one run maps
+them as follows. `SP_USER_ID`, `SP_CRASH_APP_ID` and `SP_EVENT_NAME` have no Go
+counterpart: the Go sender is anonymous-only, scopes crashes by `SHARDPILOT_APP_ID`
+and sends `app.session_started`.
+
+| This sender | Go witness |
+| --- | --- |
+| `SP_INGEST_URL` | `SHARDPILOT_INGEST_URL` |
+| `SP_INGEST_TOKEN` | `SHARDPILOT_TOKEN` (the Go sender accepts a publishable ingest credential; this one requires a Mode B token because it also records consent) |
+| `SP_ANONYMOUS_ID` | `SHARDPILOT_ANONYMOUS_ID` |
+| `SP_WORKSPACE_ID` | `SHARDPILOT_WORKSPACE_ID` |
+| `SP_APP_ID` | `SHARDPILOT_APP_ID` |
+| `SP_ENVIRONMENT_ID` | `SHARDPILOT_ENVIRONMENT_ID` |
+| `SP_CRASH_URL` | `SHARDPILOT_CRASH_INGEST_URL` |
+| `SP_CRASH_KEY` | `SHARDPILOT_API_KEY` |
+
 Do not paste credentials into commands, files, reports or shell history. The
 sender reads them from its process environment. Both URLs require HTTPS except
 on loopback; redirects and ambient HTTP proxies are disabled. No endpoint is
@@ -68,23 +86,45 @@ Exact run command, without a pipe:
 .venv-evidence-sender/bin/python examples/evidence-sender/send.py
 ```
 
-The sequence is: grant analytics consent for the configured synthetic verified user;
-send one event through the SDK's `track` API; send a batch of four synthetic clicks;
-send a small event beside one with 2,500 padding characters; send three crash
-reports; replay the minimal SDK body with its original Authorization and event ID;
-then replay it without Authorization. All events use `SP_EVENT_NAME` and source
-`client`. The target must register that name and permit the synthetic properties.
-An unregistered name can reject the whole batch with 400, unlike an oversize
-element's rejection within 202. The two replays use captured SDK bytes directly;
-they demonstrate the HTTP contracts, not the SDK's retry scheduler. Compression
-is disabled so the byte counts describe sent elements. No automatic retry loop,
-polling or shutdown event is added.
+The run is **ten exchanges, one HTTP attempt each**, named with the Go protocol
+witness's case names so one aggregate checker reads either sender's log:
 
-Each request prints its URL, method, complete synthetic body and element sizes;
-each response prints HTTP status, body, request ID (`MISSING` when absent), latency
-and `contract_match`, plus parsed counters and per-event status/code/message.
-Authorization values are never printed; configured keys
-are scrubbed from echoed response/error text. Output is newline-delimited JSON.
+| Case | What the SDK does | Go witness case |
+| --- | --- | --- |
+| `consent` | `set_consent(true)` for the configured verified user | none (the Go sender grants nothing) |
+| `single` | one `track` of `SP_EVENT_NAME` | `single` |
+| `realistic-batch` | two `session_start`/`session_end` pairs in ONE batch: four events, two sessions, each carrying sequence 1 for its start and 2 for its end, with an entry point and an end reason (finished, then backgrounded) | `realistic-batch` |
+| `mixed-size` | one small `track` beside one with 2,500 padding characters, in ONE batch | `mixed-size` |
+| `lua-nonfatal` | `emit` | none (Go has no nonfatal form) |
+| `lua-fatal` | `emit_fatal`, pre-symbolicated Lua frame | `go-panic` |
+| `native-json` | `emit_fatal`, synthetic SIGSEGV address plus module/debug identity | `native-json` |
+| `raw-text` | `emit_fatal` with `raw_text` and no frames | `raw-text` |
+| `unauthenticated` | a FRESH `track` whose Authorization the host removes at the transport seam | `unauthenticated` |
+| `duplicate` | the `single` event's captured bytes replayed once, authenticated | none |
+
+Analytics events other than the session pair use `SP_EVENT_NAME`; every event
+uses source `client`. The target must register that name, the two
+`app.session_*` names and the synthetic properties. An unregistered name can
+reject the whole batch with 400, unlike an oversize element's rejection within
+202. The `unauthenticated` case is a fresh SDK event, never a replay of an
+accepted one: reusing an accepted event ID would make the "no stored facts from
+this ID" readback unjudgeable. Only `duplicate` replays captured bytes; it
+demonstrates the idempotency contract, not the SDK's retry scheduler.
+Compression is disabled so the byte counts describe sent elements. No automatic
+retry loop, polling or shutdown event is added.
+
+Output is newline-delimited JSON, and **every line carries a `case` key** —
+including the runtime banner, the not-exercised list, SDK diagnostics and the
+final summary — so a reader that keys on it never faults on a line it should
+skip. Each attempted exchange is **one** line carrying `case`, `method`, `route`,
+`status`, `response_body` and `request_id`, plus this sender's own detail: the
+full synthetic request body, element sizes, `url`, `authorization_present`,
+`latency_ms`, parsed counters with per-event status/code/message, and
+`contract_match`. `request_id` prints `MISSING` where the Go witness prints an
+empty string. `stage` rides beside `case` carrying this sender's earlier name
+(`minimal`, `batch`, `mixed_size`, `native_frame`) so an older evidence log
+stays comparable. Authorization values are never printed; configured keys are
+scrubbed from echoed response/error text.
 
 The size check expects **202 with one accepted/observed small event and one
 `event_too_large` rejection**, matched by event ID. It requires per-element size
@@ -99,27 +139,43 @@ member may be absent; when supplied it must be the integer zero. Per-event
 expected outcomes after its verified grant. Unauthenticated must
 return 401 or 403. The authenticated replay requires one `duplicate` with
 `duplicate_event_id` and zero accepted/rejected/suppressed. Consent must report
-`recorded: true`. Crashes require 202,
-the exact submitted crash ID and no suppression; warnings remain printed, and do not prove
-symbolication. A successful ingest reply alone does not prove downstream storage.
+`recorded: true`. Crashes require 202, the exact submitted crash ID, a
+**fingerprint with non-whitespace content** and no suppression: an
+acknowledgement without one leaves the report ungrouped, so a blank or absent
+fingerprint fails the case. None of this proves symbolication, and a successful
+ingest reply alone does not prove downstream storage.
+
+The mixed outcome is also measured **as the calling game sees it**, which is the
+row a transport-only witness cannot close. The sender installs the SDK's
+documented `diagnostics` hook and reads `client:get_rejections()` after the
+flush, so the rejected event ID and its `event_too_large` reason are recorded
+from the SDK's own surfaces rather than inferred from the HTTP body the host
+already holds; the accepted sibling must be acknowledged in the same reply. A
+second flush then follows with nothing to publish, which is how the evidence
+shows the rejected event was not re-queued: the rejected ID appears in exactly
+one request body for the whole run, and every case has exactly one attempt.
+Installing the hook replaces the SDK's default `print` warnings, so those
+warnings no longer appear in a healthy run.
 
 | Crash case | What runs |
 | --- | --- |
 | Lua nonfatal | SDK `emit`, with sampling set to send every report |
 | Lua fatal | SDK `emit_fatal`, pre-symbolicated Lua frame |
 | Native frame | SDK `emit_fatal`, synthetic SIGSEGV address plus module/debug identity, `load_address` and `size` |
+| Frameless raw text | SDK `emit_fatal` with `raw_text` and no frames — the wire shape a script-error traceback ships in |
 | Previous-session engine dump / script-error hook | SDK supports these, but this sender does not crash an engine, load a real dump or exercise `sys.set_error_handler` |
 | ANR/hang watchdog, minidump upload, Android tombstone upload, UE crash-context upload | No dedicated producer in this pure-Lua SDK; not emulated or claimed |
 
-The full nine-request demonstration deliberately rejects one oversized event and
-therefore exits **1**, even when every expected contract matches. Its final record
-then has `contract_match: true`, `rejected_events: 1`, `exit_code: 1`. A 202 with
-rejected events never produces a zero exit. Unexpected responses, transport/SDK
-failures, incomplete evidence or missing requests also exit **1**, with a false
-contract match or a `sender_error`. Exit **2** means invalid/missing environment
-configuration. The runner permits exit **0** only with all contracts matching and
-no rejected events; that is not the expected full-demo outcome. The test command
-below exits zero when these positive and negative controls behave correctly.
+The deliberate oversize rejection is a **passing** rejection — it is the
+measurement the `mixed-size` case exists to take — so a complete demonstration
+exits **0** with `contract_match: true`, `rejected_events: 1`, `exit_code: 0`,
+and `caller_view_ok: true`. A rejection in any other case fails that case's
+contract and exits **1**. Unexpected responses, a missing case, a second attempt
+at one, transport/SDK failures or incomplete caller-visible evidence also exit
+**1**, with a false contract match or a `sender_error`. Exit **2** means
+invalid/missing environment configuration. The exit code is therefore usable
+directly as a receipt; earlier revisions of this example exited 1 on a fully
+successful run, and a runner that still expects that will misread a good run.
 
 An unavailable Python/Lupa installation fails before the sender starts. Each run
 creates fresh event/crash IDs under the configured synthetic identity and sends

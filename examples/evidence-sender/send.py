@@ -17,6 +17,24 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 FIELDS = ("ingest_url", "ingest_token", "user_id", "anonymous_id",
           "workspace_id", "app_id", "environment_id", "crash_url", "crash_key", "crash_app_id")
+# The case names are the Go protocol witness's, because an aggregate checker
+# reads them: keep `single`, `realistic-batch` and `mixed-size` spelled exactly
+# so a log from this sender is readable by the same script. `stage` rides beside
+# `case` carrying this sender's earlier name for older evidence logs.
+LEGACY_STAGES = {"single": "minimal", "realistic-batch": "batch", "mixed-size": "mixed_size",
+                 "lua-nonfatal": "lua_nonfatal", "lua-fatal": "lua_fatal", "native-json": "native_frame"}
+CRASH_CASES = ("lua-nonfatal", "lua-fatal", "native-json", "raw-text")
+CASES = ("consent", "single", "realistic-batch", "mixed-size") + CRASH_CASES + ("unauthenticated", "duplicate")
+# Captures this pure-Lua SDK cannot produce headlessly. Printed as absent
+# rather than simulated: a fabricated platform capture would read exactly like
+# a real one in the evidence.
+NOT_EXERCISED = (
+    "previous-session engine dump (crash.capture_previous needs the Defold crash module)",
+    "sys.set_error_handler installation and the script-error hook it feeds",
+    "ANR/hang watchdog", "minidump upload", "Android tombstone upload",
+    "Unreal crash-context upload", "symbolication of the native fixture",
+    "session_ended duration_ms property (session_end carries only a reason)",
+)
 
 
 class RefuseRedirect(request.HTTPRedirectHandler):
@@ -86,20 +104,26 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
-def check_reply(stage, sent, status, body):
-    if stage == "unauthenticated":
+def check_reply(case, sent, status, body):
+    if case == "unauthenticated":
         return status in (401, 403)
-    if status != 202 and stage != "consent":
+    if status != 202 and case != "consent":
         return False
     try:
         reply = json.loads(body)
         if not isinstance(reply, dict):
             return False
-        if stage == "consent":
+        if case == "consent":
             return 200 <= status < 300 and reply.get("recorded") is True
-        if stage in ("lua_nonfatal", "lua_fatal", "native_frame"):
+        if case in CRASH_CASES:
+            # A fingerprint is what makes the acknowledgement a GROUPED crash
+            # rather than an accepted byte count; an absent or blank one leaves
+            # the report unattributable, so it fails the case here as it does
+            # for the Go witness.
             return (isinstance(reply.get("crash_id"), str) and bool(reply["crash_id"].strip())
-                    and reply["crash_id"] == sent["crash_id"] and reply.get("suppressed") is not True)
+                    and reply["crash_id"] == sent["crash_id"]
+                    and isinstance(reply.get("fingerprint"), str) and bool(reply["fingerprint"].strip())
+                    and reply.get("suppressed") is not True)
         events = sent["events"]
         rows = reply["events"]
         suppressed = reply.get("suppressed", 0)
@@ -112,8 +136,8 @@ def check_reply(stage, sent, status, body):
             return False
         for event in events:
             row = by_id[event["event_id"]]
-            oversized = stage == "mixed_size" and len(encode(event).encode()) > 2048
-            if stage == "duplicate":
+            oversized = case == "mixed-size" and len(encode(event).encode()) > 2048
+            if case == "duplicate":
                 if row.get("status") != "duplicate" or row.get("code") != "duplicate_event_id":
                     return False
             elif oversized:
@@ -121,8 +145,8 @@ def check_reply(stage, sent, status, body):
                     return False
             elif row.get("status") not in ("accepted", "observed"):
                 return False
-        rejected = 1 if stage == "mixed_size" else 0
-        duplicates = len(events) if stage == "duplicate" else 0
+        rejected = 1 if case == "mixed-size" else 0
+        duplicates = len(events) if case == "duplicate" else 0
         accepted = sum(row.get("status") == "accepted" for row in rows)
         return (reply.get("accepted") == accepted
                 and reply.get("rejected") == rejected and reply.get("duplicates") == duplicates
@@ -134,9 +158,15 @@ def check_reply(stage, sent, status, body):
 class Sender:
     def __init__(self, config):
         self.config = config
-        self.stage = "setup"
+        self.case = "setup"
         self.records = []
+        self.raw = {}
         self.rejected_events = 0
+        # What the SDK told the CALLER, through the two documented surfaces:
+        # the diagnostics hook and the retained rejection queue.
+        self.issues = []
+        self.rejections = []
+        self.oversize_event_id = ""
         self.lua = LuaRuntime(unpack_returned_tuples=True)
         self.opener = request.build_opener(request.ProxyHandler({}), RefuseRedirect())
 
@@ -148,16 +178,28 @@ class Sender:
                 line = line.replace(secret, "[REDACTED]")
         print(line, flush=True)
 
+    def record_issue(self, issue):
+        self.issues.append(issue)
+        self.log({"case": "sdk-issue", "issue": issue})
+
+    def record_rejections(self, rows):
+        self.rejections = rows if isinstance(rows, list) else []
+        self.log({"case": "caller-view", "sdk_rejections": self.rejections,
+                  "source": "client:get_rejections()"})
+
     def exchange(self, url, method, headers, body):
         sent = json.loads(body)
-        if self.stage == "mixed_size":
+        if self.case == "mixed-size":
             sizes = [len(encode(e).encode()) for e in sent["events"]]
             if len(sizes) != 2 or not (sizes[0] <= 2048 < sizes[1]):
-                raise ValueError("mixed_size did not contain one small and one oversize SDK event")
+                raise ValueError("mixed-size did not contain one small and one oversize SDK event")
+            self.oversize_event_id = sent["events"][1]["event_id"]
         else:
             sizes = [len(encode(e).encode()) for e in sent.get("events", [])]
-        self.log({"stage": self.stage, "method": method, "url": url,
-                  "sent": sent, "event_bytes": sizes, "authorization_present": "Authorization" in headers})
+        if self.case == "unauthenticated":
+            # The credential is removed at the transport boundary rather than
+            # withheld from the SDK, so the envelope is the one the SDK built.
+            headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
         started = time.perf_counter()
         status, received, response_headers = 0, "", {}
         try:
@@ -175,7 +217,7 @@ class Sender:
                 received = raw.decode("utf-8")
         except (OSError, ValueError) as exc:
             status, received = 0, str(exc)
-        passed = check_reply(self.stage, sent, status, received)
+        passed = check_reply(self.case, sent, status, received)
         event_result = None
         try:
             reply = json.loads(received)
@@ -185,26 +227,58 @@ class Sender:
                     self.rejected_events += reply["rejected"]
         except ValueError:
             pass
-        self.log({"stage": self.stage, "status": status, "body": received,
+        # ONE line per attempted exchange, carrying the request detail beside
+        # the reply: an aggregate checker reads `case`, `status` and
+        # `response_body` from a single record. `request_id` prints MISSING
+        # where the Go witness prints an empty string.
+        record = {"case": self.case, "stage": LEGACY_STAGES.get(self.case, self.case),
+                  "method": method, "route": parse.urlsplit(url).path or "/", "url": url,
+                  "status": status, "response_body": received,
                   "request_id": response_headers.get("x-request-id", "MISSING"),
+                  "request_body": sent, "event_bytes": sizes,
+                  "authorization_present": any(k.lower() == "authorization" for k in headers),
                   "latency_ms": round((time.perf_counter() - started) * 1000, 3),
-                  "event_result": event_result, "contract_match": passed})
-        self.records.append((self.stage, passed, url, method, headers, body))
+                  "event_result": event_result, "contract_match": passed}
+        self.log(record)
+        self.records.append(record)
+        self.raw.setdefault(self.case, (url, method, headers, body))
         return {"status": status, "response": received, "headers": response_headers}
 
     def http(self, url, method, callback, headers, body, options):
         response = self.exchange(url, method, from_lua(headers), body)
         callback(None, None, self.lua.table_from(response, recursive=True))
 
+    def caller_view_holds(self):
+        """The mixed outcome as the CALLER sees it: the accepted sibling
+        acknowledged, the rejected id and its reason retained and handed to the
+        diagnostics hook, and the rejected event never sent again."""
+        mixed = [r for r in self.records if r["case"] == "mixed-size"]
+        if len(mixed) != 1 or not self.oversize_event_id:
+            return False
+        rows = (mixed[0].get("event_result") or {}).get("events") or []
+        sibling = [row for row in rows if row.get("event_id") != self.oversize_event_id]
+        if len(sibling) != 1 or sibling[0].get("status") not in ("accepted", "observed"):
+            return False
+        retained = [r for r in self.rejections if r.get("event_id") == self.oversize_event_id]
+        told = [i for i in self.issues if i.get("event_id") == self.oversize_event_id]
+        carried = sum(self.oversize_event_id in encode(r["request_body"]) for r in self.records)
+        return (len(self.rejections) == 1 and len(retained) == 1
+                and retained[0].get("code") == "event_too_large"
+                and len(told) == 1 and told[0].get("code") == "event_too_large"
+                and carried == 1)
+
     def run(self):
         g = self.lua.globals()
         # Keep embedded Lua warnings inside the redacted JSON evidence stream.
-        g.print = lambda *values: self.log({"sdk_warning": "\t".join(str(v) for v in values)})
+        g.print = lambda *values: self.log({"case": "sdk-warning",
+                                            "sdk_warning": "\t".join(str(v) for v in values)})
         g.bridge_encode = lambda v: encode(from_lua(v))
         g.bridge_decode = lambda v: self.lua.table_from(json.loads(v), recursive=True)
         g.bridge_http = self.http
         g.bridge_time = time.time
-        g.bridge_stage = lambda value: setattr(self, "stage", value)
+        g.bridge_stage = lambda value: setattr(self, "case", value)
+        g.bridge_issue = lambda value: self.record_issue(from_lua(value))
+        g.bridge_rejections = lambda value: self.record_rejections(from_lua(value))
         g.package.path = str(ROOT / "?.lua") + ";" + str(ROOT / "?" / "init.lua")
         self.lua.execute("""
             json = { encode = function(v) return bridge_encode(v) end,
@@ -212,25 +286,35 @@ class Sender:
             http = { request = function(...) return bridge_http(...) end }
             socket = { gettime = function() return bridge_time() end }
             stage = function(v) bridge_stage(v) end
+            report_issue = function(v) bridge_issue(v) end
+            report_rejections = function(v) bridge_rejections(v) end
         """)
-        self.log({"python": platform.python_version(), "lupa": lupa.__version__,
+        self.log({"case": "runtime", "python": platform.python_version(), "lupa": lupa.__version__,
                   "lua": self.lua.lua_implementation, "sdk": str(ROOT / "shardpilot"),
                   "coverage": "headless SDK + HTTP; no Defold engine, persistence or real native crash"})
+        self.log({"case": "not-exercised", "captures": list(NOT_EXERCISED)})
         self.lua.execute((HERE / "send.lua").read_text())(self.lua.table_from(self.config))
-        # Replay the actual SDK wire bytes, first authenticated to measure
-        # idempotency, then without Authorization to measure admission.
-        minimal = next(r for r in self.records if r[0] == "minimal")
-        self.stage = "duplicate"
-        self.exchange(minimal[2], minimal[3], minimal[4], minimal[5])
-        self.stage = "unauthenticated"
-        self.exchange(minimal[2], minimal[3], {k: v for k, v in minimal[4].items()
-                                             if k.lower() != "authorization"}, minimal[5])
-        expected = {"consent", "minimal", "batch", "mixed_size", "lua_nonfatal",
-                    "lua_fatal", "native_frame", "duplicate", "unauthenticated"}
-        passed = len(self.records) == 9 and {r[0] for r in self.records} == expected and all(r[1] for r in self.records)
-        exit_code = 1 if not passed or self.rejected_events else 0
-        self.log({"requests": len(self.records), "contract_match": passed,
-                  "rejected_events": self.rejected_events, "exit_code": exit_code})
+        # Replay the actual SDK wire bytes of the single event, authenticated,
+        # to measure idempotency. The unauthenticated case is its own fresh SDK
+        # event (send.lua), never this id.
+        url, method, headers, body = self.raw["single"]
+        self.case = "duplicate"
+        self.exchange(url, method, headers, body)
+        by_case = {}
+        for record in self.records:
+            by_case.setdefault(record["case"], []).append(record)
+        one_attempt = all(len(attempts) == 1 for attempts in by_case.values())
+        caller_view = self.caller_view_holds()
+        passed = (set(by_case) == set(CASES) and one_attempt and caller_view
+                  and all(record["contract_match"] for record in self.records))
+        # The deliberate oversize rejection is a PASSING rejection: it is the
+        # measurement the mixed-size case exists to take. A rejection in any
+        # other case fails that case's contract above, so it still exits 1.
+        exit_code = 0 if passed else 1
+        self.log({"case": "summary", "requests": len(self.records), "contract_match": passed,
+                  "cases": sorted(by_case), "one_attempt_per_case": one_attempt,
+                  "caller_view_ok": caller_view, "rejected_events": self.rejected_events,
+                  "exit_code": exit_code})
         return exit_code
 
 
@@ -238,13 +322,15 @@ def main():
     try:
         config = configuration()
     except ValueError as exc:
-        print(encode({"configuration_error": str(exc), "exit_code": 2}))
+        # Every JSON line carries `case`, including this one: a reader that
+        # keys on it must not fault on a configuration-failure log.
+        print(encode({"case": "configuration", "configuration_error": str(exc), "exit_code": 2}))
         return 2
     sender = Sender(config)
     try:
         return sender.run()
     except Exception as exc:
-        sender.log({"sender_error": str(exc), "exit_code": 1})
+        sender.log({"case": "sender-error", "sender_error": str(exc), "exit_code": 1})
         return 1
 
 
