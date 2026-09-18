@@ -1804,6 +1804,63 @@ local function test_a_zero_window_does_not_spin()
 	assert_true(calls:find("sdk.init", 1, true) ~= nil, "a live window must run the lane: " .. calls)
 end
 
+-- ⚠ A DUPLICATE KEY IS AMBIGUOUS AT EVERY DEPTH. The root walk refused them
+-- and the nested walk skipped values whole, so a scope carrying workspace_id
+-- twice — once the caller's, once another tenant's — was decided silently by
+-- the decoder, last one wins, and then compared against the caller's own scope
+-- and passed.
+local function test_nested_duplicate_keys_are_refused()
+	local cases = {
+		{ "scope", '"workspace_id":"ws-other",', '"scope":{' },
+		{ "age_band", '"band":"minor",', '"age_band":{' },
+		{ "a signal", '"name":"other",', '"signals_used":[{' },
+	}
+	for _, case in ipairs(cases) do
+		reset()
+		local body = plan({ age_band = { vocabulary = "coarse.v1", band = "adult" } })
+		-- The duplicate is spliced INSIDE the nested object, so the root walk
+		-- sees one occurrence of the outer key and this is genuinely nested.
+		next_response_body = body:gsub(case[3]:gsub("%p", "%%%0"), case[3] .. case[2], 1)
+		assert_true(next_response_body ~= body, "the fixture must carry " .. case[1])
+		local decision = prepare()
+		assert_true(not decision.plan_used,
+			"a duplicate key inside " .. case[1] .. " must not be used: " .. tostring(decision.reason))
+	end
+
+	-- The control: the same nested objects spelled once each still parse.
+	reset()
+	next_response_body = plan({ age_band = { vocabulary = "coarse.v1", band = "adult" } })
+	assert_true(prepare().plan_used, "well-formed nested objects must parse")
+end
+
+-- ⚠ THE CALLER'S FIELD NAMES ARE A CLOSED SET TOO, and the shape this takes in
+-- practice is a typo: `age_bnad` is silently no age band at all, so the request
+-- goes out claiming this player has none.
+local function test_an_unknown_context_field_is_refused()
+	for _, override in ipairs({
+		{ age_bnad = { vocabulary = "coarse.v1", band = "adult" } },
+		{ workspace = "ws-synthetic" },
+		{ user_id = "player-1" },
+	}) do
+		reset()
+		next_response_body = plan()
+		local decision, calls = prepare(context(override))
+		assert_equal(calls, 1, "exactly one callback")
+		assert_equal(#requests, 0, "an unknown context field must cost zero requests")
+		assert_equal(decision.reason, "invalid_request")
+		assert_true(decision.optional_processing_closed, "and the verdict is closed")
+	end
+
+	-- The control: every field the context DOES have must still be accepted,
+	-- including the optional ones, or this rule would refuse valid callers.
+	reset()
+	next_response_body = plan()
+	assert_true(prepare(context({
+		store = "steam",
+		age_band = { vocabulary = "coarse.v1", band = "adult" },
+	})).plan_used, "a context using every optional field must be accepted")
+end
+
 local tests = {
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,
@@ -1852,6 +1909,8 @@ local tests = {
 	test_an_error_envelope_keeps_its_reason,
 	test_the_example_notices_a_failed_write,
 	test_a_zero_window_does_not_spin,
+	test_nested_duplicate_keys_are_refused,
+	test_an_unknown_context_field_is_refused,
 }
 
 for _, test in ipairs(tests) do

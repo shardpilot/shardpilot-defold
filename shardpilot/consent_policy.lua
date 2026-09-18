@@ -203,6 +203,12 @@ skip_value = function(text, pos, depth)
 		return after
 	elseif c == "{" or c == "[" then
 		local close = c == "{" and "}" or "]"
+		-- ⚠ DUPLICATE KEYS ARE AMBIGUOUS AT EVERY DEPTH, NOT ONLY AT THE ROOT.
+		-- The root walk refused them and this one skipped nested values whole,
+		-- so a scope carrying workspace_id twice — once the caller's, once
+		-- another tenant's — was decided silently by the decoder, last one
+		-- wins, and then compared against the caller's own scope.
+		local seen = c == "{" and {} or nil
 		pos = skip_space(text, pos + 1)
 		if text:sub(pos, pos) == close then
 			return pos + 1
@@ -212,10 +218,14 @@ skip_value = function(text, pos, depth)
 				if text:sub(pos, pos) ~= '"' then
 					return nil
 				end
-				local _, after = read_string(text, pos)
+				local nested_key, after = read_string(text, pos)
 				if not after then
 					return nil
 				end
+				if seen[nested_key] then
+					return nil
+				end
+				seen[nested_key] = true
 				pos = skip_space(text, after)
 				if text:sub(pos, pos) ~= ":" then
 					return nil
@@ -605,9 +615,31 @@ end
 
 -- Validates the CALLER's context before anything is sent. A value outside the
 -- closed vocabulary never reaches the wire.
+-- ⚠ THE CALLER'S FIELD NAMES ARE A CLOSED SET FOR THE SAME REASON THE PLAN'S
+-- ARE. A key we do not read is a context we cannot say we understood, and the
+-- shape it actually takes in practice is a typo: `age_bnad` is silently no age
+-- band at all, so the request goes out claiming this player has none.
+local CONTEXT_KEYS = {
+	endpoint = true,
+	workspace_id = true,
+	app_id = true,
+	environment_id = true,
+	app_version = true,
+	store = true,
+	store_region = true,
+	locale = true,
+	platform = true,
+	age_band = true,
+}
+
 function M.validate_context(context)
 	if type(context) ~= "table" then
 		return false, "the context must be a table"
+	end
+	for key in pairs(context) do
+		if not CONTEXT_KEYS[key] then
+			return false, "the context carries an unknown field"
+		end
 	end
 	for _, field in ipairs({ "workspace_id", "app_id", "environment_id" }) do
 		if not bounded_string(context[field], MAX_ENTRY) then

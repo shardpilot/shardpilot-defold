@@ -126,10 +126,13 @@ the artifact being withdrawn.
 
 The historical `v0.10.1` tag lacks request compression, the 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history. These are included in `v0.10.2`.
 
-Then require the module:
+Then require the modules. **The policy module is the one the startup path
+begins with** — see the quick start below and
+[Consent regime](#consent-regime):
 
 ```lua
-local shardpilot = require "shardpilot.sdk"
+local consent_policy = require "shardpilot.consent_policy" -- resolve FIRST
+local shardpilot = require "shardpilot.sdk"                -- init inside its callback
 ```
 
 ## Quick start
@@ -1161,6 +1164,16 @@ implement all three.
   it, and never `init()` over a live client.** The analytics client has the
   same pending posture, and a re-`init` while one is still settling produces
   two clients over one spool.
+- **Fence superseded same-context resolutions in the host.** The module
+  refuses a response from an older dispatch for the same context, so a stale
+  *policy* cannot deliver — but the host's own callbacks are not fenced: two
+  reconcile paths in flight can still apply out of order. A production
+  integration keeps a resolution generation and ignores any callback that is
+  not the newest.
+- **Back off after a transient strict fallback while foregrounded.** A
+  fallback carries no `valid_for_seconds`, so nothing is scheduled and the
+  next resolution waits for an unrelated trigger. A host that wants to recover
+  from a brief outage needs its own bounded, backed-off retry.
 - **Fence asynchronous callbacks and remove the window listener in
   `final()`.** A policy resolution or a notice answer that arrives after
   teardown will happily start a lane on a torn-down script; the host needs a
