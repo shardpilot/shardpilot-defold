@@ -134,16 +134,46 @@ when the decision permits it:
 ```lua
 local consent_policy = require "shardpilot.consent_policy"
 local platform = require "shardpilot.platform"
+local shardpilot = require "shardpilot.sdk"
 
-consent_policy.prepare({
-  endpoint       = "<YOUR-POLICY-BASE-URL>", -- a third service; https, or http only for loopback
-  workspace_id   = "<YOUR-WORKSPACE-ID>",
-  app_id         = "<YOUR-APP-ID>",
-  environment_id = "develop",
-  app_version    = "1.2.3",
-  locale         = "en",
-  platform       = platform.detect(),
-}, function(decision)
+-- ONE context, used by every resolution. Two copies is how they drift apart.
+local function policy_context()
+  return {
+    endpoint       = "<YOUR-POLICY-BASE-URL>", -- a third service; https, or http only for loopback
+    workspace_id   = "<YOUR-WORKSPACE-ID>",
+    app_id         = "<YOUR-APP-ID>",
+    environment_id = "develop",
+    app_version    = "1.2.3",
+    locale         = "en",
+    platform       = platform.detect(),
+  }
+end
+
+local answered = nil -- the player's answer and the notice it was given against
+
+local function start(granted, fresh)
+  local ok, err = shardpilot.init({ --[[ the configuration below ]] })
+  if not ok then
+    print("shardpilot init failed: " .. tostring(err))
+    return
+  end
+  shardpilot.identify("<YOUR-USER-ID>")
+  -- set_consent returns false, err too (a full or unwritable consent outbox).
+  -- Starting the session anyway would emit events under a grant that was never
+  -- recorded, so the answer stays pending and is retried on the next trigger.
+  local recorded, consent_err = shardpilot.set_consent(granted)
+  if not recorded then
+    print("shardpilot consent not recorded: " .. tostring(consent_err) .. "; owed")
+    return
+  end
+  answered = { text_version = fresh.consent_text_version,
+               language = fresh.presented_language, granted = granted }
+  if granted then
+    shardpilot.session_start()
+  end
+end
+
+consent_policy.prepare(policy_context(), function(decision)
   if decision.optional_processing_closed then
     -- Nothing a player could grant, so nothing is asked and the SDK is not
     -- initialised. This is what the resolver emits today.
@@ -153,20 +183,22 @@ consent_policy.prepare({
     -- ⚠ RE-RESOLVE BEFORE ACTING ON THE ANSWER, and invalidate first: the
     -- player was reading the screen, the plan may have expired or the policy
     -- may have been revoked meanwhile, and without the invalidation this
-    -- resolution is answered by the private cache entry the launch wrote —
+    -- resolution is answered by the private cache entry the first call wrote —
     -- the very decision you are checking for staleness.
     consent_policy.invalidate()
-    consent_policy.prepare(context, function(fresh)
+    consent_policy.prepare(policy_context(), function(fresh)
       -- Act only on the FRESH decision, and only when it still permits the
-      -- lane AND still describes the notice the player actually answered.
+      -- lane, still has life left, and still describes the notice the player
+      -- actually answered.
       if fresh.optional_processing_closed then return end
+      if not fresh.valid_for_seconds or fresh.valid_for_seconds <= 0 then
+        return -- no window in which the lane could run; re-resolve later
+      end
       if fresh.consent_text_version ~= decision.consent_text_version
         or fresh.presented_language ~= decision.presented_language then
         return -- the text changed: present the new notice, do not carry the answer over
       end
-      local ok, err = shardpilot.init({ --[[ config below ]] })
-      if not ok then return end
-      shardpilot.set_consent(granted)
+      start(granted, fresh)
     end)
   end)
 end)

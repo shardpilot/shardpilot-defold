@@ -1909,6 +1909,82 @@ local function test_a_null_field_inside_a_signal_is_refused()
 	assert_true(prepare().plan_used, "well-formed signal entries must parse")
 end
 
+-- ⚠ A reason IS CHECKED WHEREVER IT APPEARS. The closed vocabulary was
+-- enforced on the branch that REQUIRES a reason and nowhere else, so an
+-- AVAILABLE signal could carry any string at all — and signals_used is a
+-- provenance record, so an unreadable reason on it is a claim about how the
+-- resolver reached its answer that nothing checked.
+local function test_a_signal_reason_is_always_from_the_vocabulary()
+	for _, signal in ipairs({
+		{ name = "server_country", available = true, reason = "because" },
+		{ name = "server_country", available = true, reason = "SOURCE_UNAVAILABLE" },
+		{ name = "server_country", available = false, reason = "because" },
+	}) do
+		reset()
+		next_response_body = plan({ signals_used = { signal } })
+		assert_true(not prepare().plan_used, "a reason outside the vocabulary must not be used")
+	end
+
+	-- The controls: every member of the vocabulary parses on an available
+	-- signal and on an unavailable one, and an available signal may still
+	-- mention no reason at all.
+	for _, reason in ipairs({ "source_not_permitted", "source_unavailable", "not_enabled_in_release" }) do
+		for _, available in ipairs({ true, false }) do
+			reset()
+			next_response_body = plan({
+				signals_used = { { name = "server_country", available = available, reason = reason } },
+			})
+			assert_true(prepare().plan_used, reason .. " must parse (available=" .. tostring(available) .. ")")
+		end
+	end
+	reset()
+	next_response_body = plan({ signals_used = { { name = "server_country", available = true } } })
+	assert_true(prepare().plan_used, "an available signal may mention no reason")
+end
+
+-- ⚠ THE NESTED age_band KEY SET IS CLOSED TOO. An object whose names are
+-- unchecked is the top-level hole one level down: a band could carry anything
+-- beside the two fields we read and still be used, and a band is the only age
+-- shape that travels.
+local function test_the_age_bands_keys_are_closed()
+	reset()
+	next_response_body = plan({
+		age_band = { vocabulary = "coarse.v1", band = "adult", precise_age = "37" },
+	})
+	assert_true(not prepare().plan_used, "an unknown key inside age_band must not be used")
+
+	reset()
+	next_response_body = plan({ age_band = { vocabulary = "coarse.v1", band = "adult" } })
+	assert_true(prepare().plan_used, "the two schema fields alone must parse")
+end
+
+-- ⚠ THE PACKAGED SKILL'S SNIPPETS ARE CODE A CUSTOMER RUNS. The skill is what
+-- an integrator's assistant reads, so a snippet that does not even parse is a
+-- broken integration shipped with confidence. Every ```lua block in it is
+-- compiled here.
+--
+-- HONEST LIMIT: this compiles them. It cannot run the policy snippet — that
+-- one is deliberately a fragment, with `<YOUR-...>` placeholders and a
+-- `present_your_consent_notice` the integrator supplies — so its SEMANTICS
+-- were checked by reading it against examples/minimal/main.script line by
+-- line, not by execution. The executable statement of the contract remains the
+-- example, which this suite does run.
+local function test_the_packaged_skill_snippets_compile()
+	local source = io.open(".claude/skills/shardpilot-defold-integration/SKILL.md")
+	assert_true(source ~= nil, "the packaged skill must exist")
+	local text = source:read("*a")
+	source:close()
+	local compile = loadstring or load
+	local blocks = 0
+	for block in text:gmatch("```lua\n(.-)```") do
+		blocks = blocks + 1
+		local chunk, err = compile(block)
+		assert_true(chunk ~= nil,
+			"a lua block in the packaged skill does not compile: " .. tostring(err))
+	end
+	assert_true(blocks >= 5, "the skill must still carry its snippets, found " .. blocks)
+end
+
 local tests = {
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,
@@ -1960,6 +2036,9 @@ local tests = {
 	test_nested_duplicate_keys_are_refused,
 	test_an_unknown_context_field_is_refused,
 	test_a_null_field_inside_a_signal_is_refused,
+	test_a_signal_reason_is_always_from_the_vocabulary,
+	test_the_age_bands_keys_are_closed,
+	test_the_packaged_skill_snippets_compile,
 }
 
 for _, test in ipairs(tests) do

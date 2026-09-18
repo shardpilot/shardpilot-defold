@@ -769,6 +769,15 @@ function M.parse_plan(plan, context, now)
 			or not bounded_string(band.band, MAX_BAND) then
 			return nil, "age_band is malformed or over its bound"
 		end
+		-- ⚠ AND ITS KEY SET IS CLOSED, like the top level's. A nested object
+		-- whose names are unchecked is the top-level hole one level down: an
+		-- age_band could carry anything beside the two fields we read and still
+		-- be used, and a band is the only age shape that travels.
+		for key in pairs(band) do
+			if key ~= "vocabulary" and key ~= "band" then
+				return nil, "age_band carries an unknown key"
+			end
+		end
 	end
 	local scope = plan.scope
 	if type(scope) ~= "table" or scope.workspace_id ~= context.workspace_id
@@ -800,6 +809,15 @@ function M.parse_plan(plan, context, now)
 			-- facts and this record exists to keep them apart.
 			if type(signal.available) ~= "boolean" then
 				return nil, "a signal does not state whether it was available"
+			end
+			-- ⚠ A reason IS CHECKED WHEREVER IT APPEARS, not only where it is
+			-- required. The vocabulary was enforced on the branch that needs a
+			-- reason and nowhere else, so an AVAILABLE signal could carry any
+			-- string at all — and this list is a provenance record, so an
+			-- unreadable reason on it is a claim about how the resolver reached
+			-- its answer that nothing checked.
+			if signal.reason ~= nil and not SIGNAL_REASONS[signal.reason] then
+				return nil, "a signal carries a reason outside the closed vocabulary"
 			end
 			-- An unavailable signal must say WHY, from the closed vocabulary. A
 			-- bare "not available" is the shape that hides a prohibited source.
