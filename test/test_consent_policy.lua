@@ -211,6 +211,7 @@ local function assert_equal(actual, expected, message)
 end
 
 local function reset()
+	crash_shutdown_pending = 0
 	requests = {}
 	next_status = 200
 	next_response_body = nil
@@ -771,7 +772,12 @@ end
 -- replaced in package.loaded and the chunk is loaded, which defines init().
 -- `between` runs after init() and before update(), i.e. while the notice is
 -- still on screen. `window_events` are fired after update().
-local function run_example(between, window_events, dts)
+-- When set, the fake crash client reports shutdown as still pending this many
+-- times before succeeding — the real one does exactly that while a POST is in
+-- flight (crash/client.lua:1175-1188).
+local crash_shutdown_pending = 0
+
+local function run_example(between, window_events, dts, finalize)
 	local seen = {}
 	local function record(name)
 		return function(...)
@@ -813,6 +819,11 @@ local function run_example(between, window_events, dts)
 			seen[#seen + 1] = "crash.set_enabled:" .. tostring(enabled)
 		end,
 		shutdown = function()
+			if crash_shutdown_pending > 0 then
+				crash_shutdown_pending = crash_shutdown_pending - 1
+				seen[#seen + 1] = "crash.shutdown:pending"
+				return false, "pending"
+			end
 			seen[#seen + 1] = "crash.shutdown"
 			return true
 		end,
@@ -860,6 +871,9 @@ local function run_example(between, window_events, dts)
 		end
 		for _, dt in ipairs(dts or {}) do
 			update(nil, dt)
+		end
+		if finalize then
+			final(nil)
 		end
 		after_update = table.concat(seen, " | ")
 	end)
@@ -1110,22 +1124,23 @@ end
 local function test_the_example_re_resolves_after_the_answer()
 	reset()
 	-- The optional lane must be OPEN, or no notice is presented and there is
-	-- no answer to be stale about. max_age_seconds = 0 means the first answer
-	-- is not cached, so the re-resolution reaches the wire and is visible.
+	-- no answer to be stale about. The plan carries the NORMAL cache lifetime:
+	-- the re-resolution has to reach the resolver on its own merits, which it
+	-- only does because the example invalidates first. An earlier version of
+	-- this scene used max_age_seconds = 0 and so could not tell a real
+	-- re-resolution from a cache entry that had simply never been written.
 	next_response_body = example_plan({
 		regime = consent_policy.SOFT_OPT_OUT,
 		crash_profile = consent_policy.CRASH_MINIMAL,
-		max_age_seconds = 0,
 	})
 	local calls = run_example(function()
 		-- While the notice is on screen the policy changes: the crash lane closes.
 		next_response_body = example_plan({
 			regime = consent_policy.SOFT_OPT_OUT,
 			crash_profile = consent_policy.CRASH_OFF,
-			max_age_seconds = 0,
 		})
 	end)
-	assert_true(#requests >= 2, "the example must resolve again after the answer")
+	assert_equal(#requests, 2, "the answer must be followed by a real request, not a cache hit")
 	assert_true(calls:find("crash.init", 1, true) == nil,
 		"the example acted on the stale decision and opened a lane the fresh one closes: " .. calls)
 end
@@ -1159,7 +1174,8 @@ local function test_the_example_closes_lanes_on_resume()
 	local saved_request = http.request
 	http.request = function(url, method, callback, headers, body, options)
 		requests[#requests + 1] = { url = url }
-		if #requests >= 2 then
+		-- Launch is 1, the post-notice re-resolution is 2, the resume is 3.
+		if #requests >= 3 then
 			next_response_body = example_plan({
 				regime = consent_policy.STRICT_OPT_IN, crash_profile = consent_policy.CRASH_OFF,
 			})
@@ -1253,7 +1269,8 @@ local function test_the_example_revalidates_at_the_plans_deadline()
 	local saved_request = http.request
 	http.request = function(url, method, callback, headers, body, options)
 		requests[#requests + 1] = { url = url }
-		if #requests >= 2 then
+		-- Launch is 1, the post-notice re-resolution is 2, the deadline is 3.
+		if #requests >= 3 then
 			next_response_body = example_plan({
 				regime = consent_policy.STRICT_OPT_IN, crash_profile = consent_policy.CRASH_OFF,
 			})
@@ -1297,7 +1314,7 @@ local function test_the_example_re_presents_when_the_notice_text_changes()
 		local saved_request = http.request
 		http.request = function(url, method, callback, headers, body, options)
 			requests[#requests + 1] = { url = url }
-			if #requests >= 2 then
+			if #requests >= 3 then
 				local overrides = { regime = consent_policy.SOFT_OPT_OUT }
 				for key, value in pairs(changed) do
 					overrides[key] = value
@@ -1342,6 +1359,124 @@ local function test_a_verdict_carries_its_validity_window()
 	assert_true(prepare().valid_for_seconds == nil, "a fallback carries no validity window")
 end
 
+-- ⚠ shutdown() CAN SAY "NOT YET", AND THE STATE HAS TO SURVIVE THAT. A crash
+-- POST in flight makes shutdown return false, "pending"; clearing the flag
+-- anyway loses the retry — final() skips it, and a later start would
+-- initialise over a client that never finished.
+local function test_a_pending_crash_shutdown_keeps_its_state()
+	reset()
+	crash_shutdown_pending = 1
+	next_response_body = example_plan({
+		regime = consent_policy.SOFT_OPT_OUT, crash_profile = consent_policy.CRASH_MINIMAL,
+	})
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url }
+		if #requests >= 3 then
+			next_response_body = example_plan({
+				regime = consent_policy.SOFT_OPT_OUT, crash_profile = consent_policy.CRASH_OFF,
+			})
+		end
+		callback(nil, nil, { status = 200, response = next_response_body })
+	end
+	-- Resume closes the crash lane; its shutdown comes back pending once, and
+	-- final() is what retries it.
+	local calls = run_example(nil, { "focus_gained" }, nil, true)
+	http.request = saved_request
+	assert_true(calls:find("crash.shutdown:pending", 1, true) ~= nil,
+		"the fixture must exercise a pending shutdown: " .. calls)
+	assert_true(calls:find("crash reporting suspended", 1, true) == nil,
+		"a pending shutdown is not a completed one: " .. calls)
+	-- final() retried it, and this time it completed. Counted over the exact
+	-- tokens, so "crash.shutdown:pending" is not mistaken for a completion.
+	local pending, completed = 0, 0
+	for token in (calls .. " | "):gmatch("(.-) | ") do
+		if token == "crash.shutdown:pending" then
+			pending = pending + 1
+		elseif token == "crash.shutdown" then
+			completed = completed + 1
+		end
+	end
+	assert_equal(pending, 1, "one pending attempt: " .. calls)
+	assert_equal(completed, 1, "final() must retry the pending shutdown until it completes: " .. calls)
+end
+
+-- ⚠ PRESENT-AND-NULL IS PRESENT. Lua has no null, so `"signature": null`
+-- decodes to the same nil as an absent key — and this build refuses every
+-- present signature precisely because it cannot check one.
+local function test_a_null_signature_is_still_a_signature()
+	reset()
+	local body = plan()
+	next_response_body = body:sub(1, 1) .. '"signature":null,' .. body:sub(2)
+	local decision = prepare()
+	assert_true(not decision.plan_used, "a null signature is not an absent one")
+	assert_true(decision.optional_processing_closed, "and the verdict is closed")
+
+	-- The control: with the key genuinely absent the same plan parses, so the
+	-- rule is about presence rather than about the fixture.
+	reset()
+	next_response_body = plan()
+	assert_true(prepare().plan_used, "an absent signature must still parse")
+end
+
+-- ⚠ A CLOCK THAT WENT BACKWARDS CANNOT AGE AN ENTRY. socket.gettime is
+-- wall-clock: an NTP step or a bad RTC can put "now" before the moment the
+-- entry was written, and then `until_at > at` stays true for as long as the
+-- clock is wrong — an entry outliving its plan by however far the clock
+-- slipped.
+local function test_a_backwards_clock_invalidates_the_cache()
+	reset()
+	next_response_body = plan({ max_age_seconds = 300 })
+	local first = prepare()
+	assert_equal(#requests, 1)
+	prepare()
+	assert_equal(#requests, 1, "the control: a cache hit while the clock behaves")
+
+	socket.now = socket.now - 60
+	next_response_body = plan({ max_age_seconds = 300 })
+	local after = prepare()
+	assert_equal(#requests, 2, "a backwards clock must discard the entry, not serve it")
+	assert_true(after.plan_used, "and the replacement is used: " .. tostring(after.reason))
+	socket.now = 1000
+
+	-- ⚠ AND NO SERVED WINDOW EVER EXCEEDS THE ONE THE RESOLVER GRANTED. The
+	-- cap is defence in depth: while the regression check above stands, the
+	-- only way remaining could exceed the ceiling is a clock earlier than the
+	-- insertion, which is already discarded — so there is no mutant that kills
+	-- the cap alone, and saying so is better than implying one.
+	reset()
+	next_response_body = plan({ max_age_seconds = 5 })
+	assert_equal(prepare().valid_for_seconds, 5, "the fresh window is the plan's own")
+	local served = prepare()
+	assert_true(served.valid_for_seconds <= 5,
+		"a served window must never exceed the ceiling: " .. tostring(served.valid_for_seconds))
+end
+
+-- ⚠ A RESTORED ANSWER IS NOT A NEW ONE. A policy suspension followed by a
+-- revalidation restarts the client, and client.new reads the persisted consent
+-- decision back — so calling set_consent again would re-persist a decision
+-- nobody made twice and enqueue a second receipt, putting a policy change into
+-- the consent trail as a player changing their mind.
+local function test_a_restored_answer_writes_no_consent()
+	reset()
+	next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT, max_age_seconds = 2 })
+	-- The plan does not change; only its life runs out, which suspends the
+	-- lane and then restarts it from the standing answer.
+	local calls = run_example(nil, nil, { 1, 1, 1 })
+	assert_true(calls:find("analytics suspended (plan_expired)", 1, true) ~= nil,
+		"the fixture must exercise a suspension: " .. calls)
+	local restarts = 0
+	for _ in calls:gmatch("sdk%.init") do
+		restarts = restarts + 1
+	end
+	assert_true(restarts >= 2, "the lane must come back after the suspension: " .. calls)
+	local writes = 0
+	for _ in calls:gmatch("sdk%.set_consent") do
+		writes = writes + 1
+	end
+	assert_equal(writes, 1, "only the newly completed notice may write consent: " .. calls)
+end
+
 local tests = {
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,
@@ -1375,6 +1510,10 @@ local tests = {
 	test_the_example_revalidates_at_the_plans_deadline,
 	test_the_example_re_presents_when_the_notice_text_changes,
 	test_a_verdict_carries_its_validity_window,
+	test_a_pending_crash_shutdown_keeps_its_state,
+	test_a_null_signature_is_still_a_signature,
+	test_a_backwards_clock_invalidates_the_cache,
+	test_a_restored_answer_writes_no_consent,
 }
 
 for _, test in ipairs(tests) do

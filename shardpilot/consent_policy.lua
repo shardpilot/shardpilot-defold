@@ -220,43 +220,54 @@ skip_value = function(text, pos, depth)
 	return stop + 1
 end
 
-local function list_keys_are_not_objects(body)
+-- Walks the plan's top level once and answers two questions the decoded table
+-- can no longer answer: whether a list key was given an object, and WHICH KEYS
+-- WERE PRESENT AT ALL.
+--
+-- ⚠ THE SECOND ONE MATTERS FOR `"signature": null`. Lua has no null, so a
+-- present-but-null key decodes to exactly the same nil as an absent one — and
+-- this build refuses every present signature precisely because it cannot check
+-- one. A response that spells the field as null would otherwise be read as
+-- "no signature at all" and admitted.
+local function scan_plan_text(body)
+	local present = {}
 	local pos = skip_space(body, 1)
 	if body:sub(pos, pos) ~= "{" then
 		-- Not an object at all; the decode refuses it on its own terms.
-		return true
+		return true, nil, present
 	end
 	pos = skip_space(body, pos + 1)
 	if body:sub(pos, pos) == "}" then
-		return true
+		return true, nil, present
 	end
 	while true do
 		if body:sub(pos, pos) ~= '"' then
-			return false, "a plan key is not a string"
+			return false, "a plan key is not a string", present
 		end
 		local key, after = read_string(body, pos)
 		if not key then
-			return false, "a plan key is not readable"
+			return false, "a plan key is not readable", present
 		end
+		present[key] = true
 		pos = skip_space(body, after)
 		if body:sub(pos, pos) ~= ":" then
-			return false, "a plan key carries no value"
+			return false, "a plan key carries no value", present
 		end
 		pos = skip_space(body, pos + 1)
 		if LIST_KEYS[key] and body:sub(pos, pos) == "{" then
-			return false, key .. " is a JSON object where the schema says a list"
+			return false, key .. " is a JSON object where the schema says a list", present
 		end
 		local next_pos = skip_value(body, pos, 1)
 		if not next_pos then
-			return false, "the plan is not readable"
+			return false, "the plan is not readable", present
 		end
 		pos = skip_space(body, next_pos)
 		local delimiter = body:sub(pos, pos)
 		if delimiter == "}" then
-			return true
+			return true, nil, present
 		end
 		if delimiter ~= "," then
-			return false, "the plan is not readable"
+			return false, "the plan is not readable", present
 		end
 		pos = skip_space(body, pos + 1)
 	end
@@ -788,13 +799,26 @@ function M.prepare(context, callback)
 	end
 
 	local key = context_key(context)
+	-- ⚠ A CLOCK THAT WENT BACKWARDS INVALIDATES THE ENTRY. socket.gettime is
+	-- wall-clock: an NTP step, a manual change or a device waking with a bad
+	-- RTC can put `at` BEFORE the moment this entry was written, and then
+	-- `until_at > at` is true for as long as the clock is wrong — an entry that
+	-- outlives its plan by however far the clock slipped. It cannot be aged, so
+	-- it is discarded.
+	if cached and at < cached.inserted_at then
+		cached = nil
+	end
 	if cached and cached.key == key and cached.until_at > at then
 		-- ⚠ A COPY, NOT THE ENTRY. The cache used to hand out the very table it
 		-- kept, so a caller that wrote a field on the decision it was given —
 		-- or that read prohibited_purposes and sorted it in place — edited what
 		-- every later prepare would serve for the next five minutes.
 		local served = copy_value(cached.decision, 0)
-		served.valid_for_seconds = cached.until_at - at
+		-- Counts DOWN, and never above the window the plan originally had:
+		-- a forward clock step must not hand the host a longer life than the
+		-- resolver granted.
+		local remaining = cached.until_at - at
+		served.valid_for_seconds = remaining < cached.lifetime and remaining or cached.lifetime
 		callback(served)
 		return
 	end
@@ -864,7 +888,7 @@ function M.prepare(context, callback)
 			settle(strict("invalid_response", "the response body is empty or over its bound"))
 			return
 		end
-		local shapes_ok, shape_refusal = list_keys_are_not_objects(body)
+		local shapes_ok, shape_refusal, present = scan_plan_text(body)
 		if not shapes_ok then
 			settle(strict("invalid_response", shape_refusal))
 			return
@@ -879,6 +903,15 @@ function M.prepare(context, callback)
 			-- nothing to synthesise; the reason is reported as the server gave
 			-- it when it is one this build knows.
 			settle(strict(tostring(decoded.reason or "policy_unavailable"), "the resolver refused"))
+			return
+		end
+		-- ⚠ PRESENT-AND-NULL IS PRESENT. Lua cannot tell `"signature": null`
+		-- from an absent key once decoded, and this build refuses every
+		-- present signature because it cannot verify one — so a response that
+		-- spells the field as null would have been read as unsigned and
+		-- admitted. The raw scan is what still knows.
+		if present.signature and decoded.signature == nil then
+			settle(strict("invalid_response", "the plan carries a signature this build cannot verify"))
 			return
 		end
 		local plan, refusal, expires_at = M.parse_plan(decoded, context, arrived)
@@ -904,7 +937,13 @@ function M.prepare(context, callback)
 		if lifetime > 0 then
 			-- The entry gets its OWN copy too, so the table delivered below and
 			-- the table kept here are never the same object.
-			cached = { key = key, decision = copy_value(decision, 0), until_at = arrived + lifetime }
+			cached = {
+				key = key,
+				decision = copy_value(decision, 0),
+				inserted_at = arrived,
+				lifetime = lifetime,
+				until_at = arrived + lifetime,
+			}
 		else
 			-- max_age_seconds = 0 says "do not reuse this". The plan is still
 			-- live for this one answer; it is simply not cacheable.

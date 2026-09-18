@@ -80,16 +80,33 @@ local function suspend_analytics(reason)
 	analytics_running = false
 end
 
+-- ⚠ shutdown() CAN SAY "NOT YET". A crash POST dispatched in the real runtime
+-- completes on a later frame, so while one is in flight shutdown returns
+-- false, "pending" — the client is still initialised and still needs pumping.
+-- Clearing the flag anyway would lose the retry: final() would skip it, and a
+-- later start_crash would init over a client that never finished. So the flag
+-- means "a client exists that has not finished shutting down", and it is
+-- cleared only when shutdown says so.
 local function suspend_crash(reason)
 	if not crash_running then
 		return
 	end
-	print("shardpilot: crash reporting suspended (" .. reason .. ")")
-	crash.shutdown()
-	crash_running = false
+	local ok, err = crash.shutdown()
+	if ok then
+		print("shardpilot: crash reporting suspended (" .. reason .. ")")
+		crash_running = false
+	else
+		print("shardpilot: crash shutdown pending (" .. tostring(err) .. "); retrying")
+	end
 end
 
-local function start_analytics(granted, decision)
+-- `newly_answered` is true only when a notice has just been completed. A
+-- RESTORED answer re-initialises the client and stops there: client.new reads
+-- the persisted consent decision back (client.lua:789-805), so calling
+-- set_consent again would re-persist a decision nobody made twice and enqueue
+-- a second receipt for it — a policy suspension would show up in the consent
+-- trail as a player changing their mind.
+local function start_analytics(granted, decision, newly_answered)
 	shardpilot.init({
 		ingest_url = "http://localhost:8080",
 		workspace_id = "workspace-example",
@@ -105,6 +122,10 @@ local function start_analytics(granted, decision)
 		api_key = "sp_ingest_publishable_placeholder",
 	})
 	shardpilot.identify("user-example")
+	if not newly_answered then
+		analytics_running = true
+		return
+	end
 	-- Each explicit decision posts a consent receipt kept in a durable outbox
 	-- until the server acknowledges it, so a decision made offline still
 	-- reaches the backend on a later launch. A DECLINE is recorded the same
@@ -188,7 +209,8 @@ reconcile = function(fresh)
 	-- answer is discarded would be worse than not asking.
 	if not fresh.optional_processing_closed and not analytics_running then
 		if answered then
-			start_analytics(answered.granted, fresh)
+			start_analytics(answered.granted, fresh, answered.fresh_answer == true)
+			answered.fresh_answer = nil
 		elseif not notice_open then
 			notice_open = true
 			present_consent_notice(fresh, function(granted)
@@ -197,10 +219,16 @@ reconcile = function(fresh)
 					text_version = fresh.consent_text_version,
 					language = fresh.presented_language,
 					granted = granted,
+					fresh_answer = true,
 				}
-				-- ⚠ RE-RESOLVE BEFORE ACTING ON THE ANSWER. The player was
-				-- reading the screen; the plan may have expired or the policy
-				-- may have been revoked meanwhile.
+				-- ⚠ RE-RESOLVE BEFORE ACTING ON THE ANSWER, AND INVALIDATE
+				-- FIRST. The player was reading the screen; the plan may have
+				-- expired or the policy may have been revoked meanwhile — and
+				-- without the invalidation this resolution is answered by the
+				-- private cache entry the LAUNCH wrote, which is the very
+				-- decision being checked for staleness. It has to reach the
+				-- resolver to mean anything.
+				consent_policy.invalidate()
 				resolve_and_reconcile()
 			end)
 			return
