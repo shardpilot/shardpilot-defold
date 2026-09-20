@@ -1274,13 +1274,15 @@ local function test_an_escaped_key_cannot_hide_an_object()
 	local body = plan()
 	next_response_body = body:gsub('"scope":{', '"scope":{"operation_blocks":{},', 1)
 	local nested = prepare()
-	-- This reader validates the scope's named fields and ignores anything else
-	-- nested inside it, so the plan is USED — which is exactly what makes this
-	-- a control for the scan: a scan that matched the name anywhere in the
-	-- document would refuse a plan the schema permits.
-	assert_true(nested.plan_used,
-		"a same-named key nested inside another object was mistaken for the top-level one: "
-			.. tostring(nested.reason) .. " / " .. tostring(nested.detail))
+	-- ⚠ THE REASON IS THE CONTROL, NOT THE VERDICT. Since R14 every schema
+	-- object has a closed key set, so this IS refused — but it must be refused
+	-- as "scope carries an unknown key", never as "operation_blocks is a JSON
+	-- object where the schema says a list". A scan that matched the name
+	-- anywhere in the document would give the second answer.
+	assert_true(not nested.plan_used, "an unknown key inside scope is refused")
+	assert_true(nested.detail ~= nil and nested.detail:find("scope carries an unknown key", 1, true) ~= nil,
+		"it must be refused as a scope member, not as a top-level list shape: "
+			.. tostring(nested.detail))
 end
 
 -- ⚠ SECOND 60 IS NOT A LEAP SECOND UNLESS IT IS 23:59:60 ON AN ANNOUNCED DATE.
@@ -2045,6 +2047,68 @@ local function test_the_example_stops_when_identify_refuses()
 		"an accepted identify must reach the consent write: " .. calls)
 end
 
+-- ⚠ EVERY OBJECT IN THE SCHEMA HAS AN EXACT KEY SET. The root was closed in
+-- R8, age_band in R12, the context's age_band in R13 — the same finding
+-- arriving at one door after another, which is what a roster is for. This
+-- asks it of all four at once, and of the shape that would otherwise slip
+-- past: an unknown member spelled `null`, which decodes to the same nil an
+-- absent one does and would vanish before any decoded-side check could see it.
+local function test_every_schema_object_has_a_closed_key_set()
+	local objects = {
+		{
+			what = "the plan root",
+			build = function(raw)
+				return raw_field('"tenant_override"', raw)
+			end,
+		},
+		{
+			what = "scope",
+			build = function(raw)
+				local body = plan()
+				return (body:gsub('"scope":{', '"scope":{"tenant_override":' .. raw .. ",", 1))
+			end,
+		},
+		{
+			what = "age_band",
+			build = function(raw)
+				local body = plan({ age_band = { vocabulary = "coarse.v1", band = "adult" } })
+				return (body:gsub('"age_band":{', '"age_band":{"tenant_override":' .. raw .. ",", 1))
+			end,
+		},
+		{
+			what = "a signal entry",
+			build = function(raw)
+				return raw_field('"signals_used"',
+					'[{"name":"server_country","available":false,"reason":"source_unavailable",' ..
+					'"tenant_override":' .. raw .. "}]", { signals_used = "__nil__" })
+			end,
+		},
+	}
+	-- A real value, and the null that would otherwise disappear in decoding.
+	for _, raw in ipairs({ '"other"', "null" }) do
+		for _, object in ipairs(objects) do
+			reset()
+			next_response_body = object.build(raw)
+			local decision = prepare()
+			assert_true(not decision.plan_used,
+				"an unknown key in " .. object.what .. " (" .. raw .. ") must not be used: "
+					.. tostring(decision.reason))
+			assert_true(decision.optional_processing_closed, "and the verdict is closed")
+		end
+	end
+
+	-- The control: every object spelled with exactly its own members parses,
+	-- so the roster refuses the unknown rather than refusing nesting.
+	reset()
+	next_response_body = plan({
+		age_band = { vocabulary = "coarse.v1", band = "adult" },
+		signals_used = { { name = "server_country", available = false, reason = "source_unavailable" } },
+		operation_blocks = { "transfer_review" },
+		prohibited_purposes = { "advertising" },
+	})
+	assert_true(prepare().plan_used, "every schema object spelled correctly must parse")
+end
+
 local tests = {
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,
@@ -2101,6 +2165,7 @@ local tests = {
 	test_the_packaged_skill_snippets_compile,
 	test_the_context_age_bands_keys_are_closed,
 	test_the_example_stops_when_identify_refuses,
+	test_every_schema_object_has_a_closed_key_set,
 }
 
 for _, test in ipairs(tests) do

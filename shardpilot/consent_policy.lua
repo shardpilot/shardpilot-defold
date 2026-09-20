@@ -118,6 +118,22 @@ local LIST_KEYS = { operation_blocks = true, prohibited_purposes = true, signals
 -- ones we read and still be used. A key we do not understand is a plan we
 -- cannot say we fully read, and "use the parts I understood" is how a
 -- permissive default gets in.
+-- ⚠ EVERY OBJECT IN THIS SCHEMA HAS AN EXACT KEY SET, and they live together
+-- so that adding one is adding a row here rather than remembering a rule. The
+-- root was closed first, then age_band, then these two — the same finding
+-- arriving at four doors, which is what a roster is for.
+--
+-- They are checked on the RAW TEXT, not on the decoded tables, because a
+-- present-and-null member decodes to the same nil an absent one does: an
+-- unknown key spelled `"tenant": null` would vanish before any decoded-side
+-- check could see it.
+local NESTED_OBJECT_KEYS = {
+	scope = { workspace_id = true, app_id = true, environment_id = true },
+	age_band = { vocabulary = true, band = true },
+}
+
+local SIGNAL_KEYS = { name = true, available = true, reason = true }
+
 local SCHEMA_KEYS = {
 	regime = true,
 	crash_profile = true,
@@ -309,6 +325,13 @@ local function scan_plan_text(body)
 		if LIST_KEYS[key] and body:sub(pos, pos) == "{" then
 			return false, key .. " is a JSON object where the schema says a list", present, present_signals
 		end
+		-- The nested objects the schema names, checked where the raw text still
+		-- knows what was written. `members` is collected by the same walk that
+		-- skips the value, so this costs no second pass.
+		local members = nil
+		if NESTED_OBJECT_KEYS[key] and body:sub(pos, pos) == "{" then
+			members = {}
+		end
 		-- ⚠ AND A null ELEMENT INSIDE ONE OF THOSE LISTS. Lua drops it: the
 		-- decoded array simply comes back one entry shorter, so a roster of
 		-- three operation blocks with the middle one nulled reads as a roster
@@ -338,6 +361,13 @@ local function scan_plan_text(body)
 				if not element_end then
 					return false, "the plan is not readable", present, present_signals
 				end
+				if collect then
+					for member in pairs(collect) do
+						if not SIGNAL_KEYS[member] then
+							return false, "a signal carries an unknown key", present, present_signals
+						end
+					end
+				end
 				scan = skip_space(body, element_end)
 				if body:sub(scan, scan) == "," then
 					scan = skip_space(body, scan + 1)
@@ -346,9 +376,16 @@ local function scan_plan_text(body)
 				end
 			end
 		end
-		local next_pos = skip_value(body, pos, 1)
+		local next_pos = skip_value(body, pos, 1, members)
 		if not next_pos then
 			return false, "the plan is not readable", present, present_signals
+		end
+		if members then
+			for member in pairs(members) do
+				if not NESTED_OBJECT_KEYS[key][member] then
+					return false, key .. " carries an unknown key", present, present_signals
+				end
+			end
 		end
 		pos = skip_space(body, next_pos)
 		local delimiter = body:sub(pos, pos)

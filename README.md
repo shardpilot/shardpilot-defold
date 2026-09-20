@@ -244,8 +244,17 @@ local function start_analytics(granted, newly_answered)
     print("shardpilot init failed: " .. tostring(start_err))
     return false
   end
-  shardpilot.identify("user-example")
   analytics_running = true
+  -- identify can refuse: under Mode B, switching identity while the previous
+  -- one still has undelivered events returns false, "events_pending" — those
+  -- envelopes were unlocked by a credential minted for the other subject.
+  -- Draining them (flush, then re-identify) is yours; do not record consent
+  -- for an identity the client did not accept.
+  local identified, identify_err = shardpilot.identify("user-example")
+  if not identified then
+    print("shardpilot identify refused: " .. tostring(identify_err))
+    return false
+  end
   if not newly_answered then
     return true
   end
