@@ -482,6 +482,13 @@ local function parse_timestamp(value)
 		if oh > 23 or om > 59 then
 			return nil
 		end
+		-- ⚠ "-00:00" IS NOT ZERO, IT IS "OFFSET UNKNOWN" (RFC 3339). An
+		-- expiry whose offset the sender declined to state is an instant this
+		-- build cannot place on a timeline, and treating it as UTC is picking
+		-- one of the twenty-seven it could have meant.
+		if sign == "-" and oh == 0 and om == 0 then
+			return nil
+		end
 		offset = (oh * 3600 + om * 60) * (sign == "-" and -1 or 1)
 	end
 	return days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec - offset
@@ -778,13 +785,20 @@ local function request_body(context)
 	return body
 end
 
+-- ⚠ PRIVATE. The public surface is prepare() and invalidate(), and this is
+-- why: parse_plan takes a DECODED TABLE, and half of what this module checks —
+-- container types, duplicate keys, present-and-null members, unknown key names
+-- — lives in the raw text and is gone by the time a table exists. An exported
+-- parse_plan would hand a caller a "validator" that silently cannot perform
+-- most of its own validation.
+--
 -- Reads a plan. It REFUSES rather than repairs: a plan the SDK cannot fully
 -- read is a plan it cannot act on, and "use the parts I understood" is how a
 -- permissive default gets in.
 -- `now` is seconds since the epoch. It is what makes expiry enforceable here
 -- rather than merely described; a caller with no clock passes nothing and
 -- prepare refuses before it ever reaches this point.
-function M.parse_plan(plan, context, now)
+local function parse_plan(plan, context, now)
 	if type(plan) ~= "table" then
 		return nil, "the plan is not an object"
 	end
@@ -918,6 +932,17 @@ function M.parse_plan(plan, context, now)
 	return plan, nil, expires_at
 end
 
+-- ⚠ PERMISSIVE MEANS "ANYTHING BUT THE FULLY CLOSED TUPLE". Not "SOFT": a
+-- STRICT plan that permits the crash lane, or an eligible server-analytics
+-- basis, or one that lifts the objection requirement, has opened something —
+-- and the three flags are orthogonal on purpose, so any one of them counts.
+local function decision_is_permissive(decision)
+	return not decision.optional_processing_closed
+		or decision.crash_profile ~= M.CRASH_OFF
+		or decision.server_analytics ~= M.SERVER_ANALYTICS_DENIED
+		or decision.server_analytics_objection_required ~= true
+end
+
 local function decision_from_plan(plan)
 	return {
 		regime = plan.regime,
@@ -1002,26 +1027,13 @@ function M.prepare(context, callback)
 	end
 
 	local key = context_key(context)
-	-- ⚠ A CLOCK THAT WENT BACKWARDS INVALIDATES THE ENTRY. socket.gettime is
-	-- wall-clock: an NTP step, a manual change or a device waking with a bad
-	-- RTC can put `at` BEFORE the moment this entry was written, and then
-	-- `until_at > at` is true for as long as the clock is wrong — an entry that
-	-- outlives its plan by however far the clock slipped. It cannot be aged, so
-	-- it is discarded.
-	if cached and at < cached.inserted_at then
-		cached = nil
-	end
 	if cached and cached.key == key and cached.until_at > at then
 		-- ⚠ A COPY, NOT THE ENTRY. The cache used to hand out the very table it
 		-- kept, so a caller that wrote a field on the decision it was given —
 		-- or that read prohibited_purposes and sorted it in place — edited what
 		-- every later prepare would serve for the next five minutes.
 		local served = copy_value(cached.decision, 0)
-		-- Counts DOWN, and never above the window the plan originally had:
-		-- a forward clock step must not hand the host a longer life than the
-		-- resolver granted.
-		local remaining = cached.until_at - at
-		served.valid_for_seconds = remaining < cached.lifetime and remaining or cached.lifetime
+		served.valid_for_seconds = cached.until_at - at
 		callback(served)
 		return
 	end
@@ -1150,7 +1162,7 @@ function M.prepare(context, callback)
 				end
 			end
 		end
-		local plan, refusal, expires_at = M.parse_plan(decoded, context, arrived)
+		local plan, refusal, expires_at = parse_plan(decoded, context, arrived)
 		if not plan then
 			settle(strict("invalid_response", refusal))
 			return
@@ -1170,19 +1182,34 @@ function M.prepare(context, callback)
 			lifetime = plan.max_age_seconds
 		end
 		decision.valid_for_seconds = lifetime
-		if lifetime > 0 then
+		-- ⚠ A PERMISSIVE DECISION IS NEVER STORED. THIS IS THE DESIGN, not an
+		-- optimisation, and it replaces a family of defects rather than one.
+		--
+		-- The whole cache existed under a promise — "an offline state can
+		-- tighten but never relax" — that a cache cannot keep. http.request
+		-- being present says NOTHING about connectivity, and Defold offers no
+		-- reliable online signal, so there is no moment at which this module
+		-- can know that a stored permission is still true. Every round of this
+		-- review found another way for a stored permission to outlive its plan
+		-- — the ceiling beating the expiry, a clock stepping backwards, a
+		-- rollback in flight, an older response landing last — because they
+		-- were all the same defect wearing different clothes.
+		--
+		-- So a permissive answer is used for the call that FETCHED it and is
+		-- not kept. Every later prepare() goes to the wire, and a request that
+		-- fails, times out or finds no network answers STRICT. A strict answer
+		-- may be cached within its life, because reusing "closed" can never
+		-- open anything.
+		--
+		-- The cost is one request per prepare() while the regime is permissive.
+		-- prepare() is called at start, on resume and at expiry — not per
+		-- frame — and the resolver's initial release emits only strict plans,
+		-- so today this costs nothing at all.
+		if lifetime > 0 and not decision_is_permissive(decision) then
 			-- The entry gets its OWN copy too, so the table delivered below and
 			-- the table kept here are never the same object.
-			cached = {
-				key = key,
-				decision = copy_value(decision, 0),
-				inserted_at = arrived,
-				lifetime = lifetime,
-				until_at = arrived + lifetime,
-			}
+			cached = { key = key, decision = copy_value(decision, 0), until_at = arrived + lifetime }
 		else
-			-- max_age_seconds = 0 says "do not reuse this". The plan is still
-			-- live for this one answer; it is simply not cacheable.
 			cached = nil
 		end
 		settle(decision)

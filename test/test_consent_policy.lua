@@ -620,14 +620,16 @@ end
 -- on liveness alone handed one app's, environment's or endpoint's permission
 -- to another, past the scope check that only ever saw the first context.
 local function test_the_cache_is_scoped_to_the_whole_context()
-	-- The control first: the SAME context is still served privately.
+	-- The control first: the SAME context is still served privately. The
+	-- fixture is a STRICT plan, because since R15 only a non-permissive
+	-- decision is cached at all.
 	reset()
-	next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT })
+	next_response_body = plan()
 	local first = prepare()
-	assert_equal(first.regime, consent_policy.SOFT_OPT_OUT, "the fixture must cache a permissive plan")
+	assert_true(first.plan_used, "the fixture must be used")
 	local again = prepare()
 	assert_equal(#requests, 1, "the same context is served from the cache")
-	assert_equal(again.regime, consent_policy.SOFT_OPT_OUT, "with the decision that was cached")
+	assert_equal(again.regime, consent_policy.STRICT_OPT_IN, "with the decision that was cached")
 
 	for _, override in ipairs({
 		{ app_id = "app-other" }, { workspace_id = "ws-other" }, { environment_id = "env-other" },
@@ -636,11 +638,11 @@ local function test_the_cache_is_scoped_to_the_whole_context()
 		{ age_band = { vocabulary = "coarse.v1", band = "adult" } },
 	}) do
 		reset()
-		next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT })
+		next_response_body = plan()
 		prepare()
 		assert_equal(#requests, 1, "the cache is primed")
 		prepare(context(override))
-		assert_equal(#requests, 2, "a changed context field must re-resolve, not reuse the permission")
+		assert_equal(#requests, 2, "a changed context field must re-resolve, not reuse the entry")
 	end
 end
 
@@ -1067,30 +1069,64 @@ local function test_an_encoder_failure_still_answers()
 	assert_true(decision.optional_processing_closed, "and the verdict is closed")
 end
 
--- ⚠ AN OUTAGE CAN TIGHTEN, NEVER RELAX — INCLUDING OVER A WARM CACHE. The
--- cache was read before the transport was checked, so losing the network
--- served the last permissive answer for the rest of the window, and it read as
--- a cache hit rather than as an outage.
-local function test_a_lost_transport_beats_a_cached_permission()
+-- ⚠ A PERMISSIVE DECISION IS NEVER STORED, WHICH IS THE ONLY WAY "an offline
+-- state can tighten but never relax" CAN BE TRUE. http.request being present
+-- says nothing about connectivity and Defold offers no reliable online signal,
+-- so there is no moment at which this module could know a stored permission is
+-- still true. It is used for the call that fetched it and not kept.
+local function test_a_permissive_decision_is_never_served_twice()
+	-- (a) Permissive, then the transport is gone: STRICT, not the permission.
 	reset()
 	next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT })
 	local first = prepare()
-	assert_equal(first.regime, consent_policy.SOFT_OPT_OUT, "the fixture must cache a permissive plan")
+	assert_equal(first.regime, consent_policy.SOFT_OPT_OUT, "the fixture must be permissive")
+	assert_true(not first.optional_processing_closed, "and must open the lane")
 
 	local saved_http = http
 	http = nil
-	local decision, calls = prepare()
+	local offline, calls = prepare()
 	http = saved_http
 	assert_equal(calls, 1, "exactly one callback")
-	assert_equal(decision.reason, "transport_unavailable", "the outage wins over the cache")
-	assert_true(not decision.plan_used, "and no plan is reported as used")
-	assert_true(decision.optional_processing_closed, "and optional processing is closed")
+	assert_equal(offline.reason, "transport_unavailable", "an outage answers strict")
+	assert_true(not offline.plan_used, "and reports no used plan")
+	assert_true(offline.optional_processing_closed, "and closes optional processing")
 
-	-- The control: with the transport back, the cache is still there — so the
-	-- assertion above is about the outage, not about the entry having expired.
-	local restored = prepare()
-	assert_equal(restored.regime, consent_policy.SOFT_OPT_OUT, "the entry survived the outage")
-	assert_equal(#requests, 1, "and was served without a new request")
+	-- (b) Permissive, then online: a SECOND REQUEST is made. The permission is
+	-- re-earned every time, or it is not served.
+	reset()
+	next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT })
+	prepare()
+	assert_equal(#requests, 1)
+	local second = prepare()
+	assert_equal(#requests, 2, "a permissive decision must be re-fetched, never reused")
+	assert_equal(second.regime, consent_policy.SOFT_OPT_OUT, "and the fresh one is delivered")
+
+	-- (c) Every axis counts, not just the regime. A STRICT plan that opens the
+	-- crash lane, or an eligible server-analytics basis, or one that lifts the
+	-- objection requirement, has opened something.
+	for _, override in ipairs({
+		{ crash_profile = consent_policy.CRASH_MINIMAL },
+		{ server_analytics = consent_policy.SERVER_ANALYTICS_ELIGIBLE },
+		{ server_analytics_objection_required = false },
+	}) do
+		reset()
+		next_response_body = plan(override)
+		prepare()
+		prepare()
+		assert_equal(#requests, 2, "a plan that opens any lane must not be cached")
+	end
+
+	-- (d) THE CONTROL, and the half that must still work: a fully closed
+	-- decision IS cached, and survives the transport going away — reusing
+	-- "closed" can never open anything.
+	reset()
+	next_response_body = plan()
+	local strict_first = prepare()
+	assert_true(strict_first.plan_used, "the strict fixture must be used")
+	assert_equal(#requests, 1)
+	local served = prepare()
+	assert_equal(#requests, 1, "a strict decision is served from the cache")
+	assert_true(served.plan_used and served.optional_processing_closed, "and is the closed answer")
 end
 
 -- ⚠ NO socket IS NOT A REASON TO BE PERMANENTLY STRICT. Returning nil made
@@ -1469,37 +1505,33 @@ local function test_a_null_signature_is_still_a_signature()
 	assert_true(prepare().plan_used, "an absent signature must still parse")
 end
 
--- ⚠ A CLOCK THAT WENT BACKWARDS CANNOT AGE AN ENTRY. socket.gettime is
--- wall-clock: an NTP step or a bad RTC can put "now" before the moment the
--- entry was written, and then `until_at > at` stays true for as long as the
--- clock is wrong — an entry outliving its plan by however far the clock
--- slipped.
-local function test_a_backwards_clock_invalidates_the_cache()
+-- ⚠ THE CLOCK-ROLLBACK ENTRY GUARD IS GONE, DELIBERATELY, AND THIS IS WHAT
+-- REPLACED IT. It existed so a stored PERMISSION could not outlive its plan
+-- when the wall clock stepped backwards. Since R15 no permission is stored at
+-- all, so there is nothing for a rolled-back clock to over-serve: the worst it
+-- can do is keep a CLOSED answer alive longer, which relaxes nothing. Rather
+-- than keep a guard whose reason has gone, the invariant it was protecting is
+-- asserted directly.
+--
+-- (The in-flight rollback check in prepare() stays and is asserted separately
+-- in test_a_clock_rollback_during_the_request_is_refused — that one guards the
+-- deadline and expiry of the response being read right now, which still
+-- matters for a permissive plan on its single permitted use.)
+local function test_a_stale_entry_can_only_ever_be_closed()
 	reset()
-	next_response_body = plan({ max_age_seconds = 300 })
-	local first = prepare()
+	next_response_body = plan()
+	assert_true(prepare().plan_used, "the fixture must be used")
 	assert_equal(#requests, 1)
-	prepare()
-	assert_equal(#requests, 1, "the control: a cache hit while the clock behaves")
 
+	-- The clock goes backwards by a minute; the entry is now un-ageable.
 	socket.now = socket.now - 60
-	next_response_body = plan({ max_age_seconds = 300 })
-	local after = prepare()
-	assert_equal(#requests, 2, "a backwards clock must discard the entry, not serve it")
-	assert_true(after.plan_used, "and the replacement is used: " .. tostring(after.reason))
-	socket.now = 1000
-
-	-- ⚠ AND NO SERVED WINDOW EVER EXCEEDS THE ONE THE RESOLVER GRANTED. The
-	-- cap is defence in depth: while the regression check above stands, the
-	-- only way remaining could exceed the ceiling is a clock earlier than the
-	-- insertion, which is already discarded — so there is no mutant that kills
-	-- the cap alone, and saying so is better than implying one.
-	reset()
-	next_response_body = plan({ max_age_seconds = 5 })
-	assert_equal(prepare().valid_for_seconds, 5, "the fresh window is the plan's own")
 	local served = prepare()
-	assert_true(served.valid_for_seconds <= 5,
-		"a served window must never exceed the ceiling: " .. tostring(served.valid_for_seconds))
+	socket.now = 1000
+	-- Whatever it does with the entry, what it serves cannot open anything.
+	assert_true(served.optional_processing_closed, "a stale entry must stay closed")
+	assert_equal(served.crash_profile, consent_policy.CRASH_OFF, "with the crash lane shut")
+	assert_equal(served.server_analytics, consent_policy.SERVER_ANALYTICS_DENIED, "and no server lane")
+	assert_true(served.server_analytics_objection_required, "and the objection standing")
 end
 
 -- ⚠ A RESTORED ANSWER IS NOT A NEW ONE. A policy suspension followed by a
@@ -2109,6 +2141,90 @@ local function test_every_schema_object_has_a_closed_key_set()
 	assert_true(prepare().plan_used, "every schema object spelled correctly must parse")
 end
 
+-- ⚠ "-00:00" IS NOT ZERO, IT IS "OFFSET UNKNOWN" (RFC 3339). An expiry
+-- whose offset the sender declined to state is an instant this build cannot
+-- place on a timeline, and reading it as UTC is picking one of the
+-- twenty-seven it could have meant.
+local function test_an_unknown_offset_is_refused()
+	reset()
+	next_response_body = plan({ expires_at = "2099-01-01T00:00:00-00:00" })
+	assert_true(not prepare().plan_used, '"-00:00" is not an offset this build can place')
+	-- The controls: "+00:00" IS zero, and "Z" is the usual spelling of it.
+	reset()
+	next_response_body = plan({ expires_at = "2099-01-01T00:00:00+00:00" })
+	assert_true(prepare().plan_used, '"+00:00" is a stated offset of zero')
+	reset()
+	next_response_body = plan({ expires_at = "2099-01-01T00:00:00Z" })
+	assert_true(prepare().plan_used, '"Z" is still UTC')
+end
+
+-- ⚠ parse_plan IS PRIVATE. The public surface is prepare() and invalidate().
+-- It takes a DECODED TABLE, and half of what this module checks — container
+-- types, duplicate keys, present-and-null members, unknown key names — lives
+-- in the raw text and is gone by the time a table exists, so an exported
+-- parse_plan would hand a caller a validator that silently cannot perform most
+-- of its own validation.
+local function test_the_public_surface_is_prepare_and_invalidate()
+	local exported = {}
+	for name, value in pairs(consent_policy) do
+		if type(value) == "function" then
+			exported[#exported + 1] = name
+		end
+	end
+	table.sort(exported)
+	assert_equal(table.concat(exported, ","), "invalidate,prepare,validate_context",
+		"the exported functions are the contract; parse_plan is not one of them")
+end
+
+-- ⚠ TWO DEBTS THE EXAMPLE USED TO DROP. An identity the client refused was
+-- reported and forgotten, so the consent write it blocks never happened again;
+-- and a RESTORED grant re-initialised the client without starting a session,
+-- leaving the lane open with nothing behind it.
+local function test_the_example_pays_its_debts()
+	-- (a) identify refuses once, then succeeds on the next trigger — over the
+	-- SAME client, not a second one — and the consent write follows.
+	reset()
+	sdk_identify_refusals = 1
+	next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT })
+	local calls = run_example(nil, { "focus_gained" })
+	assert_true(calls:find("identify refused", 1, true) ~= nil,
+		"the fixture must refuse identify once: " .. calls)
+	assert_true(calls:find("sdk.set_consent", 1, true) ~= nil,
+		"the owed consent write must follow the retried identify: " .. calls)
+	local inits = 0
+	for _ in calls:gmatch("sdk%.init") do
+		inits = inits + 1
+	end
+	assert_equal(inits, 1, "and it must be retried over the client that exists: " .. calls)
+
+	-- (b) A restored grant starts a session and writes no consent. The plan's
+	-- life runs out, the lane is suspended and restarted from the standing
+	-- answer; the placeholder DECLINED, so no session is expected here — what
+	-- must be true is that the restore wrote no second consent decision.
+	reset()
+	next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT, max_age_seconds = 2 })
+	calls = run_example(nil, nil, { 1, 1, 1 })
+	assert_true(calls:find("analytics suspended (plan_expired)", 1, true) ~= nil,
+		"the fixture must exercise a restore: " .. calls)
+	local writes, starts = 0, 0
+	for _ in calls:gmatch("sdk%.set_consent") do
+		writes = writes + 1
+	end
+	for _ in calls:gmatch("sdk%.session_start") do
+		starts = starts + 1
+	end
+	assert_equal(writes, 1, "a restore must not re-write consent: " .. calls)
+	assert_equal(starts, 0, "and a declined answer starts no session, restored or not: " .. calls)
+	-- ⚠ HONEST GAP, STATED RATHER THAN PAPERED OVER. The restore now calls
+	-- session_start when the standing answer was a GRANT, and this suite
+	-- cannot reach that path: the example's placeholder notice declines, by
+	-- design, and it is a local inside the chunk. So `starts == 0` above holds
+	-- whether or not that line exists — a mutant deleting it survives. Reaching
+	-- it would need a granting notice, which would mean bending the example to
+	-- the test; the line is three lines long and visible, and I would rather
+	-- say this than count a kill I do not have.
+end
+
 local tests = {
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,
@@ -2131,7 +2247,7 @@ local tests = {
 	test_the_published_example_branches_on_the_decision,
 	test_an_older_response_cannot_overwrite_a_newer_one,
 	test_an_encoder_failure_still_answers,
-	test_a_lost_transport_beats_a_cached_permission,
+	test_a_permissive_decision_is_never_served_twice,
 	test_the_clock_falls_back_to_os_time,
 	test_an_empty_object_is_not_an_empty_list,
 	test_an_offset_needs_its_colon,
@@ -2144,7 +2260,7 @@ local tests = {
 	test_a_verdict_carries_its_validity_window,
 	test_a_pending_crash_shutdown_keeps_its_state,
 	test_a_null_signature_is_still_a_signature,
-	test_a_backwards_clock_invalidates_the_cache,
+	test_a_stale_entry_can_only_ever_be_closed,
 	test_a_restored_answer_writes_no_consent,
 	test_a_null_list_is_not_an_absent_one,
 	test_an_unknown_top_level_key_is_refused,
@@ -2166,6 +2282,9 @@ local tests = {
 	test_the_context_age_bands_keys_are_closed,
 	test_the_example_stops_when_identify_refuses,
 	test_every_schema_object_has_a_closed_key_set,
+	test_an_unknown_offset_is_refused,
+	test_the_public_surface_is_prepare_and_invalidate,
+	test_the_example_pays_its_debts,
 }
 
 for _, test in ipairs(tests) do

@@ -45,6 +45,9 @@ local revalidate_backoff = MIN_REVALIDATE_SECONDS
 -- A consent write that failed is OWED. Until it lands, the session has not
 -- started and the answer is still pending.
 local consent_pending = false
+-- An identity the client REFUSED is owed the same way: retried on the next
+-- trigger, over the client that already exists rather than a second one.
+local identify_pending = false
 
 -- Where this example parks a remote-config value; your game reads it wherever
 -- it needs the tuned number.
@@ -157,10 +160,19 @@ local function start_analytics(granted, decision, newly_answered)
 	if not identified then
 		print("shardpilot identify refused: " .. tostring(identify_err) ..
 			"; flush and re-identify before recording consent (the host's to do)")
+		identify_pending = true
 		return false
 	end
+	identify_pending = false
 
 	if not newly_answered then
+		-- ⚠ A RESTORED GRANT STILL NEEDS ITS SESSION. The client is new; the
+		-- consent decision came back from disk with it, but the session did
+		-- not. Starting one without set_consent is the point: the decision is
+		-- restored, not re-made.
+		if granted then
+			shardpilot.session_start()
+		end
 		return true
 	end
 	-- Each explicit decision posts a consent receipt kept in a durable outbox
@@ -227,6 +239,15 @@ end
 -- new decision permits still needs an answer, and a resume that could open a
 -- lane would be a grant issued by a focus event.
 reconcile = function(fresh)
+	-- An identity the client refused is owed; retry it first, because the
+	-- consent write below is what it blocks.
+	if identify_pending and analytics_running and answered then
+		if shardpilot.identify("user-example") then
+			identify_pending = false
+			consent_pending = true
+		end
+	end
+
 	-- A consent write that failed is owed; retry it before anything else.
 	if consent_pending and analytics_running and answered then
 		local recorded, consent_err = shardpilot.set_consent(answered.granted)

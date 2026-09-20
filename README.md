@@ -177,7 +177,8 @@ local crash = require "shardpilot.crash"
 
 -- Lifecycle state: an initialised client that has not been shut down.
 local analytics_running, crash_running = false, false
-local consent_pending = false -- a consent write that failed is OWED
+local consent_pending = false  -- a consent write that failed is OWED
+local identify_pending = false -- so is an identity the client refused
 -- A verdict with no life is not runnable; the retry is bounded and backs off.
 local MIN_REVALIDATE, MAX_REVALIDATE, revalidate_backoff = 30, 300, 30
 -- The standing answer and the notice text it was given against. It survives a
@@ -253,9 +254,15 @@ local function start_analytics(granted, newly_answered)
   local identified, identify_err = shardpilot.identify("user-example")
   if not identified then
     print("shardpilot identify refused: " .. tostring(identify_err))
+    identify_pending = true
     return false
   end
+  identify_pending = false
   if not newly_answered then
+    -- A restored grant still needs its session: the client is new, the consent
+    -- decision came back from disk with it, the session did not. No
+    -- set_consent — the decision is restored, not re-made.
+    if granted then shardpilot.session_start() end
     return true
   end
   local recorded, consent_err = shardpilot.set_consent(granted) -- a DECLINE is recorded the same way
@@ -291,6 +298,14 @@ end
 -- ⚠ THE ONE PATH. It CLOSES on its own authority and OPENS only on the
 -- player's: a lane the new decision permits still needs an answer.
 reconcile = function(fresh)
+  -- An identity the client refused is owed; retry it first, because the
+  -- consent write below is what it blocks.
+  if identify_pending and analytics_running and answered then
+    if shardpilot.identify("user-example") then
+      identify_pending, consent_pending = false, true
+    end
+  end
+
   -- An owed consent write is retried before anything else.
   if consent_pending and analytics_running and answered then
     local recorded = shardpilot.set_consent(answered.granted)
@@ -1154,6 +1169,21 @@ scoped to the *whole* context — a different app, environment or endpoint is
 re-resolved rather than served the previous one's answer. An entry never
 outlives the shorter of five minutes, the plan's own `expires_at` and its
 `max_age_seconds`.
+
+⚠ **And a permissive decision is never cached at all.** Anything that opens a
+lane — a `SOFT_OPT_OUT` regime, a `MINIMAL` crash profile, an `ELIGIBLE`
+server-analytics basis, or a lifted objection requirement — is used for the
+`prepare` call that fetched it and is not stored. Every later `prepare` for
+that context goes to the wire, and a request that fails, times out or finds no
+network answers **strict**. Only a fully closed decision may be reused within
+its lifetime, because reusing "closed" can never open anything. This is the
+only way *"an offline state can tighten but never relax"* can actually hold:
+the presence of `http.request` says nothing about connectivity, and Defold
+offers no reliable online signal, so there is no moment at which the SDK could
+know a stored permission is still true. The cost is **one request per
+`prepare` while the regime is permissive** — and `prepare` is called at start,
+on resume and at expiry, not per frame. Today it costs nothing at all, because
+the resolver's initial release emits only strict plans.
 
 ### What the minimal example does not do — host requirements
 
