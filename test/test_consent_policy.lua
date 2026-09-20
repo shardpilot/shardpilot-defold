@@ -425,9 +425,21 @@ local function without_key(body, name, parent)
 	local cut_to = value_to
 	if closer == "," then
 		cut_to = value_to + 1
-	elseif body:sub(pair_from - 1, pair_from - 1) == "," then
-		-- The object's last member: take the LEADING comma with the pair.
-		pair_from = pair_from - 1
+	else
+		-- ⚠ THE OBJECT'S LAST MEMBER TAKES THE LEADING COMMA WITH IT, AND THE
+		-- COMMA NEED NOT BE THE BYTE BEFORE THE KEY. The resolver's wire bytes
+		-- are INDENTED, so what precedes a key is a newline and two spaces;
+		-- looking only at the previous byte left the comma behind and produced
+		-- `…, }`, which is not JSON. The scenes caught it by refusing with
+		-- "not readable" instead of naming the key, which is the failure
+		-- direction this helper is built for.
+		local back = pair_from - 1
+		while back > 1 and body:sub(back, back):match("[ \t\r\n]") do
+			back = back - 1
+		end
+		if body:sub(back, back) == "," then
+			pair_from = back
+		end
 	end
 	return body:sub(1, pair_from - 1) .. body:sub(cut_to + 1)
 end
@@ -490,6 +502,47 @@ end
 -- test/golden/ holds the handler's output, produced by running the server's
 -- own constructors at a pinned commit (see test/golden/README.md). The fixture
 -- above is written to match them; these are what says whether it still does.
+-- ⚠ COMPACTION WITHOUT A JSON LIBRARY, ON PURPOSE. This removes insignificant
+-- whitespace and NOTHING ELSE: bytes inside strings are copied through, so key
+-- ORDER, number spelling, escape spelling and the notice's own characters
+-- cannot move. A round trip through a decoder and an encoder would prove only
+-- that the two documents mean the same thing, which is the weaker claim and
+-- the one that let this SDK and the resolver disagree in the first place.
+local function compact_json(text)
+	local out, in_string, escaped = {}, false, false
+	for index = 1, #text do
+		local char = text:sub(index, index)
+		if in_string then
+			out[#out + 1] = char
+			if escaped then
+				escaped = false
+			elseif char == "\\" then
+				escaped = true
+			elseif char == '"' then
+				in_string = false
+			end
+		elseif char == '"' then
+			in_string = true
+			out[#out + 1] = char
+		elseif not char:match("[ \t\r\n]") then
+			out[#out + 1] = char
+		end
+	end
+	return table.concat(out)
+end
+
+-- The resolver repository stores each response RE-INDENTED so a human notices
+-- a diff; indentation is the only transformation it applies, and it applies it
+-- to both sides of its own comparison. Both forms are vendored here so the
+-- relation between them is PROVED by a scene rather than asserted in prose.
+local function golden_indented(name)
+	local file = assert(io.open("test/golden/consent-policy-" .. name .. ".indented.json"),
+		"the indented review forms must be present")
+	local body = file:read("*a")
+	file:close()
+	return body
+end
+
 local function golden(name)
 	local file = assert(io.open("test/golden/consent-policy-" .. name .. ".json"),
 		"the golden bodies must be present")
@@ -2868,8 +2921,93 @@ local function test_operation_blocks_close_every_lane()
 		"and opens the permitted crash lane: " .. calls)
 end
 
+-- ⚠ THE PROVENANCE, AS A SCENE RATHER THAN A SENTENCE. The README used to
+-- claim these files are the handler's own bytes and point at a commit. A
+-- reader had no way to check it, and a claim nobody can check is the shape
+-- every other defect in this module took.
+--
+-- Both forms are vendored: the COMPACT file, which is what the handler writes
+-- on the wire, and the INDENTED file, which is what the resolver repository
+-- stores so a human notices a diff. Its own golden test re-indents the raw
+-- response and compares that, applying indentation to both sides, so
+-- indentation is the only transformation between them. This asserts exactly
+-- that — and asserts it by COMPACTION rather than by decoding, so a key
+-- reordered, a number respelled or an escape rewritten in either file would
+-- fail here instead of passing as "the same document".
+local function test_the_review_forms_compact_to_the_wire_bytes()
+	for _, name in ipairs({ "resolved", "refusal" }) do
+		local wire, review = golden(name), golden_indented(name)
+
+		-- ⚠ THE CONTROL COMES FIRST. Without it, a review form accidentally
+		-- vendored in its compact spelling would satisfy every line below
+		-- while proving nothing at all.
+		assert_true(#review > #wire,
+			"the " .. name .. " review form carries no indentation, so this scene "
+				.. "would hold whatever the files contained")
+		assert_true(review:find("\n", 1, true) ~= nil,
+			"the " .. name .. " review form has no newlines: " .. review:sub(1, 60))
+
+		assert_equal(compact_json(review), wire,
+			"compacting the " .. name .. " review form must reproduce the wire bytes "
+				.. "EXACTLY; if it does not, the two files are not the same response")
+
+		-- And compaction is idempotent on the wire form, which is what says
+		-- the wire file carries no insignificant whitespace of its own.
+		assert_equal(compact_json(wire), wire,
+			"the " .. name .. " wire form must already be compact")
+	end
+end
+
+-- ⚠ AND THE MODULE MUST READ BOTH THE SAME WAY. JSON permits insignificant
+-- whitespace anywhere between tokens, and this module does a RAW-TEXT SCAN —
+-- duplicate keys, unknown keys, container types, present-and-null — before it
+-- ever decodes. Every golden scene in this file ran on the compact form only,
+-- so that scanner had never met a newline or an indent. A proxy that
+-- re-serialises, a future encoder, or a server that starts pretty-printing
+-- would all arrive as whitespace, and a closed validator that has only seen
+-- one spelling is one layer of exactly the gap these files exist for.
+local function test_whitespace_does_not_change_the_answer()
+	reset()
+	next_response_body = golden_indented("resolved")
+	local indented = prepare(golden_context())
+	assert_true(indented.plan_used,
+		"the indented resolved plan must be USED: " .. tostring(indented.reason)
+			.. " / " .. tostring(indented.detail))
+
+	reset()
+	next_response_body = golden("resolved")
+	local compact = prepare(golden_context())
+	assert_true(compact.plan_used, "the control: the wire form is used")
+
+	-- Field by field, because "both were used" would hold even if the scanner
+	-- had quietly taken a different path through one of them.
+	for _, field in ipairs({ "regime", "crash_profile", "server_analytics", "child_rules",
+		"analytics_choice_default", "explicit_grant_required", "notice",
+		"consent_text_version", "presented_language", "policy_version",
+		"band_vocabulary", "band_vocabulary_version", "plan_used", "reason" }) do
+		assert_equal(tostring(indented[field]), tostring(compact[field]),
+			"whitespace changed the answer for " .. field)
+	end
+
+	-- The refusal too: the reason is what identifies one, and it must survive
+	-- the same way.
+	reset()
+	next_response_body = golden_indented("refusal")
+	local refusal = prepare(golden_context())
+	assert_true(not refusal.plan_used, "the indented refusal must not be used")
+	assert_equal(refusal.reason, "invalid_scope",
+		"and must still be identified by its reason: " .. tostring(refusal.reason))
+	assert_equal(refusal.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
+		"with the choice defaulting off")
+end
+
 local function test_every_key_the_contract_sends_is_required()
-	local body = golden("resolved")
+	-- ⚠ OVER BOTH FORMS. The omission rule is about which keys ARRIVED, and
+	-- arrival is read off the raw text — so running it only on the compact
+	-- spelling left the whole rule untested against the whitespace JSON
+	-- permits between every pair of tokens.
+	for _, form in ipairs({ "wire", "review" }) do
+	local body = form == "wire" and golden("resolved") or golden_indented("resolved")
 
 	-- The control first: unmodified, these bytes are USED. Without it every
 	-- assertion below would also pass against a plan refused for some other
@@ -2877,7 +3015,7 @@ local function test_every_key_the_contract_sends_is_required()
 	reset()
 	next_response_body = body
 	assert_true(prepare(golden_context()).plan_used,
-		"the control: the resolver's own plan must be used unmodified")
+		"the control: the resolver's own plan must be used unmodified (" .. form .. ")")
 
 	local checked = 0
 	local function omission_is_refused(removed, named)
@@ -2909,14 +3047,16 @@ local function test_every_key_the_contract_sends_is_required()
 	-- sentinel at the bottom of this file exists for.
 	assert_equal(checked, 23,
 		"the golden plan carries 13 top-level names and 3 + 3 + 4 nested ones; "
-			.. "if the contract grew, refresh the golden body and this number")
+			.. "if the contract grew, refresh the golden body and this number "
+			.. "(" .. form .. ")")
 
 	-- `reason` is the one name that is NOT required: it marks a refusal rather
 	-- than a plan, and the golden resolved body does not carry it at all.
 	reset()
 	next_response_body = body
 	assert_true(prepare(golden_context()).plan_used,
-		"a plan without `reason` is a plan, not a refusal")
+		"a plan without `reason` is a plan, not a refusal (" .. form .. ")")
+	end
 end
 
 local function test_the_band_vocabulary_is_shape_checked_only()
@@ -3085,6 +3225,8 @@ local tests = {
 	test_the_age_band_is_read_again_after_the_notice,
 	test_a_fresh_answer_does_not_survive_minimised_handling,
 	test_operation_blocks_close_every_lane,
+	test_the_review_forms_compact_to_the_wire_bytes,
+	test_whitespace_does_not_change_the_answer,
 	test_every_key_the_contract_sends_is_required,
 	test_the_band_vocabulary_is_shape_checked_only,
 	test_the_notice_is_carried_whole,
