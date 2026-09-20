@@ -18,8 +18,8 @@ not the platform boundary.
   a local stack you run yourself. Which endpoints are available today is stated
   under Configuration below and in [`docs/configuration.md`](docs/configuration.md);
   read that before configuring a hosted deployment.
-- **Version `0.10.2`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.10.2`; the `v0.10.2` tag
+- **Version `0.10.3`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.10.3`; the `v0.10.3` tag
   is created by the owner after the version-bump merge (pending until then).
 
 ## What it does
@@ -102,11 +102,11 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — after owner tagging, the latest tag is `v0.10.2`:
+published tag's source archive — after owner tagging, the latest tag is `v0.10.3`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.2.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.3.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
@@ -1404,9 +1404,10 @@ implement all three.
   can fail — a full or unwritable spool — and the example neither retries it
   nor reports it, so events it was meant to save are lost silently on a kill.
 - **Retry a pending grant only against a fresh decision that still permits
-  analytics and still matches the answered notice.** The example retries an
-  owed `set_consent` on the next trigger using the standing answer; a
-  production integration must first confirm that the newest decision still
+  analytics and still matches the answered notice.** Retrying an owed
+  `set_consent` is entirely the host's responsibility; the quick start reports
+  the refused write and performs no retry. Before retrying, a production
+  integration must confirm that the newest decision still
   opens the lane and still carries the `consent_text_version` and
   `presented_language` the player answered, or a write owed under one policy
   lands under another.

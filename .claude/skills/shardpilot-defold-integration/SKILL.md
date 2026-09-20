@@ -42,13 +42,13 @@ the deeper reference.
   only). (Live Lua script-error capture IS available as the opt-in
   `script_error_capture_enabled` crash flag, default off — see the crash
   section.)
-- **Pre-launch**: the production ingest domain is not provisioned yet; use
-  local/develop endpoints. The SDK is v0 alpha and the API may change before
-  v1.
+- **Deployment availability is not verified by this SDK source.** Use an
+  endpoint supplied for your environment. The SDK is v0 alpha and the API
+  may change before v1.
 
 ## Install
 
-Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.2`.
+Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.3`.
 
 This version includes request compression, a 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history; these were absent from `v0.10.1`.
 
@@ -63,10 +63,10 @@ Two supported paths:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.2.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.3.zip
 ```
 
-`v0.10.2` is the version this skill matches, and it is the same pin the
+`v0.10.3` is the version this skill matches, and it is the same pin the
 README's Installation section carries.
 
 The earlier off-main `v0.10.1` tag still declares `0.10.0`; see the [changelog](../../../CHANGELOG.md).
@@ -1185,20 +1185,22 @@ surface — no guessing from logs.
 11. **Shutdown**: `shardpilot.shutdown("app_final")` returns `true` (or
     retry it while pumping `update`; see the shutdown notes above).
 
-## Known limitations (2026-07-19 audit)
+## Known limitations (source checked 2026-09-20 for `v0.10.3`)
 
-Stated plainly so integrations do not trip on them:
+The consent-regime host requirements and limits are recorded in the
+[v0.10.3 release notes](../../../CHANGELOG.md); preparing a policy does not
+replace the application's lifecycle or consent handling.
 
-- **No engine-real CI leg**: CI runs the test suite under host Lua
-  interpreters (Lua 5.1 and LuaJIT as the gating legs, matching Defold's
-  embedded runtime, plus Lua 5.4 host-only). No CI job builds the SDK inside
-  the Defold engine/bob toolchain — the in-engine build check is a manual
-  release step, so validate your integrated game in the engine yourself.
+- **CI builds the library but does not run your integrated game.** CI runs
+  every `test/test_*.lua` suite under Lua 5.1, LuaJIT and host-only Lua 5.4,
+  and its `bob-build` job resolves and builds a real Defold library harness.
+  Validate gameplay and lifecycle behavior in your own engine integration.
 - **Lua script-error auto-capture is OPT-IN and replaces the handler slot**:
   live Lua errors report only when `script_error_capture_enabled = true`
   (default off), and opting in installs the SDK's `sys.set_error_handler`
   handler into Defold's single process-wide slot — keep the flag off and
   call `crash.emit_fatal` from your own handler if you need both.
-- **Pre-launch platform**: no production ingest domain is provisioned; the
-  hosted docs site is not live yet. Use local/develop endpoints and the
-  in-repo `docs/` as the reference.
+- **Platform availability is a deployment fact.** Production ingest and
+  hosted documentation availability are not verified by this source check.
+  Use the endpoint supplied for your environment and the in-repo `docs/`
+  for the SDK contract.
