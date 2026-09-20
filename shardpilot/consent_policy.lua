@@ -220,6 +220,41 @@ local SCHEMA_KEYS = {
 -- verify, which is refused. No other key may be null.
 local NULLABLE_KEYS = { signature = true }
 
+-- ⚠ REQUIRED IS THE DEFAULT, AND THAT DIRECTION IS THE WHOLE POINT. The
+-- contract of record sends every name in SCHEMA_KEYS on every plan; only
+-- `reason` is conditional, and it marks a refusal rather than a plan. So the
+-- required roster is DERIVED from the schema roster minus one explicit
+-- exception, which means a key added to SCHEMA_KEYS becomes required without
+-- anyone remembering to require it. The other direction — a roster of
+-- required names kept beside the schema — is how flags.operation_blocks came
+-- to be optional here: absent was read as "no restrictions", so a malformed
+-- plan could drop every restriction it carried by leaving the key out and
+-- still be USED. That was one key; the shape of the mistake was the roster.
+local OPTIONAL_KEYS = { reason = true }
+
+-- Sorted, so a plan missing several keys names the same one every run. A
+-- refusal reason that varies between runs is a refusal nobody can test.
+local REQUIRED_KEYS = {}
+for key in pairs(SCHEMA_KEYS) do
+	if not OPTIONAL_KEYS[key] then
+		REQUIRED_KEYS[#REQUIRED_KEYS + 1] = key
+	end
+end
+table.sort(REQUIRED_KEYS)
+
+-- The same rule one level down: every member NESTED_OBJECT_KEYS names is
+-- required, with no exception to carry. Sorted by object, then by member.
+local REQUIRED_MEMBERS = {}
+for object, members in pairs(NESTED_OBJECT_KEYS) do
+	local names = {}
+	for member in pairs(members) do
+		names[#names + 1] = member
+	end
+	table.sort(names)
+	REQUIRED_MEMBERS[#REQUIRED_MEMBERS + 1] = { object = object, names = names }
+end
+table.sort(REQUIRED_MEMBERS, function(left, right) return left.object < right.object end)
+
 -- ⚠ AND THE SCAN HAS TO BE JSON-AWARE, NOT A SEARCH FOR THE LITERAL NAME. The
 -- first cut looked for `"operation_blocks"%s*:%s*{` in the raw text, which a
 -- valid response spells past in one character: "operation\u005fblocks" decodes
@@ -959,6 +994,27 @@ local function parse_plan(plan, context, now)
 	if type(plan) ~= "table" then
 		return nil, "the plan is not an object"
 	end
+	-- ⚠ PRESENCE BEFORE MEANING, FOR EVERY REQUIRED NAME AT ONCE. Each check
+	-- below reads a value; a missing one reads as nil, and nil used to mean
+	-- whatever that particular check made of it — an absent list meant "no
+	-- restrictions", an absent max_age meant "no ceiling". So this runs first
+	-- and names the key it did not find, and every check after it is about a
+	-- value that arrived.
+	if plan.regime == nil then
+		return nil, "the plan is missing the required key regime"
+	end
+	for _, object in ipairs(REQUIRED_MEMBERS) do
+		local nested = plan[object.object]
+		if type(nested) ~= "table" then
+			return nil, "the plan carries no " .. object.object .. " object"
+		end
+		for _, member in ipairs(object.names) do
+			if nested[member] == nil then
+				return nil, "the plan is missing the required key "
+					.. object.object .. "." .. member
+			end
+		end
+	end
 	if plan.regime ~= M.STRICT_OPT_IN and plan.regime ~= M.SOFT_OPT_OUT and plan.regime ~= M.UNKNOWN then
 		return nil, "unknown regime"
 	end
@@ -966,9 +1022,6 @@ local function parse_plan(plan, context, now)
 	-- SEPARATELY. None of them inherits an analytics permission, which is why
 	-- the contract groups them rather than folding them into the regime.
 	local flags = plan.flags
-	if type(flags) ~= "table" then
-		return nil, "the plan carries no flags object"
-	end
 	if not CRASH_PROFILES[flags.crash_profile] then
 		return nil, "unknown crash_profile"
 	end
@@ -978,15 +1031,18 @@ local function parse_plan(plan, context, now)
 	if not CHILD_RULES[flags.child_rules] then
 		return nil, "unknown child_rules"
 	end
-	if flags.operation_blocks ~= nil then
-		if type(flags.operation_blocks) ~= "table" or #flags.operation_blocks > MAX_ENTRIES
-			or not is_sequence(flags.operation_blocks) then
-			return nil, "operation_blocks is malformed or over its bound"
-		end
-		for _, entry in ipairs(flags.operation_blocks) do
-			if not bounded_string(entry, MAX_ENTRY) then
-				return nil, "an entry of operation_blocks is malformed"
-			end
+	-- ⚠ AN ABSENT operation_blocks IS NOT AN EMPTY ONE. The contract sends []
+	-- when there is nothing to block, so absence is a plan that lost its
+	-- restrictions in transit — and reading it as "none" let a malformed plan
+	-- drop every restriction it carried and still be USED. The roster above
+	-- has already refused an absent key by name; what is left here is shape.
+	if type(flags.operation_blocks) ~= "table" or #flags.operation_blocks > MAX_ENTRIES
+		or not is_sequence(flags.operation_blocks) then
+		return nil, "operation_blocks is malformed or over its bound"
+	end
+	for _, entry in ipairs(flags.operation_blocks) do
+		if not bounded_string(entry, MAX_ENTRY) then
+			return nil, "an entry of operation_blocks is malformed"
 		end
 	end
 	if not version_ok(plan.policy_version) or not version_ok(plan.consent_text_version) then
@@ -1010,9 +1066,6 @@ local function parse_plan(plan, context, now)
 		return nil, "the band vocabulary is missing or over its bound"
 	end
 	local basis = plan.basis
-	if type(basis) ~= "table" then
-		return nil, "the plan carries no basis object"
-	end
 	if not BASIS_CHARACTERS[basis.character] then
 		return nil, "unknown basis character"
 	end
@@ -1024,11 +1077,11 @@ local function parse_plan(plan, context, now)
 		return nil, "the basis carries no notice"
 	end
 	local scope = plan.scope
-	if type(scope) ~= "table" or scope.workspace_id ~= context.workspace_id
+	if scope.workspace_id ~= context.workspace_id
 		or scope.app_id ~= context.app_id or scope.environment_id ~= context.environment_id then
 		return nil, "the plan is scoped to another app, environment or workspace"
 	end
-	if plan.signals_used ~= nil then
+	do
 		if type(plan.signals_used) ~= "table" or #plan.signals_used > MAX_SIGNALS
 			or not is_sequence(plan.signals_used) then
 			return nil, "signals_used is malformed or over its bound"
@@ -1063,9 +1116,8 @@ local function parse_plan(plan, context, now)
 	if type(now) == "number" and expires_at <= now then
 		return nil, "the plan has already expired"
 	end
-	if plan.max_age_seconds ~= nil
-		and (type(plan.max_age_seconds) ~= "number" or plan.max_age_seconds < 0
-			or plan.max_age_seconds % 1 ~= 0) then
+	if type(plan.max_age_seconds) ~= "number" or plan.max_age_seconds < 0
+		or plan.max_age_seconds % 1 ~= 0 then
 		return nil, "max_age_seconds is not a whole non-negative number"
 	end
 	-- ⚠ THE SIGNATURE IS RESERVED AND ALWAYS null IN THIS RELEASE, so the
@@ -1311,6 +1363,20 @@ function M.prepare(context, callback)
 				return
 			end
 		end
+		-- ⚠ AND THE OTHER HALF OF THE SAME RULE: WHICH KEYS ARRIVED AT ALL.
+		-- This is the only place that can ask it. Lua has no null, so by the
+		-- time the plan is a table an absent `signature` and a `"signature":
+		-- null` are the same nil — and one of those is the unsigned state the
+		-- contract sends on every response while the other is a plan that lost
+		-- a field in transit. The raw scan is what separates them, so the
+		-- required-key roster is checked HERE, against the bytes, and
+		-- parse_plan is left to judge the values it is handed.
+		for _, key in ipairs(REQUIRED_KEYS) do
+			if not present[key] then
+				settle(strict("invalid_response", "the plan is missing the required key " .. key))
+				return
+			end
+		end
 		-- The same rule inside each signal entry.
 		for index, keys in pairs(present_signals) do
 			local entry = type(decoded.signals_used) == "table" and decoded.signals_used[index] or nil
@@ -1341,7 +1407,7 @@ function M.prepare(context, callback)
 		if expires_at - arrived < lifetime then
 			lifetime = expires_at - arrived
 		end
-		if plan.max_age_seconds ~= nil and plan.max_age_seconds < lifetime then
+		if plan.max_age_seconds < lifetime then
 			lifetime = plan.max_age_seconds
 		end
 		decision.valid_for_seconds = lifetime

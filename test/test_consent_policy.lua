@@ -42,7 +42,18 @@ local function encode_string(value)
 	return '"' .. tostring(value):gsub("\\", "\\\\"):gsub('"', '\\"') .. '"'
 end
 
+-- ⚠ A FIXTURE THAT CANNOT SAY "null" CANNOT BUILD THE CONTRACT'S OWN BODY.
+-- Lua has no null and this encoder dropped nil keys, so `signature = nil`
+-- produced a body with no signature at all — which is now a refusal, and was
+-- the shape that let the suite pass while the fixture and the resolver
+-- disagreed about what a plan looks like. NULL is a distinct value the encoder
+-- writes as `null` and the key survives.
+local NULL = setmetatable({}, { __tostring = function() return "null" end })
+
 local function encode_value(value)
+	if value == NULL then
+		return "null"
+	end
 	local value_type = type(value)
 	if value_type == "table" then
 		local is_array = true
@@ -293,6 +304,9 @@ local function plan(overrides)
 			table_provenance = "ai_draft",
 			notice = NOTICE,
 		},
+		-- Present and null, which is what the resolver sends on every response
+		-- in this release and the only admissible signature state here.
+		signature = NULL,
 	}
 	for key, value in pairs(overrides or {}) do
 		if value == "__nil__" then
@@ -312,11 +326,162 @@ local function plan(overrides)
 	return encode_value(body)
 end
 
--- Splices a field into the fixture as RAW TEXT — the encoder cannot produce
--- an empty object, a null, or an escaped key name. The field is dropped from
--- the fixture first, because a duplicate top-level key is now malformed in its
--- own right and the scene would pass for that reason instead.
+-- ⚠ THIS COMMENT USED TO DESCRIBE A DROP THE CODE DID NOT PERFORM. It said
+-- the field was removed from the fixture first; the body below only prepended,
+-- so every raw_field on a key the fixture already carried built a DUPLICATE
+-- and the scene passed on the duplicate rule rather than on the value it meant
+-- to test. Both intents are wanted, so both are now named.
+
+-- Splices a field into the fixture as RAW TEXT — the encoder cannot produce an
+-- empty object, an escaped key name, or (before the NULL sentinel) a null.
+-- REPLACES the fixture's own copy, so the scene is about the value.
 local function raw_field(name, raw_value, overrides)
+	local merged = {}
+	for key, value in pairs(overrides or {}) do
+		merged[key] = value
+	end
+	-- Unescaped names only; an escaped spelling matches no fixture key, drops
+	-- nothing, and is therefore a duplicate — which is what those scenes want.
+	local plain = name:match('^"([%a_][%w_]*)"$')
+	if plain and merged[plain] == nil then
+		merged[plain] = "__nil__"
+	end
+	local body = plan(merged)
+	return body:sub(1, 1) .. name .. ":" .. raw_value .. "," .. body:sub(2)
+end
+
+-- ⚠ REMOVES ONE TOP-LEVEL KEY FROM RAW JSON TEXT, so the omission scenes can
+-- work on the RESOLVER'S OWN BYTES rather than on a fixture that agrees with
+-- the module by construction. It walks the document tracking string state and
+-- container depth, because a key name also occurs inside the notice text and
+-- inside nested objects, and a plain gsub would cut one of those instead.
+--
+-- If this ever produced malformed text the scenes below would fail rather than
+-- pass: they assert the refusal NAMES the omitted key, and unreadable text
+-- refuses with a different reason.
+-- Locates one member of a JSON object's raw text: the byte the `"key":` pair
+-- starts at, and the byte its value ends at. Walks the document tracking
+-- string state and container depth, because a name also occurs inside the
+-- notice text and inside nested objects, and a plain find would hit one of
+-- those instead.
+local function member_span(body, name, from, to)
+	local needle = '"' .. name .. '":'
+	local depth, in_string, escaped = 0, false, false
+	local pair_from, value_from
+	local index = from
+	while index <= to do
+		local char = body:sub(index, index)
+		if in_string then
+			if escaped then
+				escaped = false
+			elseif char == "\\" then
+				escaped = true
+			elseif char == '"' then
+				in_string = false
+			end
+		elseif char == '"' then
+			if depth == 1 and not pair_from and body:sub(index, index + #needle - 1) == needle then
+				pair_from = index
+				value_from = index + #needle
+			end
+			in_string = true
+		elseif char == "{" or char == "[" then
+			depth = depth + 1
+		elseif char == "}" or char == "]" then
+			-- ⚠ TESTED BEFORE THE DECREMENT. The closing brace of the object
+			-- being scanned is the end of its LAST member's value, and it is
+			-- reached while the walk is still inside — decrementing first made
+			-- the last member's span stop one brace short and left a stray
+			-- `}` in the text.
+			if pair_from and index > value_from and depth == 1 then
+				return pair_from, value_from, index - 1, "}"
+			end
+			depth = depth - 1
+		end
+		if pair_from and index > value_from and not in_string and depth == 1 and char == "," then
+			return pair_from, value_from, index - 1, ","
+		end
+		index = index + 1
+	end
+	return nil
+end
+
+-- ⚠ REMOVES ONE KEY FROM RAW JSON TEXT, so the omission scenes can work on the
+-- RESOLVER'S OWN BYTES rather than on a fixture that agrees with the module by
+-- construction. With `parent`, removes a member of that nested object instead.
+--
+-- If this ever produced malformed text the scenes below would FAIL rather than
+-- pass: they assert the refusal NAMES the omitted key, and unreadable text
+-- refuses with a different reason.
+local function without_key(body, name, parent)
+	local from, to = 1, #body
+	if parent then
+		local _, value_from, value_to = member_span(body, parent, 1, #body)
+		assert(value_from, "without_key found no top-level key named " .. parent)
+		from, to = value_from, value_to
+	end
+	local pair_from, _, value_to, closer = member_span(body, name, from, to)
+	assert(pair_from, "without_key found no key named " .. name)
+	local cut_to = value_to
+	if closer == "," then
+		cut_to = value_to + 1
+	elseif body:sub(pair_from - 1, pair_from - 1) == "," then
+		-- The object's last member: take the LEADING comma with the pair.
+		pair_from = pair_from - 1
+	end
+	return body:sub(1, pair_from - 1) .. body:sub(cut_to + 1)
+end
+
+-- Every member name of a JSON object's raw text, in the order it was sent.
+-- The omission scenes are driven from THIS rather than from a roster typed
+-- into the suite: a roster here is a second copy of the contract, and the
+-- whole defect being repaired is a second copy of the contract drifting from
+-- the first. A key the resolver starts sending is covered the day its golden
+-- body is refreshed.
+local function member_names(body, parent)
+	local from, to = 1, #body
+	if parent then
+		local _, value_from, value_to = member_span(body, parent, 1, #body)
+		assert(value_from, "member_names found no top-level key named " .. parent)
+		from, to = value_from, value_to
+	end
+	local names = {}
+	local depth, in_string, escaped, key_from = 0, false, false, nil
+	local index = from
+	while index <= to do
+		local char = body:sub(index, index)
+		if in_string then
+			if escaped then
+				escaped = false
+			elseif char == "\\" then
+				escaped = true
+			elseif char == '"' then
+				in_string = false
+				-- A NAME is a depth-1 string followed by a colon; a depth-1
+				-- string followed by anything else is a value.
+				if depth == 1 and key_from and body:sub(index + 1, index + 1) == ":" then
+					names[#names + 1] = body:sub(key_from, index - 1)
+				end
+				key_from = nil
+			end
+		elseif char == '"' then
+			in_string = true
+			if depth == 1 then
+				key_from = index + 1
+			end
+		elseif char == "{" or char == "[" then
+			depth = depth + 1
+		elseif char == "}" or char == "]" then
+			depth = depth - 1
+		end
+		index = index + 1
+	end
+	return names
+end
+
+-- Splices a SECOND copy of a field in, leaving the fixture's own. For the
+-- scenes whose subject IS the duplicate.
+local function duplicate_field(name, raw_value, overrides)
 	local body = plan(overrides)
 	return body:sub(1, 1) .. name .. ":" .. raw_value .. "," .. body:sub(2)
 end
@@ -945,7 +1110,24 @@ local function run_example(between, window_events, dts, finalize, opts)
 		local chunk = assert(loadfile("examples/minimal/main.script"))
 		chunk()
 		opts = opts or {}
-		if opts.age_band ~= nil then
+		if opts.age_bands then
+			-- ⚠ A BAND THAT CHANGES BETWEEN READS, which a constant cannot
+			-- express: the property under test is that the example asks the
+			-- HOST again after the notice closes rather than reusing the
+			-- reading it took before the screen opened. Entries are consumed
+			-- one per call; the last one holds. "__nil__" is an unknown band,
+			-- because a nil in a Lua list is a hole and not a value.
+			local bands = opts.age_bands
+			local reads = 0
+			host_age_band = function()
+				reads = reads + 1
+				local band = bands[reads] or bands[#bands]
+				if band == "__nil__" then
+					return nil
+				end
+				return band
+			end
+		elseif opts.age_band ~= nil then
 			local band = opts.age_band
 			host_age_band = function()
 				return band
@@ -1062,6 +1244,15 @@ local function test_the_published_example_branches_on_the_decision()
 		"a fallback still puts the question: " .. calls)
 	assert_true(calls:find("sdk.set_consent:true", 1, true) ~= nil,
 		"and a grant under a fallback is a valid strict grant: " .. calls)
+	-- ⚠ AN ABSENT WINDOW IS NOT A ZERO ONE. A fallback carries no
+	-- valid_for_seconds at all — it established nothing that could expire — so
+	-- only a PRESENT non-positive window closes the lanes. Reading nil as
+	-- "no window" made every outage start nothing, which is the strict
+	-- fallback refusing the very grant it just asked for.
+	assert_true(calls:find("no validity window", 1, true) == nil,
+		"a fallback's absent window is not a zero window: " .. calls)
+	assert_true(calls:find("sdk.session_start", 1, true) ~= nil,
+		"and the granted session starts under it: " .. calls)
 
 	-- (d) An UNKNOWN or MINOR band means minimised handling: the question is
 	-- never presented and nothing optional starts. The age step is the host's
@@ -1106,6 +1297,26 @@ local function test_the_published_example_branches_on_the_decision()
 	calls = run_example(nil, nil, nil, false, { age_band = eligible, answer = true })
 	assert_true(calls:find("crash.init", 1, true) ~= nil,
 		"a permitted crash profile opens the lane: " .. calls)
+
+	-- ⚠ AND A MINOR OR UNKNOWN BAND CLOSES IT AGAIN, WHATEVER THE PROFILE
+	-- SAYS. `minimal_diagnostics_for_minors` is a release-2 path needing a
+	-- reviewed child flow the quick start does not have. The example's own
+	-- comment claimed this before the code did: `band` was local to the
+	-- analytics block and the crash block was reached by fall-through, so the
+	-- permitted profile above opened a reporter on a minor.
+	for _, band in ipairs({ "minor", "__unknown__" }) do
+		reset()
+		next_response_body = example_plan({ flags = { crash_profile = consent_policy.CRASH_MINIMAL } })
+		calls = run_example(nil, nil, nil, false, {
+			age_band = band ~= "__unknown__" and band or nil,
+			answer = true,
+		})
+		assert_true(calls:find("crash.init", 1, true) == nil,
+			"a " .. band .. " band keeps the crash lane shut under "
+				.. consent_policy.CRASH_MINIMAL .. ": " .. calls)
+		assert_true(calls:find("sdk.session_start", 1, true) == nil,
+			"and nothing analytics-side starts either: " .. calls)
+	end
 end
 
 -- ⚠ TWO REQUESTS FOR THE SAME CONTEXT SHARE A GENERATION, so neither
@@ -1622,14 +1833,23 @@ end
 --
 -- Until R16 this module refused the null too — which meant it refused every
 -- real response the resolver sends.
-local function test_the_signature_is_null_or_absent_or_refused()
+local function test_the_signature_is_present_and_null_or_refused()
 	reset()
 	next_response_body = raw_field('"signature"', "null")
 	assert_true(prepare().plan_used, "a null signature is the unsigned state")
 
+	-- ⚠ AND ABSENT IS NOT THE SAME STATE. This scene asserted that it was,
+	-- until the required-key roster: the contract sends `"signature": null` on
+	-- every response, so a plan without the key lost it on the way rather than
+	-- arriving unsigned — and "absent means unsigned" is the reading that lets
+	-- a stripped field pass as a deliberate one. It is the one key whose
+	-- absence only the RAW SCAN can see, because null and absent decode alike.
 	reset()
-	next_response_body = plan()
-	assert_true(prepare().plan_used, "an absent signature is the same state")
+	next_response_body = plan({ signature = "__nil__" })
+	local absent = prepare()
+	assert_true(not absent.plan_used, "an absent signature must not be used")
+	assert_true(absent.detail:find("missing the required key signature", 1, true) ~= nil,
+		"and the reason must name the key: " .. tostring(absent.detail))
 
 	for _, forged in ipairs({ '"ed25519:synthetic"', '""', "42" }) do
 		reset()
@@ -2198,6 +2418,10 @@ local function test_the_example_pays_its_debts()
 		"the fixture must refuse identify: " .. calls)
 	assert_true(calls:find("sdk.set_consent", 1, true) == nil,
 		"no consent may be recorded for an identity the client refused: " .. calls)
+	assert_true(calls:find("sdk.session_start", 1, true) == nil,
+		"and nothing starts on it either — not the session: " .. calls)
+	assert_true(calls:find("sdk.fetch_remote_config", 1, true) == nil,
+		"and not the remote-config fetch behind it: " .. calls)
 	local inits = 0
 	for _ in calls:gmatch("sdk%.init") do
 		inits = inits + 1
@@ -2358,19 +2582,25 @@ end
 -- transfer, age/capacity, localisation and safety — restrictions no consent
 -- choice lifts.
 local function test_a_null_list_is_not_an_absent_one()
-	-- signals_used is the one optional top-level list the contract still has.
 	reset()
-	next_response_body = raw_field('"signals_used"', "null", { signals_used = "__nil__" })
+	next_response_body = raw_field('"signals_used"', "null")
 	local decision = prepare()
 	assert_true(not decision.plan_used, "signals_used present and null must not be used")
 	assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
 			"and the choice defaults off")
 
-	-- The control: genuinely absent still parses, so the rule is about
-	-- presence rather than about the field being optional.
+	-- ⚠ AND ABSENT IS NOW REFUSED TOO, BY A DIFFERENT RULE WITH A DIFFERENT
+	-- REASON. This scene used to assert the opposite — that a genuinely absent
+	-- signals_used still parsed — because the module treated the key as
+	-- optional. The contract of record sends it on every plan, so the two
+	-- states are both malformed and the reasons say which is which: one is
+	-- present and null, the other is missing.
 	reset()
 	next_response_body = plan({ signals_used = "__nil__" })
-	assert_true(prepare().plan_used, "signals_used genuinely absent must still parse")
+	decision = prepare()
+	assert_true(not decision.plan_used, "signals_used absent must not be used either")
+	assert_true(decision.detail:find("missing the required key signals_used", 1, true) ~= nil,
+		"and the reason must name the key: " .. tostring(decision.detail))
 end
 
 -- ⚠ THE FIELD NAMES ARE A CLOSED VOCABULARY TOO. Every other bounded value in
@@ -2401,7 +2631,7 @@ end
 local function test_a_duplicate_top_level_key_is_refused()
 	reset()
 	-- The fixture keeps its own "regime"; this adds a second, permissive one.
-	next_response_body = raw_field('"regime"', '"' .. consent_policy.SOFT_OPT_OUT .. '"')
+	next_response_body = duplicate_field('"regime"', '"' .. consent_policy.SOFT_OPT_OUT .. '"')
 	local decision = prepare()
 	assert_true(not decision.plan_used, "a duplicated key must not be used")
 	assert_true(decision.regime == consent_policy.STRICT_OPT_IN,
@@ -2461,6 +2691,109 @@ end
 -- signals. So it is shape-checked and compared with NOTHING: an earlier cut
 -- compared it to the caller's vocabulary, which would refuse every plan for
 -- any host whose age scale is spelled differently.
+-- ⚠ EVERY NAME THE CONTRACT SENDS IS REQUIRED, AND THIS SCENE IS DRIVEN BY
+-- THE CONTRACT RATHER THAN BY A LIST TYPED HERE. The defect it repairs was one
+-- key: flags.operation_blocks was optional, an absent one was read as an EMPTY
+-- one, and those blocks govern transfer, age and capacity, localisation and
+-- safety — restrictions no consent choice lifts. A malformed plan could drop
+-- every restriction it carried by leaving the key out and still be USED.
+--
+-- One key was the instance. The class is a module that decides field by field
+-- what absence means, so the roster is derived on both sides: the module's
+-- from its schema roster minus `reason`, this scene's from the resolver's own
+-- golden bytes. A key the resolver starts sending is covered here the day the
+-- golden body is refreshed, with nobody remembering to add a row.
+-- ⚠ THE AGE STEP IS RE-READ AFTER THE SCREEN CLOSES, NOT CARRIED OVER IT. A
+-- consent notice is the one place in this flow where an unbounded amount of
+-- real time passes with the player in front of another screen — an age gate, a
+-- parental control, a profile edit. A band the host corrects to minor or
+-- unknown while that screen was open must govern the answer that comes back
+-- off it, or the quick start starts an analytics session for a child on the
+-- strength of a reading taken before anyone asked.
+--
+-- The example gets this right by construction rather than by a check: the
+-- notice callback invalidates the cache and RE-RESOLVES, so reconcile runs
+-- again from the top and reads host_age_band() again. Nothing asserted it.
+local function test_the_age_band_is_read_again_after_the_notice()
+	for _, corrected in ipairs({ "minor", "__nil__" }) do
+		reset()
+		next_response_body = example_plan()
+		-- Adult when the screen opens, corrected while it is open.
+		local calls = run_example(nil, nil, nil, false,
+			{ age_bands = { "adult", corrected }, answer = true })
+		assert_true(calls:find("notice:default=", 1, true) ~= nil,
+			"the screen must have opened on the first, eligible reading: " .. calls)
+		assert_true(calls:find("minimised handling", 1, true) ~= nil,
+			"and the corrected band must reach minimised handling: " .. calls)
+		assert_true(calls:find("sdk.set_consent", 1, true) == nil,
+			"a grant given under the old reading must not be recorded: " .. calls)
+		assert_true(calls:find("sdk.session_start", 1, true) == nil,
+			"and no session may start: " .. calls)
+	end
+
+	-- The control: the same run with the band UNCHANGED does start, so the
+	-- scene is about the correction and not about this path never starting.
+	reset()
+	next_response_body = example_plan()
+	local calls = run_example(nil, nil, nil, false,
+		{ age_bands = { "adult", "adult" }, answer = true })
+	assert_true(calls:find("sdk.set_consent:true", 1, true) ~= nil,
+		"an unchanged eligible band records the grant: " .. calls)
+	assert_true(calls:find("sdk.session_start", 1, true) ~= nil,
+		"and starts the session: " .. calls)
+end
+
+local function test_every_key_the_contract_sends_is_required()
+	local body = golden("resolved")
+
+	-- The control first: unmodified, these bytes are USED. Without it every
+	-- assertion below would also pass against a plan refused for some other
+	-- reason entirely.
+	reset()
+	next_response_body = body
+	assert_true(prepare(golden_context()).plan_used,
+		"the control: the resolver's own plan must be used unmodified")
+
+	local checked = 0
+	local function omission_is_refused(removed, named)
+		reset()
+		next_response_body = removed
+		local decision = prepare(golden_context())
+		assert_true(not decision.plan_used,
+			"a plan missing " .. named .. " must not be used")
+		assert_true(decision.detail:find("missing the required key " .. named, 1, true) ~= nil,
+			"and the reason must NAME " .. named .. ", not describe the damage: "
+				.. tostring(decision.detail))
+		assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
+			"and the choice defaults off")
+		checked = checked + 1
+	end
+
+	for _, key in ipairs(member_names(body)) do
+		omission_is_refused(without_key(body, key), key)
+	end
+	for _, parent in ipairs({ "flags", "scope", "basis" }) do
+		for _, member in ipairs(member_names(body, parent)) do
+			omission_is_refused(without_key(body, member, parent), parent .. "." .. member)
+		end
+	end
+
+	-- ⚠ AND THE COUNT IS ASSERTED, because the loops above are driven by a
+	-- text walk: an enumerator that quietly returned nothing would leave this
+	-- scene green having tested no key at all — the same silence the nil-hole
+	-- sentinel at the bottom of this file exists for.
+	assert_equal(checked, 23,
+		"the golden plan carries 13 top-level names and 3 + 3 + 4 nested ones; "
+			.. "if the contract grew, refresh the golden body and this number")
+
+	-- `reason` is the one name that is NOT required: it marks a refusal rather
+	-- than a plan, and the golden resolved body does not carry it at all.
+	reset()
+	next_response_body = body
+	assert_true(prepare(golden_context()).plan_used,
+		"a plan without `reason` is a plan, not a refusal")
+end
+
 local function test_the_band_vocabulary_is_shape_checked_only()
 	-- ⚠ THE CASE THE COMPARISON BROKE: a caller on its own vocabulary, a
 	-- resolver declaring another. The plan is USED.
@@ -2598,7 +2931,7 @@ local tests = {
 	test_the_example_re_presents_when_the_notice_text_changes,
 	test_a_verdict_carries_its_validity_window,
 	test_a_pending_crash_shutdown_keeps_its_state,
-	test_the_signature_is_null_or_absent_or_refused,
+	test_the_signature_is_present_and_null_or_refused,
 	test_a_stale_entry_can_only_ever_be_closed,
 	test_a_restored_answer_writes_no_consent,
 	test_a_null_list_is_not_an_absent_one,
@@ -2624,6 +2957,8 @@ local tests = {
 	test_the_example_pays_its_debts,
 	test_the_resolvers_own_bytes_are_understood,
 	test_every_plan_enum_is_closed,
+	test_the_age_band_is_read_again_after_the_notice,
+	test_every_key_the_contract_sends_is_required,
 	test_the_band_vocabulary_is_shape_checked_only,
 	test_the_notice_is_carried_whole,
 	test_the_regime_sets_the_default_not_the_silence,

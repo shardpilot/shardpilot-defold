@@ -1,3 +1,4 @@
+-- doc-region: state
 -- ⚠ POLICY FIRST, AND ONE RECONCILE PATH FOR THE WHOLE LIFECYCLE. A consent
 -- regime is not decided once at launch: the plan expires, the notice text
 -- changes, the policy is revoked, the app comes back after a week. Every one
@@ -52,7 +53,9 @@ local revalidate_backoff = MIN_REVALIDATE_SECONDS
 -- Where this example parks a remote-config value; your game reads it wherever
 -- it needs the tuned number.
 local spawn_rate = 1.0
+-- doc-region-end: state
 
+-- doc-region: policy-context
 -- The policy context, in one place, because it is resolved on every trigger
 -- and several copies is how they drift apart.
 local function policy_context()
@@ -66,7 +69,9 @@ local function policy_context()
 		platform = platform.detect(),
 	}
 end
+-- doc-region-end: policy-context
 
+-- doc-region: host-age-band
 -- ⚠ YOUR AGE STEP GOES HERE, AND IT COMES FIRST. The policy endpoint is
 -- public and credential-free, so it can never establish anyone's age; the band
 -- is the host's own, and an unknown or minor band means minimised handling —
@@ -75,7 +80,9 @@ end
 function host_age_band()
 	return nil
 end
+-- doc-region-end: host-age-band
 
+-- doc-region: present-notice
 -- ⚠ YOUR CONSENT UI GOES HERE. It is a GLOBAL so you can replace it with your
 -- own screen — and so this repository's suite can drive both answers, which is
 -- the only way the granted path is ever exercised.
@@ -91,7 +98,9 @@ function present_consent_notice(decision, callback)
 		callback(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_ON)
 	end
 end
+-- doc-region-end: present-notice
 
+-- doc-region: suspend-analytics
 -- ⚠ SUSPENDING A LANE IS NOT A PLAYER DECISION, AND MUST NOT BE WRITTEN AS
 -- ONE. set_consent(false) records and persists an explicit denial and queues
 -- its backend receipt; crash.set_enabled(false) persists an opt_out that
@@ -109,7 +118,9 @@ local function suspend_analytics(reason)
 	end
 	analytics_running = false
 end
+-- doc-region-end: suspend-analytics
 
+-- doc-region: suspend-crash
 -- ⚠ shutdown() CAN SAY "NOT YET". A crash POST dispatched in the real runtime
 -- completes on a later frame, so while one is in flight shutdown returns
 -- false, "pending" — the client is still initialised and still needs pumping.
@@ -129,7 +140,9 @@ local function suspend_crash(reason)
 		print("shardpilot: crash shutdown pending (" .. tostring(err) .. "); retrying")
 	end
 end
+-- doc-region-end: suspend-crash
 
+-- doc-region: start-analytics
 -- `newly_answered` is true only when a notice has just been completed. A
 -- RESTORED answer re-initialises the client and stops there: client.new reads
 -- the persisted consent decision back (client.lua:789-805), so calling
@@ -230,7 +243,9 @@ local function start_analytics(granted, decision, newly_answered)
 	spawn_rate = shardpilot.remote_config_number("spawn_rate", 1.0)
 	return true
 end
+-- doc-region-end: start-analytics
 
+-- doc-region: start-crash
 local function start_crash()
 	-- A separate module, endpoint, and crash:write key — see docs/crash.md.
 	-- init auto-forwards a previous-session native crash dump (set
@@ -249,7 +264,9 @@ local function start_crash()
 		print("shardpilot crash init failed: " .. tostring(err))
 	end
 end
+-- doc-region-end: start-crash
 
+-- doc-region: reconcile
 local reconcile
 
 local function resolve_and_reconcile()
@@ -334,9 +351,18 @@ reconcile = function(fresh)
 	-- The AGE step comes first and is the host's own: an unknown or minor band
 	-- means minimised handling, so the question is not put at all.
 	local band = host_age_band()
-	if band == nil or band == "minor" then
+	local minimised = band == nil or band == "minor"
+	if minimised then
 		print("shardpilot: age band unknown or minor; minimised handling, no analytics question")
 		suspend_analytics("minimised_handling")
+		-- ⚠ AND THE CRASH LANE CLOSES WITH IT, HERE AND AT (e) BELOW. The
+		-- comment at (e) claimed an unknown or minor band kept the lane shut
+		-- while the code did nothing of the kind: `band` was local to this
+		-- block and (e) was reached by fall-through, so a plan carrying
+		-- crash_profile "minimal_diagnostics_for_minors" opened a crash
+		-- reporter on a MINOR. That profile is a release-2 path needing a
+		-- reviewed child flow this quick start does not have.
+		suspend_crash("minimised_handling")
 	elseif not analytics_running then
 		if answered then
 			if start_analytics(answered.granted, fresh, answered.fresh_answer == true) then
@@ -384,8 +410,11 @@ reconcile = function(fresh)
 	-- a host that has one (its own basis, its own opt-out, minors forced off)
 	-- keeps it running unchanged. A host WITHOUT one keeps the lane closed
 	-- under "off", which is what this quick start does, because a quick start
-	-- has no reviewed gate. Either way an unknown or minor band keeps it shut.
-	if fresh.crash_profile == consent_policy.CRASH_MINIMAL and not crash_running then
+	-- has no reviewed gate. Either way an unknown or minor band keeps it shut —
+	-- `minimised` is that band, read above and tested here so the sentence is
+	-- the code rather than a promise about it.
+	if fresh.crash_profile == consent_policy.CRASH_MINIMAL and not crash_running
+		and not minimised then
 		start_crash()
 	end
 
@@ -405,7 +434,9 @@ reconcile = function(fresh)
 		print("shardpilot policy notice: " .. fresh.notice)
 	end
 end
+-- doc-region-end: reconcile
 
+-- doc-region: lifecycle
 function init(self)
 	resolve_and_reconcile()
 
@@ -485,3 +516,4 @@ function final(self)
 		analytics_running = false
 	end
 end
+-- doc-region-end: lifecycle
