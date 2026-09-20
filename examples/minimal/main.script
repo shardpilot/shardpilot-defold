@@ -67,15 +67,28 @@ local function policy_context()
 	}
 end
 
--- ⚠ YOUR CONSENT UI GOES HERE, and it is the only thing that produces a grant.
--- Replace it; this placeholder declines, so the example runs and is closed by
--- default. It also answers LATER, from update(), because a real one does — and
--- an example whose notice answers synchronously gets "nothing before the
--- player's final choice" for free without ever exercising it.
+-- ⚠ YOUR AGE STEP GOES HERE, AND IT COMES FIRST. The policy endpoint is
+-- public and credential-free, so it can never establish anyone's age; the band
+-- is the host's own, and an unknown or minor band means minimised handling —
+-- the analytics question is NOT put and nothing optional starts. Returning nil
+-- means "unknown", which is what a quick start with no age step honestly is.
+function host_age_band()
+	return nil
+end
+
+-- ⚠ YOUR CONSENT UI GOES HERE. It is a GLOBAL so you can replace it with your
+-- own screen — and so this repository's suite can drive both answers, which is
+-- the only way the granted path is ever exercised.
+--
+-- Until you replace it, it answers with the REGIME'S OWN DEFAULT, which is
+-- what a player who closes the screen without touching the switch does: off
+-- under STRICT, on under SOFT. It also answers LATER, from update(), because a
+-- real screen does — and an example whose notice answers synchronously gets
+-- "nothing before the player's final choice" for free without exercising it.
 local pending_notice = nil
-local function present_consent_notice(decision, callback)
+function present_consent_notice(decision, callback)
 	pending_notice = function()
-		callback(false)
+		callback(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_ON)
 	end
 end
 
@@ -181,6 +194,18 @@ local function start_analytics(granted, decision, newly_answered)
 	-- way — or set_consent("denied_forced_minor") when your age gate forces it
 	-- (feature-detect with
 	-- shardpilot.supports("consent_state_denied_forced_minor")).
+	-- ⚠ UNDER A SOFT PLAN THE BASIS IS NOTICE AND NON-OBJECTION, WHICH IS NOT
+	-- A CLICK. set_consent records a player's explicit decision, so using it
+	-- for a non-objection would write down a grant nobody gave. This SDK has no
+	-- API for that basis and this quick start does not invent one; the
+	-- resolver cannot emit SOFT in this release, and a host that meets one must
+	-- record the basis through its own path.
+	if not decision.explicit_grant_required then
+		print("shardpilot: SOFT regime — record the notice/non-objection basis yourself; " ..
+			"set_consent is for an explicit decision")
+		return true
+	end
+
 	-- ⚠ set_consent CAN FAIL TOO — a full consent outbox, a failed durable
 	-- write. Starting the session anyway would emit events under a grant that
 	-- was never recorded, which is the one ordering the consent outbox exists
@@ -287,8 +312,23 @@ reconcile = function(fresh)
 	end
 
 	-- (b) Whatever this decision closes, closes now.
-	if fresh.optional_processing_closed then
-		suspend_analytics("optional_processing_closed")
+	-- ⚠ A LANE THE PLAYER NEVER OPENED IS NOT ONE TO CLOSE HERE. The regime no
+	-- longer closes the analytics lane by itself: what closes it is the age
+	-- step below, or the player's own answer, or a suspension for one of the
+	-- named triggers.
+	--
+	-- ⚠ BUT A REGIME THAT NOW REQUIRES AN EXPLICIT GRANT DOES CLOSE ONE GIVEN
+	-- WITHOUT ONE. A non-objection recorded under SOFT is not an explicit
+	-- grant, so when STRICT arrives the standing answer no longer satisfies the
+	-- regime: the lane stops and the question is put again, with the default
+	-- the new plan carries.
+	-- No plan_used gate here, unlike the notice-text rule below: a FALLBACK is
+	-- the strict regime, and it requires an explicit grant just as a strict
+	-- plan does. A grant given explicitly survives a fallback; a non-objection
+	-- does not.
+	if answered and fresh.explicit_grant_required and not answered.grant_required then
+		suspend_analytics("explicit_grant_now_required")
+		answered = nil
 	end
 	if fresh.crash_profile ~= consent_policy.CRASH_MINIMAL then
 		suspend_crash("crash_profile_off")
@@ -307,10 +347,23 @@ reconcile = function(fresh)
 	revalidate_backoff = MIN_REVALIDATE_SECONDS
 	revalidate_at = fresh.valid_for_seconds and (elapsed + fresh.valid_for_seconds) or nil
 
-	-- (d) The ANALYTICS lane. Nothing is ASKED when the regime closes optional
-	-- processing: there is nothing a player could grant, so a question whose
-	-- answer is discarded would be worse than not asking.
-	if not fresh.optional_processing_closed and not analytics_running then
+	-- (d) The ANALYTICS lane.
+	--
+	-- ⚠ THE REGIME DECIDES THE DEFAULT OF THE QUESTION, NOT WHETHER IT IS
+	-- ASKED. STRICT means ask with the switch OFF and start only on an
+	-- explicit grant; SOFT means a prominent purpose notice with the switch ON
+	-- and one tap to turn it off. An earlier cut of this example read STRICT as
+	-- "nothing to ask" — and since the resolver answers STRICT to every request
+	-- in this release, a host copying it would never ask anyone and never start
+	-- analytics, for every player, forever.
+	--
+	-- The AGE step comes first and is the host's own: an unknown or minor band
+	-- means minimised handling, so the question is not put at all.
+	local band = host_age_band()
+	if band == nil or band == "minor" then
+		print("shardpilot: age band unknown or minor; minimised handling, no analytics question")
+		suspend_analytics("minimised_handling")
+	elseif not analytics_running then
 		if answered then
 			if start_analytics(answered.granted, fresh, answered.fresh_answer == true) then
 				answered.fresh_answer = nil
@@ -323,6 +376,10 @@ reconcile = function(fresh)
 					text_version = fresh.consent_text_version,
 					language = fresh.presented_language,
 					granted = granted,
+					-- The BASIS the answer was given under. A non-objection
+					-- does not satisfy a regime that requires an explicit
+					-- grant, so the two are not interchangeable later.
+					grant_required = fresh.explicit_grant_required,
 					fresh_answer = true,
 				}
 				-- ⚠ RE-RESOLVE BEFORE ACTING ON THE ANSWER, AND INVALIDATE
@@ -341,12 +398,19 @@ reconcile = function(fresh)
 		end
 	end
 
-	-- (e) The CRASH lane, decided separately — analytics being closed does not
+	-- (e) The CRASH lane, decided separately — the analytics answer does not
 	-- close it, and a permitted crash profile does not open analytics. It is
 	-- reached only once no choice is pending: the crash reporter is a capture
 	-- hook, and the first-run guarantee is that none exists before the player's
-	-- final choice. When the regime closed the optional lane there is no
-	-- pending choice at all, so the decision itself is final.
+	-- final choice.
+	--
+	-- ⚠ crash_profile "off" MEANS "THE RESOLVER OFFERS NO APPROVED CRASH
+	-- PROFILE IN THIS RELEASE" — it is what every request is answered with
+	-- today. It does NOT amend a host's own separately reviewed crash gate:
+	-- a host that has one (its own basis, its own opt-out, minors forced off)
+	-- keeps it running unchanged. A host WITHOUT one keeps the lane closed
+	-- under "off", which is what this quick start does, because a quick start
+	-- has no reviewed gate. Either way an unknown or minor band keeps it shut.
 	if fresh.crash_profile == consent_policy.CRASH_MINIMAL and not crash_running then
 		start_crash()
 	end

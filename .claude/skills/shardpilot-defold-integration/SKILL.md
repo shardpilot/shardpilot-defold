@@ -217,7 +217,12 @@ resolve_after_answer = function(decision)
   -- decision you are checking for staleness.
   consent_policy.invalidate()
   consent_policy.prepare(policy_context(), function(fresh)
-    if fresh.optional_processing_closed then return end
+      -- A fallback is STRICT: it still asks, with the default off, and a grant
+      -- given under one is a valid strict grant. Under a SOFT plan the basis
+      -- is notice and non-objection, which is not a click — record that
+      -- through your own path, not with set_consent. The resolver cannot emit
+      -- SOFT in this release.
+    if not fresh.explicit_grant_required then return end
     if not fresh.valid_for_seconds or fresh.valid_for_seconds <= 0 then
       return -- no window in which the lane could run; re-resolve later
     end
@@ -237,7 +242,8 @@ resolve_after_answer = function(decision)
 end
 
 consent_policy.prepare(policy_context(), function(decision)
-  if decision.optional_processing_closed then
+  local band = host_age_band() -- ⚠ YOUR AGE STEP COMES FIRST: unknown or minor
+  if band == nil or band == "minor" then
     -- Nothing a player could grant, so nothing is asked and the SDK is not
     -- initialised. This is what the resolver emits today.
     return
@@ -603,8 +609,12 @@ against a reachable ingest endpoint. Every observation below is the SDK's real
 surface — no guessing from logs.
 
 1. **Policy first**: `consent_policy.prepare(context, cb)` calls back exactly
-   once. If `decision.optional_processing_closed` is true — which is what the
-   resolver emits today — nothing is asked and `init` is not reached at all.
+   once. ⚠ `STRICT_OPT_IN` — which is what the resolver emits today — means
+   **ask with the switch off**, not "do not ask": read
+   `decision.analytics_choice_default` for the switch's state and
+   `decision.explicit_grant_required` for whether a click is what opens the
+   lane. Your age step comes first; an unknown or minor band means the
+   question is not put and `init` is not reached at all.
 2. **Init**: inside that callback, `shardpilot.init(cfg)` returns `true`. A
    `false, err` here is a config mistake; the `err` code names the field.
 3. **Consent-first sanity**: before any grant, `shardpilot.track("t")` returns

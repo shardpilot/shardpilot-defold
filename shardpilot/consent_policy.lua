@@ -20,9 +20,15 @@
 --
 -- The conservative rule, which is the whole point: a plan that is missing,
 -- unreadable, out of scope, expired or carrying anything outside its bounded
--- vocabulary resolves to STRICT with optional processing closed. An error or
--- an offline state can PRESERVE or ADD restrictions; it can never relax one,
--- and it can never reuse a cached permissive result.
+-- vocabulary resolves to the STRICT regime — the choice is put with the
+-- default OFF and the optional lane starts only on an explicit grant. An error
+-- or an offline state can PRESERVE or ADD restrictions; it can never relax
+-- one, and it can never reuse a cached permissive result.
+--
+-- ⚠ AND STRICT IS NOT SILENCE. A fallback still asks, under the host's own
+-- notice text, and a grant given under one is a valid strict grant. The
+-- regimes differ in the DEFAULT of the question and the basis the answer is
+-- recorded under, never in whether the question is put at all.
 --
 -- SOFT_OPT_OUT is implemented so a future plan parses. It is NOT reachable
 -- today: every row of the jurisdiction matrix is marked pending counsel
@@ -54,6 +60,21 @@ M.CRASH_MINIMAL = "minimal_diagnostics_for_minors"
 M.SERVER_ANALYTICS_DENIED = "denied"
 
 M.CHILD_RULES_MINIMISED = "minimised"
+
+-- ⚠ WHAT THE REGIME ACTUALLY DECIDES: THE DEFAULT OF THE CHOICE, NOT WHETHER A
+-- CHOICE EXISTS. This module used to report `optional_processing_closed`, and
+-- the documentation around it told every host that a closed lane meant nothing
+-- was asked and the SDK was not started. The resolver answers STRICT_OPT_IN to
+-- every request in this release — so a host following that reading would never
+-- ask anyone, never start analytics, for every customer in every country. That
+-- is not the strict regime; it is no product.
+--
+-- STRICT means: ASK, with the choice defaulted OFF, and start the optional
+-- lane only on an explicit grant. SOFT means: a prominent purpose notice, the
+-- choice defaulted ON, and one-tap off on the same screen. The difference is
+-- the default and the basis it is recorded under.
+M.CHOICE_DEFAULT_OFF = "off"
+M.CHOICE_DEFAULT_ON = "on"
 
 -- The route is public API surface; the schema it speaks has exactly one
 -- published copy, beside the resolver's own contract.
@@ -787,7 +808,15 @@ local function strict(reason, detail)
 		crash_profile = M.CRASH_OFF,
 		server_analytics = M.SERVER_ANALYTICS_DENIED,
 		child_rules = M.CHILD_RULES_MINIMISED,
-		optional_processing_closed = true,
+		-- ⚠ A FALLBACK STILL ASKS. Offline, timed out, refused or malformed —
+		-- the answer is the STRICT regime, which means the question is put with
+		-- the default off under the host's own notice text, and a grant given
+		-- under a fallback is a valid strict grant. What a fallback can never
+		-- do is default ON, reuse a SOFT answer, or open the crash or server
+		-- lanes. It is also why flooding the resolver route degrades nothing:
+		-- strict still collects from the players who say yes.
+		analytics_choice_default = M.CHOICE_DEFAULT_OFF,
+		explicit_grant_required = true,
 		plan_used = false,
 		reason = reason,
 		detail = detail,
@@ -1055,7 +1084,7 @@ end
 -- basis, or one that lifts the objection requirement, has opened something —
 -- and the three flags are orthogonal on purpose, so any one of them counts.
 local function decision_is_permissive(decision)
-	return not decision.optional_processing_closed
+	return decision.analytics_choice_default ~= M.CHOICE_DEFAULT_OFF
 		or decision.crash_profile ~= M.CRASH_OFF
 		or decision.server_analytics ~= M.SERVER_ANALYTICS_DENIED
 		or decision.child_rules ~= M.CHILD_RULES_MINIMISED
@@ -1067,11 +1096,17 @@ local function decision_from_plan(plan)
 		crash_profile = plan.flags.crash_profile,
 		server_analytics = plan.flags.server_analytics,
 		child_rules = plan.flags.child_rules,
-		-- ⚠ FALSE IS NOT PERMISSION. It says only that the regime is not what
-		-- closed the door: SOFT still waits for the final notice barrier and
-		-- for the backend admission bound to this session, which this module
-		-- knows nothing about.
-		optional_processing_closed = plan.regime ~= M.SOFT_OPT_OUT,
+		-- ⚠ THE REGIME IS REPORTED VERBATIM AND UNKNOWN IS TREATED AS STRICT.
+		-- A host needs to know the resolver could not classify — that belongs
+		-- in a receipt — but it must behave exactly as STRICT does while it
+		-- does not know.
+		analytics_choice_default = plan.regime == M.SOFT_OPT_OUT
+			and M.CHOICE_DEFAULT_ON or M.CHOICE_DEFAULT_OFF,
+		-- ⚠ AND "off" IS NOT "DO NOT ASK". It is the state of the switch when
+		-- the screen opens. Only an explicit grant starts the optional lane
+		-- under STRICT or UNKNOWN; under a used SOFT plan the basis is notice
+		-- and non-objection, which is recorded as such and never as a click.
+		explicit_grant_required = plan.regime ~= M.SOFT_OPT_OUT,
 		plan_used = true,
 		reason = nil,
 		-- ⚠ HOW LONG THIS VERDICT IS GOOD FOR, in seconds, set by prepare
