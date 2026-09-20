@@ -126,10 +126,14 @@ the artifact being withdrawn.
 
 The historical `v0.10.1` tag lacks request compression, the 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history. These are included in `v0.10.2`.
 
-Then require the module:
+Then require the modules. **The policy module is the one the startup path
+begins with** — see the quick start below and
+[Consent regime](#consent-regime):
 
+<!-- doc-region: none -- the two-line shape of the whole integration, not the flow itself -->
 ```lua
-local shardpilot = require "shardpilot.sdk"
+local consent_policy = require "shardpilot.consent_policy" -- resolve FIRST
+local shardpilot = require "shardpilot.sdk"                -- init inside its callback
 ```
 
 ## Quick start
@@ -140,55 +144,424 @@ configured, run `.venv-evidence-sender/bin/python examples/evidence-sender/send.
 
 Minimal Defold script (see [`examples/minimal/`](examples/minimal)):
 
+> **Policy first.** `consent_policy.prepare` is the first integration call and
+> `shardpilot.init` runs **inside its callback**. Requiring the SDK is not the
+> barrier — that only loads code; `init` is, because it builds the client,
+> which loads the persisted scope record and mints an anonymous identifier.
+> Calling it before the decision would create an identity for a player whose
+> consent regime had not been established yet. A decision is **not** consent:
+> it says which regime applies and whether the optional lane stays closed
+> whatever the player answers — you still have to ask them. When the resolver
+> is unreachable or answers something this build will not accept, the callback
+> receives the strict fallback (`plan_used = false`), which tightens and never
+> relaxes.
+>
+> ⚠ **`STRICT_OPT_IN` MEANS "ASK, DEFAULT OFF" — NOT "DO NOT ASK".** The
+> resolver answers `STRICT_OPT_IN` to every request in this release. A host
+> that reads that as silence never asks anyone and never starts analytics, for
+> every player, forever — which is not the strict regime, it is no product. The
+> regime decides the **default of the question** and the **basis the answer is
+> recorded under**, never whether the question exists: `STRICT` and `UNKNOWN`
+> put the choice with the switch **off** and open the optional lane only on an
+> explicit grant; `SOFT_OPT_OUT` puts a prominent purpose notice with the
+> switch **on** and one tap to turn it off. **Every fallback is strict** — ask
+> with the default off under your own notice text, and a grant given under a
+> fallback is a valid strict grant. That is also why flooding the policy route
+> degrades nothing: strict still collects from the players who say yes.
+>
+> **Branch on the decision** — `analytics_choice_default` is the state of the
+> switch when your screen opens; `explicit_grant_required` says whether a click
+> is what opens the lane; `crash_profile` decides the crash lane on its own,
+> and crash reporting is ON by default, so an unconditional `crash.init` is how
+> a closed lane gets opened; `server_analytics` gates only your backend's lane.
+>
+> ⚠ **The values are the resolver's, and the plan is nested.** `flags` carries
+> `crash_profile`, `server_analytics`, `child_rules` and `operation_blocks`;
+> the vocabularies are lower-case (`off`, `minimal_diagnostics_for_minors`,
+> `denied`, `minimised`). This SDK read a flat plan with upper-case values
+> until it was checked against the resolver's actual bytes — and refused every
+> real response as unreadable. The contract of record is the resolver's
+> published `ConsentPolicyPlan` schema; `test/golden/` holds its output.
+>
+> **And resolve again on every named trigger** — after the player answers, on
+> resume, at `valid_for_seconds`, and when the notice text or language changes
+> — then make the running lanes match the fresh answer. A lane that is now
+> closed is **suspended with `shutdown()`, never with `set_consent(false)` or
+> `crash.set_enabled(false)`**: those record a player's decision, and nobody
+> decided anything — the policy changed. See [Consent regime](#consent-regime).
+
+> ⚠ **QUOTED FROM `examples/minimal/main.script`, NOT RETYPED FROM IT.** The
+> blocks below are extracted byte for byte and
+> `test/test_documented_regions.lua` fails when one of them drifts. This flow
+> used to live in three places — the example, this section, and the packaged
+> skill — and one review round found five findings that were the three copies
+> disagreeing: an ordering fixed in one and not the others, retry state removed
+> from one and left in another, a fallback rejected here that the example
+> accepts. There is one copy now.
+>
+> The helpers this section does not quote — `suspend_analytics`,
+> `suspend_crash`, `start_analytics`, `start_crash` — are in the example, and
+> the packaged skill under `.claude/skills/` carries the whole file.
+
+The state, and what each piece of it is for:
+
+<!-- doc-region: state -->
 ```lua
+-- ⚠ POLICY FIRST, AND ONE RECONCILE PATH FOR THE WHOLE LIFECYCLE. A consent
+-- regime is not decided once at launch: the plan expires, the notice text
+-- changes, the policy is revoked, the app comes back after a week. Every one
+-- of those is the same question — resolve the policy again, then make the
+-- running lanes match the answer — so there is exactly one function that does
+-- it, and every trigger calls it.
+--
+-- The requires below are not the barrier — requiring shardpilot.sdk loads code
+-- and creates nothing (sdk.lua:1-4). init() is: it builds the client, which
+-- loads the persisted scope record and mints an anonymous identifier
+-- (client.lua:763-787).
+local consent_policy = require "shardpilot.consent_policy"
+local platform = require "shardpilot.platform"
 local shardpilot = require "shardpilot.sdk"
+local crash = require "shardpilot.crash"
 
-function init(self)
-  shardpilot.init({
-    ingest_url = "http://localhost:8080",
-    workspace_id = "workspace-example",
-    app_id = "app-example",
-    environment_id = "develop",
-    -- Auth: configure exactly one of token_provider (Mode B) or api_key (Mode A).
-    token_provider = function(callback)
-      callback("client-token-placeholder", nil, nil)
-    end,
-    -- api_key = "sp_ingest_...", -- Mode A alternative (publishable key)
-  })
-  shardpilot.identify("user-example")
-  -- Consent-first: NOTHING transmits until an explicit grant. Wire this to
-  -- your consent UX; while consent is undecided every track/session call
-  -- returns false, "consent_unknown" and the event is dropped, not held.
-  shardpilot.set_consent(true)   -- analytics consent: granted
-  shardpilot.session_start()     -- emits app.session_started
-  shardpilot.screen_view("menu") -- emits app.screen_view
-  shardpilot.track("play_cta_click", { cta_source = "main_menu" })
+-- ⚠ "RUNNING" MEANS AN INITIALISED CLIENT EXISTS THAT HAS NOT BEEN SHUT DOWN.
+-- It is lifecycle state, not a consent state, and final() reads it to know
+-- what is still owed a shutdown.
+local analytics_running = false
+local crash_running = false
+
+-- The player's standing answer, and the notice text it was given against. It
+-- SURVIVES a suspension — a plan expiring is not a reason to ask again — and
+-- is discarded only when the text or language changes, because then the answer
+-- was given to a notice this player never saw.
+local answered = nil
+local notice_open = false
+-- ⚠ THE SCREEN CAN BE OVERTAKEN. A notice is the one place in this flow where
+-- an unbounded amount of real time passes with the player somewhere else, and
+-- the world can change under it — most sharply when the host's age step
+-- corrects the band to minor or unknown. The counter below rises when that
+-- happens; an answer arriving from a screen opened under an older one is not
+-- stored, because it belongs to a question this flow is no longer asking.
+local notice_generation = 0
+
+-- The plan's own deadline, in seconds on the clock below. Cache expiry
+-- protects the next lookup and stops nothing that is already running.
+local elapsed = 0
+local revalidate_at = nil
+
+-- ⚠ A VERDICT WITH NO LIFE IS NOT RUNNABLE, and scheduling by it directly is a
+-- spin. max_age_seconds = 0 means "do not reuse this": it authorises the one
+-- answer and nothing after it, so valid_for_seconds is 0 and there is no
+-- window in which a lane could run. Re-resolving every frame is a flood
+-- against the resolver dressed up as diligence, so the retry is bounded and
+-- backs off.
+local MIN_REVALIDATE_SECONDS = 30
+local MAX_REVALIDATE_SECONDS = 300
+local revalidate_backoff = MIN_REVALIDATE_SECONDS
+
+-- ⚠ THE RETRY MACHINERY IS DELIBERATELY NOT HERE. A quick start that carried
+-- a Mode B identify-retry state machine drew a finding in four consecutive
+-- review rounds — every fix added state and the next round found the next
+-- interleaving. What a production host owes is listed in the README under
+-- "host requirements"; what this file shows is the straight path, which is
+-- what a quick start is for.
+
+-- Where this example parks a remote-config value; your game reads it wherever
+-- it needs the tuned number.
+local spawn_rate = 1.0
+```
+
+One context, resolved on every trigger, because several copies is how they
+drift apart:
+
+<!-- doc-region: policy-context -->
+```lua
+-- The policy context, in one place, because it is resolved on every trigger
+-- and several copies is how they drift apart.
+local function policy_context()
+	return {
+		endpoint = "http://localhost:8082",
+		workspace_id = "workspace-example",
+		app_id = "app-example",
+		environment_id = "develop",
+		app_version = "1.0.0",
+		locale = "en",
+		platform = platform.detect(),
+	}
+end
+```
+
+**The age step is yours and it comes first.** An unknown or minor band means
+minimised handling: the analytics question is not put at all, and the crash
+lane stays shut whatever the plan's `crash_profile` says.
+
+<!-- doc-region: host-age-band -->
+```lua
+-- ⚠ YOUR AGE STEP GOES HERE, AND IT COMES FIRST. The policy endpoint is
+-- public and credential-free, so it can never establish anyone's age; the band
+-- is the host's own, and an unknown or minor band means minimised handling —
+-- the analytics question is NOT put and nothing optional starts. Returning nil
+-- means "unknown", which is what a quick start with no age step honestly is.
+function host_age_band()
+	return nil
+end
+```
+
+**The screen is yours too.** The placeholder answers with the regime's own
+default — off under `STRICT_OPT_IN`, on under `SOFT_OPT_OUT` — which is what a
+player who closes it without touching the switch does. It answers from
+`update()` rather than synchronously, because a real screen does.
+
+<!-- doc-region: present-notice -->
+```lua
+-- ⚠ YOUR CONSENT UI GOES HERE. It is a GLOBAL so you can replace it with your
+-- own screen — and so this repository's suite can drive both answers, which is
+-- the only way the granted path is ever exercised.
+--
+-- Until you replace it, it answers with the REGIME'S OWN DEFAULT, which is
+-- what a player who closes the screen without touching the switch does: off
+-- under STRICT, on under SOFT. It also answers LATER, from update(), because a
+-- real screen does — and an example whose notice answers synchronously gets
+-- "nothing before the player's final choice" for free without exercising it.
+local pending_notice = nil
+function present_consent_notice(decision, callback)
+	pending_notice = function()
+		callback(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_ON)
+	end
+end
+```
+
+**One reconcile path for the whole lifecycle.** Given a fresh decision, make
+the running lanes match it: it CLOSES on its own authority and OPENS only on
+the player's. Read it once and the rest of this section is commentary.
+
+<!-- doc-region: reconcile -->
+```lua
+local reconcile
+
+local function resolve_and_reconcile()
+	consent_policy.prepare(policy_context(), reconcile)
 end
 
-function update(self, dt)
-  shardpilot.update(dt) -- drives flush timer + frame sampling
-end
+-- ⚠ THE ONE PATH. Given a FRESH decision, make the running lanes match it.
+-- It CLOSES on its own authority and OPENS only on the player's: a lane the
+-- new decision permits still needs an answer, and a resume that could open a
+-- lane would be a grant issued by a focus event.
+reconcile = function(fresh)
+	print("shardpilot consent regime: " .. tostring(fresh.regime) ..
+		(fresh.plan_used and "" or " (strict fallback: " .. tostring(fresh.reason) .. ")"))
 
-function final(self)
-  -- shutdown() starts a final flush. When the flush cannot deliver everything,
-  -- the undelivered events are written to the durable offline spool and
-  -- shutdown returns true — they re-send on the next launch. An undelivered
-  -- consent receipt behaves the same way: durably retained in the consent
-  -- outbox, it re-sends next launch and shutdown completes. It returns
-  -- false, "consent_pending" only when the receipt could NOT be durably
-  -- captured (no save-file backend, or the write keeps failing) — retry
-  -- shutdown then — and with spool_enabled = false it returns false, err
-  -- whenever events remain undelivered (retry shutdown until it returns true).
-  local ok, err = shardpilot.shutdown("app_final")
-  if not ok then
-    print("shardpilot shutdown not complete: " .. tostring(err))
-  end
+	-- (a) The notice the standing answer was given against. A different text
+	-- version or language means the running grant belongs to a notice this
+	-- player never saw, so it stops and the notice is presented again.
+	-- ⚠ ONLY A PLAN CAN CHANGE THE NOTICE. A strict fallback carries no
+	-- consent_text_version at all, so comparing against it read every outage as
+	-- "the text changed" and threw away an answer the player really did give. A
+	-- fallback still CLOSES — that is (b) below — it just does not erase the
+	-- standing answer.
+	if fresh.plan_used and answered
+		and (fresh.consent_text_version ~= answered.text_version
+			or fresh.presented_language ~= answered.language) then
+		suspend_analytics("consent_text_changed")
+		-- ⚠ AND THE CRASH LANE GOES WITH IT. The notice the player read is what
+		-- the session rests on; a crash reporter left running under text nobody
+		-- saw is the same defect as an analytics client left running under it.
+		-- It restarts only after the new answer, through the pending-choice
+		-- gate in (e).
+		suspend_crash("consent_text_changed")
+		answered = nil
+	end
+
+	-- (b) Whatever this decision closes, closes now.
+	-- ⚠ A LANE THE PLAYER NEVER OPENED IS NOT ONE TO CLOSE HERE. The regime no
+	-- longer closes the analytics lane by itself: what closes it is the age
+	-- step below, or the player's own answer, or a suspension for one of the
+	-- named triggers.
+	--
+	-- ⚠ BUT A REGIME THAT NOW REQUIRES AN EXPLICIT GRANT DOES CLOSE ONE GIVEN
+	-- WITHOUT ONE. A non-objection recorded under SOFT is not an explicit
+	-- grant, so when STRICT arrives the standing answer no longer satisfies the
+	-- regime: the lane stops and the question is put again, with the default
+	-- the new plan carries.
+	-- No plan_used gate here, unlike the notice-text rule below: a FALLBACK is
+	-- the strict regime, and it requires an explicit grant just as a strict
+	-- plan does. A grant given explicitly survives a fallback; a non-objection
+	-- does not.
+	if answered and fresh.explicit_grant_required and not answered.grant_required then
+		suspend_analytics("explicit_grant_now_required")
+		answered = nil
+	end
+	if fresh.crash_profile ~= consent_policy.CRASH_MINIMAL then
+		suspend_crash("crash_profile_off")
+	end
+
+	-- (c) The plan's own life. A fallback carries no validity and schedules
+	-- nothing: it established nothing that could expire.
+	if fresh.valid_for_seconds and fresh.valid_for_seconds <= 0 then
+		print("shardpilot: the verdict has no validity window; no lane started")
+		suspend_analytics("no_validity_window")
+		suspend_crash("no_validity_window")
+		revalidate_at = elapsed + revalidate_backoff
+		revalidate_backoff = math.min(revalidate_backoff * 2, MAX_REVALIDATE_SECONDS)
+		return
+	end
+	revalidate_backoff = MIN_REVALIDATE_SECONDS
+	revalidate_at = fresh.valid_for_seconds and (elapsed + fresh.valid_for_seconds) or nil
+
+	-- (c2) OPERATION BLOCKS CLOSE EVERYTHING, BECAUSE THIS QUICK START CANNOT
+	-- READ THEM. They are restrictions no consent choice lifts — transfer, age
+	-- and capacity, localisation, safety — and mapping a block NAME to the
+	-- client action it restricts needs a vocabulary this file would have to
+	-- invent. The module parses them and puts them on the decision; a quick
+	-- start that then ignored them would let a player's grant open a lane the
+	-- plan had just closed, which is the permissive default in its worst
+	-- place. So: while the list is non-empty, NO lane opens — no question, no
+	-- analytics, no crash — and the reason says which.
+	--
+	-- A production host does the mapping and refuses the restricted actions;
+	-- an unmapped name closes everything, exactly as here. See the README's
+	-- host requirements. In this release the resolver always sends [].
+	if fresh.operation_blocks and #fresh.operation_blocks > 0 then
+		print("shardpilot: the plan carries " .. #fresh.operation_blocks
+			.. " operation block(s) this quick start cannot map ("
+			.. table.concat(fresh.operation_blocks, ", ") .. "); no lane opened")
+		suspend_analytics("operation_blocks")
+		suspend_crash("operation_blocks")
+		return
+	end
+
+	-- (d) The ANALYTICS lane.
+	--
+	-- ⚠ THE REGIME DECIDES THE DEFAULT OF THE QUESTION, NOT WHETHER IT IS
+	-- ASKED. STRICT means ask with the switch OFF and start only on an
+	-- explicit grant; SOFT means a prominent purpose notice with the switch ON
+	-- and one tap to turn it off. An earlier cut of this example read STRICT as
+	-- "nothing to ask" — and since the resolver answers STRICT to every request
+	-- in this release, a host copying it would never ask anyone and never start
+	-- analytics, for every player, forever.
+	--
+	-- The AGE step comes first and is the host's own: an unknown or minor band
+	-- means minimised handling, so the question is not put at all.
+	local band = host_age_band()
+	local minimised = band == nil or band == "minor"
+	if minimised then
+		print("shardpilot: age band unknown or minor; minimised handling, no analytics question")
+		suspend_analytics("minimised_handling")
+		-- ⚠ AND THE CRASH LANE CLOSES WITH IT, HERE AND AT (e) BELOW. The
+		-- comment at (e) claimed an unknown or minor band kept the lane shut
+		-- while the code did nothing of the kind: `band` was local to this
+		-- block and (e) was reached by fall-through, so a plan carrying
+		-- crash_profile "minimal_diagnostics_for_minors" opened a crash
+		-- reporter on a MINOR. That profile is a release-2 path needing a
+		-- reviewed child flow this quick start does not have.
+		suspend_crash("minimised_handling")
+		-- ⚠ AND THE FRESH ANSWER DOES NOT SURVIVE THIS BRANCH. Suspending a
+		-- lane leaves `answered` standing on purpose — a plan expiring is no
+		-- reason to ask again — but an answer given moments ago under a band
+		-- that has since been corrected is a different thing: keeping it meant
+		-- that when the band later read eligible again, start_analytics
+		-- recorded that grant WITHOUT PRESENTING A NOTICE. One screen, one
+		-- answer, a correction in between, and a consent receipt written for a
+		-- player who was never asked a second time.
+		--
+		-- WHICH STATE IS KEPT AND WHY: a standing decision that was already
+		-- ESTABLISHED AND RECORDED survives (fresh_answer is nil once the
+		-- receipt landed), because it belongs to a notice the player did see
+		-- and a write that completed. Only the unrecorded, in-flight answer is
+		-- discarded — and a notice still open is voided, so the answer that
+		-- arrives from it is not stored either.
+		if answered and answered.fresh_answer then
+			answered = nil
+		end
+		if notice_open then
+			notice_open = false
+			notice_generation = notice_generation + 1
+		end
+	elseif not analytics_running then
+		if answered then
+			if start_analytics(answered.granted, fresh, answered.fresh_answer == true) then
+				answered.fresh_answer = nil
+			end
+		elseif not notice_open then
+			notice_open = true
+			local generation = notice_generation
+			present_consent_notice(fresh, function(granted)
+				if generation ~= notice_generation then
+					-- The band was corrected while this screen was open. The
+					-- answer belongs to a question no longer being asked, and
+					-- storing it is how it gets recorded later without asking.
+					print("shardpilot: consent answer discarded; the age band changed "
+						.. "while the notice was open")
+					return
+				end
+				notice_open = false
+				answered = {
+					text_version = fresh.consent_text_version,
+					language = fresh.presented_language,
+					granted = granted,
+					-- The BASIS the answer was given under. A non-objection
+					-- does not satisfy a regime that requires an explicit
+					-- grant, so the two are not interchangeable later.
+					grant_required = fresh.explicit_grant_required,
+					fresh_answer = true,
+				}
+				-- ⚠ RE-RESOLVE BEFORE ACTING ON THE ANSWER, AND INVALIDATE
+				-- FIRST. The player was reading the screen; the plan may have
+				-- expired or the policy may have been revoked meanwhile — and
+				-- without the invalidation this resolution is answered by the
+				-- private cache entry the LAUNCH wrote, which is the very
+				-- decision being checked for staleness. It has to reach the
+				-- resolver to mean anything.
+				consent_policy.invalidate()
+				resolve_and_reconcile()
+			end)
+			return
+		else
+			return
+		end
+	end
+
+	-- (e) The CRASH lane, decided separately — the analytics answer does not
+	-- close it, and a permitted crash profile does not open analytics. It is
+	-- reached only once no choice is pending: the crash reporter is a capture
+	-- hook, and the first-run guarantee is that none exists before the player's
+	-- final choice.
+	--
+	-- ⚠ crash_profile "off" MEANS "THE RESOLVER OFFERS NO APPROVED CRASH
+	-- PROFILE IN THIS RELEASE" — it is what every request is answered with
+	-- today. It does NOT amend a host's own separately reviewed crash gate:
+	-- a host that has one (its own basis, its own opt-out, minors forced off)
+	-- keeps it running unchanged. A host WITHOUT one keeps the lane closed
+	-- under "off", which is what this quick start does, because a quick start
+	-- has no reviewed gate. Either way an unknown or minor band keeps it shut —
+	-- `minimised` is that band, read above and tested here so the sentence is
+	-- the code rather than a promise about it.
+	if fresh.crash_profile == consent_policy.CRASH_MINIMAL and not crash_running
+		and not minimised then
+		start_crash()
+	end
+
+	-- The SERVER-SIDE analytics lane is a BASIS, not a toggle, and this example
+	-- sends nothing on it. If your backend does, gate it on
+	-- fresh.server_analytics, whose only value in this release is "denied".
+	-- The objection route is manual — the rights page or the privacy address —
+	-- and nothing in this SDK can record or satisfy it.
+	if fresh.server_analytics == consent_policy.SERVER_ANALYTICS_DENIED then
+		print("shardpilot: server-side analytics denied")
+	end
+
+	-- ⚠ THE NOTICE IS THE RESOLVER'S WORDS, CARRIED VERBATIM. It says what
+	-- kind of answer this is; show or log it as your contract requires, and do
+	-- not summarise it.
+	if fresh.notice then
+		print("shardpilot policy notice: " .. fresh.notice)
+	end
 end
 ```
 
 For multiple independent clients, use the instance API instead of the
 singleton:
 
+<!-- doc-region: none -- the module surface, not the integration flow -->
 ```lua
 local sdk = require "shardpilot.sdk"
 local client = sdk.new(config)
@@ -461,6 +834,7 @@ keeps a **single** window listener (`window.set_listener` replaces any
 previously set one), so add the `persist()` branch inside your existing
 listener rather than registering a new one:
 
+<!-- doc-region: none -- the Defold window listener, quoted from the engine API rather than from the example -->
 ```lua
 window.set_listener(function(self, event, data)
   -- ... your existing resize/focus/iconify handling ...
@@ -515,6 +889,7 @@ Set `request_compression_enabled = false` to opt out entirely.
 
 ## Remote config
 
+<!-- doc-region: none -- the remote-config API, which the flow only parks a value from -->
 ```lua
 shardpilot.fetch_remote_config(function(result)
   -- result = { ok, from_cache, error?, values?, version? }
@@ -641,6 +1016,7 @@ The assignment endpoint is served by the **same host** as the remote-config
 fetch and authenticates with the **same publishable `api_key`**, so a valid
 experiments configuration always carries all three fields together:
 
+<!-- doc-region: none -- the configuration table, whose fields this section documents one by one -->
 ```lua
 shardpilot.init({
   ingest_url = "https://…",
@@ -661,6 +1037,7 @@ remote-config and assignment fetches. Feature-detect the surface before
 
 ### API
 
+<!-- doc-region: none -- the experiments API, which the minimal example does not use -->
 ```lua
 -- Fetch the server-evaluated assignment. `attributes` is optional —
 -- (experiment_key, callback) is accepted too. The synchronous return is
@@ -883,6 +1260,191 @@ to a bounded per-app sidecar (exact wire bytes, re-sent verbatim and
 de-duplicated by `crash_id`; a `429 Retry-After` window persists across
 relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.md).
 
+## Consent regime
+
+`shardpilot/consent_policy.lua` answers one question before the SDK exists:
+**which consent regime applies to this player**. It is a standalone module —
+it imports nothing from this SDK, so preparing a regime cannot mint an
+identifier, load a spool or install a capture hook.
+
+<!-- doc-region: none -- the consent-policy module surface, listed field by field below -->
+```lua
+local consent_policy = require "shardpilot.consent_policy"
+
+consent_policy.prepare(context, function(decision) ... end)
+```
+
+`context` is validated locally before anything is sent, and a value outside
+its closed vocabulary **costs no request**: `endpoint` (the same URL rule
+`ingest_url` and `crash_ingest_url` obey — **https anywhere, plain http only
+for a loopback host**, no userinfo, query, fragment or path), `workspace_id`, `app_id`, `environment_id`,
+`app_version`, `locale`, `platform` (use `platform.detect()`), and optionally
+`store` and `age_band` — which is accepted, sent as given, and **ignored by
+the resolver in this release**. `store_region` is **not accepted** in this release: a
+non-null value carries a country claim, and refusing it here is what stops it
+travelling.
+
+The callback receives **exactly one decision, exactly once**:
+
+| Field | Meaning |
+|---|---|
+| `regime` | `STRICT_OPT_IN`, `SOFT_OPT_OUT` or `UNKNOWN` |
+| `crash_profile` | `off` or `minimal_diagnostics_for_minors` |
+| `server_analytics` | `denied` — the only value this release's contract names |
+| `child_rules` | `minimised` — the same |
+| `notice` | The resolver's own words about what kind of answer this is. Show or log it verbatim; the SDK does not interpret it |
+| `band_vocabulary` / `band_vocabulary_version` | The age scale the resolver **declares it speaks** — a constant, not an echo. Delivered verbatim and compared with nothing: in this release the resolver does not read your `age_band` at all, and says so by naming `age_band` among the unavailable `signals_used`. Your own age step governs the age-first flow |
+| `analytics_choice_default` | `off` for `STRICT_OPT_IN`, `UNKNOWN` and **every fallback**; `on` only for a used `SOFT_OPT_OUT` plan. This is the state of the switch when your screen opens — not whether to open one |
+| `explicit_grant_required` | `true` for strict, unknown and every fallback: the optional lane starts **only** after the player's explicit grant, and an untouched or declined choice starts nothing. `false` only for a used SOFT plan, whose basis is notice and non-objection — recorded as such, never as a click |
+| `plan_used` | `false` means the strict fallback was taken; `reason` says why |
+| `valid_for_seconds` | How long this verdict is good for — the shortest of the cache ceiling, the plan's `expires_at` and its `max_age_seconds`. **Schedule your own re-resolution by it:** cache expiry protects the next lookup and stops nothing that is already running. `nil` on a fallback, which established nothing that could expire |
+
+**The conservative rule.** A plan that is missing, unreadable, out of scope,
+**expired**, or carrying anything outside its bounded vocabulary resolves to
+`STRICT_OPT_IN` with optional processing closed. An error or an offline state
+can preserve or add restrictions; it can never relax one, and it can never
+reuse a cached permissive result.
+
+**Caching** is in memory, for this session only, never written to disk, and
+scoped to the *whole* context — a different app, environment or endpoint is
+re-resolved rather than served the previous one's answer. An entry never
+outlives the shorter of five minutes, the plan's own `expires_at` and its
+`max_age_seconds`.
+
+⚠ **And a permissive decision is never cached at all.** Anything that opens a
+lane — a `SOFT_OPT_OUT` regime, a `MINIMAL` crash profile, an `ELIGIBLE`
+server-analytics basis, or a lifted objection requirement — is used for the
+`prepare` call that fetched it and is not stored. Every later `prepare` for
+that context goes to the wire, and a request that fails, times out or finds no
+network answers **strict**. Only a fully closed decision may be reused within
+its lifetime, because reusing "closed" can never open anything. This is the
+only way *"an offline state can tighten but never relax"* can actually hold:
+the presence of `http.request` says nothing about connectivity, and Defold
+offers no reliable online signal, so there is no moment at which the SDK could
+know a stored permission is still true. The cost is **one request per
+`prepare` while the regime is permissive** — and `prepare` is called at start,
+on resume and at expiry, not per frame. Today it costs nothing at all, because
+the resolver's initial release emits only strict plans.
+
+### The age step, and the two things it decides
+
+⚠ **The age step comes first, and it is yours.** The policy endpoint is public
+and credential-free by construction, so it can never establish anyone's age —
+the SDK never sees a trusted one. An **unknown or minor** band means minimised
+handling: the analytics question is **not put**, nothing optional starts, and
+the crash lane stays closed. An eligible band from your own age step leads to
+the choice, with the default the decision carries.
+
+`flags.child_rules` is delivered verbatim and is `minimised` on every response
+in this release. Read it as what it is: the public bootstrap cannot establish
+age, so the minimised-mode prohibitions — no advertising identifiers, no
+profiling, no experiments, no third-party optional sharing — stand for
+**everyone** in this release, while the first-party analytics choice is
+governed by your age step and the regime's default.
+
+`flags.crash_profile` is `off` on every response too, and that means **the
+resolver offers no approved crash profile in this release** — not that crash
+reporting must stop. A host with its own separately reviewed crash gate (its
+own basis, its own opt-out, minors forced off) keeps that gate running
+unchanged; generic policy flags do not amend it. A host **without** one keeps
+the crash lane closed under `off`, which is what the minimal example does,
+because a quick start has no reviewed gate. Either way, an unknown or minor
+band keeps it shut.
+
+### What the minimal example does not do — host requirements
+
+[`examples/minimal/main.script`](examples/minimal) is a **quick start**, not a
+production integration. Three lifecycle obligations are deliberately left to
+the host, because they belong to an application's own teardown discipline
+rather than to a twenty-line illustration. A production integration must
+implement all three.
+
+- **Retry `crash.shutdown()` until it succeeds before treating a `CRASH_OFF`
+  closure as enforced.** It returns `false, "pending"` while a crash POST is in
+  flight, and the host must keep pumping `http.update` and retrying; until it
+  returns true the reporter is still live, so the lane is not actually closed.
+  The example keeps the state and retries at teardown, which is enough to show
+  the shape and not enough to guarantee the closure.
+- **Keep `analytics_running` until `shardpilot.shutdown()` returns true, retry
+  it, and never `init()` over a live client.** The analytics client has the
+  same pending posture, and a re-`init` while one is still settling produces
+  two clients over one spool.
+- **A cached decision can outlive its window if the wall clock steps
+  backwards.** Only fully closed decisions are cached, so the worst this does
+  is keep a *closed* answer alive longer than its plan — the safe direction —
+  and the SDK no longer guards against it. A host that needs the window to be
+  exact should re-resolve on its own schedule rather than trusting
+  `valid_for_seconds` across a clock change.
+- **Check notice compatibility BEFORE paying an owed consent write.** A failed
+  `set_consent` leaves a debt; if the next decision carries a different
+  `consent_text_version` or `presented_language`, paying that debt records the
+  **old** answer against text the player never saw. Discard the debt with the
+  answer and present the notice again. (The minimal example applies the same
+  invariant at `examples/minimal/main.script:276`, where a plan whose text
+  version **or** language has moved discards the stored answer rather than
+  reusing it.)
+- **Map every `operation_blocks` name to the action it restricts, and refuse
+  that action.** These are restrictions no consent choice lifts, so a grant
+  does not open what a block closed. An **unmapped** name closes everything —
+  no question, no analytics, no crash — which is what the minimal example does
+  for every name, because a quick start has no vocabulary to map them with. In
+  this release the resolver always sends `[]`.
+- **Own the Mode B identity and consent retries.** The quick start does not
+  carry them, deliberately — it shows the straight path. A production host
+  must: mark the client as existing **before** calling `identify`, so a later
+  resolution never builds a second one over the first; drain and retry
+  `identify` on the **existing** client after `events_pending`; create consent
+  debt only for a **fresh** answer, never for a restored grant, which goes
+  through the session-start path instead.
+- **Retry an owed `session_start` after a grant is recorded.** A grant whose
+  receipt landed but whose `session_start` did not leaves the lane open with
+  no session behind it; the example does not track that debt, and a production
+  integration must retry the start or record that it never happened.
+- **Retry or surface a failed background snapshot.** `persist()` on focus loss
+  can fail — a full or unwritable spool — and the example neither retries it
+  nor reports it, so events it was meant to save are lost silently on a kill.
+- **Retry a pending grant only against a fresh decision that still permits
+  analytics and still matches the answered notice.** The example retries an
+  owed `set_consent` on the next trigger using the standing answer; a
+  production integration must first confirm that the newest decision still
+  opens the lane and still carries the `consent_text_version` and
+  `presented_language` the player answered, or a write owed under one policy
+  lands under another.
+- **Fence superseded same-context resolutions in the host.** The module
+  refuses a response from an older dispatch for the same context, so a stale
+  *policy* cannot deliver — but the host's own callbacks are not fenced: two
+  reconcile paths in flight can still apply out of order. A production
+  integration keeps a resolution generation and ignores any callback that is
+  not the newest.
+- **Back off after a transient strict fallback while foregrounded.** A
+  fallback carries no `valid_for_seconds`, so nothing is scheduled and the
+  next resolution waits for an unrelated trigger. A host that wants to recover
+  from a brief outage needs its own bounded, backed-off retry.
+- **Fence asynchronous callbacks and remove the window listener in
+  `final()`.** A policy resolution or a notice answer that arrives after
+  teardown will happily start a lane on a torn-down script; the host needs a
+  generation or a disposed flag that every callback checks, and must clear the
+  listener it installed.
+
+`consent_policy.invalidate()` is what the host calls on the named
+re-resolution triggers — launch and resume, a network or permitted storefront
+change, an age correction, a language or text change, a workspace or app
+change, a policy revocation, and before the first optional admission. A
+request already in flight when it fires can no longer answer.
+
+**Plan text is read before it is decoded.** Defold's `json.decode` returns a
+plain table for both `{}` and `[]` and marks neither, so the container type is
+erased by the decode — an object supplied where the schema says a list would
+read as an empty list. The raw response is therefore scanned first, with a
+JSON-aware walk that unescapes each key before comparing it (a literal search
+is bypassed by `"operation\u005fblocks"`) and skips every value whole, so a
+key of the same name nested in another object is not mistaken for the
+top-level one.
+
+> `SOFT_OPT_OUT` parses but is **not reachable today**: every row of the
+> jurisdiction matrix is pending counsel confirmation, so the resolver's
+> initial release has no path that emits it.
+
 ## Privacy & consent
 
 - **Tokens are memory-only.** Auth material is never written to disk. The live
@@ -1082,6 +1644,7 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 | `shardpilot/experiments.lua` | Experiment-assignment consumer (off by default): assignment fetch, durable cache, revalidation, exposure/outcome facts |
 | `shardpilot/storage.lua` | The **only** module allowed to call `sys.save`/`sys.load` |
 | `shardpilot/clock.lua` · `id.lua` · `platform.lua` · `sampling.lua` | Time, UUIDv7, platform detect, runtime sampling |
+| `shardpilot/consent_policy.lua` | Consent-regime preparation before SDK init; imports nothing from this SDK |
 | `shardpilot/version.lua` | Version string constant |
 | `shardpilot/crash.lua` | Public crash entrypoint: singleton API + `new()` factory |
 | `shardpilot/crash/client.lua` | Crash client: config, sampling, emit/emit_fatal/capture_previous |
@@ -1092,7 +1655,7 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 | `shardpilot/crash/dump.lua` | Previous-session native dump → crash event |
 | `game.project` | Defold library metadata (`[library] include_dirs = shardpilot`) |
 | `examples/minimal/` | Copy-pasteable usage example |
-| `test/` | Lua test harness (`test_sdk.lua`, `test_crash.lua`, `test_remote_config.lua`, `test_experiments.lua`) + Defold collection/script |
+| `test/` | Lua test harness: every `test/test_*.lua`, which is also exactly what CI runs + Defold collection/script |
 | `docs/` | configuration · events · crash · privacy · release |
 | `scripts/` | `check_library.sh` (content guard), `package_release.sh` |
 
