@@ -2,6 +2,81 @@
 
 ### Unreleased
 
+## v0.10.3 — 2026-09-20 — prepare the consent regime before SDK initialization
+
+- Add the standalone `shardpilot.consent_policy` module from #92:
+  `validate_context(context)`, `prepare(context, callback)` and `invalidate()`.
+  Preparation imports no other SDK module and does not initialize telemetry,
+  create an identifier, load a spool or install a capture hook. Resolve first;
+  a decision is neither the player's consent nor permission to send events.
+  Merged in commit `c82358700fb6f2f22b462791825aaff3b7378d6f`.
+- The release-1 **server resolver contract** is `STRICT_OPT_IN`; the module's
+  README describes no path to `SOFT_OPT_OUT` or non-empty `operation_blocks`
+  in that release. The Lua parser can read future `SOFT_OPT_OUT` plans and
+  `minimal_diagnostics_for_minors` crash profiles; the only accepted
+  server-analytics value is `denied`.
+  The release record does not verify deployment state or enable those lanes.
+- **Future-release gates:** before making those resolver outputs reachable,
+  close [#94](https://github.com/shardpilot/shardpilot-defold/issues/94), for
+  recording a notice/non-objection basis and preserving an explicit Off, and
+  [#95](https://github.com/shardpilot/shardpilot-defold/issues/95), for keeping
+  known operation blocks through strict fallbacks in the module, per context
+  and without relaxing restrictions. These are known limits of v0.10.3;
+  parsing future plan values does not complete those integration paths.
+- Invalid context is refused locally before a request. Missing transport,
+  unavailable clock/JSON support, rejected or malformed responses, expired
+  plans and failed/offline requests take the strict fallback: the analytics
+  choice defaults `off`, an explicit grant is required, crash is `off`,
+  server analytics is `denied`, child rules are `minimised`, and
+  `plan_used = false`. Strict fallback still permits the host to ask under
+  its own notice text; it does not suppress the consent screen. Superseded
+  or invalidated responses cannot
+  deliver their old plan. There is no reuse of cached permission after failure.
+- **Permissive decisions are never cached.** An analytics choice default
+  other than `off`, a crash profile other than `off`, server analytics other
+  than `denied`, or child rules other than `minimised` prevents caching.
+  Only decisions with that conservative tuple may be
+  reused: one in-memory entry scoped to the complete context, with its initial
+  window bounded by 300 seconds, `expires_at` and `max_age_seconds`. A backward
+  wall-clock step can extend that closed-only window. Nothing is
+  persisted by this module. A cold or invalidated resolution still makes a
+  request even when the resolver returns strict; this is not zero network use.
+- **Host requirements:** follow the README's consent-regime integration
+  contract, including all twelve obligations listed there:
+  - Retry pending `crash.shutdown()` while pumping updates; do not treat a
+    crash lane as closed until shutdown succeeds.
+  - Keep analytics marked running until `shardpilot.shutdown()` succeeds;
+    retry it and never initialize over the still-live client.
+  - Re-resolve on a host schedule if a closed-cache window must remain exact
+    across a backward wall-clock step.
+  - Before retrying a consent write, discard an answer whose notice version
+    or language has changed and present the notice again.
+  - Map every operation block to its restricted action and refuse that action;
+    an unmapped block closes all optional lanes, regardless of consent.
+  - Own Mode B identity and consent retries on the existing client; retry
+    `identify` after draining `events_pending`, and create consent debt only
+    for a fresh answer, never a restored grant.
+  - Retry an owed `session_start` after the grant is recorded, or explicitly
+    record that no session was started.
+  - Retry or surface a failed background `persist()` snapshot.
+  - Retry a pending grant only under a fresh permitting decision with the
+    same `consent_text_version` and `presented_language` the player answered.
+    The quick start reports a refused consent write and performs no retry;
+    retrying the owed write is entirely the host's responsibility.
+  - Fence superseded same-context host reconciliation callbacks by generation.
+  - Use bounded backoff to re-resolve transient strict fallbacks while active.
+  - Fence callbacks after teardown and remove the installed window listener.
+  Also invalidate and re-resolve on the documented lifecycle/context changes
+  and before optional admission. Schedule re-resolution by
+  `valid_for_seconds`; cache expiry does not stop a lane already running.
+- **Limits:** non-null `store_region` is refused; no country is inferred here.
+  Signatures are not verified: plans must carry `signature: null`; a missing
+  field or a non-null signature is rejected. A two-second HTTP
+  timeout is requested and late responses fall back to strict; the module
+  has no independent timer guaranteeing callback delivery if transport never
+  calls back. The host must honor the plan's restrictions and perform
+  the lifecycle work above. The minimal example is not a production adapter.
+
 ## v0.10.2 — 2026-09-18
 
 - Release the SDK evidence witness (#90), terminal batch rejections, typed progression/ad events, request compression, and consent/spool repairs.
