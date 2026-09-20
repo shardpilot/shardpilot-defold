@@ -159,6 +159,14 @@ Minimal Defold script (see [`examples/minimal/`](examples/minimal)):
 > by default, so an unconditional `crash.init` is how a closed lane gets
 > opened; `server_analytics` gates only your backend's lane.
 >
+> ⚠ **The values are the resolver's, and the plan is nested.** `flags` carries
+> `crash_profile`, `server_analytics`, `child_rules` and `operation_blocks`;
+> the vocabularies are lower-case (`off`, `minimal_diagnostics_for_minors`,
+> `denied`, `minimised`). This SDK read a flat plan with upper-case values
+> until it was checked against the resolver's actual bytes — and refused every
+> real response as unreadable. The contract of record is the resolver's
+> published `ConsentPolicyPlan` schema; `test/golden/` holds its output.
+>
 > **And resolve again on every named trigger** — after the player answers, on
 > resume, at `valid_for_seconds`, and when the notice text or language changes
 > — then make the running lanes match the fresh answer. A lane that is now
@@ -1151,9 +1159,11 @@ The callback receives **exactly one decision, exactly once**:
 | Field | Meaning |
 |---|---|
 | `regime` | `STRICT_OPT_IN`, `SOFT_OPT_OUT` or `UNKNOWN` |
-| `crash_profile` | `OFF` or `MINIMAL` |
-| `server_analytics` | `DENIED` or `ELIGIBLE` |
-| `server_analytics_objection_required` | Stands unless the plan says, as a boolean, that it does not |
+| `crash_profile` | `off` or `minimal_diagnostics_for_minors` |
+| `server_analytics` | `denied` — the only value this release's contract names |
+| `child_rules` | `minimised` — the same |
+| `notice` | The resolver's own words about what kind of answer this is. Show or log it verbatim; the SDK does not interpret it |
+| `band_vocabulary` / `band_vocabulary_version` | The age scale the resolver understood. If you sent an `age_band`, a mismatch here is a refusal |
 | `optional_processing_closed` | `false` is **not permission** — only that the regime is not what closed the door |
 | `plan_used` | `false` means the strict fallback was taken; `reason` says why |
 | `valid_for_seconds` | How long this verdict is good for — the shortest of the cache ceiling, the plan's `expires_at` and its `max_age_seconds`. **Schedule your own re-resolution by it:** cache expiry protects the next lookup and stops nothing that is already running. `nil` on a fallback, which established nothing that could expire |
@@ -1203,6 +1213,12 @@ implement all three.
   it, and never `init()` over a live client.** The analytics client has the
   same pending posture, and a re-`init` while one is still settling produces
   two clients over one spool.
+- **A cached decision can outlive its window if the wall clock steps
+  backwards.** Only fully closed decisions are cached, so the worst this does
+  is keep a *closed* answer alive longer than its plan — the safe direction —
+  and the SDK no longer guards against it. A host that needs the window to be
+  exact should re-resolve on its own schedule rather than trusting
+  `valid_for_seconds` across a clock change.
 - **Retry an owed `session_start` after a grant is recorded.** A grant whose
   receipt landed but whose `session_start` did not leaves the lane open with
   no session behind it; the example does not track that debt, and a production

@@ -353,11 +353,18 @@ reconcile = function(fresh)
 
 	-- The SERVER-SIDE analytics lane is a BASIS, not a toggle, and this example
 	-- sends nothing on it. If your backend does, gate it on
-	-- fresh.server_analytics == consent_policy.SERVER_ANALYTICS_ELIGIBLE, and
-	-- honour fresh.server_analytics_objection_required out of band — the
-	-- objection route is manual, and nothing in this SDK can satisfy it.
-	if fresh.server_analytics ~= consent_policy.SERVER_ANALYTICS_ELIGIBLE then
-		print("shardpilot: server-side analytics not eligible")
+	-- fresh.server_analytics, whose only value in this release is "denied".
+	-- The objection route is manual — the rights page or the privacy address —
+	-- and nothing in this SDK can record or satisfy it.
+	if fresh.server_analytics == consent_policy.SERVER_ANALYTICS_DENIED then
+		print("shardpilot: server-side analytics denied")
+	end
+
+	-- ⚠ THE NOTICE IS THE RESOLVER'S WORDS, CARRIED VERBATIM. It says what
+	-- kind of answer this is; show or log it as your contract requires, and do
+	-- not summarise it.
+	if fresh.notice then
+		print("shardpilot policy notice: " .. fresh.notice)
 	end
 end
 

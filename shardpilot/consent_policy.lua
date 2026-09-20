@@ -38,11 +38,22 @@ M.STRICT_OPT_IN = "STRICT_OPT_IN"
 M.SOFT_OPT_OUT = "SOFT_OPT_OUT"
 M.UNKNOWN = "UNKNOWN"
 
-M.CRASH_OFF = "OFF"
-M.CRASH_MINIMAL = "MINIMAL"
+-- ⚠ THE VALUES ARE THE SERVER'S, NOT THIS MODULE'S. Three lanes implemented
+-- one ADR from prose and nobody parsed the other's bytes: this module read a
+-- FLAT plan with "OFF"/"MINIMAL"/"DENIED" while the resolver answers a nested
+-- one with "off"/"minimal_diagnostics_for_minors"/"denied". Every real
+-- response was refused as unreadable — invisible while the answer is STRICT
+-- anyway, and fatal the day it is not.
+--
+-- The contract of record is the resolver's published OpenAPI schema
+-- (ConsentPolicyPlan) and the constructor behind it; these constants are
+-- copied from it, not chosen here.
+M.CRASH_OFF = "off"
+M.CRASH_MINIMAL = "minimal_diagnostics_for_minors"
 
-M.SERVER_ANALYTICS_DENIED = "DENIED"
-M.SERVER_ANALYTICS_ELIGIBLE = "ELIGIBLE"
+M.SERVER_ANALYTICS_DENIED = "denied"
+
+M.CHILD_RULES_MINIMISED = "minimised"
 
 -- The route is public API surface; the schema it speaks has exactly one
 -- published copy, beside the resolver's own contract.
@@ -69,6 +80,9 @@ local MAX_ENTRIES = 64
 local MAX_SIGNALS = 16
 local MAX_BODY = 16 * 1024
 local MAX_ENDPOINT = 256
+-- basis.notice is a paragraph the host must show or log verbatim, so it is
+-- bounded generously and not interpreted here.
+local MAX_NOTICE = 2048
 
 local STORES = { steam = true, apple = true, google_play = true, standalone = true }
 local PLATFORMS = {
@@ -76,6 +90,23 @@ local PLATFORMS = {
 }
 local SIGNAL_REASONS = {
 	source_not_permitted = true, source_unavailable = true, not_enabled_in_release = true,
+}
+
+-- ⚠ EACH ENUM HOLDS THE VALUES THE CONTRACT NAMES TODAY, AND AN UNKNOWN VALUE
+-- IS A REFUSAL — never a permissive plan. Where the contract names one value,
+-- one value is what is here: a second one arrives in the release that adds it,
+-- in both repositories at once, with the golden body that proves it.
+local CRASH_PROFILES = { off = true, minimal_diagnostics_for_minors = true }
+local SERVER_ANALYTICS = { denied = true }
+local CHILD_RULES = { minimised = true }
+local BASIS_CHARACTERS = { informational_reference = true }
+local TABLE_PROVENANCES = { ai_draft = true, owner_accepted = true }
+
+-- The resolver's closed refusal vocabulary. A reason outside it is reported as
+-- the generic one rather than echoed into a caller's control flow.
+local REFUSAL_REASONS = {
+	invalid_request = true, invalid_scope = true, store_region_not_accepted = true,
+	unsupported_app_version = true, policy_unavailable = true,
 }
 
 -- The private cache: one entry, in memory, for this session only.
@@ -110,7 +141,9 @@ local latest_dispatch = {}
 -- is read there: a schema list key followed by `{` is malformed. That is the
 -- ONLY container-type signal available in this SDK, which is why this looks
 -- like string matching in a parser rather than a type check.
-local LIST_KEYS = { operation_blocks = true, prohibited_purposes = true, signals_used = true }
+-- Top-level arrays. operation_blocks moved INSIDE flags with the contract, so
+-- it is checked in the flags branch of the scan rather than here.
+local LIST_KEYS = { signals_used = true }
 
 -- ⚠ THE COMPLETE TOP-LEVEL VOCABULARY, and it is CLOSED. Every other bounded
 -- value in this module is checked against a closed set; the set of FIELD NAMES
@@ -128,29 +161,43 @@ local LIST_KEYS = { operation_blocks = true, prohibited_purposes = true, signals
 -- unknown key spelled `"tenant": null` would vanish before any decoded-side
 -- check could see it.
 local NESTED_OBJECT_KEYS = {
+	flags = { crash_profile = true, server_analytics = true, child_rules = true, operation_blocks = true },
 	scope = { workspace_id = true, app_id = true, environment_id = true },
-	age_band = { vocabulary = true, band = true },
+	basis = { character = true, table_provenance = true, notice = true },
 }
 
 local SIGNAL_KEYS = { name = true, available = true, reason = true }
 
+-- ⚠ THE TOP-LEVEL SET IS THE CONTRACT'S, INCLUDING THE FIELDS THAT LEFT.
+-- server_analytics_objection_required, prohibited_purposes and the echoed
+-- age_band are NOT in the resolver's schema and were read here because this
+-- module was written from prose rather than from the published bytes. They
+-- return when the server's contract carries them, in both repositories at once
+-- — a field this module reads and the server never sends is a promise to the
+-- host that nothing can keep.
 local SCHEMA_KEYS = {
 	regime = true,
-	crash_profile = true,
-	server_analytics = true,
-	server_analytics_objection_required = true,
-	prohibited_purposes = true,
-	operation_blocks = true,
+	flags = true,
 	policy_version = true,
 	consent_text_version = true,
 	presented_language = true,
 	scope = true,
 	signals_used = true,
-	age_band = true,
+	band_vocabulary = true,
+	band_vocabulary_version = true,
 	expires_at = true,
 	max_age_seconds = true,
 	signature = true,
+	basis = true,
+	reason = true,
 }
+
+-- ⚠ THE ONE NULLABLE KEY IN THE SCHEMA, and it is nullable by contract rather
+-- than by accident: the resolver sends `"signature": null` on EVERY response
+-- in this release. Present-and-null is the unsigned state and the only
+-- admissible one here; present and NOT null is a signature this build cannot
+-- verify, which is refused. No other key may be null.
+local NULLABLE_KEYS = { signature = true }
 
 -- ⚠ AND THE SCAN HAS TO BE JSON-AWARE, NOT A SEARCH FOR THE LITERAL NAME. The
 -- first cut looked for `"operation_blocks"%s*:%s*{` in the raw text, which a
@@ -280,11 +327,79 @@ end
 -- can no longer answer: whether a list key was given an object, and WHICH KEYS
 -- WERE PRESENT AT ALL.
 --
--- ⚠ THE SECOND ONE MATTERS FOR `"signature": null`. Lua has no null, so a
--- present-but-null key decodes to exactly the same nil as an absent one — and
--- this build refuses every present signature precisely because it cannot check
--- one. A response that spells the field as null would otherwise be read as
--- "no signature at all" and admitted.
+-- ⚠ THE SECOND ONE MATTERS BECAUSE LUA HAS NO NULL: a present-but-null key
+-- decodes to exactly the same nil as an absent one. For every key but
+-- `signature` that is a refusal; `signature` is null on every response in this
+-- release by contract, so for that one — and only that one — present-and-null
+-- is the unsigned state and is admissible.
+-- ⚠ flags CARRIES THE ONLY NESTED ARRAY IN THE SCHEMA, so it gets its own
+-- walk rather than the generic object one: operation_blocks must be an ARRAY
+-- (an object supplied there reads as no blocks at all) with no null entry (Lua
+-- drops one, so a roster of three comes back as two with nothing saying so).
+-- Those two facts live in the raw text and nowhere else.
+local function scan_flags(body, pos)
+	local seen = {}
+	pos = skip_space(body, pos + 1)
+	if body:sub(pos, pos) == "}" then
+		return true, nil, pos + 1
+	end
+	while true do
+		if body:sub(pos, pos) ~= '"' then
+			return false, "a flags key is not a string"
+		end
+		local key, after = read_string(body, pos)
+		if not key then
+			return false, "a flags key is not readable"
+		end
+		if seen[key] then
+			return false, "flags carries the key " .. key .. " twice"
+		end
+		if not NESTED_OBJECT_KEYS.flags[key] then
+			return false, "flags carries an unknown key"
+		end
+		seen[key] = true
+		pos = skip_space(body, after)
+		if body:sub(pos, pos) ~= ":" then
+			return false, "a flags key carries no value"
+		end
+		pos = skip_space(body, pos + 1)
+		if key == "operation_blocks" then
+			if body:sub(pos, pos) ~= "[" then
+				return false, "operation_blocks is not a list"
+			end
+			local scan = skip_space(body, pos + 1)
+			while body:sub(scan, scan) ~= "]" do
+				if body:sub(scan, scan + 3) == "null" then
+					return false, "operation_blocks carries a null entry"
+				end
+				local entry_end = skip_value(body, scan, 1)
+				if not entry_end then
+					return false, "the plan is not readable"
+				end
+				scan = skip_space(body, entry_end)
+				if body:sub(scan, scan) == "," then
+					scan = skip_space(body, scan + 1)
+				elseif body:sub(scan, scan) ~= "]" then
+					return false, "the plan is not readable"
+				end
+			end
+		end
+		local next_pos = skip_value(body, pos, 1)
+		if not next_pos then
+			return false, "the plan is not readable"
+		end
+		pos = skip_space(body, next_pos)
+		local delimiter = body:sub(pos, pos)
+		if delimiter == "}" then
+			return true, nil, pos + 1
+		end
+		if delimiter ~= "," then
+			return false, "the plan is not readable"
+		end
+		pos = skip_space(body, pos + 1)
+	end
+end
+
 local function scan_plan_text(body)
 	local present = {}
 	local present_signals = {}
@@ -325,18 +440,11 @@ local function scan_plan_text(body)
 		if LIST_KEYS[key] and body:sub(pos, pos) == "{" then
 			return false, key .. " is a JSON object where the schema says a list", present, present_signals
 		end
-		-- The nested objects the schema names, checked where the raw text still
-		-- knows what was written. `members` is collected by the same walk that
-		-- skips the value, so this costs no second pass.
-		local members = nil
-		if NESTED_OBJECT_KEYS[key] and body:sub(pos, pos) == "{" then
-			members = {}
-		end
-		-- ⚠ AND A null ELEMENT INSIDE ONE OF THOSE LISTS. Lua drops it: the
-		-- decoded array simply comes back one entry shorter, so a roster of
-		-- three operation blocks with the middle one nulled reads as a roster
-		-- of two, with nothing anywhere saying a third was sent. The raw text
-		-- is again the only place that still knows.
+		-- ⚠ THE ELEMENTS OF signals_used, WALKED WHERE THE RAW TEXT STILL
+		-- KNOWS THEM. Lua DROPS a null element, so a roster of three comes back
+		-- as two with nothing saying so; and a member spelled `null` inside an
+		-- entry decodes to the same nil an absent one does, so the entry's own
+		-- key set has to be recorded here too.
 		if LIST_KEYS[key] and body:sub(pos, pos) == "[" then
 			local scan = skip_space(body, pos + 1)
 			local index = 0
@@ -345,13 +453,6 @@ local function scan_plan_text(body)
 					return false, key .. " carries a null entry", present, present_signals
 				end
 				index = index + 1
-				-- ⚠ AND THE SIGNAL ENTRIES NEED THEIR OWN PRESENCE MAP. A
-				-- signal's `reason` present-and-null decodes to the same nil as
-				-- an absent one, and an unavailable signal with no reason is
-				-- the shape that hides a prohibited source — so the entry would
-				-- be refused for the right reason by luck, or accepted if the
-				-- nulled field were one the entry did not need. The nullability
-				-- rule has to reach inside the list, not stop at its name.
 				local collect = nil
 				if key == "signals_used" and body:sub(scan, scan) == "{" then
 					collect = {}
@@ -376,18 +477,39 @@ local function scan_plan_text(body)
 				end
 			end
 		end
-		local next_pos = skip_value(body, pos, 1, members)
-		if not next_pos then
-			return false, "the plan is not readable", present, present_signals
+		-- The nested objects the schema names, checked where the raw text still
+		-- knows what was written. `members` is collected by the same walk that
+		-- skips the value, so this costs no second pass.
+		local handled = false
+		if key == "flags" and body:sub(pos, pos) == "{" then
+			local flags_ok, flags_refusal, flags_end = scan_flags(body, pos)
+			if not flags_ok then
+				return false, flags_refusal, present, present_signals
+			end
+			pos = flags_end
+			handled = true
 		end
-		if members then
-			for member in pairs(members) do
-				if not NESTED_OBJECT_KEYS[key][member] then
-					return false, key .. " carries an unknown key", present, present_signals
+
+		if not handled then
+			local members = nil
+			if NESTED_OBJECT_KEYS[key] and body:sub(pos, pos) == "{" then
+				members = {}
+			end
+			local next_pos = skip_value(body, pos, 1, members)
+			if not next_pos then
+				return false, "the plan is not readable", present, present_signals
+			end
+			if members then
+				for member in pairs(members) do
+					if not NESTED_OBJECT_KEYS[key][member] then
+						return false, key .. " carries an unknown key", present, present_signals
+					end
 				end
 			end
+			pos = next_pos
 		end
-		pos = skip_space(body, next_pos)
+
+		pos = skip_space(body, pos)
 		local delimiter = body:sub(pos, pos)
 		if delimiter == "}" then
 			return true, nil, present, present_signals
@@ -647,10 +769,12 @@ end
 -- lines; a reason this build cannot recognise is reported as the generic one
 -- rather than repeated.
 local function error_envelope_reason(decoded)
-	local reason = decoded.reason
-	if type(reason) == "string" and #reason > 0 and #reason <= MAX_ENTRY
-		and reason:match("^[a-z0-9_]+$") then
-		return reason
+	-- ⚠ CHECKED AGAINST THE RESOLVER'S CLOSED LIST, not a character class. The
+	-- reason travels into decision.reason, which hosts branch on and log; a
+	-- name this build does not know is reported as the generic one rather than
+	-- repeated, because a caller cannot map a reason it has never heard of.
+	if REFUSAL_REASONS[decoded.reason] then
+		return decoded.reason
 	end
 	return "policy_unavailable"
 end
@@ -662,7 +786,7 @@ local function strict(reason, detail)
 		regime = M.STRICT_OPT_IN,
 		crash_profile = M.CRASH_OFF,
 		server_analytics = M.SERVER_ANALYTICS_DENIED,
-		server_analytics_objection_required = true,
+		child_rules = M.CHILD_RULES_MINIMISED,
 		optional_processing_closed = true,
 		plan_used = false,
 		reason = reason,
@@ -674,8 +798,12 @@ local function bounded_string(value, limit)
 	return type(value) == "string" and #value > 0 and #value <= limit
 end
 
+-- ⚠ "/" IS PERMITTED, because the resolver's own fallback names itself
+-- "strict-fallback/1" — a real identifier rather than an empty string, so a
+-- receipt that records it can be told apart from one whose writer forgot the
+-- field. A pattern that refused it refused every response this release sends.
 local function version_ok(value)
-	return bounded_string(value, MAX_VERSION) and value:match("^[A-Za-z0-9._+-]+$") ~= nil
+	return bounded_string(value, MAX_VERSION) and value:match("^[A-Za-z0-9._+/-]+$") ~= nil
 end
 
 -- Validates the CALLER's context before anything is sent. A value outside the
@@ -805,12 +933,32 @@ local function parse_plan(plan, context, now)
 	if plan.regime ~= M.STRICT_OPT_IN and plan.regime ~= M.SOFT_OPT_OUT and plan.regime ~= M.UNKNOWN then
 		return nil, "unknown regime"
 	end
-	if plan.crash_profile ~= M.CRASH_OFF and plan.crash_profile ~= M.CRASH_MINIMAL then
+	-- ⚠ THE RESTRICTIONS ARE NESTED UNDER flags, AND EACH IS DECIDED
+	-- SEPARATELY. None of them inherits an analytics permission, which is why
+	-- the contract groups them rather than folding them into the regime.
+	local flags = plan.flags
+	if type(flags) ~= "table" then
+		return nil, "the plan carries no flags object"
+	end
+	if not CRASH_PROFILES[flags.crash_profile] then
 		return nil, "unknown crash_profile"
 	end
-	if plan.server_analytics ~= M.SERVER_ANALYTICS_DENIED
-		and plan.server_analytics ~= M.SERVER_ANALYTICS_ELIGIBLE then
+	if not SERVER_ANALYTICS[flags.server_analytics] then
 		return nil, "unknown server_analytics"
+	end
+	if not CHILD_RULES[flags.child_rules] then
+		return nil, "unknown child_rules"
+	end
+	if flags.operation_blocks ~= nil then
+		if type(flags.operation_blocks) ~= "table" or #flags.operation_blocks > MAX_ENTRIES
+			or not is_sequence(flags.operation_blocks) then
+			return nil, "operation_blocks is malformed or over its bound"
+		end
+		for _, entry in ipairs(flags.operation_blocks) do
+			if not bounded_string(entry, MAX_ENTRY) then
+				return nil, "an entry of operation_blocks is malformed"
+			end
+		end
 	end
 	if not version_ok(plan.policy_version) or not version_ok(plan.consent_text_version) then
 		return nil, "a version field is missing or outside its bound"
@@ -820,38 +968,36 @@ local function parse_plan(plan, context, now)
 	if not bounded_string(plan.presented_language, MAX_LANGUAGE) then
 		return nil, "presented_language is missing or over its bound"
 	end
-	-- ⚠ THE BAND IS THE ONLY AGE SHAPE THAT TRAVELS, so its shape is checked
-	-- rather than assumed. validate_context checks the band the CALLER sends;
-	-- nothing checked the one the resolver sends back, so a plan could echo an
-	-- age_band of any shape at all and be used.
-	if plan.age_band ~= nil then
-		local band = plan.age_band
-		if type(band) ~= "table" or not bounded_string(band.vocabulary, MAX_BAND)
-			or not bounded_string(band.band, MAX_BAND) then
-			return nil, "age_band is malformed or over its bound"
-		end
-		-- ⚠ AND ITS KEY SET IS CLOSED, like the top level's. A nested object
-		-- whose names are unchecked is the top-level hole one level down: an
-		-- age_band could carry anything beside the two fields we read and still
-		-- be used, and a band is the only age shape that travels.
-		for key in pairs(band) do
-			if key ~= "vocabulary" and key ~= "band" then
-				return nil, "age_band carries an unknown key"
-			end
-		end
+	-- ⚠ THE BAND VOCABULARY THE RESOLVER UNDERSTOOD. The contract has no echo
+	-- of the band itself — it travels outward only — so the check Codex asked
+	-- for is made with the fields that exist: if this caller supplied a band,
+	-- the vocabulary the resolver names must be the one the caller used, or
+	-- the answer is about a different scale and is refused.
+	if not bounded_string(plan.band_vocabulary, MAX_BAND)
+		or not bounded_string(plan.band_vocabulary_version, MAX_BAND) then
+		return nil, "the band vocabulary is missing or over its bound"
+	end
+	if context.age_band ~= nil and plan.band_vocabulary ~= context.age_band.vocabulary then
+		return nil, "the resolver read a different age vocabulary than the one supplied"
+	end
+	local basis = plan.basis
+	if type(basis) ~= "table" then
+		return nil, "the plan carries no basis object"
+	end
+	if not BASIS_CHARACTERS[basis.character] then
+		return nil, "unknown basis character"
+	end
+	if not TABLE_PROVENANCES[basis.table_provenance] then
+		return nil, "unknown table provenance"
+	end
+	-- The notice is carried to the host VERBATIM and interpreted nowhere here.
+	if not bounded_string(basis.notice, MAX_NOTICE) then
+		return nil, "the basis carries no notice"
 	end
 	local scope = plan.scope
 	if type(scope) ~= "table" or scope.workspace_id ~= context.workspace_id
 		or scope.app_id ~= context.app_id or scope.environment_id ~= context.environment_id then
 		return nil, "the plan is scoped to another app, environment or workspace"
-	end
-	-- ⚠ A STRING IS NOT A BOOLEAN. "true" was coerced to false below, and the
-	-- objection requirement it carried vanished into a plan marked USED. An
-	-- ABSENT field is not false either: the requirement stands unless the plan
-	-- says, as a boolean, that it does not.
-	if plan.server_analytics_objection_required ~= nil
-		and type(plan.server_analytics_objection_required) ~= "boolean" then
-		return nil, "server_analytics_objection_required is not a boolean"
 	end
 	if plan.signals_used ~= nil then
 		if type(plan.signals_used) ~= "table" or #plan.signals_used > MAX_SIGNALS
@@ -862,21 +1008,9 @@ local function parse_plan(plan, context, now)
 			if type(signal) ~= "table" or not bounded_string(signal.name, MAX_ENTRY) then
 				return nil, "a signal is malformed"
 			end
-			-- ⚠ available IS A BOOLEAN OR THE PLAN IS MALFORMED, the same rule
-			-- the objection field gets. `available ~= true` quietly folded the
-			-- string "yes", the number 0 and an absent key into "unavailable" —
-			-- an answer the resolver never gave, written into the provenance
-			-- record as though it had. Unreadable and unavailable are different
-			-- facts and this record exists to keep them apart.
 			if type(signal.available) ~= "boolean" then
 				return nil, "a signal does not state whether it was available"
 			end
-			-- ⚠ A reason IS CHECKED WHEREVER IT APPEARS, not only where it is
-			-- required. The vocabulary was enforced on the branch that needs a
-			-- reason and nowhere else, so an AVAILABLE signal could carry any
-			-- string at all — and this list is a provenance record, so an
-			-- unreadable reason on it is a claim about how the resolver reached
-			-- its answer that nothing checked.
 			if signal.reason ~= nil and not SIGNAL_REASONS[signal.reason] then
 				return nil, "a signal carries a reason outside the closed vocabulary"
 			end
@@ -884,19 +1018,6 @@ local function parse_plan(plan, context, now)
 			-- bare "not available" is the shape that hides a prohibited source.
 			if not signal.available and not SIGNAL_REASONS[signal.reason] then
 				return nil, "an unavailable signal carries no known reason"
-			end
-		end
-	end
-	for _, name in ipairs({ "prohibited_purposes", "operation_blocks" }) do
-		local list = plan[name]
-		if list ~= nil then
-			if type(list) ~= "table" or #list > MAX_ENTRIES or not is_sequence(list) then
-				return nil, name .. " is malformed or over its bound"
-			end
-			for _, entry in ipairs(list) do
-				if not bounded_string(entry, MAX_ENTRY) then
-					return nil, "an entry of " .. name .. " is malformed"
-				end
 			end
 		end
 	end
@@ -909,9 +1030,7 @@ local function parse_plan(plan, context, now)
 	end
 	-- ⚠ EXPIRED IS MALFORMED. The conservative rule names expiry beside
 	-- missing and unreadable for a reason: a plan whose life has run out is
-	-- not a weaker plan, it is no plan. It used to be READ for its shape and
-	-- then used, so an expired SOFT_OPT_OUT went on reporting optional
-	-- processing open.
+	-- not a weaker plan, it is no plan.
 	if type(now) == "number" and expires_at <= now then
 		return nil, "the plan has already expired"
 	end
@@ -920,12 +1039,11 @@ local function parse_plan(plan, context, now)
 			or plan.max_age_seconds % 1 ~= 0) then
 		return nil, "max_age_seconds is not a whole non-negative number"
 	end
-	-- The signature is reserved and absent in the resolver's initial release.
-	-- If one is PRESENT, this build cannot verify it — and an unverifiable
-	-- signature must not admit, or the field's arrival becomes a downgrade.
-	-- ⚠ AN EMPTY SIGNATURE IS STILL A SIGNATURE. `""` was waved through as
-	-- though the field were absent, which is the downgrade path itself: a
-	-- signed response whose signature failed to serialise would admit.
+	-- ⚠ THE SIGNATURE IS RESERVED AND ALWAYS null IN THIS RELEASE, so the
+	-- decoded value is always nil. A NON-nil one is a signature this build
+	-- cannot verify, and an unverifiable signature must not admit or the
+	-- field's arrival becomes a downgrade. The raw scan is what tells the
+	-- difference between "sent as null" and "not sent"; both are unsigned.
 	if plan.signature ~= nil then
 		return nil, "the plan carries a signature this build cannot verify"
 	end
@@ -940,17 +1058,15 @@ local function decision_is_permissive(decision)
 	return not decision.optional_processing_closed
 		or decision.crash_profile ~= M.CRASH_OFF
 		or decision.server_analytics ~= M.SERVER_ANALYTICS_DENIED
-		or decision.server_analytics_objection_required ~= true
+		or decision.child_rules ~= M.CHILD_RULES_MINIMISED
 end
 
 local function decision_from_plan(plan)
 	return {
 		regime = plan.regime,
-		crash_profile = plan.crash_profile,
-		server_analytics = plan.server_analytics,
-		-- Absence is not false. Only an explicit boolean false lifts it, and
-		-- parse_plan has already refused anything that is not a boolean.
-		server_analytics_objection_required = plan.server_analytics_objection_required ~= false,
+		crash_profile = plan.flags.crash_profile,
+		server_analytics = plan.flags.server_analytics,
+		child_rules = plan.flags.child_rules,
 		-- ⚠ FALSE IS NOT PERMISSION. It says only that the regime is not what
 		-- closed the door: SOFT still waits for the final notice barrier and
 		-- for the backend admission bound to this session, which this module
@@ -968,8 +1084,12 @@ local function decision_from_plan(plan)
 		policy_version = plan.policy_version,
 		consent_text_version = plan.consent_text_version,
 		presented_language = plan.presented_language,
-		prohibited_purposes = plan.prohibited_purposes,
-		operation_blocks = plan.operation_blocks,
+		band_vocabulary = plan.band_vocabulary,
+		band_vocabulary_version = plan.band_vocabulary_version,
+		operation_blocks = plan.flags.operation_blocks,
+		-- Carried VERBATIM and interpreted nowhere here. The host shows or logs
+		-- it as the contract requires.
+		notice = plan.basis.notice,
 	}
 end
 
@@ -1124,7 +1244,15 @@ function M.prepare(context, callback)
 		-- {"reason": ...} for carrying a key that is not a plan field — a
 		-- regression I introduced with the allowlist, which turned every
 		-- resolver refusal into "unreadable" and lost the reason it gave.
-		if response.status < 200 or response.status >= 300 then
+		-- ⚠ A REFUSAL IS NOT ALWAYS A NON-2xx. The resolver answers a COMPLETE
+		-- strict plan on every path — that is its contract, so a caller never
+		-- receives a bare error and never has to invent a fallback — and it
+		-- returns 200 for at least one refusal. So the REASON FIELD is what
+		-- says "this is a refusal", not the status: a plan carrying one is
+		-- settled as the strict fallback it already is, with its reason
+		-- surfaced, and its scope is not compared — a refusal carries none, so
+		-- that the response cannot be used to learn which tuples exist.
+		if response.status < 200 or response.status >= 300 or decoded.reason ~= nil then
 			settle(strict(error_envelope_reason(decoded), "the resolver refused"))
 			return
 		end
@@ -1143,7 +1271,7 @@ function M.prepare(context, callback)
 		-- The raw scan knows which keys were present; anything present whose
 		-- decoded value is nil is malformed, whatever it is.
 		for key in pairs(present) do
-			if decoded[key] == nil then
+			if decoded[key] == nil and not NULLABLE_KEYS[key] then
 				settle(strict("invalid_response", key .. " is present and null"))
 				return
 			end

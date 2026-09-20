@@ -153,7 +153,12 @@ end
 -- consent write is still OWED: it is set BEFORE the write is attempted, so a
 -- refusal cannot lose the answer.
 local answered = nil
+local started = false -- an initialised client exists
 
+-- `record` is separate from `start` for one reason: when the consent write is
+-- OWED, the next resolution must retry it over the client that already exists
+-- rather than building a second one. `answered.pending` is what says so, and
+-- the branch in the resolution below is what reads it.
 local function record(fresh)
   -- set_consent returns false, err too (a full or unwritable consent outbox).
   -- Starting the session anyway would emit events under a grant that was never
@@ -185,6 +190,7 @@ local function start(fresh)
     print("shardpilot identify refused: " .. tostring(identify_err))
     return
   end
+  started = true
   record(fresh)
 end
 
@@ -214,6 +220,9 @@ resolve_after_answer = function(decision)
     if fresh.optional_processing_closed then return end
     if not fresh.valid_for_seconds or fresh.valid_for_seconds <= 0 then
       return -- no window in which the lane could run; re-resolve later
+    end
+    if answered.pending and started then
+      return record(fresh) -- the write is owed; the client already exists
     end
     if fresh.consent_text_version ~= answered.text_version
       or fresh.presented_language ~= answered.language then
