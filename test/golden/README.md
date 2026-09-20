@@ -5,12 +5,33 @@ policy handler emits**, recorded by the resolver's own golden test.
 
 | file | what it is |
 |---|---|
-| `consent-policy-resolved.json` | `200`, a resolved STRICT plan for a valid request |
-| `consent-policy-refusal.json` | `400`, a refusal with `reason: "invalid_scope"` |
+| `consent-policy-resolved.json` | `200`, a resolved STRICT plan for a valid request — **the wire bytes**, as the handler writes them |
+| `consent-policy-refusal.json` | `400`, a refusal with `reason: "invalid_scope"` — the wire bytes |
+| `consent-policy-resolved.indented.json` | the same response in the **review form** the resolver's repository stores |
+| `consent-policy-refusal.indented.json` | the same, for the refusal |
 
-**Provenance.** Recorded by the resolver service's own test at commit
-`5f64aca`, from `internal/httpserver/testdata/consent_policy_resolved_strict.json`
-and `consent_policy_refusal_invalid_scope.json`. The resolved body answers the
+**Provenance, and it is a scene rather than a sentence.** The two `.json`
+files are the bytes the handler writes on the wire. The resolver's own golden
+test re-indents each raw response and compares *that* with the file it keeps,
+applying the indentation to both sides — so **indentation is the only
+transformation** between what goes over the wire and what that repository
+stores, and the stored form is what a human reads a diff in.
+
+Both forms are vendored here, and
+`test_the_review_forms_compact_to_the_wire_bytes` proves the relation instead
+of asking you to believe it: removing insignificant whitespace from each
+`.indented.json` — **outside strings only, with no round trip through a JSON
+library** — must reproduce the corresponding `.json` byte for byte. Decoding
+and re-encoding would prove only that the two files *mean* the same thing,
+which is the weaker claim and the one that let this SDK and the resolver
+disagree for months. A key reordered, a number respelled or an escape
+rewritten fails that scene.
+
+Recorded from the resolver service's own test at commit `6f027a32`, from
+`internal/httpserver/testdata/consent_policy_resolved_strict.json` (blob
+`6a36fcc4`) and `consent_policy_refusal_invalid_scope.json` (blob
+`b9eacf6f`); those are the stored review forms, and the `.indented.json` files
+here are copies of them. The resolved body answers the
 request `{workspace_id: ws_1, app_id: app_1, environment_id: env_1,
 app_version: 1.2.3, store: steam, store_region: null, locale: en-GB,
 platform: windows}`; the refusal is the same request with an invalid
@@ -39,6 +60,18 @@ against.
 4. A refusal **does** carry `scope`, as three empty strings, so every key is
    present on every response and the required set is total. What tells a
    refusal from a plan is the presence of `reason`.
+
+**Whitespace is not a detail here.** This module scans the RAW TEXT — for
+duplicate keys, unknown keys, container types and present-and-null members —
+before it decodes anything, and JSON permits insignificant whitespace between
+every pair of tokens. Until the review forms were vendored, every golden scene
+ran on the compact spelling only, so that scanner had never met a newline or
+an indent. A proxy that re-serialises, a future encoder, or a server that
+starts pretty-printing would all arrive as whitespace, and a closed validator
+that has seen one spelling is one layer of exactly the gap these files exist
+for. `test_whitespace_does_not_change_the_answer` feeds the module both forms
+and compares the decision field by field, and the key-omission scene runs over
+both.
 
 `test_consent_policy.lua` asserts on these files directly. If the contract
 moves, the golden scene is what says so.
