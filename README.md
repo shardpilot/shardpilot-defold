@@ -1121,7 +1121,8 @@ its closed vocabulary **costs no request**: `endpoint` (the same URL rule
 `ingest_url` and `crash_ingest_url` obey — **https anywhere, plain http only
 for a loopback host**, no userinfo, query, fragment or path), `workspace_id`, `app_id`, `environment_id`,
 `app_version`, `locale`, `platform` (use `platform.detect()`), and optionally
-`store` and `age_band`. `store_region` is **not accepted** in this release: a
+`store` and `age_band` — which is accepted, sent as given, and **ignored by
+the resolver in this release**. `store_region` is **not accepted** in this release: a
 non-null value carries a country claim, and refusing it here is what stops it
 travelling.
 
@@ -1134,7 +1135,7 @@ The callback receives **exactly one decision, exactly once**:
 | `server_analytics` | `denied` — the only value this release's contract names |
 | `child_rules` | `minimised` — the same |
 | `notice` | The resolver's own words about what kind of answer this is. Show or log it verbatim; the SDK does not interpret it |
-| `band_vocabulary` / `band_vocabulary_version` | The age scale the resolver understood. If you sent an `age_band`, a mismatch here is a refusal |
+| `band_vocabulary` / `band_vocabulary_version` | The age scale the resolver **declares it speaks** — a constant, not an echo. Delivered verbatim and compared with nothing: in this release the resolver does not read your `age_band` at all, and says so by naming `age_band` among the unavailable `signals_used`. Your own age step governs the age-first flow |
 | `analytics_choice_default` | `off` for `STRICT_OPT_IN`, `UNKNOWN` and **every fallback**; `on` only for a used `SOFT_OPT_OUT` plan. This is the state of the switch when your screen opens — not whether to open one |
 | `explicit_grant_required` | `true` for strict, unknown and every fallback: the optional lane starts **only** after the player's explicit grant, and an untouched or declined choice starts nothing. `false` only for a used SOFT plan, whose basis is notice and non-objection — recorded as such, never as a click |
 | `plan_used` | `false` means the strict fallback was taken; `reason` says why |
@@ -1216,6 +1217,21 @@ implement all three.
   and the SDK no longer guards against it. A host that needs the window to be
   exact should re-resolve on its own schedule rather than trusting
   `valid_for_seconds` across a clock change.
+- **Check notice compatibility BEFORE paying an owed consent write.** A failed
+  `set_consent` leaves a debt; if the next decision carries a different
+  `consent_text_version` or `presented_language`, paying that debt records the
+  **old** answer against text the player never saw. Discard the debt with the
+  answer and present the notice again. (The minimal example applies the same
+  invariant at `examples/minimal/main.script:276`, where a plan whose text
+  version **or** language has moved discards the stored answer rather than
+  reusing it.)
+- **Own the Mode B identity and consent retries.** The quick start does not
+  carry them, deliberately — it shows the straight path. A production host
+  must: mark the client as existing **before** calling `identify`, so a later
+  resolution never builds a second one over the first; drain and retry
+  `identify` on the **existing** client after `events_pending`; create consent
+  debt only for a **fresh** answer, never for a restored grant, which goes
+  through the session-start path instead.
 - **Retry an owed `session_start` after a grant is recorded.** A grant whose
   receipt landed but whose `session_start` did not leaves the lane open with
   no session behind it; the example does not track that debt, and a production

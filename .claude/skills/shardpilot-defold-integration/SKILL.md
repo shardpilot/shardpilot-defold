@@ -181,16 +181,20 @@ local function start(fresh)
     print("shardpilot init failed: " .. tostring(err))
     return
   end
+  -- ⚠ A CLIENT EXISTS FROM HERE ON, whatever identify answers — mark it
+  -- BEFORE asking, or a later resolution calls start() again and builds a
+  -- second client over the first.
+  started = true
   -- identify can refuse: under Mode B, switching identity while the previous
   -- one still has undelivered events returns false, "events_pending". Draining
-  -- them (flush, then re-identify) is yours; do not record consent for an
-  -- identity the client did not accept.
+  -- them (flush, then re-identify) and retrying are yours — see the README's
+  -- host-requirements list. Do not record consent for an identity the client
+  -- did not accept.
   local identified, identify_err = shardpilot.identify("<YOUR-USER-ID>")
   if not identified then
     print("shardpilot identify refused: " .. tostring(identify_err))
     return
   end
-  started = true
   record(fresh)
 end
 
@@ -226,16 +230,21 @@ resolve_after_answer = function(decision)
     if not fresh.valid_for_seconds or fresh.valid_for_seconds <= 0 then
       return -- no window in which the lane could run; re-resolve later
     end
-    if answered.pending and started then
-      return record(fresh) -- the write is owed; the client already exists
-    end
+    -- ⚠ COMPATIBILITY FIRST, THEN THE OWED WRITE. The other order records the
+    -- OLD answer against text the player never saw: a failed set_consent
+    -- leaves a debt, and a later plan with a different notice version or
+    -- language would have had that debt paid against it. On a mismatch the
+    -- debt is discarded WITH the answer and the notice is presented again.
     if fresh.consent_text_version ~= answered.text_version
       or fresh.presented_language ~= answered.language then
       -- The text changed while they were answering. The answer belongs to a
       -- notice they did not see, so ASK AGAIN against the fresh decision —
       -- returning here would strand the player with no notice at all.
-      answered = nil
+      answered = nil -- the debt goes with it; it belonged to that screen
       return present(fresh)
+    end
+    if answered.pending and started then
+      return record(fresh) -- the write is owed, and the notice still matches
     end
     start(fresh)
   end)

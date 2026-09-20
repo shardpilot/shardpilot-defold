@@ -42,12 +42,12 @@ local MIN_REVALIDATE_SECONDS = 30
 local MAX_REVALIDATE_SECONDS = 300
 local revalidate_backoff = MIN_REVALIDATE_SECONDS
 
--- A consent write that failed is OWED. Until it lands, the session has not
--- started and the answer is still pending.
-local consent_pending = false
--- An identity the client REFUSED is owed the same way: retried on the next
--- trigger, over the client that already exists rather than a second one.
-local identify_pending = false
+-- ⚠ THE RETRY MACHINERY IS DELIBERATELY NOT HERE. A quick start that carried
+-- a Mode B identify-retry state machine drew a finding in four consecutive
+-- review rounds — every fix added state and the next round found the next
+-- interleaving. What a production host owes is listed in the README under
+-- "host requirements"; what this file shows is the straight path, which is
+-- what a quick start is for.
 
 -- Where this example parks a remote-config value; your game reads it wherever
 -- it needs the tuned number.
@@ -173,10 +173,8 @@ local function start_analytics(granted, decision, newly_answered)
 	if not identified then
 		print("shardpilot identify refused: " .. tostring(identify_err) ..
 			"; flush and re-identify before recording consent (the host's to do)")
-		identify_pending = true
 		return false
 	end
-	identify_pending = false
 
 	if not newly_answered then
 		-- ⚠ A RESTORED GRANT STILL NEEDS ITS SESSION. The client is new; the
@@ -212,11 +210,10 @@ local function start_analytics(granted, decision, newly_answered)
 	-- to prevent. The answer stays pending and is retried on the next trigger.
 	local recorded, consent_err = shardpilot.set_consent(granted)
 	if not recorded then
-		print("shardpilot consent not recorded: " .. tostring(consent_err) .. "; owed")
-		consent_pending = true
+		print("shardpilot consent not recorded: " .. tostring(consent_err) ..
+			"; owed (retrying it is the host's — see the README)")
 		return false
 	end
-	consent_pending = false
 	if granted then
 		shardpilot.session_start()
 	end
@@ -264,29 +261,6 @@ end
 -- new decision permits still needs an answer, and a resume that could open a
 -- lane would be a grant issued by a focus event.
 reconcile = function(fresh)
-	-- An identity the client refused is owed; retry it first, because the
-	-- consent write below is what it blocks.
-	if identify_pending and analytics_running and answered then
-		if shardpilot.identify("user-example") then
-			identify_pending = false
-			consent_pending = true
-		end
-	end
-
-	-- A consent write that failed is owed; retry it before anything else.
-	if consent_pending and analytics_running and answered then
-		local recorded, consent_err = shardpilot.set_consent(answered.granted)
-		if recorded then
-			consent_pending = false
-			answered.fresh_answer = nil
-			if answered.granted then
-				shardpilot.session_start()
-			end
-		else
-			print("shardpilot consent still not recorded: " .. tostring(consent_err))
-		end
-	end
-
 	print("shardpilot consent regime: " .. tostring(fresh.regime) ..
 		(fresh.plan_used and "" or " (strict fallback: " .. tostring(fresh.reason) .. ")"))
 

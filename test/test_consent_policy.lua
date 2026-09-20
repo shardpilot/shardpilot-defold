@@ -1815,19 +1815,19 @@ local function test_the_example_notices_a_failed_write()
 	assert_true(calls:find("sdk.shutdown", 1, true) == nil,
 		"and final() must not shut down a client that was never built: " .. calls)
 
-	-- (b) A refused consent write is OWED: the answer stays pending and the
-	-- next trigger retries it.
+	-- (b) A refused consent write is REPORTED AND OWED — and the quick start
+	-- deliberately does not retry it. Four consecutive rounds found a defect in
+	-- the retry machinery this file used to carry; the obligation is now a
+	-- README host requirement, and what the example must do is NOT pretend the
+	-- write landed.
 	reset()
 	sdk_consent_refusals = 1
 	next_response_body = example_plan()
 	calls = run_example(nil, { "focus_gained" }, nil, false, { age_band = "adult", answer = true })
 	assert_true(calls:find("consent not recorded", 1, true) ~= nil,
-		"the fixture must refuse the first write: " .. calls)
-	local writes = 0
-	for _ in calls:gmatch("sdk%.set_consent") do
-		writes = writes + 1
-	end
-	assert_equal(writes, 2, "an owed consent write must be retried on the next trigger: " .. calls)
+		"a refused write must be reported: " .. calls)
+	assert_true(calls:find("sdk.session_start", 1, true) == nil,
+		"and no session may start on a grant that was never recorded: " .. calls)
 end
 
 -- ⚠ A VERDICT WITH NO LIFE IS NOT RUNNABLE, and scheduling by it directly is a
@@ -2184,48 +2184,47 @@ end
 -- and a RESTORED grant re-initialised the client without starting a session,
 -- leaving the lane open with nothing behind it.
 local function test_the_example_pays_its_debts()
-	-- (a) identify refuses once, then succeeds on the next trigger — over the
-	-- SAME client, not a second one — and the consent write follows.
+	-- ⚠ WHAT THE QUICK START OWES IS HONESTY, NOT A RETRY. The Mode B
+	-- identify-retry machinery this file used to carry drew a finding in four
+	-- consecutive rounds; it is out, and the obligations are README host
+	-- requirements. What the example must still get right is never pretending a
+	-- refused write landed, and never building a second client over the first.
 	reset()
 	sdk_identify_refusals = 1
 	next_response_body = example_plan()
-	local calls = run_example(nil, { "focus_gained" }, nil, false, { age_band = "adult", answer = true })
+	local calls = run_example(nil, { "focus_gained" }, nil, false,
+		{ age_band = "adult", answer = true })
 	assert_true(calls:find("identify refused", 1, true) ~= nil,
-		"the fixture must refuse identify once: " .. calls)
-	assert_true(calls:find("sdk.set_consent", 1, true) ~= nil,
-		"the owed consent write must follow the retried identify: " .. calls)
+		"the fixture must refuse identify: " .. calls)
+	assert_true(calls:find("sdk.set_consent", 1, true) == nil,
+		"no consent may be recorded for an identity the client refused: " .. calls)
 	local inits = 0
 	for _ in calls:gmatch("sdk%.init") do
 		inits = inits + 1
 	end
-	assert_equal(inits, 1, "and it must be retried over the client that exists: " .. calls)
+	assert_equal(inits, 1, "and no second client may be built over the first: " .. calls)
 
 	-- (b) A restored grant starts a session and writes no consent. The plan's
 	-- life runs out, the lane is suspended and restarted from the standing
-	-- answer; the placeholder DECLINED, so no session is expected here — what
-	-- must be true is that the restore wrote no second consent decision.
+	-- answer; exactly one consent write across the run.
 	reset()
 	next_response_body = example_plan({ max_age_seconds = 2 })
-	calls = run_example(nil, nil, { 1, 1, 1 }, false, { age_band = "adult" })
+	calls = run_example(nil, nil, { 1, 1, 1 }, false, { age_band = "adult", answer = true })
 	assert_true(calls:find("analytics suspended (plan_expired)", 1, true) ~= nil,
 		"the fixture must exercise a restore: " .. calls)
-	local writes, starts = 0, 0
+	local restarts, writes, starts = 0, 0, 0
+	for _ in calls:gmatch("sdk%.init") do
+		restarts = restarts + 1
+	end
 	for _ in calls:gmatch("sdk%.set_consent") do
 		writes = writes + 1
 	end
 	for _ in calls:gmatch("sdk%.session_start") do
 		starts = starts + 1
 	end
+	assert_true(restarts >= 2, "the lane must come back after the suspension: " .. calls)
 	assert_equal(writes, 1, "a restore must not re-write consent: " .. calls)
-	assert_equal(starts, 0, "and a declined answer starts no session, restored or not: " .. calls)
-	-- ⚠ HONEST GAP, STATED RATHER THAN PAPERED OVER. The restore now calls
-	-- session_start when the standing answer was a GRANT, and this suite
-	-- cannot reach that path: the example's placeholder notice declines, by
-	-- design, and it is a local inside the chunk. So `starts == 0` above holds
-	-- whether or not that line exists — a mutant deleting it survives. Reaching
-	-- it would need a granting notice, which would mean bending the example to
-	-- the test; the line is three lines long and visible, and I would rather
-	-- say this than count a kill I do not have.
+	assert_equal(starts, 2, "and a restored GRANT still starts its session: " .. calls)
 end
 
 -- ⚠ THE RESOLVER'S OWN BYTES, AND THE REASON THIS SCENE EXISTS AT ALL.
@@ -2456,29 +2455,37 @@ local function test_every_plan_enum_is_closed()
 	end
 end
 
--- ⚠ THE BAND VOCABULARY THE RESOLVER NAMES MUST BE THE ONE THE CALLER USED.
--- The contract has no echo of the band itself — it travels outward only — so
--- this is the check that keeps a plan from answering about a different scale
--- than the one the age assertion was made on.
-local function test_the_band_vocabulary_must_match_the_caller()
-	reset()
-	next_response_body = plan({ band_vocabulary = "fine" })
-	local decision = prepare(context({ age_band = { vocabulary = "coarse", band = "adult" } }))
-	assert_true(not decision.plan_used,
-		"a plan naming another age vocabulary must not be used: " .. tostring(decision.detail))
-	assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
-			"and the choice defaults off")
-
-	-- The controls: the same vocabulary is accepted, and a caller that sent NO
-	-- band is not held to one.
+-- ⚠ THE BAND VOCABULARY IS A DECLARATION, NOT AN ECHO. The resolver states
+-- which age scale it speaks as a constant and does not read the caller's band
+-- at all in this release — it says so by naming age_band among the UNAVAILABLE
+-- signals. So it is shape-checked and compared with NOTHING: an earlier cut
+-- compared it to the caller's vocabulary, which would refuse every plan for
+-- any host whose age scale is spelled differently.
+local function test_the_band_vocabulary_is_shape_checked_only()
+	-- ⚠ THE CASE THE COMPARISON BROKE: a caller on its own vocabulary, a
+	-- resolver declaring another. The plan is USED.
 	reset()
 	next_response_body = plan({ band_vocabulary = "coarse" })
-	assert_true(prepare(context({ age_band = { vocabulary = "coarse", band = "adult" } })).plan_used,
-		"the vocabulary the caller used must be accepted")
-	reset()
-	next_response_body = plan({ band_vocabulary = "fine" })
-	assert_true(prepare().plan_used, "a caller that sent no band is not held to a vocabulary")
+	local decision = prepare(context({ age_band = { vocabulary = "acme.bands.v3", band = "adult" } }))
+	assert_true(decision.plan_used,
+		"a caller's own vocabulary must not refuse the resolver's declaration: "
+			.. tostring(decision.detail))
+	assert_equal(decision.band_vocabulary, "coarse", "and it is delivered verbatim")
+	assert_equal(decision.band_vocabulary_version, "1", "with its version")
+
+	-- The shape is still checked: missing, empty or over its bound is malformed.
+	for _, override in ipairs({
+		{ band_vocabulary = "__nil__" },
+		{ band_vocabulary_version = "__nil__" },
+		{ band_vocabulary = "" },
+		{ band_vocabulary = string.rep("x", 33) },
+	}) do
+		reset()
+		next_response_body = plan(override)
+		assert_true(not prepare().plan_used, "a malformed band vocabulary must not be used")
+	end
 end
+
 
 -- ⚠ THE NOTICE TEXT IS COMPARED WHOLE, not by prefix. It is the clause the
 -- owner required every carrier to show; a truncation or a paraphrase is a
@@ -2533,6 +2540,29 @@ local function test_the_regime_sets_the_default_not_the_silence()
 		assert_equal(fallback.explicit_grant_required, true,
 			"and requires an explicit grant")
 	end
+end
+
+-- ⚠ THE HAZARD THE SENTINEL AT THE BOTTOM OF THIS FILE EXISTS FOR, kept as a
+-- test rather than as a one-off check: ipairs STOPS at a nil hole. A scene
+-- renamed or deleted but left in the `tests` list is exactly that, and every
+-- scene after it silently never runs. It happened here during the R16
+-- migration and the suite stayed green.
+--
+-- HONEST LIMIT: this proves the LANGUAGE behaves that way. The sentinel proves
+-- the suite noticed, and it was checked by hand with a fake name.
+local function test_ipairs_stops_at_a_nil_hole()
+	local holed = { function() end }
+	holed[3] = function() end
+	local ran = 0
+	for _ in ipairs(holed) do
+		ran = ran + 1
+	end
+	assert_equal(ran, 1, "ipairs walks to the first hole and stops — silently")
+	local total = 0
+	for _ in pairs(holed) do
+		total = total + 1
+	end
+	assert_equal(total, 2, "while the entries after it are still there, unrun")
 end
 
 local tests = {
@@ -2594,9 +2624,10 @@ local tests = {
 	test_the_example_pays_its_debts,
 	test_the_resolvers_own_bytes_are_understood,
 	test_every_plan_enum_is_closed,
-	test_the_band_vocabulary_must_match_the_caller,
+	test_the_band_vocabulary_is_shape_checked_only,
 	test_the_notice_is_carried_whole,
 	test_the_regime_sets_the_default_not_the_silence,
+	test_ipairs_stops_at_a_nil_hole,
 }
 
 -- ⚠ ipairs STOPS AT A NIL HOLE, SILENTLY. A scene renamed or deleted but left

@@ -997,17 +997,17 @@ local function parse_plan(plan, context, now)
 	if not bounded_string(plan.presented_language, MAX_LANGUAGE) then
 		return nil, "presented_language is missing or over its bound"
 	end
-	-- ⚠ THE BAND VOCABULARY THE RESOLVER UNDERSTOOD. The contract has no echo
-	-- of the band itself — it travels outward only — so the check Codex asked
-	-- for is made with the fields that exist: if this caller supplied a band,
-	-- the vocabulary the resolver names must be the one the caller used, or
-	-- the answer is about a different scale and is refused.
+	-- ⚠ THE BAND VOCABULARY IS A DECLARATION, NOT AN ECHO, so it is checked for
+	-- SHAPE and compared with nothing. The resolver states which age scale it
+	-- speaks as a constant; in this release it does not read the caller's band
+	-- at all, and says so by naming age_band among the UNAVAILABLE signals.
+	-- Comparing the caller's vocabulary against it would compare against a
+	-- value that ignored the request — refusing every plan for any host whose
+	-- age vocabulary happens to be spelled differently. An earlier cut of this
+	-- module did exactly that.
 	if not bounded_string(plan.band_vocabulary, MAX_BAND)
 		or not bounded_string(plan.band_vocabulary_version, MAX_BAND) then
 		return nil, "the band vocabulary is missing or over its bound"
-	end
-	if context.age_band ~= nil and plan.band_vocabulary ~= context.age_band.vocabulary then
-		return nil, "the resolver read a different age vocabulary than the one supplied"
 	end
 	local basis = plan.basis
 	if type(basis) ~= "table" then
