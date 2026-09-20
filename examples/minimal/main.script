@@ -144,8 +144,22 @@ local function start_analytics(granted, decision, newly_answered)
 		print("shardpilot init failed: " .. tostring(start_err))
 		return false
 	end
-	shardpilot.identify("user-example")
 	analytics_running = true
+
+	-- ⚠ identify CAN REFUSE. Under Mode B, switching identity while the
+	-- previous one still has undelivered events returns false, "events_pending"
+	-- (client.lua:2124-2126): those envelopes were unlocked by a credential
+	-- minted for the OTHER subject, so sending them after the switch would
+	-- misattribute them. Draining them — flush, then re-identify — is the
+	-- host's business and this quick start does not do it. What it must not do
+	-- is record a consent decision for an identity the client did not accept.
+	local identified, identify_err = shardpilot.identify("user-example")
+	if not identified then
+		print("shardpilot identify refused: " .. tostring(identify_err) ..
+			"; flush and re-identify before recording consent (the host's to do)")
+		return false
+	end
+
 	if not newly_answered then
 		return true
 	end

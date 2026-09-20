@@ -1164,6 +1164,13 @@ implement all three.
   it, and never `init()` over a live client.** The analytics client has the
   same pending posture, and a re-`init` while one is still settling produces
   two clients over one spool.
+- **Retry an owed `session_start` after a grant is recorded.** A grant whose
+  receipt landed but whose `session_start` did not leaves the lane open with
+  no session behind it; the example does not track that debt, and a production
+  integration must retry the start or record that it never happened.
+- **Retry or surface a failed background snapshot.** `persist()` on focus loss
+  can fail — a full or unwritable spool — and the example neither retries it
+  nor reports it, so events it was meant to save are lost silently on a kill.
 - **Retry a pending grant only against a fresh decision that still permits
   analytics and still matches the answered notice.** The example retries an
   owed `set_consent` on the next trigger using the standing answer; a

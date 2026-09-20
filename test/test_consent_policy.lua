@@ -223,6 +223,7 @@ local function reset()
 	crash_shutdown_pending = 0
 	sdk_init_failures = 0
 	sdk_consent_refusals = 0
+	sdk_identify_refusals = 0
 	requests = {}
 	next_status = 200
 	next_response_body = nil
@@ -801,6 +802,7 @@ local crash_shutdown_pending = 0
 -- demand, because the example is supposed to notice.
 local sdk_init_failures = 0
 local sdk_consent_refusals = 0
+local sdk_identify_refusals = 0
 
 local function run_example(between, window_events, dts, finalize)
 	local seen = {}
@@ -823,7 +825,14 @@ local function run_example(between, window_events, dts, finalize)
 			end
 			return true
 		end,
-		identify = record("sdk.identify"),
+		identify = function()
+			seen[#seen + 1] = "sdk.identify"
+			if sdk_identify_refusals > 0 then
+				sdk_identify_refusals = sdk_identify_refusals - 1
+				return false, "events_pending"
+			end
+			return true
+		end,
 		set_consent = function(value)
 			seen[#seen + 1] = "sdk.set_consent:" .. tostring(value)
 			if sdk_consent_refusals > 0 then
@@ -1985,6 +1994,57 @@ local function test_the_packaged_skill_snippets_compile()
 	assert_true(blocks >= 5, "the skill must still carry its snippets, found " .. blocks)
 end
 
+-- ⚠ THE CONTEXT'S age_band GETS THE SAME CLOSED KEY SET THE RESPONSE'S DOES.
+-- It was closed on the band the resolver sends back and left open on the one
+-- the caller sends — and this is the side that TRAVELS: an unread member here
+-- is an age claim about this player that nothing looked at.
+local function test_the_context_age_bands_keys_are_closed()
+	reset()
+	next_response_body = plan()
+	local decision, calls = prepare(context({
+		age_band = { vocabulary = "coarse.v1", band = "adult", date_of_birth = "1989-04-02" },
+	}))
+	assert_equal(calls, 1, "exactly one callback")
+	assert_equal(#requests, 0, "an unknown age_band field must cost zero requests")
+	assert_equal(decision.reason, "invalid_request")
+	assert_true(decision.optional_processing_closed, "and the verdict is closed")
+
+	-- The control: the two schema fields alone are still accepted and reach
+	-- the wire.
+	reset()
+	next_response_body = plan()
+	assert_true(prepare(context({ age_band = { vocabulary = "coarse.v1", band = "adult" } })).plan_used,
+		"a well-formed context age_band must be accepted")
+	assert_equal(#requests, 1, "and must reach the wire")
+end
+
+-- ⚠ identify CAN REFUSE, and the example ignored it. Under Mode B a switch
+-- while the previous identity still has undelivered events returns
+-- false, "events_pending" — recording a consent decision after that would
+-- attach it to an identity the client did not accept.
+local function test_the_example_stops_when_identify_refuses()
+	reset()
+	sdk_identify_refusals = 1
+	next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT })
+	local calls = run_example(nil, nil, nil, true)
+	assert_true(calls:find("identify refused", 1, true) ~= nil,
+		"the fixture must refuse identify: " .. calls)
+	assert_true(calls:find("sdk.set_consent", 1, true) == nil,
+		"no consent may be recorded for an identity the client refused: " .. calls)
+	assert_true(calls:find("sdk.session_start", 1, true) == nil,
+		"and no session may start: " .. calls)
+	-- The client WAS built, so teardown still owes it a shutdown.
+	assert_true(calls:find("sdk.shutdown", 1, true) ~= nil,
+		"an initialised client must still be shut down: " .. calls)
+
+	-- The control: with identify accepted, the same run records consent.
+	reset()
+	next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT })
+	calls = run_example(nil, nil, nil, true)
+	assert_true(calls:find("sdk.set_consent", 1, true) ~= nil,
+		"an accepted identify must reach the consent write: " .. calls)
+end
+
 local tests = {
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,
@@ -2039,6 +2099,8 @@ local tests = {
 	test_a_signal_reason_is_always_from_the_vocabulary,
 	test_the_age_bands_keys_are_closed,
 	test_the_packaged_skill_snippets_compile,
+	test_the_context_age_bands_keys_are_closed,
+	test_the_example_stops_when_identify_refuses,
 }
 
 for _, test in ipairs(tests) do

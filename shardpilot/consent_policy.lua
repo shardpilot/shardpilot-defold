@@ -707,6 +707,16 @@ function M.validate_context(context)
 			or not bounded_string(band.band, MAX_BAND) then
 			return false, "age_band is malformed or over its bound"
 		end
+		-- ⚠ THE SAME CLOSED KEY SET THE RESPONSE'S age_band GETS. It was closed
+		-- on the band the resolver sends back and left open on the one the
+		-- caller sends — and this is the side that TRAVELS: an unread member
+		-- here is an age claim about this player that nothing looked at and
+		-- request_body would have carried anyway had it been copied wholesale.
+		for key in pairs(band) do
+			if key ~= "vocabulary" and key ~= "band" then
+				return false, "age_band carries an unknown field"
+			end
+		end
 	end
 	return true
 end
