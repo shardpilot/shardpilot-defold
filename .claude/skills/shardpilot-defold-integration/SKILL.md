@@ -175,6 +175,13 @@ local crash_running = false
 -- was given to a notice this player never saw.
 local answered = nil
 local notice_open = false
+-- ⚠ THE SCREEN CAN BE OVERTAKEN. A notice is the one place in this flow where
+-- an unbounded amount of real time passes with the player somewhere else, and
+-- the world can change under it — most sharply when the host's age step
+-- corrects the band to minor or unknown. The counter below rises when that
+-- happens; an answer arriving from a screen opened under an older one is not
+-- stored, because it belongs to a question this flow is no longer asking.
+local notice_generation = 0
 
 -- The plan's own deadline, in seconds on the clock below. Cache expiry
 -- protects the next lookup and stops nothing that is already running.
@@ -518,6 +525,28 @@ reconcile = function(fresh)
 	revalidate_backoff = MIN_REVALIDATE_SECONDS
 	revalidate_at = fresh.valid_for_seconds and (elapsed + fresh.valid_for_seconds) or nil
 
+	-- (c2) OPERATION BLOCKS CLOSE EVERYTHING, BECAUSE THIS QUICK START CANNOT
+	-- READ THEM. They are restrictions no consent choice lifts — transfer, age
+	-- and capacity, localisation, safety — and mapping a block NAME to the
+	-- client action it restricts needs a vocabulary this file would have to
+	-- invent. The module parses them and puts them on the decision; a quick
+	-- start that then ignored them would let a player's grant open a lane the
+	-- plan had just closed, which is the permissive default in its worst
+	-- place. So: while the list is non-empty, NO lane opens — no question, no
+	-- analytics, no crash — and the reason says which.
+	--
+	-- A production host does the mapping and refuses the restricted actions;
+	-- an unmapped name closes everything, exactly as here. See the README's
+	-- host requirements. In this release the resolver always sends [].
+	if fresh.operation_blocks and #fresh.operation_blocks > 0 then
+		print("shardpilot: the plan carries " .. #fresh.operation_blocks
+			.. " operation block(s) this quick start cannot map ("
+			.. table.concat(fresh.operation_blocks, ", ") .. "); no lane opened")
+		suspend_analytics("operation_blocks")
+		suspend_crash("operation_blocks")
+		return
+	end
+
 	-- (d) The ANALYTICS lane.
 	--
 	-- ⚠ THE REGIME DECIDES THE DEFAULT OF THE QUESTION, NOT WHETHER IT IS
@@ -543,6 +572,28 @@ reconcile = function(fresh)
 		-- reporter on a MINOR. That profile is a release-2 path needing a
 		-- reviewed child flow this quick start does not have.
 		suspend_crash("minimised_handling")
+		-- ⚠ AND THE FRESH ANSWER DOES NOT SURVIVE THIS BRANCH. Suspending a
+		-- lane leaves `answered` standing on purpose — a plan expiring is no
+		-- reason to ask again — but an answer given moments ago under a band
+		-- that has since been corrected is a different thing: keeping it meant
+		-- that when the band later read eligible again, start_analytics
+		-- recorded that grant WITHOUT PRESENTING A NOTICE. One screen, one
+		-- answer, a correction in between, and a consent receipt written for a
+		-- player who was never asked a second time.
+		--
+		-- WHICH STATE IS KEPT AND WHY: a standing decision that was already
+		-- ESTABLISHED AND RECORDED survives (fresh_answer is nil once the
+		-- receipt landed), because it belongs to a notice the player did see
+		-- and a write that completed. Only the unrecorded, in-flight answer is
+		-- discarded — and a notice still open is voided, so the answer that
+		-- arrives from it is not stored either.
+		if answered and answered.fresh_answer then
+			answered = nil
+		end
+		if notice_open then
+			notice_open = false
+			notice_generation = notice_generation + 1
+		end
 	elseif not analytics_running then
 		if answered then
 			if start_analytics(answered.granted, fresh, answered.fresh_answer == true) then
@@ -550,7 +601,16 @@ reconcile = function(fresh)
 			end
 		elseif not notice_open then
 			notice_open = true
+			local generation = notice_generation
 			present_consent_notice(fresh, function(granted)
+				if generation ~= notice_generation then
+					-- The band was corrected while this screen was open. The
+					-- answer belongs to a question no longer being asked, and
+					-- storing it is how it gets recorded later without asking.
+					print("shardpilot: consent answer discarded; the age band changed "
+						.. "while the notice was open")
+					return
+				end
 				notice_open = false
 				answered = {
 					text_version = fresh.consent_text_version,

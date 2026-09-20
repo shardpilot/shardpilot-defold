@@ -1140,13 +1140,26 @@ local function run_example(between, window_events, dts, finalize, opts)
 		-- does.
 		local deliver = present_consent_notice
 		local answer = opts.answer
+		-- ⚠ A DIFFERENT ANSWER PER SCREEN, which a single value cannot express.
+		-- Proving that a SECOND notice's answer is the one recorded needs the
+		-- two answers to differ: with both set to true, a scene cannot tell the
+		-- new answer from the stale one being reused.
+		local answers, presented = opts.answers, 0
 		present_consent_notice = function(decision, callback)
+			presented = presented + 1
+			local this_answer = answer
+			if answers then
+				this_answer = answers[presented]
+				if this_answer == "__untouched__" then
+					this_answer = nil
+				end
+			end
 			seen[#seen + 1] = "notice:default=" .. tostring(decision.analytics_choice_default)
 			deliver(decision, function(default_answer)
-				if answer == nil then
+				if this_answer == nil then
 					callback(default_answer)
 				else
-					callback(answer)
+					callback(this_answer)
 				end
 			end)
 		end
@@ -2743,6 +2756,118 @@ local function test_the_age_band_is_read_again_after_the_notice()
 		"and starts the session: " .. calls)
 end
 
+-- ⚠ THE THIRD READ, AND WHY THE SECOND-READ SCENE ABOVE COULD NOT SEE THIS.
+-- test_the_age_band_is_read_again_after_the_notice proves the FIRST half: an
+-- answer given while the band read adult starts nothing once the band is
+-- corrected to minor. It stops there, and a two-read scene structurally
+-- cannot ask what happens NEXT. The answer was that `answered` stayed
+-- standing with fresh_answer = true, so the moment the band read eligible
+-- again — a focus trigger, a revalidation — start_analytics recorded that
+-- grant WITHOUT PRESENTING A NOTICE. One screen, one answer, a correction in
+-- between, and a consent receipt for a player never asked a second time.
+--
+-- The band answers DIFFERENTLY on the two screens here, because with both
+-- answers the same this scene could not tell a fresh answer from the stale
+-- one being reused.
+local function test_a_fresh_answer_does_not_survive_minimised_handling()
+	reset()
+	next_response_body = example_plan()
+	-- adult when the screen opens -> minor on the post-answer resolution ->
+	-- adult again on the focus trigger. First screen GRANTS, second DECLINES.
+	local calls = run_example(nil, { "focus_lost", "focus_gained" }, nil, false, {
+		age_bands = { "adult", "minor", "adult", "adult" },
+		answers = { true, false },
+	})
+	local notices = select(2, calls:gsub("notice:default=", ""))
+	assert_equal(notices, 2, "the corrected band must cost the answer its screen, "
+		.. "and the recovered band must ASK AGAIN: " .. calls)
+	assert_true(calls:find("sdk.set_consent:false", 1, true) ~= nil,
+		"and the recorded answer must be the SECOND screen's: " .. calls)
+	assert_true(calls:find("sdk.set_consent:true", 1, true) == nil,
+		"never the one given before the correction: " .. calls)
+	assert_true(calls:find("sdk.session_start", 1, true) == nil,
+		"a decline starts no session: " .. calls)
+
+	-- ⚠ AND AN ANSWER ARRIVING FROM A SCREEN THAT WAS ALREADY OVERTAKEN is not
+	-- stored either. The example's placeholder notice answers from update(),
+	-- so `between` runs while the screen is open: the band turns minor there,
+	-- and the answer lands afterwards into a flow that is no longer asking.
+	-- The example's placeholder notice answers from update(), so `between` is
+	-- the one hook that runs with the screen genuinely OPEN. Resuming there is
+	-- a named re-resolution trigger, and it is the reconcile that reads the
+	-- corrected band and voids the screen the player is still looking at.
+	reset()
+	next_response_body = example_plan()
+	calls = run_example(function()
+		window.listener(nil, window.WINDOW_EVENT_FOCUS_GAINED, nil)
+	end, nil, nil, false, {
+		age_bands = { "adult", "minor", "adult", "adult" },
+		answers = { true, false },
+	})
+	assert_true(calls:find("answer discarded; the age band changed", 1, true) ~= nil,
+		"the answer from an overtaken screen must be discarded, and say so: " .. calls)
+	assert_true(calls:find("sdk.set_consent:true", 1, true) == nil,
+		"and must never be recorded: " .. calls)
+
+	-- The control: no correction at all, one screen, the grant recorded.
+	reset()
+	next_response_body = example_plan()
+	calls = run_example(nil, { "focus_lost", "focus_gained" }, nil, false, {
+		age_bands = { "adult", "adult", "adult", "adult" },
+		answers = { true, false },
+	})
+	assert_equal(select(2, calls:gsub("notice:default=", "")), 1,
+		"an unchanged band asks once: " .. calls)
+	assert_true(calls:find("sdk.set_consent:true", 1, true) ~= nil,
+		"and records that answer: " .. calls)
+end
+
+-- ⚠ OPERATION BLOCKS ARE RESTRICTIONS NO CONSENT CHOICE LIFTS, and the quick
+-- start cannot read them. The module parses the list and puts it on the
+-- decision; mapping a block NAME to the client action it restricts needs a
+-- vocabulary the example would have to invent. An example that carried them
+-- and ignored them would let a player's grant open a lane the plan had just
+-- closed — the permissive default in its worst place — so while the list is
+-- non-empty nothing opens at all: no question, no analytics, no crash.
+--
+-- In this release the resolver always sends []. This scene is about the
+-- release that does not.
+local function test_operation_blocks_close_every_lane()
+	for _, blocks in ipairs({ { "cross_border_transfer" },
+		{ "cross_border_transfer", "profiling_under_16" } }) do
+		reset()
+		next_response_body = example_plan({
+			flags = { crash_profile = consent_policy.CRASH_MINIMAL, operation_blocks = blocks },
+		})
+		local calls = run_example(nil, nil, nil, false, { age_band = "adult", answer = true })
+		assert_true(calls:find("operation block(s) this quick start cannot map", 1, true) ~= nil,
+			"the reason must name operation blocks: " .. calls)
+		assert_true(calls:find("notice:default=", 1, true) == nil,
+			"the question must not be put at all: " .. calls)
+		assert_true(calls:find("sdk.init", 1, true) == nil,
+			"no analytics client may be built: " .. calls)
+		assert_true(calls:find("crash.init", 1, true) == nil,
+			"and no crash reporter, though the profile permits one: " .. calls)
+		assert_true(calls:find("sdk.set_consent", 1, true) == nil,
+			"and nothing may be recorded: " .. calls)
+	end
+
+	-- The control: the SAME plan with an empty list runs the normal strict
+	-- flow, so the rule is about the blocks and not about this fixture never
+	-- starting anything.
+	reset()
+	next_response_body = example_plan({
+		flags = { crash_profile = consent_policy.CRASH_MINIMAL, operation_blocks = {} },
+	})
+	local calls = run_example(nil, nil, nil, false, { age_band = "adult", answer = true })
+	assert_true(calls:find("notice:default=off", 1, true) ~= nil,
+		"an empty list asks the question: " .. calls)
+	assert_true(calls:find("sdk.set_consent:true", 1, true) ~= nil,
+		"records the grant: " .. calls)
+	assert_true(calls:find("crash.init", 1, true) ~= nil,
+		"and opens the permitted crash lane: " .. calls)
+end
+
 local function test_every_key_the_contract_sends_is_required()
 	local body = golden("resolved")
 
@@ -2958,6 +3083,8 @@ local tests = {
 	test_the_resolvers_own_bytes_are_understood,
 	test_every_plan_enum_is_closed,
 	test_the_age_band_is_read_again_after_the_notice,
+	test_a_fresh_answer_does_not_survive_minimised_handling,
+	test_operation_blocks_close_every_lane,
 	test_every_key_the_contract_sends_is_required,
 	test_the_band_vocabulary_is_shape_checked_only,
 	test_the_notice_is_carried_whole,

@@ -15,6 +15,39 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 -- SAME BYTES inside a fenced block introduced by `<!-- doc-region: <name> -->`.
 -- Prose around the blocks is free. Code is not.
 --
+-- TO RE-EXTRACT after changing the example, from the repository root (this is
+-- deliberately not a script under scripts/: a file there is part of the judge
+-- population check_gate_integrity.py guards, and adding one would make every
+-- change that touches it refuse):
+--
+--   python3 -c "$(sed -n '/^--   BEGIN RECIPE/,/^--   END RECIPE/p' \
+--       test/test_documented_regions.lua | sed 's/^--   //;1d;$d')"
+--
+--   BEGIN RECIPE
+--   import pathlib, re
+--   ex = pathlib.Path('examples/minimal/main.script').read_text().split('\n')
+--   regions, name, buf = {}, None, None
+--   for line in ex:
+--       m = re.match(r'^-- doc-region: ([\w-]+)$', line)
+--       e = re.match(r'^-- doc-region-end: ([\w-]+)$', line)
+--       if m: name, buf = m.group(1), []
+--       elif e: regions[e.group(1)] = buf; name, buf = None, None
+--       elif name is not None: buf.append(line)
+--   for path in ['README.md', '.claude/skills/shardpilot-defold-integration/SKILL.md']:
+--       lines = pathlib.Path(path).read_text().split('\n')
+--       out, i = [], 0
+--       while i < len(lines):
+--           m = re.match(r'^<!-- doc-region: ([\w-]+) -->$', lines[i])
+--           if m and i + 1 < len(lines) and lines[i + 1] == '```lua':
+--               j = i + 2
+--               while lines[j] != '```': j += 1
+--               out += [lines[i], '```lua'] + regions[m.group(1)] + ['```']
+--               i = j + 1
+--               continue
+--           out.append(lines[i]); i += 1
+--       pathlib.Path(path).write_text('\n'.join(out))
+--   END RECIPE
+--
 -- ⚠ AND AN UNMARKED BLOCK FAILS, which is the part that keeps this from
 -- rotting. Checking only the blocks that opt in leaves the door the defect
 -- came through wide open: the next hand-written snippet is a fourth copy and
