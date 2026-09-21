@@ -1297,6 +1297,8 @@ The callback receives **exactly one decision, exactly once**:
 | `analytics_choice_default` | `off` for `STRICT_OPT_IN`, `UNKNOWN` and **every fallback**; `on` only for a used `SOFT_OPT_OUT` plan. This is the state of the switch when your screen opens — not whether to open one |
 | `explicit_grant_required` | `true` for strict, unknown and every fallback: the optional lane starts **only** after the player's explicit grant, and an untouched or declined choice starts nothing. `false` only for a used SOFT plan, whose basis is notice and non-objection — recorded as such, never as a click |
 | `plan_used` | `false` means the strict fallback was taken; `reason` says why |
+| `operation_blocks` | The operation restrictions the host must enforce. **Unreleased:** always a list, retaining the last accepted plan's set on fallback; `[]` when none is known |
+| `operation_blocks_source` | **Unreleased:** `plan` for an accepted plan, including a cache hit; `preserved` for a fallback retaining that plan's set (even `[]`); `none` when no plan is known for this context |
 | `valid_for_seconds` | How long this verdict is good for — the shortest of the cache ceiling, the plan's `expires_at` and its `max_age_seconds`. **Schedule your own re-resolution by it:** cache expiry protects the next lookup and stops nothing that is already running. `nil` on a fallback, which established nothing that could expire |
 
 **The conservative rule.** A plan that is missing, unreadable, out of scope,
@@ -1304,6 +1306,22 @@ The callback receives **exactly one decision, exactly once**:
 `STRICT_OPT_IN` with optional processing closed. An error or an offline state
 can preserve or add restrictions; it can never relax one, and it can never
 reuse a cached permissive result.
+
+**Operation-block retention (Unreleased; not in v0.10.3).** The module remembers
+the complete block list from the last accepted plan for the active context,
+independently of the response cache and its lifetime. Every newer accepted
+plan replaces that list, including with `[]`; a refusal, timeout, malformed
+response or rejected signature preserves it. Ordinary `invalidate()` also
+preserves it. This is retained restriction state, not permission to process.
+Plans still require `signature: null`; this change adds no signature verification.
+
+Selecting a different **validated** context clears the remembered list and
+fences earlier requests. The context includes workspace, app, environment,
+app version, locale, platform, store, endpoint and both age-band fields.
+Returning to a previous context starts fresh; the module keeps no history of
+inactive contexts. An invalid context gets `[]` and does not change the active
+context. Each returned list is a copy, so a caller cannot edit retained state.
+**A module reload or process restart followed by an outage starts with `[]`.**
 
 **Caching** is in memory, for this session only, never written to disk, and
 scoped to the *whole* context — a different app, environment or endpoint is
@@ -1432,6 +1450,9 @@ re-resolution triggers — launch and resume, a network or permitted storefront
 change, an age correction, a language or text change, a workspace or app
 change, a policy revocation, and before the first optional admission. A
 request already in flight when it fires can no longer answer.
+In the Unreleased implementation, invalidation preserves known operation
+blocks; only a newer accepted plan, a validated context change or module
+reload/process restart can replace or forget them as described above.
 
 **Plan text is read before it is decoded.** Defold's `json.decode` returns a
 plain table for both `{}` and `[]` and marks neither, so the container type is
