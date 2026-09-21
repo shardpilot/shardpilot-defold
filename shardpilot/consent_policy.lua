@@ -133,6 +133,12 @@ local REFUSAL_REASONS = {
 -- The private cache: one entry, in memory, for this session only.
 local cached = nil
 
+-- Restrictions outlive the response cache and ordinary invalidation. Only an
+-- accepted plan replaces them; selecting another validated context forgets
+-- them. Keep no history for contexts that are no longer active.
+local active_context = nil
+local known_blocks = nil
+
 -- ⚠ THE INVALIDATION COUNTER. invalidate() clearing the cache was not enough
 -- on its own: a request already in flight could still complete inside its
 -- deadline, deliver the decision the invalidation was meant to discard, and
@@ -837,7 +843,8 @@ end
 
 -- ⚠ STRICT IS BUILT IN ONE PLACE, so no path can invent a partial permissive
 -- result. Every failure comes through here.
-local function strict(reason, detail)
+local function strict(reason, detail, key)
+	local blocks = key ~= nil and key == active_context and known_blocks or nil
 	return {
 		regime = M.STRICT_OPT_IN,
 		crash_profile = M.CRASH_OFF,
@@ -853,6 +860,8 @@ local function strict(reason, detail)
 		analytics_choice_default = M.CHOICE_DEFAULT_OFF,
 		explicit_grant_required = true,
 		plan_used = false,
+		operation_blocks = blocks and copy_value(blocks, 0) or {},
+		operation_blocks_source = blocks and "preserved" or "none",
 		reason = reason,
 		detail = detail,
 	}
@@ -1174,13 +1183,16 @@ local function decision_from_plan(plan)
 		band_vocabulary = plan.band_vocabulary,
 		band_vocabulary_version = plan.band_vocabulary_version,
 		operation_blocks = plan.flags.operation_blocks,
+		operation_blocks_source = "plan",
 		-- Carried VERBATIM and interpreted nowhere here. The host shows or logs
 		-- it as the contract requires.
 		notice = plan.basis.notice,
 	}
 end
 
--- Clears the private cache. The host calls it on the named re-resolution
+-- Clears the response cache, retaining known operation blocks for this
+-- context: a refresh is not authority to remove a restriction. The host calls
+-- it on the named re-resolution
 -- triggers: launch and resume, a network or permitted storefront change, an
 -- age correction, a language or text change, a workspace or app change, a
 -- policy revocation, and before the first optional admission.
@@ -1199,10 +1211,26 @@ end
 function M.prepare(context, callback)
 	assert(type(callback) == "function", "prepare requires a callback")
 
+	local key
+	local function fallback(reason, detail)
+		return strict(reason, detail, key)
+	end
+
 	local ok, why = M.validate_context(context)
 	if not ok then
-		callback(strict("invalid_request", why))
+		callback(fallback("invalid_request", why))
 		return
+	end
+
+	-- Freeze the validated request: caller mutation cannot relabel an in-flight
+	-- response or the restrictions learned from it. A context change also fences
+	-- callbacks dispatched before the change, even if that context returns later.
+	context = copy_value(context, 0)
+	key = context_key(context)
+	if active_context ~= key then
+		M.invalidate()
+		active_context = key
+		known_blocks = nil
 	end
 
 	local at = now_seconds()
@@ -1211,7 +1239,7 @@ function M.prepare(context, callback)
 	-- be recognised as expired — and "used because we could not check" is the
 	-- permissive default the conservative rule exists to forbid.
 	if not at then
-		callback(strict("clock_unavailable", "no clock is available to evaluate the plan's expiry"))
+		callback(fallback("clock_unavailable", "no clock is available to evaluate the plan's expiry"))
 		return
 	end
 
@@ -1221,19 +1249,18 @@ function M.prepare(context, callback)
 	-- tighten but never relax" forbids, and it read as a cache hit rather than
 	-- as an outage. A missing transport is a fallback, and a fallback wins.
 	if not http or not http.request then
-		callback(strict("transport_unavailable", "no http transport is available"))
+		callback(fallback("transport_unavailable", "no http transport is available"))
 		return
 	end
 	if not json or not json.decode then
-		callback(strict("decoder_unavailable", "no json decoder is available"))
+		callback(fallback("decoder_unavailable", "no json decoder is available"))
 		return
 	end
 	if not json.encode then
-		callback(strict("encoder_unavailable", "no json encoder is available"))
+		callback(fallback("encoder_unavailable", "no json encoder is available"))
 		return
 	end
 
-	local key = context_key(context)
 	if cached and cached.key == key and cached.until_at > at then
 		-- ⚠ A COPY, NOT THE ENTRY. The cache used to hand out the very table it
 		-- kept, so a caller that wrote a field on the decision it was given —
@@ -1251,7 +1278,7 @@ function M.prepare(context, callback)
 	-- never arrives and the caller has nothing to fail closed on.
 	local encoded_ok, encoded = pcall(json.encode, request_body(context))
 	if not encoded_ok or type(encoded) ~= "string" then
-		callback(strict("encoder_failed", "the request body could not be encoded"))
+		callback(fallback("encoder_failed", "the request body could not be encoded"))
 		return
 	end
 
@@ -1276,7 +1303,7 @@ function M.prepare(context, callback)
 	http.request(trim_slash(context.endpoint) .. ROUTE, "POST", function(_, _, response)
 		local arrived = now_seconds()
 		if not arrived then
-			settle(strict("clock_unavailable", "no clock is available to evaluate the plan's expiry"))
+			settle(fallback("clock_unavailable", "no clock is available to evaluate the plan's expiry"))
 			return
 		end
 		-- ⚠ THE CLOCK MOVED BACKWARDS WHILE THIS REQUEST WAS IN FLIGHT. Every
@@ -1286,7 +1313,7 @@ function M.prepare(context, callback)
 		-- permissive direction: a plan looks fresher and an entry lives longer.
 		-- It is refused before anything is parsed or cached.
 		if arrived < at then
-			settle(strict("clock_regressed", "the clock moved backwards while the request was in flight"))
+			settle(fallback("clock_regressed", "the clock moved backwards while the request was in flight"))
 			return
 		end
 		-- ⚠ AN INVALIDATED REQUEST CANNOT ANSWER. A policy revocation or a
@@ -1294,7 +1321,7 @@ function M.prepare(context, callback)
 		-- the world the host has just declared gone, so it is refused here
 		-- rather than delivered — and, crucially, never written to the cache.
 		if dispatched_under ~= generation then
-			settle(strict("invalidated", "the policy was invalidated while this request was in flight"))
+			settle(fallback("invalidated", "the policy was invalidated while this request was in flight"))
 			return
 		end
 		-- ⚠ A LATER DISPATCH FOR THIS CONTEXT HAS ALREADY BEEN MADE, so this
@@ -1303,26 +1330,26 @@ function M.prepare(context, callback)
 		-- where an older permissive plan used to overwrite a newer restrictive
 		-- one purely by arriving second.
 		if latest_dispatch[key] ~= dispatch then
-			settle(strict("superseded", "a later request for this context was dispatched first"))
+			settle(fallback("superseded", "a later request for this context was dispatched first"))
 			return
 		end
 		latest_dispatch[key] = nil
 		if arrived > deadline then
-			settle(strict("deadline_exceeded", "the response arrived after the total deadline"))
+			settle(fallback("deadline_exceeded", "the response arrived after the total deadline"))
 			return
 		end
 		if type(response) ~= "table" or response.status == nil then
-			settle(strict("transport_error", "no response"))
+			settle(fallback("transport_error", "no response"))
 			return
 		end
 		local body = response.response
 		if type(body) ~= "string" or #body == 0 or #body > MAX_BODY then
-			settle(strict("invalid_response", "the response body is empty or over its bound"))
+			settle(fallback("invalid_response", "the response body is empty or over its bound"))
 			return
 		end
 		local decoded_ok, decoded = pcall(json.decode, body)
 		if not decoded_ok or type(decoded) ~= "table" then
-			settle(strict("invalid_response", "the response body is not readable"))
+			settle(fallback("invalid_response", "the response body is not readable"))
 			return
 		end
 		-- ⚠ THE STATUS DECIDES WHICH DOCUMENT THIS IS, AND IT HAS TO BE ASKED
@@ -1340,12 +1367,12 @@ function M.prepare(context, callback)
 		-- surfaced, and its scope is not compared — a refusal carries none, so
 		-- that the response cannot be used to learn which tuples exist.
 		if response.status < 200 or response.status >= 300 or decoded.reason ~= nil then
-			settle(strict(error_envelope_reason(decoded), "the resolver refused"))
+			settle(fallback(error_envelope_reason(decoded), "the resolver refused"))
 			return
 		end
 		local shapes_ok, shape_refusal, present, present_signals = scan_plan_text(body)
 		if not shapes_ok then
-			settle(strict("invalid_response", shape_refusal))
+			settle(fallback("invalid_response", shape_refusal))
 			return
 		end
 		-- ⚠ NO FIELD IN THIS SCHEMA IS NULLABLE, AND THAT IS ONE RULE RATHER
@@ -1359,7 +1386,7 @@ function M.prepare(context, callback)
 		-- decoded value is nil is malformed, whatever it is.
 		for key in pairs(present) do
 			if decoded[key] == nil and not NULLABLE_KEYS[key] then
-				settle(strict("invalid_response", key .. " is present and null"))
+				settle(fallback("invalid_response", key .. " is present and null"))
 				return
 			end
 		end
@@ -1373,7 +1400,7 @@ function M.prepare(context, callback)
 		-- parse_plan is left to judge the values it is handed.
 		for _, key in ipairs(REQUIRED_KEYS) do
 			if not present[key] then
-				settle(strict("invalid_response", "the plan is missing the required key " .. key))
+				settle(fallback("invalid_response", "the plan is missing the required key " .. key))
 				return
 			end
 		end
@@ -1381,22 +1408,25 @@ function M.prepare(context, callback)
 		for index, keys in pairs(present_signals) do
 			local entry = type(decoded.signals_used) == "table" and decoded.signals_used[index] or nil
 			if type(entry) ~= "table" then
-				settle(strict("invalid_response", "a signal entry is not an object"))
+				settle(fallback("invalid_response", "a signal entry is not an object"))
 				return
 			end
 			for key in pairs(keys) do
 				if entry[key] == nil then
-					settle(strict("invalid_response", "a signal entry carries " .. key .. " present and null"))
+					settle(fallback("invalid_response", "a signal entry carries " .. key .. " present and null"))
 					return
 				end
 			end
 		end
 		local plan, refusal, expires_at = parse_plan(decoded, context, arrived)
 		if not plan then
-			settle(strict("invalid_response", refusal))
+			settle(fallback("invalid_response", refusal))
 			return
 		end
 		local decision = decision_from_plan(plan)
+		-- Only a current, accepted plan reaches here. Replacement includes []:
+		-- a newer plan may remove a restriction, while no failure may do so.
+		known_blocks = copy_value(decision.operation_blocks, 0)
 		-- ⚠ ONLY A LIVE, VERIFIED PLAN IS EVER CACHED, and never past the
 		-- SHORTEST of the cache ceiling, the plan's own expiry and its
 		-- max_age_seconds. The ceiling used to win outright, so a plan with ten

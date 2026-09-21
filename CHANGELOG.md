@@ -2,6 +2,18 @@
 
 ### Unreleased
 
+- Keep the last accepted consent plan's `operation_blocks` through strict
+  fallbacks and ordinary `consent_policy.invalidate()` calls. Each newer
+  accepted plan replaces the entire set, including an empty set. Selecting a
+  different validated context forgets the previous set and fences its pending
+  callbacks; returning to that context starts fresh. The state is memory-only:
+  a module reload or process restart followed by an outage starts with `[]`.
+- Every consent decision now carries `operation_blocks` and
+  `operation_blocks_source`: `plan` for an accepted plan (including a cache
+  hit), `preserved` for a fallback retaining its set, or `none` before any plan
+  has been accepted for the active context. Returned lists are independent
+  copies. This does not enable new resolver outputs or change optional consent.
+
 ## v0.10.3 — 2026-09-20 — prepare the consent regime before SDK initialization
 
 - Add the standalone `shardpilot.consent_policy` module from #92:

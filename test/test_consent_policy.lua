@@ -239,7 +239,10 @@ local function reset()
 	next_status = 200
 	next_response_body = nil
 	next_response_headers = nil
-	consent_policy.invalidate()
+	-- A test starts a new module session. Ordinary invalidation is a refresh,
+	-- and must retain restrictions learned during the existing session.
+	package.loaded["shardpilot.consent_policy"] = nil
+	consent_policy = require "shardpilot.consent_policy"
 end
 
 local function context(overrides)
@@ -3163,7 +3166,257 @@ local function test_ipairs_stops_at_a_nil_hole()
 	assert_equal(total, 2, "while the entries after it are still there, unrun")
 end
 
+-- Derive the fixture from the vendored wire body; only the scene's blocks,
+-- scope, expiry and zero cache lifetime differ. The decoder erases JSON null,
+-- so restore its sentinel before encoding. The golden files are never edited.
+local function golden_block_plan(blocks, ctx, overrides)
+	local body = json_decode(golden("resolved"))
+	body.signature = NULL
+	body.flags.operation_blocks = blocks
+	body.scope = { workspace_id = ctx.workspace_id, app_id = ctx.app_id,
+		environment_id = ctx.environment_id }
+	body.expires_at = "2099-01-01T00:00:00Z"
+	body.max_age_seconds = 0
+	for key, value in pairs(overrides or {}) do
+		body[key] = value
+	end
+	return encode_value(body)
+end
+
+local function assert_blocks(decision, expected, source)
+	assert_equal(type(decision.operation_blocks), "table", "every decision carries a block list")
+	assert_equal(table.concat(decision.operation_blocks, ","), table.concat(expected, ","),
+		"the decision carries the complete expected restriction set")
+	if source then
+		assert_equal(decision.operation_blocks_source, source, "block provenance")
+	end
+end
+
+local function learn_blocks(blocks, ctx)
+	next_status = 200
+	next_response_body = golden_block_plan(blocks, ctx)
+	local decision = prepare(ctx)
+	assert_true(decision.plan_used, "the golden-derived plan must be accepted")
+	assert_blocks(decision, blocks)
+	return decision
+end
+
+local function test_known_operation_blocks_survive_fallbacks()
+	local cases = { "refusal", "malformed", "timeout", "signature", "out_of_scope",
+		"expired", "transport", "decoder", "encoder", "encode_error", "clock" }
+	local reasons = { refusal = "invalid_scope", malformed = "invalid_response",
+		timeout = "deadline_exceeded", signature = "invalid_response",
+		out_of_scope = "invalid_response", expired = "invalid_response",
+		transport = "transport_unavailable", decoder = "decoder_unavailable",
+		encoder = "encoder_unavailable", encode_error = "encoder_failed",
+		clock = "clock_unavailable" }
+	for _, mode in ipairs(cases) do
+		reset()
+		local ctx = golden_context()
+		learn_blocks({ "cross_border_transfer", "profiling_under_16" }, ctx)
+		local saved_http, saved_json, saved_socket, saved_os = http, json, socket, os
+		next_response_body = "not JSON"
+		if mode == "refusal" then
+			next_status, next_response_body = 400, golden("refusal")
+		elseif mode == "timeout" then
+			http = { request = function(...)
+				socket.now = socket.now + 3
+				saved_http.request(...)
+			end }
+		elseif mode == "signature" then
+			next_response_body = golden_block_plan({}, ctx, { signature = "unverified-fixture" })
+		elseif mode == "out_of_scope" then
+			next_response_body = golden_block_plan({}, context({ app_id = "another-app" }))
+		elseif mode == "expired" then
+			next_response_body = golden_block_plan({}, ctx, { expires_at = "1970-01-01T00:00:00Z" })
+		elseif mode == "transport" then
+			http = nil
+		elseif mode == "decoder" then
+			json = { encode = saved_json.encode }
+		elseif mode == "encoder" then
+			json = { decode = saved_json.decode }
+		elseif mode == "encode_error" then
+			json = { decode = saved_json.decode, encode = function() error("fixture encoder failure") end }
+		elseif mode == "clock" then
+			socket, os = nil, {}
+		end
+		local ok, decision = pcall(prepare, ctx)
+		http, json, socket, os = saved_http, saved_json, saved_socket, saved_os
+		assert_true(ok, mode .. " must return a decision")
+		assert_true(not decision.plan_used, mode .. " must reach a fallback")
+		assert_equal(decision.reason, reasons[mode], mode .. " reaches the intended refusal")
+		assert_blocks(decision, { "cross_border_transfer", "profiling_under_16" }, "preserved")
+		assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF)
+		assert_equal(decision.crash_profile, consent_policy.CRASH_OFF)
+	end
+	print("operation-block fallback cases passed: " .. #cases)
+end
+
+local function test_unlearned_block_fallback_is_empty()
+	reset()
+	next_response_body = "not JSON"
+	assert_blocks(prepare(golden_context()), {}, "none")
+end
+
+local function test_operation_blocks_survive_invalidation()
+	reset()
+	local ctx = golden_context()
+	learn_blocks({ "restricted" }, ctx)
+	consent_policy.invalidate()
+	next_response_body = "not JSON"
+	assert_blocks(prepare(ctx), { "restricted" }, "preserved")
+end
+
+local function test_operation_blocks_follow_validated_context()
+	local changes = {
+		{ "workspace_id", "second-workspace" }, { "app_id", "second-app" },
+		{ "environment_id", "second-environment" }, { "app_version", "2.0" },
+		{ "locale", "de" }, { "platform", "linux" }, { "store", "standalone" },
+		{ "endpoint", "https://other-policy.example" },
+		{ "age_band", { vocabulary = "other-vocabulary", band = "adult" } },
+		{ "age_band", { vocabulary = "host-age", band = "minor" } },
+	}
+	for _, change in ipairs(changes) do
+		reset()
+		local first, second = golden_context(), golden_context()
+		first.age_band = { vocabulary = "host-age", band = "adult" }
+		second.age_band = { vocabulary = "host-age", band = "adult" }
+		second[change[1]] = change[2]
+		learn_blocks({ "first-only" }, first)
+		next_response_body = "not JSON"
+		assert_blocks(prepare(second), {}, "none")
+		-- Returning after an explicit context change starts a new context epoch.
+		assert_blocks(prepare(first), {}, "none")
+	end
+	print("operation-block context fields checked: " .. #changes)
+end
+
+local function test_authoritative_operation_blocks_replace_prior_set()
+	reset()
+	local ctx = golden_context()
+	learn_blocks({ "one", "two" }, ctx)
+	assert_blocks(learn_blocks({ "two" }, ctx), { "two" }, "plan")
+	next_response_body = "not JSON"
+	assert_blocks(prepare(ctx), { "two" }, "preserved")
+	assert_blocks(learn_blocks({}, ctx), {}, "plan")
+	next_response_body = "not JSON"
+	assert_blocks(prepare(ctx), {}, "preserved")
+end
+
+local function test_operation_blocks_cannot_be_mutated_by_callers()
+	reset()
+	local ctx = golden_context()
+	local used = learn_blocks({ "restricted" }, ctx)
+	used.operation_blocks[1] = "edited-plan"
+	next_response_body = "not JSON"
+	local fallback = prepare(ctx)
+	assert_blocks(fallback, { "restricted" }, "preserved")
+	fallback.operation_blocks[1] = "edited-fallback"
+	assert_blocks(prepare(ctx), { "restricted" }, "preserved")
+end
+
+local function test_invalidated_callback_cannot_restore_operation_blocks()
+	reset()
+	local ctx = golden_context()
+	learn_blocks({ "first" }, ctx)
+	local saved_request, pending, stale = http.request
+	http.request = function(_, _, callback) pending = callback end
+	consent_policy.prepare(ctx, function(decision) stale = decision end)
+	http.request = saved_request
+	consent_policy.invalidate()
+	learn_blocks({ "current" }, ctx)
+	pending(nil, nil, { status = 200, response = golden_block_plan({ "old" }, ctx) })
+	assert_equal(stale.reason, "invalidated")
+	assert_blocks(stale, { "current" }, "preserved")
+	next_response_body = "not JSON"
+	assert_blocks(prepare(ctx), { "current" }, "preserved")
+end
+
+local function test_context_change_fences_operation_block_callbacks()
+	reset()
+	local first, second = golden_context(), golden_context()
+	second.app_id = "second-app"
+	local saved_request, pending, stale = http.request
+	http.request = function(_, _, callback) pending = callback end
+	consent_policy.prepare(first, function(decision) stale = decision end)
+	http.request = saved_request
+	learn_blocks({ "second-only" }, second)
+	pending(nil, nil, { status = 200, response = golden_block_plan({ "old-first" }, first) })
+	assert_true(not stale.plan_used, "the previous context's callback cannot install its plan")
+	assert_blocks(stale, {}, "none")
+	next_response_body = "not JSON"
+	assert_blocks(prepare(second), { "second-only" }, "preserved")
+	assert_blocks(prepare(first), {}, "none")
+end
+
+local function test_module_reload_forgets_operation_blocks()
+	reset()
+	local ctx = golden_context()
+	learn_blocks({ "restricted" }, ctx)
+	package.loaded["shardpilot.consent_policy"] = nil
+	consent_policy = require "shardpilot.consent_policy"
+	next_response_body = "not JSON"
+	assert_blocks(prepare(ctx), {}, "none")
+end
+
+local function test_invalid_context_does_not_forget_operation_blocks()
+	reset()
+	local ctx = golden_context()
+	learn_blocks({ "restricted" }, ctx)
+	local bad = golden_context()
+	bad.app_id = nil
+	local invalid = prepare(bad)
+	assert_equal(invalid.reason, "invalid_request")
+	assert_blocks(invalid, {}, "none")
+	next_response_body = "not JSON"
+	assert_blocks(prepare(ctx), { "restricted" }, "preserved")
+end
+
+local function test_caller_mutation_cannot_relabel_operation_blocks()
+	reset()
+	local ctx = golden_context()
+	learn_blocks({ "restricted" }, ctx)
+	local saved_request, pending, decision = http.request
+	http.request = function(_, _, callback) pending = callback end
+	consent_policy.prepare(ctx, function(value) decision = value end)
+	http.request = saved_request
+	ctx.app_id = "mutated-after-dispatch"
+	pending(nil, nil, { status = 200, response = golden_block_plan({}, ctx) })
+	assert_true(not decision.plan_used, "mutating the caller's table cannot change the request scope")
+	assert_blocks(decision, { "restricted" }, "preserved")
+	next_response_body = "not JSON"
+	assert_blocks(prepare(golden_context()), { "restricted" }, "preserved")
+end
+
+local function test_the_example_keeps_blocks_after_resume_outage()
+	reset()
+	local ctx = context({ workspace_id = "workspace-example", app_id = "app-example",
+		environment_id = "develop" })
+	next_response_body = golden_block_plan({ "restricted" }, ctx, { max_age_seconds = 300 })
+	local calls, initial = run_example(function() next_response_body = "not JSON" end,
+		{ "focus_lost", "focus_gained" }, nil, false, { age_band = "adult", answer = true })
+	assert_true(initial:find("operation block(s) this quick start cannot map", 1, true) ~= nil,
+		"the initial accepted plan must reach the example's block guard: " .. initial .. " / " .. calls)
+	assert_equal(select(2, calls:gsub("operation block%(s%) this quick start cannot map", "")), 2,
+		"resume plus outage must reach the same block guard")
+	for _, forbidden in ipairs({ "notice:default=", "sdk.init", "crash.init", "sdk.set_consent" }) do
+		assert_true(calls:find(forbidden, 1, true) == nil, "blocks prevent " .. forbidden)
+	end
+end
+
 local tests = {
+	test_known_operation_blocks_survive_fallbacks,
+	test_unlearned_block_fallback_is_empty,
+	test_operation_blocks_survive_invalidation,
+	test_operation_blocks_follow_validated_context,
+	test_authoritative_operation_blocks_replace_prior_set,
+	test_operation_blocks_cannot_be_mutated_by_callers,
+	test_invalidated_callback_cannot_restore_operation_blocks,
+	test_context_change_fences_operation_block_callbacks,
+	test_module_reload_forgets_operation_blocks,
+	test_invalid_context_does_not_forget_operation_blocks,
+	test_caller_mutation_cannot_relabel_operation_blocks,
+	test_the_example_keeps_blocks_after_resume_outage,
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,
 	test_an_error_never_reuses_a_cached_permission,
