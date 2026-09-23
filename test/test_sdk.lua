@@ -8943,6 +8943,93 @@ local tests = {
 	assert_equal(client:snapshot().dropped, before + 1, "one refused event, not its start as well")
 	end,
 	function()
+	-- A BACKEND CLIENT THAT OPENED AND ENDED A SESSION RENEWS LIKE ANY OTHER.
+	-- The owed start excluded the backend source, so after an explicit
+	-- start/end its next event kept the ended id. A backend client that never
+	-- opened a session still gets none: nothing is owed without an ended id.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local backend = assert(sdk.new(config({ source = "backend", flush_interval_seconds = 9999 })))
+	assert_true(backend:identify("user-example"))
+	assert_true(backend:session_start())
+	local ended = backend.session_id
+	assert_true(backend:session_end("complete"))
+	assert_true(backend:track("backend_after_end"))
+	local last = backend.queue.items[#backend.queue.items]
+	assert_equal(last.event_name, "backend_after_end")
+	assert_true(type(last.session_id) == "string" and last.session_id ~= ended,
+		"a backend event after an explicit end opens the next session")
+
+	-- control: a backend client that never opened one stays sessionless
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local sessionless = assert(sdk.new(config({ source = "backend", flush_interval_seconds = 9999 })))
+	assert_true(sessionless:identify("user-example"))
+	assert_true(sessionless:track("backend_event"))
+	assert_equal(sessionless.session_id, nil, "no session is invented for a sessionless backend client")
+	storage.reset()
+	end,
+	function()
+	-- THE SAMPLERS ARE PER SESSION. A session's perf and network summaries are
+	-- built when it ENDS, under its id, and the next session starts with empty
+	-- samplers. The owed start used to change the session id under running
+	-- samplers, so the next summary stamped both sessions' frames with the new
+	-- id, and its duration ran from before the gap.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	client:update(0.016)
+	client:update(0.016)
+	client:update(0.016)
+	assert_true(client:session_end("complete"))
+	socket.now = socket.now + 600   -- ten minutes with no session open
+	assert_true(client:track("after_end"))
+	local b = client.session_id
+	client:update(0.016)
+	client:update(0.016)
+	assert_true(client:shutdown())
+
+	local summaries = {}
+	for _, request in ipairs(requests) do
+		for _, event in ipairs(json_decode(request.body).events or {}) do
+			if event.event_name == "perf_summary" then
+				summaries[#summaries + 1] = event
+			end
+		end
+	end
+	assert_equal(#summaries, 2, "one perf summary per session")
+	assert_equal(summaries[1].session_id, a)
+	assert_equal(summaries[1].props.frames_sampled, 3, "the first session's frames only")
+	assert_true(summaries[1].props.duration_ms < 600000, "the gap is not the first session's duration")
+	assert_equal(summaries[2].session_id, b)
+	assert_equal(summaries[2].props.frames_sampled, 2, "the next session starts with empty samplers")
+	assert_true(summaries[2].props.duration_ms < 600000, "nor the next session's")
+	end,
+	function()
+	-- A LIVE RENEWAL ENDS THE SESSION IT REPLACES, FOR THE SAMPLERS TOO: an
+	-- explicit session_start while a session is open finalizes the open
+	-- session's summaries under its own id first.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	client:update(0.016)
+	client:update(0.016)
+	assert_true(client:session_start())
+	local found = nil
+	for _, event in ipairs(client.queue.items) do
+		if event.event_name == "perf_summary" then found = event end
+	end
+	assert_true(found ~= nil, "the replaced session's perf summary is built at the renewal")
+	assert_equal(found.session_id, a)
+	assert_equal(found.props.frames_sampled, 2)
+	end,
+	function()
 	-- A DROP-TIME EXPERIMENT CAPTURE AFTER AN END REFUSES, as it does with no
 	-- session at all. It read the retained id and spooled the fact into the
 	-- ended session. A capture that carries its arm-time session keeps it.

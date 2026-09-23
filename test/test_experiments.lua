@@ -7522,6 +7522,88 @@ function extra_tests.test_ended_session_background_tick_opens_no_session()
 	restore()
 end
 
+-- AN ASSIGNMENT APPLIED AFTER AN END IS EXPOSED ONCE, IN THE NEW SESSION. The
+-- snapshot used to be built with no session (the ended one is not current),
+-- and emitting it started the next session inside the sweep: the start's
+-- renewal armed a second snapshot for the new session while the first one
+-- was already being emitted into it -- two exposure ids for one application.
+-- The next session now opens BEFORE the snapshot is built, so the fact copies
+-- the new session and there is one snapshot to drain.
+function extra_tests.test_assignment_after_end_is_exposed_once_in_the_new_session()
+	reset()
+	local client = granted_client()
+	assert_true(client:session_start())
+	local ended = client.session_id
+	assert_true(client:session_end("complete"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	for _ = 1, 5 do
+		advance_seconds(1)
+		client:update(1)
+	end
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1, "one application is exposed once")
+	assert_true(exposures[1].session_id ~= ended, "not in the ended session")
+	assert_equal(exposures[1].session_id, client.session_id, "in the session that opened for it")
+	assert_equal(#queued_events(client, "app.session_started"), 2,
+		"the ended session's start and the new one's")
+end
+
+-- ...AND WHEN THE QUEUE IS FULL AT THE FETCH. The snapshot built after the end
+-- stays owed, with no session. The host's next event opened the next session,
+-- whose renewal stamped that snapshot with the ENDED session's id and armed a
+-- second one for the new session: one application, two exposures, one of
+-- them filed under a session that had already ended.
+function extra_tests.test_assignment_after_end_under_a_full_queue_is_exposed_once()
+	reset()
+	local client = granted_client({ buffer_size = 2 })
+	assert_true(client:session_start())
+	local ended = client.session_id
+	assert_true(client:session_end("complete"))
+	-- the start and the end fill the queue: the exposure is owed
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0, "the exposure is owed")
+
+	client.queue.items = {}
+	client.queue.limit = 20
+	assert_true(client:track("host_next"))
+	for _ = 1, 5 do
+		advance_seconds(1)
+		client:update(1)
+	end
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1, "one application is exposed once")
+	assert_true(exposures[1].session_id ~= ended, "not filed under the ended session")
+	assert_equal(exposures[1].session_id, client.session_id, "in the session that opened after it")
+end
+
+-- ...AND THE SAME AFTER A DENIAL AND A RE-GRANT. A re-grant re-arms the
+-- still-served treatment for exposure: after an end, that snapshot is built
+-- with no session exactly like the fetch above.
+function extra_tests.test_regrant_after_end_is_exposed_once_in_the_new_session()
+	reset()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1, "exposed in the first session")
+	local ended = client.session_id
+	assert_true(client:session_end("complete"))
+	client:set_consent(false)
+	client:set_consent(true)
+	client.queue.items = {}
+	assert_true(client:track("host_next"))
+	for _ = 1, 5 do
+		advance_seconds(1)
+		client:update(1)
+	end
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1, "the re-grant exposes the served treatment once")
+	assert_true(exposures[1].session_id ~= ended, "not filed under the ended session")
+	assert_equal(exposures[1].session_id, client.session_id, "in the session that opened after it")
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -7706,6 +7788,9 @@ local tests = {
 	extra_tests.test_escaped_null_presence_keys_are_malformed,
 	extra_tests.test_spool_purge_clears_condemnation_debt,
 	extra_tests.test_ended_session_background_tick_opens_no_session,
+	extra_tests.test_assignment_after_end_is_exposed_once_in_the_new_session,
+	extra_tests.test_assignment_after_end_under_a_full_queue_is_exposed_once,
+	extra_tests.test_regrant_after_end_is_exposed_once_in_the_new_session,
 }
 
 for _, test in ipairs(tests) do
