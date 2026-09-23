@@ -2,6 +2,16 @@
 
 ### Unreleased
 
+- After `session_end()`, the next event opens a new session announced by its
+  own `app.session_started`. It used to carry the ended session's id, after
+  that session's `app.session_ended`, so the ended session's length ran on
+  over everything played after it. Events that describe the ended session
+  still ride it: the perf and network summaries that `shutdown()` builds after
+  ending the session, and a late experiment fact that carries the session it
+  was armed in. A second `session_end()` is a no-op, so each session gets
+  exactly one `app.session_ended`. After an end, a background `update()` tick
+  opens no session, and a drop-time experiment capture is refused, as before
+  any session exists.
 - Keep the last accepted consent plan's `operation_blocks` through strict
   fallbacks and ordinary `consent_policy.invalidate()` calls. Each newer
   accepted plan replaces the entire set, including an empty set. Selecting a

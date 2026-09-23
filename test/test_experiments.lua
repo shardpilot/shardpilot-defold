@@ -2489,11 +2489,12 @@ end
 local function test_shutdown_sweeps_owed_exposure_after_flush()
 	reset()
 	local client = granted_client({ buffer_size = 2 })
-	-- End the session first: session_end tracks its own event, which a
-	-- deliberately FULL queue would reject, failing shutdown for reasons
-	-- this test is not about.
-	assert_true(client:session_end("pre-shutdown"))
+	-- End the session before shutdown: session_end tracks its own event,
+	-- which a deliberately FULL queue would reject, failing shutdown for
+	-- reasons this test is not about. The filler goes FIRST: an event after
+	-- an end opens the next session, which shutdown would then have to end.
 	assert_true(client:track("filler"))
+	assert_true(client:session_end("pre-shutdown"))
 
 	-- The assignment applies under a FULL queue: the exposure is owed, and
 	-- no update() runs again before exit.
