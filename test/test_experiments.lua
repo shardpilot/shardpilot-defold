@@ -2489,11 +2489,12 @@ end
 local function test_shutdown_sweeps_owed_exposure_after_flush()
 	reset()
 	local client = granted_client({ buffer_size = 2 })
-	-- End the session first: session_end tracks its own event, which a
-	-- deliberately FULL queue would reject, failing shutdown for reasons
-	-- this test is not about.
-	assert_true(client:session_end("pre-shutdown"))
+	-- End the session before shutdown: session_end tracks its own event,
+	-- which a deliberately FULL queue would reject, failing shutdown for
+	-- reasons this test is not about. The filler goes FIRST: an event after
+	-- an end opens the next session, which shutdown would then have to end.
 	assert_true(client:track("filler"))
+	assert_true(client:session_end("pre-shutdown"))
 
 	-- The assignment applies under a FULL queue: the exposure is owed, and
 	-- no update() runs again before exit.
@@ -7487,6 +7488,260 @@ function test_belt_denial_flip_arms_intent_not_exposure()
 	storage.reset()
 end
 
+-- AFTER AN END, A BACKGROUND TICK OPENS NO SESSION. The next session is the
+-- host's to open: its next event starts it. A pre-session snapshot still owed
+-- when the session ends is held by the tick, as it is before the first
+-- session. Without that hold, the owed start would be discharged by an SDK
+-- tick: a session no host activity created.
+function extra_tests.test_ended_session_background_tick_opens_no_session()
+	reset()
+	local restore = install_fake_sys_storage()
+	local first = granted_client()
+	next_response_body = assignment_body()
+	fetch(first, "exp-checkout")
+
+	-- Relaunch: the restored assignment arms a PRE-SESSION snapshot. The
+	-- host's first event lazily opens the first session, and the session
+	-- ends before any tick has drained the snapshot.
+	local second = assert(sdk.new(config()))
+	assert_true(second:track("host_event"))
+	local ended = second.session_id
+	assert_true(second:session_end("complete"))
+	local starts = #queued_events(second, "app.session_started")
+	second:update(0.016)
+	second:update(0.016)
+	assert_equal(#queued_events(second, "app.session_started"), starts,
+		"the background tick opened no session after the end")
+	assert_nil(second:get_session_id(), "no session is current after the end")
+
+	assert_true(second:track("host_after_end"))
+	local after = queued_events(second, "host_after_end")[1]
+	assert_true(after.session_id ~= ended,
+		"the host's next event opens the next session")
+	assert_equal(#queued_events(second, "app.session_started"), starts + 1)
+	restore()
+end
+
+-- AN ASSIGNMENT APPLIED AFTER AN END IS EXPOSED ONCE, IN THE NEW SESSION. The
+-- snapshot used to be built with no session (the ended one is not current),
+-- and emitting it started the next session inside the sweep: the start's
+-- renewal armed a second snapshot for the new session while the first one
+-- was already being emitted into it -- two exposure ids for one application.
+-- The next session now opens BEFORE the snapshot is built, so the fact copies
+-- the new session and there is one snapshot to drain.
+function extra_tests.test_assignment_after_end_is_exposed_once_in_the_new_session()
+	reset()
+	local client = granted_client()
+	assert_true(client:session_start())
+	local ended = client.session_id
+	assert_true(client:session_end("complete"))
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	for _ = 1, 5 do
+		advance_seconds(1)
+		client:update(1)
+	end
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1, "one application is exposed once")
+	assert_true(exposures[1].session_id ~= ended, "not in the ended session")
+	assert_equal(exposures[1].session_id, client.session_id, "in the session that opened for it")
+	assert_equal(#queued_events(client, "app.session_started"), 2,
+		"the ended session's start and the new one's")
+end
+
+-- ...AND WHEN THE QUEUE IS FULL AT THE FETCH. The snapshot built after the end
+-- stays owed, with no session. The host's next event opened the next session,
+-- whose renewal stamped that snapshot with the ENDED session's id and armed a
+-- second one for the new session: one application, two exposures, one of
+-- them filed under a session that had already ended.
+function extra_tests.test_assignment_after_end_under_a_full_queue_is_exposed_once()
+	reset()
+	local client = granted_client({ buffer_size = 2 })
+	assert_true(client:session_start())
+	local ended = client.session_id
+	assert_true(client:session_end("complete"))
+	-- the start and the end fill the queue: the exposure is owed
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0, "the exposure is owed")
+
+	client.queue.items = {}
+	client.queue.limit = 20
+	assert_true(client:track("host_next"))
+	for _ = 1, 5 do
+		advance_seconds(1)
+		client:update(1)
+	end
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1, "one application is exposed once")
+	assert_true(exposures[1].session_id ~= ended, "not filed under the ended session")
+	assert_equal(exposures[1].session_id, client.session_id, "in the session that opened after it")
+end
+
+-- ...AND THE SAME AFTER A DENIAL AND A RE-GRANT. A re-grant re-arms the
+-- still-served treatment for exposure: after an end, that snapshot is built
+-- with no session exactly like the fetch above.
+function extra_tests.test_regrant_after_end_is_exposed_once_in_the_new_session()
+	reset()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1, "exposed in the first session")
+	local ended = client.session_id
+	assert_true(client:session_end("complete"))
+	client:set_consent(false)
+	client:set_consent(true)
+	client.queue.items = {}
+	assert_true(client:track("host_next"))
+	for _ = 1, 5 do
+		advance_seconds(1)
+		client:update(1)
+	end
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 1, "the re-grant exposes the served treatment once")
+	assert_true(exposures[1].session_id ~= ended, "not filed under the ended session")
+	assert_equal(exposures[1].session_id, client.session_id, "in the session that opened after it")
+end
+
+-- WHAT LIVED THROUGH AN ENDED SESSION IS EXPOSED IN IT. A cache-restored
+-- (pre-session) snapshot lives through the lazily opened first session; when
+-- that session ends before any tick drained it, it is attributed to that
+-- session at the end, and the tick exposes it there without opening a session.
+function extra_tests.test_snapshot_that_lived_through_an_ended_session_is_exposed_in_it()
+	reset()
+	local restore = install_fake_sys_storage()
+	local first = granted_client()
+	next_response_body = assignment_body()
+	fetch(first, "exp-checkout")
+
+	local second = assert(sdk.new(config()))
+	assert_true(second:track("host_event"))
+	local lived = second.session_id
+	assert_true(second:session_end("complete"))
+	local starts = #queued_events(second, "app.session_started")
+	for _ = 1, 3 do
+		advance_seconds(1)
+		second:update(1)
+	end
+	local exposures = queued_events(second, "experiment_exposure")
+	assert_equal(#exposures, 1, "the restored application is exposed once")
+	assert_equal(exposures[1].session_id, lived, "in the session it lived through")
+	assert_equal(#queued_events(second, "app.session_started"), starts, "and no session was opened for it")
+	restore()
+end
+
+-- AN OWED SNAPSHOT FROM THE ENDED SESSION AND ONE ARMED AFTER IT STAY APART.
+-- The marker rotates at the end, so the next session's start migrates only the
+-- snapshot armed after the end; the one that lived through the ended session
+-- keeps that session. Each application is exposed once, in its own session.
+function extra_tests.test_ended_and_next_session_snapshots_stay_apart()
+	reset()
+	local restore = install_fake_sys_storage()
+	local first = granted_client()
+	next_response_body = assignment_body()
+	fetch(first, "exp-checkout")
+
+	local second = assert(sdk.new(config({ buffer_size = 3 })))
+	assert_true(second:track("host_event"))
+	local lived = second.session_id
+	assert_true(second:track("filler"))
+	assert_true(second:session_end("complete"))   -- the queue is full now
+	advance_seconds(1)
+	second:update(1)                                -- the lived-through exposure is owed
+	next_response_body = assignment_body({ version = 4 })
+	fetch(second, "exp-checkout")                   -- a new application, after the end
+	assert_equal(#queued_events(second, "experiment_exposure"), 0, "both are owed")
+
+	second.queue.items = {}
+	second.queue.limit = 20
+	assert_true(second:track("host_next"))
+	local next_session = second.session_id
+	for _ = 1, 5 do
+		advance_seconds(1)
+		second:update(1)
+	end
+	local by_session = {}
+	for _, event in ipairs(queued_events(second, "experiment_exposure")) do
+		by_session[event.session_id] = (by_session[event.session_id] or 0) + 1
+	end
+	assert_equal(by_session[lived], 1, "the lived-through application in the ended session")
+	assert_equal(by_session[next_session], 1, "the application after the end in the next one")
+	restore()
+end
+
+-- A BACKEND CLIENT'S BACKGROUND SWEEP NEVER OPENS A SESSION. Backend
+-- exposures drain sessionless. After an explicit start and end, an exposure
+-- re-armed by a re-grant reached the owed start through the sweep, and the
+-- tick emitted app.session_started with no host activity.
+function extra_tests.test_backend_background_sweep_opens_no_session()
+	reset()
+	local client = granted_client({ source = "backend" })
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_true(client:session_end("complete"))
+	client:set_consent(false)
+	client:set_consent(true)
+	client.queue.items = {}
+	for _ = 1, 5 do
+		advance_seconds(1)
+		client:update(1)
+	end
+	assert_equal(#queued_events(client, "app.session_started"), 0,
+		"no SDK tick opened a session for a backend client")
+	for _, exposure in ipairs(queued_events(client, "experiment_exposure")) do
+		assert_nil(exposure.session_id, "a backend exposure drains sessionless")
+	end
+end
+
+-- AN EXPLICIT EXPOSURE AFTER AN END IS AN EXTRA ONE, IN THE NEXT SESSION. The
+-- explicit path chose the post-end marker and its arm state before the owed
+-- start ran inside its own enqueue; the start re-armed the automatic exposure
+-- for the new session, and the explicit emission then wrote its stale state
+-- over it, so the sweep discarded the automatic fact as already emitted: one
+-- exposure where the call documents the automatic one plus an extra.
+function extra_tests.test_explicit_exposure_after_end_adds_to_the_automatic_one()
+	reset()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1, "exposed in the first session")
+	assert_true(client:session_end("complete"))
+	client.queue.items = {}
+	assert_true(client:track_exposure("exp-checkout"))
+	for _ = 1, 5 do
+		advance_seconds(1)
+		client:update(1)
+	end
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 2, "the automatic exposure and the explicit extra one")
+	assert_true(exposures[1].event_id ~= exposures[2].event_id, "with distinct ids")
+	for _, exposure in ipairs(exposures) do
+		assert_equal(exposure.session_id, client.session_id, "both in the new session")
+	end
+end
+
+-- ...AND A BACKEND CLIENT'S EXPLICIT EXPOSURE OPENS NOTHING. Opening early
+-- applies the enqueue's own rule: an SDK fact of a backend client never owes a
+-- start, so the explicit exposure after an end drains sessionless, as before.
+function extra_tests.test_backend_explicit_exposure_after_end_opens_no_session()
+	reset()
+	local client = granted_client({ source = "backend" })
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_true(client:session_end("complete"))
+	client.queue.items = {}
+	assert_true(client:track_exposure("exp-checkout"))
+	assert_equal(#queued_events(client, "app.session_started"), 0,
+		"the explicit exposure opened no session")
+	for _, exposure in ipairs(queued_events(client, "experiment_exposure")) do
+		assert_nil(exposure.session_id, "a backend exposure drains sessionless")
+	end
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -7670,6 +7925,15 @@ local tests = {
 	extra_tests.test_later_sentinel_cancels_covered_snapshot_write,
 	extra_tests.test_escaped_null_presence_keys_are_malformed,
 	extra_tests.test_spool_purge_clears_condemnation_debt,
+	extra_tests.test_ended_session_background_tick_opens_no_session,
+	extra_tests.test_assignment_after_end_is_exposed_once_in_the_new_session,
+	extra_tests.test_assignment_after_end_under_a_full_queue_is_exposed_once,
+	extra_tests.test_regrant_after_end_is_exposed_once_in_the_new_session,
+	extra_tests.test_snapshot_that_lived_through_an_ended_session_is_exposed_in_it,
+	extra_tests.test_ended_and_next_session_snapshots_stay_apart,
+	extra_tests.test_backend_background_sweep_opens_no_session,
+	extra_tests.test_explicit_exposure_after_end_adds_to_the_automatic_one,
+	extra_tests.test_backend_explicit_exposure_after_end_opens_no_session,
 }
 
 for _, test in ipairs(tests) do

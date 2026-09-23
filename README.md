@@ -36,7 +36,9 @@ not the platform boundary.
   later launch with their original `event_id`, so the ingest service
   de-duplicates re-sends. See [Offline durability](#offline-durability-event-spool).
 - Emits canonical helpers: `session_start()` → `app.session_started`,
-  `screen_view(name)` → `app.screen_view`, the typed progression verbs
+  `session_end([reason])` → `app.session_ended` (the next event after an end
+  opens a new session), `screen_view(name)` → `app.screen_view`, the typed
+  progression verbs
   *(new in `v0.10.2`)*
   `track_level_start(level_id, attempt)` → `level_start`,
   `track_level_complete(level_id, attempt, duration_ms[, score])` →

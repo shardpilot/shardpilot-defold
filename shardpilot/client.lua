@@ -755,6 +755,18 @@ end
 local Client = {}
 Client.__index = Client
 
+-- ⚠ THE SESSION IS ONE VALUE: its id, its sequence and its perf and network
+-- samplers. A renewal makes a new value and swaps it in whole; nothing of a
+-- session is mutated into the next one.
+local function new_session(session_id)
+	return {
+		id = session_id,
+		sequence = 0,
+		perf = sampling.new_perf(),
+		network = sampling.new_network(),
+	}
+end
+
 function M.new(config)
 	local normalized, err = validate_config(config)
 	if not normalized then
@@ -1107,18 +1119,28 @@ function M.new(config)
 		-- record; spool_disk_deadline_ms mirrors what the record carries.
 		spool_retry_after_ms = nil,
 		spool_disk_deadline_ms = nil,
+		-- `session` is the OPEN session value, `ended_session` the last one
+		-- ENDED (until the next opens), and `sessionless` the samplers and
+		-- sequence of a client with no session open -- a backend source's
+		-- normal state. session_id, session_sequence, session_active, perf and
+		-- network are READ-ONLY mirrors of these, written by mirror_session()
+		-- alone.
+		session = nil,
+		ended_session = nil,
+		sessionless = { sequence = 0, perf = sampling.new_perf(), network = sampling.new_network() },
 		session_id = nil,
 		session_sequence = 0,
 		session_active = false,
-		perf = sampling.new_perf(),
-		network = sampling.new_network(),
+		perf = nil,
+		network = nil,
 		-- Summary events a FULL queue refused at their build moment. Building
 		-- a summary CONSUMES the sampler state, so a failed enqueue would
 		-- silently lose the whole sampled window — the built snapshot is
 		-- retained here instead and re-enqueued at the next summary point
-		-- (bounded: at most one perf and one network entry, because no fresh
-		-- summary is built while one is still owed — the samplers keep
-		-- accumulating, self-bounded by their own sample caps). Each entry
+		-- (bounded by MAX_OWED_SUMMARIES: an ordinary summary point builds
+		-- nothing fresh while one is still owed, but a CLOSING session always
+		-- takes its samples with it, so each closed session can add one of
+		-- each kind; beyond the bound the oldest is dropped and counted). Each entry
 		-- keeps the BUILT event: identity, session, and timestamps stay as
 		-- stamped at the refusal moment and replay verbatim once the queue
 		-- frees (enqueue_owed_summary — never re-tracked under a later
@@ -1133,6 +1155,7 @@ function M.new(config)
 		flush_elapsed_seconds = 0,
 		initialized = true,
 	}, Client)
+	client:mirror_session()
 	-- The experiments subject id is loaded BEFORE any identity rewrite below:
 	-- persist_identity carries it forward, so a rewrite triggered by a
 	-- changed anonymous id can never drop a previously minted id (dropping
@@ -1585,10 +1608,19 @@ function M.new(config)
 				return client.consent_state
 			end,
 			analytics_session = function()
-				return client.session_id
+				-- The CURRENT session, so nil after an end as before the first
+				-- one: the background sweep's pre-session hold then holds after
+				-- an end too, and no SDK tick opens the next session.
+				return client.session_active and client.session_id or nil
 			end,
 			analytics_anonymous_id = function()
 				return client.anonymous_id
+			end,
+			open_owed_session = function()
+				-- The fact shape emit() below gives an immediate exposure:
+				-- the same predicate, so the session opens exactly when that
+				-- enqueue would have opened it — only earlier.
+				return client:open_owed_session({ omit_user_id = true })
 			end,
 			emit = function(event_name, props, event_id, overrides)
 				-- `overrides` is the ARM-TIME identity of an owed fact
@@ -2298,6 +2330,58 @@ end
 -- keep handing out a CLOSED session's id. Wired into crash config, that would
 -- attribute a crash between session_end and the next session_start to a session
 -- that was already over.
+-- The ONLY writer of the session mirrors (session_id, session_sequence,
+-- session_active, perf, network). They are read throughout the client and by
+-- hosts' tests; the session values are the state.
+function Client:mirror_session()
+	local current = self.session or self.ended_session
+	self.session_active = self.session ~= nil
+	self.session_id = current and current.id or nil
+	self.session_sequence = self:sequence_stream().sequence
+	local samplers = self.session or self.sessionless
+	self.perf, self.network = samplers.perf, samplers.network
+end
+
+-- The value whose sequence the next event continues: the open session, else
+-- the last ended one (an event that carries its own session keeps the
+-- enqueue stream's number, a documented residual), else the sessionless one.
+function Client:sequence_stream()
+	return self.session or self.ended_session or self.sessionless
+end
+
+-- Whether a runtime sample has somewhere to go. Only BETWEEN AN END AND THE
+-- NEXT START does it not: a sample there belongs to no session and is dropped,
+-- never summed under the ended one. Before the first session it waits in the
+-- sessionless samplers, which the first session adopts; a backend source has
+-- no sessions and keeps its samples sessionless.
+function Client:sampling_open()
+	return self.session ~= nil or self.ended_session == nil or self.config.source == "backend"
+end
+
+-- The FIRST session adopts what was sampled before it, as it adopts owed
+-- pre-session exposure snapshots; later sessions start empty. The sessionless
+-- samplers are replaced only once the session is committed.
+function Client:adopt_sessionless_samplers(fresh)
+	fresh.perf, fresh.network = self.sessionless.perf, self.sessionless.network
+end
+
+function Client:renew_sessionless_samplers()
+	self.sessionless.perf = sampling.new_perf()
+	self.sessionless.network = sampling.new_network()
+end
+
+-- Drops every sample not yet summarized, the open session's and the
+-- sessionless ones. An ended session's samples left with it at its close.
+function Client:reset_samplers()
+	if self.session then
+		self.session.perf = sampling.new_perf()
+		self.session.network = sampling.new_network()
+	end
+	self.sessionless.perf = sampling.new_perf()
+	self.sessionless.network = sampling.new_network()
+	self:mirror_session()
+end
+
 function Client:get_session_id()
 	if not self.session_active then
 		return nil
@@ -2600,8 +2684,7 @@ function Client:set_consent(decision)
 		-- uncounted (the snapshot re-enqueues once room frees and is counted
 		-- published when it delivers), so this wipe is the point where an
 		-- owed summary becomes a real, terminal loss.
-		self.perf = sampling.new_perf()
-		self.network = sampling.new_network()
+		self:reset_samplers()
 		if #self.owed_summaries > 0 then
 			self.stats.dropped = self.stats.dropped + #self.owed_summaries
 		end
@@ -2743,34 +2826,57 @@ function Client:set_consent(decision)
 end
 
 function Client:session_start(props)
-	local previous_session_id = self.session_id
-	local previous_session_sequence = self.session_sequence
-	local previous_session_active = self.session_active
+	return self:start_session(props, nil)
+end
 
-	self.session_id = "session-" .. id.uuid()
-	self.session_sequence = 0
-	self.session_active = true
-	local ok, err = self:track("app.session_started", props)
+-- `fact` is internal: the owed start after an end passes { retryable = true },
+-- because a start the full queue refuses is retried with the next event, not
+-- lost, and must not count as a dropped event.
+--
+-- ⚠ THE NEW SESSION IS BUILT OFF TO THE SIDE and swapped in only once its
+-- app.session_started is ACCEPTED into the queue. The start's event is stamped
+-- from the new value (its id, sequence 1); a refused start therefore leaves
+-- the open session, its samplers and its sequence exactly as they were --
+-- nothing to roll back, because nothing was touched.
+function Client:start_session(props, fact)
+	local replaced = self.session
+	local fresh = new_session("session-" .. id.uuid())
+	local first = replaced == nil and self.ended_session == nil
+	if first then
+		self:adopt_sessionless_samplers(fresh)
+	end
+	local start_fact = { session_table = fresh, retryable = fact ~= nil and fact.retryable or nil }
+	local ok, err = self:enqueue_event("app.session_started", props, nil, start_fact)
 	if not ok then
-		self.session_id = previous_session_id
-		self.session_sequence = previous_session_sequence
-		self.session_active = previous_session_active
 		return false, err
+	end
+	local previous_session_id = (replaced or self.ended_session or {}).id
+	if first then
+		self:renew_sessionless_samplers()
+	end
+	self.session = fresh
+	self.ended_session = nil
+	self:mirror_session()
+	if replaced then
+		-- A LIVE RENEWAL ENDS the session it replaces: its samples leave with
+		-- it, under its own id, now that the renewal has been accepted.
+		self:finalize_session(replaced)
 	end
 	if self.experiments then
 		-- The exposure contract is once per (experiment, version, subject)
 		-- per SESSION: an explicit session renewal re-arms it, so a
 		-- still-applied assignment emits one exposure into the new session
 		-- (with its own deterministic id) on the next application sweep.
-		-- Whether this start is a genuine RENEWAL (any session — lazy or
-		-- explicit — existed before it) decides what happens to owed
-		-- pre-session exposure snapshots: the first real session adopts
-		-- them; a renewal preserves them as prior sessions' facts — and
-		-- stamps any still-unattributed pre-session snapshot with the
-		-- PREVIOUS session's id (the lazy first session it lived through),
-		-- which the renewal path needs the id itself for.
-		self.experiments:on_session_renewed(
-			previous_session_id ~= nil, previous_session_id)
+		-- Whether this start is a genuine RENEWAL (a session — lazy or
+		-- explicit — is OPEN) decides what happens to owed pre-session
+		-- exposure snapshots: the first real session adopts them; a renewal
+		-- preserves them as prior sessions' facts — and stamps any
+		-- still-unattributed pre-session snapshot with the PREVIOUS
+		-- session's id (the lazy first session it lived through), which the
+		-- renewal path needs the id itself for. A start after an END is not a
+		-- renewal: the end already attributed what lived through the ended
+		-- session, and what was armed after it belongs to this one.
+		self.experiments:on_session_renewed(replaced ~= nil, previous_session_id)
 	end
 	return true
 end
@@ -2779,20 +2885,72 @@ function Client:session_end(reason)
 	if not self.initialized then
 		return false, "shutdown"
 	end
+	if self.session == nil and self.ended_session ~= nil then
+		-- The session already ENDED: exactly one end per session. A second end
+		-- used to emit a second app.session_ended into the retained session;
+		-- now enqueue_event would open the next session only for this end to
+		-- close it. (An end before any session was ever opened is unchanged.)
+		return true
+	end
 	if self.consent_state ~= "granted" then
 		-- Consent denied — or still unknown, which transmits nothing —
 		-- suppress the wire event but still complete the local session
 		-- teardown (the same posture as shutdown) so session state never
 		-- stays stuck active for a consent-blocked user.
-		self.session_active = false
+		self:close_session()
 		return true
 	end
 	local ok, err = self:track("app.session_ended", { reason = reason or "session_end" })
 	if not ok then
 		return false, err
 	end
-	self.session_active = false
+	self:close_session()
 	return true
+end
+
+-- ⚠ NOTHING OF AN ENDED SESSION CROSSES INTO THE NEXT ONE. The open session
+-- becomes the ended one; its samples are finalized from ITS samplers under ITS
+-- id (shutdown ends the session before its final flush, so they still
+-- describe the ended session there); and the experiments plane attributes what
+-- lived through it. The next session is a new value with empty samplers.
+function Client:close_session()
+	local closing = self.session
+	if closing == nil then
+		return
+	end
+	self.session = nil
+	self.ended_session = closing
+	self:mirror_session()
+	self:finalize_session(closing)
+	if self.experiments then
+		self.experiments:on_session_ended(closing.id)
+	end
+end
+
+-- ⚠ A CLOSING SESSION TAKES ITS SAMPLES WITH IT, whatever else is owed. Its
+-- perf and network summaries are built from its own samplers and stamped from
+-- its own value; one the queue cannot take now is held as an owed snapshot
+-- (the built event), and the samplers leave with the closed value. With
+-- consent not granted they are simply dropped with it.
+function Client:finalize_session(closing)
+	if self.consent_state ~= "granted" then
+		return
+	end
+	self:drain_owed_summaries()
+	local builds = {
+		{ "perf_summary", sampling.perf_summary(closing.perf) },
+		{ "network_summary", sampling.network_summary(closing.network, self.config.transport) },
+	}
+	for _, build in ipairs(builds) do
+		local name, summary = build[1], build[2]
+		if summary then
+			local ok, err, refused, stream = self:enqueue_event(name, summary, nil,
+				{ retryable = true, session_table = closing })
+			if not ok and err == "queue_full" and refused then
+				self:owe_summary(name, refused, stream)
+			end
+		end
+	end
 end
 
 function Client:screen_view(screen_name, props)
@@ -3075,6 +3233,35 @@ end
 -- is kept and re-enqueued once room frees. Everything else — the
 -- consent-first gates, identity requirement, lazy session, queue caps —
 -- applies to facts exactly as to events.
+-- The owed start after an end (see enqueue_event), run by the next activity
+-- that does not carry its own session. `fact` is the fact the activity will
+-- enqueue with (nil for a host event). Returns true when nothing was owed or
+-- the start was accepted; a refused start refuses the activity WITH it, never
+-- filed under the ended session, and counts as the activity's drop unless the
+-- activity is retryable. The explicit exposure calls this BEFORE it reads the
+-- experiments marker, so the exposure's ids and arm state are the next
+-- session's (experiments emit_entry_exposure).
+function Client:open_owed_session(fact)
+	local carries_own_session = fact ~= nil
+		and (fact.session_table ~= nil
+			or (type(fact.session_id) == "string" and fact.session_id ~= ""))
+	local backend_internal = self.config.source == "backend" and fact ~= nil
+	if carries_own_session or backend_internal
+		or self.session ~= nil or self.ended_session == nil then
+		return true
+	end
+	local started, start_err = self:start_session(nil, { retryable = true })
+	if not started then
+		-- Today the start can only meet the same full queue the activity
+		-- would meet; this holds the rule for any other refusal.
+		if not (fact and fact.retryable) then
+			self.stats.dropped = self.stats.dropped + 1
+		end
+		return false, start_err
+	end
+	return true
+end
+
 function Client:enqueue_event(event_name, props, context, fact)
 	if not self.initialized then
 		self.stats.dropped = self.stats.dropped + 1
@@ -3113,15 +3300,38 @@ function Client:enqueue_event(event_name, props, context, fact)
 		self.stats.dropped = self.stats.dropped + 1
 		return false, context_err
 	end
+	-- ⚠ AFTER AN END, THIS EVENT STARTS THE NEXT SESSION. session_end keeps
+	-- session_id (the shutdown summaries describe the session that collected
+	-- their samples and ride it), so the lazy open below, which fires only on
+	-- a nil id, used to file every later event under the ENDED session, after
+	-- its own app.session_ended. A session's length is read from its first
+	-- and last events, so that stretched the ended session over everything
+	-- played after it.
+	--
+	-- An event that carries its own session is not the next activity and
+	-- starts nothing: a late-drained experiment fact rides the session it was
+	-- armed in, a summary the one that collected it. session_start's own
+	-- event cannot recurse here: it marks the session active before tracking.
+	-- A backend client that explicitly opened and ended a session renews on
+	-- its next HOST event too; one that never opened a session has no ended
+	-- session to owe. An SDK-internal fact of a backend client never owes one:
+	-- backend facts and summaries drain sessionless, and a background sweep
+	-- must not open a session no host activity asked for.
+	local opened, open_err = self:open_owed_session(fact)
+	if not opened then
+		return false, open_err
+	end
 	-- The server requires session_id for non-backend sources; an event tracked
 	-- before session_start() would otherwise ship with no session_id and the
 	-- whole batch would be 400-rejected. Lazily open a session so a session_id
 	-- is always present. An explicit session_start() still renews the session.
 	local opened_lazy_session = false
-	if self.session_id == nil and self.config.source ~= "backend" then
-		self.session_id = "session-" .. id.uuid()
-		self.session_sequence = 0
-		self.session_active = true
+	if self.session == nil and self.ended_session == nil and self.config.source ~= "backend"
+		and not (fact ~= nil and fact.session_table ~= nil) then
+		local lazy = new_session("session-" .. id.uuid())
+		self:adopt_sessionless_samplers(lazy)
+		self.session = lazy
+		self:mirror_session()
 		opened_lazy_session = true
 	end
 	local user_id = self.user_id
@@ -3156,14 +3366,21 @@ function Client:enqueue_event(event_name, props, context, fact)
 			ts_override = fact.event_ts
 		end
 	end
+	-- The session this event is stamped from: its own session value (a
+	-- start's new session, a closing session's summary), else the OPEN one.
+	-- An event never takes the ENDED session's id unless it carries it as its
+	-- own; with none open (a backend source) it is sessionless. Its sequence
+	-- comes from that value, or from the stream the client last numbered.
+	local own = fact ~= nil and fact.session_table or nil
+	local stream = own or self:sequence_stream()
 	local event = {
 		event_id = event_id or id.uuid(),
 		event_name = event_name,
 		event_ts = ts_override or clock.iso_utc(),
 		user_id = user_id,
 		anonymous_id = anonymous_override or self.anonymous_id,
-		session_id = session_override or self.session_id,
-		session_sequence = self.session_sequence + 1,
+		session_id = session_override or (own and own.id) or (self.session and self.session.id) or nil,
+		session_sequence = stream.sequence + 1,
 		props = props_snapshot,
 		context = context_snapshot,
 	}
@@ -3174,9 +3391,8 @@ function Client:enqueue_event(event_name, props, context, fact)
 		-- otherwise update()/shutdown() would later sample or emit a
 		-- session_end for a session that carries no events.
 		if opened_lazy_session then
-			self.session_id = nil
-			self.session_sequence = 0
-			self.session_active = false
+			self.session = nil
+			self:mirror_session()
 		end
 		-- A RETRYABLE refusal is not a dropped event: the owed-snapshot
 		-- machinery (exposure facts, the enqueue_summaries builds) keeps the
@@ -3194,10 +3410,16 @@ function Client:enqueue_event(event_name, props, context, fact)
 		-- enqueue_summaries can retain it as an owed snapshot: a summary
 		-- must replay under the identity and session it was built with —
 		-- never re-stamped with whatever actor is current when the queue
-		-- finally frees. Other callers ignore the extra value.
-		return false, "queue_full", event
+		-- finally frees — and be numbered in the stream it was stamped
+		-- from, which rides with it. Other callers ignore the extra values.
+		return false, "queue_full", event, stream
 	end
-	self.session_sequence = event.session_sequence
+	stream.sequence = event.session_sequence
+	if opened_lazy_session then
+		-- committed: the lazy first session keeps the samplers it adopted
+		self:renew_sessionless_samplers()
+	end
+	self:mirror_session()
 	self.stats.enqueued = self.stats.enqueued + 1
 	return true
 end
@@ -3278,11 +3500,17 @@ function Client:observe_ping_ms(ms)
 	if self.consent_state ~= "granted" then
 		return
 	end
+	-- Between an end and the next start a sample belongs to no session: it is
+	-- dropped, never summed under the ended session. A backend source has no
+	-- sessions, so its samples are kept sessionless.
+	if not self:sampling_open() then
+		return
+	end
 	sampling.sample_ping(self.network, ms)
 end
 
 function Client:observe_disconnect(reason)
-	if self.consent_state ~= "granted" then
+	if self.consent_state ~= "granted" or not self:sampling_open() then
 		return
 	end
 	sampling.disconnect(self.network, reason)
@@ -3294,11 +3522,12 @@ end
 -- event verbatim (event_id, event_ts, user_id, anonymous_id, session_id)
 -- instead of re-tracking under whatever actor/session is current at drain
 -- time — an identify() or anon rotation between refusal and drain must not
--- misattribute samples collected under the old actor/session. The ONE
--- enqueue-time field is session_sequence: exactly like a late-drained
--- experiment fact, it stays the enqueue stream's counter (the refusal-time
--- number was never committed, so later events may have claimed it — the
--- server's cross-session ordering key is the timestamp).
+-- misattribute samples collected under the old actor/session. That includes
+-- session_sequence: owe_summary reserved it in the summary's own stream when
+-- the queue refused it, so a closing session's summary that drains after the
+-- next session opened is still the ended session's event, never a number from
+-- the new session's counter under the old id, and persist()'s durable copy
+-- carries the same number as the delivery.
 function Client:enqueue_owed_summary(entry)
 	if not self.initialized then
 		return false, "shutdown"
@@ -3309,14 +3538,11 @@ function Client:enqueue_owed_summary(entry)
 	if self.consent_state ~= "granted" then
 		return false, "consent_unknown"
 	end
-	local event = entry.event
-	event.session_sequence = self.session_sequence + 1
-	if not queue.push(self.queue, event) then
+	if not queue.push(self.queue, entry.event) then
 		-- Still owed — never counted dropped here: like a retryable owed
 		-- fact, the snapshot stays armed and re-enqueues once room frees.
 		return false, "queue_full"
 	end
-	self.session_sequence = event.session_sequence
 	self.stats.enqueued = self.stats.enqueued + 1
 	return true
 end
@@ -3357,8 +3583,7 @@ function Client:enqueue_summaries()
 	-- dropped with them (the denial wipe in set_consent counts them; this
 	-- belt-and-suspenders clear is only reachable already-empty).
 	if self.consent_state ~= "granted" then
-		self.perf = sampling.new_perf()
-		self.network = sampling.new_network()
+		self:reset_samplers()
 		self.owed_summaries = {}
 		return
 	end
@@ -3369,8 +3594,9 @@ function Client:enqueue_summaries()
 	if #self.owed_summaries > 0 then
 		-- The queue is still full: leave the samplers accumulating (they
 		-- self-bound at their sample caps) instead of consuming them into
-		-- ever more owed snapshots — the owed list stays bounded at one
-		-- entry per summary type.
+		-- ever more owed snapshots. The owed list is bounded by the cap in
+		-- owe_summary, not by this return: closing sessions add their own
+		-- entries.
 		return
 	end
 	-- Fresh builds enqueue through the retryable arm: a queue_full refusal is
@@ -3379,22 +3605,68 @@ function Client:enqueue_summaries()
 	-- double-book a summary that later delivers as both dropped and
 	-- published. The terminal loss point — the denial wipe of owed
 	-- snapshots — counts instead.
+	--
+	-- An ordinary summary point summarizes the OPEN session's samples (or,
+	-- before any session, the ones the first session will adopt; for a
+	-- backend source, its sessionless ones), and is stamped like any event
+	-- from the open session. A CLOSING session's are built by
+	-- finalize_session from its own value.
 	local perf = sampling.perf_summary(self.perf)
 	if perf then
-		local ok, err, refused = self:enqueue_event("perf_summary", perf, nil,
+		local ok, err, refused, stream = self:enqueue_event("perf_summary", perf, nil,
 			{ retryable = true })
-		if not ok and err == "queue_full" then
-			self.owed_summaries[#self.owed_summaries + 1] =
-				{ event_name = "perf_summary", event = refused }
+		if not ok and err == "queue_full" and refused then
+			self:owe_summary("perf_summary", refused, stream)
 		end
 	end
 	local network = sampling.network_summary(self.network, self.config.transport)
 	if network then
-		local ok, err, refused = self:enqueue_event("network_summary", network,
+		local ok, err, refused, stream = self:enqueue_event("network_summary", network,
 			nil, { retryable = true })
-		if not ok and err == "queue_full" then
-			self.owed_summaries[#self.owed_summaries + 1] =
-				{ event_name = "network_summary", event = refused }
+		if not ok and err == "queue_full" and refused then
+			self:owe_summary("network_summary", refused, stream)
+		end
+	end
+end
+
+-- At most this many built summaries are held for a full queue. A closed
+-- session can leave one of each kind; beyond the bound the OLDEST entry
+-- without a durable copy is dropped, and counted, rather than holding every
+-- session's window in memory.
+--
+-- ⚠ THE NUMBER IS RESERVED AT THE REFUSAL. The refused event already carries
+-- its stream's next number; committing it here means later events of that
+-- stream take the numbers after it, and the drain and persist()'s durable copy
+-- both reuse it. Recomputed at drain, it came from whatever stream was current
+-- (the next session's, under the old id), and two entries persisted together
+-- shared one tentative number on disk. An entry dropped below leaves a gap in
+-- its stream, never a duplicate.
+--
+-- ⚠ AN ENTRY WITH A DURABLE COPY IS NEVER DROPPED. persist() writes owed
+-- entries to the spool as crash insurance and keeps the originals in memory,
+-- and a record written by this process is pending work ONLY through its
+-- original (spool_batches holds a previous launch's records). Dropping it
+-- left an old-identity envelope on disk that no guard saw: an anonymous-id
+-- rotation passed, and the next launch replayed it under the new id. Such an
+-- entry leaves by delivery, which also removes its record. Entries kept this
+-- way are bounded by the spool's own caps: a record the spool evicts makes its
+-- entry droppable again.
+local MAX_OWED_SUMMARIES = 8
+
+function Client:owe_summary(event_name, event, stream)
+	if stream and event.session_sequence > stream.sequence then
+		stream.sequence = event.session_sequence
+		self:mirror_session()
+	end
+	local owed = self.owed_summaries
+	owed[#owed + 1] = { event_name = event_name, event = event }
+	local i = 1
+	while #owed > MAX_OWED_SUMMARIES and i <= #owed do
+		if self.spool_index[owed[i].event.event_id] then
+			i = i + 1
+		else
+			table.remove(owed, i)
+			self.stats.dropped = self.stats.dropped + 1
 		end
 	end
 end
@@ -4963,7 +5235,9 @@ function Client:capture_experiment_fact(event_name, props, event_id, overrides)
 		return false
 	end
 	overrides = overrides or {}
-	local session_id = overrides.session_id or self.session_id
+	-- The CURRENT session only: an ended session is not one to capture into.
+	local session_id = overrides.session_id
+		or (self.session_active and self.session_id or nil)
 	if type(session_id) ~= "string" or session_id == "" then
 		session_id = nil
 		-- Mirror the enqueue path's source-conditional session rule: a
@@ -4977,6 +5251,7 @@ function Client:capture_experiment_fact(event_name, props, event_id, overrides)
 			return false
 		end
 	end
+	local stream = self:sequence_stream()
 	local props_snapshot = copy_table(props, "invalid_props")
 	local event = {
 		event_id = event_id,
@@ -4985,11 +5260,12 @@ function Client:capture_experiment_fact(event_name, props, event_id, overrides)
 		user_id = nil,
 		anonymous_id = overrides.anonymous_id or self.anonymous_id,
 		session_id = session_id,
-		session_sequence = self.session_sequence + 1,
+		session_sequence = stream.sequence + 1,
 		props = props_snapshot,
 		context = nil,
 	}
-	self.session_sequence = event.session_sequence
+	stream.sequence = event.session_sequence
+	self:mirror_session()
 	return self:spool_envelopes({ envelope.build(self.config, self, event) })
 end
 

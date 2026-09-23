@@ -2,6 +2,45 @@
 
 ### Unreleased
 
+- After `session_end()`, the next event opens a new session announced by its
+  own `app.session_started`. It used to carry the ended session's id, after
+  that session's `app.session_ended`, so the ended session's length ran on
+  over everything played after it. Events that describe the ended session
+  still ride it: the perf and network summaries that `shutdown()` builds after
+  ending the session, and a late experiment fact that carries the session it
+  was armed in. A second `session_end()` is a no-op, so each session gets
+  exactly one `app.session_ended`. After an end, a background `update()` tick
+  opens no session, and a drop-time experiment capture is refused, as before
+  any session exists.
+- Nothing of an ended session crosses into the next one:
+  - A session's perf and network summaries are built when it ends (or when an
+    explicit `session_start()` replaces it), under its own id, and the next
+    session starts with empty samplers.
+  - An experiment assignment applied after an end is exposed once, in the next
+    session. It used to be exposed twice when its first emission was held
+    back, once under the session that had already ended.
+  - A `track_exposure()` after an end opens the next session first, so it
+    yields the automatic exposure plus the explicit extra one, both in that
+    session. It used to yield only one.
+  - A backend-source client that explicitly opened and ended a session renews
+    on its next event like any other; one that never opened a session still
+    has none. A backend client's own facts and summaries never open a
+    session.
+- A session is one value (its id, sequence and samplers), replaced whole:
+  - A new session is swapped in only once its `app.session_started` is
+    accepted. A refused `session_start()` leaves the open session, its
+    samples and its sequence exactly as they were.
+  - A closing session always takes its samples with it, even while an older
+    summary is still owed. A summary held for a full queue keeps the number
+    it took in the session that collected it when the queue refused it. It
+    drains, and `persist()` writes it to the spool, with that number: never
+    one from the next session's counter, and never one another held summary
+    also carries. At most 8 built summaries are held for a full queue;
+    beyond that the oldest one without a durable copy is dropped and counted
+    in `dropped`. One that `persist()` has written to the spool is kept until
+    it is delivered, so an anonymous-id rotation still waits for it.
+  - A ping or disconnect observed between an end and the next start is
+    dropped. Samples taken before the first session are summarized in it.
 - Keep the last accepted consent plan's `operation_blocks` through strict
   fallbacks and ordinary `consent_policy.invalidate()` calls. Each newer
   accepted plan replaces the entire set, including an empty set. Selecting a

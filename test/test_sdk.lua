@@ -3051,10 +3051,18 @@ local function test_retry_wake_republishes_without_a_flush_tick()
 		"the premise: and an undispatched grant holds the event legs")
 	assert_true(parked:track("grant_spin_queued_1"))
 	assert_true(parked:track("grant_spin_queued_2"))
+	-- The receipt must still be inside its window while the ticks run. This
+	-- harness's clock advances on every READ, so how many times the SDK reads
+	-- it decided whether the window lapsed mid-scene (a session value now
+	-- starts its own perf window, one read more). Hold the clock for the
+	-- ticks: the scene measures the full-queue trigger, not the read count.
+	local held_gettime = socket.gettime
+	socket.gettime = function() return socket.now end
 	parked.flush_elapsed_seconds = 0
 	parked:update(0.1)
 	parked:update(0.1)
 	parked:update(0.1)
+	socket.gettime = held_gettime
 	assert_true(parked.flush_elapsed_seconds > 0.25,
 		"the full queue behind a deferred GRANT must not flush every frame either: "
 			.. "elapsed = " .. tostring(parked.flush_elapsed_seconds))
@@ -8822,6 +8830,522 @@ local tests = {
 
 	assert_true(client:session_start())
 	assert_true(type(client:get_session_id()) == "string", "a renewed session exposes its id again")
+	end,
+	function()
+	-- AFTER AN END, THE HOST'S NEXT EVENT OPENS A NEW SESSION, announced by its
+	-- own app.session_started. It used to carry the ENDED session's id, after
+	-- that session's app.session_ended: the lazy open fires only on a nil id,
+	-- and session_end keeps the id. A session's length is read from its first
+	-- and last events, so every event played after a manual end stretched the
+	-- ended session over it.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local ended = client.session_id
+	assert_true(client:track("before_end"))
+	assert_true(client:session_end("complete"))
+	assert_true(client:track("after_end"))
+
+	local items = client.queue.items
+	assert_equal(#items, 5, "start, before_end, end, the next session's start, after_end")
+	assert_equal(items[3].event_name, "app.session_ended")
+	assert_equal(items[3].session_id, ended)
+	assert_equal(items[4].event_name, "app.session_started",
+		"the event after an end announces the session it opens")
+	local renewed = items[4].session_id
+	assert_true(type(renewed) == "string" and renewed ~= ended, "a NEW session, not the ended one")
+	assert_equal(items[5].event_name, "after_end")
+	assert_equal(items[5].session_id, renewed)
+	assert_equal(items[4].session_sequence, 1)
+	assert_equal(items[5].session_sequence, 2)
+	assert_equal(client:get_session_id(), renewed, "and the new session is current")
+	end,
+	function()
+	-- THE RETAINED ID IS LOAD-BEARING. Shutdown ends the session first and
+	-- builds the perf and network summaries afterwards; they describe the
+	-- session that collected their samples and stay in it. Clearing the id at
+	-- the end would open a session for them instead.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config()))
+	assert_true(client:session_start())
+	local ended = client.session_id
+	client:update(0.016)
+	client:update(0.016)
+	client:observe_ping_ms(40)
+	assert_true(client:shutdown())
+
+	local summaries, starts = 0, 0
+	for _, request in ipairs(requests) do
+		for _, event in ipairs(json_decode(request.body).events or {}) do
+			if event.event_name == "perf_summary" or event.event_name == "network_summary" then
+				summaries = summaries + 1
+				assert_equal(event.session_id, ended, event.event_name .. " describes the ended session")
+			elseif event.event_name == "app.session_started" then
+				starts = starts + 1
+			end
+		end
+	end
+	assert_equal(summaries, 2, "both summaries were built at shutdown")
+	assert_equal(starts, 1, "and no session was opened for them")
+	end,
+	function()
+	-- A SECOND END IS A NO-OP: exactly one app.session_ended per session. It
+	-- used to emit a second end into the retained session; with the next
+	-- session now opened by the next event, it would open a session only to
+	-- end it.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	assert_true(client:session_end("complete"))
+	assert_true(client:session_end("again"))
+	local ends, starts = 0, 0
+	for _, event in ipairs(client.queue.items) do
+		if event.event_name == "app.session_ended" then ends = ends + 1 end
+		if event.event_name == "app.session_started" then starts = starts + 1 end
+	end
+	assert_equal(ends, 1, "exactly one end per session")
+	assert_equal(starts, 1, "and no session was opened to be ended")
+	end,
+	function()
+	-- A REFUSED START REFUSES THE EVENT THAT OWED IT. Today the start can only
+	-- meet the same full queue the event would meet, so the event's own push
+	-- would refuse it anyway; this pins the rule for a refusal that is not a
+	-- full queue, so the event never lands in the ended session.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local ended = client.session_id
+	assert_true(client:session_end("complete"))
+	local before = #client.queue.items
+	client.start_session = function()
+		return false, "start_refused_for_test"
+	end
+	local ok, err = client:track("after_end")
+	client.start_session = nil
+	assert_equal(ok, false, "the event is refused with its start")
+	assert_equal(err, "start_refused_for_test")
+	assert_equal(#client.queue.items, before, "and nothing landed in the ended session")
+	assert_true(client:track("after_end"))
+	local last = client.queue.items[#client.queue.items]
+	assert_equal(last.event_name, "after_end")
+	assert_true(last.session_id ~= ended, "a later event opens the next session")
+	end,
+	function()
+	-- A REFUSED OWED START IS NOT A DROPPED EVENT: the next event retries it.
+	-- A host event refused together with its start counts ONCE, as any
+	-- refused event does. Counting the start as well made one refused event
+	-- read as two drops, and a refused retryable experiment fact as one.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999, buffer_size = 2 })))
+	assert_true(client:session_start())
+	assert_true(client:session_end("complete"))
+	local before = client:snapshot().dropped
+	local ok, err = client:track("after_end")
+	assert_equal(ok, false, "the full queue refuses the start, and the event with it")
+	assert_equal(err, "queue_full")
+	assert_equal(client:snapshot().dropped, before + 1, "one refused event, not its start as well")
+	end,
+	function()
+	-- A BACKEND CLIENT THAT OPENED AND ENDED A SESSION RENEWS LIKE ANY OTHER.
+	-- The owed start excluded the backend source, so after an explicit
+	-- start/end its next event kept the ended id. A backend client that never
+	-- opened a session still gets none: nothing is owed without an ended id.
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local backend = assert(sdk.new(config({ source = "backend", flush_interval_seconds = 9999 })))
+	assert_true(backend:identify("user-example"))
+	assert_true(backend:session_start())
+	local ended = backend.session_id
+	assert_true(backend:session_end("complete"))
+	assert_true(backend:track("backend_after_end"))
+	local last = backend.queue.items[#backend.queue.items]
+	assert_equal(last.event_name, "backend_after_end")
+	assert_true(type(last.session_id) == "string" and last.session_id ~= ended,
+		"a backend event after an explicit end opens the next session")
+
+	-- control: a backend client that never opened one stays sessionless
+	reset()
+	storage.reset()
+	seed_granted_consent()
+	local sessionless = assert(sdk.new(config({ source = "backend", flush_interval_seconds = 9999 })))
+	assert_true(sessionless:identify("user-example"))
+	assert_true(sessionless:track("backend_event"))
+	assert_equal(sessionless.session_id, nil, "no session is invented for a sessionless backend client")
+	storage.reset()
+	end,
+	function()
+	-- THE SAMPLERS ARE PER SESSION. A session's perf and network summaries are
+	-- built when it ENDS, under its id, and the next session starts with empty
+	-- samplers. The owed start used to change the session id under running
+	-- samplers, so the next summary stamped both sessions' frames with the new
+	-- id, and its duration ran from before the gap.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	client:update(0.016)
+	client:update(0.016)
+	client:update(0.016)
+	assert_true(client:session_end("complete"))
+	socket.now = socket.now + 600   -- ten minutes with no session open
+	assert_true(client:track("after_end"))
+	local b = client.session_id
+	client:update(0.016)
+	client:update(0.016)
+	assert_true(client:shutdown())
+
+	local summaries = {}
+	for _, request in ipairs(requests) do
+		for _, event in ipairs(json_decode(request.body).events or {}) do
+			if event.event_name == "perf_summary" then
+				summaries[#summaries + 1] = event
+			end
+		end
+	end
+	assert_equal(#summaries, 2, "one perf summary per session")
+	assert_equal(summaries[1].session_id, a)
+	assert_equal(summaries[1].props.frames_sampled, 3, "the first session's frames only")
+	assert_true(summaries[1].props.duration_ms < 600000, "the gap is not the first session's duration")
+	assert_equal(summaries[2].session_id, b)
+	assert_equal(summaries[2].props.frames_sampled, 2, "the next session starts with empty samplers")
+	assert_true(summaries[2].props.duration_ms < 600000, "nor the next session's")
+	end,
+	function()
+	-- A LIVE RENEWAL ENDS THE SESSION IT REPLACES, FOR THE SAMPLERS TOO: an
+	-- explicit session_start while a session is open finalizes the open
+	-- session's summaries under its own id first.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	client:update(0.016)
+	client:update(0.016)
+	assert_true(client:session_start())
+	local found = nil
+	for _, event in ipairs(client.queue.items) do
+		if event.event_name == "perf_summary" then found = event end
+	end
+	assert_true(found ~= nil, "the replaced session's perf summary is built at the renewal")
+	assert_equal(found.session_id, a)
+	assert_equal(found.props.frames_sampled, 2)
+	end,
+	function()
+	-- AN OLDER OWED SUMMARY DOES NOT KEEP THE ENDED SESSION'S SAMPLES. With a
+	-- summary still owed to a full queue, the end left the ended session's
+	-- fresh samples in the live sampler, and the next session's summary
+	-- carried them under its own id. The closing session's samples are now
+	-- taken with it whatever is owed.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999, buffer_size = 3 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	client:update(0.016)
+	client:update(0.016)
+	assert_true(client:track("filler_1"))
+	assert_true(client:track("filler_2"))
+	client:enqueue_summaries()                 -- the queue is full: this summary is owed
+	assert_true(#client.owed_summaries > 0, "an older summary is owed")
+	client:update(0.016)
+	client:update(0.016)
+	client:update(0.016)                       -- three more frames in A
+	table.remove(client.queue.items)           -- room for the end event
+	assert_true(client:session_end("complete"))
+	client.queue.items = {}
+	assert_true(client:track("after_end"))
+	local b = client.session_id
+	client:update(0.016)                       -- one frame in B
+	assert_true(client:shutdown())
+	local frames = {}
+	for _, request in ipairs(requests) do
+		for _, event in ipairs(json_decode(request.body).events or {}) do
+			if event.event_name == "perf_summary" then
+				frames[event.session_id] = (frames[event.session_id] or 0) + event.props.frames_sampled
+			end
+		end
+	end
+	assert_equal(frames[a], 5, "all of A's frames are A's")
+	assert_equal(frames[b], 1, "and B's summary holds B's frame alone")
+	end,
+	function()
+	-- A REFUSED RENEWAL LEAVES THE OPEN SESSION UNTOUCHED: its samplers, its
+	-- queue, its sequence. The renewal used to build the open session's
+	-- summaries before its own start was validated; a refused start then left
+	-- the samplers consumed, the summaries queued, and the sequence rolled back
+	-- under them, so the next event reused a summary's number.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	client:update(0.016)
+	client:update(0.016)
+	client:observe_ping_ms(40)
+	local queued = #client.queue.items
+	local cyclic = {}
+	cyclic.self = cyclic
+	local ok = client:session_start(cyclic)
+	assert_equal(ok, false, "a start with cyclic props is refused")
+	assert_equal(client.session_id, a, "the open session stays")
+	assert_equal(#client.queue.items, queued, "nothing was queued for the refused renewal")
+	assert_equal(#client.perf.frames, 2, "its frames are still its own")
+	assert_true(client:track("after_refusal"))
+	local seen = {}
+	for _, event in ipairs(client.queue.items) do
+		if event.session_id == a then
+			assert_true(not seen[event.session_sequence],
+				"sequence " .. tostring(event.session_sequence) .. " is used once")
+			seen[event.session_sequence] = true
+		end
+	end
+	end,
+	function()
+	-- BETWEEN AN END AND THE NEXT START, SAMPLES BELONG TO NO SESSION, and are
+	-- dropped. A ping or a disconnect observed after the end used to be summed
+	-- into a summary stamped with the ENDED id, after that session's end.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	assert_true(client:session_end("complete"))
+	client:observe_ping_ms(40)
+	client:observe_disconnect("gap")
+	assert_true(client:flush({ include_summaries = true }))
+	local starts = 0
+	for _, request in ipairs(requests) do
+		for _, event in ipairs(json_decode(request.body).events or {}) do
+			assert_true(event.event_name ~= "network_summary",
+				"no network summary is built from samples taken with no session open")
+			if event.event_name == "app.session_started" then starts = starts + 1 end
+		end
+	end
+	assert_equal(starts, 1, "and the flush opened no session")
+	assert_equal(client.session_id, a, "the ended session is still the last one")
+	end,
+	function()
+	-- WHAT WAS SAMPLED BEFORE THE FIRST SESSION IS SUMMARIZED IN IT. The
+	-- first session adopts the samplers that were waiting for it, as it
+	-- adopts owed pre-session exposures; later sessions start empty.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	client:observe_ping_ms(40)
+	assert_true(client:session_start())
+	local first = client.session_id
+	assert_true(client:flush({ include_summaries = true }))
+	local found = nil
+	for _, request in ipairs(requests) do
+		for _, event in ipairs(json_decode(request.body).events or {}) do
+			if event.event_name == "network_summary" then found = event end
+		end
+	end
+	assert_true(found ~= nil, "the pre-session ping is summarized")
+	assert_equal(found.session_id, first, "in the first session")
+	assert_equal(found.props.ping_sample_count, 1)
+	end,
+	function()
+	-- THE SESSION IS ONE VALUE. Across a renewal every per-session part -- the
+	-- id, the sequence, the perf and network samplers -- changes together, and
+	-- nothing of the replaced session is still reachable from the client.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local before = client.session
+	assert_true(type(before) == "table", "the open session is a table")
+	local perf, network = client.perf, client.network
+	assert_true(perf == before.perf and network == before.network, "the samplers are the session's")
+	assert_true(client:session_start())
+	local after = client.session
+	assert_true(after ~= before, "a renewal is a new session value")
+	assert_true(after.id ~= before.id, "with a new id")
+	assert_true(client.perf ~= perf and client.network ~= network, "and new samplers")
+	assert_true(client.perf == after.perf and client.network == after.network,
+		"which are the new session's")
+	assert_equal(client.session_id, after.id)
+	assert_equal(client.session_sequence, after.sequence)
+	-- and across an end and the owed start
+	assert_true(client:session_end("complete"))
+	local ended = client.session
+	assert_equal(ended, nil, "no session is open after an end")
+	assert_true(client:track("after_end"))
+	assert_true(client.session ~= nil and client.session ~= after, "the next session is a new value")
+	assert_true(client.perf == client.session.perf, "and the samplers follow it")
+	end,
+	function()
+	-- A DROP-TIME EXPERIMENT CAPTURE AFTER AN END REFUSES, as it does with no
+	-- session at all. It read the retained id and spooled the fact into the
+	-- ended session. A capture that carries its arm-time session keeps it.
+	reset()
+	seed_granted_consent()
+	storage.clear_spool(spool_scope)
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_enabled = true })))
+	assert_true(client:session_start())
+	assert_true(client:session_end("complete"))
+	assert_equal(client:capture_experiment_fact("experiment_exposure",
+		{ experiment_key = "exp" }, "fact-after-end", {}), false,
+		"no session is open to capture into")
+	for _, env in ipairs(storage.load_spool(spool_scope)) do
+		assert_true(env.event_id ~= "fact-after-end", "nothing was captured into the ended session")
+	end
+	assert_true(client:capture_experiment_fact("experiment_exposure",
+		{ experiment_key = "exp" }, "fact-armed", { session_id = "session-armed" }),
+		"the arm-time session still decides when the fact carries one")
+	storage.clear_spool(spool_scope)
+	end,
+	function()
+	-- AN OWED SUMMARY IS NUMBERED IN THE SESSION THAT COLLECTED IT. A closing
+	-- session's summary refused by a full queue drained after the next session
+	-- had opened, and took its number from the NEW session's counter while
+	-- keeping the old id: the ended session got a second event 4, its own end.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999, buffer_size = 4 })))
+	assert_true(client:session_start())                 -- A 1
+	local a = client.session_id
+	client:update(0.016)
+	client:update(0.016)
+	assert_true(client:track("a_2"))
+	assert_true(client:track("a_3"))
+	assert_true(client:session_end("complete"))         -- A 4, and the queue is full
+	assert_true(#client.owed_summaries > 0, "its perf summary is owed")
+	local used = {}
+	for _, event in ipairs(client.queue.items) do
+		if event.session_id == a then used[event.session_sequence] = true end
+		if event.event_name == "app.session_ended" then
+			assert_equal(event.session_sequence, 4, "the old session ended at 4")
+		end
+	end
+	client.queue.items = {}
+	assert_true(client:track("b_2"))                    -- B 1 and 2
+	assert_true(client:track("b_3"))                    -- B 3
+	assert_equal(client.session_sequence, 3, "the new session reached 3")
+	assert_true(client:drain_owed_summaries())
+	local drained = nil
+	for _, event in ipairs(client.queue.items) do
+		if event.event_name == "perf_summary" then drained = event end
+	end
+	assert_true(drained ~= nil, "the owed summary drained")
+	assert_equal(drained.session_id, a, "in the session that collected it")
+	assert_true(not used[drained.session_sequence],
+		"its number is not one the old session already used")
+	assert_equal(drained.session_sequence, 5, "it is the old session's fifth event")
+	assert_equal(client.session_sequence, 3, "and the new session's counter did not move")
+	end,
+	function()
+	-- AN OWED SUMMARY'S NUMBER IS RESERVED WHEN THE QUEUE REFUSES IT. persist()
+	-- wrote each still-refused summary with a tentative number that did not
+	-- advance its stream, so two summaries of one session reached the durable
+	-- spool with the same number, and a replay after a process death shipped
+	-- both. The number is taken at the refusal, and the drain reuses it.
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	next_status = 500
+	local client = assert(sdk.new(config({ buffer_size = 1, flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	client:update(0.016)
+	client:update(0.020)
+	client:observe_ping_ms(42)
+	assert_equal(client:flush(), false)
+	assert_equal(#client.owed_summaries, 2, "both built summaries are owed")
+	assert_true(client:track("filler_event"))
+	assert_true(client:persist(), "the owed summaries are durably captured")
+	local seen, spooled = {}, {}
+	for i = 1, #client.spool_record do
+		local env = client.spool_record[i]
+		local key = tostring(env.session_id) .. "#" .. tostring(env.session_sequence)
+		assert_true(not seen[key], "number " .. key .. " is on disk once")
+		seen[key] = true
+		spooled[env.event_id] = env.session_sequence
+	end
+	client.queue.limit = 50
+	next_status = 202
+	for _ = 1, 5 do
+		if #client.owed_summaries == 0 and #client.queue.items == 0 then break end
+		client:flush()
+	end
+	local delivered = 0
+	for _, request in ipairs(requests) do
+		for _, event in ipairs(json_decode(request.body).events or {}) do
+			if spooled[event.event_id] and (event.event_name == "perf_summary"
+				or event.event_name == "network_summary") then
+				assert_equal(event.session_sequence, spooled[event.event_id],
+					"delivered with the number its durable copy carries")
+				delivered = delivered + 1
+			end
+		end
+	end
+	assert_equal(delivered, 2, "both owed summaries were delivered")
+	restore()
+	storage.reset()
+	end,
+	function()
+	-- THE OWED-SUMMARY CAP NEVER DROPS AN ENTRY WITH A DURABLE COPY. A summary
+	-- that persist() had written to the spool was dropped by the cap; its
+	-- in-memory original was the only pending-work signal for that spool
+	-- record, so once the rest drained a Mode B anonymous-id rotation passed its
+	-- guard with an old-anon envelope still on disk, to be replayed at the next
+	-- launch under a token bound to the new id.
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	next_status = 500
+	local client = assert(sdk.new(config({ buffer_size = 1, flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	client:update(0.016)
+	client:update(0.020)
+	client:observe_ping_ms(42)
+	assert_equal(client:flush(), false)
+	assert_equal(#client.owed_summaries, 2, "both built summaries are owed")
+	assert_true(client:track("filler_event"))
+	assert_true(client:persist(), "the owed summaries are durably captured")
+	local spooled_ids = {}
+	for i = 1, #client.owed_summaries do
+		spooled_ids[client.owed_summaries[i].event.event_id] = true
+	end
+	local template = client.owed_summaries[2].event
+	for i = 1, 7 do
+		local event = {}
+		for k, v in pairs(template) do event[k] = v end
+		event.event_id = "capped-" .. i
+		client:owe_summary("network_summary", event)
+	end
+	local kept = 0
+	for i = 1, #client.owed_summaries do
+		if spooled_ids[client.owed_summaries[i].event.event_id] then kept = kept + 1 end
+	end
+	assert_equal(kept, 2, "the cap kept both entries whose copy is on disk")
+	local old_anon = client.anonymous_id
+	client.queue.limit = 50
+	next_status = 202
+	for _ = 1, 5 do
+		if #client.owed_summaries == 0 and #client.queue.items == 0 then break end
+		client:flush()
+	end
+	local ok = client:set_anonymous_id("anon-rotated")
+	local old_left = 0
+	for i = 1, #client.spool_record do
+		local env = client.spool_record[i]
+		if env.anonymous_id == old_anon and not client.spool_settled[env.event_id] then
+			old_left = old_left + 1
+		end
+	end
+	assert_true(not (ok and old_left > 0),
+		"the rotation guard never passes over an old-anon record on disk")
+	restore()
+	storage.reset()
 	end,
 	function()
 	-- The module-level getter is a VALUE read, so "no client" must read as nil,
