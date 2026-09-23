@@ -2757,6 +2757,19 @@ function Client:start_session(props, fact)
 	local previous_session_sequence = self.session_sequence
 	local previous_session_active = self.session_active
 
+	-- A LIVE RENEWAL ENDS the session it replaces, for the samplers too: its
+	-- perf and network summaries are built now, under its own id (they carry
+	-- it as their own session, so they start nothing), before the id changes
+	-- under them. An ended session's were built at its end (session_end).
+	if previous_session_active then
+		self:enqueue_summaries()
+	end
+	-- The new session's perf window starts with it. Frames are only sampled
+	-- while a session is open, so an empty sampler here holds nothing to keep.
+	if #self.perf.frames == 0 then
+		self.perf.start_ms = clock.unix_ms()
+	end
+
 	self.session_id = "session-" .. id.uuid()
 	self.session_sequence = 0
 	self.session_active = true
@@ -2772,15 +2785,17 @@ function Client:start_session(props, fact)
 		-- per SESSION: an explicit session renewal re-arms it, so a
 		-- still-applied assignment emits one exposure into the new session
 		-- (with its own deterministic id) on the next application sweep.
-		-- Whether this start is a genuine RENEWAL (any session — lazy or
-		-- explicit — existed before it) decides what happens to owed
-		-- pre-session exposure snapshots: the first real session adopts
-		-- them; a renewal preserves them as prior sessions' facts — and
-		-- stamps any still-unattributed pre-session snapshot with the
-		-- PREVIOUS session's id (the lazy first session it lived through),
-		-- which the renewal path needs the id itself for.
+		-- Whether this start is a genuine RENEWAL (a session — lazy or
+		-- explicit — is OPEN) decides what happens to owed pre-session
+		-- exposure snapshots: the first real session adopts them; a renewal
+		-- preserves them as prior sessions' facts — and stamps any
+		-- still-unattributed pre-session snapshot with the PREVIOUS
+		-- session's id (the lazy first session it lived through), which the
+		-- renewal path needs the id itself for. A start after an END is not a
+		-- renewal: the end already attributed what lived through the ended
+		-- session, and what was armed after it belongs to this one.
 		self.experiments:on_session_renewed(
-			previous_session_id ~= nil, previous_session_id)
+			previous_session_active == true, previous_session_id)
 	end
 	return true
 end
@@ -2802,6 +2817,7 @@ function Client:session_end(reason)
 		-- teardown (the same posture as shutdown) so session state never
 		-- stays stuck active for a consent-blocked user.
 		self.session_active = false
+		self:close_ended_session()
 		return true
 	end
 	local ok, err = self:track("app.session_ended", { reason = reason or "session_end" })
@@ -2809,7 +2825,20 @@ function Client:session_end(reason)
 		return false, err
 	end
 	self.session_active = false
+	self:close_ended_session()
 	return true
+end
+
+-- ⚠ NOTHING OF AN ENDED SESSION CROSSES INTO THE NEXT ONE. Its perf and
+-- network summaries are built now, under its own id and bounded at its end
+-- (shutdown ends the session before its final flush, so they still describe
+-- the ended session there), and the experiments plane attributes what lived
+-- through it. The next session starts with empty samplers.
+function Client:close_ended_session()
+	self:enqueue_summaries()
+	if self.experiments then
+		self.experiments:on_session_ended(self.session_id)
+	end
 end
 
 function Client:screen_view(screen_name, props)
@@ -3142,10 +3171,11 @@ function Client:enqueue_event(event_name, props, context, fact)
 	-- starts nothing: a late-drained experiment fact rides the session it was
 	-- armed in, a summary the one that collected it. session_start's own
 	-- event cannot recurse here: it marks the session active before tracking.
+	-- Any source: a backend client that explicitly opened and ended a session
+	-- renews too, and one that never opened a session has no ended id to owe.
 	local carries_own_session = fact ~= nil
 		and type(fact.session_id) == "string" and fact.session_id ~= ""
-	if not carries_own_session and self.config.source ~= "backend"
-		and self.session_id ~= nil and not self.session_active then
+	if not carries_own_session and self.session_id ~= nil and not self.session_active then
 		local started, start_err = self:start_session(nil, { retryable = true })
 		if not started then
 			-- Refused WITH its start, never filed under the ended session.

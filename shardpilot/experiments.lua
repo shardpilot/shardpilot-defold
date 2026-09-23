@@ -1185,19 +1185,48 @@ function Experiments:adopt_minted_subject_id()
 	return minted
 end
 
+-- ⚠ THE SESSION ENDED, and nothing opened yet. Two kinds of owed snapshot
+-- must not be confused afterwards:
+--   * one armed with no session id under THIS session's marker lived through
+--     the session that ended (a pre-session snapshot of a lazily opened
+--     session), so it takes that session's id now;
+--   * one armed AFTER the end belongs to the NEXT session.
+-- The marker rotates to tell them apart, and the next session's start
+-- migrates the second kind into itself (is_renewal = false). Stamping them
+-- with the ended session instead, while the start re-armed the assignment,
+-- was one application exposed twice: once under a session that had already
+-- ended, once in the new one.
+function Experiments:on_session_ended(ended_session_id)
+	if type(ended_session_id) == "string" and ended_session_id ~= "" then
+		for _, list in pairs(self.pending_exposure) do
+			for i = 1, #list do
+				if list[i].session_id == nil and list[i].session == self.session_marker then
+					list[i].session_id = ended_session_id
+				end
+			end
+		end
+	end
+	self.session_marker = id.uuid()
+	self.exposed = {}
+end
+
 -- A renewed analytics session (an explicit session_start) re-arms the
 -- once-per-SESSION exposure contract: the session marker rotates so each
 -- session derives its own deterministic ids, the de-dupe map resets, and
 -- every still-applied assignment re-exposes on its next application sweep —
 -- exactly like a cache-restored assignment does at launch.
--- `is_renewal` distinguishes a genuine renewal (a session existed in this
--- process — lazily or explicitly started) from the process's FIRST explicit
--- session_start: owed snapshots armed under the pre-session constructor
+-- `is_renewal` distinguishes a genuine renewal (a session is OPEN — lazily or
+-- explicitly started) from the process's FIRST explicit session_start: owed snapshots armed under the pre-session constructor
 -- marker (cache restores in the common init-then-start-session launch flow)
 -- belong to that first real session — no session existed for them to have
 -- run in — so they MIGRATE to it instead of a duplicate being queued. A
 -- genuine renewal preserves prior sessions' owed snapshots untouched: those
 -- treatments really ran in their sessions.
+--
+-- A start that follows an END (on_session_ended above) is not a renewal: no
+-- session is open to renew. The client passes is_renewal = false for it, so
+-- snapshots armed after the end MIGRATE to the new session like a first
+-- session's.
 function Experiments:on_session_renewed(is_renewal, previous_session_id)
 	local previous = self.session_marker
 	self.session_marker = id.uuid()

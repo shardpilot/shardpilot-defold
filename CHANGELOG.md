@@ -12,6 +12,16 @@
   exactly one `app.session_ended`. After an end, a background `update()` tick
   opens no session, and a drop-time experiment capture is refused, as before
   any session exists.
+- Nothing of an ended session crosses into the next one:
+  - A session's perf and network summaries are built when it ends (or when an
+    explicit `session_start()` replaces it), under its own id, and the next
+    session starts with empty samplers.
+  - An experiment assignment applied after an end is exposed once, in the next
+    session. It used to be exposed twice when its first emission was held
+    back, once under the session that had already ended.
+  - A backend-source client that explicitly opened and ended a session renews
+    on its next event like any other; one that never opened a session still
+    has none.
 - Keep the last accepted consent plan's `operation_blocks` through strict
   fallbacks and ordinary `consent_policy.invalidate()` calls. Each newer
   accepted plan replaces the entire set, including an empty set. Selecting a

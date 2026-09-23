@@ -7604,6 +7604,72 @@ function extra_tests.test_regrant_after_end_is_exposed_once_in_the_new_session()
 	assert_equal(exposures[1].session_id, client.session_id, "in the session that opened after it")
 end
 
+-- WHAT LIVED THROUGH AN ENDED SESSION IS EXPOSED IN IT. A cache-restored
+-- (pre-session) snapshot lives through the lazily opened first session; when
+-- that session ends before any tick drained it, it is attributed to that
+-- session at the end, and the tick exposes it there without opening a session.
+function extra_tests.test_snapshot_that_lived_through_an_ended_session_is_exposed_in_it()
+	reset()
+	local restore = install_fake_sys_storage()
+	local first = granted_client()
+	next_response_body = assignment_body()
+	fetch(first, "exp-checkout")
+
+	local second = assert(sdk.new(config()))
+	assert_true(second:track("host_event"))
+	local lived = second.session_id
+	assert_true(second:session_end("complete"))
+	local starts = #queued_events(second, "app.session_started")
+	for _ = 1, 3 do
+		advance_seconds(1)
+		second:update(1)
+	end
+	local exposures = queued_events(second, "experiment_exposure")
+	assert_equal(#exposures, 1, "the restored application is exposed once")
+	assert_equal(exposures[1].session_id, lived, "in the session it lived through")
+	assert_equal(#queued_events(second, "app.session_started"), starts, "and no session was opened for it")
+	restore()
+end
+
+-- AN OWED SNAPSHOT FROM THE ENDED SESSION AND ONE ARMED AFTER IT STAY APART.
+-- The marker rotates at the end, so the next session's start migrates only the
+-- snapshot armed after the end; the one that lived through the ended session
+-- keeps that session. Each application is exposed once, in its own session.
+function extra_tests.test_ended_and_next_session_snapshots_stay_apart()
+	reset()
+	local restore = install_fake_sys_storage()
+	local first = granted_client()
+	next_response_body = assignment_body()
+	fetch(first, "exp-checkout")
+
+	local second = assert(sdk.new(config({ buffer_size = 3 })))
+	assert_true(second:track("host_event"))
+	local lived = second.session_id
+	assert_true(second:track("filler"))
+	assert_true(second:session_end("complete"))   -- the queue is full now
+	advance_seconds(1)
+	second:update(1)                                -- the lived-through exposure is owed
+	next_response_body = assignment_body({ version = 4 })
+	fetch(second, "exp-checkout")                   -- a new application, after the end
+	assert_equal(#queued_events(second, "experiment_exposure"), 0, "both are owed")
+
+	second.queue.items = {}
+	second.queue.limit = 20
+	assert_true(second:track("host_next"))
+	local next_session = second.session_id
+	for _ = 1, 5 do
+		advance_seconds(1)
+		second:update(1)
+	end
+	local by_session = {}
+	for _, event in ipairs(queued_events(second, "experiment_exposure")) do
+		by_session[event.session_id] = (by_session[event.session_id] or 0) + 1
+	end
+	assert_equal(by_session[lived], 1, "the lived-through application in the ended session")
+	assert_equal(by_session[next_session], 1, "the application after the end in the next one")
+	restore()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -7791,6 +7857,8 @@ local tests = {
 	extra_tests.test_assignment_after_end_is_exposed_once_in_the_new_session,
 	extra_tests.test_assignment_after_end_under_a_full_queue_is_exposed_once,
 	extra_tests.test_regrant_after_end_is_exposed_once_in_the_new_session,
+	extra_tests.test_snapshot_that_lived_through_an_ended_session_is_exposed_in_it,
+	extra_tests.test_ended_and_next_session_snapshots_stay_apart,
 }
 
 for _, test in ipairs(tests) do
