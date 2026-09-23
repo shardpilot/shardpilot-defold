@@ -284,8 +284,17 @@ function M.flush()
 	return with_default("flush")
 end
 
+-- Forward every window event the host's listener receives (the engine allows
+-- one listener). A background signal snapshots like persist() and records a
+-- pause; a foreground signal ends a session paused for session_timeout_seconds
+-- or longer and starts the next one.
+function M.on_window_event(event)
+	return with_default("on_window_event", event)
+end
+
 -- Snapshot undelivered events into the durable offline spool without sending
--- or tearing down — wire this to a window focus-lost/iconify listener.
+-- or tearing down. on_window_event does this on a background signal; call it
+-- directly only where the host has no window listener to forward.
 function M.persist()
 	return with_default("persist")
 end

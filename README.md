@@ -37,7 +37,10 @@ not the platform boundary.
   de-duplicates re-sends. See [Offline durability](#offline-durability-event-spool).
 - Emits canonical helpers: `session_start()` → `app.session_started`,
   `session_end([reason])` → `app.session_ended` (the next event after an end
-  opens a new session), `screen_view(name)` → `app.screen_view`, the typed
+  opens a new session; **Unreleased:** a background stay of
+  `session_timeout_seconds` or longer ends the session at the resume, when the
+  host forwards its window events to `on_window_event` — see
+  [Offline durability](#offline-durability-event-spool)), `screen_view(name)` → `app.screen_view`, the typed
   progression verbs
   *(new in `v0.10.2`)*
   `track_level_start(level_id, attempt)` → `level_start`,
@@ -618,6 +621,7 @@ README, `docs/`, and the skill above are the reference.
 | `rejection_capacity` | `64` *(new in `v0.10.2`)* | Retained per-event rejection entries (positive integer); see [Batch verdicts](#batch-verdicts). |
 | `buffer_size` | `1000` | Max queued events (≥1); cross-SDK canonical default |
 | `flush_interval_seconds` | `15` (was `1`) *(new in `v0.10.2`)* | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value *(new in `v0.10.2`)*. |
+| `session_timeout_seconds` | `30` **Unreleased** | A background stay this long or longer (>0) ends the session at the resume, stamped at the moment the stay reached it (`reason = "idle_timeout"`), and starts the next session. Needs the host to forward window events to `on_window_event`. |
 | `publish_timeout_seconds` | `2` | Per-request timeout (>0) |
 | `request_compression_enabled` | `true` *(new in `v0.10.2`)* | Compress analytics batch bodies over 1 KiB with `Content-Encoding: deflate` (RFC 1950 zlib — see [Request compression](#request-compression)). Sub-threshold bodies go uncompressed: zlib framing makes a single-event batch bigger, not smaller. No-op on engine versions without the `zlib` module. |
 | `token_refresh_lead_ms` | `60000` | Refresh lead before token expiry (≥0) |
@@ -829,22 +833,50 @@ re-sends historic-identity envelopes unchanged. Disabling the spool
 next init. The spool stores only the envelope fields that were already bound
 for the wire — never tokens. See [`docs/privacy.md`](docs/privacy.md).
 
-**Recommended: snapshot on focus loss.** The SDK never installs global
-listeners itself, so call `persist()` from your window listener — on mobile an
-iconified app can be killed without `final()` ever running. Note that Defold
-keeps a **single** window listener (`window.set_listener` replaces any
-previously set one), so add the `persist()` branch inside your existing
+**Recommended: forward your window events.** The SDK never installs global
+listeners itself — on mobile an iconified app can be killed without `final()`
+ever running. Defold keeps a **single** window listener (`window.set_listener`
+replaces any previously set one), so add the call inside your existing
 listener rather than registering a new one:
 
 <!-- doc-region: none -- the Defold window listener, quoted from the engine API rather than from the example -->
 ```lua
 window.set_listener(function(self, event, data)
   -- ... your existing resize/focus/iconify handling ...
-  if event == window.WINDOW_EVENT_ICONFIED or event == window.WINDOW_EVENT_FOCUS_LOST then
-    shardpilot.persist() -- snapshot undelivered events; delivery continues normally
-  end
+  shardpilot.on_window_event(event)
 end)
 ```
+
+**Unreleased.** `on_window_event` does what `persist()` does on a background
+signal (and returns its result), and it drives the automatic session boundary:
+
+- **Which events count.** On mobile and web, focus lost and gained. On desktop,
+  only iconify and deiconify: a focus loss there is alt-tab, and the game keeps
+  running. The engine exports the iconify constant as `WINDOW_EVENT_ICONFIED`,
+  while its documentation spells `WINDOW_EVENT_ICONIFIED`; either is accepted.
+  Other events are ignored.
+- **The boundary.** A background signal records a pause of the open session.
+  On the foreground signal, a stay of `session_timeout_seconds` (30 s) or
+  longer ends that session with `reason = "idle_timeout"`. The end is stamped
+  at pause + timeout, never before the session's own last event. The next
+  session starts at once. Host activity that arrives past the deadline, before
+  the foreground signal, runs the boundary first. Below the timeout, nothing
+  happens. The startup focus gain is nothing.
+- **What it never does.** A session you ended or replaced during the stay is
+  not ended by it. `session_end()` or `shutdown()` over an expired pause gives
+  that single end, and opens no session only to end it. A `session_start()`
+  over an expired pause ends the timed-out session first, then starts the one
+  next session. With consent not granted, it closes the session locally and
+  sends nothing.
+- **Elapsed time** is the larger of wall time and the summed `update(dt)`, so
+  a backward clock correction is covered while frames run (a minimised desktop
+  game).
+- ⚠ **Limit: a backward clock correction during a mobile stay.** No frames
+  run while a mobile app is suspended, and pure Lua reaches no monotonic clock.
+  So a backward wall-clock correction during a mobile background stay can hide
+  an expired boundary, and the two sessions merge.
+- ⚠ **Limit: a kill in the background.** An app killed in the background sends
+  no end. Its session ends at its last event.
 
 Events persisted this way are removed from the spool as soon as their normal
 delivery is acknowledged, so the snapshot costs nothing when the app keeps

@@ -9242,6 +9242,403 @@ local tests = {
 	assert_equal(client.session_sequence, 3, "and the new session's counter did not move")
 	end,
 	function()
+	-- BOUNDARY: A RESUME BELOW THE TIMEOUT CHANGES NOTHING. The session paused
+	-- on a background signal continues; no end, no start.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
+		WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
+	local function named(client, name)
+		local out = {}
+		for _, event in ipairs(client.queue.items) do
+			if event.event_name == name then out[#out + 1] = event end
+		end
+		return out
+	end
+	window = W
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	socket.now = socket.now + 10
+	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+	assert_true(client:track("after"))
+	assert_equal(#named(client, "app.session_ended"), 0, "no end below the timeout")
+	assert_equal(#named(client, "app.session_started"), 1, "and no new start")
+	assert_equal(client.session_id, a, "the session continues")
+	window = nil
+	end,
+	function()
+	-- BOUNDARY: A RESUME AT OR PAST THE TIMEOUT ENDS THE PAUSED SESSION AT THE
+	-- LOGICAL BOUNDARY (pause + 30 s, reason idle_timeout) AND STARTS THE NEXT ONE
+	-- AT ONCE, before anything the host does after the resume.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
+		WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
+	local function named(client, name)
+		local out = {}
+		for _, event in ipairs(client.queue.items) do
+			if event.event_name == name then out[#out + 1] = event end
+		end
+		return out
+	end
+	window = W
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	assert_true(client:track("before"))
+	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	local paused_ms = client.paused.wall_ms
+	socket.now = socket.now + 40
+	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+	assert_equal(#named(client, "app.session_started"), 2,
+		"the next session starts at the resume, not at the next event")
+	assert_true(client:track("after"))
+	local ends = named(client, "app.session_ended")
+	assert_equal(#ends, 1, "one end")
+	assert_equal(ends[1].session_id, a, "of the paused session")
+	assert_equal(ends[1].props.reason, "idle_timeout")
+	assert_equal(ends[1].event_ts, os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor((paused_ms + 30000) / 1000)),
+		"stamped at the pause plus the timeout, not at the resume")
+	local starts = named(client, "app.session_started")
+	assert_equal(#starts, 2, "and the next session started")
+	local b = starts[2].session_id
+	assert_true(b ~= a, "a new session")
+	assert_equal(client.session_id, b)
+	local after = named(client, "after")[1]
+	assert_equal(after.session_id, b, "what the host does after the resume lands in it")
+	local order = {}
+	for i, event in ipairs(client.queue.items) do order[event.event_name .. (event.session_id == b and "@b" or "@a")] = i end
+	assert_true(order["app.session_ended@a"] < order["app.session_started@b"], "the end precedes the start")
+	window = nil
+	end,
+	function()
+	-- BOUNDARY: A SECOND BACKGROUND SIGNAL KEEPS THE FIRST PAUSE. Its deadline is
+	-- measured from when the session was first left, not moved later by a
+	-- repeated signal.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2 }
+	window = W
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	socket.now = socket.now + 20
+	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	socket.now = socket.now + 20
+	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+	local ended = 0
+	for _, event in ipairs(client.queue.items) do
+		if event.event_name == "app.session_ended" then ended = ended + 1 end
+	end
+	assert_equal(ended, 1, "40 s since the session was left is past the timeout")
+	window = nil
+	end,
+	function()
+	-- BOUNDARY: THE STARTUP FOCUS GAIN IS NOTHING. The engine sends a focus
+	-- gain when the game starts; a foreground with no recorded pause is neither
+	-- a boundary nor anything else.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
+		WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
+	local function named(client, name)
+		local out = {}
+		for _, event in ipairs(client.queue.items) do
+			if event.event_name == name then out[#out + 1] = event end
+		end
+		return out
+	end
+	window = W
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local before = #client.queue.items
+	socket.now = socket.now + 40
+	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+	assert_equal(#client.queue.items, before, "nothing was queued")
+	assert_true(client.session_active, "and the session is untouched")
+	window = nil
+	end,
+	function()
+	-- BOUNDARY: ON DESKTOP, ICONIFY IS THE BACKGROUND, IN EITHER SPELLING, AND A
+	-- FOCUS LOSS IS NOT. The engine exports the iconify constant misspelt
+	-- (WINDOW_EVENT_ICONFIED) while its prose documents WINDOW_EVENT_ICONIFIED;
+	-- the SDK accepts whichever the engine defines. Alt-tab keeps playing.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
+		WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
+	local function named(client, name)
+		local out = {}
+		for _, event in ipairs(client.queue.items) do
+			if event.event_name == name then out[#out + 1] = event end
+		end
+		return out
+	end
+	for _, spelling in ipairs({ "WINDOW_EVENT_ICONFIED", "WINDOW_EVENT_ICONIFIED" }) do
+		window = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2, WINDOW_EVENT_DEICONIFIED = 4 }
+		window[spelling] = 3
+		reset()
+		seed_granted_consent()
+		local client = assert(sdk.new(config({ platform = "windows", flush_interval_seconds = 9999 })))
+		assert_true(client:session_start())
+		client:on_window_event(1)
+		socket.now = socket.now + 40
+		assert_true(client:on_window_event(2))
+		assert_equal(#named(client, "app.session_ended"), 0, spelling .. ": a focus loss is not a background on desktop")
+		client:on_window_event(3)
+		socket.now = socket.now + 40
+		assert_true(client:on_window_event(4))
+		assert_equal(#named(client, "app.session_ended"), 1, spelling .. ": iconify is")
+	end
+	window = nil
+	end,
+	function()
+	-- BOUNDARY: A SESSION REPLACED BEFORE THE RESUME IS NOT ENDED BY IT. The
+	-- boundary ends only the session it paused, which it holds by reference.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
+		WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
+	local function named(client, name)
+		local out = {}
+		for _, event in ipairs(client.queue.items) do
+			if event.event_name == name then out[#out + 1] = event end
+		end
+		return out
+	end
+	window = W
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	assert_true(client:session_start())
+	local b = client.session_id
+	socket.now = socket.now + 40
+	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+	assert_equal(#named(client, "app.session_ended"), 0, "no idle end for a session the host replaced")
+	assert_equal(client.session_id, b, "and the replacement stays open")
+	window = nil
+	end,
+	function()
+	-- BOUNDARY: HOST ACTIVITY PAST THE DEADLINE, STILL IN THE BACKGROUND,
+	-- ROTATES FIRST. An event accepted after the deadline used to land in the
+	-- session that had already timed out.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
+		WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
+	local function named(client, name)
+		local out = {}
+		for _, event in ipairs(client.queue.items) do
+			if event.event_name == name then out[#out + 1] = event end
+		end
+		return out
+	end
+	window = W
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	socket.now = socket.now + 40
+	assert_true(client:track("late"))
+	local ends = named(client, "app.session_ended")
+	assert_equal(#ends, 1, "the boundary ran first")
+	assert_equal(ends[1].session_id, a)
+	local late = named(client, "late")[1]
+	assert_true(late.session_id ~= a, "the event is in the next session")
+	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+	assert_equal(#named(client, "app.session_ended"), 1, "and the resume ends nothing more")
+	assert_equal(#named(client, "app.session_started"), 2)
+	window = nil
+	end,
+	function()
+	-- BOUNDARY: AN EXPLICIT session_start() PAST THE DEADLINE ENDS THE PAUSED
+	-- SESSION FIRST. It replaced the timed-out session as a live renewal, which
+	-- emits no end, and finalized its samples at the new start, after its own
+	-- deadline.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2 }
+	window = W
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	client:update(0.016)
+	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	socket.now = socket.now + 40
+	assert_true(client:session_start())
+	local ended, starts, perf = nil, 0, nil
+	for _, event in ipairs(client.queue.items) do
+		if event.event_name == "app.session_ended" then ended = event end
+		if event.event_name == "app.session_started" then starts = starts + 1 end
+		if event.event_name == "perf_summary" then perf = event end
+	end
+	assert_true(ended ~= nil and ended.session_id == a, "the timed-out session is ended")
+	assert_equal(ended.props.reason, "idle_timeout")
+	assert_equal(perf.event_ts, ended.event_ts, "its samples are stamped at its end")
+	assert_equal(starts, 2, "and the host's start is the one next session")
+	window = nil
+	end,
+	function()
+	-- BOUNDARY: WITH CONSENT NOT GRANTED, THE BOUNDARY IS A LOCAL TEARDOWN.
+	-- Nothing reaches the queue; the session is closed.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
+		WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
+	local function named(client, name)
+		local out = {}
+		for _, event in ipairs(client.queue.items) do
+			if event.event_name == name then out[#out + 1] = event end
+		end
+		return out
+	end
+	window = W
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	client:set_consent(false)
+	client.queue.items = {}
+	socket.now = socket.now + 40
+	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+	assert_equal(#client.queue.items, 0, "nothing on the wire")
+	assert_equal(client.session_active, false, "the paused session is closed")
+	window = nil
+	end,
+	function()
+	-- BOUNDARY: A BACKWARD WALL-CLOCK CORRECTION ON DESKTOP IS COVERED BY THE
+	-- FRAME TIME. Elapsed is the larger of wall time and summed update(dt); a
+	-- minimised desktop game keeps ticking, so the sum reaches the timeout.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
+		WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
+	local function named(client, name)
+		local out = {}
+		for _, event in ipairs(client.queue.items) do
+			if event.event_name == name then out[#out + 1] = event end
+		end
+		return out
+	end
+	window = W
+	reset()
+	seed_granted_consent()
+	-- The shared harness clock must stay positive and monotonic for the scenes
+	-- after this one, so the correction is taken back from a forward step.
+	socket.now = socket.now + 7200
+	local client = assert(sdk.new(config({ platform = "linux", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	client:on_window_event(W.WINDOW_EVENT_ICONFIED)
+	socket.now = socket.now - 3600
+	for _ = 1, 31 do client:update(1) end
+	assert_true(client:on_window_event(W.WINDOW_EVENT_DEICONIFIED))
+	local ends = named(client, "app.session_ended")
+	assert_equal(#ends, 1, "the frame time reached the timeout")
+	assert_equal(ends[1].session_id, a)
+	assert_equal(ends[1].props.reason, "idle_timeout")
+	local start = named(client, "app.session_started")[1]
+	assert_true(ends[1].event_ts >= start.event_ts,
+		"the end is never stamped before the session's own events, whatever the wall clock says")
+	window = nil
+	end,
+	function()
+	-- BOUNDARY, AN ACCEPTED LIMIT: A BACKWARD WALL-CLOCK CORRECTION DURING A
+	-- MOBILE BACKGROUND STAY CAN HIDE AN EXPIRED BOUNDARY, AND THE TWO SESSIONS
+	-- MERGE. No frames run while a mobile app is suspended, so the summed frame
+	-- time cannot cover the correction, and pure Lua reaches no monotonic clock.
+	-- Pinned so that closing it (a native clock) is a visible change.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
+		WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
+	local function named(client, name)
+		local out = {}
+		for _, event in ipairs(client.queue.items) do
+			if event.event_name == name then out[#out + 1] = event end
+		end
+		return out
+	end
+	window = W
+	reset()
+	seed_granted_consent()
+	socket.now = socket.now + 7200                      -- as above: net forward
+	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	socket.now = socket.now - 3600
+	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+	assert_equal(#named(client, "app.session_ended"), 0, "the correction hid the boundary")
+	assert_equal(client.session_id, a, "and the session continues across it")
+	window = nil
+	end,
+	function()
+	-- BOUNDARY AND SHUTDOWN END A SESSION ONCE. An expired pause met by
+	-- shutdown() is the boundary's end (idle_timeout, at the boundary instant);
+	-- shutdown opens no replacement just to end it.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
+		WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
+	local function named(client, name)
+		local out = {}
+		for _, event in ipairs(client.queue.items) do
+			if event.event_name == name then out[#out + 1] = event end
+		end
+		return out
+	end
+	window = W
+	reset()
+	seed_granted_consent()
+	next_status = 202
+	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	socket.now = socket.now + 40
+	assert_true(client:shutdown())
+	local ends, starts = {}, 0
+	for _, request in ipairs(requests) do
+		for _, event in ipairs(json_decode(request.body).events or {}) do
+			if event.event_name == "app.session_ended" then ends[#ends + 1] = event end
+			if event.event_name == "app.session_started" then starts = starts + 1 end
+		end
+	end
+	assert_equal(#ends, 1, "exactly one end")
+	assert_equal(ends[1].session_id, a)
+	assert_equal(ends[1].props.reason, "idle_timeout")
+	assert_equal(starts, 1, "and no session was opened only to be ended")
+	window = nil
+	end,
+	function()
+	-- BOUNDARY: THE PAUSED SESSION'S SAMPLES STAY IN IT, STAMPED AT ITS END. A
+	-- summary point while an expired pause is pending builds nothing; the
+	-- boundary finalizes the samples under the paused id, at the end instant, so
+	-- the session does not stretch past its own end.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
+		WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
+	local function named(client, name)
+		local out = {}
+		for _, event in ipairs(client.queue.items) do
+			if event.event_name == name then out[#out + 1] = event end
+		end
+		return out
+	end
+	window = W
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	client:update(0.016)
+	client:update(0.016)
+	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	socket.now = socket.now + 40
+	client:enqueue_summaries()
+	assert_equal(#named(client, "perf_summary"), 0, "no summary is built past the deadline")
+	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+	local ends = named(client, "app.session_ended")
+	local perf = named(client, "perf_summary")
+	assert_equal(#perf, 1, "the paused session's summary")
+	assert_equal(perf[1].session_id, a, "under its id")
+	assert_equal(perf[1].event_ts, ends[1].event_ts, "stamped at its end")
+	window = nil
+	end,
+	function()
 	-- AN OWED SUMMARY'S NUMBER IS RESERVED WHEN THE QUEUE REFUSES IT. persist()
 	-- wrote each still-refused summary with a tentative number that did not
 	-- advance its stream, so two summaries of one session reached the durable
