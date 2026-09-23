@@ -7695,6 +7695,53 @@ function extra_tests.test_backend_background_sweep_opens_no_session()
 	end
 end
 
+-- AN EXPLICIT EXPOSURE AFTER AN END IS AN EXTRA ONE, IN THE NEXT SESSION. The
+-- explicit path chose the post-end marker and its arm state before the owed
+-- start ran inside its own enqueue; the start re-armed the automatic exposure
+-- for the new session, and the explicit emission then wrote its stale state
+-- over it, so the sweep discarded the automatic fact as already emitted: one
+-- exposure where the call documents the automatic one plus an extra.
+function extra_tests.test_explicit_exposure_after_end_adds_to_the_automatic_one()
+	reset()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1, "exposed in the first session")
+	assert_true(client:session_end("complete"))
+	client.queue.items = {}
+	assert_true(client:track_exposure("exp-checkout"))
+	for _ = 1, 5 do
+		advance_seconds(1)
+		client:update(1)
+	end
+	local exposures = queued_events(client, "experiment_exposure")
+	assert_equal(#exposures, 2, "the automatic exposure and the explicit extra one")
+	assert_true(exposures[1].event_id ~= exposures[2].event_id, "with distinct ids")
+	for _, exposure in ipairs(exposures) do
+		assert_equal(exposure.session_id, client.session_id, "both in the new session")
+	end
+end
+
+-- ...AND A BACKEND CLIENT'S EXPLICIT EXPOSURE OPENS NOTHING. Opening early
+-- applies the enqueue's own rule: an SDK fact of a backend client never owes a
+-- start, so the explicit exposure after an end drains sessionless, as before.
+function extra_tests.test_backend_explicit_exposure_after_end_opens_no_session()
+	reset()
+	local client = granted_client({ source = "backend" })
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_true(client:session_end("complete"))
+	client.queue.items = {}
+	assert_true(client:track_exposure("exp-checkout"))
+	assert_equal(#queued_events(client, "app.session_started"), 0,
+		"the explicit exposure opened no session")
+	for _, exposure in ipairs(queued_events(client, "experiment_exposure")) do
+		assert_nil(exposure.session_id, "a backend exposure drains sessionless")
+	end
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -7885,6 +7932,8 @@ local tests = {
 	extra_tests.test_snapshot_that_lived_through_an_ended_session_is_exposed_in_it,
 	extra_tests.test_ended_and_next_session_snapshots_stay_apart,
 	extra_tests.test_backend_background_sweep_opens_no_session,
+	extra_tests.test_explicit_exposure_after_end_adds_to_the_automatic_one,
+	extra_tests.test_backend_explicit_exposure_after_end_opens_no_session,
 }
 
 for _, test in ipairs(tests) do

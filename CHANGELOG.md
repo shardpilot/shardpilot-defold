@@ -19,6 +19,9 @@
   - An experiment assignment applied after an end is exposed once, in the next
     session. It used to be exposed twice when its first emission was held
     back, once under the session that had already ended.
+  - A `track_exposure()` after an end opens the next session first, so it
+    yields the automatic exposure plus the explicit extra one, both in that
+    session. It used to yield only one.
   - A backend-source client that explicitly opened and ended a session renews
     on its next event like any other; one that never opened a session still
     has none. A backend client's own facts and summaries never open a
@@ -28,8 +31,12 @@
     accepted. A refused `session_start()` leaves the open session, its
     samples and its sequence exactly as they were.
   - A closing session always takes its samples with it, even while an older
-    summary is still owed. At most 8 built summaries are held for a full
-    queue; beyond that the oldest is dropped and counted in `dropped`.
+    summary is still owed. A summary held for a full queue is numbered in
+    the session that collected it when it finally drains, never from the next
+    session's counter. At most 8 built summaries are held for a full queue;
+    beyond that the oldest one without a durable copy is dropped and counted
+    in `dropped`. One that `persist()` has written to the spool is kept until
+    it is delivered, so an anonymous-id rotation still waits for it.
   - A ping or disconnect observed between an end and the next start is
     dropped. Samples taken before the first session are summarized in it.
 - Keep the last accepted consent plan's `operation_blocks` through strict

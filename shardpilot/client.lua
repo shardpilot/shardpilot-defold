@@ -1616,6 +1616,12 @@ function M.new(config)
 			analytics_anonymous_id = function()
 				return client.anonymous_id
 			end,
+			open_owed_session = function()
+				-- The fact shape emit() below gives an immediate exposure:
+				-- the same predicate, so the session opens exactly when that
+				-- enqueue would have opened it — only earlier.
+				return client:open_owed_session({ omit_user_id = true })
+			end,
 			emit = function(event_name, props, event_id, overrides)
 				-- `overrides` is the ARM-TIME identity of an owed fact
 				-- (an exposure drained late must ride the session, the
@@ -2938,10 +2944,10 @@ function Client:finalize_session(closing)
 	for _, build in ipairs(builds) do
 		local name, summary = build[1], build[2]
 		if summary then
-			local ok, err, refused = self:enqueue_event(name, summary, nil,
+			local ok, err, refused, stream = self:enqueue_event(name, summary, nil,
 				{ retryable = true, session_table = closing })
 			if not ok and err == "queue_full" and refused then
-				self:owe_summary(name, refused)
+				self:owe_summary(name, refused, stream)
 			end
 		end
 	end
@@ -3227,6 +3233,35 @@ end
 -- is kept and re-enqueued once room frees. Everything else — the
 -- consent-first gates, identity requirement, lazy session, queue caps —
 -- applies to facts exactly as to events.
+-- The owed start after an end (see enqueue_event), run by the next activity
+-- that does not carry its own session. `fact` is the fact the activity will
+-- enqueue with (nil for a host event). Returns true when nothing was owed or
+-- the start was accepted; a refused start refuses the activity WITH it, never
+-- filed under the ended session, and counts as the activity's drop unless the
+-- activity is retryable. The explicit exposure calls this BEFORE it reads the
+-- experiments marker, so the exposure's ids and arm state are the next
+-- session's (experiments emit_entry_exposure).
+function Client:open_owed_session(fact)
+	local carries_own_session = fact ~= nil
+		and (fact.session_table ~= nil
+			or (type(fact.session_id) == "string" and fact.session_id ~= ""))
+	local backend_internal = self.config.source == "backend" and fact ~= nil
+	if carries_own_session or backend_internal
+		or self.session ~= nil or self.ended_session == nil then
+		return true
+	end
+	local started, start_err = self:start_session(nil, { retryable = true })
+	if not started then
+		-- Today the start can only meet the same full queue the activity
+		-- would meet; this holds the rule for any other refusal.
+		if not (fact and fact.retryable) then
+			self.stats.dropped = self.stats.dropped + 1
+		end
+		return false, start_err
+	end
+	return true
+end
+
 function Client:enqueue_event(event_name, props, context, fact)
 	if not self.initialized then
 		self.stats.dropped = self.stats.dropped + 1
@@ -3282,22 +3317,9 @@ function Client:enqueue_event(event_name, props, context, fact)
 	-- session to owe. An SDK-internal fact of a backend client never owes one:
 	-- backend facts and summaries drain sessionless, and a background sweep
 	-- must not open a session no host activity asked for.
-	local carries_own_session = fact ~= nil
-		and (fact.session_table ~= nil
-			or (type(fact.session_id) == "string" and fact.session_id ~= ""))
-	local backend_internal = self.config.source == "backend" and fact ~= nil
-	if not carries_own_session and not backend_internal
-		and self.session == nil and self.ended_session ~= nil then
-		local started, start_err = self:start_session(nil, { retryable = true })
-		if not started then
-			-- Refused WITH its start, never filed under the ended session.
-			-- Today the start can only meet the same full queue this event
-			-- would meet; this holds the rule for any other refusal.
-			if not (fact and fact.retryable) then
-				self.stats.dropped = self.stats.dropped + 1
-			end
-			return false, start_err
-		end
+	local opened, open_err = self:open_owed_session(fact)
+	if not opened then
+		return false, open_err
 	end
 	-- The server requires session_id for non-backend sources; an event tracked
 	-- before session_start() would otherwise ship with no session_id and the
@@ -3388,8 +3410,9 @@ function Client:enqueue_event(event_name, props, context, fact)
 		-- enqueue_summaries can retain it as an owed snapshot: a summary
 		-- must replay under the identity and session it was built with —
 		-- never re-stamped with whatever actor is current when the queue
-		-- finally frees. Other callers ignore the extra value.
-		return false, "queue_full", event
+		-- finally frees — and be numbered in the stream it was stamped
+		-- from, which rides with it. Other callers ignore the extra values.
+		return false, "queue_full", event, stream
 	end
 	stream.sequence = event.session_sequence
 	if opened_lazy_session then
@@ -3500,10 +3523,12 @@ end
 -- instead of re-tracking under whatever actor/session is current at drain
 -- time — an identify() or anon rotation between refusal and drain must not
 -- misattribute samples collected under the old actor/session. The ONE
--- enqueue-time field is session_sequence: exactly like a late-drained
--- experiment fact, it stays the enqueue stream's counter (the refusal-time
--- number was never committed, so later events may have claimed it — the
--- server's cross-session ordering key is the timestamp).
+-- enqueue-time field is session_sequence, and it is taken from the stream the
+-- summary was stamped from (entry.stream), never the current one: a closing
+-- session's summary that drains after the next session opened is the ended
+-- session's next event, not a number from the new session's counter under
+-- the old id. The refusal-time number was never committed, so the counter is
+-- read again at drain.
 function Client:enqueue_owed_summary(entry)
 	if not self.initialized then
 		return false, "shutdown"
@@ -3515,7 +3540,7 @@ function Client:enqueue_owed_summary(entry)
 		return false, "consent_unknown"
 	end
 	local event = entry.event
-	local stream = self:sequence_stream()
+	local stream = entry.stream or self:sequence_stream()
 	event.session_sequence = stream.sequence + 1
 	if not queue.push(self.queue, event) then
 		-- Still owed — never counted dropped here: like a retryable owed
@@ -3593,32 +3618,50 @@ function Client:enqueue_summaries()
 	-- finalize_session from its own value.
 	local perf = sampling.perf_summary(self.perf)
 	if perf then
-		local ok, err, refused = self:enqueue_event("perf_summary", perf, nil,
+		local ok, err, refused, stream = self:enqueue_event("perf_summary", perf, nil,
 			{ retryable = true })
 		if not ok and err == "queue_full" and refused then
-			self:owe_summary("perf_summary", refused)
+			self:owe_summary("perf_summary", refused, stream)
 		end
 	end
 	local network = sampling.network_summary(self.network, self.config.transport)
 	if network then
-		local ok, err, refused = self:enqueue_event("network_summary", network,
+		local ok, err, refused, stream = self:enqueue_event("network_summary", network,
 			nil, { retryable = true })
 		if not ok and err == "queue_full" and refused then
-			self:owe_summary("network_summary", refused)
+			self:owe_summary("network_summary", refused, stream)
 		end
 	end
 end
 
 -- At most this many built summaries are held for a full queue. A closed
--- session can leave one of each kind; beyond the bound the OLDEST is dropped,
--- and counted, rather than holding every session's window in memory.
+-- session can leave one of each kind; beyond the bound the OLDEST entry
+-- without a durable copy is dropped, and counted, rather than holding every
+-- session's window in memory. Each entry keeps the stream it was stamped from,
+-- so it drains with that stream's next number (enqueue_owed_summary).
+--
+-- ⚠ AN ENTRY WITH A DURABLE COPY IS NEVER DROPPED. persist() writes owed
+-- entries to the spool as crash insurance and keeps the originals in memory,
+-- and a record written by this process is pending work ONLY through its
+-- original (spool_batches holds a previous launch's records). Dropping it
+-- left an old-identity envelope on disk that no guard saw: an anonymous-id
+-- rotation passed, and the next launch replayed it under the new id. Such an
+-- entry leaves by delivery, which also removes its record. Entries kept this
+-- way are bounded by the spool's own caps: a record the spool evicts makes its
+-- entry droppable again.
 local MAX_OWED_SUMMARIES = 8
 
-function Client:owe_summary(event_name, event)
-	self.owed_summaries[#self.owed_summaries + 1] = { event_name = event_name, event = event }
-	while #self.owed_summaries > MAX_OWED_SUMMARIES do
-		table.remove(self.owed_summaries, 1)
-		self.stats.dropped = self.stats.dropped + 1
+function Client:owe_summary(event_name, event, stream)
+	local owed = self.owed_summaries
+	owed[#owed + 1] = { event_name = event_name, event = event, stream = stream }
+	local i = 1
+	while #owed > MAX_OWED_SUMMARIES and i <= #owed do
+		if self.spool_index[owed[i].event.event_id] then
+			i = i + 1
+		else
+			table.remove(owed, i)
+			self.stats.dropped = self.stats.dropped + 1
+		end
 	end
 end
 

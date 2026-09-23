@@ -2074,6 +2074,20 @@ function Experiments:emit_entry_exposure(experiment_key, entry, rearm, snapshot)
 	if refusal then
 		return false, refusal
 	end
+	-- ⚠ AN IMMEDIATE EMISSION OPENS THE OWED SESSION BEFORE ANYTHING BELOW IS
+	-- READ. After an end, its enqueue would start the next session, and that
+	-- start rotates the marker and re-arms the automatic exposure. Read first,
+	-- the marker and arm state were the ended boundary's, and the state
+	-- written after the emission overwrote the new session's, so the sweep
+	-- discarded the automatic fact as already emitted. A snapshot carries its
+	-- own session and opens nothing. Skipped when no fact would be emitted.
+	if not snapshot and self.deps.open_owed_session
+		and type(entry.subject_fact_key) == "string" and entry.subject_fact_key ~= "" then
+		local opened, open_err = self.deps.open_owed_session()
+		if not opened then
+			return false, open_err
+		end
+	end
 	local marker = snapshot and snapshot.session or self.session_marker
 	local current_session = marker == self.session_marker
 	local tuple = exposure_tuple(experiment_key, entry)

@@ -9203,6 +9203,100 @@ local tests = {
 	storage.clear_spool(spool_scope)
 	end,
 	function()
+	-- AN OWED SUMMARY IS NUMBERED IN THE SESSION THAT COLLECTED IT. A closing
+	-- session's summary refused by a full queue drained after the next session
+	-- had opened, and took its number from the NEW session's counter while
+	-- keeping the old id: the ended session got a second event 4, its own end.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999, buffer_size = 4 })))
+	assert_true(client:session_start())                 -- A 1
+	local a = client.session_id
+	client:update(0.016)
+	client:update(0.016)
+	assert_true(client:track("a_2"))
+	assert_true(client:track("a_3"))
+	assert_true(client:session_end("complete"))         -- A 4, and the queue is full
+	assert_equal(client.ended_session.sequence, 4, "the old session ended at 4")
+	assert_true(#client.owed_summaries > 0, "its perf summary is owed")
+	local used = {}
+	for _, event in ipairs(client.queue.items) do
+		if event.session_id == a then used[event.session_sequence] = true end
+	end
+	client.queue.items = {}
+	assert_true(client:track("b_2"))                    -- B 1 and 2
+	assert_true(client:track("b_3"))                    -- B 3
+	assert_equal(client.session_sequence, 3, "the new session reached 3")
+	assert_true(client:drain_owed_summaries())
+	local drained = nil
+	for _, event in ipairs(client.queue.items) do
+		if event.event_name == "perf_summary" then drained = event end
+	end
+	assert_true(drained ~= nil, "the owed summary drained")
+	assert_equal(drained.session_id, a, "in the session that collected it")
+	assert_true(not used[drained.session_sequence],
+		"its number is not one the old session already used")
+	assert_equal(drained.session_sequence, 5, "it is the old session's fifth event")
+	assert_equal(client.session_sequence, 3, "and the new session's counter did not move")
+	end,
+	function()
+	-- THE OWED-SUMMARY CAP NEVER DROPS AN ENTRY WITH A DURABLE COPY. A summary
+	-- that persist() had written to the spool was dropped by the cap; its
+	-- in-memory original was the only pending-work signal for that spool
+	-- record, so once the rest drained a Mode B anonymous-id rotation passed its
+	-- guard with an old-anon envelope still on disk, to be replayed at the next
+	-- launch under a token bound to the new id.
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	next_status = 500
+	local client = assert(sdk.new(config({ buffer_size = 1, flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	client:update(0.016)
+	client:update(0.020)
+	client:observe_ping_ms(42)
+	assert_equal(client:flush(), false)
+	assert_equal(#client.owed_summaries, 2, "both built summaries are owed")
+	assert_true(client:track("filler_event"))
+	assert_true(client:persist(), "the owed summaries are durably captured")
+	local spooled_ids = {}
+	for i = 1, #client.owed_summaries do
+		spooled_ids[client.owed_summaries[i].event.event_id] = true
+	end
+	local template = client.owed_summaries[2].event
+	for i = 1, 7 do
+		local event = {}
+		for k, v in pairs(template) do event[k] = v end
+		event.event_id = "capped-" .. i
+		client:owe_summary("network_summary", event)
+	end
+	local kept = 0
+	for i = 1, #client.owed_summaries do
+		if spooled_ids[client.owed_summaries[i].event.event_id] then kept = kept + 1 end
+	end
+	assert_equal(kept, 2, "the cap kept both entries whose copy is on disk")
+	local old_anon = client.anonymous_id
+	client.queue.limit = 50
+	next_status = 202
+	for _ = 1, 5 do
+		if #client.owed_summaries == 0 and #client.queue.items == 0 then break end
+		client:flush()
+	end
+	local ok = client:set_anonymous_id("anon-rotated")
+	local old_left = 0
+	for i = 1, #client.spool_record do
+		local env = client.spool_record[i]
+		if env.anonymous_id == old_anon and not client.spool_settled[env.event_id] then
+			old_left = old_left + 1
+		end
+	end
+	assert_true(not (ok and old_left > 0),
+		"the rotation guard never passes over an old-anon record on disk")
+	restore()
+	storage.reset()
+	end,
+	function()
 	-- The module-level getter is a VALUE read, so "no client" must read as nil,
 	-- not as the false/"not_initialized" pair a command returns. A caller using
 	-- the documented `if id ~= nil then ... end` would otherwise treat false as a
