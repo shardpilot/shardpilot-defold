@@ -7487,6 +7487,40 @@ function test_belt_denial_flip_arms_intent_not_exposure()
 	storage.reset()
 end
 
+-- AFTER AN END, A BACKGROUND TICK OPENS NO SESSION. The next session is the
+-- host's to open: its next event starts it. A pre-session snapshot still owed
+-- when the session ends is held by the tick, as it is before the first
+-- session. Without that hold, the owed start would be discharged by an SDK
+-- tick: a session no host activity created.
+function extra_tests.test_ended_session_background_tick_opens_no_session()
+	reset()
+	local restore = install_fake_sys_storage()
+	local first = granted_client()
+	next_response_body = assignment_body()
+	fetch(first, "exp-checkout")
+
+	-- Relaunch: the restored assignment arms a PRE-SESSION snapshot. The
+	-- host's first event lazily opens the first session, and the session
+	-- ends before any tick has drained the snapshot.
+	local second = assert(sdk.new(config()))
+	assert_true(second:track("host_event"))
+	local ended = second.session_id
+	assert_true(second:session_end("complete"))
+	local starts = #queued_events(second, "app.session_started")
+	second:update(0.016)
+	second:update(0.016)
+	assert_equal(#queued_events(second, "app.session_started"), starts,
+		"the background tick opened no session after the end")
+	assert_nil(second:get_session_id(), "no session is current after the end")
+
+	assert_true(second:track("host_after_end"))
+	local after = queued_events(second, "host_after_end")[1]
+	assert_true(after.session_id ~= ended,
+		"the host's next event opens the next session")
+	assert_equal(#queued_events(second, "app.session_started"), starts + 1)
+	restore()
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -7670,6 +7704,7 @@ local tests = {
 	extra_tests.test_later_sentinel_cancels_covered_snapshot_write,
 	extra_tests.test_escaped_null_presence_keys_are_malformed,
 	extra_tests.test_spool_purge_clears_condemnation_debt,
+	extra_tests.test_ended_session_background_tick_opens_no_session,
 }
 
 for _, test in ipairs(tests) do

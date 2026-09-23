@@ -8824,6 +8824,130 @@ local tests = {
 	assert_true(type(client:get_session_id()) == "string", "a renewed session exposes its id again")
 	end,
 	function()
+	-- AFTER AN END, THE HOST'S NEXT EVENT OPENS A NEW SESSION, announced by its
+	-- own app.session_started. It used to carry the ENDED session's id, after
+	-- that session's app.session_ended: the lazy open fires only on a nil id,
+	-- and session_end keeps the id. A session's length is read from its first
+	-- and last events, so every event played after a manual end stretched the
+	-- ended session over it.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local ended = client.session_id
+	assert_true(client:track("before_end"))
+	assert_true(client:session_end("complete"))
+	assert_true(client:track("after_end"))
+
+	local items = client.queue.items
+	assert_equal(#items, 5, "start, before_end, end, the next session's start, after_end")
+	assert_equal(items[3].event_name, "app.session_ended")
+	assert_equal(items[3].session_id, ended)
+	assert_equal(items[4].event_name, "app.session_started",
+		"the event after an end announces the session it opens")
+	local renewed = items[4].session_id
+	assert_true(type(renewed) == "string" and renewed ~= ended, "a NEW session, not the ended one")
+	assert_equal(items[5].event_name, "after_end")
+	assert_equal(items[5].session_id, renewed)
+	assert_equal(items[4].session_sequence, 1)
+	assert_equal(items[5].session_sequence, 2)
+	assert_equal(client:get_session_id(), renewed, "and the new session is current")
+	end,
+	function()
+	-- THE RETAINED ID IS LOAD-BEARING. Shutdown ends the session first and
+	-- builds the perf and network summaries afterwards; they describe the
+	-- session that collected their samples and stay in it. Clearing the id at
+	-- the end would open a session for them instead.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config()))
+	assert_true(client:session_start())
+	local ended = client.session_id
+	client:update(0.016)
+	client:update(0.016)
+	client:observe_ping_ms(40)
+	assert_true(client:shutdown())
+
+	local summaries, starts = 0, 0
+	for _, request in ipairs(requests) do
+		for _, event in ipairs(json_decode(request.body).events or {}) do
+			if event.event_name == "perf_summary" or event.event_name == "network_summary" then
+				summaries = summaries + 1
+				assert_equal(event.session_id, ended, event.event_name .. " describes the ended session")
+			elseif event.event_name == "app.session_started" then
+				starts = starts + 1
+			end
+		end
+	end
+	assert_equal(summaries, 2, "both summaries were built at shutdown")
+	assert_equal(starts, 1, "and no session was opened for them")
+	end,
+	function()
+	-- A SECOND END IS A NO-OP: exactly one app.session_ended per session. It
+	-- used to emit a second end into the retained session; with the next
+	-- session now opened by the next event, it would open a session only to
+	-- end it.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	assert_true(client:session_end("complete"))
+	assert_true(client:session_end("again"))
+	local ends, starts = 0, 0
+	for _, event in ipairs(client.queue.items) do
+		if event.event_name == "app.session_ended" then ends = ends + 1 end
+		if event.event_name == "app.session_started" then starts = starts + 1 end
+	end
+	assert_equal(ends, 1, "exactly one end per session")
+	assert_equal(starts, 1, "and no session was opened to be ended")
+	end,
+	function()
+	-- A REFUSED START REFUSES THE EVENT THAT OWED IT. Today the start can only
+	-- meet the same full queue the event would meet, so the event's own push
+	-- would refuse it anyway; this pins the rule for a refusal that is not a
+	-- full queue, so the event never lands in the ended session.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local ended = client.session_id
+	assert_true(client:session_end("complete"))
+	local before = #client.queue.items
+	client.session_start = function()
+		return false, "start_refused_for_test"
+	end
+	local ok, err = client:track("after_end")
+	client.session_start = nil
+	assert_equal(ok, false, "the event is refused with its start")
+	assert_equal(err, "start_refused_for_test")
+	assert_equal(#client.queue.items, before, "and nothing landed in the ended session")
+	assert_true(client:track("after_end"))
+	local last = client.queue.items[#client.queue.items]
+	assert_equal(last.event_name, "after_end")
+	assert_true(last.session_id ~= ended, "a later event opens the next session")
+	end,
+	function()
+	-- A DROP-TIME EXPERIMENT CAPTURE AFTER AN END REFUSES, as it does with no
+	-- session at all. It read the retained id and spooled the fact into the
+	-- ended session. A capture that carries its arm-time session keeps it.
+	reset()
+	seed_granted_consent()
+	storage.clear_spool(spool_scope)
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_enabled = true })))
+	assert_true(client:session_start())
+	assert_true(client:session_end("complete"))
+	assert_equal(client:capture_experiment_fact("experiment_exposure",
+		{ experiment_key = "exp" }, "fact-after-end", {}), false,
+		"no session is open to capture into")
+	for _, env in ipairs(storage.load_spool(spool_scope)) do
+		assert_true(env.event_id ~= "fact-after-end", "nothing was captured into the ended session")
+	end
+	assert_true(client:capture_experiment_fact("experiment_exposure",
+		{ experiment_key = "exp" }, "fact-armed", { session_id = "session-armed" }),
+		"the arm-time session still decides when the fact carries one")
+	storage.clear_spool(spool_scope)
+	end,
+	function()
 	-- The module-level getter is a VALUE read, so "no client" must read as nil,
 	-- not as the false/"not_initialized" pair a command returns. A caller using
 	-- the documented `if id ~= nil then ... end` would otherwise treat false as a
