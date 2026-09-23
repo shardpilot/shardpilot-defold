@@ -8913,11 +8913,11 @@ local tests = {
 	local ended = client.session_id
 	assert_true(client:session_end("complete"))
 	local before = #client.queue.items
-	client.session_start = function()
+	client.start_session = function()
 		return false, "start_refused_for_test"
 	end
 	local ok, err = client:track("after_end")
-	client.session_start = nil
+	client.start_session = nil
 	assert_equal(ok, false, "the event is refused with its start")
 	assert_equal(err, "start_refused_for_test")
 	assert_equal(#client.queue.items, before, "and nothing landed in the ended session")
@@ -8925,6 +8925,22 @@ local tests = {
 	local last = client.queue.items[#client.queue.items]
 	assert_equal(last.event_name, "after_end")
 	assert_true(last.session_id ~= ended, "a later event opens the next session")
+	end,
+	function()
+	-- A REFUSED OWED START IS NOT A DROPPED EVENT: the next event retries it.
+	-- A host event refused together with its start counts ONCE, as any
+	-- refused event does. Counting the start as well made one refused event
+	-- read as two drops, and a refused retryable experiment fact as one.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999, buffer_size = 2 })))
+	assert_true(client:session_start())
+	assert_true(client:session_end("complete"))
+	local before = client:snapshot().dropped
+	local ok, err = client:track("after_end")
+	assert_equal(ok, false, "the full queue refuses the start, and the event with it")
+	assert_equal(err, "queue_full")
+	assert_equal(client:snapshot().dropped, before + 1, "one refused event, not its start as well")
 	end,
 	function()
 	-- A DROP-TIME EXPERIMENT CAPTURE AFTER AN END REFUSES, as it does with no

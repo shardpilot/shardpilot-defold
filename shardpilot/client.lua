@@ -2746,6 +2746,13 @@ function Client:set_consent(decision)
 end
 
 function Client:session_start(props)
+	return self:start_session(props, nil)
+end
+
+-- `fact` is internal: the owed start after an end passes { retryable = true },
+-- because a start the full queue refuses is retried with the next event, not
+-- lost, and must not count as a dropped event.
+function Client:start_session(props, fact)
 	local previous_session_id = self.session_id
 	local previous_session_sequence = self.session_sequence
 	local previous_session_active = self.session_active
@@ -2753,7 +2760,7 @@ function Client:session_start(props)
 	self.session_id = "session-" .. id.uuid()
 	self.session_sequence = 0
 	self.session_active = true
-	local ok, err = self:track("app.session_started", props)
+	local ok, err = self:enqueue_event("app.session_started", props, nil, fact)
 	if not ok then
 		self.session_id = previous_session_id
 		self.session_sequence = previous_session_sequence
@@ -3139,7 +3146,7 @@ function Client:enqueue_event(event_name, props, context, fact)
 		and type(fact.session_id) == "string" and fact.session_id ~= ""
 	if not carries_own_session and self.config.source ~= "backend"
 		and self.session_id ~= nil and not self.session_active then
-		local started, start_err = self:session_start()
+		local started, start_err = self:start_session(nil, { retryable = true })
 		if not started then
 			-- Refused WITH its start, never filed under the ended session.
 			-- Today the start can only meet the same full queue this event
