@@ -21,7 +21,17 @@
     back, once under the session that had already ended.
   - A backend-source client that explicitly opened and ended a session renews
     on its next event like any other; one that never opened a session still
-    has none.
+    has none. A backend client's own facts and summaries never open a
+    session.
+- A session is one value (its id, sequence and samplers), replaced whole:
+  - A new session is swapped in only once its `app.session_started` is
+    accepted. A refused `session_start()` leaves the open session, its
+    samples and its sequence exactly as they were.
+  - A closing session always takes its samples with it, even while an older
+    summary is still owed. At most 8 built summaries are held for a full
+    queue; beyond that the oldest is dropped and counted in `dropped`.
+  - A ping or disconnect observed between an end and the next start is
+    dropped. Samples taken before the first session are summarized in it.
 - Keep the last accepted consent plan's `operation_blocks` through strict
   fallbacks and ordinary `consent_policy.invalidate()` calls. Each newer
   accepted plan replaces the entire set, including an empty set. Selecting a

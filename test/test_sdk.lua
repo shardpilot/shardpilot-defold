@@ -3051,10 +3051,18 @@ local function test_retry_wake_republishes_without_a_flush_tick()
 		"the premise: and an undispatched grant holds the event legs")
 	assert_true(parked:track("grant_spin_queued_1"))
 	assert_true(parked:track("grant_spin_queued_2"))
+	-- The receipt must still be inside its window while the ticks run. This
+	-- harness's clock advances on every READ, so how many times the SDK reads
+	-- it decided whether the window lapsed mid-scene (a session value now
+	-- starts its own perf window, one read more). Hold the clock for the
+	-- ticks: the scene measures the full-queue trigger, not the read count.
+	local held_gettime = socket.gettime
+	socket.gettime = function() return socket.now end
 	parked.flush_elapsed_seconds = 0
 	parked:update(0.1)
 	parked:update(0.1)
 	parked:update(0.1)
+	socket.gettime = held_gettime
 	assert_true(parked.flush_elapsed_seconds > 0.25,
 		"the full queue behind a deferred GRANT must not flush every frame either: "
 			.. "elapsed = " .. tostring(parked.flush_elapsed_seconds))
@@ -9122,6 +9130,27 @@ local tests = {
 	end
 	assert_equal(starts, 1, "and the flush opened no session")
 	assert_equal(client.session_id, a, "the ended session is still the last one")
+	end,
+	function()
+	-- WHAT WAS SAMPLED BEFORE THE FIRST SESSION IS SUMMARIZED IN IT. The
+	-- first session adopts the samplers that were waiting for it, as it
+	-- adopts owed pre-session exposures; later sessions start empty.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	client:observe_ping_ms(40)
+	assert_true(client:session_start())
+	local first = client.session_id
+	assert_true(client:flush({ include_summaries = true }))
+	local found = nil
+	for _, request in ipairs(requests) do
+		for _, event in ipairs(json_decode(request.body).events or {}) do
+			if event.event_name == "network_summary" then found = event end
+		end
+	end
+	assert_true(found ~= nil, "the pre-session ping is summarized")
+	assert_equal(found.session_id, first, "in the first session")
+	assert_equal(found.props.ping_sample_count, 1)
 	end,
 	function()
 	-- THE SESSION IS ONE VALUE. Across a renewal every per-session part -- the
