@@ -343,6 +343,9 @@ local function test_config_validation()
 		{ { batch_size = 1.5 }, "invalid_batch_size" },
 		{ { buffer_size = 0 }, "invalid_buffer_size" },
 		{ { flush_interval_seconds = 0 }, "invalid_flush_interval_seconds" },
+		{ { session_timeout_seconds = 0 }, "invalid_session_timeout_seconds" },
+		{ { session_timeout_seconds = 0 / 0 }, "invalid_session_timeout_seconds" },
+		{ { session_timeout_seconds = math.huge }, "invalid_session_timeout_seconds" },
 		{ { publish_timeout_seconds = -1 }, "invalid_publish_timeout_seconds" },
 		{ { token_refresh_lead_ms = -1 }, "invalid_token_refresh_lead_ms" },
 		{ { spool_enabled = "yes" }, "invalid_spool_enabled" },
@@ -9333,6 +9336,68 @@ local tests = {
 		if event.event_name == "app.session_ended" then ended = ended + 1 end
 	end
 	assert_equal(ended, 1, "40 s since the session was left is past the timeout")
+	window = nil
+	end,
+	function()
+	-- BOUNDARY: THE END IS NEVER BEFORE THE SESSION'S LATEST EVENT, even when a
+	-- later event was stamped under a clock that had stepped back. The latest
+	-- instant was overwritten by the corrected, earlier one.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2 }
+	window = W
+	reset()
+	seed_granted_consent()
+	socket.now = socket.now + 7200                      -- the shared clock stays net forward
+	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	assert_true(client:track("at_t"))
+	local at_t
+	for _, event in ipairs(client.queue.items) do
+		if event.event_name == "at_t" then at_t = event end
+	end
+	socket.now = socket.now - 600                       -- the wall clock steps back
+	assert_true(client:track("after_step_back"))
+	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	socket.now = socket.now + 40
+	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+	local ended
+	for _, event in ipairs(client.queue.items) do
+		if event.event_name == "app.session_ended" then ended = event end
+	end
+	assert_true(ended ~= nil, "the boundary ended the session")
+	assert_true(ended.event_ts >= at_t.event_ts, "the end is not before the session's latest event")
+	window = nil
+	end,
+	function()
+	-- BOUNDARY: THE PAUSED SESSION'S SAMPLERS STOP AT ITS DEADLINE. Frames and
+	-- network samples taken after it, while still in the background, belong to
+	-- no session, and the summary's duration ends at the end instant rather than
+	-- at the resume.
+	local W = { WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
+	window = W
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ platform = "linux", flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local a = client.session_id
+	local start_ms = client.session.perf.start_ms
+	client:update(0.016)
+	client:update(0.016)
+	client:on_window_event(W.WINDOW_EVENT_ICONFIED)
+	local paused_ms = client.paused.wall_ms
+	socket.now = socket.now + 40
+	for _ = 1, 5 do client:update(0.016) end            -- a minimised desktop game keeps ticking
+	client:observe_ping_ms(40)
+	client:observe_disconnect("late")
+	assert_true(client:on_window_event(W.WINDOW_EVENT_DEICONIFIED))
+	local perf, network
+	for _, event in ipairs(client.queue.items) do
+		if event.session_id == a and event.event_name == "perf_summary" then perf = event end
+		if event.session_id == a and event.event_name == "network_summary" then network = event end
+	end
+	assert_true(perf ~= nil, "the paused session's summary")
+	assert_equal(perf.props.frames_sampled, 2, "only the frames before the deadline")
+	assert_equal(perf.props.duration_ms, paused_ms + 30000 - start_ms, "its duration ends at the deadline")
+	assert_equal(network, nil, "nothing observed after the deadline is the paused session's")
 	window = nil
 	end,
 	function()

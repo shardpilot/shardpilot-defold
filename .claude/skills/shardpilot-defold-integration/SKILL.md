@@ -692,17 +692,22 @@ function init(self)
 	if window and window.set_listener then
 		window.set_listener(function(self, event, data)
 			-- ... your existing resize/focus/iconify handling ...
-			if event == window.WINDOW_EVENT_ICONFIED or event == window.WINDOW_EVENT_FOCUS_LOST then
-				-- Snapshot undelivered events to the durable spool: on mobile
-				-- an iconified app can be killed without final() ever running.
-				if analytics_running then
-					shardpilot.persist()
-				end
-			elseif event == window.WINDOW_EVENT_FOCUS_GAINED then
+			if event == window.WINDOW_EVENT_FOCUS_GAINED then
 				-- Resume is a named re-resolution trigger, and the cache must
-				-- not answer it: the whole point is that time has passed.
+				-- not answer it: the whole point is that time has passed. It
+				-- runs first, so a changed decision applies before the SDK
+				-- starts a session for the resume.
 				consent_policy.invalidate()
 				resolve_and_reconcile()
+			end
+			if analytics_running then
+				-- Every window event goes to the SDK. A background signal
+				-- snapshots undelivered events to the durable spool (on mobile
+				-- an iconified app can be killed without final() ever running)
+				-- and pauses the session; a foreground signal ends a session
+				-- that stayed away session_timeout_seconds or longer and starts
+				-- the next one. The SDK picks the signals for the platform.
+				shardpilot.on_window_event(event)
 			end
 		end)
 	end
@@ -977,7 +982,9 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
   A session is opened lazily on the first `track` if you never called
   `session_start` (the server requires a `session_id` for client sources).
 - `persist()` snapshots undelivered events into the durable spool without
-  sending — call it from your window focus-lost/iconify listener.
+  sending. `on_window_event(event)` does this on a background signal and also
+  drives the automatic session boundary, so forward every window event to it;
+  call `persist()` directly only where there is no window listener.
 - `shutdown(reason)` runs a final flush; with the spool enabled it returns
   `true` once everything is delivered **or durably spooled** (re-sent next
   launch). `false, "consent_pending"` means a consent receipt could not be

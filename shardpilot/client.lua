@@ -656,6 +656,12 @@ local function validate_config(config)
 	if not session_timeout_seconds then
 		return nil, session_timeout_err
 	end
+	-- FINITE as well as positive. NaN and math.huge pass the positivity test,
+	-- and every elapsed comparison against them is false, so the boundary would
+	-- silently never fire; the setting is a timeout, not a switch.
+	if session_timeout_seconds ~= session_timeout_seconds or session_timeout_seconds == math.huge then
+		return nil, "invalid_session_timeout_seconds"
+	end
 	local publish_timeout_seconds, publish_timeout_err =
 		normalize_positive_number(config.publish_timeout_seconds, 2, "invalid_publish_timeout_seconds")
 	if not publish_timeout_seconds then
@@ -2366,6 +2372,11 @@ end
 -- sessionless samplers, which the first session adopts; a backend source has
 -- no sessions and keeps its samples sessionless.
 function Client:sampling_open()
+	if self:timed_out_in_background() then
+		-- Past the paused session's deadline: a sample now belongs to no
+		-- session, and its summary must not cover time after its own end.
+		return false
+	end
 	return self.session ~= nil or self.ended_session == nil or self.config.source == "backend"
 end
 
@@ -2837,8 +2848,7 @@ function Client:set_consent(decision)
 end
 
 function Client:session_start(props)
-	if self.initialized and self.paused ~= nil and self.session ~= nil
-		and self.paused.session == self.session and self:pause_expired() then
+	if self.initialized and self:timed_out_in_background() then
 		-- ⚠ A START PAST THE DEADLINE ENDS THE TIMED-OUT SESSION FIRST, at the
 		-- boundary instant. As a live renewal it would replace that session
 		-- with no end and finalize its samples now, after its own deadline.
@@ -2914,8 +2924,7 @@ function Client:session_end(reason)
 		-- close it. (An end before any session was ever opened is unchanged.)
 		return true
 	end
-	if self.paused ~= nil and self.session ~= nil and self.paused.session == self.session
-		and self:pause_expired() then
+	if self:timed_out_in_background() then
 		-- ⚠ AN EXPIRED PAUSE IS THIS SESSION'S END: the boundary's, at its
 		-- instant, and no replacement is opened only for this call to end it.
 		-- One end per session, whichever of the boundary and this end comes
@@ -2943,7 +2952,7 @@ end
 -- id (shutdown ends the session before its final flush, so they still
 -- describe the ended session there); and the experiments plane attributes what
 -- lived through it. The next session is a new value with empty samplers.
-function Client:close_session(end_ts)
+function Client:close_session(end_ts, end_ms)
 	local closing = self.session
 	if closing == nil then
 		return
@@ -2951,7 +2960,7 @@ function Client:close_session(end_ts)
 	self.session = nil
 	self.ended_session = closing
 	self:mirror_session()
-	self:finalize_session(closing, end_ts)
+	self:finalize_session(closing, end_ts, end_ms)
 	if self.experiments then
 		self.experiments:on_session_ended(closing.id)
 	end
@@ -2961,16 +2970,17 @@ end
 -- perf and network summaries are built from its own samplers and stamped from
 -- its own value; one the queue cannot take now is held as an owed snapshot
 -- (the built event), and the samplers leave with the closed value. With
--- consent not granted they are simply dropped with it. `end_ts`, when the
--- session ended at an instant other than now (the session boundary), stamps
--- them at that instant, so they never fall after their session's end.
-function Client:finalize_session(closing, end_ts)
+-- consent not granted they are simply dropped with it. `end_ts` and `end_ms`,
+-- when the session ended at an instant other than now (the session boundary),
+-- stamp them at that instant and end the perf window there, so neither their
+-- time nor their contents fall after their session's end.
+function Client:finalize_session(closing, end_ts, end_ms)
 	if self.consent_state ~= "granted" then
 		return
 	end
 	self:drain_owed_summaries()
 	local builds = {
-		{ "perf_summary", sampling.perf_summary(closing.perf) },
+		{ "perf_summary", sampling.perf_summary(closing.perf, end_ms) },
 		{ "network_summary", sampling.network_summary(closing.network, self.config.transport) },
 	}
 	for _, build in ipairs(builds) do
@@ -3055,6 +3065,14 @@ function Client:on_window_event(event)
 	return true
 end
 
+-- True while the open session is paused past its deadline: it timed out in the
+-- background and the boundary has not run yet. From that instant nothing new
+-- belongs to it — no activity, no summary built now, no samples.
+function Client:timed_out_in_background()
+	return self.paused ~= nil and self.session ~= nil
+		and self.paused.session == self.session and self:pause_expired()
+end
+
 function Client:pause_expired()
 	local paused = self.paused
 	local wall_ms = clock.unix_ms() - paused.wall_ms
@@ -3092,7 +3110,7 @@ function Client:run_boundary(replace)
 		return false, err
 	end
 	self.paused = nil
-	self:close_session(end_ts)
+	self:close_session(end_ts, stamp_ms)
 	if replace then
 		self:start_session(nil, { retryable = true })
 	end
@@ -3398,7 +3416,7 @@ function Client:open_owed_session(fact)
 	-- ⚠ AN EXPIRED PAUSE IS RESOLVED FIRST. Activity past the deadline, before
 	-- the resume, used to land in the session that had already timed out; the
 	-- boundary ends it and starts the next one before this activity is placed.
-	if self.paused ~= nil and self.paused.session == self.session and self:pause_expired() then
+	if self:timed_out_in_background() then
 		local ended, end_err = self:run_boundary(true)
 		if not ended then
 			if not (fact and fact.retryable) then
@@ -3577,8 +3595,10 @@ function Client:enqueue_event(event_name, props, context, fact)
 	end
 	stream.sequence = event.session_sequence
 	if now_ms then
-		-- The session boundary never stamps an end before this.
-		stream.last_event_ms = now_ms
+		-- The session boundary never stamps an end before this. A HIGH-WATER
+		-- MARK: an event stamped after the wall clock stepped back must not
+		-- lower it below an event the session already carries.
+		stream.last_event_ms = math.max(stream.last_event_ms or 0, now_ms)
 	end
 	if opened_lazy_session then
 		-- committed: the lazy first session keeps the samplers it adopted
@@ -3597,9 +3617,11 @@ function Client:update(dt)
 		self.flush_elapsed_seconds = self.flush_elapsed_seconds + dt
 		self.frame_seconds = self.frame_seconds + dt
 	end
-	if self.session_active and self.consent_state == "granted" and type(dt) == "number" then
+	if self.session_active and self.consent_state == "granted" and type(dt) == "number"
+		and not self:timed_out_in_background() then
 		-- Frame samples are analytics data: a session kept active through a
-		-- denial must not keep feeding the perf sampler.
+		-- denial must not keep feeding the perf sampler, and a session past its
+		-- background deadline (a minimised desktop game still ticks) has ended.
 		sampling.sample_frame(self.perf, dt)
 	end
 	if self.experiments then
@@ -3757,8 +3779,7 @@ function Client:enqueue_summaries()
 	-- its sampler window is consumed — so it re-enqueues ahead of any fresh
 	-- one (older window first), envelope preserved.
 	self:drain_owed_summaries()
-	if self.paused ~= nil and self.session ~= nil and self.paused.session == self.session
-		and self:pause_expired() then
+	if self:timed_out_in_background() then
 		-- The open session timed out in the background: these samples are its
 		-- own, and the boundary finalizes them under its id at its end
 		-- instant. Built now they would be stamped after that end.

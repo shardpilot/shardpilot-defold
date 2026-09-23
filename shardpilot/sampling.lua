@@ -48,7 +48,9 @@ function M.sample_frame(state, dt)
 	append_bounded(state.frames, dt * 1000, M.max_perf_samples)
 end
 
-function M.perf_summary(state)
+-- `now_ms` ends the window at a given instant instead of now: a session that
+-- ended earlier than the moment its summary is built (the session boundary).
+function M.perf_summary(state, now_ms)
 	if #state.frames == 0 then
 		return nil
 	end
@@ -61,7 +63,7 @@ function M.perf_summary(state)
 		end
 	end
 	local sorted = sorted_copy(state.frames)
-	local duration_ms = math.max(clock.unix_ms() - state.start_ms, math.floor(total_ms))
+	local duration_ms = math.max((now_ms or clock.unix_ms()) - state.start_ms, math.floor(total_ms))
 	local summary = {
 		avg_fps = math.floor((#state.frames / math.max(total_ms / 1000, 0.001)) * 100 + 0.5) / 100,
 		p50_frame_time_ms = percentile(sorted, 0.50),

@@ -5,17 +5,18 @@
 - **An automatic session boundary.** Forward your window listener's events to
   `on_window_event(event)`; it replaces the `persist()` call there, which it
   performs on a background signal.
-  - A background stay of `session_timeout_seconds` (new, default 30) or longer
-    ends the session at the resume with `reason = "idle_timeout"`, stamped at
-    pause + timeout and never before the session's own last event. The next
-    session starts at once.
+  - A background stay of `session_timeout_seconds` (new, default 30; positive
+    and finite) or longer ends the session at the resume with
+    `reason = "idle_timeout"`, stamped at pause + timeout and never before the
+    session's own last event. The next session starts at once.
   - On mobile and web the signal is focus; on desktop it is iconify only,
     under either spelling of the engine's iconify constant.
   - The boundary is idempotent with `session_end()` and `shutdown()`. It
     never ends a session the host replaced during the stay. Activity past the
     deadline runs it first, and a `session_start()` past the deadline ends
     the timed-out session before starting the next. The paused session's
-    summaries stay in it, stamped at its end.
+    summaries stay in it, stamped at its end, and its samplers stop at the
+    deadline: nothing observed after it is counted in them.
   - Elapsed time is the larger of wall time and summed `update(dt)`. A
     backward wall-clock correction during a mobile background stay can still
     merge two sessions, since no frames run there; this is a stated limit.
