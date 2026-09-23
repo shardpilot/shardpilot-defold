@@ -3522,13 +3522,12 @@ end
 -- event verbatim (event_id, event_ts, user_id, anonymous_id, session_id)
 -- instead of re-tracking under whatever actor/session is current at drain
 -- time — an identify() or anon rotation between refusal and drain must not
--- misattribute samples collected under the old actor/session. The ONE
--- enqueue-time field is session_sequence, and it is taken from the stream the
--- summary was stamped from (entry.stream), never the current one: a closing
--- session's summary that drains after the next session opened is the ended
--- session's next event, not a number from the new session's counter under
--- the old id. The refusal-time number was never committed, so the counter is
--- read again at drain.
+-- misattribute samples collected under the old actor/session. That includes
+-- session_sequence: owe_summary reserved it in the summary's own stream when
+-- the queue refused it, so a closing session's summary that drains after the
+-- next session opened is still the ended session's event, never a number from
+-- the new session's counter under the old id, and persist()'s durable copy
+-- carries the same number as the delivery.
 function Client:enqueue_owed_summary(entry)
 	if not self.initialized then
 		return false, "shutdown"
@@ -3539,16 +3538,11 @@ function Client:enqueue_owed_summary(entry)
 	if self.consent_state ~= "granted" then
 		return false, "consent_unknown"
 	end
-	local event = entry.event
-	local stream = entry.stream or self:sequence_stream()
-	event.session_sequence = stream.sequence + 1
-	if not queue.push(self.queue, event) then
+	if not queue.push(self.queue, entry.event) then
 		-- Still owed — never counted dropped here: like a retryable owed
 		-- fact, the snapshot stays armed and re-enqueues once room frees.
 		return false, "queue_full"
 	end
-	stream.sequence = event.session_sequence
-	self:mirror_session()
 	self.stats.enqueued = self.stats.enqueued + 1
 	return true
 end
@@ -3600,8 +3594,9 @@ function Client:enqueue_summaries()
 	if #self.owed_summaries > 0 then
 		-- The queue is still full: leave the samplers accumulating (they
 		-- self-bound at their sample caps) instead of consuming them into
-		-- ever more owed snapshots — the owed list stays bounded at one
-		-- entry per summary type.
+		-- ever more owed snapshots. The owed list is bounded by the cap in
+		-- owe_summary, not by this return: closing sessions add their own
+		-- entries.
 		return
 	end
 	-- Fresh builds enqueue through the retryable arm: a queue_full refusal is
@@ -3637,8 +3632,15 @@ end
 -- At most this many built summaries are held for a full queue. A closed
 -- session can leave one of each kind; beyond the bound the OLDEST entry
 -- without a durable copy is dropped, and counted, rather than holding every
--- session's window in memory. Each entry keeps the stream it was stamped from,
--- so it drains with that stream's next number (enqueue_owed_summary).
+-- session's window in memory.
+--
+-- ⚠ THE NUMBER IS RESERVED AT THE REFUSAL. The refused event already carries
+-- its stream's next number; committing it here means later events of that
+-- stream take the numbers after it, and the drain and persist()'s durable copy
+-- both reuse it. Recomputed at drain, it came from whatever stream was current
+-- (the next session's, under the old id), and two entries persisted together
+-- shared one tentative number on disk. An entry dropped below leaves a gap in
+-- its stream, never a duplicate.
 --
 -- ⚠ AN ENTRY WITH A DURABLE COPY IS NEVER DROPPED. persist() writes owed
 -- entries to the spool as crash insurance and keeps the originals in memory,
@@ -3652,8 +3654,12 @@ end
 local MAX_OWED_SUMMARIES = 8
 
 function Client:owe_summary(event_name, event, stream)
+	if stream and event.session_sequence > stream.sequence then
+		stream.sequence = event.session_sequence
+		self:mirror_session()
+	end
 	local owed = self.owed_summaries
-	owed[#owed + 1] = { event_name = event_name, event = event, stream = stream }
+	owed[#owed + 1] = { event_name = event_name, event = event }
 	local i = 1
 	while #owed > MAX_OWED_SUMMARIES and i <= #owed do
 		if self.spool_index[owed[i].event.event_id] then

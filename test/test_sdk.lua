@@ -9217,11 +9217,13 @@ local tests = {
 	assert_true(client:track("a_2"))
 	assert_true(client:track("a_3"))
 	assert_true(client:session_end("complete"))         -- A 4, and the queue is full
-	assert_equal(client.ended_session.sequence, 4, "the old session ended at 4")
 	assert_true(#client.owed_summaries > 0, "its perf summary is owed")
 	local used = {}
 	for _, event in ipairs(client.queue.items) do
 		if event.session_id == a then used[event.session_sequence] = true end
+		if event.event_name == "app.session_ended" then
+			assert_equal(event.session_sequence, 4, "the old session ended at 4")
+		end
 	end
 	client.queue.items = {}
 	assert_true(client:track("b_2"))                    -- B 1 and 2
@@ -9238,6 +9240,55 @@ local tests = {
 		"its number is not one the old session already used")
 	assert_equal(drained.session_sequence, 5, "it is the old session's fifth event")
 	assert_equal(client.session_sequence, 3, "and the new session's counter did not move")
+	end,
+	function()
+	-- AN OWED SUMMARY'S NUMBER IS RESERVED WHEN THE QUEUE REFUSES IT. persist()
+	-- wrote each still-refused summary with a tentative number that did not
+	-- advance its stream, so two summaries of one session reached the durable
+	-- spool with the same number, and a replay after a process death shipped
+	-- both. The number is taken at the refusal, and the drain reuses it.
+	reset()
+	storage.reset()
+	local _, restore = install_stub_sys_storage()
+	seed_granted_consent()
+	next_status = 500
+	local client = assert(sdk.new(config({ buffer_size = 1, flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	client:update(0.016)
+	client:update(0.020)
+	client:observe_ping_ms(42)
+	assert_equal(client:flush(), false)
+	assert_equal(#client.owed_summaries, 2, "both built summaries are owed")
+	assert_true(client:track("filler_event"))
+	assert_true(client:persist(), "the owed summaries are durably captured")
+	local seen, spooled = {}, {}
+	for i = 1, #client.spool_record do
+		local env = client.spool_record[i]
+		local key = tostring(env.session_id) .. "#" .. tostring(env.session_sequence)
+		assert_true(not seen[key], "number " .. key .. " is on disk once")
+		seen[key] = true
+		spooled[env.event_id] = env.session_sequence
+	end
+	client.queue.limit = 50
+	next_status = 202
+	for _ = 1, 5 do
+		if #client.owed_summaries == 0 and #client.queue.items == 0 then break end
+		client:flush()
+	end
+	local delivered = 0
+	for _, request in ipairs(requests) do
+		for _, event in ipairs(json_decode(request.body).events or {}) do
+			if spooled[event.event_id] and (event.event_name == "perf_summary"
+				or event.event_name == "network_summary") then
+				assert_equal(event.session_sequence, spooled[event.event_id],
+					"delivered with the number its durable copy carries")
+				delivered = delivered + 1
+			end
+		end
+	end
+	assert_equal(delivered, 2, "both owed summaries were delivered")
+	restore()
+	storage.reset()
 	end,
 	function()
 	-- THE OWED-SUMMARY CAP NEVER DROPS AN ENTRY WITH A DURABLE COPY. A summary

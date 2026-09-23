@@ -31,9 +31,11 @@
     accepted. A refused `session_start()` leaves the open session, its
     samples and its sequence exactly as they were.
   - A closing session always takes its samples with it, even while an older
-    summary is still owed. A summary held for a full queue is numbered in
-    the session that collected it when it finally drains, never from the next
-    session's counter. At most 8 built summaries are held for a full queue;
+    summary is still owed. A summary held for a full queue keeps the number
+    it took in the session that collected it when the queue refused it. It
+    drains, and `persist()` writes it to the spool, with that number: never
+    one from the next session's counter, and never one another held summary
+    also carries. At most 8 built summaries are held for a full queue;
     beyond that the oldest one without a durable copy is dropped and counted
     in `dropped`. One that `persist()` has written to the spool is kept until
     it is delivered, so an anonymous-id rotation still waits for it.
