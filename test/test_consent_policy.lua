@@ -1112,6 +1112,10 @@ local function run_example(between, window_events, dts, finalize, opts)
 		end,
 		update = function() end,
 		persist = function() end,
+		on_window_event = function(event)
+			seen[#seen + 1] = "sdk.on_window_event:" .. tostring(event)
+			return true
+		end,
 		shutdown = function(reason)
 			seen[#seen + 1] = "sdk.shutdown:" .. tostring(reason)
 			return true
@@ -1855,6 +1859,20 @@ end
 -- POST in flight makes shutdown return false, "pending"; clearing the flag
 -- anyway loses the retry — final() skips it, and a later start would
 -- initialise over a client that never finished.
+-- THE EXAMPLE FORWARDS ITS WINDOW EVENTS TO THE SDK. Its listener used to call
+-- persist() on a background signal and nothing on a foreground one, so a host
+-- copying it never paused a session or resumed one, and the automatic session
+-- boundary never ran.
+local function test_example_forwards_window_events()
+	reset()
+	next_response_body = example_plan()
+	local calls = run_example(nil, { "focus_lost", "focus_gained" }, nil, false, { age_band = "adult" })
+	assert_true(calls:find("sdk.on_window_event:focus_lost", 1, true) ~= nil,
+		"a background signal reaches the SDK: " .. calls)
+	assert_true(calls:find("sdk.on_window_event:focus_gained", 1, true) ~= nil,
+		"and so does the foreground one: " .. calls)
+end
+
 local function test_a_pending_crash_shutdown_keeps_its_state()
 	reset()
 	crash_shutdown_pending = 1
@@ -3485,6 +3503,7 @@ local tests = {
 	test_the_notice_is_carried_whole,
 	test_the_regime_sets_the_default_not_the_silence,
 	test_ipairs_stops_at_a_nil_hole,
+	test_example_forwards_window_events,
 }
 
 -- ⚠ ipairs STOPS AT A NIL HOLE, SILENTLY. A scene renamed or deleted but left
