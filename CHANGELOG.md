@@ -14,7 +14,9 @@
   - The boundary is idempotent with `session_end()` and `shutdown()`. It
     never ends a session the host replaced during the stay. Activity past the
     deadline runs it first, and a `session_start()` past the deadline ends
-    the timed-out session before starting the next. The paused session's
+    the timed-out session before starting the next. A session that opens
+    while the app is still in the background is paused from its own start, so
+    a second background stay ends it as well. The paused session's
     summaries stay in it, stamped at its end, and its samplers stop at the
     deadline: nothing observed after it is counted in them.
   - Elapsed time is the larger of wall time and summed `update(dt)`. A

@@ -862,6 +862,12 @@ signal (and returns its result), and it drives the automatic session boundary:
   session starts at once. Host activity that arrives past the deadline, before
   the foreground signal, runs the boundary first. Below the timeout, nothing
   happens. The startup focus gain is nothing.
+- **A session that opens in the background is paused from its own start.**
+  That covers the next session after a boundary run by host activity, a
+  `session_start()`, and a session the next event opens. A second stay of
+  `session_timeout_seconds` or longer therefore ends it too, stamped
+  `session_timeout_seconds` after it opened and never before its own last
+  event. A session started by the foreground signal is not paused.
 - **Nothing after the deadline belongs to the paused session.** Frames and
   network samples observed after it, while still in the background, are
   dropped, and its perf summary's duration ends at the end instant.

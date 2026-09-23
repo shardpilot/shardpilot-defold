@@ -2889,6 +2889,7 @@ function Client:start_session(props, fact)
 	self.session = fresh
 	self.ended_session = nil
 	self:mirror_session()
+	self:pause_if_backgrounded(fresh)
 	if replaced then
 		-- A LIVE RENEWAL ENDS the session it replaces: its samples leave with
 		-- it, under its own id, now that the renewal has been accepted.
@@ -3003,7 +3004,12 @@ end
 -- session at the logical boundary and starts the next one at once.
 --
 -- The pause holds the session by REFERENCE, so a session the host ended or
--- replaced meanwhile is never ended by it. Elapsed is the larger of wall time
+-- replaced meanwhile is never ended by it. ⚠ A SESSION THAT OPENS WHILE THE APP
+-- IS STILL IN THE BACKGROUND OPENS PAUSED, from its own start: the rotation's
+-- replacement, a host session_start(), an owed start or a lazy open. Otherwise
+-- the rotation clears the only pause, and a second background stay ends
+-- nothing. `backgrounded` records the signal apart from the pause, because the
+-- pause holds a session and the app can be in the background without one. Elapsed is the larger of wall time
 -- and summed update(dt): pure Lua reaches no monotonic clock, and the frame
 -- time covers a backward wall-clock correction only while frames run
 -- (a minimised desktop game). ⚠ ACCEPTED LIMIT: during a mobile background
@@ -3050,10 +3056,16 @@ function Client:on_window_event(event)
 	end
 	local signal = window_signal(event, self.config.platform)
 	if signal == "background" then
+		self.backgrounded = true
 		if self.session ~= nil and (self.paused == nil or self.paused.session ~= self.session) then
 			self.paused = { session = self.session, wall_ms = clock.unix_ms(), frames = self.frame_seconds }
 		end
 		return self:persist()
+	end
+	if signal == "foreground" then
+		-- Cleared BEFORE the boundary, so the session it starts in front is
+		-- not paused.
+		self.backgrounded = false
 	end
 	if signal == "foreground" and self.paused ~= nil then
 		if not self:pause_expired() then
@@ -3063,6 +3075,14 @@ function Client:on_window_event(event)
 		return self:run_boundary(true)
 	end
 	return true
+end
+
+-- A session opened while the app is in the background is paused from its own
+-- start (see on_window_event).
+function Client:pause_if_backgrounded(session)
+	if self.backgrounded then
+		self.paused = { session = session, wall_ms = clock.unix_ms(), frames = self.frame_seconds }
+	end
 end
 
 -- True while the open session is paused past its deadline: it timed out in the
@@ -3510,6 +3530,7 @@ function Client:enqueue_event(event_name, props, context, fact)
 		self:adopt_sessionless_samplers(lazy)
 		self.session = lazy
 		self:mirror_session()
+		self:pause_if_backgrounded(lazy)
 		opened_lazy_session = true
 	end
 	local user_id = self.user_id

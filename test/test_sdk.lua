@@ -9460,6 +9460,9 @@ local tests = {
 	function()
 	-- BOUNDARY: A SESSION REPLACED BEFORE THE RESUME IS NOT ENDED BY IT. The
 	-- boundary ends only the session it paused, which it holds by reference.
+	-- The replacement opens in the background, so it is paused from its OWN
+	-- start: the resume comes after the first session's deadline (35 s) and
+	-- before the replacement's (15 s), so only the reference can end anything.
 	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
 		WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
 	local function named(client, name)
@@ -9475,9 +9478,10 @@ local tests = {
 	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
 	assert_true(client:session_start())
 	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	socket.now = socket.now + 20
 	assert_true(client:session_start())
 	local b = client.session_id
-	socket.now = socket.now + 40
+	socket.now = socket.now + 15
 	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
 	assert_equal(#named(client, "app.session_ended"), 0, "no idle end for a session the host replaced")
 	assert_equal(client.session_id, b, "and the replacement stays open")
@@ -9541,6 +9545,74 @@ local tests = {
 	assert_equal(ended.props.reason, "idle_timeout")
 	assert_equal(perf.event_ts, ended.event_ts, "its samples are stamped at its end")
 	assert_equal(starts, 2, "and the host's start is the one next session")
+	window = nil
+	end,
+	function()
+	-- BOUNDARY: A SESSION OPENED WHILE THE APP IS STILL IN THE BACKGROUND OPENS
+	-- PAUSED. Host activity past the deadline rotated to a replacement and
+	-- cleared the only pause, so a second background stay never ended the
+	-- replacement: the resume found no pause, and one session held the whole
+	-- idle interval. Every way a session opens is driven here: the rotation's
+	-- replacement, a host session_start(), a lazy open, and an owed start.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2 }
+	local function named(client, name)
+		local out = {}
+		for _, event in ipairs(client.queue.items) do
+			if event.event_name == name then out[#out + 1] = event end
+		end
+		return out
+	end
+	local function iso(seconds)
+		return os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor(seconds))
+	end
+	window = W
+	local paths = {
+		{ "the rotation's replacement", function(client)
+			client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+			socket.now = socket.now + 40
+			assert_true(client:track("late"))              -- A ends, B opens
+		end },
+		{ "a host session_start()", function(client)
+			client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+			socket.now = socket.now + 40
+			assert_true(client:session_start())             -- A ends, B opens
+		end },
+		{ "a lazy open", function(client)
+			client:session_end("complete")                  -- A ends, in front
+			client.ended_session = nil                      -- as before any session
+			client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+			socket.now = socket.now + 40
+			assert_true(client:track("first"))             -- B opens lazily
+		end },
+		{ "an owed start", function(client)
+			client:session_end("complete")                  -- A ends, in front
+			client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+			socket.now = socket.now + 40
+			assert_true(client:track("next"))              -- the owed B opens
+		end },
+	}
+	for _, path in ipairs(paths) do
+		reset()
+		seed_granted_consent()
+		local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+		assert_true(client:session_start())
+		path[2](client)
+		local b = client.session_id
+		assert_true(b ~= nil, path[1] .. ": a session is open in the background")
+		local opened_at = socket.now
+		local ends_before = #named(client, "app.session_ended")
+		socket.now = socket.now + 40                        -- still in the background
+		assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+		local ends = named(client, "app.session_ended")
+		assert_equal(#ends, ends_before + 1, path[1] .. ": the resume ends the session opened in the background")
+		local last = ends[#ends]
+		assert_equal(last.session_id, b, path[1] .. ": it is that session that ends")
+		assert_equal(last.props.reason, "idle_timeout", path[1])
+		assert_equal(last.event_ts, iso(opened_at + 30),
+			path[1] .. ": at its own boundary, 30 s after it opened")
+		assert_true(client.session_id ~= b, path[1] .. ": and the next one starts at the resume")
+		assert_true(client.paused == nil, path[1] .. ": the session opened in front is not paused")
+	end
 	window = nil
 	end,
 	function()
