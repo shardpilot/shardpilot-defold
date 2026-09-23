@@ -7670,6 +7670,31 @@ function extra_tests.test_ended_and_next_session_snapshots_stay_apart()
 	restore()
 end
 
+-- A BACKEND CLIENT'S BACKGROUND SWEEP NEVER OPENS A SESSION. Backend
+-- exposures drain sessionless. After an explicit start and end, an exposure
+-- re-armed by a re-grant reached the owed start through the sweep, and the
+-- tick emitted app.session_started with no host activity.
+function extra_tests.test_backend_background_sweep_opens_no_session()
+	reset()
+	local client = granted_client({ source = "backend" })
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_true(client:session_end("complete"))
+	client:set_consent(false)
+	client:set_consent(true)
+	client.queue.items = {}
+	for _ = 1, 5 do
+		advance_seconds(1)
+		client:update(1)
+	end
+	assert_equal(#queued_events(client, "app.session_started"), 0,
+		"no SDK tick opened a session for a backend client")
+	for _, exposure in ipairs(queued_events(client, "experiment_exposure")) do
+		assert_nil(exposure.session_id, "a backend exposure drains sessionless")
+	end
+end
+
 local tests = {
 	test_config_validation,
 	test_flag_off_zero_paths,
@@ -7859,6 +7884,7 @@ local tests = {
 	extra_tests.test_regrant_after_end_is_exposed_once_in_the_new_session,
 	extra_tests.test_snapshot_that_lived_through_an_ended_session_is_exposed_in_it,
 	extra_tests.test_ended_and_next_session_snapshots_stay_apart,
+	extra_tests.test_backend_background_sweep_opens_no_session,
 }
 
 for _, test in ipairs(tests) do
