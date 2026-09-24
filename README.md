@@ -51,6 +51,11 @@ not the platform boundary.
   `track_ad_impression_revenue(impression_id, network, revenue_micros,
   currency[, revenue_precision, ad_unit, ad_format, placement])` →
   `ad_impression_revenue`, plus arbitrary `track(name, props)`.
+- **Unreleased session helpers:** `session_end([reason])` is available on both
+  a client and the module singleton. It ends only an open session; `shutdown()`
+  uses `app_final` regardless of a legacy reason argument. See
+  [session end reasons](docs/events.md#session-end-reasons) for defaults and
+  background expiry.
 - Generates and persists a UUIDv7 anonymous ID per configured app and supports
   `identify(user_id)` to upgrade attribution to a known user.
 - **Consent-first analytics.** Records an explicit consent decision over the

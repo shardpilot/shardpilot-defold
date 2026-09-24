@@ -225,6 +225,10 @@ function M.session_start(props)
 	return with_default("session_start", props)
 end
 
+function M.session_end(reason)
+	return with_default("session_end", reason)
+end
+
 function M.screen_view(screen_name, props)
 	return with_default("screen_view", screen_name, props)
 end

@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- `session_end([reason])` now defaults empty or non-string reasons to
+  `session_end`, opens nothing when no session exists, and is available through
+  the module singleton. Shutdown uses `app_final` regardless of a caller
+  argument, including when its end is retried after a full queue.
 - Analytics denial (including `denied_forced_minor`) now closes the current
   session locally and discards its background deadline. Re-grant followed by
   resume or tracked activity announces a fresh session instead of continuing

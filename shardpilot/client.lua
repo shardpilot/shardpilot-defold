@@ -2930,11 +2930,8 @@ function Client:session_end(reason)
 	-- An explicit host end cancels any consent-resume obligation, including
 	-- when denial already closed the session and this call is idempotent.
 	self.resume_after_denial = nil
-	if self.session == nil and self.ended_session ~= nil then
-		-- The session already ENDED: exactly one end per session. A second end
-		-- used to emit a second app.session_ended into the retained session;
-		-- now enqueue_event would open the next session only for this end to
-		-- close it. (An end before any session was ever opened is unchanged.)
+	if self.session == nil then
+		-- An end never opens a session, including before the first activity.
 		return true
 	end
 	if self:timed_out_in_background() then
@@ -2952,7 +2949,10 @@ function Client:session_end(reason)
 		self:close_session()
 		return true
 	end
-	local ok, err = self:track("app.session_ended", { reason = reason or "session_end" })
+	if type(reason) ~= "string" or reason == "" then
+		reason = "session_end"
+	end
+	local ok, err = self:track("app.session_ended", { reason = reason })
 	if not ok then
 		return false, err
 	end
@@ -6436,6 +6436,7 @@ function Client:flush(options)
 end
 
 function Client:shutdown(reason)
+	-- Shutdown always uses app_final; caller reasons belong to session_end().
 	-- One more chance for an owed denied/disabled purge to land before
 	-- teardown (flush below retries it too; a still-failing purge is re-run
 	-- at the next launch by the persisted denial/disabled configuration).
@@ -6446,7 +6447,7 @@ function Client:shutdown(reason)
 		-- session_end completes the local teardown even while consent is
 		-- denied or unknown (the wire event is suppressed inside session_end);
 		-- summary events are suppressed below via include_summaries.
-		local session_ok, session_err = self:session_end(reason or "app_final")
+		local session_ok, session_err = self:session_end("app_final")
 		if not session_ok then
 			if session_err == "queue_full" then
 				-- A FULL queue is exactly the scenario the flush below
@@ -6557,7 +6558,7 @@ function Client:shutdown(reason)
 			-- complete the session teardown. Only a STILL-full queue is
 			-- retryable by a later pass; any other failure keeps the old
 			-- contract — report it and stay alive for a host retry.
-			local retry_ok, retry_err = self:session_end(reason or "app_final")
+			local retry_ok, retry_err = self:session_end("app_final")
 			if retry_ok then
 				owed_session_end = false
 				enqueued_any = true
