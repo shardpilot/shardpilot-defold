@@ -39,6 +39,17 @@ today, and once ingest begins rejecting unregistered names it is refused
 **together with every event batched alongside it** — so this list being accurate
 is not documentation hygiene.
 
+## Session end reasons
+
+**Unreleased:** `session_end([reason])`, on a client or the module singleton,
+preserves a non-empty string reason. An absent, empty or non-string reason uses
+`session_end`. With no session open, the call emits nothing and opens nothing;
+a second end is also a no-op. `shutdown()` uses `app_final`, including a retry
+after queue pressure; a legacy caller reason is ignored. Both methods resolve
+an already-expired background pause first, emitting one `idle_timeout` end at
+its deadline and opening no replacement. End events require no duration prop,
+and are suppressed unless analytics consent is granted.
+
 ## Removed: `tutorial_start`, `tutorial_step_complete`, `tutorial_complete`
 
 These three helpers were removed in 2026-08-29. They emitted event names with no

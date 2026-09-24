@@ -13485,3 +13485,162 @@ end)()
 end)()
 
 print("shardpilot defold lua tests passed")
+
+;(function()
+	local cases = {}
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2 }
+	local function fresh(overrides, ungranted)
+		reset()
+		storage.reset()
+		window = W
+		if not ungranted then seed_granted_consent() end
+		local options = { platform = "android", flush_interval_seconds = 9999, spool_enabled = false }
+		for key, value in pairs(overrides or {}) do options[key] = value end
+		return assert(sdk.new(config(options)))
+	end
+	local function wire_ends()
+		local ends = {}
+		for _, request in ipairs(requests) do
+			if request.url:find("/v1/events:batch", 1, true) then
+				for _, event in ipairs(json.decode(request.body).events) do
+					if event.event_name == "app.session_ended" then ends[#ends + 1] = event end
+				end
+			end
+		end
+		return ends
+	end
+	local function one_end(reason, session_id)
+		local ends = wire_ends()
+		assert_equal(#ends, 1, "exactly one end reached the transport")
+		assert_equal(ends[1].props.reason, reason, "wire end reason")
+		assert_equal(ends[1].session_id, session_id)
+		assert_equal(ends[1].props.duration_ms, nil, "the end needs no duration")
+		assert_equal(ends[1].props.idle_timeout_ms, nil)
+		return ends[1]
+	end
+	for _, entry in ipairs({
+		{ name = "absent", expected = "session_end" },
+		{ name = "empty", value = "", expected = "session_end" },
+		{ name = "custom", value = "level_complete", expected = "level_complete" },
+		{ name = "whitespace", value = " ", expected = " " },
+		{ name = "false", value = false, expected = "session_end" },
+		{ name = "number", value = 7, expected = "session_end" },
+		{ name = "table", value = {}, expected = "session_end" },
+	}) do
+		local reason = entry
+		cases["explicit reason " .. reason.name] = function()
+			local client = fresh()
+			assert_true(client:session_start())
+			local original = client:get_session_id()
+			assert_true(client:session_end(reason.value))
+			assert_equal(client:get_session_id(), nil)
+			assert_true(client:session_end("second_call"))
+			assert_true(client:flush())
+			one_end(reason.expected, original)
+		end
+		for _, capacity in ipairs({ 1, 100 }) do
+			local size = capacity
+			cases["shutdown reason " .. reason.name .. " capacity " .. size] = function()
+				local client = fresh({ buffer_size = size })
+				assert_true(client:session_start())
+				local original = client:get_session_id()
+				assert_equal(#client.queue.items, 1, "the single-slot control starts full")
+				assert_true(client:shutdown(reason.value))
+				assert_equal(client.initialized, false)
+				one_end("app_final", original)
+			end
+		end
+	end
+	for _, entry in ipairs({ "session_end", "shutdown" }) do
+		local method = entry
+		cases[method .. " without any session"] = function()
+			local client = fresh()
+			assert_equal(client.session, nil)
+			assert_equal(client.ended_session, nil)
+			assert_true(client[method](client, "caller_reason"))
+			assert_equal(client.session, nil, "no open session was invented")
+			assert_equal(client.ended_session, nil, "no ephemeral session was opened and ended")
+			assert_equal(#client.queue.items, 0)
+			assert_equal(#wire_ends(), 0)
+		end
+		cases[method .. " resolves expired pause"] = function()
+			local client = fresh()
+			assert_true(client:session_start())
+			local original = client:get_session_id()
+			local ok, err = client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+			assert_equal(ok, false)
+			assert_equal(err, "spool_disabled")
+			assert_true(client.paused ~= nil, "the real host path recorded a pause")
+			local pause_ms = client.paused.wall_ms
+			socket.now = socket.now + 40
+			assert_true(client[method](client, "caller_reason"))
+			assert_equal(client:get_session_id(), nil, "an explicit end starts no replacement")
+			if method == "session_end" then
+				assert_true(client:session_end("second_call"))
+				assert_true(client:flush())
+			end
+			local event = one_end("idle_timeout", original)
+			assert_equal(event.event_ts, os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor((pause_ms + 30000) / 1000)))
+		end
+		for _, status in ipairs({ "unknown", "denied", "denied_forced_minor" }) do
+			local consent = status
+			cases[method .. " while " .. consent] = function()
+				local client = fresh(nil, consent == "unknown")
+				if consent ~= "unknown" then
+					assert_true(client:session_start())
+					local decision = consent
+					if consent == "denied" then decision = false end
+					assert_true(client:set_consent(decision))
+				end
+				assert_true(client[method](client, "caller_reason"))
+				assert_equal(client:get_session_id(), nil)
+				assert_equal(#client.queue.items, 0)
+				assert_equal(#wire_ends(), 0, "no lifecycle event was published without consent")
+			end
+		end
+	end
+	cases["module wrapper lifecycle"] = function()
+		fresh()
+		local singleton = assert(loadfile("shardpilot/sdk.lua"))()
+		assert_true(type(singleton.session_end) == "function", "module exposes session_end")
+		local ok, err = singleton.session_end()
+		assert_equal(ok, false)
+		assert_equal(err, "not_initialized")
+		assert_true(singleton.init(config({ spool_enabled = false, flush_interval_seconds = 9999 })))
+		assert_true(singleton.session_end(), "an initialized singleton can end no session")
+		assert_equal(singleton.get_session_id(), nil)
+		assert_true(singleton.session_start())
+		local original = singleton.get_session_id()
+		assert_true(type(original) == "string" and original ~= "")
+		assert_true(singleton.session_end(""))
+		assert_true(singleton.flush())
+		one_end("session_end", original)
+		assert_true(singleton.shutdown("ignored"))
+		ok, err = singleton.session_end()
+		assert_equal(ok, false)
+		assert_equal(err, "not_initialized")
+	end
+	cases["full queue keeps explicit end retryable"] = function()
+		local client = fresh({ buffer_size = 1 })
+		assert_true(client:session_start())
+		local original = client:get_session_id()
+		local ok, err = client:session_end("")
+		assert_equal(ok, false)
+		assert_equal(err, "queue_full")
+		assert_equal(client:get_session_id(), original)
+		assert_true(client:flush())
+		assert_true(client:session_end(""))
+		assert_true(client:flush())
+		one_end("session_end", original)
+	end
+	local names, failed = {}, 0
+	for name in pairs(cases) do names[#names + 1] = name end
+	table.sort(names)
+	for _, name in ipairs(names) do
+		local ok, failure = pcall(cases[name])
+		print("explicit end scene " .. name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(failure)))
+		if not ok then failed = failed + 1 end
+	end
+	window = nil
+	assert_equal(failed, 0, "explicit end scene failures")
+end)()
