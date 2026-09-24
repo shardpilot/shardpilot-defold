@@ -1290,17 +1290,16 @@ end
 -- consent contract outranks the facts-about-the-past retention that governs
 -- auth latches and subject re-mints. Snapshots for since-dropped
 -- assignments die HERE (a re-grant must never publish a treatment the
--- server already killed); still-LIVE assignments re-emit on re-grant —
--- with the same deterministic ids, so anything that HAD already published
--- collapses server-side as a duplicate, and the session never under-counts
--- real, still-served treatment.
+-- server already killed). Still-live assignments re-arm on re-grant and
+-- emit in the fresh session, with that session's distinct deterministic id.
+-- Only retries of the SAME fact collapse server-side as duplicates.
 --
 -- The re-arm is recorded as INTENT only (`pending_rearm`), not as a
 -- snapshot: consent is already denied when this runs, getters serve
 -- nothing during denial, and a snapshot minted NOW would stamp the future
 -- fact with a denied-period timestamp and anonymous identity for a
 -- treatment that was not being served. The replacement snapshot
--- materializes at the first granted sweep — the moment serving actually
+-- materializes at the grant — the moment serving actually
 -- resumes — with THAT moment's identity; an intent whose entry died
 -- meanwhile is discarded (dead treatments never re-emit).
 function Experiments:on_analytics_purge()

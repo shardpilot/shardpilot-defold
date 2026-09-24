@@ -2392,12 +2392,16 @@ function Client:renew_sessionless_samplers()
 	self.sessionless.network = sampling.new_network()
 end
 
--- Drops every sample not yet summarized, the open session's and the
--- sessionless ones. An ended session's samples left with it at its close.
+-- Drop samples from every retained owner. A consent teardown archives the
+-- closing session without finalizing it, so its samples can still be present.
 function Client:reset_samplers()
 	if self.session then
 		self.session.perf = sampling.new_perf()
 		self.session.network = sampling.new_network()
+	end
+	if self.ended_session then
+		self.ended_session.perf = sampling.new_perf()
+		self.ended_session.network = sampling.new_network()
 	end
 	self.sessionless.perf = sampling.new_perf()
 	self.sessionless.network = sampling.new_network()
@@ -2643,6 +2647,11 @@ function Client:set_consent(decision)
 	end
 	local purged = true
 	if not granted then
+		-- Denial ends attribution locally, without an end event. Discard the
+		-- pause so a later grant cannot emit an end inside the denied interval.
+		self.resume_after_denial = self.resume_after_denial or self.session ~= nil
+		self.paused = nil
+		self:close_session()
 		local cleared = queue.size(self.queue)
 		if cleared > 0 then
 			queue.drain(self.queue, cleared)
@@ -2713,10 +2722,9 @@ function Client:set_consent(decision)
 		self.owed_summaries = {}
 		if self.experiments then
 			-- The purge above discarded any queued-but-unpublished
-			-- experiment exposure facts: re-arm this session's emissions so
+			-- experiment exposure facts: re-arm the assignment's emissions so
 			-- a later re-grant of a retained assignment emits its exposure
-			-- again (already-published facts collapse server-side on their
-			-- deterministic event ids) instead of under-counting treatment.
+			-- in the next session instead of under-counting treatment.
 			self.experiments:on_analytics_purge()
 		end
 	end
@@ -2888,6 +2896,7 @@ function Client:start_session(props, fact)
 	end
 	self.session = fresh
 	self.ended_session = nil
+	self.resume_after_denial = nil
 	self:mirror_session()
 	self:pause_if_backgrounded(fresh)
 	if replaced then
@@ -2918,6 +2927,9 @@ function Client:session_end(reason)
 	if not self.initialized then
 		return false, "shutdown"
 	end
+	-- An explicit host end cancels any consent-resume obligation, including
+	-- when denial already closed the session and this call is idempotent.
+	self.resume_after_denial = nil
 	if self.session == nil and self.ended_session ~= nil then
 		-- The session already ENDED: exactly one end per session. A second end
 		-- used to emit a second app.session_ended into the retained session;
@@ -3073,6 +3085,13 @@ function Client:on_window_event(event)
 			return true
 		end
 		return self:run_boundary(true)
+	end
+	if signal == "foreground" and self.resume_after_denial and self.consent_state == "granted"
+		and self.session == nil and self.ended_session ~= nil then
+		-- Resume is the next activity after a consent teardown.
+		-- The retryable start path announces a distinct session, and retains
+		-- the obligation if the queue cannot accept it yet.
+		return self:start_session(nil, { retryable = true })
 	end
 	return true
 end

@@ -1329,10 +1329,9 @@ local function test_session_end_while_denied_completes_locally()
 	assert_true(client:session_start())
 	assert_true(client:flush())
 	assert_true(client:set_consent(false))
-	assert_equal(client.session_active, true)
+	assert_equal(client.session_active, false, "denial itself tears the session down")
 
-	-- the local session teardown must complete while denied; only the wire
-	-- event is suppressed
+	-- A later explicit end stays idempotent and emits no wire event.
 	local ok, err = client:session_end("denied_end")
 	assert_true(ok, err)
 	assert_equal(client.session_active, false)
@@ -1843,7 +1842,7 @@ local function test_shutdown_completes_when_consent_denied()
 	assert_true(client:session_start())
 	assert_true(client:flush())
 	assert_true(client:set_consent(false))
-	assert_equal(client.session_active, true)
+	assert_equal(client.session_active, false, "denial itself tears the session down")
 
 	-- a denied user must still be able to tear the client down; the
 	-- session_end event is suppressed, not transmitted
@@ -9599,7 +9598,7 @@ local tests = {
 		path[2](client)
 		local b = client.session_id
 		assert_true(b ~= nil, path[1] .. ": a session is open in the background")
-		local opened_at = socket.now
+		local opened_at = client.paused.wall_ms / 1000
 		local ends_before = #named(client, "app.session_ended")
 		socket.now = socket.now + 40                        -- still in the background
 		assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
@@ -13233,6 +13232,207 @@ end)()
 		if not ok then failed = failed + 1 end
 	end
 	assert_equal(failed, 0, "rejection scene failures")
+end)()
+
+;(function()
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2 }
+	local cases = {}
+	local clock = require "shardpilot.clock"
+	local function fresh(source)
+		reset()
+		seed_granted_consent()
+		window = W
+		return assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999,
+			spool_enabled = false, source = source })))
+	end
+	local function pause(client)
+		local ok, err = client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+		assert_equal(ok, false)
+		assert_equal(err, "spool_disabled", "the memory-only fixture does not persist")
+		assert_true(client.paused ~= nil, "the real lifecycle path recorded its pause")
+	end
+	local function named(client, name)
+		local events = {}
+		for _, event in ipairs(client.queue.items) do
+			if event.event_name == name then events[#events + 1] = event end
+		end
+		return events
+	end
+	for _, decision in ipairs({ false, "denied_forced_minor" }) do
+		local deny = decision
+		for _, seconds in ipairs({ 5, 40 }) do
+			local away = seconds
+			cases[tostring(deny) .. " resume after " .. away] = function()
+				local client = fresh()
+				assert_true(client:session_start())
+				local old = client:get_session_id()
+				pause(client)
+				assert_true(client:set_consent(deny))
+				socket.now = socket.now + away
+				assert_true(client:set_consent(true))
+				local regrant = clock.iso_utc()
+				assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+				assert_equal(#named(client, "app.session_ended"), 0, "no end for the denied interval")
+				local starts = named(client, "app.session_started")
+				assert_equal(#starts, 1, "resume announces exactly one fresh session")
+				assert_true(starts[1].session_id ~= old, "the pre-denial session cannot continue")
+				assert_equal(starts[1].session_sequence, 1)
+				assert_true(starts[1].event_ts >= regrant, "start belongs to the new grant")
+				assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+				assert_equal(#named(client, "app.session_started"), 1, "duplicate resume is harmless")
+				assert_true(client:track("after_regrant"))
+				assert_equal(named(client, "after_regrant")[1].session_id, starts[1].session_id)
+			end
+		end
+		cases[tostring(deny) .. " tears down immediately"] = function()
+			local client = fresh()
+			assert_true(client:session_start())
+			pause(client)
+			assert_true(client:set_consent(deny))
+			assert_equal(client:get_session_id(), nil, "denial closes the current session immediately")
+			assert_equal(client.paused, nil, "the pre-denial deadline is discarded")
+			assert_true(client:set_consent(deny), "repeated denial remains safe")
+			socket.now = socket.now + 40
+			assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+			assert_equal(#client.queue.items, 0, "denied resume emits nothing")
+			assert_true(client:set_consent(true))
+			assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+			assert_equal(#named(client, "app.session_started"), 1, "repeated denial preserves the fresh-start obligation")
+		end
+		cases[tostring(deny) .. " foreground activity"] = function()
+			local client = fresh()
+			assert_true(client:session_start())
+			local old = client:get_session_id()
+			assert_true(client:set_consent(deny))
+			assert_true(client:set_consent(true))
+			assert_true(client:track("after_regrant"))
+			assert_equal(#named(client, "app.session_ended"), 0)
+			assert_equal(#named(client, "app.session_started"), 1, "activity announces a fresh session")
+			assert_true(client:get_session_id() ~= old)
+			assert_true(client:session_end())
+			assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+			assert_equal(#named(client, "app.session_started"), 1, "accepted start clears the consent-resume obligation")
+		end
+		cases[tostring(deny) .. " clears archived samples"] = function()
+			local client = fresh()
+			assert_true(client:session_start())
+			client:update(0.016)
+			client:observe_ping_ms(23)
+			client:observe_disconnect("synthetic_disconnect")
+			local collected = client.session
+			assert_equal(#collected.perf.frames, 1, "the real sampler collected a frame")
+			assert_equal(#collected.network.pings, 1)
+			assert_equal(collected.network.disconnect_count, 1)
+			assert_equal(collected.network.last_disconnect_reason, "synthetic_disconnect")
+			assert_true(client:set_consent(deny))
+			assert_equal(#collected.perf.frames, 0, "denial discards frames even after archiving")
+			assert_equal(#collected.network.pings, 0, "denial discards archived pings")
+			assert_equal(collected.network.disconnect_count, 0)
+			assert_equal(collected.network.last_disconnect_reason, nil)
+			assert_equal(#client.queue.items, 0, "cleanup emits no summary")
+		end
+		for _, when in ipairs({ "before grant", "after grant" }) do
+			local ended_when = when
+			cases[tostring(deny) .. " explicit end " .. ended_when] = function()
+				local client = fresh()
+				assert_true(client:session_start())
+				local old = client:get_session_id()
+				pause(client)
+				assert_true(client:set_consent(deny))
+				if ended_when == "before grant" then assert_true(client:session_end()) end
+				assert_true(client:set_consent(true))
+				if ended_when == "after grant" then assert_true(client:session_end()) end
+				assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+				assert_equal(#client.queue.items, 0, "explicit end cancels the denied-resume obligation")
+				assert_equal(client:get_session_id(), nil)
+				assert_true(client:track("after_explicit_end"))
+				assert_equal(#named(client, "app.session_started"), 1, "host activity still starts the next session")
+				assert_true(client:get_session_id() ~= old)
+			end
+		end
+	end
+	for _, seconds in ipairs({ 5, 40 }) do
+		local away = seconds
+		cases["granted control " .. away] = function()
+			local client = fresh()
+			assert_true(client:session_start())
+			local old = client:get_session_id()
+			pause(client)
+			socket.now = socket.now + away
+			assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+			assert_equal(#named(client, "app.session_ended"), away < 30 and 0 or 1)
+			assert_equal(client:get_session_id() == old, away < 30)
+		end
+	end
+	cases["startup control"] = function()
+		local client = fresh()
+		assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+		assert_equal(client:get_session_id(), nil, "startup focus does not invent a session")
+		assert_equal(#client.queue.items, 0)
+	end
+	cases["explicit end control"] = function()
+		local client = fresh()
+		assert_true(client:session_start())
+		assert_true(client:session_end())
+		local before = #client.queue.items
+		assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+		assert_equal(#client.queue.items, before, "an explicit end still waits for host activity")
+		assert_equal(client:get_session_id(), nil)
+	end
+	cases["denied resume waits for regrant"] = function()
+		local client = fresh()
+		assert_true(client:session_start())
+		pause(client)
+		assert_true(client:set_consent(false))
+		socket.now = socket.now + 40
+		assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+		assert_equal(#client.queue.items, 0)
+		assert_true(client:set_consent(true))
+		assert_true(client:track("after_regrant"))
+		assert_equal(#named(client, "app.session_started"), 1)
+		assert_equal(#named(client, "app.session_ended"), 0)
+	end
+	for _, source in ipairs({ "client", "backend" }) do
+		local event_source = source
+		cases["full queue retries resume " .. event_source] = function()
+			local client = fresh(event_source)
+			assert_true(client:session_start())
+			pause(client)
+			assert_true(client:set_consent(false))
+			assert_true(client:set_consent(true))
+			client.queue.limit = 0
+			local dropped = client:snapshot().dropped
+			local ok, err = client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED)
+			assert_equal(ok, false)
+			assert_equal(err, "queue_full")
+			assert_equal(client:get_session_id(), nil, "refused start does not open a session")
+			assert_equal(client:snapshot().dropped, dropped, "an owed resume is not a dropped event")
+			for _ = 1, 3 do
+				ok, err = client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED)
+				assert_equal(ok, false)
+				assert_equal(err, "queue_full")
+			end
+			assert_equal(client:snapshot().dropped, dropped, "resume retries do not invent event losses")
+			ok, err = client:track("refused_host_event")
+			assert_equal(ok, false)
+			assert_equal(err, "queue_full")
+			assert_equal(client:snapshot().dropped, dropped + 1, "a refused host event still counts")
+			client.queue.limit = 100
+			assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+			assert_equal(#named(client, "app.session_started"), 1)
+			assert_equal(#named(client, "app.session_ended"), 0)
+		end
+	end
+	local names, failed = {}, 0
+	for name in pairs(cases) do names[#names + 1] = name end
+	table.sort(names)
+	for _, name in ipairs(names) do
+		local ok, failure = pcall(cases[name])
+		window = nil
+		print("consent session scene " .. name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(failure)))
+		if not ok then failed = failed + 1 end
+	end
+	assert_equal(failed, 0, "consent session scene failures")
 end)()
 
 print("shardpilot defold lua tests passed")
