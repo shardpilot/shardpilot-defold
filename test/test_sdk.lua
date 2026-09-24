@@ -9274,16 +9274,22 @@ local tests = {
 	assert_true(client.paused ~= nil, "the host notification recorded a real pause")
 	socket.now = socket.now + seconds
 	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
-	local ends = 0
+	local replacement = client:get_session_id()
+	assert_true(type(replacement) == "string" and replacement ~= "", "the background control opens a replacement")
+	assert_true(replacement ~= original, "the background control starts a distinct session")
+	local ends, starts = 0, 0
 	for _, event in ipairs(client.queue.items) do
 		if event.event_name == "app.session_ended" then
 			ends = ends + 1
 			assert_equal(event.session_id, original)
 			assert_equal(event.props.reason, "idle_timeout")
+		elseif event.event_name == "app.session_started" and event.session_id == replacement then
+			starts = starts + 1
+			assert_equal(event.session_sequence, 1)
 		end
 	end
 	assert_equal(ends, 1, "the background control emits exactly one end")
-	assert_true(client:get_session_id() ~= original, "the background control starts a distinct session")
+	assert_equal(starts, 1, "the background control announces exactly one replacement")
 	window = nil
 	end,
 	function()
