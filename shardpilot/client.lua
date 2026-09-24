@@ -2392,12 +2392,16 @@ function Client:renew_sessionless_samplers()
 	self.sessionless.network = sampling.new_network()
 end
 
--- Drops every sample not yet summarized, the open session's and the
--- sessionless ones. An ended session's samples left with it at its close.
+-- Drop samples from every retained owner. A consent teardown archives the
+-- closing session without finalizing it, so its samples can still be present.
 function Client:reset_samplers()
 	if self.session then
 		self.session.perf = sampling.new_perf()
 		self.session.network = sampling.new_network()
+	end
+	if self.ended_session then
+		self.ended_session.perf = sampling.new_perf()
+		self.ended_session.network = sampling.new_network()
 	end
 	self.sessionless.perf = sampling.new_perf()
 	self.sessionless.network = sampling.new_network()

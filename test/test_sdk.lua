@@ -13313,6 +13313,24 @@ end)()
 			assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
 			assert_equal(#named(client, "app.session_started"), 1, "accepted start clears the consent-resume obligation")
 		end
+		cases[tostring(deny) .. " clears archived samples"] = function()
+			local client = fresh()
+			assert_true(client:session_start())
+			client:update(0.016)
+			client:observe_ping_ms(23)
+			client:observe_disconnect("synthetic_disconnect")
+			local collected = client.session
+			assert_equal(#collected.perf.frames, 1, "the real sampler collected a frame")
+			assert_equal(#collected.network.pings, 1)
+			assert_equal(collected.network.disconnect_count, 1)
+			assert_equal(collected.network.last_disconnect_reason, "synthetic_disconnect")
+			assert_true(client:set_consent(deny))
+			assert_equal(#collected.perf.frames, 0, "denial discards frames even after archiving")
+			assert_equal(#collected.network.pings, 0, "denial discards archived pings")
+			assert_equal(collected.network.disconnect_count, 0)
+			assert_equal(collected.network.last_disconnect_reason, nil)
+			assert_equal(#client.queue.items, 0, "cleanup emits no summary")
+		end
 	end
 	for _, seconds in ipairs({ 5, 40 }) do
 		local away = seconds
