@@ -75,6 +75,8 @@ explicit **granted** decision opens the event pipeline.
   sequence 1. No delayed end is emitted for time spent under denial. A resume
   while still denied emits nothing; an accepted fresh start clears the restart
   obligation, while a queue-full refusal leaves it for retry.
+  An explicit `session_end()` cancels that resume obligation, even when denial
+  already closed the session; the next tracked activity can still start anew.
 - **`denied_forced_minor`** is the band-forced denial the age-gate flow
   persists for under-threshold players. Every analytics gate treats it
   exactly like **denied** — same `consent_denied` refusals, same queue/

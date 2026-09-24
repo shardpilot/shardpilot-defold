@@ -2927,6 +2927,9 @@ function Client:session_end(reason)
 	if not self.initialized then
 		return false, "shutdown"
 	end
+	-- An explicit host end cancels any consent-resume obligation, including
+	-- when denial already closed the session and this call is idempotent.
+	self.resume_after_denial = nil
 	if self.session == nil and self.ended_session ~= nil then
 		-- The session already ENDED: exactly one end per session. A second end
 		-- used to emit a second app.session_ended into the retained session;

@@ -13331,6 +13331,25 @@ end)()
 			assert_equal(collected.network.last_disconnect_reason, nil)
 			assert_equal(#client.queue.items, 0, "cleanup emits no summary")
 		end
+		for _, when in ipairs({ "before grant", "after grant" }) do
+			local ended_when = when
+			cases[tostring(deny) .. " explicit end " .. ended_when] = function()
+				local client = fresh()
+				assert_true(client:session_start())
+				local old = client:get_session_id()
+				pause(client)
+				assert_true(client:set_consent(deny))
+				if ended_when == "before grant" then assert_true(client:session_end()) end
+				assert_true(client:set_consent(true))
+				if ended_when == "after grant" then assert_true(client:session_end()) end
+				assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+				assert_equal(#client.queue.items, 0, "explicit end cancels the denied-resume obligation")
+				assert_equal(client:get_session_id(), nil)
+				assert_true(client:track("after_explicit_end"))
+				assert_equal(#named(client, "app.session_started"), 1, "host activity still starts the next session")
+				assert_true(client:get_session_id() ~= old)
+			end
+		end
 	end
 	for _, seconds in ipairs({ 5, 40 }) do
 		local away = seconds
