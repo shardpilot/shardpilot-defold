@@ -9244,6 +9244,55 @@ local tests = {
 	assert_equal(client.session_sequence, 3, "and the new session's counter did not move")
 	end,
 	function()
+	-- BOUNDARY: FOREGROUND SILENCE DOES NOT END A SESSION. Both clocks pass the
+	-- timeout while frames run, without activity or a background notification.
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2 }
+	window = W
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999,
+		spool_enabled = false })))
+	assert_true(client:session_start())
+	local original = client:get_session_id()
+	local seconds = client.config.session_timeout_seconds + 10
+	socket.now = socket.now + seconds
+	client:update(seconds)
+	assert_equal(client:get_session_id(), original, "foreground silence keeps the open session")
+	assert_equal(client.paused, nil, "foreground frames do not invent a pause")
+	assert_equal(#client.queue.items, 1, "foreground silence emits no end or replacement start")
+	assert_equal(client.queue.items[1].event_name, "app.session_started")
+	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+	assert_true(client:track("after_foreground_silence"))
+	assert_equal(#client.queue.items, 2, "the next activity emits no lifecycle boundary")
+	assert_equal(client.queue.items[2].session_id, original)
+	assert_equal(client.queue.items[2].session_sequence, 2, "the original sequence continues")
+
+	-- Positive control: the same timeout after a real pause does end it.
+	local ok, err = client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	assert_equal(ok, false)
+	assert_equal(err, "spool_disabled", "the fixture uses only the memory queue")
+	assert_true(client.paused ~= nil, "the host notification recorded a real pause")
+	socket.now = socket.now + seconds
+	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+	local replacement = client:get_session_id()
+	assert_true(type(replacement) == "string" and replacement ~= "", "the background control opens a replacement")
+	assert_true(replacement ~= original, "the background control starts a distinct session")
+	local ends, starts = 0, 0
+	for _, event in ipairs(client.queue.items) do
+		if event.event_name == "app.session_ended" then
+			ends = ends + 1
+			assert_equal(event.session_id, original)
+			assert_equal(event.props.reason, "idle_timeout")
+		elseif event.event_name == "app.session_started" and event.session_id == replacement then
+			starts = starts + 1
+			assert_equal(event.session_sequence, 1)
+		end
+	end
+	assert_equal(ends, 1, "the background control emits exactly one end")
+	assert_equal(starts, 1, "the background control announces exactly one replacement")
+	window = nil
+	end,
+	function()
 	-- BOUNDARY: A RESUME BELOW THE TIMEOUT CHANGES NOTHING. The session paused
 	-- on a background signal continues; no end, no start.
 	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
