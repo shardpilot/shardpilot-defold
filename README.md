@@ -1262,13 +1262,14 @@ game has to handle specially.
 
   **Treat exposure delivery as best-effort, and the `diagnostics` hook as the
   place you learn otherwise.** Facts carry a deterministic `event_id`, so the
-  server counts a repeated send once — but the client may send more than once
-  (a consent denial and re-grant in the same session re-arms live
-  assignments), and under sustained queue pressure the SDK sheds owed
-  exposures rather than growing without bound. Neither is visible in the
-  return codes; both surface on the hook as `status = "exposure_skipped"` with
-  a `code` naming the reason. Watch it if the measured population matters to
-  you.
+  server counts retries of the same fact once. **Unreleased:** a consent denial
+  closes the session; after re-grant, retained assignments re-arm into the
+  fresh session and use its distinct exposure ID. Those are separate facts,
+  not duplicate sends of the pre-denial exposure. Under sustained queue
+  pressure the SDK sheds owed exposures rather than growing without bound.
+  Automatic exposure failures surface on the hook as
+  `status = "exposure_skipped"` with a `code` naming the reason. Watch it if
+  the measured population matters to you.
 
   Two specific gaps worth knowing by name, because neither is an error from
   your point of view:

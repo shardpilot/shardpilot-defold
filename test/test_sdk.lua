@@ -13238,12 +13238,12 @@ end)()
 	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2 }
 	local cases = {}
 	local clock = require "shardpilot.clock"
-	local function fresh()
+	local function fresh(source)
 		reset()
 		seed_granted_consent()
 		window = W
 		return assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999,
-			spool_enabled = false })))
+			spool_enabled = false, source = source })))
 	end
 	local function pause(client)
 		local ok, err = client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
@@ -13392,21 +13392,36 @@ end)()
 		assert_equal(#named(client, "app.session_started"), 1)
 		assert_equal(#named(client, "app.session_ended"), 0)
 	end
-	cases["full queue retries resume"] = function()
-		local client = fresh()
-		assert_true(client:session_start())
-		pause(client)
-		assert_true(client:set_consent(false))
-		assert_true(client:set_consent(true))
-		client.queue.limit = 0
-		local ok, err = client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED)
-		assert_equal(ok, false)
-		assert_equal(err, "queue_full")
-		assert_equal(client:get_session_id(), nil, "refused start does not open a session")
-		client.queue.limit = 100
-		assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
-		assert_equal(#named(client, "app.session_started"), 1)
-		assert_equal(#named(client, "app.session_ended"), 0)
+	for _, source in ipairs({ "client", "backend" }) do
+		local event_source = source
+		cases["full queue retries resume " .. event_source] = function()
+			local client = fresh(event_source)
+			assert_true(client:session_start())
+			pause(client)
+			assert_true(client:set_consent(false))
+			assert_true(client:set_consent(true))
+			client.queue.limit = 0
+			local dropped = client:snapshot().dropped
+			local ok, err = client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED)
+			assert_equal(ok, false)
+			assert_equal(err, "queue_full")
+			assert_equal(client:get_session_id(), nil, "refused start does not open a session")
+			assert_equal(client:snapshot().dropped, dropped, "an owed resume is not a dropped event")
+			for _ = 1, 3 do
+				ok, err = client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED)
+				assert_equal(ok, false)
+				assert_equal(err, "queue_full")
+			end
+			assert_equal(client:snapshot().dropped, dropped, "resume retries do not invent event losses")
+			ok, err = client:track("refused_host_event")
+			assert_equal(ok, false)
+			assert_equal(err, "queue_full")
+			assert_equal(client:snapshot().dropped, dropped + 1, "a refused host event still counts")
+			client.queue.limit = 100
+			assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+			assert_equal(#named(client, "app.session_started"), 1)
+			assert_equal(#named(client, "app.session_ended"), 0)
+		end
 	end
 	local names, failed = {}, 0
 	for name in pairs(cases) do names[#names + 1] = name end

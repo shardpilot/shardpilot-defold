@@ -3089,9 +3089,9 @@ function Client:on_window_event(event)
 	if signal == "foreground" and self.resume_after_denial and self.consent_state == "granted"
 		and self.session == nil and self.ended_session ~= nil then
 		-- Resume is the next activity after a consent teardown.
-		-- The normal owed-start path announces a distinct session, and retains
+		-- The retryable start path announces a distinct session, and retains
 		-- the obligation if the queue cannot accept it yet.
-		return self:open_owed_session(nil)
+		return self:start_session(nil, { retryable = true })
 	end
 	return true
 end
