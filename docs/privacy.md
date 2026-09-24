@@ -68,7 +68,13 @@ explicit **granted** decision opens the event pipeline.
   and keep their normal load/delivery rules.
 - **Denied** drops events at enqueue (`false, "consent_denied"`), clears the
   pending queue, discards in-flight batches on completion instead of retrying
-  them, and purges the offline spool (see below).
+  them, and purges the offline spool (see below). **Unreleased:** it also closes
+  the current session locally without an end event and discards its pending
+  background deadline. A re-grant does not continue that session: the next
+  resume or tracked activity announces a fresh `app.session_started`, at
+  sequence 1. No delayed end is emitted for time spent under denial. A resume
+  while still denied emits nothing; an accepted fresh start clears the restart
+  obligation, while a queue-full refusal leaves it for retry.
 - **`denied_forced_minor`** is the band-forced denial the age-gate flow
   persists for under-threshold players. Every analytics gate treats it
   exactly like **denied** — same `consent_denied` refusals, same queue/

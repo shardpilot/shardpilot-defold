@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- Analytics denial (including `denied_forced_minor`) now closes the current
+  session locally and discards its background deadline. Re-grant followed by
+  resume or tracked activity announces a fresh session instead of continuing
+  the pre-denial session or emitting an end inside the denied interval.
 - **An automatic session boundary.** Forward your window listener's events to
   `on_window_event(event)`; it replaces the `persist()` call there, which it
   performs on a background signal.

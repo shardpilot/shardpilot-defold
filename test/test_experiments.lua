@@ -2208,17 +2208,20 @@ local function test_consent_purge_rearms_unpublished_exposures()
 	local original_event_id = exposures[1].event_id
 
 	-- The denial purges the queued-but-unpublished exposure fact; the
-	-- session's emission must re-arm so the re-granted assignment counts.
+	-- assignment must re-arm in the fresh session after re-grant.
 	assert_true(client:set_consent(false))
 	assert_equal(#queued_events(client), 0, "the purge cleared the queue")
 	assert_true(client:set_consent(true))
 	client:update(0.016)
+	assert_equal(#queued_events(client, "experiment_exposure"), 0,
+		"a background sweep cannot reopen the denied session")
+	assert_true(client:track("after_regrant"))
+	client:update(0.016)
 	exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 1,
 		"the purged exposure must re-emit after a re-grant")
-	assert_equal(exposures[1].event_id, original_event_id,
-		"the re-emission derives the SAME deterministic id (published"
-		.. " duplicates collapse server-side)")
+	assert_true(exposures[1].event_id ~= original_event_id,
+		"the fresh session gets its own deterministic exposure id")
 
 	-- Still once per session: no growth on further ticks.
 	client:update(0.016)
@@ -4199,6 +4202,7 @@ local function test_purge_rearm_materializes_at_grant_identity()
 	assert_true(client:set_consent(true))
 	local ts_high = clock_mod.iso_utc()
 	advance_seconds(5)
+	assert_true(client:track("after_regrant"))
 	client:update(0.016)
 	local exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 1)
@@ -4753,6 +4757,7 @@ local function test_regrant_window_blocks_rotation_until_materialized()
 	assert_equal(ok, false,
 		"rotation is blocked while the grant-materialized exposure is owed")
 	assert_equal(err, "events_pending")
+	assert_true(client:track("after_regrant"))
 	client:update(0.016)
 	assert_true(client:flush({ include_summaries = false }))
 	assert_true(client:set_anonymous_id("anon-rotated"),

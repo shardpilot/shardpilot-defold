@@ -1588,7 +1588,10 @@ top-level one.
   rest alike. `denied` drops events at
   enqueue (`consent_denied`), clears the pending
   queue, discards in-flight batches instead of retrying, and purges the
-  offline spool. `"denied_forced_minor"` — the persisted decision for
+  offline spool. **Unreleased:** denial also closes the current session locally
+  and discards its pending background deadline. After a re-grant, the next
+  resume or tracked activity announces a distinct session; no end is emitted
+  for the denied interval. `"denied_forced_minor"` — the persisted decision for
   age-gate under-threshold players — is treated by every analytics gate
   exactly like `denied` (same refusals, same cleanup, same
   purge-at-every-launch); the one difference is its receipt, which carries
