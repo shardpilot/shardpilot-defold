@@ -13789,3 +13789,162 @@ end)()
 	end
 	assert_equal(failed, 0, "drop capture scene failures")
 end)()
+
+-- New analytics strings match the server's replacement/count behavior; actor
+-- identities and previously persisted envelopes are deliberately not rewritten.
+;(function()
+	local replacement = string.char(239, 191, 189)
+	local bad = string.char(255, 233)
+	local cases = {}
+	function cases.mixed_batch(client)
+		local props = { screen_name = "synthetic_" .. bad,
+			nested = { ["key_" .. bad] = { bad, false, 3 } } }
+		assert_true(client:track("app.screen_view", props, { label = bad }))
+		assert_true(client:screen_view("synthetic_normal"))
+		assert_true(client:flush())
+		assert_equal(#requests, 1, "the real SDK dispatched one mixed batch")
+		assert_true(not requests[1].body:find(bad, 1, true), "wire has no malformed property bytes")
+		local events = json.decode(requests[1].body).events
+		assert_equal(#events, 2, "replacement loses neither event")
+		assert_equal(events[1].props.screen_name, "synthetic_" .. replacement:rep(2))
+		local nested = events[1].props.nested["key_" .. replacement:rep(2)]
+		assert_equal(nested[1], replacement:rep(2))
+		assert_equal(nested[2], false)
+		assert_equal(nested[3], 3)
+		assert_equal(events[1].context.label, replacement:rep(2))
+		assert_equal(events[2].props.screen_name, "synthetic_normal")
+		assert_equal(props.nested["key_" .. bad][1], bad, "caller table is unchanged")
+		assert_equal(client:snapshot().dropped, 0)
+	end
+	function cases.name_and_metadata(client)
+		assert_true(client:track("synthetic_" .. bad))
+		assert_true(client:flush())
+		local event = json.decode(requests[1].body).events[1]
+		assert_equal(event.event_name, "synthetic_" .. replacement:rep(2))
+		assert_equal(event.app_version, "version_" .. replacement:rep(2))
+		assert_equal(event.app_build, "build_" .. replacement:rep(2))
+	end
+	function cases.utf8_shapes(client)
+		local rows = {
+			{ "ASCII", "ASCII" }, { "", "" }, { string.char(0), string.char(0) },
+			{ string.char(194,128), string.char(194,128) },
+			{ string.char(223,191), string.char(223,191) },
+			{ string.char(224,160,128), string.char(224,160,128) },
+			{ string.char(237,159,191), string.char(237,159,191) },
+			{ string.char(238,128,128), string.char(238,128,128) },
+			{ string.char(239,191,191), string.char(239,191,191) },
+			{ string.char(240,144,128,128), string.char(240,144,128,128) },
+			{ string.char(244,143,191,191), string.char(244,143,191,191) },
+			{ string.char(128), replacement }, { string.char(255), replacement },
+			{ string.char(192,175), replacement:rep(2) },
+			{ string.char(224,128,128), replacement:rep(3) },
+			{ string.char(237,160,128), replacement:rep(3) },
+			{ string.char(240,128,128,128), replacement:rep(4) },
+			{ string.char(244,144,128,128), replacement:rep(4) },
+			{ string.char(245,128,128,128), replacement:rep(4) },
+			{ string.char(194), replacement }, { string.char(226,130), replacement:rep(2) },
+			{ string.char(240,144,128), replacement:rep(3) },
+			{ string.char(226) .. "A" .. string.char(172), replacement .. "A" .. replacement },
+		}
+		for _, row in ipairs(rows) do
+			assert_true(client:track("synthetic_shape", { text = row[1] }))
+			assert_equal(client.queue.items[#client.queue.items].props.text, row[2])
+		end
+	end
+	function cases.required_bound(client)
+		local at = string.rep("A", 127) .. string.char(128)
+		assert_true(client:track_ad_impression_revenue("synthetic", at, 1, "USD"))
+		assert_equal(client.queue.items[1].props.network, string.rep("A", 127) .. replacement)
+		local ok, err = client:track_ad_impression_revenue("synthetic", at .. string.char(128), 1, "USD")
+		assert_equal(ok, false)
+		assert_equal(err, "invalid_network", "replacement code points exceed 128")
+	end
+	function cases.optional_bound(client)
+		local at = string.rep("A", 255) .. string.char(128)
+		assert_true(client:track_ad_impression_revenue("synthetic", "network", 1, "USD", nil, nil, nil, at))
+		assert_equal(client.queue.items[1].props.placement, string.rep("A", 255) .. replacement)
+		local ok, err = client:track_ad_impression_revenue("synthetic", "network", 1, "USD", nil, nil, nil, at .. string.char(128))
+		assert_equal(ok, false)
+		assert_equal(err, "invalid_placement", "replacement code points exceed 256")
+	end
+	function cases.currency_count(client)
+		assert_true(client:track_ad_impression_revenue("synthetic", "network", 1, string.char(192,175) .. "A"))
+		assert_equal(client.queue.items[1].props.currency, replacement:rep(2) .. "A")
+		local ok, err = client:track_ad_impression_revenue("synthetic", "network", 1, string.char(192,175))
+		assert_equal(ok, false)
+		assert_equal(err, "invalid_currency")
+	end
+	function cases.valid_multibyte_bound(client)
+		local scalar = string.char(240,144,128,128)
+		assert_true(client:track_ad_impression_revenue("synthetic", scalar:rep(128), 1, "USD"))
+		assert_equal(client.queue.items[1].props.network, scalar:rep(128))
+		local ok, err = client:track_ad_impression_revenue("synthetic", scalar:rep(129), 1, "USD")
+		assert_equal(ok, false)
+		assert_equal(err, "invalid_network")
+	end
+	function cases.identities_unchanged(client)
+		local anon = client:get_anonymous_id()
+		assert_true(client:identify("synthetic_" .. bad))
+		assert_true(client:track("synthetic_identity", { text = bad }))
+		assert_equal(client.queue.items[1].user_id, "synthetic_" .. bad)
+		assert_equal(client:get_anonymous_id(), anon)
+		assert_equal(client.consent_state, "granted")
+		assert_true(client:flush())
+		assert_equal(json.decode(requests[1].body).events[1].user_id, "synthetic_" .. bad)
+	end
+	function cases.anonymous_identity_unchanged(client, options)
+		local actor = "synthetic_" .. bad
+		assert_true(storage.save(identity_scope, { anonymous_id = actor, consent_analytics = "granted" }))
+		local restored = assert(sdk.new(options))
+		assert_true(restored:set_anonymous_id(actor))
+		assert_equal(restored:get_anonymous_id(), actor, "stored identity is not repaired")
+		assert_equal(restored.consent_state, "granted", "consent stays with its exact actor")
+	end
+	function cases.key_collision(client)
+		assert_true(client:track("synthetic_keys", { [string.char(255)] = "left", [string.char(254)] = "right", normal = "kept" }))
+		local props = client.queue.items[1].props
+		assert_true(props[replacement] == "left" or props[replacement] == "right")
+		assert_equal(props.normal, "kept")
+		assert_equal(props[string.char(255)], nil)
+		assert_equal(props[string.char(254)], nil)
+	end
+	function cases.persist_new(client)
+		assert_true(client:track("synthetic_" .. bad, { value = bad }))
+		assert_true(client:persist())
+		local event = storage.load_spool(identity_scope)[1]
+		assert_equal(event.event_name, "synthetic_" .. replacement:rep(2))
+		assert_equal(event.props.value, replacement:rep(2))
+	end
+	function cases.capture_new(client)
+		assert_true(client:session_start())
+		assert_true(client:capture_experiment_fact("synthetic_" .. bad, { value = bad }, "synthetic_fact"))
+		local event = storage.load_spool(identity_scope)[1]
+		assert_equal(event.event_name, "synthetic_" .. replacement:rep(2))
+		assert_equal(event.props.value, replacement:rep(2))
+	end
+	function cases.persisted_history(client, options)
+		assert_true(client:track("synthetic_old", { value = "old" }))
+		assert_true(client:persist())
+		local old = storage.load_spool(identity_scope)
+		old[1].props.value = bad
+		assert_true(storage.save_spool(identity_scope, old, options))
+		local replay = assert(sdk.new(options))
+		assert_true(replay:flush())
+		assert_equal(json.decode(requests[1].body).events[1].props.value, bad, "historic envelope stays verbatim")
+	end
+	local failed = 0
+	for name, scene in pairs(cases) do
+		reset()
+		storage.reset()
+		local _, restore = install_stub_sys_storage()
+		seed_granted_consent()
+		local options = config({ flush_interval_seconds = 9999, batch_size = 100,
+			app_version = "version_" .. bad, app_build = "build_" .. bad })
+		local ok, err = pcall(scene, assert(sdk.new(options)), options)
+		restore()
+		storage.reset()
+		if not ok then failed = failed + 1 end
+		print("UTF-8 scene " .. name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	assert_equal(failed, 0, "UTF-8 scene failures")
+end)()

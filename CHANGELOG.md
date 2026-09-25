@@ -2,6 +2,11 @@
 
 ### Unreleased
 
+- New analytics text replaces malformed UTF-8 with U+FFFD, and typed length
+  limits count the repaired value as ingest does. Event names, nested property
+  and context keys/values, and version/build metadata share the same repair.
+  Identities, persisted history, crash and remote config are unchanged; see
+  `docs/configuration.md` for the scope and replacement collisions.
 - New crash reports serialize SDK-owned fatality and, for a sampled-in
   non-fatal report with the default counter, its known 1-in-N rate. Custom
   samplers and unrepresentable rates stay unknown. Retry bodies retain the

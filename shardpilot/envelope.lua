@@ -1,5 +1,6 @@
 local clock = require "shardpilot.clock"
 local id = require "shardpilot.id"
+local utf8 = require "shardpilot.utf8"
 
 local M = {}
 
@@ -36,8 +37,8 @@ function M.build(config, state, event)
 		session_id = event.session_id,
 		session_sequence = event.session_sequence,
 		platform = config.platform,
-		app_version = config.app_version,
-		app_build = config.app_build,
+		app_version = utf8.repair(config.app_version),
+		app_build = utf8.repair(config.app_build),
 		props = props,
 		context = context,
 	}
