@@ -123,6 +123,15 @@ process are always dropped. A sampled-out `emit` looks exactly like a sent
 one at the call site; supply a custom `sampler` (e.g. `function() return
 true end`) to transmit every non-fatal.
 
+**Unreleased:** newly captured reports carry SDK-stamped `fatal` on the wire.
+An admitted non-fatal report also carries `non_fatal_sample_one_in` when the
+default counter's rate is an integer from 1 through 1,000,000. Custom samplers,
+including those that throw and keep the report, leave the rate unknown and omit
+that field; rates outside the representable range are omitted too. Caller
+event fields cannot supply either annotation. Both are serialized at capture,
+so retries preserve the original decision even after configuration changes.
+Older spooled bodies replay unchanged and carry no inferred annotations.
+
 ## Opting out
 
 Crash reporting is **on by default** — it exists to keep the game working and
