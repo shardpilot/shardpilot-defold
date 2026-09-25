@@ -2,6 +2,7 @@ local client_mod = require "shardpilot.client"
 
 local M = {}
 local default_client = nil
+local pending_init_flush = nil
 
 -- Capability discovery. Lets an integration feature-detect SDK abilities that
 -- are not new functions (and so cannot be detected by their presence, the way
@@ -45,11 +46,12 @@ function M.new(config)
 end
 
 function M.init(config)
-	local client, err = client_mod.new(config)
+	local client, err, flush_init_diagnostics = client_mod.new(config, true)
 	if not client then
 		return false, err
 	end
 	default_client = client
+	pending_init_flush = flush_init_diagnostics
 	return true
 end
 
@@ -273,7 +275,16 @@ function M.track_ad_impression_revenue(
 end
 
 function M.update(dt)
-	return with_default("update", dt)
+	local client = default()
+	if not client then return false, "not_initialized" end
+	local flush = pending_init_flush
+	pending_init_flush = nil
+	if flush then
+		flush(function() return default_client == client end)
+		-- Check after the final callback too: it may have removed this client.
+		if default_client ~= client then return end
+	end
+	return client:update(dt)
 end
 
 function M.observe_ping_ms(ms)
@@ -309,8 +320,10 @@ function M.shutdown(reason)
 		return false, "not_initialized"
 	end
 	local ok, err = client:shutdown(reason)
-	if ok then
+	-- A synchronous shutdown response hook may have adopted another client.
+	if ok and default_client == client then
 		default_client = nil
+		pending_init_flush = nil
 	end
 	return ok, err
 end

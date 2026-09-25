@@ -579,10 +579,10 @@ neither persisted nor retried. These additions are new in
 and the unchanged Boolean `flush()` contract.
 
 The optional `diagnostics` hook is invoked with each non-accepted ingest
-outcome the server reports, and with the one issue this SDK can see before
-any request is made: a configured `platform` it did not recognise, reported as
-`{ scope = "config", status = "ignored", code = "platform_unmapped" }` at
-construction (see "Platform"). Inside a `202` events-batch response the SDK parses
+outcome the server reports, and with construction issues such as a configured
+`platform` it did not recognise, reported as
+`{ scope = "config", status = "ignored", code = "platform_unmapped" }`
+(see "Platform" and the delivery timing below). Inside a `202` events-batch response the SDK parses
 the per-event status array and reports every `observed`, `duplicate`,
 `rejected`, `suppressed_no_consent`, or `suppressed_ad_revenue_consent`
 event (with its server `code`); on a
@@ -598,6 +598,24 @@ and `identity_changed` carry a `count`); and when a configured
 `anonymous_id` override replaces a different persisted identity, the
 fresh-identity reset is reported as
 `{ scope = "consent", status = "dropped", code = "identity_override_changed" }`.
+
+**Unreleased — boot delivery timing:** module-level `init()` finishes construction
+and adopts the client before any of its diagnostic hooks run. The first module
+`update(dt)` delivers those queued boot issues before pumping that client. Keep
+calling `update(dt)` even if there are no analytics events to publish. Boot stats
+and `last_event_issue` are updated during construction; delivering the hook later
+does not overwrite a newer runtime diagnostic latch.
+
+If a boot hook calls module `shutdown()` or `init()`, that action applies to the
+adopted client. The remaining old boot issues are discarded and that update does
+not pump either the old client or its replacement. A client shut down or replaced
+before its first update never delivers its pending boot hooks; a failed re-init
+preserves the existing client's pending delivery. Throwing hooks remain isolated.
+A replacement installed by a shutdown response hook is preserved too.
+Standalone `new()` has no singleton adoption step: its boot hooks still run before
+it returns, after construction has settled. Runtime diagnostics remain synchronous,
+including between module `init()` and its first `update()`.
+
 Counts are also available on `snapshot()` (`accepted`, `dropped`, `last_error`,
 `rejected`, `duplicates`, `observed`, `suppressed`, `last_event_issue`, plus
 the spool counters `spooled`, `spool_resent`, `spool_evicted`,

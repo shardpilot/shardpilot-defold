@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- Module `init()` defers boot diagnostic hooks until the first `update()`,
+  after adopting the client. Hook-triggered shutdown/re-init stops stale delivery
+  and pumping; standalone `new()` and runtime diagnostics retain synchronous
+  delivery. Boot counters/latches remain available immediately.
 - Supply an iOS privacy manifest fragment with explicit game-owned merge
   instructions, collection/linkage/consent notes and the unused engine IDFV
   read. Final iOS archive and Xcode privacy-report verification remains owed;
