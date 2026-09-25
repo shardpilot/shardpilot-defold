@@ -13948,3 +13948,116 @@ end)()
 	end
 	assert_equal(failed, 0, "UTF-8 scene failures")
 end)()
+
+-- Exercise every early refusal in the four progression/ad entrypoints, then
+-- prove that delegated refusals and successful calls are not counted twice.
+;(function()
+	local cases = {}
+	local function add(name, method, args, code, source)
+		cases[#cases + 1] = { name = name, method = method, args = args, code = code, source = source }
+	end
+	for _, method in ipairs({ "track_level_start", "track_level_complete", "track_level_fail" }) do
+		add(method .. " source", method, { "synthetic", 1, 1 }, "source_not_client", "backend")
+		add(method .. " level", method, { "", 1, 1 }, "level_id_required")
+		add(method .. " attempt", method, { "synthetic", 0, 1 }, "invalid_attempt")
+	end
+	add("complete duration", "track_level_complete", { "synthetic", 1, -1 }, "invalid_duration")
+	add("complete score", "track_level_complete", { "synthetic", 1, 1, math.huge }, "invalid_score")
+	add("fail duration", "track_level_fail", { "synthetic", 1, -1 }, "invalid_duration")
+	add("fail reason", "track_level_fail", { "synthetic", 1, 1, false }, "invalid_fail_reason")
+	local ad = "track_ad_impression_revenue"
+	add("ad source", ad, { "synthetic", "network", 1, "USD" }, "source_not_client", "server")
+	add("impression type", ad, { false, "network", 1, "USD" }, "invalid_impression_id")
+	add("impression empty", ad, { " ", "network", 1, "USD" }, "invalid_impression_id")
+	add("network type", ad, { "synthetic", false, 1, "USD" }, "invalid_network")
+	add("network length", ad, { "synthetic", string.rep("N", 129), 1, "USD" }, "invalid_network")
+	add("revenue", ad, { "synthetic", "network", math.huge, "USD" }, "invalid_revenue_micros")
+	add("currency type", ad, { "synthetic", "network", 1, false }, "invalid_currency")
+	add("currency length", ad, { "synthetic", "network", 1, "US" }, "invalid_currency")
+	for offset, field in ipairs({ { "revenue_precision", 64 }, { "ad_unit", 256 }, { "ad_format", 64 }, { "placement", 256 } }) do
+		for _, kind in ipairs({ "type", "length" }) do
+			local args = { "synthetic", "network", 1, "USD", n = 8 }
+			if kind == "type" then args[4 + offset] = false
+			else args[4 + offset] = string.rep("A", field[2] + 1) end
+			add(field[1] .. " " .. kind, ad, args, "invalid_" .. field[1])
+		end
+	end
+	local failed, passed = 0, 0
+	local unpack_args = table.unpack or unpack
+	for _, api in ipairs({ "instance", "singleton" }) do
+		local function run(name, fn, source, consent, capacity)
+			reset()
+			storage.reset()
+			local _, restore = install_stub_sys_storage()
+			if consent ~= "unknown" then seed_granted_consent() end
+			local options = config({ source = source or "client", buffer_size = capacity or 100,
+				flush_interval_seconds = 9999 })
+			local client = api == "instance" and assert(sdk.new(options)) or nil
+			if not client then assert_true(sdk.init(options)) end
+			local function call(method, ...)
+				if client then return client[method](client, ...) end
+				return sdk[method](...)
+			end
+			local ok, err = pcall(fn, call)
+			restore()
+			storage.reset()
+			if ok then passed = passed + 1 else failed = failed + 1 end
+			print("refusal scene " .. api .. " " .. name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+		end
+		for _, scene in ipairs(cases) do
+			run(scene.name, function(call)
+				local before = call("snapshot").dropped
+				local ok, err = call(scene.method, unpack_args(scene.args, 1, scene.args.n or #scene.args))
+				assert_equal(ok, false)
+				assert_equal(err, scene.code)
+				assert_equal(call("snapshot").dropped, before + 1, "one early refusal is one dropped event")
+				assert_equal(call("snapshot").last_error, scene.code, "last error names the refusal")
+				assert_equal(call("snapshot").enqueued, 0)
+				assert_equal(call("snapshot").rejected, 0, "not a server rejection")
+				assert_equal(#storage.load_spool(identity_scope), 0)
+				assert_equal(#requests, 0)
+				local again = call(scene.method, unpack_args(scene.args, 1, scene.args.n or #scene.args))
+				assert_equal(again, false)
+				assert_equal(call("snapshot").dropped, before + 2, "the counter accumulates")
+			end, scene.source)
+		end
+		run("accepted controls", function(call)
+			assert_true(call("track_level_start", "synthetic", 1))
+			assert_true(call("track_level_complete", "synthetic", 1, 0))
+			assert_true(call("track_level_fail", "synthetic", 1, 0))
+			assert_true(call(ad, "synthetic", "network", 1, "USD"))
+			assert_equal(call("snapshot").dropped, 0)
+			assert_equal(call("snapshot").enqueued, 4)
+		end)
+		run("delegated consent", function(call)
+			local ok, err = call("track_level_start", "synthetic", 1)
+			assert_equal(ok, false); assert_equal(err, "consent_unknown")
+			assert_equal(call("snapshot").dropped, 1)
+		end, nil, "unknown")
+		run("delegated props", function(call)
+			local props = {}; props.cycle = props
+			local ok, err = call("track_level_complete", "synthetic", 1, 0, nil, props)
+			assert_equal(ok, false); assert_equal(err, "invalid_props")
+			assert_equal(call("snapshot").dropped, 1)
+		end)
+		run("delegated queue", function(call)
+			assert_true(call("track_level_start", "synthetic", 1))
+			local ok, err = call(ad, "synthetic", "network", 1, "USD")
+			assert_equal(ok, false); assert_equal(err, "queue_full")
+			assert_equal(call("snapshot").dropped, 1)
+		end, nil, nil, 1)
+		run("delegated shutdown", function(call)
+			assert_true(call("shutdown"))
+			local ok, err = call("track_level_fail", "synthetic", 1, 0)
+			assert_equal(ok, false)
+			if api == "instance" then
+				assert_equal(err, "shutdown")
+				assert_equal(call("snapshot").dropped, 1)
+			else
+				assert_equal(err, "not_initialized")
+				assert_equal(call("snapshot"), false, "no client means no client counter")
+			end
+		end)
+	end
+	assert_equal(failed, 0, "refusal scene failures; passing controls " .. passed)
+end)()
