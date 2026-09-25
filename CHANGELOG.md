@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- Drop-time experiment capture without an arm-time session now refuses once
+  the current background pause expires. It neither files a new fact into the
+  timed-out session nor opens a replacement; an explicit arm-time session is
+  preserved. The live owed exposure remains available for its later sweep.
 - Empty event properties are omitted from new envelopes. Hosts that encode an
   empty Lua table as an array no longer produce an invalid `props: []` that
   rejects every event in the same batch. Non-empty properties are preserved.

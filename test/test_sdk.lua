@@ -13707,3 +13707,85 @@ end)()
 	end
 	assert_equal(failures, 0, "empty props scene failures")
 end)()
+
+-- Drop-time capture must not borrow a session whose background deadline passed.
+;(function()
+	local failed = 0
+	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2 }
+	local cases = {
+		{ name = "active", accepted = true },
+		{ name = "short pause", pause = true, elapsed = 5, accepted = true },
+		{ name = "expired wall", pause = true, elapsed = 40 },
+		{ name = "expired frames", pause = true, frames = 40 },
+		{ name = "expired full queue", pause = true, elapsed = 40, capacity = 1 },
+		{ name = "arm-time session", pause = true, elapsed = 40, armed = true, accepted = true },
+		{ name = "explicitly ended", ended = true },
+		{ name = "sessionless backend", backend = true, sessionless = true, accepted = true },
+		{ name = "expired backend session", backend = true, pause = true, elapsed = 40 },
+	}
+	for _, scene in ipairs(cases) do
+		reset()
+		storage.reset()
+		local _, restore = install_stub_sys_storage()
+		seed_granted_consent()
+		window = W
+		local ok, err = pcall(function()
+			local options = config({ platform = "android", source = scene.backend and "backend" or "client",
+				buffer_size = scene.capacity or 100, flush_interval_seconds = 9999 })
+			local client = assert(sdk.new(options))
+			if not scene.sessionless then assert_true(client:session_start()) end
+			local original = client.session
+			if scene.ended then assert_true(client:session_end("complete")) end
+			if scene.pause then
+				assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST))
+				if scene.frames then
+					-- Advance the already-accumulated frame clock, with wall
+					-- time corrected backward; no update sweep runs first.
+					client.frame_seconds = client.frame_seconds + scene.frames
+					socket.now = socket.now - 5
+				else
+					socket.now = socket.now + scene.elapsed
+				end
+			end
+			local stream = client:sequence_stream()
+			local sequence = stream.sequence
+			local overrides = scene.armed and { session_id = "session-armed", event_ts = "2026-09-01T00:00:00Z" } or {}
+			local accepted = client:capture_experiment_fact("experiment_exposure",
+				{ experiment_key = "synthetic-exp" }, "synthetic-drop-fact", overrides)
+			assert_equal(accepted, scene.accepted == true, "capture admission")
+			local expected_session = original
+			if scene.ended then expected_session = nil end
+			assert_true(client.session == expected_session, "capture opens or replaces no session")
+			local captured
+			for _, event in ipairs(storage.load_spool(identity_scope)) do
+				if event.event_id == "synthetic-drop-fact" then captured = event end
+			end
+			if not scene.accepted then
+				assert_equal(captured, nil, "refusal persisted no misattributed fact")
+				assert_equal(stream.sequence, sequence, "refusal consumed no sequence")
+			else
+				assert_true(captured ~= nil, "the real capture persisted its envelope")
+				local expected = scene.armed and "session-armed" or (original and original.id)
+				assert_equal(captured.session_id, expected, "durable session attribution")
+				if scene.armed then assert_equal(captured.event_ts, overrides.event_ts) end
+				reset()
+				local replay = assert(sdk.new(options))
+				assert_true(replay:flush())
+				local found
+				for _, request in ipairs(requests) do
+					for _, event in ipairs(json.decode(request.body).events or {}) do
+						if event.event_id == "synthetic-drop-fact" then found = event end
+					end
+				end
+				assert_true(found ~= nil, "captured fact replayed through actual transport")
+				assert_equal(found.session_id, expected)
+			end
+		end)
+		restore()
+		storage.reset()
+		window = nil
+		if not ok then failed = failed + 1 end
+		print("drop capture scene " .. scene.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	assert_equal(failed, 0, "drop capture scene failures")
+end)()
