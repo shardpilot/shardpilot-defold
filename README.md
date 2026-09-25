@@ -1525,6 +1525,11 @@ top-level one.
 
 ## Privacy & consent
 
+- **iOS manifest (unreleased):** merge the supplied
+  [`PrivacyInfo.xcprivacy` fragment](shardpilot/privacy/PrivacyInfo.xcprivacy)
+  into the game's own manifest using the
+  [iOS integration guide](docs/ios-privacy.md). It does not bundle itself;
+  preserve engine/dependency declarations and verify the final archive.
 - **Tokens are memory-only.** Auth material is never written to disk. The live
   event queue is in-memory; only undeliverable event envelopes are persisted,
   to the bounded offline spool

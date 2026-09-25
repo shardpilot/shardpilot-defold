@@ -1,5 +1,10 @@
 # Privacy And Tokens
 
+For iOS, explicitly merge the SDK's unreleased manifest fragment into the
+game-owned manifest. The [iOS privacy guide](ios-privacy.md) maps data types,
+consent defaults and linkage, records the unused engine IDFV read, and describes
+the final archive/report evidence still required.
+
 ShardPilot Defold SDK v0 keeps tokens in memory only. Client tokens are
 memory-only — they are never written to the identity record, the crash-retry
 sidecar, or the offline event spool. The live event queue is in-memory; only
