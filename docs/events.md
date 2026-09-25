@@ -15,7 +15,7 @@ All events use app-first ShardPilot ingest fields:
 - `platform`
 - `app_version`
 - `app_build`
-- `props`
+- `props` (omitted from new envelopes when empty or absent)
 - `context`
 
 Do not use legacy public SDK fields: `project_id`, `game_id`, `env`,

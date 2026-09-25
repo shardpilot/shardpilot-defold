@@ -2,6 +2,9 @@
 
 ### Unreleased
 
+- Empty event properties are omitted from new envelopes. Hosts that encode an
+  empty Lua table as an array no longer produce an invalid `props: []` that
+  rejects every event in the same batch. Non-empty properties are preserved.
 - `session_end([reason])` now defaults empty or non-string reasons to
   `session_end`, opens nothing when no session exists, and is available through
   the module singleton. Shutdown uses `app_final` regardless of a caller

@@ -15,7 +15,11 @@ local function copy_table(value)
 end
 
 function M.build(config, state, event)
-	local props = copy_table(event.props) or {}
+	local props = copy_table(event.props)
+	-- Omission is unambiguous even when the host encodes an empty table as [].
+	if props and next(props) == nil then
+		props = nil
+	end
 	local context = copy_table(event.context)
 
 	return {

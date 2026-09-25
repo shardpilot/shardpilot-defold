@@ -13644,3 +13644,66 @@ print("shardpilot defold lua tests passed")
 	window = nil
 	assert_equal(failed, 0, "explicit end scene failures")
 end)()
+
+-- Empty event properties must not depend on the host encoder's empty-table
+-- choice. The test encoder deliberately emits [] for {}, as a control.
+;(function()
+	assert_equal(json.encode({}), "[]")
+	local failures = 0
+	for _, shape in ipairs({ "absent", "empty", "nonempty" }) do
+		for _, path in ipairs({ "queue", "spool" }) do
+			reset()
+			storage.reset()
+			local _, restore_storage = install_stub_sys_storage()
+			seed_granted_consent()
+			local real_request = http.request
+			local accepted, status, captured = 0, nil, nil
+			http.request = function(url, method, callback, headers, body)
+				assert_contains(url, "/v1/events:batch")
+				captured = body
+				-- Ingest accepts omitted/object props; an array rejects the
+				-- whole batch. Inspect the wire before decoding loses {} vs [].
+				status = body:find('"props":%s*%[') and 400 or 202
+				if status == 202 then accepted = #json.decode(body).events end
+				callback(nil, nil, { status = status, response = json.encode({ accepted = accepted }) })
+			end
+			local ok, err = pcall(function()
+				local options = config({ flush_interval_seconds = 9999 })
+				local client = assert(sdk.new(options))
+				local props
+				if shape == "empty" then props = {} end
+				if shape == "nonempty" then props = { entry_point = "synthetic_start" } end
+				assert_true(client:session_start(props))
+				assert_true(client:screen_view("synthetic_screen", { enabled = false, samples = { 1, 2 } }))
+				if path == "spool" then
+					assert_true(client:persist())
+					client = assert(sdk.new(options))
+					assert_equal(#client.spool_record, 2, "both envelopes survived persistence")
+				end
+				client:flush()
+				assert_true(captured ~= nil, "the actual SDK dispatched the batch")
+				assert_equal(status, 202, "mixed batch wire shape is accepted")
+				assert_equal(accepted, 2, "the empty-props event and its neighbor are accepted")
+				local events = json.decode(captured).events
+				assert_equal(events[1].event_name, "app.session_started")
+				assert_equal(events[2].event_name, "app.screen_view")
+				if shape == "nonempty" then
+					assert_equal(events[1].props.entry_point, "synthetic_start", "a map is not an empty array")
+				else
+					assert_equal(events[1].props, nil, "empty properties are omitted")
+				end
+				assert_equal(events[2].props.screen_name, "synthetic_screen")
+				assert_equal(events[2].props.enabled, false)
+				assert_equal(events[2].props.samples[2], 2, "nested arrays retain their shape")
+				assert_equal(client:snapshot().dropped, 0)
+				if path == "spool" then assert_equal(#client.spool_record, 0) end
+			end)
+			http.request = real_request
+			restore_storage()
+			storage.reset()
+			if not ok then failures = failures + 1 end
+			print("empty props scene " .. shape .. " " .. path .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+		end
+	end
+	assert_equal(failures, 0, "empty props scene failures")
+end)()
