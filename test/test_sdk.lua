@@ -14184,3 +14184,346 @@ end)()
 	end
 	assert_equal(failed, 0, "suppression scene failures")
 end)()
+
+-- Boot callbacks belong to the adopted client, including configuration warnings
+-- emitted before the client object exists and multiple issues from one boot.
+;(function()
+	local scenes = {}
+	local function scene(name, body) scenes[#scenes + 1] = { name = name, body = body } end
+	local function with_boot(kind, body)
+		reset(); storage.reset()
+		local saved = { get_save_file = sys.get_save_file, save = sys.save, load = sys.load }
+		local stores, clients, paths = {}, {}, {}
+		local core = require "shardpilot.client"
+		local real_new = core.new
+		local facade = dofile("shardpilot/sdk.lua")
+		local function cfg(app, hook)
+			return config({ app_id = app, anonymous_id = app .. "-actor", diagnostics = hook })
+		end
+		sys.get_save_file = function(app, name)
+			paths[name] = app .. "/" .. name
+			return paths[name]
+		end
+		sys.save = function(path, value) stores[path] = value; return true end
+		sys.load = function(path) return stores[path] or {} end
+		-- Instrument only the returned instances; all construction and callbacks
+		-- execute the real factory. Preserve the optional deferred-delivery return.
+		core.new = function(...)
+			local client, err, flush = real_new(...)
+			if client then clients[client.config.app_id] = client end
+			return client, err, flush
+		end
+		local ok, err = pcall(function()
+			assert_true(facade.init(cfg("boot-previous")))
+			local outer = cfg("boot-outer")
+			assert_true(storage.save(outer, { anonymous_id = outer.anonymous_id, consent_analytics = "granted" }))
+			if kind == "legacy" or kind == "both" then
+				assert_true(storage.spool_is_durable(outer))
+				stores[paths.spool] = {
+					events = { { event_id = "boot-obsolete", event_name = "tutorial_start" } },
+				}
+			end
+			if kind == "platform" or kind == "both" then outer.platform = "synthetic-unmapped" end
+			body(facade, outer, clients, cfg)
+		end)
+		core.new = real_new
+		sys.get_save_file, sys.save, sys.load = saved.get_save_file, saved.save, saved.load
+		storage.reset()
+		assert_true(ok, err)
+	end
+	for _, kind in ipairs({ "legacy", "platform", "both" }) do
+		for _, action in ipairs({ "shutdown", "init" }) do
+			scene(kind .. " " .. action, function()
+				with_boot(kind, function(facade, outer, clients, cfg)
+					local seen, action_ok = {}, nil
+					outer.diagnostics = function(issue)
+						seen[#seen + 1] = { actor = facade.get_anonymous_id(), code = issue.code }
+						if #seen == 1 then
+							if action == "shutdown" then action_ok = facade.shutdown()
+							else action_ok = facade.init(cfg("boot-nested")) end
+						else
+							-- A second OLD callback must not reach and shut down the replacement.
+							facade.shutdown()
+						end
+					end
+					assert_true(facade.init(outer))
+					local before_tick = #seen
+					facade.update(0.25)
+					assert_equal(#seen, 1, "stop stale delivery after the hook changes adoption")
+					assert_true(action_ok, "the requested facade action executed")
+					if action == "shutdown" then
+						assert_equal(clients["boot-outer"].initialized, false, "shutdown closes the newly adopted client")
+						assert_not_initialized("hook shutdown cleared the new client", function() return facade.snapshot() end)
+					else
+						assert_equal(facade.get_anonymous_id(), "boot-nested-actor", "outer init cannot overwrite nested adoption")
+						assert_equal(clients["boot-nested"].flush_elapsed_seconds, 0, "replacement waits for its own tick")
+					end
+					assert_equal(seen[1].actor, "boot-outer-actor", "hook acts on this client, not the previous one")
+					assert_equal(before_tick, 0, "init returns before invoking host diagnostics")
+					assert_equal(clients["boot-previous"].initialized, true, "previous client was not shut down")
+					assert_equal(clients["boot-outer"].flush_elapsed_seconds, 0, "last hook cannot fall through to the old pump")
+				end)
+			end)
+		end
+	end
+	for _, action in ipairs({ "observe", "throw", "update", "diagnose" }) do
+		scene("multiple " .. action, function()
+			with_boot("both", function(facade, outer, clients)
+				local seen = {}
+				outer.diagnostics = function(issue)
+					seen[#seen + 1] = issue.code
+					if action == "throw" then error("synthetic boot hook error") end
+					if action == "update" and #seen == 1 then facade.update(0) end
+					if action == "diagnose" and #seen == 1 then
+						clients["boot-outer"]:diagnose({ status = "observed", code = "during-drain" })
+					end
+				end
+				local original_hook = outer.diagnostics
+				assert_true(facade.init(outer))
+				assert_equal(#seen, 0, "all boot hooks are deferred")
+				assert_equal(facade.snapshot().last_event_issue, "dropped:legacy_event_name", "latch is immediate, not replayed by the drain")
+				facade.update(0)
+				local count = action == "diagnose" and 3 or 2
+				assert_equal(#seen, count, "deliver each queued issue once, including after a throwing or reentrant hook")
+				assert_equal(seen[1], "platform_unmapped")
+				assert_equal(seen[count], "legacy_event_name")
+				if action == "diagnose" then
+					assert_equal(seen[2], "during-drain", "runtime diagnostics stay synchronous")
+					assert_equal(facade.snapshot().last_event_issue, "observed:during-drain", "queued hooks do not overwrite a newer latch")
+				end
+				facade.update(0)
+				assert_equal(#seen, count, "later ticks do not replay boot issues")
+				clients["boot-outer"]:diagnose({ status = "observed", code = "runtime-control" })
+				assert_equal(#seen, count + 1, "runtime diagnostics remain live after the boot drain")
+				assert_equal(seen[count + 1], "runtime-control")
+				assert_equal(outer.diagnostics, original_hook, "caller config is not rewritten")
+			end)
+		end)
+	end
+	scene("runtime before tick control", function()
+		with_boot("legacy", function(facade, outer, clients)
+			local seen = {}
+			outer.diagnostics = function(issue) seen[#seen + 1] = issue.code end
+			assert_true(facade.init(outer))
+			clients["boot-outer"]:diagnose({ status = "observed", code = "before-tick" })
+			assert_equal(#seen, 1, "runtime delivery does not wait for the boot drain")
+			assert_equal(seen[1], "before-tick")
+			facade.update(0)
+			assert_equal(seen[2], "legacy_event_name")
+			assert_equal(facade.snapshot().last_event_issue, "observed:before-tick")
+		end)
+	end)
+	scene("failed reinit preserves pending", function()
+		with_boot("legacy", function(facade, outer)
+			local calls = 0
+			outer.diagnostics = function() calls = calls + 1 end
+			assert_true(facade.init(outer))
+			assert_equal(facade.init({}), false)
+			assert_equal(calls, 0)
+			facade.update(0)
+			assert_equal(calls, 1, "failed init keeps the adopted client's pending hook")
+			assert_equal(facade.get_anonymous_id(), "boot-outer-actor")
+		end)
+	end)
+	for _, action in ipairs({ "shutdown", "replace" }) do
+		scene("before tick " .. action, function()
+			with_boot("both", function(facade, outer, clients, cfg)
+				local calls = 0
+				outer.diagnostics = function() calls = calls + 1 end
+				assert_true(facade.init(outer))
+				if action == "shutdown" then assert_true(facade.shutdown())
+				else assert_true(facade.init(cfg("boot-replacement"))) end
+				facade.update(0)
+				assert_equal(calls, 0, "an unadopted client's pending boot hooks are discarded")
+			end)
+		end)
+	end
+	for _, constructor in ipairs({ "facade new", "core new" }) do
+		scene(constructor .. " control", function()
+			with_boot("both", function(facade, outer, clients)
+				local seen = {}
+				outer.diagnostics = function(issue) seen[#seen + 1] = issue.code end
+				local client
+				if constructor == "facade new" then client = assert(facade.new(outer))
+				else client = assert(require("shardpilot.client").new(outer)) end
+				assert_equal(#seen, 2, "standalone construction still delivers before returning")
+				assert_equal(seen[1], "platform_unmapped")
+				assert_equal(seen[2], "legacy_event_name")
+				assert_equal(client:snapshot().last_event_issue, "dropped:legacy_event_name")
+				assert_equal(facade.get_anonymous_id(), "boot-previous-actor", "new never adopts the singleton")
+			end)
+		end)
+	end
+	scene("invalid config control", function()
+		with_boot("platform", function(facade, outer)
+			outer.diagnostics = 42
+			local ok, err = facade.init(outer)
+			assert_equal(ok, false)
+			assert_equal(err, "invalid_diagnostics")
+			assert_equal(facade.get_anonymous_id(), "boot-previous-actor", "failed init preserves adoption")
+		end)
+	end)
+	scene("deferred core drain once", function()
+		with_boot("both", function(facade, outer)
+			local calls = 0
+			outer.diagnostics = function() calls = calls + 1 end
+			local client, err, flush = require("shardpilot.client").new(outer, true)
+			assert_true(client, err)
+			assert_equal(calls, 0, "internal deferred construction invokes no host hooks")
+			assert_true(type(flush) == "function")
+			flush()
+			assert_equal(calls, 2)
+			flush()
+			assert_equal(calls, 2, "the construction delivery handle is consumed once")
+		end)
+	end)
+	scene("nested init keeps its pending hook", function()
+		with_boot("legacy", function(facade, outer, clients, cfg)
+			local seen = {}
+			outer.diagnostics = function(issue)
+				seen[#seen + 1] = issue.code
+				local nested = cfg("boot-nested", function(next_issue)
+					seen[#seen + 1] = next_issue.code
+				end)
+				nested.platform = "synthetic-unmapped"
+				assert_true(facade.init(nested))
+			end
+			assert_true(facade.init(outer))
+			facade.update(0)
+			assert_equal(#seen, 1, "nested init does not deliver in the old drain")
+			assert_equal(facade.get_anonymous_id(), "boot-nested-actor")
+			facade.update(0)
+			assert_equal(#seen, 2, "outer drain preserves the replacement's pending hook")
+			assert_equal(seen[2], "platform_unmapped")
+		end)
+	end)
+	scene("shutdown callback preserves replacement", function()
+		with_boot("legacy", function(facade, outer, clients, cfg)
+			local request = http.request
+			local replaced, shutdown_ok = false, nil
+			http.request = function(url, method, callback, headers, body)
+				local events = json.decode(body).events
+				local outcomes = {}
+				for _, event in ipairs(events) do
+					outcomes[#outcomes + 1] = { event_id = event.event_id, status = "rejected", code = "shutdown-reentry" }
+				end
+				callback(nil, nil, { status = 202, response = json.encode({ rejected = #events, events = outcomes }) })
+			end
+			local ok, err = pcall(function()
+				outer.diagnostics = function(issue)
+					if issue.code == "legacy_event_name" then
+						assert_true(facade.track("boot_activity", { synthetic = true }))
+						shutdown_ok = facade.shutdown()
+					elseif issue.code == "shutdown-reentry" and not replaced then
+						replaced = true
+						assert_true(facade.init(cfg("boot-nested")))
+					end
+				end
+				assert_true(facade.init(outer))
+				facade.update(0)
+				assert_true(replaced, "real shutdown publish response invoked the host hook")
+				assert_true(shutdown_ok)
+				assert_equal(facade.get_anonymous_id(), "boot-nested-actor", "shutdown cannot clear a replacement adopted by its response hook")
+			end)
+			http.request = request
+			assert_true(ok, err)
+		end)
+	end)
+
+	scene("positive reentrant update counts one frame", function()
+		with_boot("both", function(facade, outer, clients)
+			local calls = 0
+			outer.diagnostics = function(issue)
+				if issue.code == "platform_unmapped" then calls = calls + 1; facade.update(0.75) end
+			end
+			assert_true(facade.init(outer))
+			facade.update(0.25)
+			assert_equal(calls, 1, "reentrant host hook really ran")
+			assert_equal(clients["boot-outer"].frame_seconds, 0.25, "nested update must not add frame time")
+			facade.update(0.5)
+			assert_equal(clients["boot-outer"].frame_seconds, 0.75, "later ordinary updates still pump")
+		end)
+	end)
+	scene("drain finishes before reentrant publish", function()
+		with_boot("both", function(facade, outer)
+			outer.flush_interval_seconds = 0.5
+			local at_second_hook, boot_calls = nil, 0
+			outer.diagnostics = function(issue)
+				if issue.code == "platform_unmapped" then boot_calls = boot_calls + 1; facade.update(1)
+				elseif issue.code == "legacy_event_name" then boot_calls = boot_calls + 1; at_second_hook = #requests end
+			end
+			assert_true(facade.init(outer))
+			assert_true(facade.track("boot_publish", { synthetic = true }))
+			facade.update(0.5)
+			assert_equal(boot_calls, 2)
+			assert_equal(at_second_hook, 0, "nested update cannot publish before boot delivery finishes")
+			assert_equal(#requests, 1, "outer update publishes after the drain")
+			local found = 0
+			for _, event in ipairs(json.decode(requests[1].body).events) do
+				if event.event_name == "boot_publish" then found = found + 1 end
+			end
+			assert_equal(found, 1, "the real tracked event was published")
+		end)
+	end)
+	scene("nested update cannot drain replacement", function()
+		with_boot("legacy", function(facade, outer, clients, cfg)
+			local calls = 0
+			outer.diagnostics = function()
+				local nested = cfg("boot-nested", function() calls = calls + 1 end)
+				nested.platform = "synthetic-unmapped"
+				assert_true(facade.init(nested))
+				facade.update(0.75)
+			end
+			assert_true(facade.init(outer))
+			facade.update(0.25)
+			assert_equal(calls, 0, "replacement's boot drain waits for an ordinary update")
+			assert_equal(clients["boot-nested"].frame_seconds, 0)
+			facade.update(0.5)
+			assert_equal(calls, 1)
+			assert_equal(clients["boot-nested"].frame_seconds, 0.5)
+		end)
+	end)
+	for _, kind in ipairs({ "platform", "both" }) do
+		scene("failed shutdown aborts " .. kind, function()
+			with_boot(kind, function(facade, outer, clients)
+				local save = sys.save
+				local boot_calls, first_ok, first_err, pending_after_failure = 0, nil, nil, false
+				outer.diagnostics = function(issue)
+					if issue.code == "platform_unmapped" or issue.code == "legacy_event_name" then
+						boot_calls = boot_calls + 1
+						if boot_calls == 1 then
+							next_status = 500
+							sys.save = function(path, value)
+								if path:sub(-6) == "/spool" then return false end
+								return save(path, value)
+							end
+							first_ok, first_err = facade.shutdown()
+							pending_after_failure = clients["boot-outer"].in_flight_batch ~= nil
+							sys.save = save
+							next_status = 202
+						else facade.shutdown() end
+					end
+				end
+				assert_true(facade.init(outer))
+				assert_true(facade.track("boot_pending", { synthetic = true }))
+				facade.update(0.75)
+				assert_equal(first_ok, false, "real shutdown failed with an undurable remnant")
+				assert_true(pending_after_failure, "failed shutdown retained the undurable batch")
+				assert_true(#requests > 0, "shutdown ran the real publisher")
+				assert_equal(boot_calls, 1, "failed shutdown also stops remaining boot hooks")
+				assert_equal(clients["boot-outer"].frame_seconds, 0, "failed shutdown aborts this update pump")
+				assert_equal(clients["boot-outer"].initialized, true, "failed shutdown leaves retryable client installed")
+				assert_equal(facade.get_anonymous_id(), "boot-outer-actor")
+				facade.update(0)
+				assert_equal(boot_calls, 1, "aborted boot issues never replay")
+			end)
+		end)
+	end
+	local failed = 0
+	for _, entry in ipairs(scenes) do
+		local ok, err = pcall(entry.body)
+		if not ok then failed = failed + 1 end
+		print("init diagnostic scene " .. entry.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	assert_equal(failed, 0, "init diagnostic scene failures")
+end)()

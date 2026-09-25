@@ -521,7 +521,7 @@ end
 -- and warning about it would be noise. Note this also stops a blank reaching
 -- the wire, which it previously did (`config.platform or ...` treats "" as
 -- present, Lua having no falsy empty string).
-local function resolve_envelope_platform(config)
+local function resolve_envelope_platform(config, diagnostics)
 	local configured = config.platform
 	if configured == nil or configured == "" then
 		return platform.detect()
@@ -534,7 +534,7 @@ local function resolve_envelope_platform(config)
 
 	-- Integrator code, on the same terms the publish path gives it: optional,
 	-- and never allowed to break construction.
-	local hook = config.diagnostics
+	local hook = diagnostics
 	if type(hook) == "function" then
 		pcall(hook, {
 			scope = "config",
@@ -546,7 +546,7 @@ local function resolve_envelope_platform(config)
 	return nil
 end
 
-local function validate_config(config)
+local function validate_config(config, diagnostics)
 	if type(config) ~= "table" then
 		return nil, "config_required"
 	end
@@ -746,13 +746,13 @@ local function validate_config(config)
 		schema_revision = declared_schema_revision,
 		consent_kind_emission_enabled = config.consent_kind_emission_enabled ~= false,
 		request_compression_enabled = config.request_compression_enabled ~= false,
-		platform = resolve_envelope_platform(config),
+		platform = resolve_envelope_platform(config, diagnostics),
 		transport = config.transport,
 		token_provider = config.token_provider,
 		api_key = has_api_key and config.api_key or nil,
 		experiments_enabled = experiments_enabled,
 		remote_config_attributes_enabled = remote_config_attributes_enabled,
-		diagnostics = config.diagnostics,
+		diagnostics = diagnostics,
 		rejection_capacity = rejection_capacity,
 		batch_size = batch_size,
 		buffer_size = buffer_size,
@@ -782,8 +782,24 @@ local function new_session(session_id)
 	}
 end
 
-function M.new(config)
-	local normalized, err = validate_config(config)
+function M.new(config, defer_init_diagnostics)
+	-- Buffer the shared hook before validation: configuration warnings and all
+	-- constructor/subcomponent diagnostics must cross the same adoption boundary.
+	-- Keep the caller's configuration and the synchronous stats latches intact.
+	local pending = {}
+	local constructing = true
+	local hook = type(config) == "table" and config.diagnostics or nil
+	local diagnostics
+	if type(hook) == "function" then
+		diagnostics = function(issue)
+			if constructing then
+				pending[#pending + 1] = issue
+			else
+				hook(issue)
+			end
+		end
+	end
+	local normalized, err = validate_config(config, diagnostics)
 	if not normalized then
 		return nil, err
 	end
@@ -1998,6 +2014,24 @@ function M.new(config)
 	-- delivery attempt after the whole init settled — the same dispatch
 	-- timing the load-at-the-end shape always had.
 	client:try_send_consent_outbox()
+	constructing = false
+	local function flush_init_diagnostics(is_current)
+		local issues = pending
+		pending = nil
+		if not issues then return end
+		for _, issue in ipairs(issues) do
+			-- A hook may replace or shut down the facade. No later old issue
+			-- may act on its replacement. Detach before any reentrant delivery.
+			if is_current and not is_current() then break end
+			pcall(hook, issue)
+		end
+	end
+	if defer_init_diagnostics then
+		return client, nil, flush_init_diagnostics
+	end
+	-- Standalone callers have no facade adoption step; preserve delivery before
+	-- new() returns, after every constructor state transition has completed.
+	flush_init_diagnostics()
 	return client
 end
 
