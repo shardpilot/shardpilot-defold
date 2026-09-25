@@ -4122,7 +4122,8 @@ end
 
 -- Parse a 202 batch body: keep the aggregate counters and surface every
 -- non-accepted per-event outcome (observed / duplicate / rejected /
--- suppressed_no_consent). A 202 is NOT treated as full per-event success.
+-- suppressed_no_consent / suppressed_ad_revenue_consent). A 202 is NOT
+-- treated as full per-event success.
 -- "duplicate" is terminal, not retryable: the batch is already cleared by the
 -- success path, so nothing is re-sent here.
 function Client:apply_batch_response(body, batch_count)
@@ -4147,7 +4148,7 @@ function Client:apply_batch_response(body, batch_count)
 			local status = entry.status
 			if status == "observed" then
 				self.stats.observed = self.stats.observed + 1
-			elseif status == "suppressed_no_consent" then
+			elseif status == "suppressed_no_consent" or status == "suppressed_ad_revenue_consent" then
 				self.stats.suppressed = self.stats.suppressed + 1
 			end
 			if status ~= nil and status ~= "accepted" then

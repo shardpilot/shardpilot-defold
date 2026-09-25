@@ -584,7 +584,8 @@ any request is made: a configured `platform` it did not recognise, reported as
 `{ scope = "config", status = "ignored", code = "platform_unmapped" }` at
 construction (see "Platform"). Inside a `202` events-batch response the SDK parses
 the per-event status array and reports every `observed`, `duplicate`,
-`rejected`, or `suppressed_no_consent` event (with its server `code`); on a
+`rejected`, `suppressed_no_consent`, or `suppressed_ad_revenue_consent`
+event (with its server `code`); on a
 non-2xx it reports the parsed error envelope (`error.code` plus per-field
 detail codes); when a permanent reject drops entries from the offline
 spool it reports `{ scope = "spool", status = "dropped", code, count }`; when
@@ -606,6 +607,12 @@ SDK honors a `429` `Retry-After` header by deferring the next publish, and
 falls back to exponential backoff with jitter when no header is present —
 consent-receipt retries pace themselves the same way, on their own
 consent-plane deferral.
+
+**Unreleased:** `suppressed` counts both `suppressed_no_consent` and
+`suppressed_ad_revenue_consent`, once per returned event, accumulating across
+batches. The response's aggregate suppression count is not added again.
+Suppressed entries remain terminal and are not retried; other counters and
+the per-event diagnostics retain their existing behavior.
 
 **Unreleased:** `dropped` also counts each early validation refusal from
 `track_level_start`, `track_level_complete`, `track_level_fail` and

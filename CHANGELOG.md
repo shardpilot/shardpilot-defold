@@ -2,6 +2,9 @@
 
 ### Unreleased
 
+- `snapshot().suppressed` now includes `suppressed_ad_revenue_consent`
+  alongside `suppressed_no_consent`, once per returned event. Diagnostics
+  and terminal delivery behavior are unchanged.
 - Typed progression/ad validation refusals now increment `snapshot().dropped`
   once and latch their returned code in `last_error`. Refusals already counted
   by the enqueue path are not counted again; accepted calls are unchanged.

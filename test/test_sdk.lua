@@ -14120,3 +14120,67 @@ end)()
 	end
 	assert_equal(failed, 0, "consent diagnostic scene failures")
 end)()
+
+-- Count both wire suppression statuses once; the aggregate is not added again.
+;(function()
+	local failed = 0
+	for _, scene in ipairs({
+		{ name = "analytics suppression", statuses = { "suppressed_no_consent" }, suppressed = 1 },
+		{ name = "ad suppression", statuses = { "suppressed_ad_revenue_consent" }, suppressed = 1 },
+		{ name = "mixed outcomes", statuses = { "accepted", "duplicate", "rejected", "observed", "suppressed_no_consent", "suppressed_ad_revenue_consent" }, suppressed = 2, accepted = 1, rejected = 1, duplicates = 1, observed = 1 },
+		{ name = "throwing hook", statuses = { "suppressed_ad_revenue_consent" }, suppressed = 1, throws = true },
+		{ name = "code is not status", statuses = { "accepted" }, code = "suppressed_ad_revenue_consent", accepted = 1 },
+		{ name = "legacy observed", statuses = { "observed" }, observed = 1 },
+		{ name = "unknown prefix", statuses = { "suppressed_future_status" } },
+	}) do
+		reset()
+		storage.reset()
+		seed_granted_consent()
+		local issues = {}
+		local ok, err = pcall(function()
+			local client = assert(sdk.new(config({ flush_interval_seconds = 9999,
+				diagnostics = function(issue)
+					issues[#issues + 1] = issue
+					if scene.throws then error("synthetic host failure") end
+				end,
+			})))
+			assert_true(client:session_start())
+			assert_true(client:flush())
+			local before = client:snapshot()
+			requests = {}
+			local per_batch_issues = 0
+			for batch = 1, 2 do
+				local entries = {}
+				for i, status in ipairs(scene.statuses) do
+					assert_true(client:track_ad_impression_revenue("synthetic-" .. batch .. "-" .. i, "network", 1, "USD"))
+					entries[i] = { event_id = client.queue.items[i].event_id, status = status, code = scene.code or "synthetic", message = "synthetic outcome" }
+					if batch == 1 and status ~= "accepted" then per_batch_issues = per_batch_issues + 1 end
+				end
+				next_response_body = json.encode({ accepted = scene.accepted or 0, rejected = scene.rejected or 0,
+					duplicates = scene.duplicates or 0, suppressed = scene.suppressed or 0, events = entries })
+				assert_true(client:flush())
+				assert_equal(#requests, batch, "real publish callback ran exactly once")
+				local wire = json.decode(requests[batch].body)
+				assert_equal(#wire.events, #entries)
+				assert_equal(wire.events[#entries].event_id, entries[#entries].event_id)
+				assert_equal(#client.queue.items, 0, "terminal response clears the queue")
+				assert_equal(client:spool_pending(), false, "terminal response creates no retry spool")
+				assert_equal(#issues, batch * per_batch_issues, "diagnostics remain observable")
+				if per_batch_issues > 0 then
+					assert_equal(issues[#issues].status, scene.statuses[#scene.statuses])
+					assert_equal(client:snapshot().last_event_issue, issues[#issues].status .. ":synthetic")
+				end
+				for _, key in ipairs({ "accepted", "rejected", "duplicates", "observed", "suppressed" }) do
+					assert_equal(client:snapshot()[key], before[key] + batch * (scene[key] or 0), key .. " accumulates without double counting")
+				end
+				assert_equal(client:snapshot().dropped, before.dropped)
+			end
+			assert_true(client:flush())
+			assert_equal(#requests, 2, "settled suppressions are not retried")
+		end)
+		storage.reset()
+		if not ok then failed = failed + 1 end
+		print("suppression scene " .. scene.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	assert_equal(failed, 0, "suppression scene failures")
+end)()
