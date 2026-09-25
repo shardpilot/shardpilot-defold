@@ -687,7 +687,10 @@ is always sent on the wire in both modes.
 The SDK sends `POST {ingest_url}/v1/events:batch` with app-first fields:
 `event_id`, `schema_version`, `event_name`, `source`, `event_ts`,
 `workspace_id`, `app_id`, `environment_id`, `session_id`, `session_sequence`,
-`platform`, `app_version`, `app_build`, `props`, and optional `context`.
+`platform`, `app_version`, `app_build`, and optional `props` and `context`.
+Empty or absent event properties are omitted from new envelopes, so their wire
+shape does not depend on how the host JSON encoder treats an empty Lua table.
+Non-empty properties keep their values, including nested arrays.
 
 Legacy public-SDK fields are **never** emitted: `project_id`, `game_id`, `env`,
 `event_ts_server`, `event_seq_session`, and top-level `build_version`. Of these,
