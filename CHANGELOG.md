@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- Supply an iOS privacy manifest fragment with explicit game-owned merge
+  instructions, collection/linkage/consent notes and the unused engine IDFV
+  read. Final iOS archive and Xcode privacy-report verification remains owed;
+  the pure-Lua fragment is not automatically bundled.
 - `snapshot().suppressed` now includes `suppressed_ad_revenue_consent`
   alongside `suppressed_no_consent`, once per returned event. Diagnostics
   and terminal delivery behavior are unchanged.
