@@ -1275,6 +1275,10 @@ game has to handle specially.
   fresh session and use its distinct exposure ID. Those are separate facts,
   not duplicate sends of the pre-denial exposure. Under sustained queue
   pressure the SDK sheds owed exposures rather than growing without bound.
+  A drop-time durable capture with no arm-time session is also refused after
+  the current background pause expires, just as after an explicit session end.
+  It opens no session; the live owed exposure remains for its later sweep.
+  A capture carrying its arm-time session keeps that attribution.
   Automatic exposure failures surface on the hook as
   `status = "exposure_skipped"` with a `code` naming the reason. Watch it if
   the measured population matters to you.

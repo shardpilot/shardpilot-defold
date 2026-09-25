@@ -5469,6 +5469,12 @@ function Client:capture_experiment_fact(event_name, props, event_id, overrides)
 		return false
 	end
 	overrides = overrides or {}
+	-- A background capture may keep its arm-time session, but may not borrow
+	-- one whose pause expired. Like capture after an end, refuse without
+	-- opening a replacement; the live owed snapshot remains for its sweep.
+	if not overrides.session_id and self:timed_out_in_background() then
+		return false
+	end
 	-- The CURRENT session only: an ended session is not one to capture into.
 	local session_id = overrides.session_id
 		or (self.session_active and self.session_id or nil)
