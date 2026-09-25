@@ -608,7 +608,11 @@ does not overwrite a newer runtime diagnostic latch.
 
 If a boot hook calls module `shutdown()` or `init()`, that action applies to the
 adopted client. The remaining old boot issues are discarded and that update does
-not pump either the old client or its replacement. A client shut down or replaced
+not pump either the old client or its replacement. A shutdown attempt stops the
+drain even if teardown fails; the retained client can be updated or retried later.
+Nested module `update(dt)` calls during boot delivery are ignored, so they neither
+add frame time nor publish before the remaining boot issues are delivered.
+A client shut down or replaced
 before its first update never delivers its pending boot hooks; a failed re-init
 preserves the existing client's pending delivery. Throwing hooks remain isolated.
 A replacement installed by a shutdown response hook is preserved too.

@@ -14429,6 +14429,96 @@ end)()
 			assert_true(ok, err)
 		end)
 	end)
+
+	scene("positive reentrant update counts one frame", function()
+		with_boot("both", function(facade, outer, clients)
+			local calls = 0
+			outer.diagnostics = function(issue)
+				if issue.code == "platform_unmapped" then calls = calls + 1; facade.update(0.75) end
+			end
+			assert_true(facade.init(outer))
+			facade.update(0.25)
+			assert_equal(calls, 1, "reentrant host hook really ran")
+			assert_equal(clients["boot-outer"].frame_seconds, 0.25, "nested update must not add frame time")
+			facade.update(0.5)
+			assert_equal(clients["boot-outer"].frame_seconds, 0.75, "later ordinary updates still pump")
+		end)
+	end)
+	scene("drain finishes before reentrant publish", function()
+		with_boot("both", function(facade, outer)
+			outer.flush_interval_seconds = 0.5
+			local at_second_hook, boot_calls = nil, 0
+			outer.diagnostics = function(issue)
+				if issue.code == "platform_unmapped" then boot_calls = boot_calls + 1; facade.update(1)
+				elseif issue.code == "legacy_event_name" then boot_calls = boot_calls + 1; at_second_hook = #requests end
+			end
+			assert_true(facade.init(outer))
+			assert_true(facade.track("boot_publish", { synthetic = true }))
+			facade.update(0.5)
+			assert_equal(boot_calls, 2)
+			assert_equal(at_second_hook, 0, "nested update cannot publish before boot delivery finishes")
+			assert_equal(#requests, 1, "outer update publishes after the drain")
+			local found = 0
+			for _, event in ipairs(json.decode(requests[1].body).events) do
+				if event.event_name == "boot_publish" then found = found + 1 end
+			end
+			assert_equal(found, 1, "the real tracked event was published")
+		end)
+	end)
+	scene("nested update cannot drain replacement", function()
+		with_boot("legacy", function(facade, outer, clients, cfg)
+			local calls = 0
+			outer.diagnostics = function()
+				local nested = cfg("boot-nested", function() calls = calls + 1 end)
+				nested.platform = "synthetic-unmapped"
+				assert_true(facade.init(nested))
+				facade.update(0.75)
+			end
+			assert_true(facade.init(outer))
+			facade.update(0.25)
+			assert_equal(calls, 0, "replacement's boot drain waits for an ordinary update")
+			assert_equal(clients["boot-nested"].frame_seconds, 0)
+			facade.update(0.5)
+			assert_equal(calls, 1)
+			assert_equal(clients["boot-nested"].frame_seconds, 0.5)
+		end)
+	end)
+	for _, kind in ipairs({ "platform", "both" }) do
+		scene("failed shutdown aborts " .. kind, function()
+			with_boot(kind, function(facade, outer, clients)
+				local save = sys.save
+				local boot_calls, first_ok, first_err, pending_after_failure = 0, nil, nil, false
+				outer.diagnostics = function(issue)
+					if issue.code == "platform_unmapped" or issue.code == "legacy_event_name" then
+						boot_calls = boot_calls + 1
+						if boot_calls == 1 then
+							next_status = 500
+							sys.save = function(path, value)
+								if path:sub(-6) == "/spool" then return false end
+								return save(path, value)
+							end
+							first_ok, first_err = facade.shutdown()
+							pending_after_failure = clients["boot-outer"].in_flight_batch ~= nil
+							sys.save = save
+							next_status = 202
+						else facade.shutdown() end
+					end
+				end
+				assert_true(facade.init(outer))
+				assert_true(facade.track("boot_pending", { synthetic = true }))
+				facade.update(0.75)
+				assert_equal(first_ok, false, "real shutdown failed with an undurable remnant")
+				assert_true(pending_after_failure, "failed shutdown retained the undurable batch")
+				assert_true(#requests > 0, "shutdown ran the real publisher")
+				assert_equal(boot_calls, 1, "failed shutdown also stops remaining boot hooks")
+				assert_equal(clients["boot-outer"].frame_seconds, 0, "failed shutdown aborts this update pump")
+				assert_equal(clients["boot-outer"].initialized, true, "failed shutdown leaves retryable client installed")
+				assert_equal(facade.get_anonymous_id(), "boot-outer-actor")
+				facade.update(0)
+				assert_equal(boot_calls, 1, "aborted boot issues never replay")
+			end)
+		end)
+	end
 	local failed = 0
 	for _, entry in ipairs(scenes) do
 		local ok, err = pcall(entry.body)

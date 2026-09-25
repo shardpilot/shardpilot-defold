@@ -3,6 +3,7 @@ local client_mod = require "shardpilot.client"
 local M = {}
 local default_client = nil
 local pending_init_flush = nil
+local active_init_drain = nil
 
 -- Capability discovery. Lets an integration feature-detect SDK abilities that
 -- are not new functions (and so cannot be detected by their presence, the way
@@ -275,14 +276,19 @@ function M.track_ad_impression_revenue(
 end
 
 function M.update(dt)
+	-- A boot callback cannot start another drain or pump, even after re-init.
+	if active_init_drain then return end
 	local client = default()
 	if not client then return false, "not_initialized" end
 	local flush = pending_init_flush
 	pending_init_flush = nil
 	if flush then
-		flush(function() return default_client == client end)
+		local drain = { cancelled = false }
+		active_init_drain = drain
+		flush(function() return default_client == client and not drain.cancelled end)
+		active_init_drain = nil
 		-- Check after the final callback too: it may have removed this client.
-		if default_client ~= client then return end
+		if default_client ~= client or drain.cancelled then return end
 	end
 	return client:update(dt)
 end
@@ -315,6 +321,8 @@ function M.persist()
 end
 
 function M.shutdown(reason)
+	-- A failed teardown still ends the current boot delivery attempt.
+	if active_init_drain then active_init_drain.cancelled = true end
 	local client = default()
 	if not client then
 		return false, "not_initialized"
