@@ -14061,3 +14061,62 @@ end)()
 	end
 	assert_equal(failed, 0, "refusal scene failures; passing controls " .. passed)
 end)()
+
+-- A pending consent mint must not borrow an unrelated analytics error.
+;(function()
+	local failed = 0
+	for _, scene in ipairs({
+		{ name = "pending after progression", refusal = "progression", mode = "pending" },
+		{ name = "pending after ad", refusal = "ad", mode = "pending" },
+		{ name = "pending without refusal", mode = "pending" },
+		{ name = "synchronous success", refusal = "progression", mode = "success" },
+		{ name = "synchronous mint failure", refusal = "ad", mode = "failure" },
+	}) do
+		reset()
+		storage.reset()
+		local _, restore = install_stub_sys_storage()
+		local callback
+		local ok, err = pcall(function()
+			local client = assert(sdk.new(config({ token_provider = function(cb)
+				callback = cb
+				if scene.mode == "success" then cb("synthetic-consent", nil, nil) end
+				if scene.mode == "failure" then cb(nil, nil, "synthetic-mint-failure") end
+			end })))
+			if scene.refusal == "progression" then
+				local accepted, code = client:track_level_start("synthetic", 0)
+				assert_equal(accepted, false); assert_equal(code, "invalid_attempt")
+			elseif scene.refusal == "ad" then
+				local accepted, code = client:track_ad_impression_revenue("synthetic", "network", 1, "US")
+				assert_equal(accepted, false); assert_equal(code, "invalid_currency")
+			end
+			local analytics_error, dropped = client:snapshot().last_error, client:snapshot().dropped
+			assert_true(client:set_consent(true))
+			assert_equal(client:snapshot().dropped, dropped, "consent adds no analytics refusal")
+			if scene.mode == "success" then
+				assert_equal(client:snapshot().consent_recorded, 1)
+				assert_equal(client:snapshot().last_consent_error, nil)
+				assert_equal(client:snapshot().last_error, analytics_error)
+			else
+				assert_equal(client:snapshot().last_consent_error, "token_unavailable", "consent reports its own dispatch state")
+				assert_equal(#requests, 0)
+				assert_equal(#client.consent_outbox, 1, "pending receipt stays retained")
+				if scene.mode == "pending" then
+					assert_equal(client:snapshot().last_error, analytics_error, "analytics latch stays intact")
+					callback("synthetic-consent", nil, nil)
+					client:update(client.config.flush_interval_seconds)
+					assert_equal(#requests, 1)
+					assert_contains(requests[1].url, "/v1/consent")
+					assert_equal(#client.consent_outbox, 0)
+					assert_equal(client:snapshot().consent_recorded, 1)
+				else
+					assert_equal(client:snapshot().last_error, "token_unavailable", "real mint failures retain their existing error")
+				end
+			end
+		end)
+		restore()
+		storage.reset()
+		if not ok then failed = failed + 1 end
+		print("consent diagnostic scene " .. scene.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	assert_equal(failed, 0, "consent diagnostic scene failures")
+end)()

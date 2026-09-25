@@ -5052,7 +5052,9 @@ function Client:send_consent_decision()
 		-- durably retained and is retried at the next dispatch point
 		-- (init/update/flush/shutdown) without another set_consent call.
 		self.stats.consent_failed = self.stats.consent_failed + 1
-		self.stats.last_consent_error = self.stats.last_error or "token_unavailable"
+		-- The analytics latch can name an unrelated validation/transport
+		-- error. This undispatched receipt owns its own diagnostic.
+		self.stats.last_consent_error = "token_unavailable"
 	end
 	-- Report on the CURRENT durability state, not the first write attempt:
 	-- the dispatch path retries an owed write, so an append whose first write

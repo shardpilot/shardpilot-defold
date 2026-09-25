@@ -610,7 +610,8 @@ consent-plane deferral.
 **Unreleased:** `dropped` also counts each early validation refusal from
 `track_level_start`, `track_level_complete`, `track_level_fail` and
 `track_ad_impression_revenue`, on a client or initialized singleton. These
-refusals set `last_error` to the same code returned to the caller. Each call
+refusals set `last_error` to the same code returned to the caller; consent
+diagnostics are derived independently from consent dispatch. Each call
 adds one, even when several fields are invalid; validation order and error
 codes are unchanged. Nothing is queued, sent or spooled by a refused call.
 Successful calls add no drop, and a refusal delegated to the normal enqueue
