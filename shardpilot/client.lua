@@ -11,6 +11,7 @@ local sampling = require "shardpilot.sampling"
 local schema_revision_mod = require "shardpilot.schema_revision"
 local storage = require "shardpilot.storage"
 local transport = require "shardpilot.transport"
+local utf8 = require "shardpilot.utf8"
 
 local M = {}
 
@@ -92,7 +93,7 @@ local max_snapshot_depth = 4
 
 local function copy_value(value, depth, seen)
 	if type(value) ~= "table" then
-		return value, nil
+		return utf8.repair(value), nil
 	end
 	if depth >= max_snapshot_depth or seen[value] then
 		return nil, "invalid_table"
@@ -109,7 +110,7 @@ local function copy_value(value, depth, seen)
 			seen[value] = nil
 			return nil, err
 		end
-		out[k] = copied
+		out[utf8.repair(k)] = copied
 	end
 	seen[value] = nil
 	return out, nil
@@ -3321,11 +3322,10 @@ local MAX_PLACEMENT = 256
 
 -- JSON Schema's maxLength counts CODE POINTS; Lua 5.1's # counts BYTES. A
 -- 100-character CJK network name is 300 bytes, so a byte-length check
--- refused an impression the schema accepts and lost the revenue event
--- (shardpilot-defold#76 round 1). Continuation bytes are 0x80..0xBF; every
--- other byte starts a code point.
+-- refused an impression the schema accepts and lost the revenue event.
+-- Count the replacement characters the server will see for malformed bytes.
 local function code_point_length(value)
-	local _, count = value:gsub("[^\128-\191]", "")
+	local _, count = utf8.repair(value)
 	return count
 end
 
@@ -3594,7 +3594,7 @@ function Client:enqueue_event(event_name, props, context, fact)
 	local now_ms = ts_override == nil and clock.unix_ms() or nil
 	local event = {
 		event_id = event_id or id.uuid(),
-		event_name = event_name,
+		event_name = utf8.repair(event_name),
 		event_ts = ts_override or clock.iso_utc(now_ms),
 		user_id = user_id,
 		anonymous_id = anonymous_override or self.anonymous_id,
@@ -5495,7 +5495,7 @@ function Client:capture_experiment_fact(event_name, props, event_id, overrides)
 	local props_snapshot = copy_table(props, "invalid_props")
 	local event = {
 		event_id = event_id,
-		event_name = event_name,
+		event_name = utf8.repair(event_name),
 		event_ts = overrides.event_ts or clock.iso_utc(),
 		user_id = nil,
 		anonymous_id = overrides.anonymous_id or self.anonymous_id,

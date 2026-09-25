@@ -79,6 +79,27 @@ existed self-heal at load: an oversized stored anonymous ID is replaced by a
 fresh one, and outbox receipts carrying oversized identifiers are dropped by
 the load-time sanitizer like any other malformed entry.
 
+### Malformed UTF-8 in new analytics
+
+**Unreleased:** new analytics event names, property/context keys and string
+values (including nested tables and typed fields), and `app_version`/`app_build`
+replace malformed UTF-8 with U+FFFD before encoding. One invalid byte consumes
+one replacement character, matching the ingest JSON decoder: an overlong or
+truncated encoding can therefore produce several replacements. Typed length
+limits count code points of that repaired value. A malformed value within its
+limit remains an event, and does not prevent a normal neighbor from being sent.
+The caller's tables and valid UTF-8 are unchanged; no Unicode normalization is
+performed. Distinct malformed strings can become the same string. If property
+keys collide after replacement, one value survives in Lua traversal order;
+applications must supply valid UTF-8 when exact distinctions matter.
+
+This rule excludes envelope identity: actor, session, event and
+workspace/app/environment identifiers are never rewritten by UTF-8 repair, since changing identity could
+change attribution or move consent. Their existing validation remains in force.
+Previously persisted envelopes/consent are not migrated or repaired, and crash
+and remote-config paths are outside this change. The rule therefore does not
+guarantee UTF-8 validity for every SDK request or repair an old corrupted identity.
+
 ## Authentication modes
 
 The ingest endpoint accepts two credential kinds, and the SDK supports both.
