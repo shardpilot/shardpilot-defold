@@ -2,6 +2,9 @@
 
 ### Unreleased
 
+- Typed progression/ad validation refusals now increment `snapshot().dropped`
+  once and latch their returned code in `last_error`. Refusals already counted
+  by the enqueue path are not counted again; accepted calls are unchanged.
 - New analytics text replaces malformed UTF-8 with U+FFFD, and typed length
   limits count the repaired value as ingest does. Event names, nested property
   and context keys/values, and version/build metadata share the same repair.

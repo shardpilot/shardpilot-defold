@@ -597,7 +597,7 @@ and `identity_changed` carry a `count`); and when a configured
 `anonymous_id` override replaces a different persisted identity, the
 fresh-identity reset is reported as
 `{ scope = "consent", status = "dropped", code = "identity_override_changed" }`.
-Counts are also available on `snapshot()` (`accepted`,
+Counts are also available on `snapshot()` (`accepted`, `dropped`, `last_error`,
 `rejected`, `duplicates`, `observed`, `suppressed`, `last_event_issue`, plus
 the spool counters `spooled`, `spool_resent`, `spool_evicted`,
 `spool_persist_failed` and the consent-outbox counters
@@ -606,3 +606,16 @@ SDK honors a `429` `Retry-After` header by deferring the next publish, and
 falls back to exponential backoff with jitter when no header is present —
 consent-receipt retries pace themselves the same way, on their own
 consent-plane deferral.
+
+**Unreleased:** `dropped` also counts each early validation refusal from
+`track_level_start`, `track_level_complete`, `track_level_fail` and
+`track_ad_impression_revenue`, on a client or initialized singleton. These
+refusals set `last_error` to the same code returned to the caller; consent
+diagnostics are derived independently from consent dispatch. Each call
+adds one, even when several fields are invalid; validation order and error
+codes are unchanged. Nothing is queued, sent or spooled by a refused call.
+Successful calls add no drop, and a refusal delegated to the normal enqueue
+path (consent, properties, queue capacity or shutdown) is still counted once.
+`rejected` continues to describe server responses. A singleton with no client
+returns `not_initialized` and has no client counter to update. This change
+does not redefine experiment/session operations or other SDK refusal counters.

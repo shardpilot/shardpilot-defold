@@ -3217,6 +3217,14 @@ local function valid_unsigned_32(value)
 	return is_integer(value) and value >= 0 and value <= MAX_LEVEL_UNSIGNED_32
 end
 
+-- Typed validation ends before enqueue_event. Count only those refusals here;
+-- delegated delivery/consent/queue refusals already own their accounting.
+function Client:_record_refusal(code)
+	self.stats.dropped = self.stats.dropped + 1
+	self.stats.last_error = code
+	return false, code
+end
+
 -- The progression schemas pin source to the constant "client" and the
 -- envelope carries the CONFIGURED source, so a dedicated server's events
 -- could never satisfy the schema: they would be rejected per event inside an
@@ -3235,11 +3243,11 @@ end
 -- codes, the lazy session, the queue and the spool are unchanged.
 function Client:track_level_start(level_id, attempt, props)
 	if not self:_require_client_source() then
-		return false, "source_not_client"
+		return self:_record_refusal("source_not_client")
 	end
 	local out, err = build_level_props(level_id, attempt, props)
 	if not out then
-		return false, err
+		return self:_record_refusal(err)
 	end
 	return self:track("level_start", out)
 end
@@ -3250,7 +3258,7 @@ end
 -- the schema types as an integer.
 function Client:track_level_complete(level_id, attempt, duration_ms, score, props)
 	if not self:_require_client_source() then
-		return false, "source_not_client"
+		return self:_record_refusal("source_not_client")
 	end
 	-- score and props are INDEPENDENTLY optional, as the signature in the
 	-- README and the integration skill says, and Lua has no way to skip a
@@ -3264,13 +3272,13 @@ function Client:track_level_complete(level_id, attempt, duration_ms, score, prop
 	end
 	local out, err = build_level_props(level_id, attempt, props)
 	if not out then
-		return false, err
+		return self:_record_refusal(err)
 	end
 	if not valid_unsigned_32(duration_ms) then
-		return false, "invalid_duration"
+		return self:_record_refusal("invalid_duration")
 	end
 	if score ~= nil and not valid_unsigned_32(score) then
-		return false, "invalid_score"
+		return self:_record_refusal("invalid_score")
 	end
 	out.duration_ms = duration_ms
 	out.score = score
@@ -3282,7 +3290,7 @@ end
 -- spelling it.
 function Client:track_level_fail(level_id, attempt, duration_ms, fail_reason, props)
 	if not self:_require_client_source() then
-		return false, "source_not_client"
+		return self:_record_refusal("source_not_client")
 	end
 	-- As in track_level_complete: fail_reason is always a string, so a table
 	-- in its slot with no props argument is the props table (round 3).
@@ -3292,13 +3300,13 @@ function Client:track_level_fail(level_id, attempt, duration_ms, fail_reason, pr
 	end
 	local out, err = build_level_props(level_id, attempt, props)
 	if not out then
-		return false, err
+		return self:_record_refusal(err)
 	end
 	if not valid_unsigned_32(duration_ms) then
-		return false, "invalid_duration"
+		return self:_record_refusal("invalid_duration")
 	end
 	if fail_reason ~= nil and type(fail_reason) ~= "string" then
-		return false, "invalid_fail_reason"
+		return self:_record_refusal("invalid_fail_reason")
 	end
 	out.duration_ms = duration_ms
 	if fail_reason == nil or fail_reason == "" then
@@ -3366,25 +3374,25 @@ function Client:track_ad_impression_revenue(
 	placement
 )
 	if not self:_require_client_source() then
-		return false, "source_not_client"
+		return self:_record_refusal("source_not_client")
 	end
 	local impression = bounded_string(impression_id, MAX_IMPRESSION_ID)
 	if not impression then
-		return false, "invalid_impression_id"
+		return self:_record_refusal("invalid_impression_id")
 	end
 	local ad_network = bounded_string(network, MAX_NETWORK)
 	if not ad_network then
-		return false, "invalid_network"
+		return self:_record_refusal("invalid_network")
 	end
 	if not is_integer(revenue_micros) or revenue_micros < 0 then
-		return false, "invalid_revenue_micros"
+		return self:_record_refusal("invalid_revenue_micros")
 	end
 	if type(currency) ~= "string" then
-		return false, "invalid_currency"
+		return self:_record_refusal("invalid_currency")
 	end
 	local code = currency:match("^%s*(.-)%s*$")
 	if code_point_length(code) ~= CURRENCY_LENGTH then
-		return false, "invalid_currency"
+		return self:_record_refusal("invalid_currency")
 	end
 	local out = {
 		impression_id = impression,
@@ -3406,12 +3414,12 @@ function Client:track_ad_impression_revenue(
 			-- one. The raw check that preceded this refused the whole
 			-- impression over a space (shardpilot-godot#23 round 1).
 			if type(value) ~= "string" then
-				return false, "invalid_" .. key
+				return self:_record_refusal("invalid_" .. key)
 			end
 			local trimmed = value:match("^%s*(.-)%s*$")
 			if trimmed ~= "" then
 				if code_point_length(trimmed) > max_length then
-					return false, "invalid_" .. key
+					return self:_record_refusal("invalid_" .. key)
 				end
 				out[key] = trimmed
 			end
@@ -5044,7 +5052,9 @@ function Client:send_consent_decision()
 		-- durably retained and is retried at the next dispatch point
 		-- (init/update/flush/shutdown) without another set_consent call.
 		self.stats.consent_failed = self.stats.consent_failed + 1
-		self.stats.last_consent_error = self.stats.last_error or "token_unavailable"
+		-- The analytics latch can name an unrelated validation/transport
+		-- error. This undispatched receipt owns its own diagnostic.
+		self.stats.last_consent_error = "token_unavailable"
 	end
 	-- Report on the CURRENT durability state, not the first write attempt:
 	-- the dispatch path retries an owed write, so an append whose first write
