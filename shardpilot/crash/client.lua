@@ -686,11 +686,17 @@ local function should_emit(self, event)
 		end
 		return keep ~= false
 	end
-	if self.config.sample_every <= 1 then
-		return true
+	local sample_every = self.config.sample_every
+	local known_rate
+	if sample_every >= 1 and sample_every <= 1000000
+		and sample_every == math.floor(sample_every) then
+		known_rate = sample_every
+	end
+	if sample_every <= 1 then
+		return true, known_rate
 	end
 	self.sample_counter = self.sample_counter + 1
-	return (self.sample_counter % self.config.sample_every) == 0
+	return (self.sample_counter % sample_every) == 0, known_rate
 end
 
 -- Core emit. `fatal` bypasses the sampler (a fatal crash is ALWAYS sent).
@@ -727,10 +733,19 @@ function Client:emit_internal(event, fatal, trusted_frame_functions, prepare_opt
 		self.stats.last_error = prepare_err
 		return false, prepare_err
 	end
-	if not fatal and not should_emit(self, prepared) then
-		self.stats.sampled_out = self.stats.sampled_out + 1
-		return true
+	local known_rate
+	if not fatal then
+		local keep
+		keep, known_rate = should_emit(self, prepared)
+		if not keep then
+			self.stats.sampled_out = self.stats.sampled_out + 1
+			return true
+		end
 	end
+	-- SDK-owned annotations are fixed by this admission decision before the
+	-- body is encoded/persisted. Custom samplers return no known rate.
+	prepared.fatal = fatal == true
+	prepared.non_fatal_sample_one_in = known_rate
 	-- Write-ahead durability for EVERY report that reached dispatch (a fatal
 	-- crash, a sampled-in non-fatal, a one-shot dump forward alike): encode
 	-- the wire body ONCE and persist it to the per-app sidecar BEFORE the

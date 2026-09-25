@@ -5751,3 +5751,97 @@ for _, test in ipairs(tests) do
 end
 
 print("shardpilot defold crash tests passed")
+
+-- Sampling annotations describe the SDK admission decision, never caller data.
+;(function()
+	local failed = 0
+	local cases = {
+		{ name = "fatal", fatal = true, custom = "reject" },
+		{ name = "default tenth", rate = 10, calls = 10 },
+		{ name = "every report", every = 1, rate = 1 },
+		{ name = "maximum rate", every = 1000000, counter = 999999, rate = 1000000 },
+		{ name = "unrepresentable rate", every = 1000001, counter = 1000000 },
+		{ name = "custom keep", custom = "keep" },
+		{ name = "custom throws", custom = "throws" },
+		{ name = "custom changes config", custom = "changes" },
+		{ name = "first nine sampled out", calls = 9, dropped = true },
+		{ name = "custom rejects", custom = "reject", dropped = true },
+		{ name = "old serialized body", legacy = true },
+	}
+	for _, scene in ipairs(cases) do
+		reset()
+		local restore = install_fake_sys_storage()
+		local real_request = http.request
+		local ok, err = pcall(function()
+			local client, sampler_calls = nil, 0
+			local options = config({ sample_every = scene.every })
+			if scene.custom then
+				options.sampler = function(view)
+					sampler_calls = sampler_calls + 1
+					view.fatal = true
+					view.non_fatal_sample_one_in = 2
+					if scene.custom == "throws" then error("synthetic sampler failure") end
+					if scene.custom == "changes" then
+						client.config.sampler = nil
+						client.config.sample_every = 1
+					end
+					return scene.custom ~= "reject"
+				end
+			end
+			client = assert(crash.new(options))
+			if scene.legacy then
+				local prepared = assert(event_mod.prepare(client, presymbolicated_event(), false, {}))
+				local body = json.encode(prepared)
+				assert_not_contains(body, '"fatal"')
+				assert_not_contains(body, '"non_fatal_sample_one_in"')
+				assert_true(storage.save_pending_crash(client:pending_scope(),
+					{ body = body, crash_id = prepared.crash_id, fatal = true }) ~= nil)
+				storage.reset()
+				local replay = assert(crash.new(config({ sample_every = 1 })))
+				assert_true(replay:resend_pending())
+				assert_equal(#requests, 1)
+				assert_equal(requests[1].body, body, "old body remains byte-identical and unknown")
+				return
+			end
+			client.sample_counter = scene.counter or 0
+			next_status = 503
+			http.request = function(url, method, callback, headers, body, options)
+				local entries = storage.load_pending_entries(client:pending_scope())
+				assert_equal(#entries, 1, "body persisted before first dispatch")
+				assert_equal(entries[1].body, body, "capture body equals first wire body")
+				return real_request(url, method, callback, headers, body, options)
+			end
+			local caller = presymbolicated_event({ fatal = not scene.fatal, non_fatal_sample_one_in = 99 })
+			for _ = 1, scene.calls or 1 do
+				if scene.fatal then assert_true(client:emit_fatal(caller))
+				else assert_true(client:emit(caller)) end
+			end
+			http.request = real_request
+			if scene.dropped then
+				assert_equal(#requests, 0)
+				assert_equal(#storage.load_pending_crashes(client:pending_scope()), 0)
+				assert_equal(client:snapshot().sampled_out, scene.calls or 1)
+				return
+			end
+			assert_equal(#requests, 1, "exactly one report was admitted")
+			local body = requests[1].body
+			local report = json.decode(body)
+			assert_equal(report.fatal, scene.fatal == true, "SDK fatality wins over caller/sampler data")
+			assert_equal(report.non_fatal_sample_one_in, scene.rate, "rate describes the actual sampler")
+			if scene.fatal then assert_equal(sampler_calls, 0, "fatal bypasses the sampler") end
+			assert_equal(caller.non_fatal_sample_one_in, 99, "caller data was not mutated")
+			-- Relaunch under another rate: serialization at capture owns the rate.
+			reset()
+			local replay = assert(crash.new(config({ sample_every = 1 })))
+			assert_true(replay:resend_pending())
+			assert_equal(#requests, 1)
+			assert_equal(requests[1].body, body, "replay does not restamp under new policy")
+		end)
+		http.request = real_request
+		restore()
+		storage.reset()
+		if not ok then failed = failed + 1 end
+		print("crash sampling scene " .. scene.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	assert_equal(failed, 0, "crash sampling scene failures")
+end)()

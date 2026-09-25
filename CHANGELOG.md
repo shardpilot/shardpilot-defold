@@ -2,6 +2,11 @@
 
 ### Unreleased
 
+- New crash reports serialize SDK-owned fatality and, for a sampled-in
+  non-fatal report with the default counter, its known 1-in-N rate. Custom
+  samplers and unrepresentable rates stay unknown. Retry bodies retain the
+  capture-time annotations; older spooled bodies remain unchanged. The default
+  sampling rate remains one in ten.
 - Drop-time experiment capture without an arm-time session now refuses once
   the current background pause expires. It neither files a new fact into the
   timed-out session nor opens a replacement; an explicit arm-time session is
