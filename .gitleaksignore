@@ -1,0 +1,5 @@
+# Synthetic golden assignment identifiers; source: test/fixtures/experiment-age/contract.md.
+test/fixtures/experiment-age/adult.json:generic-api-key:1
+test/fixtures/experiment-age/undeclared.json:generic-api-key:1
+test/fixtures/experiment-age/under_threshold.json:generic-api-key:1
+test/fixtures/experiment-age/unknown.json:generic-api-key:1

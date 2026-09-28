@@ -2578,6 +2578,20 @@ function Client:fetch_experiment_assignment(experiment_key, attributes, callback
 	return self.experiments:fetch(experiment_key, attributes, callback)
 end
 
+function Client:fetch_experiment_assignment_with_age_band(experiment_key, band, attributes, callback)
+	if type(attributes) == "function" and callback == nil then
+		callback, attributes = attributes, nil
+	end
+	local declared, err = experiments_mod.attributes_with_age_band(band, attributes)
+	if not declared then
+		if type(callback) == "function" then
+			pcall(callback, { ok = false, from_cache = false, error = err })
+		end
+		return false, err
+	end
+	return self:fetch_experiment_assignment(experiment_key, declared, callback)
+end
+
 function Client:experiment_variant(experiment_key)
 	if not self.experiments then
 		return nil

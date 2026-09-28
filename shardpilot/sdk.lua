@@ -200,6 +200,20 @@ function M.fetch_experiment_assignment(experiment_key, attributes, callback)
 	return client:fetch_experiment_assignment(experiment_key, attributes, callback)
 end
 
+function M.fetch_experiment_assignment_with_age_band(experiment_key, band, attributes, callback)
+	if type(attributes) == "function" and callback == nil then
+		callback, attributes = attributes, nil
+	end
+	local client = default()
+	if not client then
+		if type(callback) == "function" then
+			pcall(callback, { ok = false, from_cache = false, error = "not_initialized" })
+		end
+		return false, "not_initialized"
+	end
+	return client:fetch_experiment_assignment_with_age_band(experiment_key, band, attributes, callback)
+end
+
 function M.experiment_variant(experiment_key)
 	local client = default()
 	if not client then
