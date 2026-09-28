@@ -1088,6 +1088,9 @@ remote-config and assignment fetches. Feature-detect the surface before
 
 ### API
 
+The age-band method below is **Unreleased**. Use a source revision that contains
+it; the published `v0.10.3` tag does not provide it.
+
 <!-- doc-region: none -- the experiments API, which the minimal example does not use -->
 ```lua
 -- Fetch for a player your game has declared adult. `attributes` is optional —
