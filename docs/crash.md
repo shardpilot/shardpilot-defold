@@ -123,7 +123,7 @@ process are always dropped. A sampled-out `emit` looks exactly like a sent
 one at the call site; supply a custom `sampler` (e.g. `function() return
 true end`) to transmit every non-fatal.
 
-**Unreleased:** newly captured reports carry SDK-stamped `fatal` on the wire.
+**New in `v0.11.0`:** newly captured reports carry SDK-stamped `fatal` on the wire.
 An admitted non-fatal report also carries `non_fatal_sample_one_in` when the
 default counter's rate is an integer from 1 through 1,000,000. Custom samplers,
 including those that throw and keep the report, leave the rate unknown and omit

@@ -1,6 +1,6 @@
 # Privacy And Tokens
 
-For iOS, explicitly merge the SDK's unreleased manifest fragment into the
+For iOS, explicitly merge the SDK's `v0.11.0` manifest fragment into the
 game-owned manifest. The [iOS privacy guide](ios-privacy.md) maps data types,
 consent defaults and linkage, records the unused engine IDFV read, and describes
 the final archive/report evidence still required.
@@ -73,7 +73,7 @@ explicit **granted** decision opens the event pipeline.
   and keep their normal load/delivery rules.
 - **Denied** drops events at enqueue (`false, "consent_denied"`), clears the
   pending queue, discards in-flight batches on completion instead of retrying
-  them, and purges the offline spool (see below). **Unreleased:** it also closes
+  them, and purges the offline spool (see below). **New in `v0.11.0`:** it also closes
   the current session locally without an end event and discards its pending
   background deadline. A re-grant does not continue that session: the next
   resume or tracked activity announces a fresh `app.session_started`, at

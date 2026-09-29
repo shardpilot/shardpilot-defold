@@ -41,7 +41,7 @@ is not documentation hygiene.
 
 ## Session end reasons
 
-**Unreleased:** `session_end([reason])`, on a client or the module singleton,
+**New in `v0.11.0`:** `session_end([reason])`, on a client or the module singleton,
 preserves a non-empty string reason. An absent, empty or non-string reason uses
 `session_end`. With no session open, the call emits nothing and opens nothing;
 a second end is also a no-op. `shutdown()` uses `app_final`, including a retry

@@ -18,8 +18,8 @@ not the platform boundary.
   a local stack you run yourself. Which endpoints are available today is stated
   under Configuration below and in [`docs/configuration.md`](docs/configuration.md);
   read that before configuring a hosted deployment.
-- **Version `0.10.3`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.10.3`; the `v0.10.3` tag
+- **Version `0.11.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.11.0`; the `v0.11.0` tag
   is created by the owner after the version-bump merge (pending until then).
 
 ## What it does
@@ -37,7 +37,7 @@ not the platform boundary.
   de-duplicates re-sends. See [Offline durability](#offline-durability-event-spool).
 - Emits canonical helpers: `session_start()` → `app.session_started`,
   `session_end([reason])` → `app.session_ended` (the next event after an end
-  opens a new session; **Unreleased:** a background stay of
+  opens a new session; **New in `v0.11.0`:** a background stay of
   `session_timeout_seconds` or longer ends the session at the resume, when the
   host forwards its window events to `on_window_event` — see
   [Offline durability](#offline-durability-event-spool)), `screen_view(name)` → `app.screen_view`, the typed
@@ -51,7 +51,7 @@ not the platform boundary.
   `track_ad_impression_revenue(impression_id, network, revenue_micros,
   currency[, revenue_precision, ad_unit, ad_format, placement])` →
   `ad_impression_revenue`, plus arbitrary `track(name, props)`.
-- **Unreleased session helpers:** `session_end([reason])` is available on both
+- **Session helpers (new in `v0.11.0`):** `session_end([reason])` is available on both
   a client and the module singleton. It ends only an open session; `shutdown()`
   uses `app_final` regardless of a legacy reason argument. See
   [session end reasons](docs/events.md#session-end-reasons) for defaults and
@@ -70,7 +70,7 @@ not the platform boundary.
 - **Capability discovery.** `shardpilot.supports(capability)` feature-detects
   SDK abilities before `init()` — `"consent_receipt_outbox"`,
   `"consent_state_denied_forced_minor"`, `"schema_revision_declaration"`,
-  `"experiments_assignment"`, and `"experiments_age_band"` (Unreleased); unknown names return `false` on older and
+  `"experiments_assignment"`, and `"experiments_age_band"` (New in `v0.11.0`); unknown names return `false` on older and
   newer SDKs alike, so integrations can gate new call shapes safely.
 - Samples basic runtime signals via `update(dt)`, `observe_ping_ms(ms)`, and
   `observe_disconnect(reason)`.
@@ -112,11 +112,11 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — after owner tagging, the latest tag is `v0.10.3`:
+published tag's source archive — after owner tagging, the latest tag is `v0.11.0`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.3.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.11.0.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
@@ -626,7 +626,7 @@ README, `docs/`, and the skill above are the reference.
 | `rejection_capacity` | `64` *(new in `v0.10.2`)* | Retained per-event rejection entries (positive integer); see [Batch verdicts](#batch-verdicts). |
 | `buffer_size` | `1000` | Max queued events (≥1); cross-SDK canonical default |
 | `flush_interval_seconds` | `15` (was `1`) *(new in `v0.10.2`)* | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value *(new in `v0.10.2`)*. |
-| `session_timeout_seconds` | `30` **Unreleased** | A background stay this long or longer (>0, finite) ends the session at the resume, stamped at the moment the stay reached it (`reason = "idle_timeout"`), and starts the next session. Needs the host to forward window events to `on_window_event`. |
+| `session_timeout_seconds` | `30` **New in `v0.11.0`** | A background stay this long or longer (>0, finite) ends the session at the resume, stamped at the moment the stay reached it (`reason = "idle_timeout"`), and starts the next session. Needs the host to forward window events to `on_window_event`. |
 | `publish_timeout_seconds` | `2` | Per-request timeout (>0) |
 | `request_compression_enabled` | `true` *(new in `v0.10.2`)* | Compress analytics batch bodies over 1 KiB with `Content-Encoding: deflate` (RFC 1950 zlib — see [Request compression](#request-compression)). Sub-threshold bodies go uncompressed: zlib framing makes a single-event batch bigger, not smaller. No-op on engine versions without the `zlib` module. |
 | `token_refresh_lead_ms` | `60000` | Refresh lead before token expiry (≥0) |
@@ -855,7 +855,7 @@ window.set_listener(function(self, event, data)
 end)
 ```
 
-**Unreleased.** `on_window_event` does what `persist()` does on a background
+**New in `v0.11.0`.** `on_window_event` does what `persist()` does on a background
 signal (and returns its result), and it drives the automatic session boundary:
 
 - **Which events count.** On mobile and web, focus lost and gained. On desktop,
@@ -1090,8 +1090,9 @@ method; the original experiment capability does not promise that newer method.
 
 ### API
 
-The age-band method below is **Unreleased**. Use a source revision that contains
-it; the published `v0.10.3` tag does not provide it.
+The age-band method below is new in **v0.11.0** and is absent from `v0.10.3`.
+The v0.11.0 tag remains pending until the owner publishes it after the release
+preparation merge; feature-detect the method as shown below.
 
 <!-- doc-region: none -- the experiments API, which the minimal example does not use -->
 ```lua
@@ -1310,7 +1311,7 @@ game has to handle specially.
 
   **Treat exposure delivery as best-effort, and the `diagnostics` hook as the
   place you learn otherwise.** Facts carry a deterministic `event_id`, so the
-  server counts retries of the same fact once. **Unreleased:** a consent denial
+  server counts retries of the same fact once. **New in `v0.11.0`:** a consent denial
   closes the session; after re-grant, retained assignments re-arm into the
   fresh session and use its distinct exposure ID. Those are separate facts,
   not duplicate sends of the pre-denial exposure. Under sustained queue
@@ -1393,8 +1394,8 @@ The callback receives **exactly one decision, exactly once**:
 | `analytics_choice_default` | `off` for `STRICT_OPT_IN`, `UNKNOWN` and **every fallback**; `on` only for a used `SOFT_OPT_OUT` plan. This is the state of the switch when your screen opens — not whether to open one |
 | `explicit_grant_required` | `true` for strict, unknown and every fallback: the optional lane starts **only** after the player's explicit grant, and an untouched or declined choice starts nothing. `false` only for a used SOFT plan, whose basis is notice and non-objection — recorded as such, never as a click |
 | `plan_used` | `false` means the strict fallback was taken; `reason` says why |
-| `operation_blocks` | The operation restrictions the host must enforce. **Unreleased:** always a list, retaining the last accepted plan's set on fallback; `[]` when none is known |
-| `operation_blocks_source` | **Unreleased:** `plan` for an accepted plan, including a cache hit; `preserved` for a fallback retaining that plan's set (even `[]`); `none` when no plan is known for this context |
+| `operation_blocks` | The operation restrictions the host must enforce. **New in `v0.11.0`:** always a list, retaining the last accepted plan's set on fallback; `[]` when none is known |
+| `operation_blocks_source` | **New in `v0.11.0`:** `plan` for an accepted plan, including a cache hit; `preserved` for a fallback retaining that plan's set (even `[]`); `none` when no plan is known for this context |
 | `valid_for_seconds` | How long this verdict is good for — the shortest of the cache ceiling, the plan's `expires_at` and its `max_age_seconds`. **Schedule your own re-resolution by it:** cache expiry protects the next lookup and stops nothing that is already running. `nil` on a fallback, which established nothing that could expire |
 
 **The conservative rule.** A plan that is missing, unreadable, out of scope,
@@ -1403,7 +1404,7 @@ The callback receives **exactly one decision, exactly once**:
 can preserve or add restrictions; it can never relax one, and it can never
 reuse a cached permissive result.
 
-**Operation-block retention (Unreleased; not in v0.10.3).** The module remembers
+**Operation-block retention (new in v0.11.0).** The module remembers
 the complete block list from the last accepted plan for the active context,
 independently of the response cache and its lifetime. Every newer accepted
 plan replaces that list, including with `[]`; a refusal, timeout, malformed
@@ -1546,7 +1547,7 @@ re-resolution triggers — launch and resume, a network or permitted storefront
 change, an age correction, a language or text change, a workspace or app
 change, a policy revocation, and before the first optional admission. A
 request already in flight when it fires can no longer answer.
-In the Unreleased implementation, invalidation preserves known operation
+In v0.11.0, invalidation preserves known operation
 blocks; only a newer accepted plan, a validated context change or module
 reload/process restart can replace or forget them as described above.
 
@@ -1565,7 +1566,7 @@ top-level one.
 
 ## Privacy & consent
 
-- **iOS manifest (unreleased):** merge the supplied
+- **iOS manifest (new in `v0.11.0`):** merge the supplied
   [`PrivacyInfo.xcprivacy` fragment](shardpilot/privacy/PrivacyInfo.xcprivacy)
   into the game's own manifest using the
   [iOS integration guide](docs/ios-privacy.md). It does not bundle itself;
@@ -1646,7 +1647,7 @@ top-level one.
   rest alike. `denied` drops events at
   enqueue (`consent_denied`), clears the pending
   queue, discards in-flight batches instead of retrying, and purges the
-  offline spool. **Unreleased:** denial also closes the current session locally
+  offline spool. **New in `v0.11.0`:** denial also closes the current session locally
   and discards its pending background deadline. After a re-grant, the next
   resume or tracked activity announces a distinct session; no end is emitted
   for the denied interval. `"denied_forced_minor"` — the persisted decision for

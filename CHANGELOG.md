@@ -1,7 +1,12 @@
 # Changelog
 
-### Unreleased
+## v0.11.0 — 2026-09-29 — age admission and session lifecycle
 
+- **Upgrade behavior:** this is a pre-1.0 minor bump. An authoritative
+  `age_ineligible` response now clears a cached variant that v0.10.3 kept
+  serving as stale. Undeclared and non-adult players stay ineligible; games
+  must declare an eligible age band to receive an assignment. The new API
+  and session lifecycle changes below require integration review.
 - Treat `age_ineligible` as an authoritative experiment refusal, preserving
   its reason and withdrawing memory/durable assignments without transient
   retries. Unknown future reasons remain malformed.
