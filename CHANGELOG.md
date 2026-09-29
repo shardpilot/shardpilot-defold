@@ -1,5 +1,15 @@
 # Changelog
 
+### Unreleased
+
+- A client-id experiment assignment cached without an age declaration, such as
+  one v0.10.x persisted, is no longer restored after a restart. It serves
+  nothing and arms no exposure until the next fetch, which carries the current
+  declaration, decides it. Before, it was served until its first revalidation,
+  about 300 s later, which the platform refuses with `age_ineligible`.
+  Assignments cached with a declaration, and synthetic-subject assignments,
+  restore as before. ([#118](https://github.com/shardpilot/shardpilot-defold/issues/118))
+
 ## v0.11.0 — 2026-09-29 — age admission and session lifecycle
 
 - **Upgrade behavior:** this is a pre-1.0 minor bump. An authoritative

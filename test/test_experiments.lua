@@ -1159,7 +1159,7 @@ local function test_restart_restores_cache_serves_offline_and_exposes_once()
 	local restore = install_fake_sys_storage()
 	local first = granted_client()
 	next_response_body = assignment_body()
-	fetch(first, "exp-checkout")
+	fetch(first, "exp-checkout", { age_band = "adult" })
 	local first_exposure = queued_events(first, "experiment_exposure")[1]
 
 	-- A relaunch serves the persisted assignment before (and without) any
@@ -1169,7 +1169,7 @@ local function test_restart_restores_cache_serves_offline_and_exposes_once()
 		"the restored cache serves before any fetch")
 	next_status = 0
 	next_response_body = nil
-	local result = fetch(second, "exp-checkout")
+	local result = fetch(second, "exp-checkout", { age_band = "adult" })
 	assert_true(result.ok, "an offline relaunch serves last-known-good")
 	assert_equal(result.from_cache, true)
 	assert_equal(result.variant_key, "treatment")
@@ -1542,15 +1542,15 @@ local function test_permanent_drop_reaches_disk_after_latch_wipe()
 	local restore = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body({ experiment_key = "exp-a" })
-	fetch(client, "exp-a")
+	fetch(client, "exp-a", { age_band = "adult" })
 	next_response_body = assignment_body({ experiment_key = "exp-b", variant_key = "beta" })
-	fetch(client, "exp-b")
+	fetch(client, "exp-b", { age_band = "adult" })
 
 	-- The latch clears the in-memory serving set; the durable record is
 	-- deliberately retained.
 	next_status = 401
 	next_response_body = json.encode({ error = "invalid runtime token" })
-	fetch(client, "exp-a")
+	fetch(client, "exp-a", { age_band = "adult" })
 	local record = storage.load_experiments(client.config)
 	assert_true(record.entries["exp-a"] ~= nil and record.entries["exp-b"] ~= nil,
 		"the latch retains the durable record")
@@ -1559,7 +1559,7 @@ local function test_permanent_drop_reaches_disk_after_latch_wipe()
 	-- is served in memory for the key.
 	next_status = 404
 	next_response_body = json.encode({ error = "published experiment not found" })
-	fetch(client, "exp-a")
+	fetch(client, "exp-a", { age_band = "adult" })
 	record = storage.load_experiments(client.config)
 	assert_nil(record.entries["exp-a"],
 		"a permanent drop must reach the durable record after a latch wipe")
@@ -1569,7 +1569,7 @@ local function test_permanent_drop_reaches_disk_after_latch_wipe()
 	-- A post-latch reinstall must not clobber retained siblings either.
 	next_status = 200
 	next_response_body = assignment_body({ experiment_key = "exp-a" })
-	fetch(client, "exp-a")
+	fetch(client, "exp-a", { age_band = "adult" })
 	record = storage.load_experiments(client.config)
 	assert_true(record.entries["exp-a"] ~= nil and record.entries["exp-b"] ~= nil,
 		"installing one experiment must keep the sibling's durable entry")
@@ -1973,7 +1973,7 @@ local function test_failed_refresh_write_never_leaves_superseded_variant()
 	local restore, _, state = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	fetch(client, "exp-checkout", { age_band = "adult" })
 	local record = storage.load_experiments(client.config)
 	assert_equal(record.entries["exp-checkout"].variant_key, "treatment")
 
@@ -1989,7 +1989,7 @@ local function test_failed_refresh_write_never_leaves_superseded_variant()
 	end
 	advance_seconds(2)
 	next_response_body = assignment_body({ version = 4, variant_key = "control" })
-	fetch(client, "exp-checkout")
+	fetch(client, "exp-checkout", { age_band = "adult" })
 	assert_equal(client:experiment_variant("exp-checkout"), "control",
 		"memory serves the refreshed variant")
 	record = storage.load_experiments(client.config)
@@ -2331,7 +2331,7 @@ local function test_ordinary_auth_failure_keeps_durable_cache_despite_owed_write
 	local restore, _, state = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	fetch(client, "exp-checkout", { age_band = "adult" })
 
 	-- A refresh write fails and stays OWED (the tombstone save fails too, so
 	-- the ORIGINAL record remains the disk truth).
@@ -2340,7 +2340,7 @@ local function test_ordinary_auth_failure_keeps_durable_cache_despite_owed_write
 	end
 	advance_seconds(2)
 	next_response_body = assignment_body({ version = 4, variant_key = "control" })
-	fetch(client, "exp-checkout")
+	fetch(client, "exp-checkout", { age_band = "adult" })
 
 	-- An ORDINARY 401 then latches fail-closed while that write is still
 	-- owed. The documented behavior retains the durable record: the owed
@@ -2349,7 +2349,7 @@ local function test_ordinary_auth_failure_keeps_durable_cache_despite_owed_write
 	state.fail_save = nil
 	next_status = 401
 	next_response_body = json.encode({ error = "invalid runtime token" })
-	local latched = fetch(client, "exp-checkout")
+	local latched = fetch(client, "exp-checkout", { age_band = "adult" })
 	assert_equal(latched.error, "unauthorized")
 	client:update(0.016)
 	local record = storage.load_experiments(client.config)
@@ -2608,14 +2608,14 @@ local function test_clock_rollback_does_not_fence_refresh_write()
 	local restore = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	fetch(client, "exp-checkout", { age_band = "adult" })
 
 	-- The wall clock rolls BACK before a successful refresh: the write must
 	-- supersede the stored record it replaces — a fenced write would leave
 	-- the OLD variant as reload truth while memory serves the new one.
 	socket.now = socket.now - 100
 	next_response_body = assignment_body({ version = 4, variant_key = "control" })
-	fetch(client, "exp-checkout")
+	fetch(client, "exp-checkout", { age_band = "adult" })
 	assert_equal(client:experiment_variant("exp-checkout"), "control")
 	local record = storage.load_experiments(client.config)
 	assert_equal(record.entries["exp-checkout"].variant_key, "control",
@@ -2702,7 +2702,7 @@ local function test_owed_exposures_stay_session_scoped()
 	local restore = install_fake_sys_storage()
 	local seed = granted_client()
 	next_response_body = assignment_body()
-	fetch(seed, "exp-checkout")
+	fetch(seed, "exp-checkout", { age_band = "adult" })
 	next_status = 202
 	next_response_body = nil
 	assert_true(seed:shutdown())
@@ -2941,7 +2941,7 @@ local function test_restored_exposure_migrates_to_first_session()
 	local restore = install_fake_sys_storage()
 	local seed = granted_client()
 	next_response_body = assignment_body()
-	fetch(seed, "exp-checkout")
+	fetch(seed, "exp-checkout", { age_band = "adult" })
 	next_status = 202
 	next_response_body = nil
 	assert_true(seed:shutdown())
@@ -3139,7 +3139,7 @@ local function test_credential_swap_scopes_the_cache()
 	local restore = install_fake_sys_storage()
 	local first = granted_client()
 	next_response_body = assignment_body()
-	fetch(first, "exp-checkout")
+	fetch(first, "exp-checkout", { age_band = "adult" })
 	assert_equal(first:experiment_variant("exp-checkout"), "treatment")
 
 	-- The scope carries a credential FINGERPRINT — never the raw key.
@@ -3278,9 +3278,9 @@ local function test_sibling_write_lands_owed_drops()
 	local restore, _, state = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body({ experiment_key = "exp-a" })
-	fetch(client, "exp-a")
+	fetch(client, "exp-a", { age_band = "adult" })
 	next_response_body = assignment_body({ experiment_key = "exp-b", variant_key = "beta" })
-	fetch(client, "exp-b")
+	fetch(client, "exp-b", { age_band = "adult" })
 
 	-- exp-a's kill fails to persist: the drop is OWED and the disk record
 	-- still carries the killed assignment.
@@ -3288,7 +3288,7 @@ local function test_sibling_write_lands_owed_drops()
 		return fail_experiment_saves(path)
 	end
 	next_response_body = not_assigned_body("kill_switch")
-	fetch(client, "exp-a")
+	fetch(client, "exp-a", { age_band = "adult" })
 	state.fail_save = nil
 	local record = storage.load_experiments(client.config)
 	assert_true(record.entries["exp-a"] ~= nil,
@@ -3302,7 +3302,7 @@ local function test_sibling_write_lands_owed_drops()
 		variant_key = "beta",
 		version = 4,
 	})
-	fetch(client, "exp-b")
+	fetch(client, "exp-b", { age_band = "adult" })
 	record = storage.load_experiments(client.config)
 	assert_nil(record.entries["exp-a"],
 		"a successful sibling write must land the owed drop")
@@ -3516,9 +3516,9 @@ local function test_sibling_save_folds_owed_writes()
 	local restore, _, state = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body({ experiment_key = "exp-a" })
-	fetch(client, "exp-a")
+	fetch(client, "exp-a", { age_band = "adult" })
 	next_response_body = assignment_body({ experiment_key = "exp-b", variant_key = "beta" })
-	fetch(client, "exp-b")
+	fetch(client, "exp-b", { age_band = "adult" })
 
 	-- exp-a's refresh write fails (owed; the tombstone save fails too, so
 	-- the SUPERSEDED variant stays reload truth for the moment).
@@ -3531,7 +3531,7 @@ local function test_sibling_save_folds_owed_writes()
 		version = 4,
 		variant_key = "fresh",
 	})
-	fetch(client, "exp-a")
+	fetch(client, "exp-a", { age_band = "adult" })
 	state.fail_save = nil
 	local record = storage.load_experiments(client.config)
 	assert_equal(record.entries["exp-a"].variant_key, "treatment",
@@ -3541,7 +3541,7 @@ local function test_sibling_save_folds_owed_writes()
 	-- refreshed write with it: an exit before the retry tick must not
 	-- reload the superseded variant.
 	next_response_body = not_assigned_body("kill_switch")
-	fetch(client, "exp-b")
+	fetch(client, "exp-b", { age_band = "adult" })
 	record = storage.load_experiments(client.config)
 	assert_equal(record.entries["exp-a"].variant_key, "fresh",
 		"a successful sibling save must fold the owed refreshed write")
@@ -3596,7 +3596,7 @@ local function test_restored_attributes_renormalize_before_revalidation()
 	local restore = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout", { geo = "de" })
+	fetch(client, "exp-checkout", { geo = "de", age_band = "adult" })
 	next_status = 202
 	next_response_body = nil
 	assert_true(client:shutdown())
@@ -3609,6 +3609,7 @@ local function test_restored_attributes_renormalize_before_revalidation()
 		{ name = "experiment_key", value = "evil-key" },
 		{ name = "not_in_vocabulary", value = "x" },
 		{ name = "geo", value = "de" },
+		{ name = "age_band", value = "adult" },
 		{ name = "user_segment", value = string.rep("v", 600) },
 	}
 	assert_true(storage.save_experiments(config(), record))
@@ -4043,13 +4044,13 @@ local function test_condemned_survivor_restores_and_converges()
 	seed_granted_consent()
 	local a = assert(sdk.new(config()))
 	next_response_body = assignment_body()
-	fetch(a, "exp-checkout")
+	fetch(a, "exp-checkout", { age_band = "adult" })
 	state.fail_save = fail_experiment_saves
 	next_status = 403
 	next_response_body = json.encode({
 		error = "experiment real-subject assignment is disabled",
 	})
-	fetch(a, "exp-checkout")
+	fetch(a, "exp-checkout", { age_band = "adult" })
 	next_status = 200
 	state.fail_save = nil
 	advance_seconds(5)
@@ -4061,11 +4062,11 @@ local function test_condemned_survivor_restores_and_converges()
 	local b = assert(sdk.new(config()))
 	next_status = 503
 	next_response_body = nil
-	local stale = fetch(b, "exp-checkout")
+	local stale = fetch(b, "exp-checkout", { age_band = "adult" })
 	assert_equal(stale.ok, false, "condemned entries must not restore")
 	next_status = 200
 	next_response_body = assignment_body({ experiment_key = "exp-onboarding" })
-	fetch(b, "exp-onboarding")
+	fetch(b, "exp-onboarding", { age_band = "adult" })
 	local record = storage.load_experiments(config())
 	assert_true(record ~= nil and record.entries["exp-onboarding"] ~= nil,
 		"the fresh authorized install persists")
@@ -4076,7 +4077,7 @@ local function test_condemned_survivor_restores_and_converges()
 	local c = assert(sdk.new(config()))
 	next_status = 503
 	next_response_body = nil
-	local kept = fetch(c, "exp-onboarding")
+	local kept = fetch(c, "exp-onboarding", { age_band = "adult" })
 	assert_equal(kept.ok, true, "the survivor serves normally after the next restart")
 	assert_equal(kept.from_cache, true)
 	next_status = 200
@@ -4114,7 +4115,7 @@ local function test_migrated_snapshot_keeps_apply_identity_through_session_start
 	local restore, stores = install_fake_sys_storage()
 	local seed_client = granted_client()
 	next_response_body = assignment_body()
-	fetch(seed_client, "exp-checkout")
+	fetch(seed_client, "exp-checkout", { age_band = "adult" })
 
 	-- Restart: the restored assignment arms its pre-session snapshot at
 	-- construction. Time passes and the anonymous id rotates BEFORE the
@@ -4247,7 +4248,7 @@ local function test_denied_restore_arms_intent_and_exposes_at_grant_identity()
 	local restore, stores = install_fake_sys_storage()
 	local seed_client = granted_client()
 	next_response_body = assignment_body()
-	fetch(seed_client, "exp-checkout")
+	fetch(seed_client, "exp-checkout", { age_band = "adult" })
 
 	-- Restart with a persisted DENIED consent: the restored assignment is
 	-- not being served (getters are consent-gated), so its exposure must
@@ -4324,13 +4325,13 @@ local function test_sentinel_clear_never_condemns_foreign_scope()
 	-- must survive both the immediate clear and any later condemnation.
 	local b = assert(sdk.new(config({ environment_id = "staging" })))
 	next_response_body = assignment_body({ environment_key = "staging" })
-	fetch(b, "exp-checkout")
+	fetch(b, "exp-checkout", { age_band = "adult" })
 	local a = assert(sdk.new(config()))
 	next_status = 403
 	next_response_body = json.encode({
 		error = "experiment real-subject assignment is disabled",
 	})
-	fetch(a, "exp-checkout")
+	fetch(a, "exp-checkout", { age_band = "adult" })
 	next_status = 200
 	local record = storage.load_experiments(config({ environment_id = "staging" }))
 	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
@@ -4346,7 +4347,7 @@ local function test_sentinel_clear_never_condemns_foreign_scope()
 	next_response_body = json.encode({
 		error = "experiment real-subject assignment is disabled",
 	})
-	fetch(a, "exp-checkout")
+	fetch(a, "exp-checkout", { age_band = "adult" })
 	next_status = 200
 	state.fail_save = nil
 	assert_nil(storage.load_experiments_clear(config()),
@@ -4354,7 +4355,7 @@ local function test_sentinel_clear_never_condemns_foreign_scope()
 	local b2 = assert(sdk.new(config({ environment_id = "staging" })))
 	next_status = 503
 	next_response_body = nil
-	local stale = fetch(b2, "exp-checkout")
+	local stale = fetch(b2, "exp-checkout", { age_band = "adult" })
 	assert_equal(stale.ok, true)
 	assert_equal(stale.from_cache, true,
 		"the foreign scope's restart serves its own retained assignment")
@@ -4520,7 +4521,7 @@ local function test_retry_after_arms_cadence_before_first_tick()
 	local restore, stores = install_fake_sys_storage()
 	local seed_client = granted_client()
 	next_response_body = assignment_body()
-	fetch(seed_client, "exp-checkout")
+	fetch(seed_client, "exp-checkout", { age_band = "adult" })
 
 	-- A restored assignment has no cadence armed before its first tick.
 	-- A transient fetch with a SHORT Retry-After must arm the cadence
@@ -4530,7 +4531,7 @@ local function test_retry_after_arms_cadence_before_first_tick()
 	next_status = 503
 	next_response_body = nil
 	next_response_headers = { ["retry-after"] = "5" }
-	local stale = fetch(client, "exp-checkout")
+	local stale = fetch(client, "exp-checkout", { age_band = "adult" })
 	assert_equal(stale.from_cache, true)
 	local base = #assignment_requests()
 	next_status = 200
@@ -4549,14 +4550,14 @@ local function test_fresh_install_outranks_pending_clear_marker()
 	local restore, stores, state = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	fetch(client, "exp-checkout", { age_band = "adult" })
 
 	-- The sentinel lands while the record store is down: the clear cannot
 	-- land, so the condemnation persists as the sidecar marker.
 	state.fail_save = fail_experiment_saves
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	fetch(client, "exp-checkout", { age_band = "adult" })
 
 	-- The clock rolls back below the marker's stamp, storage recovers, and
 	-- a LATER authorized fetch reassigns: the install must raise the fresh
@@ -4568,7 +4569,7 @@ local function test_fresh_install_outranks_pending_clear_marker()
 	state.fail_save = nil
 	next_status = 200
 	next_response_body = assignment_body({ variant_key = "fresh" })
-	local result = fetch(client, "exp-checkout")
+	local result = fetch(client, "exp-checkout", { age_band = "adult" })
 	assert_true(result.ok, "the post-sentinel authorized fetch installs")
 	assert_equal(client:experiment_variant("exp-checkout"), "fresh")
 
@@ -4676,9 +4677,9 @@ local function test_stale_sentinel_stamp_ignores_post_dispatch_install()
 	local client = granted_client()
 	assert_true(client:session_start())
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	fetch(client, "exp-checkout", { age_band = "adult" })
 	next_response_body = assignment_body({ experiment_key = "exp-two", variant_key = "beta" })
-	fetch(client, "exp-two")
+	fetch(client, "exp-two", { age_band = "adult" })
 
 	-- One revalidation batch: exp-checkout's answer is HELD in flight while
 	-- exp-two's fresh 200 lands first. The held answer then reports the
@@ -4903,7 +4904,7 @@ local function test_presession_exposure_attributes_to_lazy_first_session()
 	local restore = install_fake_sys_storage()
 	local seed_client = granted_client()
 	next_response_body = assignment_body()
-	fetch(seed_client, "exp-checkout")
+	fetch(seed_client, "exp-checkout", { age_band = "adult" })
 
 	-- Relaunch: the restored snapshot is pre-session. Host activity lazily
 	-- opens the first real session (a pre-start track), the snapshot stays
@@ -5146,7 +5147,7 @@ local function test_shutdown_closes_session_opened_by_final_drain()
 	local restore = install_fake_sys_storage()
 	local seed_client = granted_client()
 	next_response_body = assignment_body()
-	fetch(seed_client, "exp-checkout")
+	fetch(seed_client, "exp-checkout", { age_band = "adult" })
 
 	-- Relaunch with a restored pre-session owed exposure and NO session:
 	-- the shutdown's final drain lazily opens the exit-time session for
@@ -6106,7 +6107,7 @@ local function test_backend_restored_exposure_drains_in_background()
 	local restore = install_fake_sys_storage()
 	local seed_client = granted_client({ source = "backend" })
 	next_response_body = assignment_body()
-	fetch(seed_client, "exp-checkout")
+	fetch(seed_client, "exp-checkout", { age_band = "adult" })
 
 	-- A backend relaunch restores the assignment with a sessionless owed
 	-- snapshot. Backend envelopes are legitimately sessionless on the
@@ -6375,7 +6376,7 @@ function extra_tests.test_unreadable_record_read_keeps_kill_drop_owed()
 	local restore = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	fetch(client, "exp-checkout", { age_band = "adult" })
 	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
 
 	-- PROCESS BOUNDARY: the in-process memory mirror dies with the exit
@@ -6401,7 +6402,7 @@ function extra_tests.test_unreadable_record_read_keeps_kill_drop_owed()
 		return saved_load(path)
 	end
 	next_response_body = not_assigned_body("kill_switch")
-	fetch(second, "exp-checkout")
+	fetch(second, "exp-checkout", { age_band = "adult" })
 	assert_nil(second:experiment_variant("exp-checkout"),
 		"memory dropped the killed assignment")
 	local ok, err = second:persist()
@@ -6642,7 +6643,7 @@ function extra_tests.test_shadow_never_masks_unreadable_record()
 	local client = granted_client()
 	assert_true(client:session_start())
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	fetch(client, "exp-checkout", { age_band = "adult" })
 	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
 
 	-- A sibling process persists ANOTHER experiment into the shared record
@@ -6688,7 +6689,7 @@ function extra_tests.test_shadow_never_masks_unreadable_record()
 		return saved_load(path)
 	end
 	next_response_body = not_assigned_body("kill_switch")
-	fetch(client, "exp-checkout")
+	fetch(client, "exp-checkout", { age_band = "adult" })
 	assert_nil(client:experiment_variant("exp-checkout"))
 
 	-- The store heals: the retry decides over the REAL file — the kill
@@ -6711,9 +6712,9 @@ function extra_tests.test_stale_epoch_kill_still_lands_durably()
 	local client = granted_client()
 	assert_true(client:session_start())
 	next_response_body = assignment_body({ experiment_key = "exp-a" })
-	fetch(client, "exp-a")
+	fetch(client, "exp-a", { age_band = "adult" })
 	next_response_body = assignment_body({ experiment_key = "exp-b" })
-	fetch(client, "exp-b")
+	fetch(client, "exp-b", { age_band = "adult" })
 
 	-- exp-b's revalidation-shaped fetch is in flight when exp-a's 401
 	-- latches the plane and bumps the auth epoch...
@@ -6726,14 +6727,14 @@ function extra_tests.test_stale_epoch_kill_still_lands_durably()
 		return true
 	end
 	local result_b = nil
-	client:fetch_experiment_assignment("exp-b", function(value)
+	client:fetch_experiment_assignment("exp-b", { age_band = "adult" }, function(value)
 		result_b = value
 	end)
 	responder = nil
 	assert_equal(#held, 1)
 	next_status = 401
 	next_response_body = json.encode({ error = "unauthorized" })
-	fetch(client, "exp-a")
+	fetch(client, "exp-a", { age_band = "adult" })
 	next_status = 200
 
 	-- ...and exp-b's answer is the kill switch. The stale epoch suppresses
@@ -7024,7 +7025,7 @@ function extra_tests.test_sentinel_preserves_owed_post_dispatch_write()
 	local restore, _, state = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body({ experiment_key = "exp-a" })
-	fetch(client, "exp-a")
+	fetch(client, "exp-a", { age_band = "adult" })
 
 	-- The sentinel's request goes out...
 	local held = {}
@@ -7035,7 +7036,7 @@ function extra_tests.test_sentinel_preserves_owed_post_dispatch_write()
 		held[#held + 1] = callback
 		return true
 	end
-	client:fetch_experiment_assignment("exp-a", function() end)
+	client:fetch_experiment_assignment("exp-a", { age_band = "adult" }, function() end)
 	responder = nil
 	assert_equal(#held, 1)
 
@@ -7046,7 +7047,7 @@ function extra_tests.test_sentinel_preserves_owed_post_dispatch_write()
 	next_response_body = assignment_body({
 		experiment_key = "exp-b", variant_key = "treatment-b",
 	})
-	fetch(client, "exp-b")
+	fetch(client, "exp-b", { age_band = "adult" })
 	assert_equal(client:experiment_variant("exp-b"), "treatment-b")
 
 	-- The sentinel arrives (record store still down: the clear is owed and
@@ -7076,7 +7077,7 @@ function extra_tests.test_invalid_cached_version_never_restores()
 	local restore, stores = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	fetch(client, "exp-checkout", { age_band = "adult" })
 
 	-- On-disk corruption: sibling entries whose versions fail the positive-
 	-- integer wire grammar. They must drop at load; the valid one survives.
@@ -7126,7 +7127,7 @@ function extra_tests.test_unreadable_record_keeps_whole_clear_owed()
 	local restore, stores, state = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body({ experiment_key = "exp-a" })
-	fetch(client, "exp-a")
+	fetch(client, "exp-a", { age_band = "adult" })
 
 	-- The sentinel's request goes out; a post-dispatch sibling assignment
 	-- lands DURABLY (a survivor by the dispatch-bound rule).
@@ -7138,14 +7139,14 @@ function extra_tests.test_unreadable_record_keeps_whole_clear_owed()
 		held[#held + 1] = callback
 		return true
 	end
-	client:fetch_experiment_assignment("exp-a", function() end)
+	client:fetch_experiment_assignment("exp-a", { age_band = "adult" }, function() end)
 	responder = nil
 	assert_equal(#held, 1)
 	advance_seconds(1)
 	next_response_body = assignment_body({
 		experiment_key = "exp-b", variant_key = "treatment-b",
 	})
-	fetch(client, "exp-b")
+	fetch(client, "exp-b", { age_band = "adult" })
 
 	-- The record READ starts throwing; the sentinel arrives. The owed
 	-- whole-record clear must NOT blind-wipe the file it cannot read — the
@@ -7291,7 +7292,7 @@ function extra_tests.test_later_sentinel_cancels_covered_snapshot_write()
 	local restore, _, state = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body({ experiment_key = "exp-a" })
-	fetch(client, "exp-a")
+	fetch(client, "exp-a", { age_band = "adult" })
 
 	-- Sentinel ONE goes out; after its dispatch exp-b lands with its
 	-- install save failing. The first wipe preserves exp-b's owed write as
@@ -7304,7 +7305,7 @@ function extra_tests.test_later_sentinel_cancels_covered_snapshot_write()
 		held[#held + 1] = callback
 		return true
 	end
-	client:fetch_experiment_assignment("exp-a", function() end)
+	client:fetch_experiment_assignment("exp-a", { age_band = "adult" }, function() end)
 	responder = nil
 	assert_equal(#held, 1)
 	advance_seconds(1)
@@ -7312,7 +7313,7 @@ function extra_tests.test_later_sentinel_cancels_covered_snapshot_write()
 	next_response_body = assignment_body({
 		experiment_key = "exp-b", variant_key = "treatment-b",
 	})
-	fetch(client, "exp-b")
+	fetch(client, "exp-b", { age_band = "adult" })
 	next_response_body = nil
 	held[1](nil, nil, { status = 403,
 		response = json.encode({ error = "experiment real-subject assignment is disabled" }) })
@@ -7329,14 +7330,14 @@ function extra_tests.test_later_sentinel_cancels_covered_snapshot_write()
 		held[#held + 1] = callback
 		return true
 	end
-	client:fetch_experiment_assignment("exp-a", function() end)
+	client:fetch_experiment_assignment("exp-a", { age_band = "adult" }, function() end)
 	responder = nil
 	assert_equal(#held, 2)
 	advance_seconds(1)
 	next_response_body = assignment_body({
 		experiment_key = "exp-d", variant_key = "treatment-d",
 	})
-	fetch(client, "exp-d")
+	fetch(client, "exp-d", { age_band = "adult" })
 	next_response_body = nil
 	held[2](nil, nil, { status = 403,
 		response = json.encode({ error = "experiment real-subject assignment is disabled" }) })
@@ -7459,7 +7460,7 @@ function test_belt_denial_flip_arms_intent_not_exposure()
 	storage.reset()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout", { geo = "de" })
+	fetch(client, "exp-checkout", { geo = "de", age_band = "adult" })
 	next_status = 202
 	next_response_body = nil
 	assert_true(client:shutdown())
@@ -7618,7 +7619,7 @@ function extra_tests.test_snapshot_that_lived_through_an_ended_session_is_expose
 	local restore = install_fake_sys_storage()
 	local first = granted_client()
 	next_response_body = assignment_body()
-	fetch(first, "exp-checkout")
+	fetch(first, "exp-checkout", { age_band = "adult" })
 
 	local second = assert(sdk.new(config()))
 	assert_true(second:track("host_event"))
@@ -7645,7 +7646,7 @@ function extra_tests.test_ended_and_next_session_snapshots_stay_apart()
 	local restore = install_fake_sys_storage()
 	local first = granted_client()
 	next_response_body = assignment_body()
-	fetch(first, "exp-checkout")
+	fetch(first, "exp-checkout", { age_band = "adult" })
 
 	local second = assert(sdk.new(config({ buffer_size = 3 })))
 	assert_true(second:track("host_event"))
@@ -7655,7 +7656,7 @@ function extra_tests.test_ended_and_next_session_snapshots_stay_apart()
 	advance_seconds(1)
 	second:update(1)                                -- the lived-through exposure is owed
 	next_response_body = assignment_body({ version = 4 })
-	fetch(second, "exp-checkout")                   -- a new application, after the end
+	fetch(second, "exp-checkout", { age_band = "adult" })                   -- a new application, after the end
 	assert_equal(#queued_events(second, "experiment_exposure"), 0, "both are owed")
 
 	second.queue.items = {}
@@ -7940,6 +7941,63 @@ function extra_tests.test_age_restored_refusal_never_promoted()
 	end
 end
 
+function extra_tests.test_restored_undeclared_client_id_assignment_is_not_served()
+	-- A record written by a release that sent no age declaration holds a
+	-- client-id assignment with no age attribute. Client-id admission
+	-- requires a declaration, so that entry is neither served nor exposed
+	-- at restore; it waits for a fetch under the host's current
+	-- declaration. The adult and synthetic-subject entries in the same
+	-- record are the controls.
+	reset()
+	local restore = install_fake_sys_storage()
+	local seed = granted_client()
+	next_response_body = assignment_body({ experiment_key = "exp-undeclared" })
+	fetch(seed, "exp-undeclared", { geo = "de" })
+	next_response_body = assignment_body({ experiment_key = "exp-declared" })
+	fetch(seed, "exp-declared", { age_band = "adult" })
+	next_response_body = assignment_body({
+		experiment_key = "exp-synthetic",
+		boundary = { assignment_unit = "synthetic_subject_key" },
+	})
+	fetch(seed, "exp-synthetic")
+	next_status = 202
+	next_response_body = nil
+	assert_true(seed:shutdown())
+	storage.reset()
+
+	next_status = 200
+	local before = #assignment_requests()
+	local relaunch = assert(sdk.new(config()))
+	assert_nil(relaunch:experiment_variant("exp-undeclared"),
+		"an undeclared client-id assignment is not served after a restart")
+	assert_equal(relaunch:experiment_variant("exp-declared"), "treatment",
+		"control: a client-id assignment declared adult restores")
+	assert_equal(relaunch:experiment_variant("exp-synthetic"), "treatment",
+		"control: a synthetic-subject assignment has no age gate and restores")
+	assert_nil(relaunch.experiments.pending_exposure["exp-undeclared"],
+		"the undeclared assignment arms no exposure")
+	local armed = 0
+	for _ in pairs(relaunch.experiments.pending_exposure) do
+		armed = armed + 1
+	end
+	assert_equal(armed, 2, "only the two restored assignments arm an exposure")
+	assert_equal(#assignment_requests(), before, "the restore makes no request")
+
+	next_response_body = assignment_body({
+		experiment_key = "exp-undeclared",
+		variant_key = "decided",
+	})
+	local result = fetch(relaunch, "exp-undeclared", { age_band = "adult" })
+	assert_true(result.ok and result.assigned and result.from_cache ~= true,
+		"the next fetch is decided by the server, not by the restored entry")
+	assert_equal(query_params(last_assignment_request().url).age_band, "adult",
+		"the fetch carries the host's current declaration")
+	assert_equal(relaunch:experiment_variant("exp-undeclared"), "decided")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
 function extra_tests.test_age_module_facade()
 	reset()
 	sdk.shutdown()
@@ -8046,6 +8104,7 @@ local tests = {
 	extra_tests.test_age_attributes_keep_refusals,
 	extra_tests.test_age_restart_keeps_declarations,
 	extra_tests.test_age_restored_refusal_never_promoted,
+	extra_tests.test_restored_undeclared_client_id_assignment_is_not_served,
 	extra_tests.test_age_module_facade,
 
 	test_config_validation,
