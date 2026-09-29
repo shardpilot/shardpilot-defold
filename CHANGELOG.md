@@ -1,6 +1,6 @@
 # Changelog
 
-### Unreleased
+## v0.11.1 — 2026-09-29 — undeclared cached experiment assignments are not restored
 
 - A client-id experiment assignment cached without an age declaration, such as
   one v0.10.x persisted, is no longer restored after a restart. It serves
