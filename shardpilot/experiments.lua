@@ -894,10 +894,10 @@ end
 -- coincide. The same tuple always derives the same id, so an accidental
 -- double emission inside one session collapses server-side as a duplicate
 -- even if the assignment key was regenerated between the two; an explicit
--- re-arm bumps the counter, and a rotated session marker or re-minted
--- subject derives a distinct id. Retries of one emitted fact are idempotent
--- regardless — the id is stamped once at enqueue and the spool re-sends it
--- verbatim.
+-- re-arm bumps the counter (so does a readmission after an age withdrawal),
+-- and a rotated session marker or re-minted subject derives a distinct id.
+-- Retries of one emitted fact are idempotent regardless — the id is stamped
+-- once at enqueue and the spool re-sends it verbatim.
 function M.exposure_event_id(session_marker, subject_key, experiment_key, version, arm)
 	local text = table.concat({
 		"exposure",
@@ -997,6 +997,14 @@ function M.new(config, deps)
 		-- while that emission is still owed in the queue, and must not
 		-- consume its slot.
 		exposed = {},
+		-- Arms an age withdrawal RETIRED: session marker \31 tuple key → the
+		-- first arm none of the withdrawn facts can have used under that
+		-- marker. A readmission's automatic fact takes that arm instead of
+		-- arm 0, so it never re-derives the id of a withdrawn fact that may
+		-- still be on the wire (see apply_age_withdrawal). Survives marker
+		-- rotations: an owed snapshot keeps its own marker. Empty unless a
+		-- withdrawal ran.
+		retired_arms = {},
 		-- One marker per constructed consumer (= per SDK session): part of
 		-- the deterministic exposure id, so each session's first application
 		-- emits its own fact while duplicates within the session collapse.
@@ -2152,7 +2160,9 @@ end
 -- runs while that automatic emission is still owed in the queue takes arm 1
 -- and leaves the owed snapshot its arm 0 — the re-arm buys an EXTRA fact,
 -- never the owed one's slot — and the later sweep emits the arm 0 exactly
--- once.
+-- once. After an age withdrawal the automatic slot of the withdrawn tuple
+-- moves to its first unretired arm (`retired_arms`, keyed by the marker the
+-- emission derives its id from), and the re-arm arithmetic shifts with it.
 function Experiments:emit_entry_exposure(experiment_key, entry, rearm, snapshot)
 	local refusal = consent_refusal(self.deps.consent())
 	if refusal then
@@ -2190,7 +2200,8 @@ function Experiments:emit_entry_exposure(experiment_key, entry, rearm, snapshot)
 		self:diagnose("exposure_skipped", "no_subject_fact_key")
 		return false, "exposure_no_subject_fact_key", true
 	end
-	local arm = 0
+	local first = self.retired_arms[marker .. "\31" .. tuple] or 0
+	local arm = first
 	local next_exposed
 	if rearm then
 		if exposed then
@@ -2206,17 +2217,18 @@ function Experiments:emit_entry_exposure(experiment_key, entry, rearm, snapshot)
 			-- on top of it, never consuming the automatic slot — the
 			-- intent still materializes arm 0 and both facts emit with
 			-- distinct deterministic ids.
-			arm = 1
-			next_exposed = { arm = 1, auto = false }
+			arm = first + 1
+			next_exposed = { arm = arm, auto = false }
 		else
-			next_exposed = { arm = 0, auto = true }
+			next_exposed = { arm = first, auto = true }
 		end
 	else
-		-- The automatic emission: arm 0 by definition. Reachable with
-		-- `exposed` already set only while that arm-0 fact was owed behind
-		-- explicit re-arms — emitting it completes the auto slot without
-		-- lowering the recorded highest arm.
-		next_exposed = { arm = exposed and exposed.arm or 0, auto = true }
+		-- The automatic emission: arm 0 by definition (the first unretired
+		-- arm after an age withdrawal). Reachable with `exposed` already
+		-- set only while that fact was owed behind explicit re-arms —
+		-- emitting it completes the auto slot without lowering the
+		-- recorded highest arm.
+		next_exposed = { arm = exposed and exposed.arm or first, auto = true }
 	end
 	local event_id = M.exposure_event_id(
 		marker, entry.subject_key, experiment_key, entry.version, arm)
@@ -2675,10 +2687,14 @@ end
 --   * the subject's owed exposure snapshots and any consent-purge re-arm
 --     intent are discarded — never swept, and never captured into the spool:
 --     the kill path's drop-time capture is exactly what must not run here;
---   * the session's arm accounting for the subject's tuples resets: a
---     withdrawn fact never egressed, so a later adult re-assignment in this
---     session exposes again (a fact that did egress re-derives the same
---     deterministic id and collapses server-side as a duplicate);
+--   * the session's arm accounting for the subject's tuples resets, so a
+--     later adult readmission in this session is exposed again — under a
+--     FRESH id: every arm the tuple handed out under this session's marker
+--     is retired (`retired_arms`), and the readmission's automatic fact
+--     takes the next one. A withdrawn fact may already be on the wire, past
+--     recall; a readmission re-deriving its id would let that batch's
+--     acknowledgment (ack-based spool removal is keyed by event_id) delete
+--     the readmission's durable copy;
 --   * the client withdraws the key's facts already accepted into the
 --     analytics pipeline — memory queue, retained batch, loaded spool
 --     chunks, durable spool record (Client:withdraw_experiment_facts);
@@ -2687,7 +2703,9 @@ end
 -- experiments' owed facts are legitimate and untouched. The subject's facts
 -- are named by its server-minted fact key: the dropped entry's, the refusal
 -- body's, and that of any owed snapshot of this same subject. When none is
--- known, the experiment key alone decides. A batch already ON THE WIRE is
+-- known, no accepted fact is withdrawn: the experiment key alone would take
+-- another subject's legitimate facts with it. Owed snapshots are told apart
+-- by their own subject and need no fact key. A batch already ON THE WIRE is
 -- past recall (the consent purge's carve-out): it is neither re-sent nor
 -- counted as withdrawn.
 function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms, refused_fact_key)
@@ -2711,14 +2729,13 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 				refuse_fact_key(held.subject_fact_key)
 			end
 		end
-		-- Only a snapshot carrying ANOTHER subject's known fact key stays
-		-- owed; one without a fact key could never emit anyway.
+		-- Only the refused subject's snapshots are withdrawn, told apart by
+		-- the snapshot's OWN subject: another subject's (a re-minted
+		-- predecessor's) stay owed whether or not any fact key is known.
 		local kept = {}
 		for i = 1, #owed do
 			local held = owed[i].entry
-			local key = held and held.subject_fact_key
-			if fact_keys and type(key) == "string" and key ~= ""
-				and not fact_keys[key] then
+			if not (held and subject and held.subject_key == subject) then
 				kept[#kept + 1] = owed[i]
 			end
 		end
@@ -2728,8 +2745,11 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 	if subject then
 		local prefix = experiment_key .. "\31"
 		local suffix = "\31" .. subject
-		for tuple in pairs(self.exposed) do
+		for tuple, exposed in pairs(self.exposed) do
 			if tuple:sub(1, #prefix) == prefix and tuple:sub(-#suffix) == suffix then
+				local retired = self.session_marker .. "\31" .. tuple
+				self.retired_arms[retired] = math.max(
+					self.retired_arms[retired] or 0, exposed.arm + 1)
 				self.exposed[tuple] = nil
 			end
 		end

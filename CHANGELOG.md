@@ -10,7 +10,10 @@
   refusal itself wrote the owed exposure to the spool. A batch already being
   sent is not recalled, but is not retried or persisted either. Other
   experiments' facts are unaffected, and `kill_switch`, `targeting_unmatched`
-  and the traffic-gate miss keep delivering owed facts as before.
+  and the traffic-gate miss keep delivering owed facts as before. Queued and
+  spooled facts are matched by the player's subject fact key; when neither the
+  response nor the player's cached assignment or owed exposure carries one,
+  they are left as they are.
   ([#121](https://github.com/shardpilot/shardpilot-defold/issues/121))
 
 ## v0.11.1 — 2026-09-29 — undeclared cached experiment assignments are not restored

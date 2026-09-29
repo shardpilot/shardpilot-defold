@@ -5524,10 +5524,12 @@ function Client:purge_experiment_facts()
 end
 
 -- The facts of ONE experiment for ONE refused subject: an experiment fact
--- whose `experiment_key` prop is the refused key and — when the subject's
--- server-minted fact keys are known (`fact_keys`, a set) — whose
--- `assignment_key` prop is one of them. With no known key the experiment
--- key alone decides. Queue items and wire envelopes both carry props.
+-- whose `experiment_key` prop is the refused key and whose `assignment_key`
+-- prop is one of the subject's server-minted fact keys (`fact_keys`, a set).
+-- With no known key NOTHING matches: the experiment key alone cannot tell
+-- the refused subject's facts from another subject's (a re-minted subject's
+-- predecessor, say), and those are legitimate. Queue items and wire
+-- envelopes both carry props.
 local function refused_fact_matcher(experiment_key, fact_keys)
 	return function(event)
 		if not is_experiment_fact(event) then
@@ -5537,7 +5539,7 @@ local function refused_fact_matcher(experiment_key, fact_keys)
 		if type(props) ~= "table" or props.experiment_key ~= experiment_key then
 			return false
 		end
-		return fact_keys == nil or fact_keys[props.assignment_key] == true
+		return fact_keys ~= nil and fact_keys[props.assignment_key] == true
 	end
 end
 

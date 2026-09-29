@@ -1266,7 +1266,11 @@ not yet emitted, and every `experiment_exposure` or `experiment_outcome` for
 that experiment and player that is queued, held for a retry, or in the offline
 spool (including copies a `persist()` already wrote). None of them is sent,
 and none replays after a restart. A later `track_outcome` for the experiment
-returns `no_assignment`. Other experiments' facts are not affected. A batch
+returns `no_assignment`. Other experiments' facts are not affected. The
+player's facts are recognized by its subject fact key, taken from the response
+or from the player's own cached assignment or owed exposure; when none carries
+one, facts already queued or spooled are left as they are, since they cannot
+be told apart from another player's. A batch
 that is already being sent when the response arrives cannot be recalled: it
 is not retried if that send fails, and a `persist()` before it settles does
 not write its facts to disk. If the offline spool cannot be rewritten

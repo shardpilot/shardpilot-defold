@@ -212,7 +212,9 @@ consent rules), but it means an at-rest review must account for them.
   cache and stops its revalidation; it does not erase the separate identity
   record or override the consent-downgrade retention described above. It
   also removes that experiment's undelivered exposure and outcome facts for
-  the refused player from the offline event spool.
+  the refused player from the offline event spool, matched by the player's
+  subject fact key; when neither the response nor the player's cached
+  assignment or owed exposure carries one, they are left in place.
 - **Experiment clear marker** — not merely a timestamp: it stores a timestamp
   **and the record scope**. That scope is a derived string over the workspace
   id, environment id, the SDK-minted subject id, the remote-config base URL,
