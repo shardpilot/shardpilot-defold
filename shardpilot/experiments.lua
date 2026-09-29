@@ -273,7 +273,7 @@ end
 -- strings stay verbatim, numbers and booleans are stringified. The surviving
 -- pairs are sorted by name and capped at 64 (drop beyond the cap, in that
 -- same order — mirroring the server's sorted-key consideration).
-local function normalize_targeting_attributes(attributes)
+function M.normalize_attributes(attributes)
 	local pairs_out = {}
 	local dropped = 0
 	if type(attributes) ~= "table" then
@@ -321,7 +321,7 @@ local function age_attribute_value(value)
 	return value
 end
 
-function M.normalize_attributes(attributes)
+function M.normalize_assignment_attributes(attributes)
 	if type(attributes) ~= "table" then return {}, 0 end
 	local other, age = {}, {}
 	for name, value in pairs(attributes) do
@@ -331,7 +331,7 @@ function M.normalize_attributes(attributes)
 			other[name] = value
 		end
 	end
-	local normalized, dropped = normalize_targeting_attributes(other)
+	local normalized, dropped = M.normalize_attributes(other)
 	while #normalized > max_attributes - #age do
 		table.remove(normalized)
 		dropped = dropped + 1
@@ -360,7 +360,7 @@ local function sanitize_restored_attributes(list)
 			end
 		end
 	end
-	local normalized = M.normalize_attributes(attributes)
+	local normalized = M.normalize_assignment_attributes(attributes)
 	if #normalized == 0 then return nil end
 	return normalized
 end
@@ -2920,7 +2920,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		-- same input set, not un-targeted.
 		normalized_attributes = preset_attributes
 	elseif attributes ~= nil then
-		normalized_attributes, dropped = M.normalize_attributes(attributes)
+		normalized_attributes, dropped = M.normalize_assignment_attributes(attributes)
 		if dropped > 0 then
 			self:diagnose("dropped", "attributes")
 		end

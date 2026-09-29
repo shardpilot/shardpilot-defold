@@ -69,8 +69,8 @@ not the platform boundary.
   [Privacy & consent](#privacy--consent).
 - **Capability discovery.** `shardpilot.supports(capability)` feature-detects
   SDK abilities before `init()` — `"consent_receipt_outbox"`,
-  `"consent_state_denied_forced_minor"`, `"schema_revision_declaration"`, and
-  `"experiments_assignment"` today; unknown names return `false` on older and
+  `"consent_state_denied_forced_minor"`, `"schema_revision_declaration"`,
+  `"experiments_assignment"`, and `"experiments_age_band"` (Unreleased); unknown names return `false` on older and
   newer SDKs alike, so integrations can gate new call shapes safely.
 - Samples basic runtime signals via `update(dt)`, `observe_ping_ms(ms)`, and
   `observe_disconnect(reason)`.
@@ -1084,7 +1084,9 @@ In Mode B, `token_provider` and `api_key` are configured *together* (the
 documented exception to "exactly one" — see [Authentication](#authentication)):
 the token stays the ingest `Bearer`, the `api_key` authenticates the
 remote-config and assignment fetches. Feature-detect the surface before
-`init()` with `shardpilot.supports("experiments_assignment")`.
+`init()` with `shardpilot.supports("experiments_assignment")`. The separate
+`shardpilot.supports("experiments_age_band")` capability detects the age-band
+method; the original experiment capability does not promise that newer method.
 
 ### API
 
@@ -1093,6 +1095,10 @@ it; the published `v0.10.3` tag does not provide it.
 
 <!-- doc-region: none -- the experiments API, which the minimal example does not use -->
 ```lua
+if not shardpilot.supports("experiments_age_band") then
+  return -- Keep the control experience on an older SDK.
+end
+
 -- Fetch for a player your game has declared adult. `attributes` is optional —
 -- (experiment_key, age_band, callback) is accepted too. The synchronous return is
 -- DISPATCH status, not the answer: `true` means the request went out and the

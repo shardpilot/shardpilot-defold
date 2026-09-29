@@ -7750,6 +7750,11 @@ end
 -- Golden responses: experiment_age_eligibility_routes_test.go:36 and
 -- experiment_fact_apply_routes_test.go:219; capture/projection hashes are
 -- recorded in test/fixtures/experiment-age/contract.md.
+function extra_tests.test_age_golden_hashes()
+	local status = os.execute("python3 test/test_experiment_age_golden.py")
+	assert_true(status == 0 or status == true, "golden fixture SHA-256 must match; re-review scanner pins")
+end
+
 function extra_tests.age_golden(band)
 	local file = assert(io.open("test/fixtures/experiment-age/" .. band .. ".json", "rb"))
 	local body = file:read("*a")
@@ -7870,7 +7875,7 @@ function extra_tests.test_age_attributes_keep_refusals()
 	for _, refusal in ipairs({ "unknown", "under_threshold", "", " adult ", false, {}, string.rep(" ", 512) .. "adult" }) do
 		local attrs = { age_band = "adult", custom_attribute_age_band = refusal }
 		for i = 1, 70 do attrs["custom_attribute_a" .. string.format("%02d", i)] = "x" end
-		local pairs_out = experiments.normalize_attributes(attrs)
+		local pairs_out = experiments.normalize_assignment_attributes(attrs)
 		local out = {}
 		for _, pair in ipairs(pairs_out) do out[pair.name] = pair.value end
 		assert_equal(#pairs_out, 64)
@@ -7878,7 +7883,7 @@ function extra_tests.test_age_attributes_keep_refusals()
 		local expected = type(refusal) == "string" and #refusal <= 512 and refusal or "unknown"
 		assert_equal(out.custom_attribute_age_band, expected, "refusing alias survives without promotion")
 	end
-	local out = experiments.normalize_attributes({ age_band = "under_threshold", custom_attribute_age_band = "adult" })
+	local out = experiments.normalize_assignment_attributes({ age_band = "under_threshold", custom_attribute_age_band = "adult" })
 	assert_equal(out[1].name, "age_band")
 	assert_equal(out[1].value, "under_threshold")
 end
@@ -7957,7 +7962,80 @@ function extra_tests.test_age_module_facade()
 	sdk.shutdown()
 end
 
+function extra_tests.test_age_remote_config_keeps_targeting_rules()
+	reset()
+	local client = granted_client({ remote_config_attributes_enabled = true })
+	local cases = {
+		{ attributes = { age_band = "adult", geo = " US " }, expected = { geo = "US" } },
+		{ attributes = { custom_attribute_age_band = " adult " }, expected = { custom_attribute_age_band = "adult" } },
+		{ attributes = { custom_attribute_age_band = " " }, expected = {} },
+		{ attributes = { custom_attribute_age_band = string.rep("x", 513) }, expected = {} },
+		{ attributes = { custom_attribute_age_band = false }, expected = { custom_attribute_age_band = "false" } },
+		{ attributes = { custom_attribute_age_band = {} }, expected = {} },
+	}
+	local capped = { age_band = "adult", custom_attribute_age_band = "under_threshold" }
+	local expected = {}
+	for i = 1, 64 do
+		local key = string.format("custom_attribute_a%02d", i)
+		capped[key], expected[key] = "value", "value"
+	end
+	cases[#cases + 1] = { attributes = capped, expected = expected }
+	local failures = {}
+	for i, case in ipairs(cases) do
+		assert_true(client:set_remote_config_attributes(case.attributes))
+		next_response_body = '{"version":1,"values":{}}'
+		local before = #requests
+		assert_true(client:fetch_remote_config())
+		assert_equal(#requests, before + 1, "real remote-config dispatch ran")
+		local sent = query_params(requests[#requests].url)
+		for key, value in pairs(sent) do
+			if case.expected[key] ~= value then failures[#failures + 1] = i .. ": unexpected " .. key end
+		end
+		for key, value in pairs(case.expected) do
+			if sent[key] ~= value then failures[#failures + 1] = i .. ": missing " .. key end
+		end
+	end
+	client:shutdown()
+	assert_equal(#failures, 0, table.concat(failures, "; "))
+end
+
+function extra_tests.test_age_api_lifecycle_precedes_arguments()
+	for _, state in ipairs({ "disabled", "shutdown" }) do
+		for _, input in ipairs({ { "invalid" }, { "adult", false }, { "adult", {} } }) do
+			reset()
+			local client = assert(sdk.new(config({ experiments_enabled = state ~= "disabled" })))
+			if state == "shutdown" then client:shutdown() end
+			local expected = state == "shutdown" and "shutdown" or "experiments_not_configured"
+			local calls, result, before = 0, nil, #requests
+			local ok, err = client:fetch_experiment_assignment_with_age_band("exp-checkout", input[1], input[2],
+				function(value) calls = calls + 1; result = value end)
+			assert_equal(ok, false)
+			assert_equal(err, expected, state .. " precedes argument validation")
+			assert_equal(result.error, expected)
+			assert_equal(result.ok, false)
+			assert_equal(result.from_cache, false)
+			assert_equal(calls, 1)
+			assert_equal(#requests, before, "unavailable client never dispatched")
+			assert_equal(pcall(function()
+				client:fetch_experiment_assignment_with_age_band("exp-checkout", "invalid", function() error("host callback") end)
+			end), true, "host callback remains protected")
+			client:shutdown()
+		end
+	end
+end
+
+function extra_tests.test_age_capability_is_distinct()
+	assert_equal(sdk.supports("experiments_assignment"), true, "existing capability")
+	assert_equal(sdk.supports("experiments_future_unknown"), false, "unknown capability control")
+	assert_equal(sdk.supports("experiments_age_band"), true, "new method needs its own capability")
+	assert_equal(type(sdk.fetch_experiment_assignment_with_age_band), "function")
+end
+
 local tests = {
+	extra_tests.test_age_remote_config_keeps_targeting_rules,
+	extra_tests.test_age_api_lifecycle_precedes_arguments,
+	extra_tests.test_age_capability_is_distinct,
+	extra_tests.test_age_golden_hashes,
 	extra_tests.test_age_golden_adult_control,
 	extra_tests.test_age_golden_undeclared_refusal,
 	extra_tests.test_age_golden_unknown_refusal,

@@ -2582,6 +2582,9 @@ function Client:fetch_experiment_assignment_with_age_band(experiment_key, band, 
 	if type(attributes) == "function" and callback == nil then
 		callback, attributes = attributes, nil
 	end
+	if not self.initialized or not self.experiments then
+		return self:fetch_experiment_assignment(experiment_key, attributes, callback)
+	end
 	local declared, err = experiments_mod.attributes_with_age_band(band, attributes)
 	if not declared then
 		if type(callback) == "function" then

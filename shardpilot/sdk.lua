@@ -36,6 +36,8 @@ local capabilities = {
 	-- config field unknown to an older SDK would be silently ignored, and
 	-- the enablement preconditions live server-side.
 	experiments_assignment = true,
+	-- The declared-age fetch method is separate from the original consumer.
+	experiments_age_band = true,
 }
 
 function M.supports(capability)

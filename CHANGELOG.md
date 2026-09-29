@@ -9,6 +9,9 @@
   `under_threshold`, and `adult`; undeclared players are ineligible by default.
   Preserve age declarations through normalization, attribute limits and durable
   revalidation without promoting a non-adult or padded value to adult.
+  Detect the new method with `supports("experiments_age_band")`; unavailable
+  client lifecycle errors retain precedence. Remote-config targeting keeps
+  its existing normalization, and the privacy inventory includes persisted age.
 
 - Module `init()` defers boot diagnostic hooks until the first `update()`,
   after adopting the client. Hook-triggered shutdown/re-init stops stale delivery
