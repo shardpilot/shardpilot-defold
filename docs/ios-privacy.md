@@ -1,6 +1,6 @@
 # iOS privacy manifest integration
 
-**Unreleased:** the SDK supplies
+**New in `v0.11.0`:** the SDK supplies
 [`shardpilot/privacy/PrivacyInfo.xcprivacy`](../shardpilot/privacy/PrivacyInfo.xcprivacy)
 as a contribution to the game's privacy manifest. **Merge it explicitly into
 the game's own manifest.** A loose file in this pure-Lua library is not proof

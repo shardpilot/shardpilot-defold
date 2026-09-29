@@ -48,7 +48,7 @@ the deeper reference.
 
 ## Install
 
-Version pin (CI-checked): this skill matches shardpilot-defold `v0.10.3`.
+Version pin (CI-checked): this skill matches shardpilot-defold `v0.11.0`.
 
 This version includes request compression, a 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history; these were absent from `v0.10.1`.
 
@@ -63,10 +63,10 @@ Two supported paths:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.10.3.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.11.0.zip
 ```
 
-`v0.10.3` is the version this skill matches, and it is the same pin the
+`v0.11.0` is the version this skill matches, and it is the same pin the
 README's Installation section carries.
 
 The earlier off-main `v0.10.1` tag still declares `0.10.0`; see the [changelog](../../../CHANGELOG.md).
@@ -1192,10 +1192,10 @@ surface — no guessing from logs.
 11. **Shutdown**: `shardpilot.shutdown("app_final")` returns `true` (or
     retry it while pumping `update`; see the shutdown notes above).
 
-## Known limitations (source checked 2026-09-20 for `v0.10.3`)
+## Known limitations (release preparation 2026-09-29 for `v0.11.0`)
 
 The consent-regime host requirements and limits are recorded in the
-[v0.10.3 release notes](../../../CHANGELOG.md); preparing a policy does not
+[v0.11.0 release notes](../../../CHANGELOG.md); preparing a policy does not
 replace the application's lifecycle or consent handling.
 
 - **CI builds the library but does not run your integrated game.** CI runs

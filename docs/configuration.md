@@ -81,7 +81,7 @@ the load-time sanitizer like any other malformed entry.
 
 ### Malformed UTF-8 in new analytics
 
-**Unreleased:** new analytics event names, property/context keys and string
+**New in `v0.11.0`:** new analytics event names, property/context keys and string
 values (including nested tables and typed fields), and `app_version`/`app_build`
 replace malformed UTF-8 with U+FFFD before encoding. One invalid byte consumes
 one replacement character, matching the ingest JSON decoder: an overlong or
@@ -259,7 +259,7 @@ The public calls, verified against `shardpilot/sdk.lua`:
 - **`track_exposure(experiment_key)`** — emits one extra exposure fact for the
   live assignment (the automatic at-most-once-per-session exposure needs no
   call). "At most once per session" describes the DEDUPLICATED fact: retries
-  of the same exposure reuse its deterministic event ID. **Unreleased:**
+  of the same exposure reuse its deterministic event ID. **New in `v0.11.0`:**
   revoking consent closes the session and re-arms retained assignments for
   the next grant. When a fresh session opens, its exposure has a distinct
   deterministic ID; it is separately countable, not a duplicate of the
@@ -599,7 +599,7 @@ and `identity_changed` carry a `count`); and when a configured
 fresh-identity reset is reported as
 `{ scope = "consent", status = "dropped", code = "identity_override_changed" }`.
 
-**Unreleased — boot delivery timing:** module-level `init()` finishes construction
+**New in `v0.11.0` — boot delivery timing:** module-level `init()` finishes construction
 and adopts the client before any of its diagnostic hooks run. The first module
 `update(dt)` delivers those queued boot issues before pumping that client. Keep
 calling `update(dt)` even if there are no analytics events to publish. Boot stats
@@ -630,13 +630,13 @@ falls back to exponential backoff with jitter when no header is present —
 consent-receipt retries pace themselves the same way, on their own
 consent-plane deferral.
 
-**Unreleased:** `suppressed` counts both `suppressed_no_consent` and
+**New in `v0.11.0`:** `suppressed` counts both `suppressed_no_consent` and
 `suppressed_ad_revenue_consent`, once per returned event, accumulating across
 batches. The response's aggregate suppression count is not added again.
 Suppressed entries remain terminal and are not retried; other counters and
 the per-event diagnostics retain their existing behavior.
 
-**Unreleased:** `dropped` also counts each early validation refusal from
+**New in `v0.11.0`:** `dropped` also counts each early validation refusal from
 `track_level_start`, `track_level_complete`, `track_level_fail` and
 `track_ad_impression_revenue`, on a client or initialized singleton. These
 refusals set `last_error` to the same code returned to the caller; consent
