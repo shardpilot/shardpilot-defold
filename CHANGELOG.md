@@ -1,5 +1,18 @@
 # Changelog
 
+### Unreleased
+
+- An `age_ineligible` experiment refusal now withdraws what the refused player
+  still owes for that experiment: an exposure not yet emitted, and the
+  experiment's exposure and outcome facts that are queued, held for a retry,
+  or in the offline spool, including copies written by `persist()`. None of
+  them is sent or replays after a restart; before, they were delivered, and the
+  refusal itself wrote the owed exposure to the spool. A batch already being
+  sent is not recalled, but is not retried or persisted either. Other
+  experiments' facts are unaffected, and `kill_switch`, `targeting_unmatched`
+  and the traffic-gate miss keep delivering owed facts as before.
+  ([#121](https://github.com/shardpilot/shardpilot-defold/issues/121))
+
 ## v0.11.1 — 2026-09-29 — undeclared cached experiment assignments are not restored
 
 - A client-id experiment assignment cached without an age declaration, such as

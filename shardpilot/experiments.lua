@@ -38,10 +38,13 @@
 --     "kill_switch" (operator kill), "age_ineligible" (no eligible adult
 --     declaration). All four drop the cached assignment
 --     for the experiment; a kill additionally guarantees no exposure is
---     emitted for it. An UNKNOWN reason — like a 200 whose body names a
---     DIFFERENT experiment than the request — is treated as malformed
---     (transient serve-stale), never executed as a directive this client
---     does not understand.
+--     emitted for it. An age refusal also WITHDRAWS the subject's owed
+--     applications for the experiment — owed exposures and every fact
+--     accepted but not yet delivered — where the other three keep them
+--     (see apply_age_withdrawal). An UNKNOWN reason — like a 200 whose
+--     body names a DIFFERENT experiment than the request — is treated as
+--     malformed (transient serve-stale), never executed as a directive
+--     this client does not understand.
 --   * 401/403 — fail CLOSED: the result never serves a cached assignment,
 --     in-memory serving stops (getters return nil) and revalidation halts
 --     until re-init or a later successful, authorized fetch. The durable
@@ -782,6 +785,17 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 				return serve_entry_or_fail(entry, "malformed_response",
 					requested_attributes), { transient = true }
 			end
+			local outcome = { authoritative = true, drop_entry = true }
+			if reason == "age_ineligible" then
+				-- The one refusal that also WITHDRAWS what the subject still
+				-- owes for this experiment (install routes it to
+				-- apply_age_withdrawal instead of apply_entry_drop). The
+				-- body's subject-fact key names the refused subject's facts;
+				-- a key outside the sfk1_ grammar is simply not used.
+				outcome.withdraw_owed = true
+				outcome.refused_fact_key = valid_subject_fact_key(decoded.subject_fact_key)
+					and decoded.subject_fact_key or nil
+			end
 			return {
 				ok = true,
 				from_cache = false,
@@ -789,7 +803,7 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 				reason = reason,
 				version = type(decoded.version) == "number" and decoded.version or nil,
 				boundary = copy_value(boundary, 0),
-			}, { authoritative = true, drop_entry = true }
+			}, outcome
 		end
 		return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
 	end
@@ -2648,6 +2662,89 @@ function Experiments:apply_entry_drop(scope, experiment_key, resolved_at_ms)
 	self:sync_durable_entry(scope, experiment_key, as_of)
 end
 
+-- An authoritative `age_ineligible` refusal's WITHDRAWAL: the per-key drop
+-- PLUS the withdrawal of every application the refused subject still owes
+-- for this experiment. The server just said this subject may not take part
+-- (no eligible adult declaration), so what the subject still owes is not a
+-- fact to preserve: it is the data the platform refused. Selected by the
+-- parser's `withdraw_owed` flag; every other not-assigned reason keeps
+-- apply_entry_drop, whose owed exposures survive the drop and are captured
+-- durably. The steps:
+--   * the served entry leaves memory, so serving stops and a new
+--     track_outcome for the key is refused locally (no_assignment);
+--   * the subject's owed exposure snapshots and any consent-purge re-arm
+--     intent are discarded — never swept, and never captured into the spool:
+--     the kill path's drop-time capture is exactly what must not run here;
+--   * the session's arm accounting for the subject's tuples resets: a
+--     withdrawn fact never egressed, so a later adult re-assignment in this
+--     session exposes again (a fact that did egress re-derives the same
+--     deterministic id and collapses server-side as a duplicate);
+--   * the client withdraws the key's facts already accepted into the
+--     analytics pipeline — memory queue, retained batch, loaded spool
+--     chunks, durable spool record (Client:withdraw_experiment_facts);
+--   * the durable entry drop converges exactly as apply_entry_drop's does.
+-- SCOPE: this experiment key and this subject, never plane-wide — other
+-- experiments' owed facts are legitimate and untouched. The subject's facts
+-- are named by its server-minted fact key: the dropped entry's, the refusal
+-- body's, and that of any owed snapshot of this same subject. When none is
+-- known, the experiment key alone decides. A batch already ON THE WIRE is
+-- past recall (the consent purge's carve-out): it is neither re-sent nor
+-- counted as withdrawn.
+function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms, refused_fact_key)
+	local dropped = self.entries[experiment_key]
+	self.entries[experiment_key] = nil
+	local subject = self:current_subject_id()
+	local fact_keys = nil
+	local function refuse_fact_key(value)
+		if type(value) == "string" and value ~= "" then
+			fact_keys = fact_keys or {}
+			fact_keys[value] = true
+		end
+	end
+	refuse_fact_key(dropped and dropped.subject_fact_key)
+	refuse_fact_key(refused_fact_key)
+	local owed = self.pending_exposure[experiment_key]
+	if type(owed) == "table" then
+		for i = 1, #owed do
+			local held = owed[i].entry
+			if held and subject and held.subject_key == subject then
+				refuse_fact_key(held.subject_fact_key)
+			end
+		end
+		-- Only a snapshot carrying ANOTHER subject's known fact key stays
+		-- owed; one without a fact key could never emit anyway.
+		local kept = {}
+		for i = 1, #owed do
+			local held = owed[i].entry
+			local key = held and held.subject_fact_key
+			if fact_keys and type(key) == "string" and key ~= ""
+				and not fact_keys[key] then
+				kept[#kept + 1] = owed[i]
+			end
+		end
+		self.pending_exposure[experiment_key] = kept[1] and kept or nil
+	end
+	self.pending_rearm[experiment_key] = nil
+	if subject then
+		local prefix = experiment_key .. "\31"
+		local suffix = "\31" .. subject
+		for tuple in pairs(self.exposed) do
+			if tuple:sub(1, #prefix) == prefix and tuple:sub(-#suffix) == suffix then
+				self.exposed[tuple] = nil
+			end
+		end
+	end
+	if self.deps.withdraw_facts then
+		self.deps.withdraw_facts(experiment_key, fact_keys)
+	end
+	local as_of = type(resolved_at_ms) == "number" and resolved_at_ms or 0
+	if dropped and type(dropped.fetched_at_ms) == "number"
+		and dropped.fetched_at_ms >= as_of then
+		as_of = dropped.fetched_at_ms + 1
+	end
+	self:sync_durable_entry(scope, experiment_key, as_of)
+end
+
 -- Apply ONLY the destructive half of an authoritative server outcome —
 -- the durable withdrawal — for a response whose CONSTRUCTIVE half a gate
 -- suppressed: a stale auth epoch (a fail-closed latch raced the batch)
@@ -2677,6 +2774,13 @@ function Experiments:apply_destructive_outcome(seq, scope, experiment_key, outco
 	self.settled[fence_key] = seq
 	if outcome.drop_all then
 		self:apply_sentinel_withdrawal(scope, resolved_at_ms, dispatched_at_ms)
+		return
+	end
+	if outcome.withdraw_owed then
+		-- An age refusal withdraws the subject's owed applications on these
+		-- partitions too (a deny→re-grant race re-armed them at the grant).
+		self:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
+			outcome.refused_fact_key)
 		return
 	end
 	self:apply_entry_drop(scope, experiment_key, resolved_at_ms)
@@ -2768,6 +2872,11 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 	-- plane — the deadline simply expires on its own (clamped to a day; the
 	-- deferral setter already keeps only the LATEST deadline).
 	self.backoff_attempt = 0
+	if outcome.withdraw_owed then
+		self:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
+			outcome.refused_fact_key)
+		return
+	end
 	if outcome.drop_entry then
 		self:apply_entry_drop(scope, experiment_key, resolved_at_ms)
 		return
