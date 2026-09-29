@@ -195,12 +195,22 @@ consent rules), but it means an at-rest review must account for them.
   truncated and never reach disk, so an at-rest audit should not expect a
   deeper subtree to be present — the `version`, the `assignment_unit`, the
   fetch timestamp, and — this is the part worth reviewing — the **normalized
-  targeting attributes the assignment was evaluated under**. Those attributes
-  are whatever the host passed to `fetch_experiment_assignment`: `geo`,
+  targeting attributes and age declarations the assignment was evaluated under**.
+  These come from the host's `fetch_experiment_assignment` attributes or
+  `fetch_experiment_assignment_with_age_band` declaration and attributes: `geo`,
   `app_version`, `device_type`, `install_date`, `user_segment`, and any
-  `custom_attribute_<name>` values. **If your game passes user-specific
-  targeting values, those values are written to disk here.** The SDK neither
-  invents nor infers any of them.
+  `custom_attribute_<name>` values, including the age alias
+  `custom_attribute_age_band`, plus canonical `age_band`. The age-band method
+  inserts the host's declared `unknown`, `under_threshold`, or `adult` value;
+  the SDK does not infer a player's age. Assignment normalization preserves
+  age strings verbatim within the size bound and maps unusable age values to
+  `unknown`, so they cannot become an adult declaration. These normalized
+  values persist with a cached assignment for later revalidation.
+  **If your game passes user-specific targeting values or an age declaration,
+  those values are written to disk here.** An authoritative `age_ineligible`
+  response removes that experiment's assignment and attributes from this
+  cache and stops its revalidation; it does not erase the separate identity
+  record or override the consent-downgrade retention described above.
 - **Experiment clear marker** — not merely a timestamp: it stores a timestamp
   **and the record scope**. That scope is a derived string over the workspace
   id, environment id, the SDK-minted subject id, the remote-config base URL,

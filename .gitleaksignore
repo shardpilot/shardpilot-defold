@@ -1,0 +1,10 @@
+# Synthetic golden assignment identifiers; source: test/fixtures/experiment-age/contract.md.
+# Directory fingerprints are path:rule:line, not byte-bound; test_experiment_age_golden.py pins SHA-256.
+test/fixtures/experiment-age/adult.json:generic-api-key:1
+test/fixtures/experiment-age/undeclared.json:generic-api-key:1
+test/fixtures/experiment-age/under_threshold.json:generic-api-key:1
+test/fixtures/experiment-age/unknown.json:generic-api-key:1
+/github/workspace/test/fixtures/experiment-age/adult.json:generic-api-key:1
+/github/workspace/test/fixtures/experiment-age/undeclared.json:generic-api-key:1
+/github/workspace/test/fixtures/experiment-age/under_threshold.json:generic-api-key:1
+/github/workspace/test/fixtures/experiment-age/unknown.json:generic-api-key:1

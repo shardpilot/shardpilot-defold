@@ -2,6 +2,17 @@
 
 ### Unreleased
 
+- Treat `age_ineligible` as an authoritative experiment refusal, preserving
+  its reason and withdrawing memory/durable assignments without transient
+  retries. Unknown future reasons remain malformed.
+- Add `fetch_experiment_assignment_with_age_band` with `unknown`,
+  `under_threshold`, and `adult`; undeclared players are ineligible by default.
+  Preserve age declarations through normalization, attribute limits and durable
+  revalidation without promoting a non-adult or padded value to adult.
+  Detect the new method with `supports("experiments_age_band")`; unavailable
+  client lifecycle errors retain precedence. Remote-config targeting keeps
+  its existing normalization, and the privacy inventory includes persisted age.
+
 - Module `init()` defers boot diagnostic hooks until the first `update()`,
   after adopting the client. Hook-triggered shutdown/re-init stops stale delivery
   and pumping; standalone `new()` and runtime diagnostics retain synchronous

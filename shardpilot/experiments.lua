@@ -32,10 +32,11 @@
 --     Assignment stickiness is entirely the server's deterministic hash; the
 --     cache is a latency/offline device, never an assignment authority, and
 --     this client never re-buckets locally.
---   * 200 not-assigned — three shapes distinguished only by `reason`, a
+--   * 200 not-assigned — four shapes distinguished only by `reason`, a
 --     CLOSED vocabulary: absent (deterministic traffic-gate miss),
 --     "targeting_unmatched" (may change when attributes change),
---     "kill_switch" (operator kill). All three drop the cached assignment
+--     "kill_switch" (operator kill), "age_ineligible" (no eligible adult
+--     declaration). All four drop the cached assignment
 --     for the experiment; a kill additionally guarantees no exposure is
 --     emitted for it. An UNKNOWN reason — like a 200 whose body names a
 --     DIFFERENT experiment than the request — is treated as malformed
@@ -307,32 +308,78 @@ function M.normalize_attributes(attributes)
 	return pairs_out, dropped
 end
 
--- Re-validate a RESTORED attribute array against the SAME vocabulary and
--- bounds a live fetch enforces, before it can ever ride a revalidation: a
--- corrupt or older-build durable record must not emit reserved names
--- (experiment_key, subject_key, …), out-of-vocabulary names, or
--- empty/overlong values into the query. Anything that fails degrades to
--- ABSENCE — a safe targeting miss — never a reshaped request.
-local function sanitize_restored_attributes(list)
-	if type(list) ~= "table" then
-		return nil
+-- Age is admission input, not optional targeting. Never trim a refusal into
+-- adult, discard it in favour of an adult alias, or lose it at the cap.
+local function is_age_attribute(name)
+	return name == "age_band" or name == "custom_attribute_age_band"
+end
+
+local function age_attribute_value(value)
+	if type(value) ~= "string" or #value > max_attribute_value_bytes then
+		return "unknown"
 	end
-	local out = {}
+	return value
+end
+
+function M.normalize_assignment_attributes(attributes)
+	if type(attributes) ~= "table" then return {}, 0 end
+	local other, age = {}, {}
+	for name, value in pairs(attributes) do
+		if is_age_attribute(name) then
+			age[#age + 1] = { name = name, value = age_attribute_value(value) }
+		else
+			other[name] = value
+		end
+	end
+	local normalized, dropped = M.normalize_attributes(other)
+	while #normalized > max_attributes - #age do
+		table.remove(normalized)
+		dropped = dropped + 1
+	end
+	for _, pair in ipairs(age) do normalized[#normalized + 1] = pair end
+	table.sort(normalized, function(a, b) return a.name < b.name end)
+	return normalized, dropped
+end
+
+-- Restored declarations use the same admission rules. Corrupt duplicate age
+-- entries keep any refusal; neither an adult duplicate nor a cap erases it.
+local function sanitize_restored_attributes(list)
+	if type(list) ~= "table" then return nil end
+	local attributes = {}
 	for i = 1, #list do
 		local pair = list[i]
-		if type(pair) == "table" and valid_attribute_name(pair.name)
-			and type(pair.value) == "string" then
-			local value = trim(pair.value)
-			if value ~= "" and #value <= max_attribute_value_bytes
-				and #out < max_attributes then
-				out[#out + 1] = { name = pair.name, value = value }
+		if type(pair) == "table" then
+			if is_age_attribute(pair.name) then
+				local value = age_attribute_value(pair.value)
+				local previous = attributes[pair.name]
+				if previous == nil or previous == "adult" then
+					attributes[pair.name] = value
+				end
+			elseif valid_attribute_name(pair.name) and type(pair.value) == "string" then
+				attributes[pair.name] = pair.value
 			end
 		end
 	end
-	if #out == 0 then
-		return nil
+	local normalized = M.normalize_assignment_attributes(attributes)
+	if #normalized == 0 then return nil end
+	return normalized
+end
+
+-- This fetch-scoped declaration does not change consent or the caller's map.
+function M.attributes_with_age_band(band, attributes)
+	if band ~= "unknown" and band ~= "under_threshold" and band ~= "adult" then
+		return nil, "invalid_experiment_age_band"
 	end
-	return out
+	if attributes ~= nil and type(attributes) ~= "table" then
+		return nil, "invalid_experiment_attributes"
+	end
+	if attributes and attributes.age_band ~= nil and attributes.age_band ~= band then
+		return nil, "invalid_experiment_age_band"
+	end
+	local declared = {}
+	for name, value in pairs(attributes or {}) do declared[name] = value end
+	declared.age_band = band
+	return declared
 end
 
 -- ── response handling ─────────────────────────────────────────────────────────
@@ -698,10 +745,10 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 				return serve_entry_or_fail(entry, "malformed_response",
 					requested_attributes), { transient = true }
 			end
-			-- The three not-assigned shapes, distinguished only by `reason`,
+			-- The four not-assigned shapes, distinguished only by `reason`,
 			-- form a CLOSED vocabulary: ABSENT (deterministic traffic-gate
-			-- miss), "targeting_unmatched", "kill_switch". Each drops the
-			-- cached assignment: the server just said this subject has no
+			-- miss), "targeting_unmatched", "kill_switch", "age_ineligible".
+			-- Each drops the cached assignment: the server just said this subject has no
 			-- variant NOW, and a kill in particular must stop applying at
 			-- the next safe point and emit no exposure. Anything else a
 			-- PRESENT reason field carries — an unknown string, or a
@@ -712,7 +759,8 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 			local reason = decoded.reason
 			if (reason ~= nil and (type(reason) ~= "string"
 				or (reason ~= "kill_switch"
-					and reason ~= "targeting_unmatched")))
+					and reason ~= "targeting_unmatched"
+					and reason ~= "age_ineligible")))
 				or (reason == nil and body_field_is_null(body_scan, "reason")) then
 				-- A PRESENT-NULL reason is the presence/type split's blind
 				-- spot on null→nil decoders: present and outside the
@@ -1022,8 +1070,8 @@ function M.new(config, deps)
 					and stored_at > condemned_stamp) then
 					-- Restored attributes re-validate against the live
 					-- fetch vocabulary before any revalidation can send
-					-- them: corrupt or older-build records degrade to a
-					-- safe targeting miss, never a reshaped request.
+					-- them; malformed age declarations remain refusals,
+					-- never a missing value beside an adult alias.
 					entry.attributes = sanitize_restored_attributes(entry.attributes)
 					ex.entries[key] = entry
 					if deps.consent() == "granted" then
@@ -2872,7 +2920,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		-- same input set, not un-targeted.
 		normalized_attributes = preset_attributes
 	elseif attributes ~= nil then
-		normalized_attributes, dropped = M.normalize_attributes(attributes)
+		normalized_attributes, dropped = M.normalize_assignment_attributes(attributes)
 		if dropped > 0 then
 			self:diagnose("dropped", "attributes")
 		end

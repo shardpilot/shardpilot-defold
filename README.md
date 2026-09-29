@@ -69,8 +69,8 @@ not the platform boundary.
   [Privacy & consent](#privacy--consent).
 - **Capability discovery.** `shardpilot.supports(capability)` feature-detects
   SDK abilities before `init()` — `"consent_receipt_outbox"`,
-  `"consent_state_denied_forced_minor"`, `"schema_revision_declaration"`, and
-  `"experiments_assignment"` today; unknown names return `false` on older and
+  `"consent_state_denied_forced_minor"`, `"schema_revision_declaration"`,
+  `"experiments_assignment"`, and `"experiments_age_band"` (Unreleased); unknown names return `false` on older and
   newer SDKs alike, so integrations can gate new call shapes safely.
 - Samples basic runtime signals via `update(dt)`, `observe_ping_ms(ms)`, and
   `observe_disconnect(reason)`.
@@ -1084,21 +1084,30 @@ In Mode B, `token_provider` and `api_key` are configured *together* (the
 documented exception to "exactly one" — see [Authentication](#authentication)):
 the token stays the ingest `Bearer`, the `api_key` authenticates the
 remote-config and assignment fetches. Feature-detect the surface before
-`init()` with `shardpilot.supports("experiments_assignment")`.
+`init()` with `shardpilot.supports("experiments_assignment")`. The separate
+`shardpilot.supports("experiments_age_band")` capability detects the age-band
+method; the original experiment capability does not promise that newer method.
 
 ### API
 
+The age-band method below is **Unreleased**. Use a source revision that contains
+it; the published `v0.10.3` tag does not provide it.
+
 <!-- doc-region: none -- the experiments API, which the minimal example does not use -->
 ```lua
--- Fetch the server-evaluated assignment. `attributes` is optional —
--- (experiment_key, callback) is accepted too. The synchronous return is
+if not shardpilot.supports("experiments_age_band") then
+  return -- Keep the control experience on an older SDK.
+end
+
+-- Fetch for a player your game has declared adult. `attributes` is optional —
+-- (experiment_key, age_band, callback) is accepted too. The synchronous return is
 -- DISPATCH status, not the answer: `true` means the request went out and the
 -- result will arrive through the callback; `false, err` means the call was
 -- refused before dispatch (and the callback still reports that refusal).
 -- Read the assignment off the callback -- with one exception: shutdown()
 -- cancels the callbacks of requests still in flight, so do not park state
 -- that only a callback can release across a shutdown.
-shardpilot.fetch_experiment_assignment("menu_layout", function(result)
+shardpilot.fetch_experiment_assignment_with_age_band("menu_layout", "adult", function(result)
   -- result = { ok, from_cache, assigned?, variant_key?, variant_payload?,
   --            version?, boundary?, reason?, error? }
   -- `boundary` is a copy of the server's boundary table, passed through on a
@@ -1110,7 +1119,8 @@ shardpilot.fetch_experiment_assignment("menu_layout", function(result)
 end)
 
 -- With optional targeting attributes (server-evaluated; see below):
-shardpilot.fetch_experiment_assignment("menu_layout", { geo = "US" }, function(result) end)
+shardpilot.fetch_experiment_assignment_with_age_band("menu_layout", "adult",
+  { geo = "US" }, function(result) end)
 
 -- Cached getters: never touch the network, never fail, never re-bucket.
 -- Both return nil when there is no assignment to serve — treat nil as the
@@ -1131,6 +1141,7 @@ shardpilot.track_outcome("menu_layout", "purchase_value", 4.99)
 | Call | Returns | Failure codes you can branch on |
 |---|---|---|
 | `fetch_experiment_assignment(key, [attributes], callback)` | `true` = dispatched, or `false, err` = refused before dispatch; the assignment arrives through `callback` unless `shutdown()` cancels it first | pre-dispatch: `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `consent_unknown`, `consent_denied`, `http_unavailable`, `json_unavailable`. In the callback's `result.error`: `unauthorized`, `not_found`, `bad_request`, `malformed_response`, `stale_subject`, `superseded`, `consent_unknown`, `consent_denied`, `consent_changed`, `http_0`, `transient_408`, `transient_429`, `transient_<5xx>`, and `http_<status>` for anything unclassified |
+| `fetch_experiment_assignment_with_age_band(key, age_band, [attributes], callback)` | The same dispatch status and callback as `fetch_experiment_assignment` | The same failures, plus `invalid_experiment_age_band` for an unsupported band or conflicting canonical attribute, and `invalid_experiment_attributes` for a non-table attributes argument |
 | `experiment_variant(key)` | variant key `string`, or `nil` | — (never fails) |
 | `experiment_payload(key)` | the variant payload (a copy), or `nil` | — (never fails) |
 | `track_exposure(key)` | `ok, err` | `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `no_assignment`, `consent_unknown`, `consent_denied`, `exposure_no_subject_fact_key`, `queue_full` |
@@ -1190,8 +1201,8 @@ the id is never host-settable: there is no supported way to pin it yourself.
   document tree.
 - **Not assigned** — `ok = true, assigned = false` with a closed `reason`
   vocabulary: absent (a deterministic traffic-gate miss),
-  `"targeting_unmatched"`, or `"kill_switch"` (an operator kill). All three
-  drop the cached assignment, and a kill additionally stops any *future*
+  `"targeting_unmatched"`, `"kill_switch"` (an operator kill), or
+  `"age_ineligible"` (no eligible adult declaration). All four drop the cached assignment, and a kill additionally stops any *future*
   exposure for it. It does **not** retroactively suppress a treatment that
   already ran: an exposure still owed at kill time — the variant was applied
   but the fact had not left yet, e.g. the queue was full — is deliberately
@@ -1226,6 +1237,33 @@ the SDK is running, consent is granted, and at least one assignment is cached
 — that cadence is the SDK's share of the kill-switch reach. Stated honestly:
 **an offline client keeps its last-known-good variant indefinitely.**
 
+### Declare the player's age band
+
+`fetch_experiment_assignment_with_age_band` accepts exactly `"unknown"`,
+`"under_threshold"`, or `"adult"`. The game determines this band and is
+responsible for its declaration as the data controller. This is not age
+verification and does not grant analytics consent or override a forced-minor
+refusal. The declaration is scoped to this fetch and is sent as `age_band`.
+It is retained with a cached assignment for revalidation; the caller's
+attributes table is not changed.
+
+The legacy `fetch_experiment_assignment` remains available and supplies no age
+by default. An undeclared player is not eligible for client-id experiments.
+A server response with `reason = "age_ineligible"` returns `ok = true`,
+`assigned = false`, `from_cache = false`, and that exact `reason`. Like a
+targeting miss, it removes the memory and durable assignment and stops its
+revalidation; use the normal experience. A later explicit fetch may declare a
+new band. A truly unknown response reason remains `malformed_response`.
+
+Both `age_band` and the older `custom_attribute_age_band` attribute are
+preserved as admission inputs, including at the attribute limit. Every present
+spelling must be exactly `adult` for age eligibility: a blank, padded or
+non-adult declaration cannot be replaced by an adult alias. Oversized or
+non-string declarations become `unknown`. The new API rejects a conflicting
+`age_band` before dispatch and preserves any alias for the server to evaluate.
+Declaring adult permits evaluation; it does not promise a variant or bypass
+other eligibility and consent checks.
+
 ### Before the server enables experiments for your app
 
 Experiments must be enabled **server-side for your app** as well. Until that
@@ -1258,8 +1296,10 @@ game has to handle specially.
   `custom_attribute_<name>` where the suffix is **1–64 bytes** (measured in
   bytes, not code points — a multibyte suffix that looks short enough can
   still be over the limit, and an over-limit name is dropped silently; keep
-  custom attribute names ASCII). Values are trimmed and bounded to 512 bytes,
-  at most 64 attributes ride one fetch, and names outside the vocabulary are
+  custom attribute names ASCII). Targeting values are trimmed and bounded to
+  512 bytes. Age declarations follow the admission rules above instead of
+  trimming; their slots count toward the same 64-attribute limit. Names outside
+  the vocabulary are
   dropped client-side and never sent. Matching is **100% server-evaluated**;
   the SDK evaluates no rules.
 - **Exposure and outcome facts** ride the normal analytics pipeline (queue →

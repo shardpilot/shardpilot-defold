@@ -7747,7 +7747,307 @@ function extra_tests.test_backend_explicit_exposure_after_end_opens_no_session()
 	end
 end
 
+-- Golden responses: experiment_age_eligibility_routes_test.go:36 and
+-- experiment_fact_apply_routes_test.go:219; capture/projection hashes are
+-- recorded in test/fixtures/experiment-age/contract.md.
+function extra_tests.test_age_golden_hashes()
+	local status = os.execute("python3 test/test_experiment_age_golden.py")
+	assert_true(status == 0 or status == true, "golden fixture SHA-256 must match; re-review scanner pins")
+end
+
+function extra_tests.age_golden(band)
+	local file = assert(io.open("test/fixtures/experiment-age/" .. band .. ".json", "rb"))
+	local body = file:read("*a")
+	file:close()
+	return body
+end
+
+function extra_tests.test_age_golden_adult_control()
+	local result, outcome = experiments.apply(nil,
+		{ status = 200, response = extra_tests.age_golden("adult") }, 1000,
+		"exposure-banner", "exposure-app", "develop", {})
+	assert_true(result.ok and result.assigned)
+	assert_equal(result.variant_key, "control")
+	assert_true(outcome.authoritative)
+end
+
+function extra_tests.age_refusal(band)
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client({ app_id = "exposure-app" })
+	client:set_consent(true)
+	next_response_body = extra_tests.age_golden("adult")
+	client:fetch_experiment_assignment("exposure-banner", { age_band = "adult" })
+	assert_equal(client:experiment_variant("exposure-banner"), "control", "adult prefill ran")
+	next_response_body = extra_tests.age_golden(band)
+	local attributes = band == "undeclared" and {} or { age_band = band }
+	local result
+	client:fetch_experiment_assignment("exposure-banner", attributes, function(value) result = value end)
+	local sent = query_params(last_assignment_request().url)
+	assert_equal(sent.age_band, attributes.age_band, "wire declaration")
+	assert_true(result.ok and not result.assigned and not result.from_cache, "authoritative refusal")
+	assert_equal(result.reason, "age_ineligible", "reason remains its own verdict")
+	assert_nil(client:experiment_variant("exposure-banner"), "memory assignment withdrawn")
+	assert_nil(client:experiment_payload("exposure-banner"), "payload withdrawn")
+	local before = #assignment_requests()
+	advance_seconds(1000)
+	client:update(0)
+	assert_equal(#assignment_requests(), before, "refusal must stop revalidation")
+	client:shutdown()
+	storage.reset()
+	local restarted = assert(sdk.new(config({ app_id = "exposure-app" })))
+	restarted:set_consent(true)
+	assert_nil(restarted:experiment_variant("exposure-banner"), "durable assignment withdrawn")
+	restarted:shutdown()
+	restore()
+end
+
+function extra_tests.test_age_golden_undeclared_refusal()
+	extra_tests.age_refusal("undeclared")
+end
+function extra_tests.test_age_golden_unknown_refusal()
+	extra_tests.age_refusal("unknown")
+end
+function extra_tests.test_age_golden_under_threshold_refusal()
+	extra_tests.age_refusal("under_threshold")
+end
+
+function extra_tests.test_age_future_reason_stays_malformed()
+	reset()
+	local client = granted_client({ app_id = "exposure-app" })
+	client:set_consent(true)
+	next_response_body = extra_tests.age_golden("adult")
+	client:fetch_experiment_assignment("exposure-banner", {})
+	-- Explicitly derived negative control, not a server-captured verdict.
+	next_response_body = extra_tests.age_golden("unknown"):gsub('"age_ineligible"', '"future_age_reason"')
+	local result
+	client:fetch_experiment_assignment("exposure-banner", {}, function(value) result = value end)
+	assert_true(result.ok and result.assigned and result.from_cache)
+	assert_equal(result.error, "malformed_response")
+	assert_equal(client:experiment_variant("exposure-banner"), "control")
+	client:shutdown()
+end
+
+function extra_tests.test_age_api_contract()
+	for _, band in ipairs({ "adult", "unknown", "under_threshold" }) do
+		reset()
+		local client = granted_client({ app_id = "exposure-app" })
+		client:set_consent(true)
+		local attrs = { geo = "DE" }
+		next_response_body = extra_tests.age_golden(band)
+		local count, result = 0, nil
+		local ok = client:fetch_experiment_assignment_with_age_band("exposure-banner", band, attrs,
+			function(value) count = count + 1; result = value end)
+		assert_true(ok)
+		assert_equal(count, 1)
+		assert_equal(query_params(last_assignment_request().url).age_band, band)
+		assert_equal(attrs.geo, "DE")
+		assert_nil(attrs.age_band, "caller map unchanged")
+		assert_equal(result.assigned, band == "adult")
+		if band ~= "adult" then assert_equal(result.reason, "age_ineligible") end
+		client:shutdown()
+	end
+end
+
+function extra_tests.test_age_api_invalid_and_conflicting()
+	reset()
+	local client = granted_client()
+	for _, band in ipairs({ "minor", "ADULT", " adult ", "", false, 1, {} }) do
+		local count, result = 0, nil
+		local ok, err = client:fetch_experiment_assignment_with_age_band("exp-checkout", band,
+			function(value) count = count + 1; result = value end)
+		assert_equal(ok, false)
+		assert_equal(err, "invalid_experiment_age_band")
+		assert_equal(result.error, err)
+		assert_equal(count, 1)
+	end
+	for _, declared in ipairs({ "unknown", "under_threshold", "", " adult " }) do
+		local ok, err = client:fetch_experiment_assignment_with_age_band("exp-checkout", "adult",
+			{ age_band = declared })
+		assert_equal(ok, false)
+		assert_equal(err, "invalid_experiment_age_band")
+	end
+	assert_equal(#assignment_requests(), 0, "invalid declarations never dispatch")
+	client:shutdown()
+end
+
+function extra_tests.test_age_attributes_keep_refusals()
+	for _, refusal in ipairs({ "unknown", "under_threshold", "", " adult ", false, {}, string.rep(" ", 512) .. "adult" }) do
+		local attrs = { age_band = "adult", custom_attribute_age_band = refusal }
+		for i = 1, 70 do attrs["custom_attribute_a" .. string.format("%02d", i)] = "x" end
+		local pairs_out = experiments.normalize_assignment_attributes(attrs)
+		local out = {}
+		for _, pair in ipairs(pairs_out) do out[pair.name] = pair.value end
+		assert_equal(#pairs_out, 64)
+		assert_equal(out.age_band, "adult", "canonical band survives cap")
+		local expected = type(refusal) == "string" and #refusal <= 512 and refusal or "unknown"
+		assert_equal(out.custom_attribute_age_band, expected, "refusing alias survives without promotion")
+	end
+	local out = experiments.normalize_assignment_attributes({ age_band = "under_threshold", custom_attribute_age_band = "adult" })
+	assert_equal(out[1].name, "age_band")
+	assert_equal(out[1].value, "under_threshold")
+end
+
+function extra_tests.test_age_restart_keeps_declarations()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client({ app_id = "exposure-app" })
+	client:set_consent(true)
+	next_response_body = extra_tests.age_golden("adult")
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", { geo = "DE" })
+	client:shutdown()
+	storage.reset()
+	local restarted = assert(sdk.new(config({ app_id = "exposure-app" })))
+	restarted:set_consent(true)
+	assert_equal(restarted:experiment_variant("exposure-banner"), "control", "durable positive control")
+	restarted:update(0) -- restore arms its first cadence on the first tick
+	local before = #assignment_requests()
+	advance_seconds(1000)
+	restarted:update(0)
+	assert_equal(#assignment_requests(), before + 1, "restored cadence executed")
+	assert_equal(query_params(last_assignment_request().url).age_band, "adult", "restored declaration")
+	restarted:shutdown()
+	restore()
+end
+
+function extra_tests.test_age_restored_refusal_never_promoted()
+	for _, refusal in ipairs({ "", " adult ", string.rep("x", 513) }) do
+		reset()
+		local restore = install_fake_sys_storage()
+		local client = granted_client({ app_id = "exposure-app" })
+		client:set_consent(true)
+		next_response_body = extra_tests.age_golden("adult")
+		client:fetch_experiment_assignment("exposure-banner", { custom_attribute_age_band = "adult" })
+		client:shutdown()
+		local record = storage.load_experiments(client.config)
+		for _, entry in pairs(record.entries) do
+			entry.attributes = { { name = "age_band", value = "adult" },
+				{ name = "custom_attribute_age_band", value = refusal },
+				{ name = "custom_attribute_age_band", value = "adult" } }
+		end
+		storage.save_experiments(client.config, record)
+		storage.reset()
+		local restarted = assert(sdk.new(config({ app_id = "exposure-app" })))
+		restarted:set_consent(true)
+		restarted:update(0)
+		advance_seconds(1000)
+		restarted:update(0)
+		local sent = query_params(last_assignment_request().url)
+		assert_equal(sent.age_band, "adult")
+		assert_equal(sent.custom_attribute_age_band, #refusal <= 512 and refusal or "unknown")
+		restarted:shutdown()
+		restore()
+	end
+end
+
+function extra_tests.test_age_module_facade()
+	reset()
+	sdk.shutdown()
+	local calls, rejected = 0, nil
+	local ok, err = sdk.fetch_experiment_assignment_with_age_band("exposure-banner", "adult",
+		function(value) calls = calls + 1; rejected = value end)
+	assert_equal(ok, false)
+	assert_equal(err, "not_initialized")
+	assert_equal(rejected.error, err)
+	assert_equal(calls, 1)
+	local cfg = config({ app_id = "exposure-app" })
+	assert(sdk.init(cfg))
+	sdk.set_consent(true)
+	next_response_body = extra_tests.age_golden("adult")
+	local result
+	assert(sdk.fetch_experiment_assignment_with_age_band("exposure-banner", "adult",
+		function(value) result = value end))
+	assert_true(result.ok and result.assigned)
+	assert_equal(query_params(last_assignment_request().url).age_band, "adult")
+	sdk.shutdown()
+end
+
+function extra_tests.test_age_remote_config_keeps_targeting_rules()
+	reset()
+	local client = granted_client({ remote_config_attributes_enabled = true })
+	local cases = {
+		{ attributes = { age_band = "adult", geo = " US " }, expected = { geo = "US" } },
+		{ attributes = { custom_attribute_age_band = " adult " }, expected = { custom_attribute_age_band = "adult" } },
+		{ attributes = { custom_attribute_age_band = " " }, expected = {} },
+		{ attributes = { custom_attribute_age_band = string.rep("x", 513) }, expected = {} },
+		{ attributes = { custom_attribute_age_band = false }, expected = { custom_attribute_age_band = "false" } },
+		{ attributes = { custom_attribute_age_band = {} }, expected = {} },
+	}
+	local capped = { age_band = "adult", custom_attribute_age_band = "under_threshold" }
+	local expected = {}
+	for i = 1, 64 do
+		local key = string.format("custom_attribute_a%02d", i)
+		capped[key], expected[key] = "value", "value"
+	end
+	cases[#cases + 1] = { attributes = capped, expected = expected }
+	local failures = {}
+	for i, case in ipairs(cases) do
+		assert_true(client:set_remote_config_attributes(case.attributes))
+		next_response_body = '{"version":1,"values":{}}'
+		local before = #requests
+		assert_true(client:fetch_remote_config())
+		assert_equal(#requests, before + 1, "real remote-config dispatch ran")
+		local sent = query_params(requests[#requests].url)
+		for key, value in pairs(sent) do
+			if case.expected[key] ~= value then failures[#failures + 1] = i .. ": unexpected " .. key end
+		end
+		for key, value in pairs(case.expected) do
+			if sent[key] ~= value then failures[#failures + 1] = i .. ": missing " .. key end
+		end
+	end
+	client:shutdown()
+	assert_equal(#failures, 0, table.concat(failures, "; "))
+end
+
+function extra_tests.test_age_api_lifecycle_precedes_arguments()
+	for _, state in ipairs({ "disabled", "shutdown" }) do
+		for _, input in ipairs({ { "invalid" }, { "adult", false }, { "adult", {} } }) do
+			reset()
+			local client = assert(sdk.new(config({ experiments_enabled = state ~= "disabled" })))
+			if state == "shutdown" then client:shutdown() end
+			local expected = state == "shutdown" and "shutdown" or "experiments_not_configured"
+			local calls, result, before = 0, nil, #requests
+			local ok, err = client:fetch_experiment_assignment_with_age_band("exp-checkout", input[1], input[2],
+				function(value) calls = calls + 1; result = value end)
+			assert_equal(ok, false)
+			assert_equal(err, expected, state .. " precedes argument validation")
+			assert_equal(result.error, expected)
+			assert_equal(result.ok, false)
+			assert_equal(result.from_cache, false)
+			assert_equal(calls, 1)
+			assert_equal(#requests, before, "unavailable client never dispatched")
+			assert_equal(pcall(function()
+				client:fetch_experiment_assignment_with_age_band("exp-checkout", "invalid", function() error("host callback") end)
+			end), true, "host callback remains protected")
+			client:shutdown()
+		end
+	end
+end
+
+function extra_tests.test_age_capability_is_distinct()
+	assert_equal(sdk.supports("experiments_assignment"), true, "existing capability")
+	assert_equal(sdk.supports("experiments_future_unknown"), false, "unknown capability control")
+	assert_equal(sdk.supports("experiments_age_band"), true, "new method needs its own capability")
+	assert_equal(type(sdk.fetch_experiment_assignment_with_age_band), "function")
+end
+
 local tests = {
+	extra_tests.test_age_remote_config_keeps_targeting_rules,
+	extra_tests.test_age_api_lifecycle_precedes_arguments,
+	extra_tests.test_age_capability_is_distinct,
+	extra_tests.test_age_golden_hashes,
+	extra_tests.test_age_golden_adult_control,
+	extra_tests.test_age_golden_undeclared_refusal,
+	extra_tests.test_age_golden_unknown_refusal,
+	extra_tests.test_age_golden_under_threshold_refusal,
+	extra_tests.test_age_future_reason_stays_malformed,
+	extra_tests.test_age_api_contract,
+	extra_tests.test_age_api_invalid_and_conflicting,
+	extra_tests.test_age_attributes_keep_refusals,
+	extra_tests.test_age_restart_keeps_declarations,
+	extra_tests.test_age_restored_refusal_never_promoted,
+	extra_tests.test_age_module_facade,
+
 	test_config_validation,
 	test_flag_off_zero_paths,
 	test_fetch_happy_path_and_boundary_passthrough,
