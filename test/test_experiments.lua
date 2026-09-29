@@ -8767,6 +8767,112 @@ function extra_tests.test_age_readmission_exposure_survives_withdrawn_batch_ack(
 	storage.reset()
 end
 
+function extra_tests.test_age_readmission_kill_capture_keeps_fresh_id()
+	local client, restore = extra_tests.age_client({ buffer_size = 3 })
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	local withdrawn = queued_events(client, "experiment_exposure")[1]
+	assert_true(withdrawn ~= nil, "the admission's exposure is queued")
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+	client:flush({ include_summaries = false })
+	assert_true(held[1] ~= nil and client.publish_in_flight, "the exposure is on the wire")
+	extra_tests.refuse(client, "age_ineligible")
+
+	-- A full queue keeps the same-session readmission's exposure OWED, so
+	-- the kill captures it durably at drop time.
+	while client:track("filler-host-event") do end
+	extra_tests.admit(client)
+	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "the readmission's exposure is owed")
+	extra_tests.refuse(client, "kill_switch")
+	held[1](nil, nil, { status = 202, response = '{"accepted":1}' })
+	responder = nil
+	local captured = {}
+	for _, env in ipairs(storage.load_spool(client.config) or {}) do
+		if env.event_name == "experiment_exposure" then
+			captured[#captured + 1] = env.event_id
+		end
+	end
+	assert_equal(#captured, 1, "the old batch's acknowledgment left the drop-time capture")
+	local subject = client.experiments:current_subject_id()
+	assert_equal(captured[1], experiments.exposure_event_id(client.experiments.session_marker,
+		subject, "exposure-banner", 1, 1), "the capture carries the readmission's fresh id")
+
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local from = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	relaunch:update(0.016)
+	relaunch:flush({ include_summaries = false })
+	local exposures, _, delivered = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures, 1, "exactly one exposure of the readmission is delivered")
+	for i = 1, #delivered do
+		if delivered[i].event_name == "experiment_exposure" then
+			assert_equal(delivered[i].event_id, captured[1], "under the fresh id")
+		end
+	end
+	assert_true(captured[1] ~= withdrawn.event_id, "not the withdrawn exposure's id")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_withdraws_restored_entry_without_subject_key()
+	local first, restore = extra_tests.age_client()
+	extra_tests.admit(first)
+	-- A cached entry stored without its subject key (an older record):
+	-- sanitization keeps it, and the constructor restores it under the
+	-- record's scoped subject.
+	local record = storage.load_experiments(first.config)
+	record.entries["exposure-banner"].subject_key = nil
+	assert_true(storage.save_experiments(first.config, record))
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local owed = second.experiments.pending_exposure["exposure-banner"]
+	assert_true(owed ~= nil and #owed == 1, "the restore owes the exposure")
+	assert_nil(owed[1].entry.subject_key, "under an entry without a subject key")
+
+	extra_tests.refuse(second, "age_ineligible")
+	assert_nil(second.experiments.pending_exposure["exposure-banner"], "the refusal withdrew the restored exposure")
+	local from = #requests
+	assert_true(second:session_start())
+	second:update(0.016)
+	assert_true(second:flush({ include_summaries = false }))
+	second:update(0.016)
+	second:flush({ include_summaries = false })
+	local exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "the refused exposure is never delivered")
+	second:shutdown()
+	restore()
+	storage.reset()
+
+	-- A later admission replaced the restored entry while both exposures
+	-- are owed (full queue): the restored snapshot still carries the refused
+	-- subject's fact key.
+	first, restore = extra_tests.age_client()
+	extra_tests.admit(first)
+	record = storage.load_experiments(first.config)
+	record.entries["exposure-banner"].subject_key = nil
+	assert_true(storage.save_experiments(first.config, record))
+	storage.reset() -- SIMULATED PROCESS DEATH
+	second = assert(sdk.new(config({ app_id = "exposure-app", buffer_size = 1 })))
+	assert_true(second:track("filler-host-event"))
+	extra_tests.admit(second)
+	owed = second.experiments.pending_exposure["exposure-banner"]
+	assert_true(owed ~= nil and #owed == 2 and owed[1].entry.subject_key == nil, "both applications are owed")
+	extra_tests.refuse(second, "age_ineligible")
+	assert_nil(second.experiments.pending_exposure["exposure-banner"], "the refusal withdrew both")
+	second:shutdown()
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	extra_tests.test_age_remote_config_keeps_targeting_rules,
 	extra_tests.test_age_api_lifecycle_precedes_arguments,
@@ -8797,6 +8903,8 @@ local tests = {
 	extra_tests.test_age_withdrawn_exposure_reexposes_on_readmission,
 	extra_tests.test_age_refusal_without_known_key_spares_other_subject,
 	extra_tests.test_age_readmission_exposure_survives_withdrawn_batch_ack,
+	extra_tests.test_age_readmission_kill_capture_keeps_fresh_id,
+	extra_tests.test_age_refusal_withdraws_restored_entry_without_subject_key,
 
 	test_config_validation,
 	test_flag_off_zero_paths,

@@ -1001,9 +1001,10 @@ function M.new(config, deps)
 		-- first arm none of the withdrawn facts can have used under that
 		-- marker. A readmission's automatic fact takes that arm instead of
 		-- arm 0, so it never re-derives the id of a withdrawn fact that may
-		-- still be on the wire (see apply_age_withdrawal). Survives marker
-		-- rotations: an owed snapshot keeps its own marker. Empty unless a
-		-- withdrawal ran.
+		-- still be on the wire (see apply_age_withdrawal); a drop-time
+		-- capture of its owed snapshot derives the same arm, so the pair
+		-- keeps one id. Survives marker rotations: an owed snapshot keeps
+		-- its own marker. Empty unless a withdrawal ran.
 		retired_arms = {},
 		-- One marker per constructed consumer (= per SDK session): part of
 		-- the deterministic exposure id, so each session's first application
@@ -2655,7 +2656,7 @@ function Experiments:apply_entry_drop(scope, experiment_key, resolved_at_ms)
 					assignment_unit = held.assignment_unit,
 				}, M.exposure_event_id(snapshot.session,
 					held.subject_key, experiment_key,
-					held.version, 0), {
+					held.version, self.retired_arms[snapshot.session .. "\31" .. exposure_tuple(experiment_key, held)] or 0), {
 					session_id = snapshot.session_id,
 					anonymous_id = snapshot.anonymous_id,
 					event_ts = snapshot.event_ts,
@@ -2705,9 +2706,10 @@ end
 -- body's, and that of any owed snapshot of this same subject. When none is
 -- known, no accepted fact is withdrawn: the experiment key alone would take
 -- another subject's legitimate facts with it. Owed snapshots are told apart
--- by their own subject and need no fact key. A batch already ON THE WIRE is
--- past recall (the consent purge's carve-out): it is neither re-sent nor
--- counted as withdrawn.
+-- by their own subject and need no fact key (one restored without a subject
+-- key, by being the dropped entry or carrying a refused fact key). A batch
+-- already ON THE WIRE is past recall (the consent purge's carve-out): it is
+-- neither re-sent nor counted as withdrawn.
 function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms, refused_fact_key)
 	local dropped = self.entries[experiment_key]
 	self.entries[experiment_key] = nil
@@ -2731,11 +2733,24 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 		end
 		-- Only the refused subject's snapshots are withdrawn, told apart by
 		-- the snapshot's OWN subject: another subject's (a re-minted
-		-- predecessor's) stay owed whether or not any fact key is known.
+		-- predecessor's) stay owed whether or not any fact key is known. An
+		-- entry cached without a subject key (an older record) was restored
+		-- under the record's scoped subject: its snapshot is the refused
+		-- subject's when its entry IS the dropped one, or when it carries
+		-- one of the refused subject's server-minted fact keys.
+		local function refused(held)
+			if held == nil then
+				return false
+			end
+			if subject and held.subject_key == subject then
+				return true
+			end
+			return held.subject_key == nil and (held == dropped
+				or (fact_keys ~= nil and fact_keys[held.subject_fact_key] == true))
+		end
 		local kept = {}
 		for i = 1, #owed do
-			local held = owed[i].entry
-			if not (held and subject and held.subject_key == subject) then
+			if not refused(owed[i].entry) then
 				kept[#kept + 1] = owed[i]
 			end
 		end
