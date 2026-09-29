@@ -48,7 +48,7 @@ the deeper reference.
 
 ## Install
 
-Version pin (CI-checked): this skill matches shardpilot-defold `v0.11.0`.
+Version pin (CI-checked): this skill matches shardpilot-defold `v0.11.1`.
 
 This version includes request compression, a 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history; these were absent from `v0.10.1`.
 
@@ -63,10 +63,10 @@ Two supported paths:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.11.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.11.1.zip
 ```
 
-`v0.11.0` is the version this skill matches, and it is the same pin the
+`v0.11.1` is the version this skill matches, and it is the same pin the
 README's Installation section carries.
 
 The earlier off-main `v0.10.1` tag still declares `0.10.0`; see the [changelog](../../../CHANGELOG.md).
@@ -1192,11 +1192,13 @@ surface — no guessing from logs.
 11. **Shutdown**: `shardpilot.shutdown("app_final")` returns `true` (or
     retry it while pumping `update`; see the shutdown notes above).
 
-## Known limitations (release preparation 2026-09-29 for `v0.11.0`)
+## Known limitations (release preparation 2026-09-29 for `v0.11.1`)
 
 The consent-regime host requirements and limits are recorded in the
 [v0.11.0 release notes](../../../CHANGELOG.md); preparing a policy does not
-replace the application's lifecycle or consent handling.
+replace the application's lifecycle or consent handling. The only source
+change in `v0.11.1` is the experiment cache restore, which none of the limits
+below describes.
 
 - **CI builds the library but does not run your integrated game.** CI runs
   every `test/test_*.lua` suite under Lua 5.1, LuaJIT and host-only Lua 5.4,
