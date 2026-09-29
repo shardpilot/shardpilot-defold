@@ -1209,6 +1209,9 @@ the id is never host-settable: there is no supported way to pin it yourself.
   retained and emitted afterwards, because an application that happened is a
   fact about the past. A `experiment_exposure` arriving shortly after a kill
   is therefore expected behavior, not a client violating the kill.
+  `"age_ineligible"` is the exception: it withdraws what the refused player
+  still owes for that experiment, as described under
+  [Declare the player's age band](#declare-the-players-age-band).
 - **`401`/`403` fail closed** — the fetch reports `unauthorized`, **nothing is
   served** for that outcome, the getters go `nil`, and revalidation stops
   until re-`init()` or a later authorized fetch. The durable record is kept —
@@ -1256,6 +1259,23 @@ A server response with `reason = "age_ineligible"` returns `ok = true`,
 targeting miss, it removes the memory and durable assignment and stops its
 revalidation; use the normal experience. A later explicit fetch may declare a
 new band. A truly unknown response reason remains `malformed_response`.
+
+Unlike the other not-assigned reasons, an `age_ineligible` response also
+withdraws what the refused player still owes for that experiment: an exposure
+not yet emitted, and every `experiment_exposure` or `experiment_outcome` for
+that experiment and player that is queued, held for a retry, or in the offline
+spool (including copies a `persist()` already wrote). None of them is sent,
+and none replays after a restart. A later `track_outcome` for the experiment
+returns `no_assignment`. Other experiments' facts are not affected. The
+player's facts are recognized by its subject fact key, taken from the response
+or from the player's own cached assignment or owed exposure; when none carries
+one, facts already queued or spooled are left as they are, since they cannot
+be told apart from another player's. A batch
+that is already being sent when the response arrives cannot be recalled: it
+is not retried if that send fails, and a `persist()` before it settles does
+not write its facts to disk. If the offline spool cannot be rewritten
+(storage failing) and the app exits before a later write succeeds, the next
+launch can still send those facts.
 
 Both `age_band` and the older `custom_attribute_age_band` attribute are
 preserved as admission inputs, including at the attribute limit. Every present

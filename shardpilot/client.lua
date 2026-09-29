@@ -1049,6 +1049,11 @@ function M.new(config, defer_init_diagnostics)
 		-- retained, the settle path filters the withdrawn facts before any
 		-- retry or spool capture.
 		experiment_purge_awaited = false,
+		-- The per-experiment twin for age refusals: the fact matchers of
+		-- withdrawals that found a publish mid-flight (nil when none). The
+		-- settle path filters a RETAINED batch with them, and a pre-settle
+		-- persist/shutdown snapshot leaves their facts out.
+		experiment_withdrawals_awaited = nil,
 		-- Set while CONDEMNED experiment facts remain on the durable spool
 		-- because their removal write failed (the sentinel purge's rewrite,
 		-- or the relaunch condemnation filter): durable work still owed.
@@ -1678,6 +1683,12 @@ function M.new(config, defer_init_diagnostics)
 				-- accepted into the analytics pipeline carry those keys
 				-- verbatim and must not egress on a later flush.
 				return client:purge_experiment_facts()
+			end,
+			withdraw_facts = function(experiment_key, fact_keys)
+				-- An age refusal withdrew ONE experiment's owed
+				-- applications for the refused subject: its facts already
+				-- accepted into the analytics pipeline must not egress.
+				return client:withdraw_experiment_facts(experiment_key, fact_keys)
 			end,
 			capture_fact = function(event_name, props, event_id, overrides)
 				-- Drop-time durable capture: a durable entry delete with
@@ -5386,11 +5397,13 @@ end
 -- Remove experiment facts from a batch IN PLACE and rebuild its cached wire
 -- payload (the payload snapshots the envelopes at first attempt — a filtered
 -- batch resending the unfiltered capture would defeat the purge). Returns
--- the number removed.
-local function filter_batch_facts(batch)
+-- the number removed. `matches` narrows the removal (an age refusal's
+-- per-experiment matcher); absent, every experiment fact goes.
+local function filter_batch_facts(batch, matches)
+	matches = matches or is_experiment_fact
 	local kept = {}
 	for i = 1, #batch do
-		if not is_experiment_fact(batch[i]) then
+		if not matches(batch[i]) then
 			kept[#kept + 1] = batch[i]
 		end
 	end
@@ -5508,6 +5521,111 @@ function Client:purge_experiment_facts()
 		self.stats.dropped = self.stats.dropped + purged
 	end
 	return purged
+end
+
+-- The facts of ONE experiment for ONE refused subject: an experiment fact
+-- whose `experiment_key` prop is the refused key and whose `assignment_key`
+-- prop is one of the subject's server-minted fact keys (`fact_keys`, a set).
+-- With no known key NOTHING matches: the experiment key alone cannot tell
+-- the refused subject's facts from another subject's (a re-minted subject's
+-- predecessor, say), and those are legitimate. Queue items and wire
+-- envelopes both carry props.
+local function refused_fact_matcher(experiment_key, fact_keys)
+	return function(event)
+		if not is_experiment_fact(event) then
+			return false
+		end
+		local props = event.props
+		if type(props) ~= "table" or props.experiment_key ~= experiment_key then
+			return false
+		end
+		return fact_keys ~= nil and fact_keys[props.assignment_key] == true
+	end
+end
+
+-- True when a withdrawal still awaiting a publish's settle claims `event`.
+local function withdrawal_awaited(awaited, event)
+	if awaited then
+		for i = 1, #awaited do
+			if awaited[i](event) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- Withdraw one experiment's facts for one refused subject from every
+-- analytics pipeline surface. Invoked by the experiments consumer when an
+-- `age_ineligible` refusal lands: the subject's owed applications for that
+-- experiment are withdrawn, and facts already ACCEPTED into the pipeline
+-- are owed applications too. The purge_experiment_facts surfaces, narrowed
+-- to refused_fact_matcher: other experiments' facts and the host's events
+-- are untouched. The memory queue; the retained in-flight batch — only
+-- between attempts: a batch ON THE WIRE is past recall (the consent purge's
+-- publish-in-flight carve-out), so its facts are neither counted as
+-- withdrawn nor re-sent — a retained failure is filtered at settle and a
+-- pre-settle persist/shutdown snapshot leaves them out
+-- (experiment_withdrawals_awaited); the loaded spool chunks; and the
+-- durable spool record, converging through the settled/rewrite machinery
+-- when the store is down (the storage-down-through-exit residual family, as
+-- for the sentinel purge). Returns the number withdrawn.
+function Client:withdraw_experiment_facts(experiment_key, fact_keys)
+	local matches = refused_fact_matcher(experiment_key, fact_keys)
+	local withdrawn = queue.remove_matching(self.queue, matches)
+	if self.in_flight_batch then
+		if self.publish_in_flight then
+			local awaited = self.experiment_withdrawals_awaited or {}
+			awaited[#awaited + 1] = matches
+			self.experiment_withdrawals_awaited = awaited
+		else
+			withdrawn = withdrawn + filter_batch_facts(self.in_flight_batch, matches)
+			if #self.in_flight_batch == 0 then
+				self.in_flight_batch = nil
+				-- The emptied batch's deferral is stale (the purge's rule).
+				self.publish_retry_after_ms = nil
+				self.publish_server_retry_after_ms = nil
+				self.publish_backoff_attempt = 0
+				self.spool_retry_after_ms = nil
+			end
+		end
+	end
+	if #self.spool_batches > 0 then
+		local kept_chunks = {}
+		for i = 1, #self.spool_batches do
+			local chunk = self.spool_batches[i]
+			local kept = {}
+			for j = 1, #chunk do
+				if matches(chunk[j]) then
+					withdrawn = withdrawn + 1
+				else
+					kept[#kept + 1] = chunk[j]
+				end
+			end
+			if #kept > 0 then
+				kept_chunks[#kept_chunks + 1] = kept
+			end
+		end
+		self.spool_batches = kept_chunks
+	end
+	-- Durable spool: the durable shadows of copies counted above, or of a
+	-- drop-time capture, or of a persist() snapshot taken before the
+	-- refusal — marked settled and rewritten away, never counted again.
+	local marked = false
+	for i = 1, #self.spool_record do
+		local env = self.spool_record[i]
+		if matches(env) and type(env.event_id) == "string" then
+			self.spool_settled[env.event_id] = true
+			marked = true
+		end
+	end
+	if marked and not self:write_spool_record(self.spool_record) then
+		self.spool_rewrite_pending = true
+	end
+	if withdrawn > 0 then
+		self.stats.dropped = self.stats.dropped + withdrawn
+	end
+	return withdrawn
 end
 
 -- Durably capture ONE experiment fact straight into the spool, bypassing the
@@ -5937,8 +6055,10 @@ function Client:spool_undelivered(extra_envelopes)
 			-- a crash pre-settle would replay them at the next launch. The
 			-- QUEUE part below is deliberately unfiltered — facts there
 			-- postdate the purge (a flip-back re-exposure) and are
-			-- legitimate.
-			if not (self.experiment_purge_awaited and is_experiment_fact(env)) then
+			-- legitimate. An age refusal's withdrawal that found the batch
+			-- on the wire is held out the same way, for its facts only.
+			if not (self.experiment_purge_awaited and is_experiment_fact(env))
+				and not withdrawal_awaited(self.experiment_withdrawals_awaited, env) then
 				envelopes[#envelopes + 1] = env
 			end
 		end
@@ -6104,6 +6224,10 @@ function Client:start_publish_batch(automatic)
 		-- carve-out), a retained failure filters them below.
 		local purge_awaited = self.experiment_purge_awaited
 		self.experiment_purge_awaited = false
+		-- Likewise an age refusal's per-experiment withdrawal (its facts
+		-- only): egressed on success, filtered from a retained failure.
+		local withdrawals_awaited = self.experiment_withdrawals_awaited
+		self.experiment_withdrawals_awaited = nil
 		if ok then
 			if compressed then
 				self.compression_proven = true
@@ -6166,15 +6290,19 @@ function Client:start_publish_batch(automatic)
 		-- this FIRST so the deferral below is only set for a batch we keep.
 		local retain = (is_retryable_publish_failure(err, unauthorized, retryable, mode_b) or encoding_refused)
 			and not consent_denied_state(self.consent_state)
-		if retain and purge_awaited then
+		if retain and (purge_awaited or withdrawals_awaited) then
 			-- The failed batch is retained for retry, but a sentinel purge
-			-- ran mid-flight: the withdrawn facts must not ride the next
+			-- (or an age refusal's withdrawal, for its facts) ran
+			-- mid-flight: the withdrawn facts must not ride the next
 			-- attempt or the spool capture below. Filter them now (their
 			-- spool shadows were already marked settled by the purge); an
 			-- emptied batch has nothing left to retain, defer, or spool —
 			-- and its facts were counted dropped per-item here, so the
 			-- terminal not-retained accounting below must not run for it.
-			local removed = filter_batch_facts(events)
+			local removed = filter_batch_facts(events, function(event)
+				return (purge_awaited and is_experiment_fact(event))
+					or withdrawal_awaited(withdrawals_awaited, event)
+			end)
 			if removed > 0 then
 				self.stats.dropped = self.stats.dropped + removed
 			end

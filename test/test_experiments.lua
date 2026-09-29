@@ -8089,6 +8089,790 @@ function extra_tests.test_age_capability_is_distinct()
 	assert_equal(type(sdk.fetch_experiment_assignment_with_age_band), "function")
 end
 
+-- ── age refusal withdraws the subject's owed applications ────────────────────
+--
+-- An authoritative age_ineligible refusal for experiment K withdraws what the
+-- refused subject still owes for K: owed exposures, accepted-but-undelivered
+-- facts (queue, retained batch, loaded spool chunks, durable spool), and the
+-- durable entry an owed exposure could re-arm from. Every other not-assigned
+-- reason keeps the owed facts (the kill-switch control below). Scope is K and
+-- that subject only.
+
+-- The refused subject's server-minted fact key, as the golden fixtures carry it.
+function extra_tests.age_fact_key()
+	return json.decode(extra_tests.age_golden("adult")).subject_fact_key
+end
+
+-- The captured refusal for the admitted subject; another reason is swapped in
+-- for the controls.
+function extra_tests.refusal_body(reason)
+	local body = extra_tests.age_golden("under_threshold")
+	return (body:gsub('"age_ineligible"', '"' .. reason .. '"', 1))
+end
+
+-- Experiment facts of `experiment_key` in a list of queued events or wire
+-- envelopes, narrowed to one subject's facts when `fact_key` is given.
+function extra_tests.count_facts(list, experiment_key, fact_key)
+	list = list or {}
+	local exposures, outcomes = 0, 0
+	for i = 1, #list do
+		local props = type(list[i]) == "table" and list[i].props or nil
+		if type(props) == "table" and props.experiment_key == experiment_key
+			and (fact_key == nil or props.assignment_key == fact_key) then
+			if list[i].event_name == "experiment_exposure" then
+				exposures = exposures + 1
+			elseif list[i].event_name == "experiment_outcome" then
+				outcomes = outcomes + 1
+			end
+		end
+	end
+	return exposures, outcomes
+end
+
+-- The owed exposure snapshots an experiment still holds (0 when none).
+function extra_tests.owed_count(client, experiment_key)
+	return #(client.experiments.pending_exposure[experiment_key] or {})
+end
+
+function extra_tests.disk_facts(client, experiment_key, fact_key)
+	return extra_tests.count_facts(storage.load_spool(client.config), experiment_key, fact_key)
+end
+
+function extra_tests.chunk_facts(client, experiment_key)
+	local all = {}
+	for i = 1, #client.spool_batches do
+		for j = 1, #client.spool_batches[i] do
+			all[#all + 1] = client.spool_batches[i][j]
+		end
+	end
+	return extra_tests.count_facts(all, experiment_key)
+end
+
+-- Every envelope the events:batch requests after index `from` carried, and
+-- the experiment facts of `experiment_key` among them.
+function extra_tests.delivered_facts(from, experiment_key, fact_key)
+	local envelopes = {}
+	for i = from + 1, #requests do
+		if requests[i].url:find("/v1/events:batch", 1, true) then
+			for _, env in ipairs(json.decode(requests[i].body).events or {}) do
+				envelopes[#envelopes + 1] = env
+			end
+		end
+	end
+	local exposures, outcomes = extra_tests.count_facts(envelopes, experiment_key, fact_key)
+	return exposures, outcomes, envelopes
+end
+
+function extra_tests.has_event(envelopes, event_name)
+	for i = 1, #envelopes do
+		if envelopes[i].event_name == event_name then
+			return true
+		end
+	end
+	return false
+end
+
+function extra_tests.batch_answer(status)
+	return function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			callback(nil, nil, { status = status, response = status == 202 and '{"accepted":1}' or "{}" })
+			return true
+		end
+		return false
+	end
+end
+
+-- A client on the golden fixtures' app with durable fake storage and granted
+-- analytics consent. No assignment yet.
+function extra_tests.age_client(overrides)
+	reset()
+	local restore = install_fake_sys_storage()
+	local settings = { app_id = "exposure-app" }
+	for key, value in pairs(overrides or {}) do
+		settings[key] = value
+	end
+	local client = granted_client(settings)
+	client:set_consent(true)
+	return client, restore
+end
+
+-- The subject is admitted (adult) to `experiment_key`: the golden adult body
+-- for exposure-banner, a same-subject assignment (same fact key) otherwise.
+function extra_tests.admit(client, experiment_key)
+	experiment_key = experiment_key or "exposure-banner"
+	if experiment_key == "exposure-banner" then
+		next_response_body = extra_tests.age_golden("adult")
+	else
+		next_response_body = assignment_body({
+			app_key = "exposure-app",
+			experiment_key = experiment_key,
+			subject_fact_key = extra_tests.age_fact_key(),
+		})
+	end
+	local result
+	client:fetch_experiment_assignment_with_age_band(experiment_key, "adult", nil,
+		function(value) result = value end)
+	assert_true(result and result.ok and result.assigned, "adult admission control: " .. experiment_key)
+end
+
+function extra_tests.refuse(client, reason)
+	next_response_body = extra_tests.refusal_body(reason)
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) result = value end)
+	assert_equal(result and result.reason, reason, "authoritative refusal control")
+	return result
+end
+
+-- The owed scene: the exposure is OWED in memory (the queue was full when the
+-- treatment applied), an outcome is accepted in the queue, then the refusal
+-- lands by explicit fetch or by the automatic revalidation.
+function extra_tests.owed_scene(reason, via_revalidation)
+	local client, restore = extra_tests.age_client({ buffer_size = 1 })
+	assert_true(client:track("filler-host-event"))
+	extra_tests.admit(client)
+	assert_nil(queued_events(client, "experiment_exposure")[1], "the full queue keeps the exposure owed")
+	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "one owed exposure")
+	assert_true(client:flush({ include_summaries = false }))
+	assert_true(client:track_outcome("exposure-banner", "score", 1), "an accepted outcome")
+	if via_revalidation then
+		client:update(0) -- arms the cadence
+		next_response_body = extra_tests.refusal_body(reason)
+		local before = #assignment_requests()
+		advance_seconds(1000)
+		client:update(0.016)
+		assert_equal(#assignment_requests(), before + 1, "the revalidation dispatched")
+		assert_equal(query_params(last_assignment_request().url).age_band, "adult",
+			"the revalidation re-sent the admitted declaration")
+	else
+		extra_tests.refuse(client, reason)
+	end
+	return client, restore
+end
+
+function extra_tests.assert_owed_withdrawn(via_revalidation)
+	local path = via_revalidation and "revalidation: " or "explicit fetch: "
+	local client, restore = extra_tests.owed_scene("age_ineligible", via_revalidation)
+	assert_nil(client:experiment_variant("exposure-banner"), path .. "nothing is served")
+	assert_nil(client.experiments.pending_exposure["exposure-banner"], path .. "no owed exposure")
+	assert_nil(client.experiments.pending_rearm["exposure-banner"], path .. "no re-arm intent")
+	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, path .. "no accepted fact stays queued")
+	exposures, outcomes = extra_tests.count_facts(client.spool_record, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, path .. "the refusal spooled no copy")
+	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, path .. "the refusal wrote no durable copy")
+	local ok, err = client:track_outcome("exposure-banner", "score", 2)
+	assert_equal(ok, false, path .. "a new outcome is refused")
+	assert_equal(err, "no_assignment", path .. "refused locally")
+
+	assert_true(client:track("host-after-refusal"))
+	local from = #requests
+	local assignments = #assignment_requests()
+	client:update(0.016)
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	client:flush({ include_summaries = false })
+	advance_seconds(1000)
+	client:update(0.016)
+	client:flush({ include_summaries = false })
+	local delivered
+	exposures, outcomes, delivered = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, path .. "no fact of the refused experiment is delivered")
+	assert_true(extra_tests.has_event(delivered, "host-after-refusal"), path .. "the host's event delivers")
+	assert_equal(#assignment_requests(), assignments, path .. "the refusal stopped revalidation")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_withdraws_owed_applications()
+	extra_tests.assert_owed_withdrawn(false)
+end
+
+function extra_tests.test_age_revalidation_refusal_withdraws_owed_applications()
+	extra_tests.assert_owed_withdrawn(true)
+end
+
+function extra_tests.test_age_refusal_leaves_nothing_to_replay()
+	-- No persist: the refusal itself must write no durable copy.
+	local client, restore = extra_tests.owed_scene("age_ineligible", false)
+	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "the refusal wrote no durable copy of the owed exposure")
+	storage.reset() -- SIMULATED PROCESS DEATH: memory dies, the fake disk survives
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	assert_nil(relaunch:experiment_variant("exposure-banner"), "the withdrawal landed durably")
+	assert_nil(relaunch.experiments.pending_exposure["exposure-banner"], "nothing re-arms at relaunch")
+	assert_true(relaunch:track("host-after-relaunch"))
+	local from = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	relaunch:update(0.016)
+	relaunch:flush({ include_summaries = false })
+	local delivered
+	exposures, outcomes, delivered = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "nothing of the refused experiment replays")
+	assert_true(extra_tests.has_event(delivered, "host-after-relaunch"), "the relaunch delivers")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+
+	-- persist() BEFORE the refusal: its durable copies must not replay.
+	client, restore = extra_tests.age_client()
+	extra_tests.admit(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(client:session_start(), "a renewal owes the exposure again")
+	assert_true(client:track("host-before-persist"))
+	assert_true(client:persist())
+	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_true(exposures == 2 and outcomes == 1, "persist captured the facts durably")
+	extra_tests.refuse(client, "age_ineligible")
+	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "the refusal rewrote the persisted copies away")
+	storage.reset() -- SIMULATED PROCESS DEATH
+	relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	from = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	relaunch:update(0.016)
+	relaunch:flush({ include_summaries = false })
+	exposures, outcomes, delivered = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "copies persisted before the refusal do not replay")
+	assert_true(extra_tests.has_event(delivered, "host-before-persist"), "the host's persisted event replays")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_kill_switch_keeps_owed_applications()
+	local client, restore = extra_tests.owed_scene("kill_switch", false)
+	assert_nil(client:experiment_variant("exposure-banner"), "the kill stops serving")
+	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "the owed exposure survives the kill")
+	local _, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+	assert_equal(outcomes, 1, "the accepted outcome stays queued")
+	local exposures = extra_tests.disk_facts(client, "exposure-banner")
+	assert_equal(exposures, 1, "the drop captured the owed exposure durably")
+	local from = #requests
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	client:flush({ include_summaries = false })
+	exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures, 1, "the owed exposure is delivered after the kill")
+	assert_equal(outcomes, 1, "and so is the accepted outcome")
+	client:shutdown()
+	restore()
+	storage.reset()
+
+	client, restore = extra_tests.owed_scene("kill_switch", false)
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	assert_true(relaunch:spool_pending(), "the durable capture survived the death")
+	from = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	exposures = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures, 1, "the captured exposure replays after relaunch")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_spares_other_experiment()
+	local fact_key = extra_tests.age_fact_key()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	extra_tests.admit(client, "exposure-other")
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(client:track_outcome("exposure-other", "score", 1))
+	assert_true(client:persist())
+	-- A renewal owes both exposures again, in memory.
+	assert_true(client:session_start())
+	-- ANOTHER subject's exposure-banner application, as a subject re-mint
+	-- leaves it behind (an owed exposure and an accepted outcome under its own
+	-- fact key): not the refused subject's to withdraw.
+	client.experiments:arm_exposure("exposure-banner", {
+		version = 1, subject_key = "spcid_" .. string.rep("c", 32),
+		subject_fact_key = fixture_subject_fact_key, variant_key = "control",
+		assignment_unit = "client_id",
+	})
+	assert_true(client:enqueue_event("experiment_outcome", {
+		experiment_key = "exposure-banner", experiment_version = 1,
+		assignment_key = fixture_subject_fact_key, variant_key = "control",
+		assignment_unit = "client_id", outcome_key = "score", outcome_value = 7,
+	}, nil, { omit_user_id = true }))
+
+	extra_tests.refuse(client, "age_ineligible")
+	local owed = client.experiments.pending_exposure["exposure-banner"]
+	assert_true(owed ~= nil and #owed == 1, "the refused experiment owes only the other subject's exposure")
+	assert_equal(owed[1].entry.subject_fact_key, fixture_subject_fact_key, "which stays owed")
+	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", fact_key)
+	assert_equal(exposures + outcomes, 0, "the refused subject's facts left the queue")
+	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "and the durable spool")
+	assert_equal(client:experiment_variant("exposure-other"), "treatment", "the other experiment still serves")
+	assert_equal(extra_tests.owed_count(client, "exposure-other"), 1, "its owed exposure stays owed")
+	exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-other")
+	assert_true(exposures == 1 and outcomes == 1, "its accepted facts stay queued")
+	exposures, outcomes = extra_tests.disk_facts(client, "exposure-other")
+	assert_true(exposures == 1 and outcomes == 1, "and durably spooled")
+	_, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", fixture_subject_fact_key)
+	assert_equal(outcomes, 1, "another subject's fact for the refused experiment stays queued")
+
+	local from = #requests
+	client:update(0.016)
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	client:flush({ include_summaries = false })
+	exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner", fact_key)
+	assert_equal(exposures + outcomes, 0, "nothing of the refused subject's experiment is delivered")
+	exposures, outcomes = extra_tests.delivered_facts(from, "exposure-other")
+	assert_true(exposures == 2 and outcomes == 1, "the other experiment's owed and accepted facts are delivered")
+	exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner", fixture_subject_fact_key)
+	assert_true(exposures == 1 and outcomes == 1, "another subject's facts are delivered")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_filters_retained_batch()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	extra_tests.admit(client, "exposure-other")
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(client:track("filler-host-event"))
+	responder = extra_tests.batch_answer(503)
+	assert_true(not client:flush({ include_summaries = false }), "the 503 retains the batch")
+	responder = nil
+	assert_true(client.in_flight_batch ~= nil and not client.publish_in_flight, "retained between attempts")
+	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "the failed batch spooled durably")
+
+	extra_tests.refuse(client, "age_ineligible")
+	exposures, outcomes = extra_tests.count_facts(client.in_flight_batch, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "the retained batch lost the refused facts")
+	exposures = extra_tests.count_facts(client.in_flight_batch, "exposure-other")
+	assert_equal(exposures, 1, "and kept the other experiment's")
+	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "their durable copies are withdrawn")
+
+	responder = extra_tests.batch_answer(202)
+	advance_seconds(60)
+	local from = #requests
+	assert_true(client:flush({ include_summaries = false }))
+	responder = nil
+	local delivered
+	exposures, outcomes, delivered = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "the retry does not re-send the refused facts")
+	assert_equal((extra_tests.delivered_facts(from, "exposure-other")), 1, "it delivers the other experiment's")
+	assert_true(extra_tests.has_event(delivered, "filler-host-event"), "and the host's event")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_filters_restored_spool_chunks()
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	assert_true(first:track_outcome("exposure-banner", "score", 1))
+	assert_true(first:track("filler-host-event"))
+	responder = extra_tests.batch_answer(503)
+	assert_true(not first:flush({ include_summaries = false }))
+	responder = nil
+	storage.reset() -- SIMULATED PROCESS DEATH
+
+	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	assert_true(second:spool_pending(), "the spooled batch awaits re-send")
+	assert_equal(second:experiment_variant("exposure-banner"), "control", "the declared assignment restored")
+	local exposures, outcomes = extra_tests.chunk_facts(second, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "the loaded chunks carry the facts")
+	extra_tests.refuse(second, "age_ineligible")
+	exposures, outcomes = extra_tests.chunk_facts(second, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "the loaded chunks lost the refused facts")
+	assert_nil(second.experiments.pending_exposure["exposure-banner"], "the restore's owed exposure is withdrawn")
+
+	local from = #requests
+	assert_true(second:flush({ include_summaries = false }))
+	local delivered
+	exposures, outcomes, delivered = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "the spool re-send excludes the refused facts")
+	assert_true(extra_tests.has_event(delivered, "filler-host-event"), "and still delivers the host's event")
+	second:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_leaves_wire_batch_unrecalled()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(client:track("filler-host-event"))
+	local held = nil
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			held = callback
+			return true
+		end
+		return false
+	end
+	client:flush({ include_summaries = false })
+	responder = nil
+	assert_true(held ~= nil and client.publish_in_flight, "the batch is on the wire")
+
+	-- The refusal lands mid-flight: the attempt is wire-ambiguous. It is not
+	-- claimed as withdrawn, and it must not be re-sent.
+	local dropped = client.stats.dropped
+	extra_tests.refuse(client, "age_ineligible")
+	assert_equal(client.stats.dropped, dropped, "the wire batch's facts are not counted as withdrawn")
+	local exposures, outcomes = extra_tests.count_facts(client.in_flight_batch, "exposure-banner")
+	assert_equal(exposures + outcomes, 2, "a batch on the wire is past recall")
+	client:persist()
+	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "a pre-settle snapshot leaves the refused facts out")
+	local captured = storage.load_spool(client.config)
+	assert_true(extra_tests.has_event(captured, "filler-host-event"), "and still captures the host's event")
+
+	held(nil, nil, { status = 503, response = "{}" })
+	exposures, outcomes = extra_tests.count_facts(client.in_flight_batch, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "the retained failure drops the refused facts")
+	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "and spools none of them")
+	responder = extra_tests.batch_answer(202)
+	advance_seconds(60)
+	local from = #requests
+	assert_true(client:flush({ include_summaries = false }))
+	responder = nil
+	local delivered
+	exposures, outcomes, delivered = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "the retry does not re-send them")
+	assert_true(extra_tests.has_event(delivered, "filler-host-event"), "the host's event is retried")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_withdraws_across_consent_transition()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	local held = {}
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	local late = nil
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) late = value end)
+	responder = nil
+	assert_equal(#held, 1)
+	assert_true(client:set_consent(false))
+	assert_true(client:set_consent(true))
+	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1,
+		"the re-grant re-armed the live assignment's exposure")
+
+	-- The refusal answers across the transition: constructive half
+	-- suppressed, the withdrawal still lands.
+	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("under_threshold") })
+	assert_equal(late and late.error, "consent_changed", "the late refusal answers closed")
+	assert_nil(client:experiment_variant("exposure-banner"), "nothing is served")
+	assert_nil(client.experiments.pending_exposure["exposure-banner"], "the re-armed exposure is withdrawn")
+	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "and not captured durably")
+	assert_true(client:track("host-after-refusal"))
+	local from = #requests
+	client:update(0.016)
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	client:flush({ include_summaries = false })
+	local delivered
+	exposures, outcomes, delivered = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "no fact of the refused experiment is delivered")
+	assert_true(extra_tests.has_event(delivered, "host-after-refusal"), "the host's event delivers")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_withdraws_on_stale_epoch()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	extra_tests.admit(client, "exposure-other")
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	-- A renewal owes both exposures in memory; an ordinary latch keeps them.
+	assert_true(client:session_start())
+	local held = {}
+	responder = function(url, _, callback)
+		if not url:find("experiment_key=exposure-banner", 1, true) then
+			return false
+		end
+		held[#held + 1] = callback
+		return true
+	end
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+	responder = nil
+	assert_equal(#held, 1)
+	next_status = 401
+	next_response_body = json.encode({ error = "unauthorized" })
+	client:fetch_experiment_assignment_with_age_band("exposure-other", "adult", nil, function() end)
+	next_status = 200
+	assert_true(client.experiments.auth_blocked, "the sibling's 401 latched the plane")
+	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "the latch kept the owed exposure")
+
+	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("under_threshold") })
+	assert_nil(client.experiments.pending_exposure["exposure-banner"],
+		"the stale-epoch refusal withdrew the owed exposure")
+	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "and the accepted facts")
+	assert_equal(extra_tests.owed_count(client, "exposure-other"), 1, "the other experiment still owes")
+	local record = storage.load_experiments(client.config)
+	assert_true(record ~= nil, "the durable record is readable")
+	assert_nil(record.entries["exposure-banner"], "the refused entry is dropped durably")
+	assert_true(record.entries["exposure-other"] ~= nil, "the latch retained the other record")
+
+	local from = #requests
+	client:update(0.016)
+	assert_true(client:flush({ include_summaries = false }))
+	exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "no fact of the refused experiment is delivered")
+	assert_equal((extra_tests.delivered_facts(from, "exposure-other")), 2,
+		"the other experiment's facts are delivered")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_withdrawn_exposure_reexposes_on_readmission()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	assert_equal((extra_tests.count_facts(client.queue.items, "exposure-banner")), 1, "the exposure is queued")
+	extra_tests.refuse(client, "age_ineligible")
+	assert_equal((extra_tests.count_facts(client.queue.items, "exposure-banner")), 0, "and withdrawn")
+	-- The withdrawn exposure never egressed: a later adult admission in the
+	-- same session is exposed again.
+	extra_tests.admit(client)
+	assert_equal((extra_tests.count_facts(client.queue.items, "exposure-banner")), 1,
+		"the readmission is exposed again")
+	local from = #requests
+	assert_true(client:flush({ include_summaries = false }))
+	assert_equal((extra_tests.delivered_facts(from, "exposure-banner")), 1, "and delivered")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_without_known_key_spares_other_subject()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	-- ANOTHER subject's exposure-banner applications, as a subject re-mint
+	-- leaves them behind: an accepted exposure and outcome, persisted, and an
+	-- owed exposure, all under that subject's own fact key.
+	local other = {
+		version = 1, subject_key = "spcid_" .. string.rep("c", 32),
+		subject_fact_key = fixture_subject_fact_key, variant_key = "control",
+		assignment_unit = "client_id",
+	}
+	local props = {
+		experiment_key = "exposure-banner", experiment_version = 1,
+		assignment_key = fixture_subject_fact_key, variant_key = "control",
+		assignment_unit = "client_id",
+	}
+	assert_true(client:enqueue_event("experiment_exposure", props, nil, { omit_user_id = true }))
+	props.outcome_key, props.outcome_value = "score", 7
+	assert_true(client:enqueue_event("experiment_outcome", props, nil, { omit_user_id = true }))
+	assert_true(client:persist())
+	client.experiments:arm_exposure("exposure-banner", other)
+	-- The refused subject holds no assignment of the experiment and owes
+	-- nothing for it, and the refusal names no fact key: none is known.
+	assert_nil(client.experiments.entries["exposure-banner"], "no local assignment supplies a key")
+	next_response_body = (extra_tests.refusal_body("age_ineligible")
+		:gsub('"subject_fact_key":"[^"]*",', "", 1))
+	assert_true(not next_response_body:find('"subject_fact_key"', 1, true), "the refusal names no fact key")
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) result = value end)
+	assert_equal(result and result.reason, "age_ineligible", "authoritative refusal control")
+
+	local owed = client.experiments.pending_exposure["exposure-banner"]
+	assert_true(owed ~= nil and #owed == 1, "the other subject's owed exposure stays owed")
+	assert_equal(owed[1].entry.subject_key, other.subject_key, "under its own subject")
+	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "the other subject's accepted facts stay queued")
+	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "and durably spooled")
+
+	local from = #requests
+	client:update(0.016)
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	client:flush({ include_summaries = false })
+	exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner", fixture_subject_fact_key)
+	assert_true(exposures == 2 and outcomes == 1, "the other subject's owed and accepted facts are delivered")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_readmission_exposure_survives_withdrawn_batch_ack()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	local withdrawn = queued_events(client, "experiment_exposure")[1]
+	assert_true(withdrawn ~= nil, "the admission's exposure is queued")
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+	client:flush({ include_summaries = false })
+	assert_true(held[1] ~= nil and client.publish_in_flight, "the exposure is on the wire")
+	extra_tests.refuse(client, "age_ineligible")
+
+	-- A same-session, same-version readmission is exposed again, persisted
+	-- while the withdrawn exposure's batch is still unsettled.
+	extra_tests.admit(client)
+	local readmitted = queued_events(client, "experiment_exposure")[1]
+	assert_true(readmitted ~= nil, "the readmission is exposed again")
+	assert_true(client:persist(), "persist() captured the readmission durably")
+	held[1](nil, nil, { status = 202, response = '{"accepted":1}' })
+	responder = nil
+	local durable = false
+	for _, env in ipairs(storage.load_spool(client.config) or {}) do
+		durable = durable or env.event_id == readmitted.event_id
+	end
+	assert_true(durable, "the old batch's acknowledgment left the readmission's durable copy")
+
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local from = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	relaunch:update(0.016)
+	relaunch:flush({ include_summaries = false })
+	local _, _, delivered = extra_tests.delivered_facts(from, "exposure-banner")
+	local replayed = false
+	for i = 1, #delivered do
+		replayed = replayed or delivered[i].event_id == readmitted.event_id
+	end
+	assert_true(replayed, "the readmission's exposure is delivered after relaunch")
+	assert_true(readmitted.event_id ~= withdrawn.event_id, "under an id the withdrawn exposure did not use")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_readmission_kill_capture_keeps_fresh_id()
+	local client, restore = extra_tests.age_client({ buffer_size = 3 })
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	local withdrawn = queued_events(client, "experiment_exposure")[1]
+	assert_true(withdrawn ~= nil, "the admission's exposure is queued")
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+	client:flush({ include_summaries = false })
+	assert_true(held[1] ~= nil and client.publish_in_flight, "the exposure is on the wire")
+	extra_tests.refuse(client, "age_ineligible")
+
+	-- A full queue keeps the same-session readmission's exposure OWED, so
+	-- the kill captures it durably at drop time.
+	while client:track("filler-host-event") do end
+	extra_tests.admit(client)
+	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "the readmission's exposure is owed")
+	extra_tests.refuse(client, "kill_switch")
+	held[1](nil, nil, { status = 202, response = '{"accepted":1}' })
+	responder = nil
+	local captured = {}
+	for _, env in ipairs(storage.load_spool(client.config) or {}) do
+		if env.event_name == "experiment_exposure" then
+			captured[#captured + 1] = env.event_id
+		end
+	end
+	assert_equal(#captured, 1, "the old batch's acknowledgment left the drop-time capture")
+	local subject = client.experiments:current_subject_id()
+	assert_equal(captured[1], experiments.exposure_event_id(client.experiments.session_marker,
+		subject, "exposure-banner", 1, 1), "the capture carries the readmission's fresh id")
+
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local from = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	relaunch:update(0.016)
+	relaunch:flush({ include_summaries = false })
+	local exposures, _, delivered = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures, 1, "exactly one exposure of the readmission is delivered")
+	for i = 1, #delivered do
+		if delivered[i].event_name == "experiment_exposure" then
+			assert_equal(delivered[i].event_id, captured[1], "under the fresh id")
+		end
+	end
+	assert_true(captured[1] ~= withdrawn.event_id, "not the withdrawn exposure's id")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_withdraws_restored_entry_without_subject_key()
+	local first, restore = extra_tests.age_client()
+	extra_tests.admit(first)
+	-- A cached entry stored without its subject key (an older record):
+	-- sanitization keeps it, and the constructor restores it under the
+	-- record's scoped subject.
+	local record = storage.load_experiments(first.config)
+	record.entries["exposure-banner"].subject_key = nil
+	assert_true(storage.save_experiments(first.config, record))
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local owed = second.experiments.pending_exposure["exposure-banner"]
+	assert_true(owed ~= nil and #owed == 1, "the restore owes the exposure")
+	assert_nil(owed[1].entry.subject_key, "under an entry without a subject key")
+
+	extra_tests.refuse(second, "age_ineligible")
+	assert_nil(second.experiments.pending_exposure["exposure-banner"], "the refusal withdrew the restored exposure")
+	local from = #requests
+	assert_true(second:session_start())
+	second:update(0.016)
+	assert_true(second:flush({ include_summaries = false }))
+	second:update(0.016)
+	second:flush({ include_summaries = false })
+	local exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "the refused exposure is never delivered")
+	second:shutdown()
+	restore()
+	storage.reset()
+
+	-- A later admission replaced the restored entry while both exposures
+	-- are owed (full queue): the restored snapshot still carries the refused
+	-- subject's fact key.
+	first, restore = extra_tests.age_client()
+	extra_tests.admit(first)
+	record = storage.load_experiments(first.config)
+	record.entries["exposure-banner"].subject_key = nil
+	assert_true(storage.save_experiments(first.config, record))
+	storage.reset() -- SIMULATED PROCESS DEATH
+	second = assert(sdk.new(config({ app_id = "exposure-app", buffer_size = 1 })))
+	assert_true(second:track("filler-host-event"))
+	extra_tests.admit(second)
+	owed = second.experiments.pending_exposure["exposure-banner"]
+	assert_true(owed ~= nil and #owed == 2 and owed[1].entry.subject_key == nil, "both applications are owed")
+	extra_tests.refuse(second, "age_ineligible")
+	assert_nil(second.experiments.pending_exposure["exposure-banner"], "the refusal withdrew both")
+	second:shutdown()
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	extra_tests.test_age_remote_config_keeps_targeting_rules,
 	extra_tests.test_age_api_lifecycle_precedes_arguments,
@@ -8106,6 +8890,21 @@ local tests = {
 	extra_tests.test_age_restored_refusal_never_promoted,
 	extra_tests.test_restored_undeclared_client_id_assignment_is_not_served,
 	extra_tests.test_age_module_facade,
+	extra_tests.test_age_refusal_withdraws_owed_applications,
+	extra_tests.test_age_revalidation_refusal_withdraws_owed_applications,
+	extra_tests.test_age_refusal_leaves_nothing_to_replay,
+	extra_tests.test_kill_switch_keeps_owed_applications,
+	extra_tests.test_age_refusal_spares_other_experiment,
+	extra_tests.test_age_refusal_filters_retained_batch,
+	extra_tests.test_age_refusal_filters_restored_spool_chunks,
+	extra_tests.test_age_refusal_leaves_wire_batch_unrecalled,
+	extra_tests.test_age_refusal_withdraws_across_consent_transition,
+	extra_tests.test_age_refusal_withdraws_on_stale_epoch,
+	extra_tests.test_age_withdrawn_exposure_reexposes_on_readmission,
+	extra_tests.test_age_refusal_without_known_key_spares_other_subject,
+	extra_tests.test_age_readmission_exposure_survives_withdrawn_batch_ack,
+	extra_tests.test_age_readmission_kill_capture_keeps_fresh_id,
+	extra_tests.test_age_refusal_withdraws_restored_entry_without_subject_key,
 
 	test_config_validation,
 	test_flag_off_zero_paths,
