@@ -314,6 +314,19 @@ local function is_age_attribute(name)
 	return name == "age_band" or name == "custom_attribute_age_band"
 end
 
+-- Whether a stored attribute list carries an age declaration under either
+-- spelling, whatever its value: the server decided admission on it.
+local function has_age_declaration(list)
+	if type(list) ~= "table" then return false end
+	for i = 1, #list do
+		local pair = list[i]
+		if type(pair) == "table" and is_age_attribute(pair.name) then
+			return true
+		end
+	end
+	return false
+end
+
 local function age_attribute_value(value)
 	if type(value) ~= "string" or #value > max_attribute_value_bytes then
 		return "unknown"
@@ -1066,8 +1079,18 @@ function M.new(config, deps)
 			for key, entry in pairs(record.entries) do
 				local stored_at = type(entry.fetched_at_ms) == "number"
 					and entry.fetched_at_ms or 0
-				if not record_condemned or (type(condemned_stamp) == "number"
-					and stored_at > condemned_stamp) then
+				-- A client-id assignment stored without an age declaration
+				-- (a release that had none, or a fetch that declared none)
+				-- is neither served nor exposed: client-id admission
+				-- requires a declaration. The next fetch, carrying the
+				-- host's current declaration, decides the experiment and
+				-- replaces this durable entry. Synthetic-subject
+				-- assignments have no age gate and restore.
+				local undeclared = entry.assignment_unit == "client_id"
+					and not has_age_declaration(entry.attributes)
+				if not undeclared and (not record_condemned
+					or (type(condemned_stamp) == "number"
+						and stored_at > condemned_stamp)) then
 					-- Restored attributes re-validate against the live
 					-- fetch vocabulary before any revalidation can send
 					-- them; malformed age declarations remain refusals,

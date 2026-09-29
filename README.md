@@ -1246,7 +1246,9 @@ responsible for its declaration as the data controller. This is not age
 verification and does not grant analytics consent or override a forced-minor
 refusal. The declaration is scoped to this fetch and is sent as `age_band`.
 It is retained with a cached assignment for revalidation; the caller's
-attributes table is not changed.
+attributes table is not changed. A client-id assignment cached without any age
+declaration (such as one v0.10.x stored) is not restored after a restart: it
+serves nothing until the next fetch decides it.
 
 The legacy `fetch_experiment_assignment` remains available and supplies no age
 by default. An undeclared player is not eligible for client-id experiments.
