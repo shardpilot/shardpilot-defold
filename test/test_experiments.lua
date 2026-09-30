@@ -8138,14 +8138,14 @@ function extra_tests.disk_facts(client, experiment_key, fact_key)
 	return extra_tests.count_facts(storage.load_spool(client.config), experiment_key, fact_key)
 end
 
-function extra_tests.chunk_facts(client, experiment_key)
+function extra_tests.chunk_facts(client, experiment_key, fact_key)
 	local all = {}
 	for i = 1, #client.spool_batches do
 		for j = 1, #client.spool_batches[i] do
 			all[#all + 1] = client.spool_batches[i][j]
 		end
 	end
-	return extra_tests.count_facts(all, experiment_key)
+	return extra_tests.count_facts(all, experiment_key, fact_key)
 end
 
 -- Every envelope the events:batch requests after index `from` carried, and
@@ -8873,6 +8873,460 @@ function extra_tests.test_age_refusal_withdraws_restored_entry_without_subject_k
 	storage.reset()
 end
 
+-- ── the fact-key history ─────────────────────────────────────────────────────
+--
+-- The server rotates the subject-fact key on every published version, and a
+-- drop deletes the entry: facts built under an earlier entry's key (queued,
+-- spooled, captured at a kill) must still be withdrawn by a later age
+-- refusal. The consumer keeps, per experiment and subject, the retired keys
+-- a live fact still carries — in memory and in the durable record's
+-- `fact_key_history` section (shardpilot/shardpilot-go#138).
+
+-- The republished version's key for the same subject (synthetic).
+extra_tests.republished_fact_key = "sfk1_" .. string.rep("d", 64)
+
+-- The subject is admitted to version 2 of exposure-banner: the server
+-- republished the experiment and rotated the subject's fact key.
+function extra_tests.admit_republished(client)
+	next_response_body = extra_tests.age_golden("adult")
+		:gsub('"version":1,', '"version":2,', 1)
+		:gsub(extra_tests.age_fact_key(), extra_tests.republished_fact_key, 1)
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) result = value end)
+	assert_true(result and result.ok and result.assigned and result.version == 2,
+		"republished admission control")
+end
+
+-- The age refusal of `version`, echoing `fact_key`, or no fact key at all
+-- when `fact_key` is false.
+function extra_tests.refuse_with(client, version, fact_key)
+	local body = extra_tests.refusal_body("age_ineligible")
+		:gsub('"version":1,', '"version":' .. version .. ',', 1)
+	if fact_key then
+		body = body:gsub(extra_tests.age_fact_key(), fact_key, 1)
+	else
+		body = body:gsub('"subject_fact_key":"[^"]*",', "", 1)
+		assert_true(not body:find('"subject_fact_key"', 1, true), "the refusal names no fact key")
+	end
+	next_response_body = body
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) result = value end)
+	assert_equal(result and result.reason, "age_ineligible", "authoritative refusal control")
+end
+
+-- The history's keys for `experiment_key`, sorted and joined ("" for none):
+-- memory's, and the durable record's as the next launch reads it.
+function extra_tests.memory_history(client, experiment_key)
+	local keys = {}
+	for key in pairs((client.experiments.fact_key_history or {})[experiment_key] or {}) do
+		keys[#keys + 1] = key
+	end
+	table.sort(keys)
+	return table.concat(keys, ",")
+end
+
+function extra_tests.disk_history(client, experiment_key)
+	local record = storage.load_experiments(client.config)
+	local history = record and record.fact_key_history or {}
+	return table.concat(history[experiment_key] or {}, ",")
+end
+
+-- A joined key list with the scenes' two keys spelled A and B, for output.
+function extra_tests.named_keys(text)
+	return (text:gsub(extra_tests.age_fact_key(), "A"):gsub(extra_tests.republished_fact_key, "B"))
+end
+
+-- Exposures plus outcomes of `experiment_key` under `fact_key` delivered in
+-- the events:batch requests after index `from`.
+function extra_tests.delivered_count(from, experiment_key, fact_key)
+	local exposures, outcomes = extra_tests.delivered_facts(from, experiment_key, fact_key)
+	return exposures + outcomes
+end
+
+-- Flush everything deliverable (a host event first, as the control).
+function extra_tests.deliver_all(client)
+	assert_true(client:track("host-after-refusal"))
+	local from = #requests
+	client:update(0.016)
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0.016)
+	client:flush({ include_summaries = false })
+	local _, _, delivered = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_true(extra_tests.has_event(delivered, "host-after-refusal"), "the host's event delivers")
+	return from
+end
+
+function extra_tests.test_age_refusal_withdraws_republished_facts_in_process()
+	local key_a, key_b = extra_tests.age_fact_key(), extra_tests.republished_fact_key
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(client:persist())
+	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner", key_a)
+	assert_true(exposures == 1 and outcomes == 1, "version 1's facts are spooled under A")
+	extra_tests.admit_republished(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 2))
+	exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", key_b)
+	assert_true(exposures == 1 and outcomes == 1, "version 2's facts are queued under B")
+
+	extra_tests.refuse_with(client, 2, key_b)
+	local from = extra_tests.deliver_all(client)
+	local a = extra_tests.delivered_count(from, "exposure-banner", key_a)
+	local b = extra_tests.delivered_count(from, "exposure-banner", key_b)
+	print(("fact-key history republish scene, same process: delivered by key: A=%d B=%d"):format(a, b))
+	assert_equal(a, 0, "no fact under the republished-away key A is delivered")
+	assert_equal(b, 0, "no fact under the echoed key B is delivered")
+	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "no fact under A or B stays spooled")
+	assert_equal(extra_tests.memory_history(client, "exposure-banner"), "",
+		"the withdrawn facts' keys left the history")
+	assert_equal(extra_tests.disk_history(client, "exposure-banner"), "", "durably")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_withdraws_republished_facts_after_relaunch()
+	local key_a, key_b = extra_tests.age_fact_key(), extra_tests.republished_fact_key
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	assert_true(first:track_outcome("exposure-banner", "score", 1))
+	assert_true(first:persist())
+	storage.reset() -- SIMULATED PROCESS DEATH: version 1's facts are spooled under A
+
+	-- The republish lands on a launch that RESTORED version 1's entry: only
+	-- the durable record knew A when version 2 replaced it.
+	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	assert_equal(second:experiment_variant("exposure-banner"), "control", "version 1's entry restored")
+	assert_true(second:session_start())
+	extra_tests.admit_republished(second)
+	assert_true(second:track_outcome("exposure-banner", "score", 2))
+	second:persist()
+	storage.reset() -- SIMULATED PROCESS DEATH: A's and B's facts are spooled
+
+	local third = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local exposures, outcomes = extra_tests.chunk_facts(third, "exposure-banner", key_a)
+	assert_true(exposures >= 1 and outcomes == 1, "the relaunch restored facts under A")
+	exposures, outcomes = extra_tests.chunk_facts(third, "exposure-banner", key_b)
+	assert_true(exposures == 1 and outcomes == 1, "and under B")
+	extra_tests.refuse_with(third, 2, key_b)
+	local from = extra_tests.deliver_all(third)
+	local a = extra_tests.delivered_count(from, "exposure-banner", key_a)
+	local b = extra_tests.delivered_count(from, "exposure-banner", key_b)
+	print(("fact-key history republish scene, after relaunch: delivered by key: A=%d B=%d"):format(a, b))
+	assert_equal(a, 0, "no restored fact under A is delivered")
+	assert_equal(b, 0, "no restored fact under B is delivered")
+	assert_equal(extra_tests.disk_history(third, "exposure-banner"), "", "the withdrawn keys left the record")
+	third:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_fact_key_history_prunes_after_the_last_fact()
+	local key_a = extra_tests.age_fact_key()
+	for _, fate in ipairs({ "delivered", "dropped", "purged" }) do
+		local client, restore = extra_tests.age_client()
+		assert_true(client:session_start())
+		extra_tests.admit(client)
+		assert_true(client:track_outcome("exposure-banner", "score", 1))
+		assert_true(client:persist())
+		extra_tests.admit_republished(client)
+		assert_equal(extra_tests.memory_history(client, "exposure-banner"), key_a,
+			fate .. ": the republish retired A while its facts are live")
+		assert_equal(extra_tests.disk_history(client, "exposure-banner"), key_a,
+			fate .. ": in the same durable write")
+		local from = #requests
+		if fate == "dropped" then
+			-- A terminal rejection drops the batch, A's last facts with it.
+			responder = extra_tests.batch_answer(400)
+			assert_true(not client:flush({ include_summaries = false }), "the 400 drops the batch")
+			responder = nil
+			assert_nil(client.in_flight_batch, "nothing is retained")
+		elseif fate == "purged" then
+			-- A consent denial purges the queue and the spool; the next tick
+			-- prunes.
+			assert_true(client:set_consent(false))
+			client:update(0.016)
+		else
+			assert_true(client:flush({ include_summaries = false }))
+			assert_equal(extra_tests.delivered_count(from, "exposure-banner", key_a), 2,
+				"A's last facts are delivered")
+		end
+		local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner", key_a)
+		assert_equal(exposures + outcomes, 0, fate .. ": no fact under A is left")
+		local memory = extra_tests.memory_history(client, "exposure-banner")
+		local disk = extra_tests.disk_history(client, "exposure-banner")
+		print(("fact-key history prune scene, last fact %s: memory=[%s] disk=[%s]"):format(
+			fate, extra_tests.named_keys(memory), extra_tests.named_keys(disk)))
+		assert_equal(memory, "", fate .. ": A left the history")
+		assert_equal(disk, "", fate .. ": and the durable record")
+		client:shutdown()
+		restore()
+		storage.reset()
+	end
+end
+
+function extra_tests.test_fact_key_history_keeps_a_spooled_key_across_relaunch()
+	local key_a = extra_tests.age_fact_key()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	responder = extra_tests.batch_answer(503)
+	assert_true(not client:flush({ include_summaries = false }), "the 503 retains the batch")
+	responder = nil
+	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner", key_a)
+	assert_true(exposures == 1 and outcomes == 1, "A's facts are spooled")
+	extra_tests.admit_republished(client)
+	assert_equal(extra_tests.memory_history(client, "exposure-banner"), key_a,
+		"the republish keeps A while its facts are spooled")
+	assert_equal(extra_tests.disk_history(client, "exposure-banner"), key_a,
+		"the persisted record holds A")
+	storage.reset() -- SIMULATED PROCESS DEATH
+
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	exposures, outcomes = extra_tests.chunk_facts(relaunch, "exposure-banner", key_a)
+	assert_true(exposures == 1 and outcomes == 1, "the relaunch restored A's facts")
+	local memory = extra_tests.memory_history(relaunch, "exposure-banner")
+	local disk = extra_tests.disk_history(relaunch, "exposure-banner")
+	print(("fact-key history kept scene, after relaunch: memory=[%s] disk=[%s]"):format(
+		extra_tests.named_keys(memory), extra_tests.named_keys(disk)))
+	assert_equal(memory, key_a, "the relaunch keeps A while its restored facts are live")
+	assert_equal(disk, key_a, "and the record keeps it past the load-time prune")
+	local from = #requests
+	assert_true(relaunch:flush({ include_summaries = false }))
+	assert_equal(extra_tests.delivered_count(from, "exposure-banner", key_a), 2,
+		"the restored facts under A are delivered")
+	assert_equal(extra_tests.memory_history(relaunch, "exposure-banner"), "", "then A leaves the history")
+	assert_equal(extra_tests.disk_history(relaunch, "exposure-banner"), "", "and the record")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- A record exactly as this SDK wrote it before the history section existed
+-- (0.11.1): the table storage.save_experiments handed to sys.save for one
+-- cached client-id assignment of the default config, transcribed from a run
+-- of that code (the fake sys layer stores that table as the bytes). It has no
+-- `fact_key_history` member.
+function extra_tests.pre_history_record()
+	return {
+		entries = {
+			["exp-checkout"] = {
+				assignment_key = "asgn_" .. string.rep("a", 32),
+				assignment_unit = "client_id",
+				attributes = {
+					[1] = {
+						name = "age_band",
+						value = "adult",
+					},
+				},
+				fetched_at_ms = 1000400,
+				subject_fact_key = "sfk1_" .. string.rep("b", 64),
+				subject_key = "spcid_" .. string.rep("e", 32),
+				variant_key = "treatment",
+				variant_payload = {
+					color = "blue",
+					limit = 5,
+				},
+				version = 3,
+			},
+		},
+		scope = "workspace-test\31develop\31spcid_" .. string.rep("e", 32)
+			.. "\31http://localhost:18081\31a7b5f8db",
+	}
+end
+
+-- A fake store holding `record` as the default config's experiments file,
+-- with the fixture's subject persisted and analytics consent granted.
+function extra_tests.store_experiments_record(record)
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	storage.save(storage_scope, {
+		consent_analytics = "granted",
+		experiments_client_id = "spcid_" .. string.rep("e", 32),
+	})
+	assert_true(storage.save_experiments(storage_scope, { scope = "probe", entries = {} }))
+	local path = nil
+	for candidate in pairs(stores) do
+		if fail_experiment_saves(candidate) then
+			path = candidate
+		end
+	end
+	stores[path] = record
+	return restore, stores, path
+end
+
+function extra_tests.test_record_without_fact_key_history_loads()
+	local restore, stores, path = extra_tests.store_experiments_record(extra_tests.pre_history_record())
+	local client = assert(sdk.new(config()))
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment", "the old record serves as before")
+	assert_equal(client:experiment_payload("exp-checkout").color, "blue", "with its payload")
+	assert_equal(extra_tests.owed_count(client, "exp-checkout"), 1, "and re-arms its exposure")
+	local record = storage.load_experiments(client.config)
+	local loaded = record and record.fact_key_history
+	print(("fact-key history old-record scene: variant=%s history=%s"):format(
+		tostring(client:experiment_variant("exp-checkout")),
+		type(loaded) == "table" and (next(loaded) == nil and "empty" or "non-empty") or tostring(loaded)))
+	assert_true(type(loaded) == "table" and next(loaded) == nil, "it loads with an empty history")
+	assert_nil(next(client.experiments.fact_key_history), "memory's history is empty too")
+	-- A rewrite that retires nothing keeps the old shape: no section an
+	-- older release would have to drop.
+	next_response_body = assignment_body()
+	local result
+	client:fetch_experiment_assignment_with_age_band("exp-checkout", "adult", nil,
+		function(value) result = value end)
+	assert_true(result and result.ok and result.assigned, "same-version revalidation control")
+	assert_true(stores[path] ~= nil and stores[path].entries["exp-checkout"] ~= nil, "the record was rewritten")
+	assert_nil(stores[path].fact_key_history, "an empty history writes no section")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_fact_key_history_parses_tolerantly()
+	local key_c = "sfk1_" .. string.rep("c", 64)
+	local record = extra_tests.pre_history_record()
+	record.fact_key_history = {
+		["exp-checkout"] = { key_c, "sfk1_short", 42, key_c, { key_c },
+			"sfk1_" .. string.rep("C", 64) },
+		[""] = { key_c },
+		[7] = { key_c },
+		["exp-string"] = key_c,
+		["exp-garbled"] = { "not-a-fact-key" },
+	}
+	local restore = extra_tests.store_experiments_record(record)
+	local loaded = storage.load_experiments(storage_scope)
+	local names = {}
+	for experiment_key, keys in pairs(loaded.fact_key_history) do
+		names[#names + 1] = tostring(experiment_key) .. "=" .. table.concat(keys, ",")
+	end
+	assert_equal(table.concat(names, ";"), "exp-checkout=" .. key_c, "only well-formed keys survive, once")
+	assert_true(loaded.entries["exp-checkout"] ~= nil, "the entries load beside it")
+	local client = assert(sdk.new(config()))
+	assert_equal(extra_tests.memory_history(client, "exp-checkout"), "",
+		"a key no live fact carries is pruned at load")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment", "serving is unaffected")
+	client:shutdown()
+	restore()
+	storage.reset()
+
+	record = extra_tests.pre_history_record()
+	record.fact_key_history = "garbled"
+	restore = extra_tests.store_experiments_record(record)
+	loaded = storage.load_experiments(storage_scope)
+	assert_true(loaded ~= nil and next(loaded.fact_key_history) == nil, "a garbled section loads as empty")
+	assert_true(loaded.entries["exp-checkout"] ~= nil, "without costing the entries")
+	restore()
+	storage.reset()
+end
+
+-- The kill switch drops the entry and captures its owed exposure into the
+-- spool (a plain envelope: no subject, no scope); then the exposure leaves
+-- the owed records — emitted into the queue once the retained outcome's
+-- failed batch frees the room. From here on nothing but the fact-key
+-- history remembers the subject's key.
+function extra_tests.kill_and_emit_owed(client)
+	assert_true(client:track("filler-host-event"))
+	extra_tests.admit(client)
+	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "the full queue keeps the exposure owed")
+	assert_true(client:flush({ include_summaries = false }))
+	assert_true(client:track_outcome("exposure-banner", "score", 1), "an accepted outcome")
+	extra_tests.refuse(client, "kill_switch")
+	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "the owed exposure survives the kill")
+	assert_equal((extra_tests.disk_facts(client, "exposure-banner")), 1, "the kill captured it durably")
+	responder = extra_tests.batch_answer(503)
+	assert_true(not client:flush({ include_summaries = false }), "the outcome's batch is retained")
+	responder = nil
+	client:update(0.016)
+	assert_nil(client.experiments.pending_exposure["exposure-banner"], "nothing is owed any more")
+	local exposures = extra_tests.count_facts(client.queue.items, "exposure-banner")
+	assert_equal(exposures, 1, "the owed exposure is queued")
+	local _, outcomes = extra_tests.count_facts(client.in_flight_batch, "exposure-banner")
+	assert_equal(outcomes, 1, "the outcome is retained")
+end
+
+function extra_tests.test_age_refusal_after_kill_withdraws_captured_facts_in_process()
+	local client, restore = extra_tests.age_client({ buffer_size = 1 })
+	extra_tests.kill_and_emit_owed(client)
+	extra_tests.refuse_with(client, 1, false)
+	-- Read before anything settles: the withdrawal itself prunes.
+	local memory = extra_tests.memory_history(client, "exposure-banner")
+	local disk = extra_tests.disk_history(client, "exposure-banner")
+	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	local from = #requests
+	responder = extra_tests.batch_answer(202)
+	advance_seconds(60)
+	client:flush({ include_summaries = false })
+	client:update(0.016)
+	client:flush({ include_summaries = false })
+	responder = nil
+	local delivered = extra_tests.delivered_count(from, "exposure-banner")
+	print(("fact-key history kill-then-refusal scene, same process: delivered %d"):format(delivered))
+	assert_equal(delivered, 0, "no captured, queued or retained fact is delivered")
+	assert_equal(exposures + outcomes, 0, "the capture and the spooled outcome are withdrawn")
+	assert_equal(memory, "", "the withdrawn key left the history")
+	assert_equal(disk, "", "durably, although the drop had nothing left to write")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_after_kill_withdraws_captured_facts_after_relaunch()
+	local key_a = extra_tests.age_fact_key()
+	local client, restore = extra_tests.age_client({ buffer_size = 1 })
+	extra_tests.kill_and_emit_owed(client)
+	client:persist()
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	assert_nil(relaunch:experiment_variant("exposure-banner"), "the kill landed durably")
+	local exposures, outcomes = extra_tests.chunk_facts(relaunch, "exposure-banner", key_a)
+	assert_true(exposures == 1 and outcomes == 1, "the capture and the outcome replay from the spool")
+	extra_tests.refuse_with(relaunch, 1, false)
+	local from = extra_tests.deliver_all(relaunch)
+	local delivered = extra_tests.delivered_count(from, "exposure-banner")
+	print(("fact-key history kill-then-refusal scene, after relaunch: delivered %d"):format(delivered))
+	assert_equal(delivered, 0, "no restored fact of the killed entry is delivered")
+	assert_equal(extra_tests.disk_history(relaunch, "exposure-banner"), "", "the withdrawn key left the record")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_fact_key_retired_when_its_entry_never_reached_disk()
+	local key_a, key_b = extra_tests.age_fact_key(), extra_tests.republished_fact_key
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client({ app_id = "exposure-app" })
+	client:set_consent(true)
+	assert_true(client:session_start())
+	-- Version 1's entry write fails: the disk never holds A.
+	state.fail_save = fail_experiment_saves
+	extra_tests.admit(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	client:persist()
+	state.fail_save = nil
+	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner", key_a)
+	assert_true(exposures == 1 and outcomes == 1, "A's facts are spooled")
+	local record = storage.load_experiments(client.config)
+	assert_true(record == nil or record.entries["exposure-banner"] == nil, "the entry under A never reached disk")
+	extra_tests.admit_republished(client)
+	extra_tests.refuse_with(client, 2, key_b)
+	local from = extra_tests.deliver_all(client)
+	local a = extra_tests.delivered_count(from, "exposure-banner", key_a)
+	local b = extra_tests.delivered_count(from, "exposure-banner", key_b)
+	print(("fact-key history scene, unwritten entry: delivered by key: A=%d B=%d"):format(a, b))
+	assert_equal(a, 0, "the facts under the never-persisted key A are withdrawn")
+	assert_equal(b, 0, "and those under B")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	extra_tests.test_age_remote_config_keeps_targeting_rules,
 	extra_tests.test_age_api_lifecycle_precedes_arguments,
@@ -8905,6 +9359,15 @@ local tests = {
 	extra_tests.test_age_readmission_exposure_survives_withdrawn_batch_ack,
 	extra_tests.test_age_readmission_kill_capture_keeps_fresh_id,
 	extra_tests.test_age_refusal_withdraws_restored_entry_without_subject_key,
+	extra_tests.test_age_refusal_withdraws_republished_facts_in_process,
+	extra_tests.test_age_refusal_withdraws_republished_facts_after_relaunch,
+	extra_tests.test_fact_key_history_prunes_after_the_last_fact,
+	extra_tests.test_fact_key_history_keeps_a_spooled_key_across_relaunch,
+	extra_tests.test_record_without_fact_key_history_loads,
+	extra_tests.test_fact_key_history_parses_tolerantly,
+	extra_tests.test_age_refusal_after_kill_withdraws_captured_facts_in_process,
+	extra_tests.test_age_refusal_after_kill_withdraws_captured_facts_after_relaunch,
+	extra_tests.test_fact_key_retired_when_its_entry_never_reached_disk,
 
 	test_config_validation,
 	test_flag_off_zero_paths,

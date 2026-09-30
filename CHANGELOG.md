@@ -15,6 +15,20 @@
   response nor the player's cached assignment or owed exposure carries one,
   they are left as they are.
   ([#121](https://github.com/shardpilot/shardpilot-defold/issues/121))
+- The `age_ineligible` withdrawal now also reaches the player's facts built
+  under an earlier subject fact key of the same experiment. The server issues
+  a new key with every published version, and a kill switch removes the cached
+  assignment, so a refusal after a republish, or after a kill switch whose
+  owed exposure was captured and then emitted, used to miss those queued,
+  retained and spooled facts and deliver them. The SDK now keeps those keys
+  per experiment in a `fact_key_history` section of the experiment cache
+  record, in the same write that replaces or deletes the entry, and drops
+  each key once no queued, in-flight, spooled or owed fact carries it. The
+  history survives a restart. A record written by an earlier release loads
+  with an empty history; an earlier release reading a newer record ignores
+  the section and drops it when it rewrites the record. `kill_switch` still
+  keeps and delivers owed facts.
+  ([shardpilot/shardpilot-go#138](https://github.com/shardpilot/shardpilot-go/issues/138))
 
 ## v0.11.1 — 2026-09-29 — undeclared cached experiment assignments are not restored
 

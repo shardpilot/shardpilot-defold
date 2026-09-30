@@ -1270,7 +1270,13 @@ returns `no_assignment`. Other experiments' facts are not affected. The
 player's facts are recognized by its subject fact key, taken from the response
 or from the player's own cached assignment or owed exposure; when none carries
 one, facts already queued or spooled are left as they are, since they cannot
-be told apart from another player's. A batch
+be told apart from another player's. The server issues a new subject fact key
+with every published version of an experiment, so the SDK also remembers, per
+experiment, the player's earlier keys while facts under them are still queued,
+being sent or spooled: a refusal after a republish, or after a kill switch
+removed the cached assignment, withdraws those facts too, in the same process
+and after a restart. A key is forgotten once its last fact is delivered,
+dropped or withdrawn. A batch
 that is already being sent when the response arrives cannot be recalled: it
 is not retried if that send fails, and a `persist()` before it settles does
 not write its facts to disk. If the offline spool cannot be rewritten
@@ -1634,7 +1640,8 @@ top-level one.
   clear marker. Those last two are the SDK's most identifier-bearing storage
   and are retained across a consent downgrade and across a later launch with
   the flag off: the cache holds the SDK-minted subject id, the server-minted
-  assignment and subject-fact keys, the variant payload, **and the normalized
+  assignment and subject-fact keys (earlier subject-fact keys too, while an
+  undelivered fact still carries one), the variant payload, **and the normalized
   targeting attributes the assignment was evaluated under** — so
   user-specific values your game passes to `fetch_experiment_assignment` are
   written to disk; the clear marker holds a timestamp plus the record scope

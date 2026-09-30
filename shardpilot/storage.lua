@@ -2263,6 +2263,53 @@ local function sanitize_experiment_entries(entries)
 	return out
 end
 
+-- Keep only the usable part of the record-level fact-key history
+-- (`fact_key_history`: experiment_key → the subject-fact keys that live facts
+-- of that experiment may still carry although no cached entry does — see
+-- Experiments:sync_durable_entry). Parsed tolerantly: a garbled section, a
+-- non-list value or a key failing the fact-key grammar is dropped rather than
+-- trusted, and so is a history left empty by the filter. Each list is
+-- de-duplicated and sorted, so the same history always saves as the same list.
+local function sanitize_fact_key_history(history)
+	local out = {}
+	if type(history) ~= "table" then
+		return out
+	end
+	for experiment_key, keys in pairs(history) do
+		if type(experiment_key) == "string" and experiment_key ~= ""
+			and type(keys) == "table" then
+			local seen = {}
+			local list = {}
+			for _, value in pairs(keys) do
+				if valid_subject_fact_key(value) and not seen[value] then
+					seen[value] = true
+					list[#list + 1] = value
+				end
+			end
+			if list[1] then
+				table.sort(list)
+				out[experiment_key] = list
+			end
+		end
+	end
+	return out
+end
+
+-- The record shape both directions share: scope, sanitized entries, and the
+-- fact-key history section — written only when non-empty, so a record with no
+-- history keeps the exact shape releases without the section wrote.
+local function sanitize_experiments_record(record)
+	local stored = {
+		scope = record.scope,
+		entries = sanitize_experiment_entries(record.entries),
+	}
+	local history = sanitize_fact_key_history(record.fact_key_history)
+	if next(history) ~= nil then
+		stored.fact_key_history = history
+	end
+	return stored
+end
+
 -- Load the cached experiment-assignment record for this app (the same per-app
 -- namespace scheme as the spool), or nil when absent or unusable. A record
 -- without a scope stamp cannot be attributed to any (workspace, environment,
@@ -2300,25 +2347,25 @@ function M.load_experiments(scope)
 		or type(record.scope) ~= "string" or record.scope == "" then
 		return nil
 	end
-	return {
-		scope = record.scope,
-		entries = sanitize_experiment_entries(record.entries),
-	}
+	-- A record written before the history section existed loads with an
+	-- empty history: nothing was retired under it.
+	local loaded = sanitize_experiments_record(record)
+	loaded.fact_key_history = loaded.fact_key_history or {}
+	return loaded
 end
 
 -- Replace the cached experiment-assignment record
--- (`{ scope, entries = { [experiment_key] = entry } }`). Returns true when
--- stored — in the durable save file, or in the in-memory fallback on hosts
--- without the save-file API (which then lasts only for the process lifetime).
+-- (`{ scope, entries = { [experiment_key] = entry },
+-- fact_key_history = { [experiment_key] = { fact_key, ... } } }`). Returns
+-- true when stored — in the durable save file, or in the in-memory fallback
+-- on hosts without the save-file API (which then lasts only for the process
+-- lifetime).
 function M.save_experiments(scope, record)
 	if type(record) ~= "table"
 		or type(record.scope) ~= "string" or record.scope == "" then
 		return false
 	end
-	local stored = {
-		scope = record.scope,
-		entries = sanitize_experiment_entries(record.entries),
-	}
+	local stored = sanitize_experiments_record(record)
 	-- The size cap is a DETERMINISTIC bound, so an oversized record must
 	-- never surface as a retryable failure: the caller would record an owed
 	-- durable sync that can never land and persist()/shutdown() would wedge
@@ -2343,14 +2390,20 @@ function M.save_experiments(scope, record)
 				oldest_key = key
 			end
 		end
-		if oldest_key == nil then
+		if oldest_key ~= nil then
+			stored.entries[oldest_key] = nil
+		elseif stored.fact_key_history ~= nil then
+			-- Entries go first; the fact-key history goes last, whole:
+			-- memory keeps it for the process, and a record that cannot fit
+			-- with it must still land its entry drops.
+			stored.fact_key_history = nil
+		else
 			-- Nothing left to evict and the record still exceeds the cap:
 			-- deterministic and terminal for this input, surfaced as a
 			-- plain failure (callers treat it like any failed save; no
 			-- retry can change it, but no entry data exists to wedge on).
 			return false, evicted
 		end
-		stored.entries[oldest_key] = nil
 		evicted = evicted + 1
 	end
 	local ns = spool_namespace(scope)

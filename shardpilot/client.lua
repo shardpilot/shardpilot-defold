@@ -1703,6 +1703,11 @@ function M.new(config, defer_init_diagnostics)
 				-- must not retire over them.
 				return client.condemned_spool_pending == true
 			end,
+			live_fact_keys = function(experiment_key)
+				-- The fact-key history keeps a retired key only while a
+				-- fact of the experiment on this pipeline still carries it.
+				return client:live_experiment_fact_keys(experiment_key)
+			end,
 		})
 	end
 	-- Offline event spool: re-load the envelopes a previous launch could not
@@ -2020,6 +2025,12 @@ function M.new(config, defer_init_diagnostics)
 				client.flush_elapsed_seconds = normalized.flush_interval_seconds
 			end
 		end
+	end
+	if client.experiments then
+		-- The spool is restored (or purged): only now may the experiments
+		-- fact-key history prune, since a restored chunk under a retired key
+		-- keeps that key.
+		client.experiments:on_spool_restored()
 	end
 	-- The retained receipts (reloaded above, before the spool) get their
 	-- delivery attempt after the whole init settled — the same dispatch
@@ -5520,6 +5531,7 @@ function Client:purge_experiment_facts()
 		-- refusal.
 		self.stats.dropped = self.stats.dropped + purged
 	end
+	self:owe_fact_key_prune()
 	return purged
 end
 
@@ -5626,6 +5638,63 @@ function Client:withdraw_experiment_facts(experiment_key, fact_keys)
 		self.stats.dropped = self.stats.dropped + withdrawn
 	end
 	return withdrawn
+end
+
+-- The subject-fact keys (`assignment_key` props) that ONE experiment's facts
+-- still live on this pipeline carry, as a set — the liveness question of the
+-- experiments fact-key history, asked over the withdrawal's surfaces: the
+-- memory queue; the in-flight batch, retained between attempts or ON THE
+-- WIRE (a batch on the wire stays live until its settle, facts an age
+-- refusal could not recall from it — experiment_withdrawals_awaited —
+-- included); the loaded spool chunks; and the durable spool mirror, less the
+-- entries already settled (acknowledged or withdrawn, their removal rewrite
+-- still owed). Emission is synchronous, so no fact is ever between surfaces.
+-- The experiments consumer adds its own owed snapshots.
+function Client:live_experiment_fact_keys(experiment_key)
+	local live = {}
+	local function note(event)
+		if is_experiment_fact(event) and type(event.props) == "table"
+			and event.props.experiment_key == experiment_key
+			and type(event.props.assignment_key) == "string" then
+			live[event.props.assignment_key] = true
+		end
+	end
+	for i = 1, #self.queue.items do
+		note(self.queue.items[i])
+	end
+	local batch = self.in_flight_batch or {}
+	for i = 1, #batch do
+		note(batch[i])
+	end
+	for i = 1, #self.spool_batches do
+		local chunk = self.spool_batches[i]
+		for j = 1, #chunk do
+			note(chunk[j])
+		end
+	end
+	for i = 1, #self.spool_record do
+		local env = self.spool_record[i]
+		if type(env) == "table" and not self.spool_settled[env.event_id] then
+			note(env)
+		end
+	end
+	return live
+end
+
+-- A publish settled: the experiments fact-key history drops the keys no fact
+-- carries any more (a no-op while the history is empty).
+function Client:prune_fact_key_history()
+	if self.experiments then
+		self.experiments:prune_fact_key_history()
+	end
+end
+
+-- Facts just left the pipeline outside a settle (cap eviction, a purge): the
+-- experiments fact-key history prunes on the next tick, not mid-operation.
+function Client:owe_fact_key_prune()
+	if self.experiments then
+		self.experiments.fact_key_prune_owed = true
+	end
 end
 
 -- Durably capture ONE experiment fact straight into the spool, bypassing the
@@ -5755,6 +5824,7 @@ function Client:write_spool_record(events)
 	end
 	if #target > #saved then
 		self.stats.spool_evicted = self.stats.spool_evicted + (#target - #saved)
+		self:owe_fact_key_prune()
 	end
 	self.spool_record = saved
 	-- The derived append state describes the PREVIOUS record. Dropping it
@@ -5925,6 +5995,9 @@ function Client:spool_envelopes(envelopes)
 		end
 		self.spool_record = saved
 		self.stats.spool_evicted = self.stats.spool_evicted + #evicted + #shed
+		if #evicted + #shed > 0 then
+			self:owe_fact_key_prune()
+		end
 		self.spool_disk_deadline_ms = self.spool_retry_after_ms
 		return self:report_spool_capture(envelopes, fresh)
 	end
@@ -6256,6 +6329,8 @@ function Client:start_publish_batch(automatic)
 			if self.in_flight_batch == events then
 				self.in_flight_batch = nil
 			end
+			-- Delivered facts no longer hold their fact-key history keys.
+			self:prune_fact_key_history()
 			return
 		end
 		self.stats.failed_batches = self.stats.failed_batches + 1
@@ -6478,6 +6553,9 @@ function Client:start_publish_batch(automatic)
 				})
 			end
 		end
+		-- A dropped batch, or withdrawn facts filtered out of a retained one,
+		-- no longer holds its fact-key history keys either.
+		self:prune_fact_key_history()
 	end, compress)
 	if not dispatched and self.publish_in_flight then
 		self.publish_in_flight = false
