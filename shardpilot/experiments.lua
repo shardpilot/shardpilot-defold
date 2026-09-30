@@ -1647,6 +1647,20 @@ function Experiments:settle_fact_key_history(scope, on_disk)
 	return listed_fact_keys(history)
 end
 
+-- Write `record` (the durable record of the history's scope, or a fresh
+-- stub for it) when its section differs from the settled history. A stub
+-- is written only when a history remains to carry. Best-effort, like a
+-- prune: a failed save leaves the key in memory for the next write that
+-- lands.
+function Experiments:save_fact_key_history(record)
+	local on_disk = record.fact_key_history or {}
+	local settled = self:settle_fact_key_history(record.scope, on_disk)
+	if not same_fact_keys(settled, on_disk) then
+		record.fact_key_history = settled
+		storage.save_experiments(self.config, record)
+	end
+end
+
 -- Prune the current subject's history, and rewrite the durable section when
 -- it changed. Runs after a publish settles, after an age withdrawal, at load
 -- once the spool is restored, and on the tick after a cap eviction or a
@@ -1787,6 +1801,12 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 				return false
 			end
 			self.durable_pending[composite] = nil
+			-- Nothing is stored to drop: the entry never reached the disk
+			-- (its own write failed, or the size cap evicted it). The key
+			-- this sync just retired can still name spooled facts, so the
+			-- record's section takes it now; otherwise a relaunch would
+			-- have no key to withdraw them by.
+			self:save_fact_key_history(record)
 			return true
 		end
 		local deciding = not is_retry

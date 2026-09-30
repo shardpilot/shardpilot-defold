@@ -9327,6 +9327,45 @@ function extra_tests.test_fact_key_retired_when_its_entry_never_reached_disk()
 	storage.reset()
 end
 
+-- The entry under A never reached the disk; a kill switch then drops it, so
+-- the drop finds nothing stored to delete. The key it retires must still
+-- reach the record, or the relaunch has nothing to withdraw A's spooled
+-- facts by.
+function extra_tests.test_fact_key_retired_by_dropping_an_unwritten_entry_survives_relaunch()
+	local key_a = extra_tests.age_fact_key()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client({ app_id = "exposure-app" })
+	client:set_consent(true)
+	assert_true(client:session_start())
+	state.fail_save = fail_experiment_saves
+	extra_tests.admit(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	client:persist()
+	state.fail_save = nil
+	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner", key_a)
+	assert_true(exposures == 1 and outcomes == 1, "A's facts are spooled")
+	local record = storage.load_experiments(client.config)
+	assert_true(record == nil or record.entries["exposure-banner"] == nil, "the entry under A never reached disk")
+	extra_tests.refuse(client, "kill_switch")
+	local disk = extra_tests.disk_history(client, "exposure-banner")
+	client:persist()
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	exposures, outcomes = extra_tests.chunk_facts(relaunch, "exposure-banner", key_a)
+	assert_true(exposures == 1 and outcomes == 1, "A's facts replay from the spool")
+	extra_tests.refuse_with(relaunch, 1, false)
+	local from = extra_tests.deliver_all(relaunch)
+	local a = extra_tests.delivered_count(from, "exposure-banner", key_a)
+	print(("fact-key history scene, dropped unwritten entry, after relaunch: disk=[%s] delivered A=%d")
+		:format(extra_tests.named_keys(disk), a))
+	assert_equal(disk, key_a, "the drop that found nothing stored persists the key it retired")
+	assert_equal(a, 0, "no restored fact under A is delivered")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	extra_tests.test_age_remote_config_keeps_targeting_rules,
 	extra_tests.test_age_api_lifecycle_precedes_arguments,
@@ -9368,6 +9407,7 @@ local tests = {
 	extra_tests.test_age_refusal_after_kill_withdraws_captured_facts_in_process,
 	extra_tests.test_age_refusal_after_kill_withdraws_captured_facts_after_relaunch,
 	extra_tests.test_fact_key_retired_when_its_entry_never_reached_disk,
+	extra_tests.test_fact_key_retired_by_dropping_an_unwritten_entry_survives_relaunch,
 
 	test_config_validation,
 	test_flag_off_zero_paths,
