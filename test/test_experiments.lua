@@ -9413,6 +9413,50 @@ function extra_tests.test_restored_key_retires_when_the_disk_no_longer_shows_it(
 	storage.reset()
 end
 
+-- An oversized save evicts version 1's entry (oldest first), then the
+-- oversized entry itself, and the process exits right after. The evicted
+-- entry's key must reach the history that same save writes, or the
+-- relaunch has nothing to withdraw A's spooled facts by.
+function extra_tests.test_cap_evicted_entry_key_survives_relaunch()
+	local key_a = extra_tests.age_fact_key()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(client:persist())
+	local blob = {}
+	for i = 1, 26000 do
+		blob[i] = i
+	end
+	next_response_body = assignment_body({
+		app_key = "exposure-app",
+		experiment_key = "exp-big",
+		subject_fact_key = "sfk1_" .. string.rep("e", 64),
+		variant_payload = { blob = blob },
+	})
+	local result
+	client:fetch_experiment_assignment_with_age_band("exp-big", "adult", nil,
+		function(value) result = value end)
+	assert_true(result and result.ok and result.assigned, "the oversized assignment installs")
+	local record = storage.load_experiments(client.config)
+	assert_true(record ~= nil and record.entries["exposure-banner"] == nil, "the cap evicted the entry under A")
+	local disk = extra_tests.disk_history(client, "exposure-banner")
+	storage.reset() -- SIMULATED PROCESS DEATH right after the evicting save
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local exposures, outcomes = extra_tests.chunk_facts(relaunch, "exposure-banner", key_a)
+	assert_true(exposures == 1 and outcomes == 1, "A's facts replay from the spool")
+	extra_tests.refuse_with(relaunch, 1, false)
+	local from = extra_tests.deliver_all(relaunch)
+	local a = extra_tests.delivered_count(from, "exposure-banner", key_a)
+	print(("fact-key history scene, cap-evicted entry, after relaunch: disk=[%s] delivered A=%d")
+		:format(extra_tests.named_keys(disk), a))
+	assert_equal(disk, key_a, "the evicting save retires A into the history")
+	assert_equal(a, 0, "no restored fact under the evicted entry's key is delivered")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	extra_tests.test_age_remote_config_keeps_targeting_rules,
 	extra_tests.test_age_api_lifecycle_precedes_arguments,
@@ -9456,6 +9500,7 @@ local tests = {
 	extra_tests.test_fact_key_retired_when_its_entry_never_reached_disk,
 	extra_tests.test_fact_key_retired_by_dropping_an_unwritten_entry_survives_relaunch,
 	extra_tests.test_restored_key_retires_when_the_disk_no_longer_shows_it,
+	extra_tests.test_cap_evicted_entry_key_survives_relaunch,
 
 	test_config_validation,
 	test_flag_off_zero_paths,

@@ -2391,7 +2391,29 @@ function M.save_experiments(scope, record)
 			end
 		end
 		if oldest_key ~= nil then
+			-- The evicted entry's key leaves the record here, so it retires
+			-- into the fact-key history in this same write: facts built
+			-- under it may still be spooled, and after a relaunch nothing
+			-- else would name them. The next prune drops it once no live
+			-- fact carries it.
+			local evicted_entry = stored.entries[oldest_key]
+			local fact_key = type(evicted_entry) == "table"
+				and evicted_entry.subject_fact_key or nil
 			stored.entries[oldest_key] = nil
+			if valid_subject_fact_key(fact_key) then
+				local history = stored.fact_key_history or {}
+				local keys = history[oldest_key] or {}
+				local known = false
+				for i = 1, #keys do
+					known = known or keys[i] == fact_key
+				end
+				if not known then
+					keys[#keys + 1] = fact_key
+					table.sort(keys)
+				end
+				history[oldest_key] = keys
+				stored.fact_key_history = history
+			end
 		elseif stored.fact_key_history ~= nil then
 			-- Entries go first; the fact-key history goes last, whole:
 			-- memory keeps it for the process, and a record that cannot fit
