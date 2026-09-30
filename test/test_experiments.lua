@@ -10287,6 +10287,43 @@ function extra_tests.test_age_unanswered_declaration_withdraws_client_id_beneath
 	storage.reset()
 end
 
+-- An unanswered declaration that keeps a synthetic-subject assignment
+-- withdraws the client-id facts already queued beneath it even when no owed
+-- snapshot carries their key any more: the fact-key history does.
+function extra_tests.test_age_unanswered_declaration_keeping_synthetic_withdraws_queued_client_id_facts()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1), "setup: an accepted client-id outcome")
+	local fact_key = extra_tests.age_fact_key()
+	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", fact_key)
+	assert_true(exposures == 1 and outcomes == 1, "setup: the client-id exposure and outcome are queued, got "
+		.. exposures .. "/" .. outcomes)
+	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 0, "setup: no owed snapshot carries the client-id key")
+	-- A republished version, so the synthetic assignment is not the client-id one.
+	next_response_body = extra_tests.synthetic_body(false, 2)
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) result = value end)
+	assert_true(result ~= nil and result.assigned, "setup: the synthetic assignment installs")
+	extra_tests.declare_unconfirmed(client)
+	local check, verify = extra_tests.checklist()
+	check(client:experiment_variant("exposure-banner") == "control", "the synthetic assignment must keep serving, got "
+		.. tostring(client:experiment_variant("exposure-banner")))
+	exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", fact_key)
+	check(exposures + outcomes == 0, "withdraw: " .. (exposures + outcomes)
+		.. " queued client-id fact(s) survive beneath the synthetic assignment")
+	local from = #requests
+	client:flush({ include_summaries = false })
+	exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+	check(exposures + outcomes == 0, "withdraw: " .. (exposures + outcomes)
+		.. " client-id fact(s) delivered after the unanswered declaration")
+	verify("queued client-id facts beneath synthetic")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
 -- An unanswered declaration that keeps a synthetic-subject assignment still
 -- retires the withdrawn client-id application's exposure slot: a later adult
 -- re-admission to the same client-id version is a new application, exposed
@@ -10832,6 +10869,7 @@ local tests = {
 	extra_tests.test_age_unanswered_declaration_keeping_synthetic_still_fences,
 	extra_tests.test_age_unanswered_declaration_withdraws_client_id_beneath_synthetic,
 	extra_tests.test_age_unanswered_declaration_keeping_synthetic_reopens_client_id_exposure,
+	extra_tests.test_age_unanswered_declaration_keeping_synthetic_withdraws_queued_client_id_facts,
 	extra_tests.test_age_declaration_pending_refuses_synthetic_keyed_outcome,
 	extra_tests.test_age_declaration_answered_by_its_grammar_retry,
 	extra_tests.test_age_adult_declaration_after_unconfirmed_one_is_new_application,
