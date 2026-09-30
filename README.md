@@ -1277,13 +1277,16 @@ being sent or spooled: a refusal after a republish, or after a kill switch
 removed the cached assignment, withdraws those facts too, in the same process
 and after a restart. A key is forgotten once its last fact is delivered,
 dropped or withdrawn. Clients of the same app built with `sdk.new` in one
-process share the player and the offline files, and the refusal reaches all
-of them: each client that serves the same player in the same environment
-stops serving the experiment, withdraws its own owed exposure and facts, and
-discards the answer to a fetch of the experiment it sent before the refusal. A
-client that was already shut down withdraws too: the facts it wrote to the
-offline spool at shutdown are not sent after a restart.
-An earlier key is kept while any of these clients still holds a fact under it.
+process share the offline spool, and with experiments the player and the
+assignment cache; the refusal reaches all of them. Every client, in any
+environment and with or without experiments, drops the refused facts it
+holds, including copies it restored from the shared spool. A client that
+serves the same player in the same environment also stops serving the
+experiment, withdraws its owed exposure, and discards the answer to a fetch
+of the experiment it sent before the refusal. The refused facts are also
+removed from the spool file itself, including any a client wrote there at
+shutdown. An earlier key is kept while any of these clients holds a fact
+under it, owes one, or serves the assignment that carries it.
 A batch
 that is already being sent when the response arrives cannot be recalled: it
 is not retried if that send fails, and a `persist()` before it settles does

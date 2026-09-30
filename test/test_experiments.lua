@@ -9541,8 +9541,10 @@ function extra_tests.test_age_refusal_leaves_a_sibling_of_another_scope()
 	-- another scope.
 	local other = assert(sdk.new(config({ app_id = "exposure-app", environment_id = "staging" })))
 	assert_true(other:session_start())
+	-- The server mints another subject fact key for another environment.
 	next_response_body = extra_tests.age_golden("adult")
 		:gsub('"environment_key":"develop"', '"environment_key":"staging"', 1)
+		:gsub(extra_tests.age_fact_key(), "sfk1_" .. string.rep("c", 64), 1)
 	local result
 	other:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
 		function(value) result = value end)
@@ -9592,6 +9594,210 @@ function extra_tests.test_age_refusal_fences_a_sibling_fetch_in_flight()
 		"an answer the sibling dispatched before the refusal installs nothing")
 	second:shutdown()
 	first:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- Envelopes of `event_name` on the shared spool as a client of the app reads it.
+function extra_tests.spooled_count(client, event_name)
+	local count = 0
+	for _, env in ipairs(storage.load_spool(client.config)) do
+		if env.event_name == event_name then
+			count = count + 1
+		end
+	end
+	return count
+end
+
+function extra_tests.test_age_refusal_keeps_what_other_clients_spooled_since()
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	assert_true(first:track_outcome("exposure-banner", "score", 1))
+	responder = extra_tests.batch_answer(503)
+	first:shutdown()
+	responder = nil
+	-- A client started after that shutdown restores the shared spool, and
+	-- spools a host event of its own.
+	local second = extra_tests.sibling_of(first)
+	assert_true(second:track("unrelated-host-event"))
+	assert_true(second:persist())
+	assert_equal(extra_tests.spooled_count(second, "unrelated-host-event"), 1, "premise: the host event is spooled")
+
+	extra_tests.refuse(second, "age_ineligible")
+	local exposures, outcomes = extra_tests.disk_facts(second, "exposure-banner")
+	local outcome = ("on the spool: host event=%d refused facts=%d"):format(
+		extra_tests.spooled_count(second, "unrelated-host-event"), exposures + outcomes)
+	print("stale spool copy scene: " .. outcome)
+	assert_equal(outcome, "on the spool: host event=1 refused facts=0",
+		"the refusal keeps what another client spooled, and removes the refused facts")
+	second:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- A client of the same app that restored the refused subject's spooled facts:
+-- another environment's (`overrides`), or one without experiments.
+function extra_tests.assert_refusal_reaches_a_restored_copy(overrides, label)
+	local key_a = extra_tests.age_fact_key()
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	assert_true(first:track_outcome("exposure-banner", "score", 1))
+	assert_true(first:persist())
+	local settings = { app_id = "exposure-app" }
+	for key, value in pairs(overrides) do
+		settings[key] = value
+	end
+	local other = assert(sdk.new(config(settings)))
+	local exposures, outcomes = extra_tests.chunk_facts(other, "exposure-banner", key_a)
+	assert_true(exposures + outcomes > 0, "premise: " .. label .. " restored the refused subject's facts")
+
+	extra_tests.refuse(first, "age_ineligible")
+	local from = extra_tests.deliver_all(other)
+	local outcome = ("%s delivered under the refused key=%d"):format(
+		label, extra_tests.delivered_count(from, "exposure-banner", key_a))
+	print("restored copy scene: " .. outcome)
+	assert_equal(outcome, label .. " delivered under the refused key=0",
+		"the refusal reaches the copy " .. label .. " restored from the shared spool")
+	other:shutdown()
+	first:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_reaches_another_environments_restored_copy()
+	extra_tests.assert_refusal_reaches_a_restored_copy({ environment_id = "staging" }, "another environment's client")
+end
+
+function extra_tests.test_age_refusal_reaches_a_restored_copy_without_experiments()
+	extra_tests.assert_refusal_reaches_a_restored_copy({ experiments_enabled = false }, "a client without experiments")
+end
+
+function extra_tests.test_age_refusal_reaches_what_a_collected_sibling_spooled()
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	local second = extra_tests.sibling_of(first)
+	assert_true(second:session_start())
+	second:update(0.016)
+	assert_true(second:track_outcome("exposure-banner", "score", 1), "premise: the sibling records an outcome")
+	responder = extra_tests.batch_answer(503)
+	second:shutdown()
+	responder = nil
+	-- The game drops the shut-down client, and it is collected.
+	second = nil
+	collectgarbage("collect")
+	collectgarbage("collect")
+	if storage.spool_siblings then
+		assert_equal(#storage.spool_siblings(first.config, first), 0, "premise: the collected client left the registry")
+	end
+
+	extra_tests.refuse(first, "age_ineligible")
+	first:shutdown()
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local from = extra_tests.deliver_all(relaunch)
+	local outcome = ("after a relaunch, delivered=%d"):format(extra_tests.delivered_count(from, "exposure-banner"))
+	print("collected sibling scene: " .. outcome)
+	assert_equal(outcome, "after a relaunch, delivered=0",
+		"the refusal withdraws what a collected sibling spooled")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_fact_key_history_prune_counts_a_sibling_serving_the_key()
+	local key_a = extra_tests.age_fact_key()
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	-- The sibling restores and serves version 1 under key A; its own
+	-- exposure is delivered, so only the entry it serves carries A.
+	local second = extra_tests.sibling_of(first)
+	assert_true(second:session_start())
+	second:update(0.016)
+	assert_true(second:flush({ include_summaries = false }))
+	assert_equal(extra_tests.owed_count(second, "exposure-banner"), 0, "premise: the sibling owes nothing")
+	local exposures, outcomes = extra_tests.count_facts(second.queue.items, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "premise: the sibling holds no fact")
+
+	-- The first client republishes (A retires) and delivers its own facts,
+	-- then prunes.
+	extra_tests.admit_republished(first)
+	assert_true(first:flush({ include_summaries = false }))
+	first.experiments:prune_fact_key_history()
+	local disk = extra_tests.disk_history(first, "exposure-banner")
+
+	-- The sibling, still on version 1, records under A and spools; the
+	-- process dies, and the next launch is refused under key B.
+	assert_equal(second:experiment_variant("exposure-banner"), "control", "premise: the sibling still serves version 1")
+	assert_true(second:track_outcome("exposure-banner", "score", 1))
+	assert_true(second:persist())
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	extra_tests.refuse_with(relaunch, 2, extra_tests.republished_fact_key)
+	local from = extra_tests.deliver_all(relaunch)
+	local outcome = ("disk after the prune=[%s] delivered A=%d"):format(
+		extra_tests.named_keys(disk), extra_tests.delivered_count(from, "exposure-banner", key_a))
+	print("fact-key history served-key scene: " .. outcome)
+	assert_equal(outcome, "disk after the prune=[A] delivered A=0",
+		"the prune keeps a key a sibling still serves")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_fact_key_history_prune_counts_a_sibling_owing_the_key()
+	local key_a = extra_tests.age_fact_key()
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	assert_true(first:flush({ include_summaries = false }))
+	-- The sibling restores version 1 under key A behind a full queue: its
+	-- exposure under A stays owed, and it moves on to version 2 under B.
+	local second = assert(sdk.new(config({ app_id = "exposure-app", buffer_size = 1 })))
+	assert_true(second:track("filler-host-event"))
+	second:update(0.016)
+	extra_tests.admit_republished(second)
+	local owed_a = 0
+	for _, held in ipairs(second.experiments.pending_exposure["exposure-banner"] or {}) do
+		if held.entry and held.entry.subject_fact_key == key_a then
+			owed_a = owed_a + 1
+		end
+	end
+	assert_equal(owed_a, 1, "premise: the sibling owes the exposure under A")
+	local exposures, outcomes = extra_tests.count_facts(second.queue.items, "exposure-banner", key_a)
+	assert_equal(exposures + outcomes, 0, "premise: no fact under A is queued on the sibling")
+
+	-- The first client republishes too, delivers its own facts, and prunes.
+	extra_tests.admit_republished(first)
+	assert_true(first:flush({ include_summaries = false }))
+	first.experiments:prune_fact_key_history()
+	local disk = extra_tests.disk_history(first, "exposure-banner")
+
+	-- The sibling's owed exposure under A reaches its queue while the ingest
+	-- fails, so it is spooled; the process dies, and the next launch is
+	-- refused under key B.
+	responder = extra_tests.batch_answer(503)
+	second:flush({ include_summaries = false })
+	second:update(0.016)
+	second:flush({ include_summaries = false })
+	second:persist()
+	responder = nil
+	local spooled_a = select(1, extra_tests.disk_facts(second, "exposure-banner", key_a))
+	assert_equal(spooled_a, 1, "premise: the sibling's exposure under A is spooled")
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local restored_a = select(1, extra_tests.chunk_facts(relaunch, "exposure-banner", key_a))
+	extra_tests.refuse_with(relaunch, 2, extra_tests.republished_fact_key)
+	local from = extra_tests.deliver_all(relaunch)
+	local outcome = ("disk after the prune=[%s] restored under A=%d delivered A=%d"):format(
+		extra_tests.named_keys(disk), restored_a, extra_tests.delivered_count(from, "exposure-banner", key_a))
+	print("fact-key history owed-key scene: " .. outcome)
+	assert_equal(outcome, "disk after the prune=[A] restored under A=1 delivered A=0",
+		"the prune keeps a key a sibling's owed exposure carries")
+	relaunch:shutdown()
 	restore()
 	storage.reset()
 end
@@ -9678,6 +9884,12 @@ local tests = {
 	extra_tests.test_age_refusal_reaches_a_shut_down_siblings_spooled_facts,
 	extra_tests.test_age_refusal_fences_a_sibling_fetch_in_flight,
 	extra_tests.test_fact_key_history_prune_counts_a_sibling_clients_facts,
+	extra_tests.test_age_refusal_keeps_what_other_clients_spooled_since,
+	extra_tests.test_age_refusal_reaches_another_environments_restored_copy,
+	extra_tests.test_age_refusal_reaches_a_restored_copy_without_experiments,
+	extra_tests.test_age_refusal_reaches_what_a_collected_sibling_spooled,
+	extra_tests.test_fact_key_history_prune_counts_a_sibling_serving_the_key,
+	extra_tests.test_fact_key_history_prune_counts_a_sibling_owing_the_key,
 
 	test_config_validation,
 	test_flag_off_zero_paths,

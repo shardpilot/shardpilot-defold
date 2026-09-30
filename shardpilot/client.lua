@@ -1684,11 +1684,18 @@ function M.new(config, defer_init_diagnostics)
 				-- verbatim and must not egress on a later flush.
 				return client:purge_experiment_facts()
 			end,
-			withdraw_facts = function(experiment_key, fact_keys)
+			withdraw_facts = function(experiment_key, fact_keys, memory_only)
 				-- An age refusal withdrew ONE experiment's owed
 				-- applications for the refused subject: its facts already
 				-- accepted into the analytics pipeline must not egress.
-				return client:withdraw_experiment_facts(experiment_key, fact_keys)
+				return client:withdraw_experiment_facts(experiment_key, fact_keys, memory_only)
+			end,
+			reach_siblings = function(scope, experiment_key, fact_keys, resolved_at_ms, refused_fact_key)
+				client:reach_siblings_with_age_withdrawal(
+					scope, experiment_key, fact_keys, resolved_at_ms, refused_fact_key)
+			end,
+			sibling_live_fact_keys = function(experiment_key)
+				return client:sibling_live_experiment_fact_keys(experiment_key)
 			end,
 			capture_fact = function(event_name, props, event_id, overrides)
 				-- Drop-time durable capture: a durable entry delete with
@@ -2032,6 +2039,9 @@ function M.new(config, defer_init_diagnostics)
 		-- keeps that key.
 		client.experiments:on_spool_restored()
 	end
+	-- From here on the other clients of the app in the process reach this
+	-- one with their age refusals and count its facts in their prunes.
+	storage.register_client(normalized, client)
 	-- The retained receipts (reloaded above, before the spool) get their
 	-- delivery attempt after the whole init settled — the same dispatch
 	-- timing the load-at-the-end shape always had.
@@ -5582,7 +5592,65 @@ end
 -- durable spool record, converging through the settled/rewrite machinery
 -- when the store is down (the storage-down-through-exit residual family, as
 -- for the sentinel purge). Returns the number withdrawn.
-function Client:withdraw_experiment_facts(experiment_key, fact_keys)
+-- The spool FILE is shared by every client of the app in the process, and
+-- each client writes it from its own copy. What another client spooled (one
+-- that shut down, one garbage-collected since, or one that wrote after this
+-- client's copy was taken) is only in the file, so the file itself is
+-- filtered: a read-modify-write of its current content, which keeps
+-- everything else in it. An unreadable file is left alone.
+function Client:withdraw_experiment_facts_from_spool_file(matches)
+	local on_disk, retry_after_until_ms, err = storage.load_spool(self.config)
+	if err ~= nil or type(on_disk) ~= "table" then
+		return
+	end
+	local kept = {}
+	for i = 1, #on_disk do
+		if not matches(on_disk[i]) then
+			kept[#kept + 1] = on_disk[i]
+		end
+	end
+	if #kept < #on_disk then
+		storage.save_spool(self.config, kept,
+			self.config.spool_max_events, self.config.spool_max_bytes, retry_after_until_ms)
+	end
+end
+
+-- An age refusal this client received reaches every other client of the app
+-- in the process. Each drops the refused facts from its pipeline and its copy
+-- of the spool, whatever its scope and whether or not it runs experiments,
+-- since the spool it restored is shared. One that serves the same subject
+-- scope also withdraws its assignment state
+-- (Experiments:apply_sibling_age_withdrawal).
+function Client:reach_siblings_with_age_withdrawal(scope, experiment_key, fact_keys, resolved_at_ms, refused_fact_key)
+	local siblings = storage.spool_siblings(self.config, self)
+	for i = 1, #siblings do
+		siblings[i]:withdraw_experiment_facts(experiment_key, fact_keys, true)
+		if siblings[i].experiments then
+			siblings[i].experiments:apply_sibling_age_withdrawal(
+				scope, experiment_key, resolved_at_ms, refused_fact_key)
+		end
+	end
+end
+
+-- The subject-fact keys of `experiment_key` that the other clients of the
+-- app in the process hold facts under or may still build them under: their
+-- pipelines and copies of the spool, their owed snapshots, and the entries
+-- they serve.
+function Client:sibling_live_experiment_fact_keys(experiment_key)
+	local live = {}
+	local siblings = storage.spool_siblings(self.config, self)
+	for i = 1, #siblings do
+		for key in pairs(siblings[i]:live_experiment_fact_keys(experiment_key)) do
+			live[key] = true
+		end
+		if siblings[i].experiments then
+			siblings[i].experiments:add_held_fact_keys(experiment_key, live)
+		end
+	end
+	return live
+end
+
+function Client:withdraw_experiment_facts(experiment_key, fact_keys, memory_only)
 	local matches = refused_fact_matcher(experiment_key, fact_keys)
 	local withdrawn = queue.remove_matching(self.queue, matches)
 	if self.in_flight_batch then
@@ -5620,19 +5688,44 @@ function Client:withdraw_experiment_facts(experiment_key, fact_keys)
 		end
 		self.spool_batches = kept_chunks
 	end
-	-- Durable spool: the durable shadows of copies counted above, or of a
-	-- drop-time capture, or of a persist() snapshot taken before the
-	-- refusal — marked settled and rewritten away, never counted again.
-	local marked = false
-	for i = 1, #self.spool_record do
-		local env = self.spool_record[i]
-		if matches(env) and type(env.event_id) == "string" then
-			self.spool_settled[env.event_id] = true
-			marked = true
+	if memory_only then
+		-- Another client's refusal: this client's copy of the spool drops
+		-- the refused facts in memory only. The client that received the
+		-- refusal filters the shared file itself, and a write from this copy
+		-- would replace the file and could erase what other clients spooled
+		-- since the copy was taken.
+		local kept = {}
+		for i = 1, #self.spool_record do
+			if not matches(self.spool_record[i]) then
+				kept[#kept + 1] = self.spool_record[i]
+			end
 		end
-	end
-	if marked and not self:write_spool_record(self.spool_record) then
-		self.spool_rewrite_pending = true
+		if #kept < #self.spool_record then
+			self.spool_record = kept
+			self.spool_state = nil
+			self.spool_index = {}
+			for i = 1, #kept do
+				if type(kept[i].event_id) == "string" then
+					self.spool_index[kept[i].event_id] = true
+				end
+			end
+		end
+	else
+		-- Durable spool: the durable shadows of copies counted above, or of
+		-- a drop-time capture, or of a persist() snapshot taken before the
+		-- refusal — marked settled and rewritten away, never counted again.
+		local marked = false
+		for i = 1, #self.spool_record do
+			local env = self.spool_record[i]
+			if matches(env) and type(env.event_id) == "string" then
+				self.spool_settled[env.event_id] = true
+				marked = true
+			end
+		end
+		if marked and not self:write_spool_record(self.spool_record) then
+			self.spool_rewrite_pending = true
+		end
+		self:withdraw_experiment_facts_from_spool_file(matches)
 	end
 	if withdrawn > 0 then
 		self.stats.dropped = self.stats.dropped + withdrawn

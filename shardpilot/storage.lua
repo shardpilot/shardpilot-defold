@@ -2310,29 +2310,26 @@ local function sanitize_experiments_record(record)
 	return stored
 end
 
--- Every experiments consumer of this process, with the per-app namespace of
--- its files. Clients built with sdk.new in one process share the experiments
--- subject, the experiments record and the spool: an age refusal that lands on
--- one reaches the others, and the fact-key history's prune counts their
--- facts. Process memory, like the fallback records, so reset() forgets it
--- too. Weak keys: a consumer leaves with its client's garbage, not at
--- shutdown(), because what a shut-down client spooled is still on the shared
--- spool.
-local experiments_consumers = setmetatable({}, { __mode = "k" })
+-- Every client of this process, with the per-app namespace of its files.
+-- Clients of one app share the spool, and with experiments the subject and
+-- the experiments record: an age refusal that lands on one reaches the
+-- others, and the fact-key history's prune counts their facts. Every client
+-- joins, experiments or not, since each one restores and sends the shared
+-- spool. Process memory, like the fallback records, so reset() forgets it
+-- too. Weak keys: a client leaves with its garbage.
+local spool_clients = setmetatable({}, { __mode = "k" })
 
-function M.register_experiments_consumer(scope, consumer)
-	experiments_consumers[consumer] = spool_namespace(scope)
+function M.register_client(scope, client)
+	spool_clients[client] = spool_namespace(scope)
 end
 
--- The other consumers whose files are `consumer`'s.
-function M.experiments_siblings(consumer)
-	local namespace = experiments_consumers[consumer]
+-- The other registered clients whose files are those of `scope` (the asking
+-- client's configuration; it need not be registered yet).
+function M.spool_siblings(scope, client)
+	local namespace = spool_namespace(scope)
 	local out = {}
-	if namespace == nil then
-		return out
-	end
-	for other, other_namespace in pairs(experiments_consumers) do
-		if other ~= consumer and other_namespace == namespace then
+	for other, other_namespace in pairs(spool_clients) do
+		if other ~= client and other_namespace == namespace then
 			out[#out + 1] = other
 		end
 	end
@@ -2590,7 +2587,7 @@ function M.reset()
 	remote_config_memory = {}
 	experiments_memory = {}
 	experiments_clear_memory = {}
-	experiments_consumers = setmetatable({}, { __mode = "k" })
+	spool_clients = setmetatable({}, { __mode = "k" })
 end
 
 return M

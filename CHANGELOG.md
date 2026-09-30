@@ -31,17 +31,19 @@
   ([shardpilot/shardpilot-go#138](https://github.com/shardpilot/shardpilot-go/issues/138))
 - The `age_ineligible` withdrawal now reaches every client of the same app
   built with `sdk.new` in one process, not only the client that received the
-  refusal. Such clients share the player and the offline files, so another
-  client kept serving the refused experiment, delivered its own queued facts,
-  and could install the answer to a fetch it had sent before the refusal.
-  Each client that serves the same player in the same environment now stops
-  serving the experiment, withdraws its owed exposure and facts as the
-  receiving client does, and discards that older answer. A client that was
-  already shut down withdraws too, so the facts it wrote to the offline spool
-  at shutdown are not sent after a restart. The earlier subject
-  fact keys the refusal also reaches are kept while any of these clients
-  still holds a fact under one; before, one client could drop a key another
-  client's queued fact still needed.
+  refusal. Such clients share the offline spool, and with experiments the
+  player and the assignment cache, so another client kept serving the refused
+  experiment, delivered its own queued facts and the copies it restored from
+  the spool, and could install the answer to a fetch it had sent before the
+  refusal. Every client, in any environment and with or without experiments,
+  now drops the refused facts it holds. A client that serves the same player
+  in the same environment also stops serving the experiment, withdraws its
+  owed exposure, and discards that older answer. The refused facts are also
+  removed from the spool file itself, including any a client wrote there at
+  shutdown. The earlier subject fact keys the refusal also reaches are kept
+  while any of these clients holds a fact under one, owes one, or serves the
+  assignment that carries it; before, one client could drop a key another
+  client's facts still needed.
   ([#126](https://github.com/shardpilot/shardpilot-defold/issues/126))
 
 ## v0.11.1 — 2026-09-29 — undeclared cached experiment assignments are not restored
