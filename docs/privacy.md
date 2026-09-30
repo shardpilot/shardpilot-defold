@@ -214,9 +214,15 @@ consent rules), but it means an at-rest review must account for them.
   also removes that experiment's undelivered exposure and outcome facts for
   the refused player from the offline event spool, matched by the player's
   subject fact key; when neither the response nor the player's cached
-  assignment or owed exposure carries one, they are left in place. A fetch
-  declaring a non-adult age that ends without the server's answer (for
-  example, a transient failure) removes the same data.
+  assignment or owed exposure carries one, they are left in place. The same
+  record also keeps a `fact_key_history` section: per experiment, the
+  server-minted `subject_fact_key` values of the player's earlier assignments
+  (a republished version rotates the key; a kill switch removes the
+  assignment) for as long as an undelivered fact still carries one, so a
+  later `age_ineligible` refusal can withdraw those facts too. A key leaves
+  the section once its last fact is delivered, dropped or withdrawn.
+  A fetch declaring a non-adult age that ends without the server's answer
+  (for example, a transient failure) removes the same data.
 - **Experiment clear marker** — not merely a timestamp: it stores a timestamp
   **and the record scope**. That scope is a derived string over the workspace
   id, environment id, the SDK-minted subject id, the remote-config base URL,

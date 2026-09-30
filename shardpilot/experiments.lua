@@ -963,6 +963,60 @@ end
 local Experiments = {}
 Experiments.__index = Experiments
 
+-- The fact-key history's two shapes: memory holds experiment_key →
+-- { [fact_key] = true }; the durable section (and every read of it) holds
+-- experiment_key → a sorted list of fact keys. Fold a durable-shaped
+-- `lists` into memory's `history`.
+local function add_fact_keys(history, lists)
+	if type(lists) ~= "table" then
+		return
+	end
+	for experiment_key, keys in pairs(lists) do
+		for i = 1, #keys do
+			local set = history[experiment_key] or {}
+			set[keys[i]] = true
+			history[experiment_key] = set
+		end
+	end
+end
+
+-- Memory's history in the durable shape: sorted lists, empty sets left out.
+local function listed_fact_keys(history)
+	local out = {}
+	for experiment_key, set in pairs(history) do
+		local list = {}
+		for key in pairs(set) do
+			list[#list + 1] = key
+		end
+		if list[1] then
+			table.sort(list)
+			out[experiment_key] = list
+		end
+	end
+	return out
+end
+
+-- True when two durable-shaped histories hold the same keys.
+local function same_fact_keys(a, b)
+	for experiment_key, list in pairs(a) do
+		local other = b[experiment_key]
+		if other == nil or #other ~= #list then
+			return false
+		end
+		for i = 1, #list do
+			if other[i] ~= list[i] then
+				return false
+			end
+		end
+	end
+	for experiment_key in pairs(b) do
+		if a[experiment_key] == nil then
+			return false
+		end
+	end
+	return true
+end
+
 -- `config` is the client's normalized configuration. `deps` wires the client
 -- without import cycles:
 --   * subject_id()          — the persisted subject-id candidate (raw; the
@@ -979,7 +1033,10 @@ Experiments.__index = Experiments
 --                             identity rules applied there). `overrides`
 --                             carries the ARM-TIME identity of an owed fact
 --                             ({ session_id, anonymous_id, event_ts }); a
---                             missing field means "stamp the current value".
+--                             missing field means "stamp the current value";
+--   * live_fact_keys(key)   — the set of subject-fact keys this experiment's
+--                             facts on the analytics pipeline still carry
+--                             (the fact-key history's liveness question).
 function M.new(config, deps)
 	local ex = setmetatable({
 		config = config,
@@ -1018,6 +1075,30 @@ function M.new(config, deps)
 		-- 401/403 canon retains the durable record) while authoritative
 		-- drops still land.
 		durable_pending = {},
+		-- The FACT-KEY HISTORY of one scope (one subject's record):
+		-- experiment_key → { [fact_key] = true } for subject-fact keys that
+		-- live facts of the experiment may still carry although no cached
+		-- entry does. The server rotates the key on every published
+		-- version, and a drop deletes the entry, so a fact built under an
+		-- earlier entry (queued, in flight, spooled, owed) would otherwise
+		-- be unmatchable by a later age refusal. Keys ENTER at the durable
+		-- write that retires them (sync_durable_entry) and LEAVE when no
+		-- live fact references them (prune_history). Mirrored in the
+		-- durable record's `fact_key_history` section.
+		fact_key_history = {},
+		fact_key_history_scope = nil,
+		-- experiment_key → the subject-fact key of the entry the last
+		-- durable sync of that key converged toward (same scope as the
+		-- history). A sync toward another key retires this one even when
+		-- the disk never held it (a failed or cap-evicted write).
+		synced_fact_keys = {},
+		-- Liveness is unknown until the client restored its spool: until
+		-- then the history only grows, never prunes (a restored chunk may
+		-- still carry a retired key).
+		fact_keys_restored = false,
+		-- Facts left the pipeline outside a settle or a durable write (cap
+		-- eviction, a consent or sentinel purge): the next tick prunes.
+		fact_key_prune_owed = false,
 		durable_clear_pending = false,
 		-- The SCOPE the owed whole-record clear was decided for: the record
 		-- file is shared across assignment scopes in this app namespace,
@@ -1145,10 +1226,22 @@ function M.new(config, deps)
 	if subject then
 		local record = storage.load_experiments(config)
 		if record and record.scope == ex:scope_for(subject) then
+			-- The history is this subject's whatever the entries' fate
+			-- below: it names facts, not assignments to serve, and the
+			-- first prune (after the spool restore) keeps only keys a live
+			-- fact still carries.
+			ex:history_of(record.scope)
+			add_fact_keys(ex.fact_key_history, record.fact_key_history)
 			local record_condemned = (condemned_stamp ~= nil
 				and (condemned_scope == nil or condemned_scope == record.scope))
 				or condemned_miss == "unreadable"
 			for key, entry in pairs(record.entries) do
+				-- Memory's side of the retirement starts from the key the
+				-- record holds (sync_durable_entry): a later replace or drop
+				-- retires it even when the disk that write diffs against no
+				-- longer shows it (the size cap evicted it, or a read came
+				-- back empty).
+				ex.synced_fact_keys[key] = entry.subject_fact_key
 				local stored_at = type(entry.fetched_at_ms) == "number"
 					and entry.fetched_at_ms or 0
 				-- A client-id assignment stored without an age declaration
@@ -1452,6 +1545,8 @@ function Experiments:on_analytics_purge()
 	for key in pairs(self.entries) do
 		self.pending_rearm[key] = true
 	end
+	-- The purged facts no longer hold their history keys.
+	self.fact_key_prune_owed = true
 end
 
 -- Materialize the purge/denied-restore re-arm INTENTS at the moment consent
@@ -1531,6 +1626,134 @@ function Experiments:durable_record_for(scope)
 		record == nil and miss == "unreadable" and "unreadable" or nil
 end
 
+-- ── the fact-key history ──────────────────────────────────────────────────────
+--
+-- Per (experiment, subject): the subject-fact keys that live facts may still
+-- carry after the entry that minted them left the record. The server rotates
+-- the key on every published version, so a republish replaces it; a drop
+-- deletes it, and a kill switch's drop-time capture is a plain envelope whose
+-- key is all that ties it to the subject. An age refusal withdraws facts
+-- under these keys too (apply_age_withdrawal). A key stays while any live
+-- fact references it — queued, in the retained or on-the-wire batch, in a
+-- loaded spool chunk, in the durable spool less its settled entries, or in an
+-- owed exposure snapshot — and is pruned once the last one is delivered,
+-- dropped or withdrawn. No count bound: the spool's own caps bound it. The
+-- record is one subject's, so memory holds one scope's history at a time.
+
+-- Memory's history for `scope`. Another scope (a re-mint) starts empty: the
+-- retired subject can no longer be refused, every outcome being scope-fenced.
+function Experiments:history_of(scope)
+	if self.fact_key_history_scope ~= scope then
+		self.fact_key_history_scope = scope
+		self.fact_key_history = {}
+		self.synced_fact_keys = {}
+	end
+	return self.fact_key_history
+end
+
+-- Retire `fact_key` of `experiment_key` into `scope`'s history.
+function Experiments:retire_fact_key(scope, experiment_key, fact_key)
+	if type(fact_key) ~= "string" or fact_key == "" then
+		return
+	end
+	local history = self:history_of(scope)
+	local set = history[experiment_key] or {}
+	set[fact_key] = true
+	history[experiment_key] = set
+end
+
+-- Drop from `history` every key no live fact references any more: the
+-- client's pipeline surfaces (deps.live_fact_keys) plus this consumer's owed
+-- snapshots. A no-op until the spool is restored — pruning earlier would
+-- forget a key that a chunk about to be restored still carries.
+function Experiments:prune_history(history)
+	if not self.fact_keys_restored or not self.deps.live_fact_keys then
+		return
+	end
+	for experiment_key, set in pairs(history) do
+		local live = self.deps.live_fact_keys(experiment_key) or {}
+		local owed = self.pending_exposure[experiment_key]
+		if type(owed) == "table" then
+			for i = 1, #owed do
+				local held = owed[i].entry
+				if held and type(held.subject_fact_key) == "string" then
+					live[held.subject_fact_key] = true
+				end
+			end
+		end
+		for key in pairs(set) do
+			if not live[key] then
+				set[key] = nil
+			end
+		end
+		if next(set) == nil then
+			history[experiment_key] = nil
+		end
+	end
+end
+
+-- The history a durable write of `scope`'s record carries: memory's plus the
+-- record's own section (`on_disk`, durable shape), pruned. Memory adopts the
+-- result whether or not the write then lands, so a failed write loses no key.
+function Experiments:settle_fact_key_history(scope, on_disk)
+	local history = self:history_of(scope)
+	add_fact_keys(history, on_disk)
+	self:prune_history(history)
+	return listed_fact_keys(history)
+end
+
+-- Write `record` (the durable record of the history's scope, or a fresh
+-- stub for it) when its section differs from the settled history. A stub
+-- is written only when a history remains to carry. Best-effort, like a
+-- prune: a failed save leaves the key in memory for the next write that
+-- lands.
+function Experiments:save_fact_key_history(record)
+	local on_disk = record.fact_key_history or {}
+	local settled = self:settle_fact_key_history(record.scope, on_disk)
+	if not same_fact_keys(settled, on_disk) then
+		record.fact_key_history = settled
+		storage.save_experiments(self.config, record)
+	end
+end
+
+-- Prune the current subject's history, and rewrite the durable section when
+-- it changed. Runs after a publish settles, after an age withdrawal, at load
+-- once the spool is restored, and on the tick after a cap eviction or a
+-- purge. Best-effort: a failed save leaves a key on disk that the next write
+-- or prune removes, and nothing is owed. Only an existing record of this
+-- scope is rewritten; creating one is the durable write's business.
+function Experiments:prune_fact_key_history()
+	self.fact_key_prune_owed = false
+	if next(self.fact_key_history) == nil then
+		-- The common case, answered without a read: memory holds every key
+		-- this process retired or loaded.
+		return
+	end
+	local subject = self:current_subject_id()
+	if not subject then
+		return
+	end
+	local scope = self:scope_for(subject)
+	if next(self:history_of(scope)) == nil then
+		return
+	end
+	local record = storage.load_experiments(self.config)
+	local on_disk = record and record.scope == scope
+		and record.fact_key_history or nil
+	local settled = self:settle_fact_key_history(scope, on_disk)
+	if on_disk and not same_fact_keys(settled, on_disk) then
+		record.fact_key_history = settled
+		storage.save_experiments(self.config, record)
+	end
+end
+
+-- The client restored its spool (or had none to restore): liveness is known
+-- from here on, and the history loaded with the record prunes now.
+function Experiments:on_spool_restored()
+	self.fact_keys_restored = true
+	self:prune_fact_key_history()
+end
+
 -- Converge one experiment's durable entry to the in-memory truth: an entry
 -- present in memory is written, an absent one is dropped. `as_of_ms` stamps
 -- the state change (the entry's own fetch time for a write, the resolution
@@ -1555,7 +1778,25 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 		-- snapshot, and the write lands from it.
 		entry = prior.entry
 	end
+	-- Memory's side of the fact-key retirement: the key memory converged
+	-- this experiment toward last time leaves when this sync converges
+	-- toward another key or none. Retired before any early return below,
+	-- so a write that yields, fails, or finds nothing stored to drop still
+	-- keeps it for the next write that lands.
+	self:history_of(scope)
+	local converging = entry and entry.subject_fact_key or nil
+	if self.synced_fact_keys[experiment_key] ~= converging then
+		self:retire_fact_key(scope, experiment_key,
+			self.synced_fact_keys[experiment_key])
+		self.synced_fact_keys[experiment_key] = converging
+	end
 	local record, record_miss = self:durable_record_for(scope)
+	-- The durable side: every entry's key as the record holds it now,
+	-- diffed below against what this write leaves.
+	local stored_fact_keys = {}
+	for key, held in pairs(record.entries) do
+		stored_fact_keys[key] = held.subject_fact_key
+	end
 	local stored = record.entries[experiment_key]
 	local as_of = type(as_of_ms) == "number" and as_of_ms or 0
 	if entry then
@@ -1615,6 +1856,12 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 				return false
 			end
 			self.durable_pending[composite] = nil
+			-- Nothing is stored to drop: the entry never reached the disk
+			-- (its own write failed, or the size cap evicted it). The key
+			-- this sync just retired can still name spooled facts, so the
+			-- record's section takes it now; otherwise a relaunch would
+			-- have no key to withdraw them by.
+			self:save_fact_key_history(record)
 			return true
 		end
 		local deciding = not is_retry
@@ -1682,6 +1929,19 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 			end
 		end
 	end
+	-- A key that leaves the record's entries in this write — replaced by an
+	-- install under another version's key, or deleted by any drop (a kill
+	-- switch's included: its drop body is untouched, it reaches the disk
+	-- only through here) — is retired into the fact-key history IN THIS
+	-- SAME WRITE, and the section the record carries is settled with it.
+	for key, fact_key in pairs(stored_fact_keys) do
+		local kept = record.entries[key]
+		if kept == nil or kept.subject_fact_key ~= fact_key then
+			self:retire_fact_key(scope, key, fact_key)
+		end
+	end
+	record.fact_key_history = self:settle_fact_key_history(scope,
+		record.fact_key_history)
 	local record_saved, cap_evicted = storage.save_experiments(self.config, record)
 	if record_saved then
 		if type(cap_evicted) == "number" and cap_evicted > 0 then
@@ -2758,8 +3018,10 @@ end
 --   * the durable entry drop converges exactly as apply_entry_drop's does.
 -- SCOPE: this experiment key and this subject, never plane-wide — other
 -- experiments' owed facts are legitimate and untouched. The subject's facts
--- are named by its server-minted fact key: the dropped entry's, the refusal
--- body's, and that of any owed snapshot of this same subject. When none is
+-- are named by its server-minted fact keys: the dropped entry's, the refusal
+-- body's, that of any owed snapshot of this same subject, and the ones the
+-- fact-key history retired for this experiment (an earlier version's, or an
+-- entry a kill switch deleted). When none is
 -- known, no accepted fact is withdrawn: the experiment key alone would take
 -- another subject's legitimate facts with it. Owed snapshots are told apart
 -- by their own subject and need no fact key (one restored without a subject
@@ -2791,6 +3053,13 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 	end
 	refuse_fact_key(dropped and dropped.subject_fact_key)
 	refuse_fact_key(refused_fact_key)
+	-- The fact-key history: this subject's keys of the experiment that no
+	-- entry carries any more — a republish rotated the key, or a drop (a
+	-- kill switch's included) deleted the entry — while facts under them are
+	-- still queued, spooled or captured.
+	for fact_key in pairs(self:history_of(scope)[experiment_key] or {}) do
+		refuse_fact_key(fact_key)
+	end
 	local owed = self.pending_exposure[experiment_key]
 	if type(owed) == "table" then
 		for i = 1, #owed do
@@ -2845,15 +3114,19 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 	if self.deps.withdraw_facts then
 		self.deps.withdraw_facts(experiment_key, fact_keys)
 	end
-	if keep_assignment then
-		return
+	if not keep_assignment then
+		local as_of = type(resolved_at_ms) == "number" and resolved_at_ms or 0
+		if dropped and type(dropped.fetched_at_ms) == "number"
+			and dropped.fetched_at_ms >= as_of then
+			as_of = dropped.fetched_at_ms + 1
+		end
+		self:sync_durable_entry(scope, experiment_key, as_of)
 	end
-	local as_of = type(resolved_at_ms) == "number" and resolved_at_ms or 0
-	if dropped and type(dropped.fetched_at_ms) == "number"
-		and dropped.fetched_at_ms >= as_of then
-		as_of = dropped.fetched_at_ms + 1
-	end
-	self:sync_durable_entry(scope, experiment_key, as_of)
+	-- The withdrawn facts are gone: their keys leave the history, durably,
+	-- even when the sync above found nothing stored to write (a kill switch
+	-- already dropped the entry). A fact the withdrawal could not recall (a
+	-- batch on the wire) keeps its key until that batch settles.
+	self:prune_fact_key_history()
 end
 
 -- Apply ONLY the destructive half of an authoritative server outcome —
@@ -3606,6 +3879,11 @@ function Experiments:tick(_)
 	-- kill drop decided under grant must land durably even if consent
 	-- flipped meanwhile.
 	self:retry_durable_sync()
+	if self.fact_key_prune_owed then
+		-- Facts left the pipeline outside a settle (cap eviction, a purge):
+		-- the same housekeeping, whatever the consent state.
+		self:prune_fact_key_history()
+	end
 	if consent_refusal(self.deps.consent()) then
 		return
 	end
