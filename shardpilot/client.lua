@@ -1690,9 +1690,9 @@ function M.new(config, defer_init_diagnostics)
 				-- accepted into the analytics pipeline must not egress.
 				return client:withdraw_experiment_facts(experiment_key, fact_keys, memory_only)
 			end,
-			reach_siblings = function(scope, experiment_key, fact_keys, resolved_at_ms, refused_fact_key)
+			reach_siblings = function(scope, experiment_key, fact_keys, resolved_at_ms, refused_fact_key, keep_assignment)
 				client:reach_siblings_with_age_withdrawal(
-					scope, experiment_key, fact_keys, resolved_at_ms, refused_fact_key)
+					scope, experiment_key, fact_keys, resolved_at_ms, refused_fact_key, keep_assignment)
 			end,
 			sibling_live_fact_keys = function(experiment_key)
 				return client:sibling_live_experiment_fact_keys(experiment_key)
@@ -5620,14 +5620,15 @@ end
 -- of the spool, whatever its scope and whether or not it runs experiments,
 -- since the spool it restored is shared. One that serves the same subject
 -- scope also withdraws its assignment state
--- (Experiments:apply_sibling_age_withdrawal).
-function Client:reach_siblings_with_age_withdrawal(scope, experiment_key, fact_keys, resolved_at_ms, refused_fact_key)
+-- (Experiments:apply_sibling_age_withdrawal), keeping a synthetic-subject
+-- assignment when the withdrawal keeps it (`keep_assignment`).
+function Client:reach_siblings_with_age_withdrawal(scope, experiment_key, fact_keys, resolved_at_ms, refused_fact_key, keep_assignment)
 	local siblings = storage.spool_siblings(self.config, self)
 	for i = 1, #siblings do
 		siblings[i]:withdraw_experiment_facts(experiment_key, fact_keys, true)
 		if siblings[i].experiments then
 			siblings[i].experiments:apply_sibling_age_withdrawal(
-				scope, experiment_key, resolved_at_ms, refused_fact_key)
+				scope, experiment_key, resolved_at_ms, refused_fact_key, keep_assignment)
 		end
 	end
 end
@@ -6804,6 +6805,11 @@ end
 
 function Client:shutdown(reason)
 	-- Shutdown always uses app_final; caller reasons belong to session_end().
+	-- An experiment fetch still in flight is abandoned here: a non-adult age
+	-- declaration riding one ends now, unanswered, before the final flush.
+	if self.experiments then
+		self.experiments:abort_declarations()
+	end
 	-- One more chance for an owed denied/disabled purge to land before
 	-- teardown (flush below retries it too; a still-failing purge is re-run
 	-- at the next launch by the persisted denial/disabled configuration).

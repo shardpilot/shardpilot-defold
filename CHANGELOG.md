@@ -29,6 +29,29 @@
   the section and drops it when it rewrites the record. `kill_switch` still
   keeps and delivers owed facts.
   ([shardpilot/shardpilot-go#138](https://github.com/shardpilot/shardpilot-go/issues/138))
+- A non-adult age declaration now takes effect when it is made, not only when
+  the server answers it. From the moment a fetch declares `age_band` or
+  `custom_attribute_age_band` as anything other than exactly `adult` for an
+  experiment, and until that fetch ends, `experiment_variant` and
+  `experiment_payload` return `nil` for it, `track_exposure` and
+  `track_outcome` return `no_assignment`, revalidation does not re-send the
+  earlier declaration, and an exposure still owed in memory for it is not
+  emitted. An answer from the server applies as before: `age_ineligible`
+  withdraws what the player owes, `kill_switch` keeps it. If the fetch ends
+  without one (a transient failure such as a `503` or a timeout, a
+  `401`/`403`, a consent refusal, a superseded response, or a `shutdown()`
+  while it is in flight), the experiment is withdrawn as for
+  `age_ineligible`: the cached assignment leaves memory and disk, and the
+  player's owed exposure and undelivered facts for it are withdrawn. A
+  response to an earlier fetch of that experiment that arrives afterwards
+  installs nothing. Before, the cached adult assignment kept serving and
+  recording, and revalidation kept declaring `adult`. A later `adult`
+  declaration is decided by its own fetch, and a re-admitted player is
+  exposed again under a new event id. A synthetic-subject assignment, which
+  has no age gate, keeps serving (while the declaration is pending it records
+  no outcome under a server fact key): an unanswered declaration keeps it and
+  withdraws only the client-id applications still owed from before it.
+  ([#125](https://github.com/shardpilot/shardpilot-defold/issues/125))
 - The `age_ineligible` withdrawal now reaches every client of the same app
   built with `sdk.new` in one process, not only the client that received the
   refusal. Such clients share the offline spool, and with experiments the
