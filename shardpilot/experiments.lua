@@ -2826,16 +2826,19 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 	end
 	if not keep_assignment then
 		self.pending_rearm[experiment_key] = nil
-		if subject then
-			local prefix = experiment_key .. "\31"
-			local suffix = "\31" .. subject
-			for tuple, exposed in pairs(self.exposed) do
-				if tuple:sub(1, #prefix) == prefix and tuple:sub(-#suffix) == suffix then
-					local retired = self.session_marker .. "\31" .. tuple
-					self.retired_arms[retired] = math.max(
-						self.retired_arms[retired] or 0, exposed.arm + 1)
-					self.exposed[tuple] = nil
-				end
+	end
+	-- The withdrawn applications' exposure slots are retired even when a
+	-- synthetic-subject assignment is kept: a re-admission later in the
+	-- session is a new application, exposed with a fresh id.
+	if subject then
+		local prefix = experiment_key .. "\31"
+		local suffix = "\31" .. subject
+		for tuple, exposed in pairs(self.exposed) do
+			if tuple:sub(1, #prefix) == prefix and tuple:sub(-#suffix) == suffix then
+				local retired = self.session_marker .. "\31" .. tuple
+				self.retired_arms[retired] = math.max(
+					self.retired_arms[retired] or 0, exposed.arm + 1)
+				self.exposed[tuple] = nil
 			end
 		end
 	end

@@ -9703,6 +9703,45 @@ function extra_tests.test_age_unanswered_declaration_withdraws_client_id_beneath
 	storage.reset()
 end
 
+-- An unanswered declaration that keeps a synthetic-subject assignment still
+-- retires the withdrawn client-id application's exposure slot: a later adult
+-- re-admission to the same client-id version is a new application, exposed
+-- with a fresh id.
+function extra_tests.test_age_unanswered_declaration_keeping_synthetic_reopens_client_id_exposure()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	local withdrawn = queued_events(client, "experiment_exposure")[1]
+	assert_true(withdrawn ~= nil, "setup: the client-id application's exposure is queued")
+	-- A republished version, so the synthetic assignment is not the client-id one.
+	next_response_body = extra_tests.synthetic_body(false, 2)
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) result = value end)
+	assert_true(result ~= nil and result.assigned, "setup: the synthetic assignment installs")
+	extra_tests.declare_unconfirmed(client)
+	assert_equal(client:experiment_variant("exposure-banner"), "control", "setup: the synthetic assignment is kept")
+	next_status = 200
+	next_response_body = extra_tests.age_golden("adult")
+	result = nil
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) result = value end)
+	local check, verify = extra_tests.checklist()
+	check(result ~= nil and result.assigned and not result.from_cache, "the adult re-admission must install")
+	local fresh = 0
+	for _, exposure in ipairs(queued_events(client, "experiment_exposure")) do
+		if exposure.event_id ~= withdrawn.event_id then
+			fresh = fresh + 1
+		end
+	end
+	check(fresh == 1, "the re-admission beneath a kept synthetic assignment must be exposed once with a fresh id: "
+		.. fresh .. " fresh exposure(s) queued (withdrawn " .. tostring(withdrawn.event_id) .. ")")
+	verify("re-admission beneath a kept synthetic")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
 -- A synthetic-subject assignment can carry a server fact key. While a
 -- non-adult declaration of the experiment is pending, it keeps serving but
 -- records no outcome under that key; once the declaration's fetch fails it
@@ -10196,6 +10235,7 @@ local tests = {
 	extra_tests.test_age_declaration_blocks_stale_grammar_retry,
 	extra_tests.test_age_unanswered_declaration_keeping_synthetic_still_fences,
 	extra_tests.test_age_unanswered_declaration_withdraws_client_id_beneath_synthetic,
+	extra_tests.test_age_unanswered_declaration_keeping_synthetic_reopens_client_id_exposure,
 	extra_tests.test_age_declaration_pending_refuses_synthetic_keyed_outcome,
 	extra_tests.test_age_declaration_answered_by_its_grammar_retry,
 	extra_tests.test_age_adult_declaration_after_unconfirmed_one_is_new_application,
