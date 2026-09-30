@@ -5450,6 +5450,24 @@ local function filter_batch_facts(batch, matches)
 	return removed
 end
 
+-- A fact purge or withdrawal just emptied the restored spool chunks. A
+-- deadline restored with them (or armed by their last attempt) belonged to
+-- that work; with no restored chunk and no retained batch left, nothing it
+-- was set for remains, so it is cleared, as it is for an emptied retained
+-- batch (the consent-purge stale-deadline rule). Left armed, it would hold an
+-- unrelated later event, even from an explicit flush(), for up to the
+-- Retry-After cap. The durable record drops it at its next write. A batch on
+-- the wire keeps the deadline: its settle decides.
+function Client:clear_emptied_restore_deferral()
+	if #self.spool_batches > 0 or self.in_flight_batch ~= nil then
+		return
+	end
+	self.publish_retry_after_ms = nil
+	self.publish_server_retry_after_ms = nil
+	self.publish_backoff_attempt = 0
+	self.spool_retry_after_ms = nil
+end
+
 -- Purge experiment facts from every analytics pipeline surface. Invoked by
 -- the experiments consumer when the real-subjects sentinel lands: the
 -- withdrawn subject-fact keys ride these facts verbatim, and a fact that
@@ -5503,6 +5521,7 @@ function Client:purge_experiment_facts()
 			end
 		end
 		self.spool_batches = kept_chunks
+		self:clear_emptied_restore_deferral()
 	end
 	-- Durable spool: mark the fact envelopes settled — every successful
 	-- write drops settled entries — and attempt the rewrite immediately; a
@@ -5619,6 +5638,7 @@ function Client:withdraw_experiment_facts(experiment_key, fact_keys)
 			end
 		end
 		self.spool_batches = kept_chunks
+		self:clear_emptied_restore_deferral()
 	end
 	-- Durable spool: the durable shadows of copies counted above, or of a
 	-- drop-time capture, or of a persist() snapshot taken before the
