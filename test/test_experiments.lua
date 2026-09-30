@@ -9366,6 +9366,53 @@ function extra_tests.test_fact_key_retired_by_dropping_an_unwritten_entry_surviv
 	storage.reset()
 end
 
+-- Version 1's entry is RESTORED from disk, and the republish's write then
+-- finds no record to diff against (the read came back empty, as it does
+-- after the size cap evicted the entry): only the key the restore seeded
+-- can retire A.
+function extra_tests.test_restored_key_retires_when_the_disk_no_longer_shows_it()
+	local key_a, key_b = extra_tests.age_fact_key(), extra_tests.republished_fact_key
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	assert_true(first:track_outcome("exposure-banner", "score", 1))
+	assert_true(first:persist())
+	storage.reset() -- SIMULATED PROCESS DEATH: version 1's facts are spooled under A
+
+	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	assert_equal(second:experiment_variant("exposure-banner"), "control", "version 1's entry restored")
+	assert_true(second:session_start())
+	-- The restored exposure drains into the pipeline; the batch fails, so
+	-- A's facts stay live (retained or spooled) and nothing owed names A.
+	responder = extra_tests.batch_answer(503)
+	second:update(0.016)
+	second:flush({ include_summaries = false })
+	responder = nil
+	assert_nil(second.experiments.pending_exposure["exposure-banner"], "the restored exposure left the owed records")
+	local live = second:live_experiment_fact_keys("exposure-banner")
+	assert_true(live[key_a] == true, "facts under A are live before the republish")
+	local saved_load = sys.load
+	sys.load = function(path)
+		if path:sub(-#"/experiments") == "/experiments" then
+			return nil
+		end
+		return saved_load(path)
+	end
+	extra_tests.admit_republished(second)
+	sys.load = saved_load
+	local disk = extra_tests.disk_history(second, "exposure-banner")
+	extra_tests.refuse_with(second, 2, key_b)
+	local from = extra_tests.deliver_all(second)
+	local a = extra_tests.delivered_count(from, "exposure-banner", key_a)
+	print(("fact-key history scene, restored key the disk no longer shows: disk=[%s] delivered A=%d")
+		:format(extra_tests.named_keys(disk), a))
+	assert_equal(disk, key_a, "the republish retires the restored key A")
+	assert_equal(a, 0, "no fact under the restored key A is delivered")
+	second:shutdown()
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	extra_tests.test_age_remote_config_keeps_targeting_rules,
 	extra_tests.test_age_api_lifecycle_precedes_arguments,
@@ -9408,6 +9455,7 @@ local tests = {
 	extra_tests.test_age_refusal_after_kill_withdraws_captured_facts_after_relaunch,
 	extra_tests.test_fact_key_retired_when_its_entry_never_reached_disk,
 	extra_tests.test_fact_key_retired_by_dropping_an_unwritten_entry_survives_relaunch,
+	extra_tests.test_restored_key_retires_when_the_disk_no_longer_shows_it,
 
 	test_config_validation,
 	test_flag_off_zero_paths,

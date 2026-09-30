@@ -1187,6 +1187,12 @@ function M.new(config, deps)
 				and (condemned_scope == nil or condemned_scope == record.scope))
 				or condemned_miss == "unreadable"
 			for key, entry in pairs(record.entries) do
+				-- Memory's side of the retirement starts from the key the
+				-- record holds (sync_durable_entry): a later replace or drop
+				-- retires it even when the disk that write diffs against no
+				-- longer shows it (the size cap evicted it, or a read came
+				-- back empty).
+				ex.synced_fact_keys[key] = entry.subject_fact_key
 				local stored_at = type(entry.fetched_at_ms) == "number"
 					and entry.fetched_at_ms or 0
 				-- A client-id assignment stored without an age declaration
