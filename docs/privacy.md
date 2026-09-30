@@ -221,6 +221,8 @@ consent rules), but it means an at-rest review must account for them.
   assignment) for as long as an undelivered fact still carries one, so a
   later `age_ineligible` refusal can withdraw those facts too. A key leaves
   the section once its last fact is delivered, dropped or withdrawn.
+  A fetch declaring a non-adult age that ends without the server's answer
+  (for example, a transient failure) removes the same data.
 - **Experiment clear marker** — not merely a timestamp: it stores a timestamp
   **and the record scope**. That scope is a derived string over the workspace
   id, environment id, the SDK-minted subject id, the remote-config base URL,
