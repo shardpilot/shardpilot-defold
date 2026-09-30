@@ -9457,6 +9457,148 @@ function extra_tests.test_cap_evicted_entry_key_survives_relaunch()
 	storage.reset()
 end
 
+-- ── sibling clients ──────────────────────────────────────────────────────────
+--
+-- Two clients built with sdk.new in one process share the experiments subject
+-- and the per-app files: the experiments record and the spool. An age refusal
+-- that lands on one reaches the other, and the fact-key history's prune counts
+-- the live facts of both.
+
+-- A second client of the golden fixtures' app, beside `first`.
+function extra_tests.sibling_of(first)
+	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	assert_equal(second.experiments:current_subject_id(), first.experiments:current_subject_id(),
+		"premise: the sibling shares the subject")
+	return second
+end
+
+function extra_tests.test_age_refusal_reaches_a_sibling_client()
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	extra_tests.admit(first, "exp-other")
+	local second = extra_tests.sibling_of(first)
+	assert_true(second:session_start())
+	second:update(0.016)
+	assert_equal(second:experiment_variant("exposure-banner"), "control",
+		"premise: the sibling serves the restored assignment")
+	assert_true(second:track_outcome("exposure-banner", "score", 1), "premise: the sibling records an outcome")
+	assert_true(second:track_outcome("exp-other", "score", 1), "premise: and one of another experiment")
+
+	extra_tests.refuse(first, "age_ineligible")
+	local served = second:experiment_variant("exposure-banner")
+	local owed = extra_tests.owed_count(second, "exposure-banner")
+	local from = extra_tests.deliver_all(second)
+	local outcome = ("sibling serves=%s owed=%d delivered: refused experiment=%d other experiment=%d"):format(
+		tostring(served), owed,
+		extra_tests.delivered_count(from, "exposure-banner"),
+		extra_tests.delivered_count(from, "exp-other"))
+	print("sibling age refusal scene: " .. outcome)
+	assert_equal(outcome,
+		"sibling serves=nil owed=0 delivered: refused experiment=0 other experiment=2",
+		"the refusal withdraws the sibling's facts of the refused experiment only")
+	second:shutdown()
+	first:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_leaves_a_sibling_of_another_scope()
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	-- Another environment of the same app: the same files and subject id,
+	-- another scope.
+	local other = assert(sdk.new(config({ app_id = "exposure-app", environment_id = "staging" })))
+	assert_true(other:session_start())
+	next_response_body = extra_tests.age_golden("adult")
+		:gsub('"environment_key":"develop"', '"environment_key":"staging"', 1)
+	local result
+	other:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) result = value end)
+	assert_true(result and result.ok and result.assigned, "premise: the other environment's admission")
+	assert_true(other:track_outcome("exposure-banner", "score", 1), "premise: the other scope records an outcome")
+
+	extra_tests.refuse(first, "age_ineligible")
+	local served = other:experiment_variant("exposure-banner")
+	local from = extra_tests.deliver_all(other)
+	local outcome = ("another scope's sibling serves=%s delivered=%d"):format(
+		tostring(served), extra_tests.delivered_count(from, "exposure-banner"))
+	print("sibling of another scope scene: " .. outcome)
+	assert_equal(outcome, "another scope's sibling serves=control delivered=2",
+		"the refusal of one scope leaves another scope's facts")
+	other:shutdown()
+	first:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_fences_a_sibling_fetch_in_flight()
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	local second = extra_tests.sibling_of(first)
+	-- The sibling's own adult fetch is on the wire when the refusal lands.
+	local held = nil
+	responder = function(url, _, callback)
+		if held == nil and url:find("/experiments/assignment", 1, true) then
+			held = callback
+			return true
+		end
+		return false
+	end
+	local answered = nil
+	second:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) answered = value end)
+	assert_true(held ~= nil, "premise: the sibling's fetch is on the wire")
+	responder = nil
+	extra_tests.refuse(first, "age_ineligible")
+	held(nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	local outcome = ("after the sibling's older answer landed: serves=%s handed=%s"):format(
+		tostring(second:experiment_variant("exposure-banner")),
+		tostring(answered and answered.variant_key))
+	print("sibling fetch in flight scene: " .. outcome)
+	assert_equal(outcome, "after the sibling's older answer landed: serves=nil handed=nil",
+		"an answer the sibling dispatched before the refusal installs nothing")
+	second:shutdown()
+	first:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_fact_key_history_prune_counts_a_sibling_clients_facts()
+	local key_a = extra_tests.age_fact_key()
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	assert_true(first:track_outcome("exposure-banner", "score", 1))
+	extra_tests.admit_republished(first)
+	assert_equal(extra_tests.disk_history(first, "exposure-banner"), key_a, "premise: A is in the durable history")
+	local exposures, outcomes = extra_tests.count_facts(first.queue.items, "exposure-banner", key_a)
+	assert_true(exposures == 1 and outcomes == 1, "premise: the first client holds the facts under A")
+
+	-- The sibling loads A from the shared record and prunes it once its own
+	-- (empty) spool is restored.
+	local second = extra_tests.sibling_of(first)
+	second:update(0.016)
+	local disk = extra_tests.disk_history(second, "exposure-banner")
+
+	-- The first client spools its facts under A, and the process dies.
+	assert_true(first:persist())
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	extra_tests.refuse_with(relaunch, 2, extra_tests.republished_fact_key)
+	local from = extra_tests.deliver_all(relaunch)
+	local outcome = ("disk after the sibling's prune=[%s] delivered A=%d"):format(
+		extra_tests.named_keys(disk), extra_tests.delivered_count(from, "exposure-banner", key_a))
+	print("fact-key history sibling scene: " .. outcome)
+	assert_equal(outcome, "disk after the sibling's prune=[A] delivered A=0",
+		"the sibling keeps A while the first client holds facts under it")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	extra_tests.test_age_remote_config_keeps_targeting_rules,
 	extra_tests.test_age_api_lifecycle_precedes_arguments,
@@ -9501,6 +9643,10 @@ local tests = {
 	extra_tests.test_fact_key_retired_by_dropping_an_unwritten_entry_survives_relaunch,
 	extra_tests.test_restored_key_retires_when_the_disk_no_longer_shows_it,
 	extra_tests.test_cap_evicted_entry_key_survives_relaunch,
+	extra_tests.test_age_refusal_reaches_a_sibling_client,
+	extra_tests.test_age_refusal_leaves_a_sibling_of_another_scope,
+	extra_tests.test_age_refusal_fences_a_sibling_fetch_in_flight,
+	extra_tests.test_fact_key_history_prune_counts_a_sibling_clients_facts,
 
 	test_config_validation,
 	test_flag_off_zero_paths,

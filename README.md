@@ -1276,7 +1276,13 @@ experiment, the player's earlier keys while facts under them are still queued,
 being sent or spooled: a refusal after a republish, or after a kill switch
 removed the cached assignment, withdraws those facts too, in the same process
 and after a restart. A key is forgotten once its last fact is delivered,
-dropped or withdrawn. A batch
+dropped or withdrawn. Clients of the same app built with `sdk.new` in one
+process share the player and the offline files, and the refusal reaches all
+of them: each client that serves the same player in the same environment
+stops serving the experiment, withdraws its own owed exposure and facts, and
+discards the answer to a fetch of the experiment it sent before the refusal.
+An earlier key is kept while any of these clients still holds a fact under it.
+A batch
 that is already being sent when the response arrives cannot be recalled: it
 is not retried if that send fails, and a `persist()` before it settles does
 not write its facts to disk. If the offline spool cannot be rewritten

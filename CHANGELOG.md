@@ -29,6 +29,18 @@
   the section and drops it when it rewrites the record. `kill_switch` still
   keeps and delivers owed facts.
   ([shardpilot/shardpilot-go#138](https://github.com/shardpilot/shardpilot-go/issues/138))
+- The `age_ineligible` withdrawal now reaches every client of the same app
+  built with `sdk.new` in one process, not only the client that received the
+  refusal. Such clients share the player and the offline files, so another
+  client kept serving the refused experiment, delivered its own queued facts,
+  and could install the answer to a fetch it had sent before the refusal.
+  Each client that serves the same player in the same environment now stops
+  serving the experiment, withdraws its owed exposure and facts as the
+  receiving client does, and discards that older answer. The earlier subject
+  fact keys the refusal also reaches are kept while any of these clients
+  still holds a fact under one; before, one client could drop a key another
+  client's queued fact still needed.
+  ([#126](https://github.com/shardpilot/shardpilot-defold/issues/126))
 
 ## v0.11.1 — 2026-09-29 — undeclared cached experiment assignments are not restored
 

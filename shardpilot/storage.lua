@@ -2310,6 +2310,35 @@ local function sanitize_experiments_record(record)
 	return stored
 end
 
+-- Every experiments consumer of this process, with the per-app namespace of
+-- its files. Clients built with sdk.new in one process share the experiments
+-- subject, the experiments record and the spool: an age refusal that lands on
+-- one reaches the others, and the fact-key history's prune counts their
+-- facts. Process memory, like the fallback records, so reset() forgets it
+-- too. Weak keys: a consumer leaves with its client's garbage, not at
+-- shutdown(), because what a shut-down client spooled is still on the shared
+-- spool.
+local experiments_consumers = setmetatable({}, { __mode = "k" })
+
+function M.register_experiments_consumer(scope, consumer)
+	experiments_consumers[consumer] = spool_namespace(scope)
+end
+
+-- The other consumers whose files are `consumer`'s.
+function M.experiments_siblings(consumer)
+	local namespace = experiments_consumers[consumer]
+	local out = {}
+	if namespace == nil then
+		return out
+	end
+	for other, other_namespace in pairs(experiments_consumers) do
+		if other ~= consumer and other_namespace == namespace then
+			out[#out + 1] = other
+		end
+	end
+	return out
+end
+
 -- Load the cached experiment-assignment record for this app (the same per-app
 -- namespace scheme as the spool), or nil when absent or unusable. A record
 -- without a scope stamp cannot be attributed to any (workspace, environment,
@@ -2561,6 +2590,7 @@ function M.reset()
 	remote_config_memory = {}
 	experiments_memory = {}
 	experiments_clear_memory = {}
+	experiments_consumers = setmetatable({}, { __mode = "k" })
 end
 
 return M

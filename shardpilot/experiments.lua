@@ -1247,6 +1247,11 @@ function Experiments:teardown()
 	self.torn_down = true
 end
 
+-- The other consumers of this process that share this one's files.
+function Experiments:siblings()
+	return storage.experiments_siblings(self)
+end
+
 function Experiments:diagnose(status, code)
 	local hook = self.config.diagnostics
 	if type(hook) == "function" then
@@ -1613,24 +1618,39 @@ function Experiments:retire_fact_key(scope, experiment_key, fact_key)
 	history[experiment_key] = set
 end
 
--- Drop from `history` every key no live fact references any more: the
--- client's pipeline surfaces (deps.live_fact_keys) plus this consumer's owed
--- snapshots. A no-op until the spool is restored — pruning earlier would
--- forget a key that a chunk about to be restored still carries.
+-- Add to `live` the subject-fact keys of `experiment_key` that this
+-- consumer's live facts carry: the client's pipeline surfaces
+-- (deps.live_fact_keys) plus the owed snapshots.
+function Experiments:add_live_fact_keys(experiment_key, live)
+	for key in pairs(self.deps.live_fact_keys(experiment_key) or {}) do
+		live[key] = true
+	end
+	local owed = self.pending_exposure[experiment_key]
+	if type(owed) == "table" then
+		for i = 1, #owed do
+			local held = owed[i].entry
+			if held and type(held.subject_fact_key) == "string" then
+				live[held.subject_fact_key] = true
+			end
+		end
+	end
+end
+
+-- Drop from `history` every key no live fact references any more, on this
+-- client or on a sibling that shares the record. A no-op until the spool is
+-- restored — pruning earlier would forget a key that a chunk about to be
+-- restored still carries. A sibling is registered only once its own spool is
+-- restored (on_spool_restored).
 function Experiments:prune_history(history)
 	if not self.fact_keys_restored or not self.deps.live_fact_keys then
 		return
 	end
+	local siblings = self:siblings()
 	for experiment_key, set in pairs(history) do
-		local live = self.deps.live_fact_keys(experiment_key) or {}
-		local owed = self.pending_exposure[experiment_key]
-		if type(owed) == "table" then
-			for i = 1, #owed do
-				local held = owed[i].entry
-				if held and type(held.subject_fact_key) == "string" then
-					live[held.subject_fact_key] = true
-				end
-			end
+		local live = {}
+		self:add_live_fact_keys(experiment_key, live)
+		for i = 1, #siblings do
+			siblings[i]:add_live_fact_keys(experiment_key, live)
 		end
 		for key in pairs(set) do
 			if not live[key] then
@@ -1702,6 +1722,9 @@ end
 -- from here on, and the history loaded with the record prunes now.
 function Experiments:on_spool_restored()
 	self.fact_keys_restored = true
+	-- From here on, sibling clients of this process count this client's
+	-- facts and hand it their age refusals.
+	storage.register_experiments_consumer(self.config, self)
 	self:prune_fact_key_history()
 end
 
@@ -2972,7 +2995,7 @@ end
 -- key, by being the dropped entry or carrying a refused fact key). A batch
 -- already ON THE WIRE is past recall (the consent purge's carve-out): it is
 -- neither re-sent nor counted as withdrawn.
-function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms, refused_fact_key)
+function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms, refused_fact_key, from_sibling)
 	local dropped = self.entries[experiment_key]
 	self.entries[experiment_key] = nil
 	local subject = self:current_subject_id()
@@ -3052,6 +3075,31 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 	-- already dropped the entry). A fact the withdrawal could not recall (a
 	-- batch on the wire) keeps its key until that batch settles.
 	self:prune_fact_key_history()
+	-- A sibling client of this process that shares the subject serves its
+	-- own copy of the entry and holds its own owed snapshots and queue: it
+	-- withdraws them the same way.
+	if not from_sibling then
+		local siblings = self:siblings()
+		for i = 1, #siblings do
+			siblings[i]:apply_sibling_age_withdrawal(scope, experiment_key, resolved_at_ms, refused_fact_key)
+		end
+	end
+end
+
+-- A sibling client received an age refusal of `experiment_key` for `scope`.
+-- When this client serves the same subject, it withdraws as if the refusal
+-- had landed here. A fetch of the experiment it dispatched before the
+-- refusal answers from before it, so the per-key fence discards that answer.
+function Experiments:apply_sibling_age_withdrawal(scope, experiment_key, resolved_at_ms, refused_fact_key)
+	local subject = self:current_subject_id()
+	if self.torn_down or not subject or self:scope_for(subject) ~= scope then
+		return
+	end
+	local fence_key = scope .. scope_separator .. experiment_key
+	if self.fetch_seq > (self.settled[fence_key] or 0) then
+		self.settled[fence_key] = self.fetch_seq
+	end
+	self:apply_age_withdrawal(scope, experiment_key, resolved_at_ms, refused_fact_key, true)
 end
 
 -- Apply ONLY the destructive half of an authoritative server outcome —
