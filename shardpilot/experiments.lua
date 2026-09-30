@@ -3090,9 +3090,11 @@ end
 -- When this client serves the same subject, it withdraws as if the refusal
 -- had landed here. A fetch of the experiment it dispatched before the
 -- refusal answers from before it, so the per-key fence discards that answer.
+-- A client that already shut down withdraws too: what it spooled at shutdown
+-- is on the shared spool, and only its own copy of the spool names it.
 function Experiments:apply_sibling_age_withdrawal(scope, experiment_key, resolved_at_ms, refused_fact_key)
 	local subject = self:current_subject_id()
-	if self.torn_down or not subject or self:scope_for(subject) ~= scope then
+	if not subject or self:scope_for(subject) ~= scope then
 		return
 	end
 	local fence_key = scope .. scope_separator .. experiment_key

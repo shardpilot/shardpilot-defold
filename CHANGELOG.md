@@ -36,7 +36,9 @@
   and could install the answer to a fetch it had sent before the refusal.
   Each client that serves the same player in the same environment now stops
   serving the experiment, withdraws its owed exposure and facts as the
-  receiving client does, and discards that older answer. The earlier subject
+  receiving client does, and discards that older answer. A client that was
+  already shut down withdraws too, so the facts it wrote to the offline spool
+  at shutdown are not sent after a restart. The earlier subject
   fact keys the refusal also reaches are kept while any of these clients
   still holds a fact under one; before, one client could drop a key another
   client's queued fact still needed.

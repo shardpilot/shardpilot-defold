@@ -1280,7 +1280,9 @@ dropped or withdrawn. Clients of the same app built with `sdk.new` in one
 process share the player and the offline files, and the refusal reaches all
 of them: each client that serves the same player in the same environment
 stops serving the experiment, withdraws its own owed exposure and facts, and
-discards the answer to a fetch of the experiment it sent before the refusal.
+discards the answer to a fetch of the experiment it sent before the refusal. A
+client that was already shut down withdraws too: the facts it wrote to the
+offline spool at shutdown are not sent after a restart.
 An earlier key is kept while any of these clients still holds a fact under it.
 A batch
 that is already being sent when the response arrives cannot be recalled: it

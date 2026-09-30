@@ -9503,6 +9503,36 @@ function extra_tests.test_age_refusal_reaches_a_sibling_client()
 	storage.reset()
 end
 
+function extra_tests.test_age_refusal_reaches_a_shut_down_siblings_spooled_facts()
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	local second = extra_tests.sibling_of(first)
+	assert_true(second:session_start())
+	second:update(0.016)
+	assert_true(second:track_outcome("exposure-banner", "score", 1), "premise: the sibling records an outcome")
+	-- The ingest is failing when the sibling shuts down: its facts go to the
+	-- shared spool.
+	responder = extra_tests.batch_answer(503)
+	second:shutdown()
+	responder = nil
+	local exposures, outcomes = extra_tests.disk_facts(first, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "premise: the sibling's facts are spooled")
+
+	extra_tests.refuse(first, "age_ineligible")
+	first:shutdown()
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local from = extra_tests.deliver_all(relaunch)
+	local outcome = ("after a relaunch, delivered=%d"):format(extra_tests.delivered_count(from, "exposure-banner"))
+	print("shut-down sibling scene: " .. outcome)
+	assert_equal(outcome, "after a relaunch, delivered=0",
+		"the refusal withdraws what a shut-down sibling spooled")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
 function extra_tests.test_age_refusal_leaves_a_sibling_of_another_scope()
 	local first, restore = extra_tests.age_client()
 	assert_true(first:session_start())
@@ -9645,6 +9675,7 @@ local tests = {
 	extra_tests.test_cap_evicted_entry_key_survives_relaunch,
 	extra_tests.test_age_refusal_reaches_a_sibling_client,
 	extra_tests.test_age_refusal_leaves_a_sibling_of_another_scope,
+	extra_tests.test_age_refusal_reaches_a_shut_down_siblings_spooled_facts,
 	extra_tests.test_age_refusal_fences_a_sibling_fetch_in_flight,
 	extra_tests.test_fact_key_history_prune_counts_a_sibling_clients_facts,
 
