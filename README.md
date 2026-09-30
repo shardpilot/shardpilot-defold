@@ -1277,6 +1277,29 @@ not write its facts to disk. If the offline spool cannot be rewritten
 (storage failing) and the app exits before a later write succeeds, the next
 launch can still send those facts.
 
+A declaration other than `adult` takes effect when it is made. From the moment
+a fetch declares `age_band` or `custom_attribute_age_band` as anything other
+than exactly `adult` for an experiment, and until that fetch ends,
+`experiment_variant` and `experiment_payload` return `nil` for it,
+`track_exposure` and `track_outcome` return `no_assignment`, and revalidation
+does not re-send the earlier declaration. What the player already owes waits
+for the server's answer, which applies as described above: an exposure still
+owed in memory is not emitted until then (facts already queued are sent as
+usual). If the fetch ends without one (a transient failure, `401`/`403`, a
+consent refusal, a response superseded by a newer one, or a `shutdown()`
+while it is in flight), the experiment is withdrawn as for
+`age_ineligible`: the cached assignment leaves memory and disk, and what the
+player owes for it is withdrawn. A response to an earlier fetch of that
+experiment that arrives afterwards installs nothing. The `diagnostics` hook
+reports this withdrawal as `status = "withdrawn"` with
+`code = "age_declaration_unconfirmed"`. An `adult` declaration made while a
+non-adult one is pending replaces it and is decided by its own fetch; a fetch
+that declares no age leaves it pending. A synthetic-subject assignment has no
+age gate and keeps serving (while the declaration is pending, `track_outcome`
+records nothing under a server fact key it carries): an unanswered declaration
+keeps it and withdraws only the client-id applications still owed from before
+it.
+
 Both `age_band` and the older `custom_attribute_age_band` attribute are
 preserved as admission inputs, including at the attribute limit. Every present
 spelling must be exactly `adult` for age eligibility: a blank, padded or

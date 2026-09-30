@@ -8873,6 +8873,1090 @@ function extra_tests.test_age_refusal_withdraws_restored_entry_without_subject_k
 	storage.reset()
 end
 
+-- ── a non-adult declaration the server has not confirmed (#125) ─────────────
+--
+-- The host declares an age other than adult for exposure-banner. While that
+-- fetch is in flight the experiment is not served or recorded and the
+-- revalidation leaves it alone; the server's answer, once applied, governs as
+-- it always has. When the fetch ends without one (a 503, an auth latch, a
+-- consent refusal), the declaration alone makes the subject ineligible: the
+-- experiment stops serving and what the subject owes for it is withdrawn,
+-- exactly as for an age_ineligible refusal, and fetches that left earlier
+-- cannot bring it back. Plus the missing transport scenes: the forced-minor
+-- floor with an adult declaration, and an adult answer or revalidation in
+-- flight losing to a later refusal. Checks are collected so a run names every
+-- broken part of a scene, not only the first.
+
+extra_tests.unavailable_body = json.encode({ error = "unavailable" })
+
+function extra_tests.checklist()
+	local failures = {}
+	local function check(ok, message)
+		if not ok then
+			failures[#failures + 1] = message
+		end
+	end
+	local function verify(label)
+		assert_equal(#failures, 0, label .. ": " .. table.concat(failures, "; "))
+	end
+	return check, verify
+end
+
+-- An adult assignment of exposure-banner applied and measured: its exposure
+-- and an outcome accepted into the queue, both owed.
+function extra_tests.applied_scene(overrides)
+	local client, restore = extra_tests.age_client(overrides)
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1), "setup: an accepted outcome")
+	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "setup: the exposure and the outcome are owed")
+	return client, restore
+end
+
+-- The host declares under_threshold for exposure-banner and the fetch fails
+-- with a 503.
+function extra_tests.declare_unconfirmed(client)
+	next_status = 503
+	next_response_body = extra_tests.unavailable_body
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) result = value end)
+	return result
+end
+
+-- Every fact the subject still owes for the experiment: owed exposure
+-- snapshots, and accepted facts in the queue, the retained batch, the loaded
+-- spool chunks and the durable spool.
+function extra_tests.owed_total(client, experiment_key)
+	local total = extra_tests.owed_count(client, experiment_key)
+	local lists = { client.queue.items, client.in_flight_batch or {}, storage.load_spool(client.config) or {} }
+	for i = 1, #lists do
+		local exposures, outcomes = extra_tests.count_facts(lists[i], experiment_key)
+		total = total + exposures + outcomes
+	end
+	local exposures, outcomes = extra_tests.chunk_facts(client, experiment_key)
+	return total + exposures + outcomes
+end
+
+function extra_tests.durable_entry(client, experiment_key)
+	local record = storage.load_experiments(client.config)
+	return record and record.entries[experiment_key] or nil
+end
+
+-- The exposure-banner assignment requests after the first `from` that
+-- declared adult under either spelling.
+function extra_tests.adult_declarations_after(from)
+	local adult = {}
+	local list = assignment_requests()
+	for i = from + 1, #list do
+		local sent = query_params(list[i].url)
+		if sent.experiment_key == "exposure-banner"
+			and (sent.age_band == "adult" or sent.custom_attribute_age_band == "adult") then
+			adult[#adult + 1] = tostring(i)
+		end
+	end
+	return adult
+end
+
+-- The rule's whole effect on exposure-banner: not served by either getter, no
+-- exposure or outcome recorded, nothing owed, `withdrawn` accepted facts
+-- counted dropped since `dropped` (each once; nil skips the count), no
+-- durable assignment, and after the revalidation cadence and a flush no
+-- assignment request after the first `from` declaring adult and no fact of
+-- the experiment delivered.
+function extra_tests.assert_declaration_withdrew(client, check, dropped, withdrawn, from)
+	local key = "exposure-banner"
+	check(client:experiment_variant(key) == nil,
+		"stop serving: experiment_variant still serves " .. tostring(client:experiment_variant(key)))
+	check(client:experiment_payload(key) == nil, "stop serving: experiment_payload still serves")
+	if withdrawn then
+		check(client.stats.dropped - dropped == withdrawn, "withdraw: " .. (client.stats.dropped - dropped)
+			.. " withdrawn fact(s) counted dropped, want " .. withdrawn)
+	end
+	local queued = #client.queue.items
+	local ok, err = client:track_exposure(key)
+	check(not ok and err == "no_assignment",
+		"stop serving: track_exposure answered " .. tostring(ok) .. "/" .. tostring(err) .. ", want no_assignment")
+	ok, err = client:track_outcome(key, "score", 2)
+	check(not ok and err == "no_assignment",
+		"stop serving: a new outcome answered " .. tostring(ok) .. "/" .. tostring(err) .. ", want no_assignment")
+	check(#client.queue.items == queued,
+		"stop serving: " .. (#client.queue.items - queued) .. " fact(s) recorded after the declaration")
+	local owed = extra_tests.owed_total(client, key)
+	check(owed == 0, "withdraw: " .. owed .. " owed application(s) survive the non-adult declaration")
+	check(extra_tests.durable_entry(client, key) == nil, "withdraw: the adult assignment is still in the durable record")
+	local sent = #requests
+	for _ = 1, 2 do
+		advance_seconds(1000)
+		client:update(0.016)
+		client:flush({ include_summaries = false })
+	end
+	local adult = extra_tests.adult_declarations_after(from)
+	check(#adult == 0, "no stale re-send: assignment request(s) " .. table.concat(adult, ",")
+		.. " declared adult after the non-adult declaration")
+	local exposures, outcomes = extra_tests.delivered_facts(sent, key)
+	check(exposures + outcomes == 0, "withdraw: " .. (exposures + outcomes)
+		.. " fact(s) of the experiment delivered after the declaration")
+end
+
+-- The scene itself: an adult assignment is applied and measured, then the
+-- host declares a non-adult age and that fetch fails with a 503. The server
+-- never confirms a refusal, yet nothing is served or owed, the revalidation
+-- declares nothing adult, and nothing of the experiment is delivered. Every
+-- spelling the request sends as non-adult is a declaration.
+function extra_tests.test_age_unconfirmed_declaration_withdraws_experiment()
+	local declarations = {
+		{ "under_threshold", function(client, callback)
+			client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, callback)
+		end },
+		{ "unknown", function(client, callback)
+			client:fetch_experiment_assignment_with_age_band("exposure-banner", "unknown", nil, callback)
+		end },
+		{ "a non-adult alias beside adult", function(client, callback)
+			client:fetch_experiment_assignment("exposure-banner",
+				{ age_band = "adult", custom_attribute_age_band = "under_threshold" }, callback)
+		end },
+		{ "an empty age_band", function(client, callback)
+			client:fetch_experiment_assignment("exposure-banner", { age_band = "" }, callback)
+		end },
+	}
+	local check_all, verify = extra_tests.checklist()
+	for _, case in ipairs(declarations) do
+		local function check(ok, message)
+			check_all(ok, case[1] .. ": " .. message)
+		end
+		local client, restore = extra_tests.applied_scene()
+		local dropped = client.stats.dropped
+		next_status = 503
+		next_response_body = extra_tests.unavailable_body
+		local result
+		case[2](client, function(value) result = value end)
+		assert_equal(#assignment_requests(), 2, "setup: the admission and the failed declaration")
+		check(result ~= nil and not result.ok and not result.assigned and not result.from_cache,
+			"the declaration's fetch across a 503 must fail closed")
+		extra_tests.assert_declaration_withdrew(client, check, dropped, 2, 2)
+		client:shutdown()
+		restore()
+		storage.reset()
+	end
+	verify("unconfirmed declaration")
+end
+
+-- The same with the applications already sealed into a batch whose delivery
+-- failed (retained and spooled), and after a relaunch loaded back as spool
+-- chunks: they are withdrawn when the declaration's fetch fails, not
+-- delivered when the ingest recovers.
+function extra_tests.test_age_unconfirmed_declaration_withdraws_spooled_facts()
+	local client, restore = extra_tests.applied_scene()
+	responder = extra_tests.batch_answer(503)
+	assert_true(not client:flush({ include_summaries = false }), "setup: the 503 retains the batch")
+	responder = nil
+	local exposures, outcomes = extra_tests.count_facts(client.in_flight_batch, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "setup: the retained batch holds the facts")
+	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "setup: the failed batch spooled durably")
+	local dropped = client.stats.dropped
+	extra_tests.declare_unconfirmed(client)
+	local check, verify = extra_tests.checklist()
+	exposures, outcomes = extra_tests.count_facts(client.in_flight_batch, "exposure-banner")
+	check(exposures + outcomes == 0, "withdraw: the retained batch keeps " .. (exposures + outcomes) .. " fact(s)")
+	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	check(exposures + outcomes == 0, "withdraw: the durable spool keeps " .. (exposures + outcomes) .. " fact(s)")
+	extra_tests.assert_declaration_withdrew(client, check, dropped, 2, #assignment_requests())
+	client:shutdown()
+	restore()
+	storage.reset()
+
+	local first
+	first, restore = extra_tests.applied_scene()
+	responder = extra_tests.batch_answer(503)
+	assert_true(not first:flush({ include_summaries = false }), "setup: the 503 spools the batch")
+	responder = nil
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	assert_equal(second:experiment_variant("exposure-banner"), "control", "setup: the adult assignment restored")
+	exposures, outcomes = extra_tests.chunk_facts(second, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "setup: the loaded chunks carry the facts")
+	dropped = second.stats.dropped
+	extra_tests.declare_unconfirmed(second)
+	local function after_relaunch(ok, message)
+		check(ok, "after a relaunch: " .. message)
+	end
+	exposures, outcomes = extra_tests.chunk_facts(second, "exposure-banner")
+	after_relaunch(exposures + outcomes == 0, "withdraw: the loaded chunks keep " .. (exposures + outcomes) .. " fact(s)")
+	extra_tests.assert_declaration_withdrew(second, after_relaunch, dropped, 2, #assignment_requests())
+	verify("spooled facts")
+	second:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- The declaration withdraws one experiment: another experiment the server
+-- assigned under the adult declaration keeps serving and delivering.
+function extra_tests.test_age_unconfirmed_declaration_spares_other_experiment()
+	local client, restore = extra_tests.applied_scene()
+	extra_tests.admit(client, "exposure-other")
+	assert_true(client:track_outcome("exposure-other", "score", 1), "setup: the other experiment's outcome")
+	extra_tests.declare_unconfirmed(client)
+	next_status = 200
+	local check, verify = extra_tests.checklist()
+	check(client:experiment_variant("exposure-banner") == nil, "the declared experiment still serves")
+	check(client:experiment_variant("exposure-other") == "treatment", "the other experiment must keep serving, got "
+		.. tostring(client:experiment_variant("exposure-other")))
+	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-other")
+	check(exposures == 1 and outcomes == 1, "the other experiment's facts must stay owed")
+	check(extra_tests.durable_entry(client, "exposure-other") ~= nil, "the other experiment must stay durable")
+	local from = #requests
+	client:update(0.016)
+	client:flush({ include_summaries = false })
+	exposures, outcomes = extra_tests.delivered_facts(from, "exposure-other")
+	check(exposures == 1 and outcomes == 1, "the other experiment delivered " .. (exposures + outcomes)
+		.. " fact(s), want its exposure and outcome")
+	exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+	check(exposures + outcomes == 0, "the declared experiment delivered " .. (exposures + outcomes) .. " fact(s)")
+	verify("other experiment")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- Controls: an adult declaration, or a fetch declaring no age, is not a
+-- withdrawal. Across a 503 the cached adult assignment keeps serving and what
+-- is owed is delivered.
+function extra_tests.test_age_adult_or_absent_declaration_across_failure_keeps_serving()
+	local client, restore = extra_tests.applied_scene()
+	local dropped = client.stats.dropped
+	next_status = 503
+	next_response_body = extra_tests.unavailable_body
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) result = value end)
+	local check, verify = extra_tests.checklist()
+	check(result ~= nil and result.ok and result.assigned and result.from_cache and result.variant_key == "control",
+		"an adult declaration across a 503 must serve the cached adult assignment")
+	client:fetch_experiment_assignment("exposure-banner", nil, function() end)
+	next_status = 200
+	check(client:experiment_variant("exposure-banner") == "control", "the adult assignment must keep serving, got "
+		.. tostring(client:experiment_variant("exposure-banner")))
+	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+	check(exposures == 1 and outcomes == 1, "both owed facts must be kept")
+	check(client.stats.dropped == dropped, "nothing must be counted dropped")
+	check(extra_tests.durable_entry(client, "exposure-banner") ~= nil, "the adult assignment must stay durable")
+	local from = #requests
+	client:update(0.016)
+	client:flush({ include_summaries = false })
+	exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+	check(exposures == 1 and outcomes == 1, (exposures + outcomes) .. " fact(s) delivered, want the exposure and the outcome")
+	verify("adult or absent declaration")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- While the declaring fetch is in flight nothing is served or recorded, and
+-- the owed applications (two accepted facts, and a renewal's exposure still
+-- owed in memory) wait for the server: the background tick does not emit the
+-- owed exposure. The answer governs. An age_ineligible answer withdraws
+-- them, each accepted fact counted once; a kill_switch answer keeps them and
+-- they are delivered, exactly as without the declaration.
+function extra_tests.test_age_declaration_in_flight_stops_serving_until_answered()
+	local check_all, verify = extra_tests.checklist()
+	for _, reason in ipairs({ "age_ineligible", "kill_switch" }) do
+		local function check(ok, message)
+			check_all(ok, reason .. ": " .. message)
+		end
+		local client, restore = extra_tests.applied_scene()
+		assert_true(client:session_start(), "setup: a renewal owes the exposure again")
+		assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "setup: the renewal's exposure is owed")
+		local dropped = client.stats.dropped
+		local held = {}
+		responder = function(url, _, callback)
+			if url:find("/runtime/experiments/assignment", 1, true) then
+				held[#held + 1] = callback
+				return true
+			end
+			return false
+		end
+		local answer
+		client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+			function(value) answer = value end)
+		responder = nil
+		assert_equal(#held, 1, "setup: the declaration is in flight")
+		check(client:experiment_variant("exposure-banner") == nil, "stop serving: "
+			.. tostring(client:experiment_variant("exposure-banner")) .. " served while the declaration is in flight")
+		check(client:experiment_payload("exposure-banner") == nil, "stop serving: a payload served while in flight")
+		local queued = #client.queue.items
+		local ok, err = client:track_exposure("exposure-banner")
+		check(not ok and err == "no_assignment", "stop serving: track_exposure answered "
+			.. tostring(ok) .. "/" .. tostring(err) .. " while in flight")
+		ok, err = client:track_outcome("exposure-banner", "score", 3)
+		check(not ok and err == "no_assignment", "stop serving: an outcome answered "
+			.. tostring(ok) .. "/" .. tostring(err) .. " while in flight")
+		check(#client.queue.items == queued, "stop serving: " .. (#client.queue.items - queued)
+			.. " fact(s) recorded while in flight")
+		advance_seconds(1)
+		client:update(0.016)
+		local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+		local owed = extra_tests.owed_count(client, "exposure-banner")
+		check(exposures == 1 and outcomes == 1 and owed == 1, "the owed applications must wait for the answer, found "
+			.. (exposures + outcomes) .. " accepted and " .. owed .. " owed")
+		check(client.stats.dropped == dropped, "nothing may be withdrawn before the answer")
+		held[1](nil, nil, { status = 200, response = extra_tests.refusal_body(reason) })
+		check(answer ~= nil and answer.reason == reason, "the server's answer must settle")
+		exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+		owed = extra_tests.owed_count(client, "exposure-banner")
+		if reason == "age_ineligible" then
+			check(exposures + outcomes + owed == 0 and client.stats.dropped - dropped == 2,
+				"the age_ineligible answer must withdraw each application once: left "
+				.. (exposures + outcomes + owed) .. ", counted " .. (client.stats.dropped - dropped))
+		else
+			check(exposures == 1 and outcomes == 1 and owed == 1 and client.stats.dropped == dropped,
+				"the kill_switch answer governs: left " .. (exposures + outcomes + owed) .. ", counted "
+				.. (client.stats.dropped - dropped) .. ", want all three kept and none counted")
+			local from = #requests
+			client:update(0.016)
+			client:flush({ include_summaries = false })
+			exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+			check(exposures == 2 and outcomes == 1, "after the kill_switch answer " .. exposures .. " exposure(s) and "
+				.. outcomes .. " outcome(s) delivered, want both sessions' exposures and the outcome")
+		end
+		client:shutdown()
+		restore()
+		storage.reset()
+	end
+	verify("declaration in flight")
+end
+
+-- A shutdown abandons a declaring fetch still in flight: the declaration
+-- ends unanswered before the final flush, so the shutdown completes, nothing
+-- of the experiment is delivered or left on disk, the late answer is
+-- discarded, and a relaunch does not serve the experiment.
+function extra_tests.test_age_declaration_in_flight_at_shutdown_withdraws()
+	local client, restore = extra_tests.applied_scene()
+	assert_true(client:session_start(), "setup: a renewal owes the exposure again")
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) then
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+	responder = nil
+	assert_equal(#held, 1, "setup: the declaration is in flight")
+	local check, verify = extra_tests.checklist()
+	local from = #requests
+	local ok, err = client:shutdown()
+	check(ok == true, "the shutdown must complete, got " .. tostring(ok) .. "/" .. tostring(err))
+	local exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+	check(exposures + outcomes == 0, "the final flush delivered " .. (exposures + outcomes)
+		.. " fact(s) of the declared experiment")
+	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	check(exposures + outcomes == 0, (exposures + outcomes) .. " fact(s) of the declared experiment left on disk")
+	check(extra_tests.durable_entry(client, "exposure-banner") == nil,
+		"the adult assignment is still in the durable record")
+	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	storage.reset() -- relaunch
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	check(relaunch:experiment_variant("exposure-banner") == nil, "the relaunch serves the declared experiment")
+	from = #requests
+	relaunch:update(0.016)
+	relaunch:flush({ include_summaries = false })
+	exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+	check(exposures + outcomes == 0, "the relaunch delivered " .. (exposures + outcomes)
+		.. " fact(s) of the declared experiment")
+	verify("shutdown in flight")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- While the declaring fetch is in flight the revalidation cadence does not
+-- re-send the entry's remembered adult declaration.
+function extra_tests.test_age_declaration_in_flight_is_not_revalidated()
+	local client, restore = extra_tests.applied_scene()
+	client:update(0) -- arms the cadence
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) and #held == 0 then
+			held[1] = callback
+			return true
+		end
+		return false
+	end
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+	assert_equal(#held, 1, "setup: the declaration is in flight")
+	local from = #assignment_requests()
+	next_response_body = extra_tests.age_golden("adult")
+	advance_seconds(1000)
+	client:update(0.016)
+	responder = nil
+	local sent = #assignment_requests() - from
+	local adult = extra_tests.adult_declarations_after(from)
+	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("under_threshold") })
+	local check, verify = extra_tests.checklist()
+	check(sent == 0, "no stale re-send: the cadence sent " .. sent .. " request(s) while the declaration was in flight")
+	check(#adult == 0, "no stale re-send: assignment request(s) " .. table.concat(adult, ",") .. " declared adult")
+	verify("cadence while in flight")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- An auth latch is not the server's answer to the declaration: the latch
+-- retains the durable assignment for a later unlatch or relaunch, so the
+-- declaration withdraws it, and neither a later unlatching fetch nor a
+-- relaunch serves it again.
+function extra_tests.test_age_declaration_answered_by_auth_latch_withdraws()
+	local client, restore = extra_tests.applied_scene()
+	local dropped = client.stats.dropped
+	next_status = 401
+	next_response_body = json.encode({ error = "unauthorized" })
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) result = value end)
+	assert_equal(result and result.error, "unauthorized", "setup: the 401 answers the declaration")
+	next_status = 200
+	-- Another experiment's authorized answer unlatches the plane.
+	extra_tests.admit(client, "exposure-other")
+	assert_true(not client.experiments.auth_blocked, "setup: the plane unlatched")
+	local check, verify = extra_tests.checklist()
+	extra_tests.assert_declaration_withdrew(client, check, dropped, 2, 2)
+	client:shutdown()
+	storage.reset() -- relaunch
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	check(relaunch:experiment_variant("exposure-banner") == nil, "the relaunch serves the latched assignment again")
+	check(relaunch:experiment_variant("exposure-other") == "treatment", "the relaunch keeps the other experiment")
+	verify("auth latch")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- No stale re-send: a revalidation that left with the adult declaration
+-- before the host declared under_threshold, and whose adult 200 arrives
+-- after that declaration's fetch failed, installs nothing, persists nothing,
+-- and leaves nothing for a later cycle to re-send as adult.
+function extra_tests.test_age_adult_revalidation_in_flight_loses_to_unconfirmed_declaration()
+	local client, restore = extra_tests.applied_scene()
+	client:update(0) -- arms the cadence
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) and #held == 0 then
+			held[1] = callback
+			return true
+		end
+		return false
+	end
+	advance_seconds(1000)
+	client:update(0.016)
+	assert_equal(#held, 1, "setup: the adult revalidation is in flight")
+	assert_equal(query_params(last_assignment_request().url).age_band, "adult", "setup: the revalidation declared adult")
+	local dropped = client.stats.dropped
+	extra_tests.declare_unconfirmed(client)
+	responder = nil
+	local from = #assignment_requests()
+	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	local check, verify = extra_tests.checklist()
+	check(client:experiment_variant("exposure-banner") == nil, "no stale re-send: the in-flight adult revalidation reinstalled "
+		.. tostring(client:experiment_variant("exposure-banner")))
+	check(extra_tests.durable_entry(client, "exposure-banner") == nil,
+		"no stale re-send: the in-flight adult revalidation persisted the assignment")
+	extra_tests.assert_declaration_withdrew(client, check, dropped, 2, from)
+	verify("revalidation in flight")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- Two adult fetches left before the host declared under_threshold. One lands
+-- while that declaration is still pending: its caller receives no variant.
+-- The other lands after it, superseded by the first: its caller receives no
+-- cache serve either. The declaration's fetch then fails with a 503, and the
+-- experiment is withdrawn exactly as in the scene above.
+function extra_tests.test_age_adult_answer_lands_while_declaration_pending()
+	local client, restore = extra_tests.applied_scene()
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) then
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+	local older, newer
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) older = value end)
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) newer = value end)
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+	responder = nil
+	assert_equal(#held, 3, "setup: two adult fetches and the declaration are in flight")
+	local from = #assignment_requests()
+	local dropped = client.stats.dropped
+	local check, verify = extra_tests.checklist()
+	held[2](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	check(newer ~= nil and not newer.ok and not newer.assigned, "the adult caller answered while the declaration "
+		.. "is pending received " .. tostring(newer and newer.variant_key))
+	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	check(older ~= nil and not older.ok and not older.assigned, "the superseded adult caller received "
+		.. tostring(older and older.variant_key))
+	check(client:experiment_variant("exposure-banner") == nil, "stop serving: "
+		.. tostring(client:experiment_variant("exposure-banner")) .. " served while the declaration is pending")
+	held[3](nil, nil, { status = 503, response = extra_tests.unavailable_body })
+	extra_tests.assert_declaration_withdrew(client, check, dropped, 2, from)
+	verify("adult answer while pending")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- The declaring fetch's own cache serve: a client-id assignment installed
+-- from an answer to an under_threshold request matches that request's
+-- attributes, yet a later under_threshold fetch that fails hands its caller
+-- no variant, and the experiment is withdrawn.
+function extra_tests.test_age_declaration_own_cache_serve_is_withdrawn()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	next_response_body = extra_tests.age_golden("adult")
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) result = value end)
+	assert_true(result ~= nil and result.assigned and not result.from_cache,
+		"setup: the stub assigned the under_threshold request")
+	client:update(0.016)
+	assert_true(client:track_outcome("exposure-banner", "score", 1), "setup: an accepted outcome")
+	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "setup: the exposure and the outcome are owed")
+	local dropped = client.stats.dropped
+	local answer = extra_tests.declare_unconfirmed(client)
+	local check, verify = extra_tests.checklist()
+	check(answer ~= nil and not answer.ok and not answer.assigned and not answer.from_cache,
+		"the failed declaration handed its caller " .. tostring(answer and answer.variant_key)
+		.. (answer and answer.from_cache and " from the cache" or ""))
+	extra_tests.assert_declaration_withdrew(client, check, dropped, 2, #assignment_requests())
+	verify("own cache serve")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- A synthetic-subject assignment has no age gate: the server assigns it
+-- whatever age is declared. A pending non-adult declaration does not hide
+-- it or withhold another fetch's answer from its caller, and a declaration
+-- whose fetch fails serves it from the cache and keeps it.
+function extra_tests.test_age_declaration_leaves_synthetic_assignment()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	local synthetic = extra_tests.age_golden("adult"):gsub('"assignment_unit":"client_id"',
+		'"assignment_unit":"synthetic_subject_key"', 1)
+	assert_true(synthetic:find('"assignment_unit":"synthetic_subject_key"', 1, true) ~= nil,
+		"setup: a synthetic-subject body")
+	next_response_body = synthetic
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) result = value end)
+	assert_true(result ~= nil and result.assigned, "setup: the synthetic assignment is assigned under under_threshold")
+	client:update(0.016)
+	local dropped = client.stats.dropped
+	local queued = #client.queue.items
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) and #held == 0 then
+			held[1] = callback
+			return true
+		end
+		return false
+	end
+	local answer
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) answer = value end)
+	assert_equal(#held, 1, "setup: the declaration is in flight")
+	local check, verify = extra_tests.checklist()
+	check(client:experiment_variant("exposure-banner") == "control",
+		"the synthetic assignment must keep serving while the declaration is in flight, got "
+		.. tostring(client:experiment_variant("exposure-banner")))
+	responder = nil
+	held[1](nil, nil, { status = 503, response = extra_tests.unavailable_body })
+	check(answer ~= nil and answer.ok and answer.assigned and answer.from_cache and answer.variant_key == "control",
+		"the failed declaration must serve the synthetic assignment from the cache, got "
+		.. tostring(answer and answer.variant_key) .. "/" .. tostring(answer and answer.error))
+	check(client:experiment_variant("exposure-banner") == "control", "the synthetic assignment must keep serving, got "
+		.. tostring(client:experiment_variant("exposure-banner")))
+	check(extra_tests.durable_entry(client, "exposure-banner") ~= nil, "the synthetic assignment left the durable record")
+	check(client.stats.dropped == dropped and #client.queue.items >= queued,
+		"nothing of the synthetic assignment may be withdrawn")
+	-- Another fetch's answer landing while a declaration is pending: a
+	-- fetch declaring no age still receives the synthetic assignment.
+	held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) and #held == 0 then
+			held[1] = callback
+			return true
+		end
+		return false
+	end
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+	local undeclared
+	client:fetch_experiment_assignment("exposure-banner", nil, function(value) undeclared = value end)
+	responder = nil
+	check(undeclared ~= nil and undeclared.assigned and undeclared.variant_key == "control",
+		"a fetch declaring no age must hand back the synthetic assignment, got "
+		.. tostring(undeclared and undeclared.variant_key) .. "/" .. tostring(undeclared and undeclared.error))
+	held[1](nil, nil, { status = 503, response = extra_tests.unavailable_body })
+	check(client:experiment_variant("exposure-banner") == "control", "the synthetic assignment must still serve, got "
+		.. tostring(client:experiment_variant("exposure-banner")))
+	check(client.stats.dropped == dropped, "nothing of the synthetic assignment may be withdrawn")
+	verify("synthetic assignment")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- A grammar re-mint retry is a revalidation too: an adult revalidation in
+-- flight when the host declares under_threshold is answered with the
+-- subject-grammar 400, and its re-mint retry does not re-send the adult
+-- declaration while the declaration is pending. When the declaration's
+-- fetch fails, nothing serves the experiment and nothing brings it back.
+function extra_tests.test_age_declaration_blocks_stale_grammar_retry()
+	local client, restore = extra_tests.applied_scene()
+	client:update(0) -- arms the cadence
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) then
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+	advance_seconds(1000)
+	client:update(0.016)
+	assert_equal(#held, 1, "setup: the adult revalidation is in flight")
+	assert_equal(query_params(last_assignment_request().url).age_band, "adult", "setup: the revalidation declared adult")
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+	assert_equal(#held, 2, "setup: the declaration is in flight")
+	local from = #assignment_requests()
+	held[1](nil, nil, { status = 400, response = json.encode({
+		error = "experiment metadata must use synthetic local-safe identifiers only",
+	}) })
+	assert_true(client.experiments.reminted, "setup: the grammar reject re-minted the subject")
+	local check, verify = extra_tests.checklist()
+	local adult = extra_tests.adult_declarations_after(from)
+	check(#adult == 0, "no stale re-send: the re-mint retry sent request(s) " .. table.concat(adult, ",")
+		.. " declaring adult while the declaration was pending")
+	held[2](nil, nil, { status = 503, response = extra_tests.unavailable_body })
+	for i = 3, #held do
+		held[i](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	end
+	responder = nil
+	check(client:experiment_variant("exposure-banner") == nil, "stop serving: "
+		.. tostring(client:experiment_variant("exposure-banner")) .. " served after the declaration failed")
+	local ok, err = client:track_outcome("exposure-banner", "score", 2)
+	check(not ok and err == "no_assignment", "a new outcome answered " .. tostring(ok) .. "/" .. tostring(err))
+	next_response_body = extra_tests.age_golden("adult")
+	for _ = 1, 2 do
+		advance_seconds(1000)
+		client:update(0.016)
+	end
+	adult = extra_tests.adult_declarations_after(from)
+	check(#adult == 0, "no stale re-send: assignment request(s) " .. table.concat(adult, ",")
+		.. " declared adult after the non-adult declaration")
+	check(client:experiment_variant("exposure-banner") == nil, "the experiment is served again: "
+		.. tostring(client:experiment_variant("exposure-banner")))
+	-- The re-mint's tombstone of the retired subject's record lands on the
+	-- ticks above.
+	check(extra_tests.durable_entry(client, "exposure-banner") == nil, "the adult assignment is in the durable record")
+	client:shutdown()
+	storage.reset() -- relaunch
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	check(relaunch:experiment_variant("exposure-banner") == nil, "the relaunch serves the experiment")
+	verify("grammar retry while pending")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- The golden adult body as a synthetic-subject assignment; `fact_key` false
+-- drops its subject-fact key (the usual synthetic shape), `version` replaces
+-- its experiment version.
+function extra_tests.synthetic_body(fact_key, version)
+	local body = extra_tests.age_golden("adult"):gsub('"assignment_unit":"client_id"',
+		'"assignment_unit":"synthetic_subject_key"', 1)
+	if fact_key == false then
+		body = body:gsub('"subject_fact_key":"[^"]*",', "", 1)
+	end
+	if version then
+		body = body:gsub('"version":1,', '"version":' .. version .. ",", 1)
+	end
+	return body
+end
+
+-- A synthetic-subject assignment kept by an unanswered declaration does not
+-- lower the fence: an adult fetch dispatched before the declaration and
+-- answered with a client-id assignment after it ended installs nothing.
+function extra_tests.test_age_unanswered_declaration_keeping_synthetic_still_fences()
+	local client, restore = extra_tests.age_client()
+	next_response_body = extra_tests.synthetic_body()
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) result = value end)
+	assert_true(result ~= nil and result.assigned, "setup: the synthetic assignment is assigned")
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) then
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil, function() end)
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+	responder = nil
+	assert_equal(#held, 2, "setup: the adult fetch and the declaration are in flight")
+	held[2](nil, nil, { status = 503, response = extra_tests.unavailable_body })
+	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("adult")
+		:gsub('"variant_key":"control"', '"variant_key":"client-id-variant"', 1) })
+	local check, verify = extra_tests.checklist()
+	check(client:experiment_variant("exposure-banner") ~= "client-id-variant",
+		"the adult fetch dispatched before the unanswered declaration installed its client-id assignment")
+	check(client:experiment_variant("exposure-banner") == "control", "the synthetic assignment must keep serving, got "
+		.. tostring(client:experiment_variant("exposure-banner")))
+	verify("synthetic fence")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- An experiment now served as a synthetic-subject assignment still owes the
+-- client-id applications made before it (an exposure still owed in memory,
+-- an outcome accepted): the synthetic assignment records no outcome for
+-- them while the declaration is pending, and an unanswered declaration
+-- withdraws them while it keeps the synthetic assignment.
+function extra_tests.test_age_unanswered_declaration_withdraws_client_id_beneath_synthetic()
+	local client, restore = extra_tests.age_client({ buffer_size = 1 })
+	assert_true(client:track("filler-host-event"))
+	extra_tests.admit(client)
+	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "setup: the client-id exposure is owed")
+	assert_true(client:flush({ include_summaries = false }))
+	assert_true(client:track_outcome("exposure-banner", "score", 1), "setup: an accepted client-id outcome")
+	-- A republished version, so its application is not the owed client-id one.
+	next_response_body = extra_tests.synthetic_body(false, 2)
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) result = value end)
+	assert_true(result ~= nil and result.assigned, "setup: the synthetic assignment installs")
+	local client_id_owed = 0
+	for _, snapshot in ipairs(client.experiments.pending_exposure["exposure-banner"] or {}) do
+		if snapshot.entry.assignment_unit == "client_id" then
+			client_id_owed = client_id_owed + 1
+		end
+	end
+	assert_equal(client_id_owed, 1, "setup: the client-id exposure is still owed beneath the synthetic assignment")
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) then
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+	responder = nil
+	assert_equal(#held, 1, "setup: the declaration is in flight")
+	local check, verify = extra_tests.checklist()
+	local ok, err = client:track_outcome("exposure-banner", "score", 3)
+	check(not ok, "an outcome was recorded while the declaration was pending (" .. tostring(err) .. ")")
+	held[1](nil, nil, { status = 503, response = extra_tests.unavailable_body })
+	local fact_key = extra_tests.age_fact_key()
+	local owed = 0
+	for _, snapshot in ipairs(client.experiments.pending_exposure["exposure-banner"] or {}) do
+		if snapshot.entry.assignment_unit ~= "synthetic_subject_key" then
+			owed = owed + 1
+		end
+	end
+	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", fact_key)
+	owed = owed + exposures + outcomes
+	check(owed == 0, "withdraw: " .. owed .. " owed client-id application(s) survive beneath the synthetic assignment")
+	local own = 0
+	for _, snapshot in ipairs(client.experiments.pending_exposure["exposure-banner"] or {}) do
+		if snapshot.entry.assignment_unit == "synthetic_subject_key" then
+			own = own + 1
+		end
+	end
+	check(own == 1, "the kept synthetic assignment's own owed application was withdrawn (" .. own .. " left)")
+	local from = #requests
+	for _ = 1, 2 do
+		client:update(0.016)
+		client:flush({ include_summaries = false })
+	end
+	exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+	check(exposures + outcomes == 0, "withdraw: " .. (exposures + outcomes)
+		.. " client-id fact(s) delivered after the unanswered declaration")
+	check(client:experiment_variant("exposure-banner") == "control", "the synthetic assignment must keep serving, got "
+		.. tostring(client:experiment_variant("exposure-banner")))
+	check(extra_tests.durable_entry(client, "exposure-banner") ~= nil, "the synthetic assignment left the durable record")
+	verify("client-id beneath synthetic")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- A synthetic-subject assignment can carry a server fact key. While a
+-- non-adult declaration of the experiment is pending, it keeps serving but
+-- records no outcome under that key; once the declaration's fetch fails it
+-- is kept, and records again.
+function extra_tests.test_age_declaration_pending_refuses_synthetic_keyed_outcome()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	next_response_body = extra_tests.synthetic_body()
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) result = value end)
+	assert_true(result ~= nil and result.assigned, "setup: the synthetic assignment is assigned")
+	assert_equal(client.experiments.entries["exposure-banner"].subject_fact_key, extra_tests.age_fact_key(),
+		"setup: the synthetic entry carries the server fact key")
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) then
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+	responder = nil
+	assert_equal(#held, 1, "setup: the declaration is in flight")
+	local check, verify = extra_tests.checklist()
+	local queued = #client.queue.items
+	local ok, err = client:track_outcome("exposure-banner", "score", 3)
+	check(not ok and err == "no_assignment", "an outcome was recorded under the synthetic fact key while the "
+		.. "declaration was pending (" .. tostring(ok) .. "/" .. tostring(err) .. ")")
+	check(#client.queue.items == queued, (#client.queue.items - queued) .. " fact(s) recorded while pending")
+	check(client:experiment_variant("exposure-banner") == "control", "the synthetic assignment must keep serving")
+	held[1](nil, nil, { status = 503, response = extra_tests.unavailable_body })
+	check(client:experiment_variant("exposure-banner") == "control", "the synthetic assignment must be kept")
+	ok = client:track_outcome("exposure-banner", "score", 4)
+	check(ok == true, "the kept synthetic assignment must record outcomes again")
+	verify("synthetic keyed outcome")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- A declaring host fetch's grammar re-mint retry answers the pending
+-- declaration: an assignment it installs is the server's answer and keeps
+-- serving once the declaration ends.
+function extra_tests.test_age_declaration_answered_by_its_grammar_retry()
+	local client, restore = extra_tests.age_client()
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = json.encode({
+				error = "experiment metadata must use synthetic local-safe identifiers only",
+			}) })
+		else
+			callback(nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+		end
+		return true
+	end
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) result = value end)
+	responder = nil
+	assert_equal(answers, 2, "setup: the grammar reject re-minted and retried")
+	local check, verify = extra_tests.checklist()
+	check(result ~= nil and result.assigned and not result.from_cache, "the retry's answer must reach the caller, got "
+		.. tostring(result and result.error))
+	check(client:experiment_variant("exposure-banner") == "control", "the retry's answer was withdrawn as unanswered: "
+		.. tostring(client:experiment_variant("exposure-banner")))
+	verify("grammar retry answer")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- A later adult declaration decides afresh: it is sent as a new fetch, and
+-- the re-admission is a new application with a fresh exposure id, delivered.
+function extra_tests.test_age_adult_declaration_after_unconfirmed_one_is_new_application()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	local withdrawn = queued_events(client, "experiment_exposure")[1]
+	assert_true(withdrawn ~= nil, "setup: the first application's exposure is queued")
+	extra_tests.declare_unconfirmed(client)
+	next_status = 200
+	next_response_body = extra_tests.age_golden("adult")
+	local before = #assignment_requests()
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) result = value end)
+	local check, verify = extra_tests.checklist()
+	check(result ~= nil and result.assigned and not result.from_cache,
+		"the adult re-declaration must be decided by a new fetch")
+	check(#assignment_requests() == before + 1, "the adult re-declaration must be sent")
+	local exposures = queued_events(client, "experiment_exposure")
+	check(#exposures == 1 and exposures[1].event_id ~= withdrawn.event_id,
+		"the re-admission must be one new application with a fresh id: " .. #exposures
+		.. " exposure(s) queued, first id " .. tostring(exposures[1] and exposures[1].event_id)
+		.. " (withdrawn " .. tostring(withdrawn.event_id) .. ")")
+	local from = #requests
+	client:flush({ include_summaries = false })
+	local _, _, delivered = extra_tests.delivered_facts(from, "exposure-banner")
+	local ids = {}
+	for i = 1, #delivered do
+		if delivered[i].event_name == "experiment_exposure" then
+			ids[#ids + 1] = delivered[i].event_id
+		end
+	end
+	check(#ids == 1 and ids[1] ~= withdrawn.event_id, "the re-admission's exposure alone must be delivered, got "
+		.. table.concat(ids, ","))
+	verify("re-admission")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- A declaration made while consent refuses is not held for a re-grant: its
+-- fetch ends before the wire, unconfirmed, and the re-grant serves nothing.
+function extra_tests.test_age_declaration_under_refused_consent_withdraws()
+	local client, restore = extra_tests.applied_scene()
+	assert_true(client:set_consent(false))
+	local ok, err = client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function() end)
+	assert_true(ok == false and err == "consent_denied", "setup: the declaration is refused before the wire")
+	assert_true(client:set_consent(true))
+	local check, verify = extra_tests.checklist()
+	check(client.experiments.pending_rearm["exposure-banner"] == nil, "withdraw: the re-grant re-arms the exposure")
+	extra_tests.assert_declaration_withdrew(client, check, nil, nil, 1)
+	verify("refused consent")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- The forced-minor floor stays closed for an adult declaration: cold (no
+-- traffic, no subject minted) and with a cached, applied assignment (nothing
+-- served, applied or recorded, no request).
+function extra_tests.test_age_forced_minor_floor_closed_for_adult_declaration()
+	local client, restore = extra_tests.age_client()
+	assert_nil(client.experiments:current_subject_id(), "setup: no subject yet")
+	assert_true(client:set_consent("denied_forced_minor"))
+	local result
+	local ok, err = client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) result = value end)
+	assert_true(ok == false and err == "consent_denied" and result and result.error == "consent_denied",
+		"cold: an adult declaration under the forced-minor floor must be refused")
+	advance_seconds(1000)
+	client:update(0.016)
+	assert_equal(#assignment_requests(), 0, "cold: forced minor with an adult declaration sent requests")
+	assert_nil(client.experiments:current_subject_id(), "cold: forced minor with an adult declaration minted a subject")
+	client:shutdown()
+	restore()
+	storage.reset()
+
+	client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	assert_true(client:set_consent("denied_forced_minor"))
+	ok, err = client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil, function() end)
+	assert_true(ok == false and err == "consent_denied", "cached: the adult declaration must be refused")
+	assert_nil(client:experiment_variant("exposure-banner"), "cached: the forced-minor floor served")
+	ok, err = client:track_exposure("exposure-banner")
+	assert_true(ok == false and err == "consent_denied", "cached: the forced-minor floor applied")
+	ok, err = client:track_outcome("exposure-banner", "score", 1)
+	assert_true(ok == false and err == "consent_denied", "cached: the forced-minor floor recorded an outcome")
+	local from = #requests
+	advance_seconds(1000)
+	client:update(0.016)
+	client:flush({ include_summaries = false })
+	assert_equal(#assignment_requests(), 1, "cached: forced-minor assignment traffic")
+	local exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "cached: forced-minor facts delivered")
+	exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "cached: forced-minor facts queued")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- An adult 200 in flight when a later refusal settles installs nothing,
+-- hands its caller no variant, and persists nothing: the per-key fence with a
+-- refusal, not two assignments.
+function extra_tests.test_age_adult_answer_in_flight_loses_to_later_refusal()
+	local client, restore = extra_tests.age_client()
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) and #held == 0 then
+			held[1] = callback
+			return true
+		end
+		return false
+	end
+	local late
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+		function(value) late = value end)
+	assert_equal(#held, 1, "setup: the adult fetch is in flight")
+	next_response_body = extra_tests.age_golden("under_threshold")
+	local refused
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) refused = value end)
+	responder = nil
+	assert_equal(refused and refused.reason, "age_ineligible", "setup: the refusal lands")
+	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	assert_true(late ~= nil and not late.assigned, "the superseded adult caller received a variant")
+	assert_nil(client:experiment_variant("exposure-banner"), "the late adult response reinstalled the assignment")
+	assert_nil(extra_tests.durable_entry(client, "exposure-banner"), "the late adult response persisted the assignment")
+	client:shutdown()
+	storage.reset() -- relaunch
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	assert_nil(relaunch:experiment_variant("exposure-banner"), "the late adult response restored at relaunch")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- A revalidation in flight (declaring adult) when a later refusal settles
+-- installs nothing and persists nothing.
+function extra_tests.test_age_revalidation_in_flight_loses_to_later_refusal()
+	local client, restore = extra_tests.age_client()
+	extra_tests.admit(client)
+	client:update(0) -- arms the cadence
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) and #held == 0 then
+			held[1] = callback
+			return true
+		end
+		return false
+	end
+	advance_seconds(1000)
+	client:update(0.016)
+	assert_equal(#held, 1, "setup: the revalidation is in flight")
+	assert_equal(query_params(last_assignment_request().url).age_band, "adult", "setup: the revalidation declared adult")
+	next_response_body = extra_tests.age_golden("under_threshold")
+	local refused
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) refused = value end)
+	responder = nil
+	assert_equal(refused and refused.reason, "age_ineligible", "setup: the refusal lands")
+	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	assert_nil(client:experiment_variant("exposure-banner"), "the in-flight revalidation reinstalled the assignment")
+	assert_nil(extra_tests.durable_entry(client, "exposure-banner"), "the in-flight revalidation persisted the assignment")
+	client:shutdown()
+	storage.reset() -- relaunch
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	assert_nil(relaunch:experiment_variant("exposure-banner"), "the in-flight revalidation restored at relaunch")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	extra_tests.test_age_remote_config_keeps_targeting_rules,
 	extra_tests.test_age_api_lifecycle_precedes_arguments,
@@ -9097,6 +10181,28 @@ local tests = {
 	extra_tests.test_backend_background_sweep_opens_no_session,
 	extra_tests.test_explicit_exposure_after_end_adds_to_the_automatic_one,
 	extra_tests.test_backend_explicit_exposure_after_end_opens_no_session,
+	extra_tests.test_age_unconfirmed_declaration_withdraws_experiment,
+	extra_tests.test_age_unconfirmed_declaration_withdraws_spooled_facts,
+	extra_tests.test_age_unconfirmed_declaration_spares_other_experiment,
+	extra_tests.test_age_adult_or_absent_declaration_across_failure_keeps_serving,
+	extra_tests.test_age_declaration_in_flight_stops_serving_until_answered,
+	extra_tests.test_age_declaration_in_flight_is_not_revalidated,
+	extra_tests.test_age_declaration_in_flight_at_shutdown_withdraws,
+	extra_tests.test_age_declaration_answered_by_auth_latch_withdraws,
+	extra_tests.test_age_adult_revalidation_in_flight_loses_to_unconfirmed_declaration,
+	extra_tests.test_age_adult_answer_lands_while_declaration_pending,
+	extra_tests.test_age_declaration_own_cache_serve_is_withdrawn,
+	extra_tests.test_age_declaration_leaves_synthetic_assignment,
+	extra_tests.test_age_declaration_blocks_stale_grammar_retry,
+	extra_tests.test_age_unanswered_declaration_keeping_synthetic_still_fences,
+	extra_tests.test_age_unanswered_declaration_withdraws_client_id_beneath_synthetic,
+	extra_tests.test_age_declaration_pending_refuses_synthetic_keyed_outcome,
+	extra_tests.test_age_declaration_answered_by_its_grammar_retry,
+	extra_tests.test_age_adult_declaration_after_unconfirmed_one_is_new_application,
+	extra_tests.test_age_declaration_under_refused_consent_withdraws,
+	extra_tests.test_age_forced_minor_floor_closed_for_adult_declaration,
+	extra_tests.test_age_adult_answer_in_flight_loses_to_later_refusal,
+	extra_tests.test_age_revalidation_in_flight_loses_to_later_refusal,
 }
 
 for _, test in ipairs(tests) do

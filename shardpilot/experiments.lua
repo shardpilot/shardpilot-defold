@@ -41,7 +41,10 @@
 --     emitted for it. An age refusal also WITHDRAWS the subject's owed
 --     applications for the experiment — owed exposures and every fact
 --     accepted but not yet delivered — where the other three keep them
---     (see apply_age_withdrawal). An UNKNOWN reason — like a 200 whose
+--     (see apply_age_withdrawal). A host fetch that DECLARES a non-adult age
+--     stops a client-id experiment serving until it ends, and withdraws it
+--     the same way when it ends without the server's answer applied (see
+--     begin_host_declaration). An UNKNOWN reason — like a 200 whose
 --     body names a DIFFERENT experiment than the request — is treated as
 --     malformed (transient serve-stale), never executed as a directive
 --     this client does not understand.
@@ -379,6 +382,45 @@ local function sanitize_restored_attributes(list)
 	local normalized = M.normalize_assignment_attributes(attributes)
 	if #normalized == 0 then return nil end
 	return normalized
+end
+
+-- Whether a host fetch's attributes declare an age other than adult under
+-- either spelling, read the way the request sends it: only an exact "adult"
+-- admits, so an unknown, under-threshold, empty, padded, oversized or
+-- non-string value is non-adult. An absent declaration declares nothing.
+local function declares_non_adult_age(attributes)
+	if type(attributes) ~= "table" then return false end
+	for _, name in ipairs({ "age_band", "custom_attribute_age_band" }) do
+		local value = attributes[name]
+		if value ~= nil and age_attribute_value(value) ~= "adult" then
+			return true
+		end
+	end
+	return false
+end
+
+-- Whether a host fetch's attributes declare adult under every age spelling
+-- they carry, and carry at least one.
+local function declares_adult_age(attributes)
+	if type(attributes) ~= "table" then return false end
+	local declared = false
+	for _, name in ipairs({ "age_band", "custom_attribute_age_band" }) do
+		local value = attributes[name]
+		if value ~= nil then
+			if age_attribute_value(value) ~= "adult" then
+				return false
+			end
+			declared = true
+		end
+	end
+	return declared
+end
+
+-- A synthetic-subject assignment has no age gate: the server assigns it
+-- whatever age is declared, so a pending non-adult declaration neither hides
+-- nor withdraws it. Anything else is treated as age-gated.
+local function age_exempt(entry)
+	return type(entry) == "table" and entry.assignment_unit == "synthetic_subject_key"
 end
 
 -- This fetch-scoped declaration does not change consent or the caller's map.
@@ -1015,6 +1057,13 @@ function M.new(config, deps)
 		-- one for its key may install.
 		fetch_seq = 0,
 		settled = {},
+		-- The host's non-adult age declarations whose fetch has not ended:
+		-- experiment_key → { fence_seq, seq, decided } (see
+		-- begin_host_declaration). While one stands the experiment is not
+		-- served and the revalidation cadence leaves it alone; a fetch that
+		-- ends without the server's answer applied withdraws the experiment
+		-- (end_non_adult_declaration). A later host declaration replaces it.
+		declaring = {},
 		-- Fail-closed latch: set by 401/403, cleared by re-init or a later
 		-- authoritative, authorized outcome of a fetch STARTED AFTER the
 		-- latch was set. While set, nothing is served and revalidation
@@ -2270,6 +2319,13 @@ function Experiments:sweep_pending(experiment_key, mode)
 		return
 	end
 	while list[1] do
+		if self.declaring[experiment_key] then
+			-- A non-adult declaration of the experiment is unanswered: its
+			-- owed applications wait, unsent, for the answer — kept when it
+			-- governs that they survive (kill_switch), withdrawn when it
+			-- refuses or never comes. Re-checked at every head.
+			return
+		end
 		if mode == "background" and list[1].session_id == nil
 			and self.config.source ~= "backend"
 			and (not self.deps.analytics_session
@@ -2710,9 +2766,21 @@ end
 -- key, by being the dropped entry or carrying a refused fact key). A batch
 -- already ON THE WIRE is past recall (the consent purge's carve-out): it is
 -- neither re-sent nor counted as withdrawn.
-function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms, refused_fact_key)
-	local dropped = self.entries[experiment_key]
-	self.entries[experiment_key] = nil
+-- `keep_assignment` (an unanswered non-adult declaration keeping a
+-- synthetic-subject assignment): the entry, its durable copy, its re-arm
+-- intent and its exposure accounting stay, and only the subject's owed
+-- CLIENT-ID applications of the experiment are withdrawn with their facts.
+function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms, refused_fact_key, keep_assignment)
+	local dropped = nil
+	if not keep_assignment then
+		dropped = self.entries[experiment_key]
+		self.entries[experiment_key] = nil
+	end
+	-- An install applies here, so a kept synthetic assignment's own owed
+	-- application is not among the withdrawn: only age-gated ones are.
+	local function withdrawable(held)
+		return not (keep_assignment and age_exempt(held))
+	end
 	local subject = self:current_subject_id()
 	local fact_keys = nil
 	local function refuse_fact_key(value)
@@ -2727,7 +2795,7 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 	if type(owed) == "table" then
 		for i = 1, #owed do
 			local held = owed[i].entry
-			if held and subject and held.subject_key == subject then
+			if held and subject and held.subject_key == subject and withdrawable(held) then
 				refuse_fact_key(held.subject_fact_key)
 			end
 		end
@@ -2739,7 +2807,7 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 		-- subject's when its entry IS the dropped one, or when it carries
 		-- one of the refused subject's server-minted fact keys.
 		local function refused(held)
-			if held == nil then
+			if held == nil or not withdrawable(held) then
 				return false
 			end
 			if subject and held.subject_key == subject then
@@ -2756,21 +2824,26 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 		end
 		self.pending_exposure[experiment_key] = kept[1] and kept or nil
 	end
-	self.pending_rearm[experiment_key] = nil
-	if subject then
-		local prefix = experiment_key .. "\31"
-		local suffix = "\31" .. subject
-		for tuple, exposed in pairs(self.exposed) do
-			if tuple:sub(1, #prefix) == prefix and tuple:sub(-#suffix) == suffix then
-				local retired = self.session_marker .. "\31" .. tuple
-				self.retired_arms[retired] = math.max(
-					self.retired_arms[retired] or 0, exposed.arm + 1)
-				self.exposed[tuple] = nil
+	if not keep_assignment then
+		self.pending_rearm[experiment_key] = nil
+		if subject then
+			local prefix = experiment_key .. "\31"
+			local suffix = "\31" .. subject
+			for tuple, exposed in pairs(self.exposed) do
+				if tuple:sub(1, #prefix) == prefix and tuple:sub(-#suffix) == suffix then
+					local retired = self.session_marker .. "\31" .. tuple
+					self.retired_arms[retired] = math.max(
+						self.retired_arms[retired] or 0, exposed.arm + 1)
+					self.exposed[tuple] = nil
+				end
 			end
 		end
 	end
 	if self.deps.withdraw_facts then
 		self.deps.withdraw_facts(experiment_key, fact_keys)
+	end
+	if keep_assignment then
+		return
 	end
 	local as_of = type(resolved_at_ms) == "number" and resolved_at_ms or 0
 	if dropped and type(dropped.fetched_at_ms) == "number"
@@ -2819,6 +2892,146 @@ function Experiments:apply_destructive_outcome(seq, scope, experiment_key, outco
 		return
 	end
 	self:apply_entry_drop(scope, experiment_key, resolved_at_ms)
+end
+
+-- Record a HOST fetch's age declaration for one experiment, before any
+-- consent gate. A non-adult declaration stops the experiment serving at
+-- once (served_entry) and keeps the revalidation cadence from re-sending the
+-- entry's remembered adult declaration while its fetch is in flight; owed
+-- applications are left for the server's answer. `fence_seq` is the last
+-- fetch dispatched before the declaration: every fetch at or below it left
+-- with an earlier one. `seq` is the declaring fetch's own, once dispatched,
+-- and `decided` is set when the server's answer to it was applied. An adult
+-- declaration replaces a pending non-adult one (the later declaration
+-- decides afresh); a fetch that declares no age changes nothing. Returns the
+-- non-adult declaration, or nil.
+function Experiments:begin_host_declaration(experiment_key, attributes)
+	if declares_non_adult_age(attributes) then
+		local declaration = { fence_seq = self.fetch_seq, seq = nil, decided = false }
+		self.declaring[experiment_key] = declaration
+		return declaration
+	end
+	if declares_adult_age(attributes) then
+		self.declaring[experiment_key] = nil
+	end
+	return nil
+end
+
+-- End a non-adult declaration when its fetch ends, on every path. When the
+-- server's answer was applied (`decided`) that answer governs, as it always
+-- has: an age_ineligible refusal withdraws, a kill switch keeps what is owed,
+-- an assignment installs. Otherwise the server has not confirmed the
+-- declaration (a transient failure, an auth latch, which retains the durable
+-- record for a later init, a consent refusal, a fenced-out or stale-scope
+-- answer), and the declaration alone makes the subject ineligible for a
+-- client-id assignment, so it is not held for a later answer. It is the
+-- age_ineligible refusal's package, as if the server had refused with no
+-- fact key of its own (apply_age_withdrawal): the entry stops serving and its
+-- durable drop converges, and every application the subject owes for the
+-- experiment is withdrawn with its accepted facts. The key's sequence fence
+-- is raised past every fetch dispatched before the declaration, the way a
+-- newer settled answer raises it, so an adult answer or revalidation that
+-- left earlier installs nothing when it lands. A later host declaration
+-- replaced this one: nothing happens here. A synthetic-subject assignment
+-- has no age gate and is kept; only what the subject owes for the
+-- experiment is withdrawn. Nothing is minted: with no subject there is
+-- nothing cached or owed. Returns true when it withdrew the entry.
+function Experiments:end_non_adult_declaration(experiment_key, declaration)
+	if self.declaring[experiment_key] ~= declaration then
+		return false
+	end
+	self.declaring[experiment_key] = nil
+	if declaration.decided or self.torn_down then
+		return false
+	end
+	local subject = self:current_subject_id()
+	if not subject then
+		return false
+	end
+	local scope = self:scope_for(subject)
+	local fence_key = scope .. scope_separator .. experiment_key
+	if (self.settled[fence_key] or 0) < declaration.fence_seq then
+		self.settled[fence_key] = declaration.fence_seq
+	end
+	-- No echo from the server names the subject's facts. The served entry
+	-- does; an auth latch clears it from memory while retaining the durable
+	-- record, which then does.
+	local entry = self.entries[experiment_key]
+	local fact_key = nil
+	if not entry then
+		local stored = self:durable_record_for(scope).entries[experiment_key]
+		if type(stored) == "table" then
+			entry = stored
+			if type(stored.subject_fact_key) == "string" then
+				fact_key = stored.subject_fact_key
+			end
+		end
+	end
+	self:diagnose("withdrawn", "age_declaration_unconfirmed")
+	if age_exempt(entry) then
+		-- A synthetic-subject assignment has no age gate: it keeps serving.
+		-- The client-id applications the subject still owes for the
+		-- experiment from before it are withdrawn all the same.
+		self:apply_age_withdrawal(scope, experiment_key, clock.unix_ms(), nil, true)
+		return false
+	end
+	self:apply_age_withdrawal(scope, experiment_key, clock.unix_ms(), fact_key)
+	return true
+end
+
+-- Whether `outcome`, landing now for fetch `seq`, is the server's answer to
+-- the pending non-adult `declaration` and is about to be applied to the
+-- assignment state: a not-assigned verdict of any reason, a permanent drop,
+-- the real-subjects sentinel, or an install (`installs` false when the auth
+-- epoch or a consent refusal strips the constructive half). It must be the
+-- declaring fetch's own answer, for the current scope, and not fenced out. A
+-- transient, an auth latch and an unproven status are not answers: they
+-- leave the declaration unconfirmed. Evaluated before the outcome applies.
+function Experiments:answers_declaration(declaration, seq, scope, experiment_key, outcome, installs)
+	if not declaration or declaration.seq ~= seq
+		or self.declaring[experiment_key] ~= declaration then
+		return false
+	end
+	local subject = self:current_subject_id()
+	if not subject or self:scope_for(subject) ~= scope
+		or seq <= (self.settled[scope .. scope_separator .. experiment_key] or 0) then
+		return false
+	end
+	if outcome.drop_all then
+		return true
+	end
+	if outcome.transient or outcome.auth_blocked then
+		return false
+	end
+	if outcome.authoritative and outcome.drop_entry then
+		return true
+	end
+	return installs and outcome.new_entry ~= nil
+end
+
+-- End every pending non-adult declaration as unconfirmed. The client's
+-- shutdown abandons the fetches still in flight (a torn-down consumer
+-- discards their answers), so each is aborted, not answered, and ends now,
+-- before the final flush and sweep, as a fetch that ends unanswered does.
+function Experiments:abort_declarations()
+	local keys = {}
+	for key in pairs(self.declaring) do
+		keys[#keys + 1] = key
+	end
+	table.sort(keys)
+	for i = 1, #keys do
+		self:end_non_adult_declaration(keys[i], self.declaring[keys[i]])
+	end
+end
+
+-- The entry the getters serve and record against: none while a non-adult
+-- declaration of the experiment is pending, unless it is age-exempt.
+function Experiments:served_entry(experiment_key)
+	local entry = self.entries[experiment_key]
+	if entry and self.declaring[experiment_key] and not age_exempt(entry) then
+		return nil
+	end
+	return entry
 end
 
 -- Settle an authoritative fetch outcome and, when it may, install it. Gates,
@@ -3036,7 +3249,9 @@ end
 --   boundary?, from_cache, error? } and — like every request callback — fires
 -- exactly once, pcall-guarded. Returns true when a request was dispatched, or
 -- (false, error_code) with the callback already invoked when it could not be.
-function Experiments:fetch(experiment_key, attributes, callback, is_revalidation, preset_attributes)
+-- `carried_declaration` is internal: the grammar re-mint retry carries the
+-- rejected request's pending non-adult declaration, so it ends with the retry.
+function Experiments:fetch(experiment_key, attributes, callback, is_revalidation, preset_attributes, carried_declaration)
 	local function finish(result)
 		if type(callback) == "function" then
 			-- The callback is game code; never let it break the SDK.
@@ -3049,24 +3264,66 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		finish({ ok = false, from_cache = false, error = "experiment_key_required" })
 		return false, "experiment_key_required"
 	end
+	-- A HOST fetch's age declaration is recorded before any consent gate: a
+	-- non-adult declaration made while the plane refuses still withdraws when
+	-- its fetch ends, or a re-grant would serve the assignment the host has
+	-- declared the subject ineligible for. The cadence and the re-mint retry
+	-- re-send an earlier declaration and are not new ones.
+	local declaration = carried_declaration
+	local own_declaration = false
+	if not is_revalidation and preset_attributes == nil then
+		declaration = self:begin_host_declaration(experiment_key, attributes)
+		own_declaration = declaration ~= nil
+	end
+	-- Every path that ends this fetch ends its declaration first, so the
+	-- caller sees the state the declaration left. A cache serve the
+	-- unconfirmed declaration just withdrew is not handed back.
+	local function conclude(result)
+		if declaration and self:end_non_adult_declaration(experiment_key, declaration)
+			and result.from_cache then
+			result = { ok = false, from_cache = false, error = result.error }
+		end
+		return finish(result)
+	end
+	if is_revalidation and self.declaring[experiment_key] then
+		-- A revalidation re-sends an earlier declaration — the cadence's
+		-- remembered attributes, or a grammar re-mint retry's preset set —
+		-- and must not leave while the host's non-adult declaration of the
+		-- experiment is pending: its answer would outrank the declaration's
+		-- fence. Only a host fetch's own retry, carrying its declaration,
+		-- proceeds.
+		finish({ ok = false, from_cache = false, error = "declaration_pending" })
+		return false, "declaration_pending"
+	end
 	-- GRANTED-ONLY plane (see the module header): while consent is unknown or
 	-- denied — the forced-minor state included — no request leaves the
 	-- device, nothing is minted, nothing is served.
 	local refusal = consent_refusal(self.deps.consent())
 	if refusal then
-		finish({ ok = false, from_cache = false, error = refusal })
+		conclude({ ok = false, from_cache = false, error = refusal })
 		return false, refusal
 	end
 	if not json or type(json.decode) ~= "function" then
 		-- Without a decoder neither a fresh body nor a cached entry could be
 		-- interpreted when it was stored; nothing can be served.
-		finish({ ok = false, from_cache = false, error = "json_unavailable" })
+		conclude({ ok = false, from_cache = false, error = "json_unavailable" })
 		return false, "json_unavailable"
 	end
 
 	local subject = self:ensure_subject_id()
 	self.fetch_seq = self.fetch_seq + 1
 	local seq = self.fetch_seq
+	if own_declaration and self.declaring[experiment_key] == declaration then
+		declaration.seq = seq
+	elseif preset_attributes ~= nil and not is_revalidation
+		and declares_non_adult_age(attributes) then
+		-- A declaring host fetch's grammar re-mint retry: its answer is the
+		-- answer to the pending declaration.
+		local pending = self.declaring[experiment_key]
+		if pending then
+			pending.seq = seq
+		end
+	end
 
 	-- Capture the scope and the auth epoch ONCE per fetch: the URL, the
 	-- served cache, and the installed entry all describe the same subject
@@ -3106,7 +3363,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	if not http or not http.request then
 		local result = serve_entry_or_fail(entry, "http_unavailable",
 			normalized_attributes)
-		finish(result)
+		conclude(result)
 		return false, "http_unavailable"
 	end
 
@@ -3139,6 +3396,9 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		-- nothing installs, persists, or paces, and game code is not
 		-- called back after shutdown (the documented teardown contract).
 		if self.torn_down then
+			if declaration then
+				self:end_non_adult_declaration(experiment_key, declaration)
+			end
 			return
 		end
 		-- The consent re-check comes next: a revocation while the request
@@ -3172,9 +3432,16 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 			local _, closed_outcome = M.apply(nil, response,
 				revoked_resolved_at_ms, experiment_key, self.config.app_id,
 				self.config.environment_id, normalized_attributes)
+			-- Only the destructive half can answer a declaration here: the
+			-- install a consent refusal strips leaves it unconfirmed.
+			local answers = self:answers_declaration(declaration, seq, scope,
+				experiment_key, closed_outcome, false)
 			self:apply_destructive_outcome(seq, scope, experiment_key,
 				closed_outcome, revoked_resolved_at_ms, dispatched_at_ms)
-			finish({ ok = false, from_cache = false, error = refusal_now })
+			if answers then
+				declaration.decided = true
+			end
+			conclude({ ok = false, from_cache = false, error = refusal_now })
 			return
 		end
 		-- Transient serves come from the CURRENT fenced entry, not the one
@@ -3224,7 +3491,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 				-- entry, so the cadence path could no longer recover its
 				-- saved attributes on its own.
 				self:fetch(experiment_key, attributes, callback,
-					is_revalidation, normalized_attributes)
+					is_revalidation, normalized_attributes, declaration)
 				return
 			end
 		end
@@ -3261,8 +3528,13 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 				end
 			end
 		end
+		local answers = self:answers_declaration(declaration, seq, scope,
+			experiment_key, outcome, auth_epoch == self.auth_epoch)
 		self:install(seq, scope, experiment_key, outcome, auth_epoch,
 			resolved_at_ms, dispatched_at_ms)
+		if answers then
+			declaration.decided = true
+		end
 		-- The epoch re-check guards the PUBLIC callback like the install:
 		-- a response that raced a fail-closed latch was discarded from
 		-- state above, and its caller must not receive a healthy
@@ -3270,7 +3542,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		-- latch-setting response itself re-derives its own identical
 		-- closed result here.)
 		if auth_epoch ~= self.auth_epoch then
-			finish({ ok = false, from_cache = false, error = "unauthorized" })
+			conclude({ ok = false, from_cache = false, error = "unauthorized" })
 			return
 		end
 		-- The subject-scope re-check guards the callback the same way: a
@@ -3279,7 +3551,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		-- caller must receive the miss, never the discarded variant.
 		local subject_now = self:current_subject_id()
 		if not subject_now or self:scope_for(subject_now) ~= scope then
-			finish({ ok = false, from_cache = false, error = "stale_subject" })
+			conclude({ ok = false, from_cache = false, error = "stale_subject" })
 			return
 		end
 		-- And the per-key sequence fence guards it last: an older
@@ -3296,11 +3568,24 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 			-- older request carried, and the race loser's callback must
 			-- not receive a mismatched variant as a successful cache
 			-- serve — it gets the closed superseded result instead.
-			finish(serve_entry_or_fail(self.entries[experiment_key],
+			conclude(serve_entry_or_fail(self:served_entry(experiment_key),
 				"superseded", normalized_attributes))
 			return
 		end
-		finish(result)
+		-- A non-adult declaration of the experiment pending since this fetch
+		-- left (another fetch's): its caller receives no variant, a cache
+		-- serve included, whatever this answer installed. The getters serve
+		-- none either. The result's source (the cached entry for a cache
+		-- serve, the installed one otherwise) decides: an age-exempt one is
+		-- handed back as before.
+		local pending = self.declaring[experiment_key]
+		local source = result.from_cache and entry_now or outcome.new_entry
+		if pending and pending.seq ~= seq and result.assigned
+			and not age_exempt(source) then
+			conclude({ ok = false, from_cache = false, error = "superseded" })
+			return
+		end
+		conclude(result)
 	end, headers, nil, options)
 	return true
 end
@@ -3345,7 +3630,11 @@ function Experiments:tick(_)
 	self:arm_revalidation(now)
 	local keys = {}
 	for key in pairs(self.entries) do
-		keys[#keys + 1] = key
+		-- A key with a pending non-adult declaration is left alone: its
+		-- remembered attributes declare the earlier age.
+		if not self.declaring[key] then
+			keys[#keys + 1] = key
+		end
 	end
 	table.sort(keys)
 	local generation = self.cache_generation
@@ -3384,7 +3673,7 @@ function Experiments:variant(experiment_key)
 	if consent_refusal(self.deps.consent()) then
 		return nil
 	end
-	local entry = self.entries[experiment_key]
+	local entry = self:served_entry(experiment_key)
 	if not entry then
 		return nil
 	end
@@ -3398,7 +3687,7 @@ function Experiments:payload(experiment_key)
 	if consent_refusal(self.deps.consent()) then
 		return nil
 	end
-	local entry = self.entries[experiment_key]
+	local entry = self:served_entry(experiment_key)
 	if not entry then
 		return nil
 	end
@@ -3413,8 +3702,9 @@ function Experiments:track_exposure(experiment_key)
 	if type(experiment_key) ~= "string" or experiment_key == "" then
 		return false, "experiment_key_required"
 	end
-	-- The explicit re-arm targets the LIVE assignment only.
-	local entry = self.entries[experiment_key]
+	-- The explicit re-arm targets the LIVE assignment only (none while a
+	-- non-adult declaration is pending).
+	local entry = self:served_entry(experiment_key)
 	if not entry then
 		return false, "no_assignment"
 	end
@@ -3445,8 +3735,15 @@ function Experiments:track_outcome(experiment_key, outcome_key, outcome_value)
 		or outcome_value <= -math.huge or outcome_value >= math.huge then
 		return false, "invalid_outcome_value"
 	end
-	local entry = self.entries[experiment_key]
+	-- A pending non-adult declaration records nothing under the earlier one:
+	-- not against an age-gated entry (served_entry hides it), nor under a
+	-- server fact key carried by a synthetic-subject one.
+	local entry = self:served_entry(experiment_key)
 	if not entry then
+		return false, "no_assignment"
+	end
+	if self.declaring[experiment_key]
+		and type(entry.subject_fact_key) == "string" and entry.subject_fact_key ~= "" then
 		return false, "no_assignment"
 	end
 	-- Same egress rule as the exposure lane: the server-minted subject-fact

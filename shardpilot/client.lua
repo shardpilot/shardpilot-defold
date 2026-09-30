@@ -6633,6 +6633,11 @@ end
 
 function Client:shutdown(reason)
 	-- Shutdown always uses app_final; caller reasons belong to session_end().
+	-- An experiment fetch still in flight is abandoned here: a non-adult age
+	-- declaration riding one ends now, unanswered, before the final flush.
+	if self.experiments then
+		self.experiments:abort_declarations()
+	end
 	-- One more chance for an owed denied/disabled purge to land before
 	-- teardown (flush below retries it too; a still-failing purge is re-run
 	-- at the next launch by the persisted denial/disabled configuration).
