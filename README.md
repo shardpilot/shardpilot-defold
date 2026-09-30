@@ -1280,8 +1280,11 @@ dropped or withdrawn. A batch
 that is already being sent when the response arrives cannot be recalled: it
 is not retried if that send fails, and a `persist()` before it settles does
 not write its facts to disk. If the offline spool cannot be rewritten
-(storage failing) and the app exits before a later write succeeds, the next
-launch can still send those facts.
+(storage failing), the withdrawn facts are recorded in a separate file, and
+the next launch drops them from the spool before anything is sent, whether or
+not experiments are enabled on it. Only when that file cannot be written
+either, and the app exits before a later write succeeds, can the next launch
+still send them.
 
 A declaration other than `adult` takes effect when it is made. From the moment
 a fetch declares `age_band` or `custom_attribute_age_band` as anything other

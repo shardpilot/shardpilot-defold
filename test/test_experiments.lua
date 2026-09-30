@@ -10617,6 +10617,352 @@ function extra_tests.test_age_revalidation_in_flight_loses_to_later_refusal()
 	storage.reset()
 end
 
+-- ── the durable age-withdrawal debt (#127) ──
+--
+-- A storage fault followed by an exit: an age withdrawal whose spool rewrite
+-- fails, a fact-key retirement whose history-only save fails, and an
+-- unconfirmed declaration's end after an auth latch cleared an entry whose
+-- own write had failed.
+
+-- A predicate for state.fail_save that fails only the spool writes.
+function extra_tests.fail_spool_saves(path)
+	return path:sub(-#"/spool") == "/spool"
+end
+
+-- The durable withdrawal debts on the fake disk that still name an event.
+function extra_tests.armed_debts(stores)
+	local armed = 0
+	for path, record in pairs(stores) do
+		if path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn"
+			and type(record) == "table" and type(record.events) == "table"
+			and #record.events > 0 then
+			armed = armed + 1
+		end
+	end
+	return armed
+end
+
+-- The spooled scene on fake storage whose failures the scene controls: the
+-- subject is admitted, an outcome is accepted, and a failed batch spools the
+-- exposure and the outcome.
+function extra_tests.spooled_debt_scene()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client({ app_id = "exposure-app" })
+	client:set_consent(true)
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1), "setup: an accepted outcome")
+	responder = extra_tests.batch_answer(503)
+	assert_true(not client:flush({ include_summaries = false }), "setup: the 503 spools the batch")
+	responder = nil
+	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "setup: the exposure and the outcome are spooled")
+	return client, restore, stores, state
+end
+
+-- The refusal lands while the spool store fails, and the rewrite that would
+-- remove the refused facts fails with it.
+function extra_tests.refuse_through_failing_spool(client, state)
+	state.fail_save = extra_tests.fail_spool_saves
+	extra_tests.refuse(client, "age_ineligible")
+	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "setup: the failed rewrite left the facts on disk")
+end
+
+-- The app exits with the rewrite still owed, and relaunches with storage
+-- healthy again.
+function extra_tests.relaunch_after(state, overrides)
+	storage.reset() -- SIMULATED PROCESS DEATH
+	state.fail_save = nil
+	local settings = { app_id = "exposure-app" }
+	for key, value in pairs(overrides or {}) do
+		settings[key] = value
+	end
+	return assert(sdk.new(config(settings)))
+end
+
+-- The refused facts reach neither the wire nor the disk after the relaunch,
+-- with experiments enabled or disabled on it.
+function extra_tests.assert_refusal_debt_honoured(overrides, label)
+	local client, restore, stores, state = extra_tests.spooled_debt_scene()
+	extra_tests.refuse_through_failing_spool(client, state)
+	local armed = extra_tests.armed_debts(stores)
+	local relaunch = extra_tests.relaunch_after(state, overrides)
+	local from = extra_tests.deliver_all(relaunch)
+	local delivered = extra_tests.delivered_count(from, "exposure-banner")
+	local exposures, outcomes = extra_tests.disk_facts(relaunch, "exposure-banner")
+	local observed = ("debt=%d delivered=%d on disk=%d debt after=%d"):format(
+		armed, delivered, exposures + outcomes, extra_tests.armed_debts(stores))
+	print(("withdrawal debt scene, %s: %s"):format(label, observed))
+	assert_equal(observed, "debt=1 delivered=0 on disk=0 debt after=0",
+		"the refused facts replay after a failed rewrite and an exit (" .. label .. ")")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_through_failed_spool_rewrite_and_exit()
+	extra_tests.assert_refusal_debt_honoured(nil, "experiments enabled")
+end
+
+function extra_tests.test_age_refusal_debt_honoured_with_experiments_disabled()
+	extra_tests.assert_refusal_debt_honoured({ experiments_enabled = false }, "experiments disabled")
+end
+
+-- The debt is spent when a later spool write lands in the same process: the
+-- file it guarded no longer holds the refused facts.
+function extra_tests.test_age_refusal_debt_spent_by_a_later_spool_write()
+	local client, restore, stores, state = extra_tests.spooled_debt_scene()
+	extra_tests.refuse_through_failing_spool(client, state)
+	local armed = extra_tests.armed_debts(stores)
+	state.fail_save = nil
+	-- The flush cadence retries the owed rewrite first.
+	responder = extra_tests.batch_answer(202)
+	client:flush({ include_summaries = false })
+	responder = nil
+	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	local observed = ("debt=%d on disk=%d debt after the write=%d"):format(
+		armed, exposures + outcomes, extra_tests.armed_debts(stores))
+	print(("withdrawal debt scene, a later write lands: %s"):format(observed))
+	assert_equal(observed, "debt=1 on disk=0 debt after the write=0",
+		"the debt outlives the rewrite that spent it")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- The debt names each withdrawn copy by its event id AND its event_ts: an
+-- envelope stored later under the same id with another event_ts (a capture
+-- that re-derived the id and replaced the copy) is not the withdrawn copy,
+-- and survives the relaunch.
+function extra_tests.test_age_refusal_debt_spares_a_replaced_copy()
+	local client, restore, stores, state = extra_tests.spooled_debt_scene()
+	extra_tests.refuse_through_failing_spool(client, state)
+	-- The replacement: the stored exposure now carries a later event_ts.
+	local replaced = 0
+	for path, record in pairs(stores) do
+		if path:sub(-#"/spool") == "/spool" and type(record) == "table" then
+			for _, env in ipairs(record.events or {}) do
+				if env.event_name == "experiment_exposure" then
+					env.event_ts = "2099-01-01T00:00:00Z"
+					replaced = replaced + 1
+				end
+			end
+		end
+	end
+	assert_equal(replaced, 1, "setup: the spooled exposure was replaced")
+	local relaunch = extra_tests.relaunch_after(state)
+	local exposures, outcomes = extra_tests.chunk_facts(relaunch, "exposure-banner")
+	local observed = ("restored exposures=%d outcomes=%d"):format(exposures, outcomes)
+	print(("withdrawal debt scene, a replaced copy: %s"):format(observed))
+	assert_equal(observed, "restored exposures=1 outcomes=0",
+		"the debt drops a copy stored after it under the same id")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- The debt write fails with the rewrite: the rewrite's retry writes the debt
+-- first, so an exit while the spool store still fails replays nothing.
+function extra_tests.test_age_refusal_debt_write_retried_with_the_rewrite()
+	local client, restore, stores, state = extra_tests.spooled_debt_scene()
+	state.fail_save = function(path)
+		return extra_tests.fail_spool_saves(path)
+			or path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn"
+	end
+	extra_tests.refuse(client, "age_ineligible")
+	local after_refusal = extra_tests.armed_debts(stores)
+	state.fail_save = extra_tests.fail_spool_saves
+	client:flush({ include_summaries = false })
+	local after_retry = extra_tests.armed_debts(stores)
+	local relaunch = extra_tests.relaunch_after(state)
+	local from = extra_tests.deliver_all(relaunch)
+	local delivered = extra_tests.delivered_count(from, "exposure-banner")
+	local observed = ("debt after the refusal=%d after the retry=%d delivered=%d"):format(
+		after_refusal, after_retry, delivered)
+	print(("withdrawal debt scene, a failed debt write: %s"):format(observed))
+	assert_equal(observed, "debt after the refusal=0 after the retry=1 delivered=0",
+		"the failed debt write is not retried")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- The rewrite lands but the debt's clear fails: the stale debt names nothing
+-- the relaunch restores, and the relaunch spends it.
+function extra_tests.test_age_refusal_stale_debt_spent_at_relaunch()
+	local client, restore, stores, state = extra_tests.spooled_debt_scene()
+	extra_tests.refuse_through_failing_spool(client, state)
+	state.fail_save = function(path)
+		return path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn"
+	end
+	responder = extra_tests.batch_answer(202)
+	client:flush({ include_summaries = false })
+	responder = nil
+	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "setup: the rewrite landed")
+	local stale = extra_tests.armed_debts(stores)
+	local relaunch = extra_tests.relaunch_after(state)
+	local observed = ("debt after the landed rewrite=%d after the relaunch=%d"):format(
+		stale, extra_tests.armed_debts(stores))
+	print(("withdrawal debt scene, a stale debt: %s"):format(observed))
+	assert_equal(observed, "debt after the landed rewrite=1 after the relaunch=0",
+		"the stale debt outlives the relaunch")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- #127, first follow-up: the entry under A never reached the disk, and a kill
+-- switch drops it while the experiments store still fails, so the drop's
+-- history-only save fails too. That save is owed: persist() reports it, the
+-- retry lands it, and the relaunch's refusal withdraws A's spooled facts.
+function extra_tests.test_failed_history_save_of_a_dropped_unwritten_entry_is_owed()
+	local key_a = extra_tests.age_fact_key()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client({ app_id = "exposure-app" })
+	client:set_consent(true)
+	assert_true(client:session_start())
+	state.fail_save = fail_experiment_saves
+	extra_tests.admit(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	client:persist()
+	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner", key_a)
+	assert_true(exposures == 1 and outcomes == 1, "setup: A's facts are spooled")
+	extra_tests.refuse(client, "kill_switch")
+	local _, while_failing = client:persist()
+	state.fail_save = nil
+	client:persist()
+	local disk = extra_tests.named_keys(extra_tests.disk_history(client, "exposure-banner"))
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	extra_tests.refuse_with(relaunch, 1, false)
+	local from = extra_tests.deliver_all(relaunch)
+	local a = extra_tests.delivered_count(from, "exposure-banner", key_a)
+	local observed = ("persist while failing=%s disk=[%s] delivered A=%d"):format(
+		tostring(while_failing), disk, a)
+	print(("withdrawal debt scene, failed history save: %s"):format(observed))
+	assert_equal(observed, "persist while failing=experiments_pending disk=[A] delivered A=0",
+		"the failed history save is not owed")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- #127, second follow-up: the current assignment's durable write failed, its
+-- facts are queued, and the declaring fetch is answered with a 401. The
+-- latch clears the entry and cancels the owed write, so at the declaration's
+-- end neither the entry nor the record names the subject's fact key; the key
+-- the entry carried when the declaration was made does.
+function extra_tests.test_declaration_end_after_auth_latch_withdraws_by_captured_key()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client({ app_id = "exposure-app" })
+	client:set_consent(true)
+	assert_true(client:session_start())
+	state.fail_save = fail_experiment_saves
+	extra_tests.admit(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	state.fail_save = nil
+	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "setup: the facts are queued")
+	assert_nil(extra_tests.durable_entry(client, "exposure-banner"), "setup: the entry never reached disk")
+	next_status = 401
+	next_response_body = json.encode({ error = "unauthorized" })
+	local result
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) result = value end)
+	next_status = 200
+	assert_equal(result and result.error, "unauthorized", "setup: the 401 answers the declaration")
+	exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+	local observed = ("queued after the declaration=%d"):format(exposures + outcomes)
+	print(("withdrawal debt scene, declaration end after an auth latch: %s"):format(observed))
+	assert_equal(observed, "queued after the declaration=0",
+		"the declaration's end withdraws nothing by the key it cannot find")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- The record still holds version 1's entry under A, and the republish to
+-- version 2 under B failed its write: the end names both keys, and the
+-- queued facts under B are withdrawn with A's.
+function extra_tests.test_declaration_end_after_auth_latch_withdraws_under_an_older_stored_key()
+	local key_a, key_b = extra_tests.age_fact_key(), extra_tests.republished_fact_key
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client({ app_id = "exposure-app" })
+	client:set_consent(true)
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	assert_true(client:flush({ include_summaries = false }), "setup: A's exposure delivers")
+	state.fail_save = fail_experiment_saves
+	extra_tests.admit_republished(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	state.fail_save = nil
+	local stored = extra_tests.durable_entry(client, "exposure-banner")
+	assert_true(stored and stored.subject_fact_key == key_a, "setup: the record holds A's entry")
+	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", key_b)
+	assert_true(exposures == 1 and outcomes == 1, "setup: B's facts are queued")
+	next_status = 401
+	next_response_body = json.encode({ error = "unauthorized" })
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function() end)
+	next_status = 200
+	exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", key_b)
+	local observed = ("queued under B after the declaration=%d"):format(exposures + outcomes)
+	print(("withdrawal debt scene, declaration end over an older stored key: %s"):format(observed))
+	assert_equal(observed, "queued under B after the declaration=0",
+		"the declaration's end withdraws by the older stored key only")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- The captured key is the declaring subject's. A subject-grammar 400 re-mints
+-- the subject, and the retry is answered with a 401: the end runs for the
+-- new subject, and the queued facts of the subject the re-mint retired stay,
+-- as they do without a captured key.
+function extra_tests.test_declaration_end_after_remint_keeps_the_retired_subjects_facts()
+	local client, restore = extra_tests.age_client()
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+	assert_true(exposures == 1 and outcomes == 1, "setup: the facts are queued")
+	local answers = 0
+	responder = function(url, _, callback)
+		if not url:find("/runtime/experiments/assignment", 1, true) then
+			return false
+		end
+		answers = answers + 1
+		if answers == 1 then
+			callback(nil, nil, { status = 400, response = json.encode({
+				error = "experiment metadata must use synthetic local-safe identifiers only",
+			}) })
+		else
+			callback(nil, nil, { status = 401, response = json.encode({ error = "unauthorized" }) })
+		end
+		return true
+	end
+	local subject = client.experiments:current_subject_id()
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function() end)
+	responder = nil
+	assert_equal(answers, 2, "setup: the grammar reject re-minted and retried")
+	assert_true(client.experiments:current_subject_id() ~= subject, "setup: the subject was re-minted")
+	exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
+	local observed = ("queued after the declaration=%d"):format(exposures + outcomes)
+	print(("withdrawal debt scene, declaration end after a re-mint: %s"):format(observed))
+	assert_equal(observed, "queued after the declaration=2",
+		"the declaration's end withdraws the retired subject's facts")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	extra_tests.test_age_remote_config_keeps_targeting_rules,
 	extra_tests.test_age_api_lifecycle_precedes_arguments,
@@ -10877,6 +11223,16 @@ local tests = {
 	extra_tests.test_age_forced_minor_floor_closed_for_adult_declaration,
 	extra_tests.test_age_adult_answer_in_flight_loses_to_later_refusal,
 	extra_tests.test_age_revalidation_in_flight_loses_to_later_refusal,
+	extra_tests.test_age_refusal_through_failed_spool_rewrite_and_exit,
+	extra_tests.test_age_refusal_debt_honoured_with_experiments_disabled,
+	extra_tests.test_age_refusal_debt_spent_by_a_later_spool_write,
+	extra_tests.test_age_refusal_debt_spares_a_replaced_copy,
+	extra_tests.test_failed_history_save_of_a_dropped_unwritten_entry_is_owed,
+	extra_tests.test_declaration_end_after_auth_latch_withdraws_by_captured_key,
+	extra_tests.test_declaration_end_after_remint_keeps_the_retired_subjects_facts,
+	extra_tests.test_declaration_end_after_auth_latch_withdraws_under_an_older_stored_key,
+	extra_tests.test_age_refusal_debt_write_retried_with_the_rewrite,
+	extra_tests.test_age_refusal_stale_debt_spent_at_relaunch,
 }
 
 for _, test in ipairs(tests) do
