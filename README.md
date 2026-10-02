@@ -1629,8 +1629,8 @@ top-level one.
   to the bounded offline spool
   ([above](#offline-durability-event-spool)) — set `spool_enabled = false` for
   a fully memory-only event path.
-- **Durable storage is nine small bounded records** per configured app — the
-  last three only ever created by the features that own them (a consent
+- **Durable storage is ten small bounded records** per configured app — the
+  last four only ever created by the features that own them (a consent
   denial, and a run with `experiments_enabled` on): the
   identity record (anonymous ID + consent decision; plus, when a decision has
   superseded a consent trail this device could not read, **the timestamp of that
@@ -1662,10 +1662,14 @@ top-level one.
   when that denial superseded an unreadable consent trail, the same provenance
   pair the identity record holds, so the fact is not lost if the identity write
   is what failed), and — created only by a
-  run with `experiments_enabled` on — the experiment-assignment cache and its
-  clear marker. Those last two are the SDK's most identifier-bearing storage
-  and are retained across a consent downgrade and across a later launch with
-  the flag off: the cache holds the SDK-minted subject id, the server-minted
+  run with `experiments_enabled` on — the experiment-assignment cache, its
+  clear marker, and the age-withdrawal record (`experiments-withdrawn`: the
+  event ids and envelope timestamps, `event_ts`, of withdrawn experiment facts
+  still in the spool, written only when an age withdrawal's spool rewrite
+  fails, and cleared by the next spool write or purge that lands). The cache
+  and the clear marker are the SDK's most identifier-bearing storage and are
+  retained across a consent downgrade and across a later launch with the flag
+  off: the cache holds the SDK-minted subject id, the server-minted
   assignment and subject-fact keys (earlier subject-fact keys too, while an
   undelivered fact still carries one), the variant payload, **and the normalized
   targeting attributes the assignment was evaluated under** — so
@@ -1849,12 +1853,13 @@ top-level one.
 - **No durable I/O beyond the enumerated records** (identity, event spool,
   consent-receipt outbox, consent denial marker, crash-retry sidecar,
   crash-reporting settings, remote-config cache, the experiment-assignment
-  cache, and the experiment clear marker). The last two are **created** only
-  by a run with `experiments_enabled` on — but once created they persist, and
-  a later run with the flag **off** still reads the clear marker to filter
-  withdrawn experiment facts out of the spool. For a storage or privacy
-  audit: the flag gates creation, not the existence or the reading of these
-  records.
+  cache, the experiment clear marker, and the experiment age-withdrawal
+  record). The last three are **created** only by a run with
+  `experiments_enabled` on — but once created they persist, and a later run
+  with the flag **off** still reads the clear marker and the age-withdrawal
+  record to filter withdrawn experiment facts out of the spool. For a storage
+  or privacy audit: the flag gates creation, not the existence or the reading
+  of these records.
   `io.*`, `os.execute`, and browser/local storage are forbidden in source;
   `sys.save`/`sys.load`/`sys.get_save_file` are confined to
   `shardpilot/storage.lua`, which writes only the identity record, the bounded
@@ -1862,7 +1867,7 @@ top-level one.
   write-ahead consent denial marker, the bounded, TTL'd
   crash-retry sidecar, the one-boolean crash-reporting settings record, the
   single bounded remote-config cache record, and the experiment-assignment
-  cache record plus its clear marker.
+  cache record plus its clear marker and the age-withdrawal record.
 - **No raw/provider/token/billing surface.** Terms like `raw_payload`, `prompt`,
   `access_token`, `github_token`, `billing` must not appear in SDK or example
   source.

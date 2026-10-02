@@ -2537,10 +2537,11 @@ end
 -- could not land. Each is named by its event_id AND its event_ts, so a
 -- later capture that re-derived the id with a fresh identity is never taken
 -- for the withdrawn copy. The next launch drops the named copies from the
--- restored spool before anything re-sends; any spool write that lands spends
--- the debt. A separate file, like the condemnation marker: the spool file's
--- write is what failed. Returns a map event_id -> event_ts ("" when the
--- envelope carried none), or nil and "unreadable" when the read errored.
+-- restored spool before anything re-sends; any spool write or purge that
+-- lands spends the debt. A separate file, like the condemnation marker: the
+-- spool file's write is what failed. Returns a map event_id -> event_ts (""
+-- when the envelope carried none), or nil and "unreadable" when the read
+-- errored.
 local withdrawn_facts_memory = {}
 
 function M.load_withdrawn_facts(scope)

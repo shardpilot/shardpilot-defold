@@ -164,7 +164,7 @@ persisted opt-out record cannot be **read** (a storage error — as opposed to
 cleanly absent on a fresh install), the crash client **fails closed** and
 sends nothing until an explicit `set_enabled` decision is persisted again.
 
-- Durable storage is limited to nine small, bounded records, all written
+- Durable storage is limited to ten small, bounded records, all written
   through Defold `sys.save`: the identity record described above, a bounded
   crash-retry sidecar, the crash-reporting settings record (both described
   below), the bounded offline event spool, the bounded consent-receipt
@@ -174,17 +174,19 @@ sends nothing until an explicit `set_enabled` decision is persisted again.
   payload — it carries the denial and, when that denial superseded an unreadable
   consent trail, the same provenance pair the identity record holds, so the fact
   is not lost if the identity write is what failed), and — created only by a run with `experiments_enabled` on — the
-  experiment-assignment cache and its clear marker, both detailed below. The
-  last three exist only once the feature that owns them has run: a build that
-  has never denied consent and never enabled experiments carries six. No
-  cookies and no other browser or tracking storage.
+  experiment-assignment cache, its clear marker, and the age-withdrawal
+  record, all three detailed below. The last four exist only once the feature
+  that owns them has run: a build that has never denied consent and never
+  enabled experiments carries six. No cookies and no other browser or
+  tracking storage.
 
 ### What the experiment records hold (experiments-enabled builds only)
 
-These two records are the most identifier-bearing storage the SDK writes, and
-both are **retained across a consent downgrade and across a later launch with
-`experiments_enabled` off** — retention is deliberate (see the experiments
-consent rules), but it means an at-rest review must account for them.
+The first two records below are the most identifier-bearing storage the SDK
+writes, and both are **retained across a consent downgrade and across a later
+launch with `experiments_enabled` off** — retention is deliberate (see the
+experiments consent rules), but it means an at-rest review must account for
+them.
 
 - **Experiment-assignment cache** — one size-capped record per app, holding
   per cached experiment: the **SDK-minted subject id** (`spcid_…`), the
@@ -228,12 +230,23 @@ consent rules), but it means an at-rest review must account for them.
   id, environment id, the SDK-minted subject id, the remote-config base URL,
   and a short non-secret fingerprint of the API key (a hash — the key itself
   is never written to disk).
+- **Experiment age-withdrawal record** (`experiments-withdrawn`) — written
+  only when an age withdrawal (an `age_ineligible` refusal, or a non-adult
+  declaration that ends unanswered) cannot rewrite the offline spool to
+  remove the withdrawn facts. It holds the **event id and envelope timestamp
+  (`event_ts`)** of each withdrawn experiment fact still in the spool, and
+  nothing else, so the next launch drops those copies before anything is
+  sent, with `experiments_enabled` on or off. It is cleared by the next spool
+  write that lands and by any spool purge that lands (a consent denial, or a
+  launch without a persisted grant or with the spool disabled). A launch that
+  cannot read it drops every restored experiment fact instead, and keeps it
+  for a launch that can.
 
 - **The identity record also holds a copy of the subject id.** Once minted it
   is stored as `experiments_client_id` in the identity record described at the
   top of this document, and every later identity rewrite carries it forward —
   **including on launches with `experiments_enabled` off.** This matters for
-  an erasure review: deleting the two experiment records above does *not*
+  an erasure review: deleting the experiment records above does *not*
   remove every persisted experiment identifier, because this copy is what
   makes the subject sticky across launches in the first place.
 

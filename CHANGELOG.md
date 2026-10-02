@@ -9,8 +9,13 @@
   `experiments-withdrawn` save file; the next launch drops them from the
   restored spool before anything is sent, with experiments enabled or not, and
   any spool write that lands clears the file. Before, the next launch sent
-  them. A launch with no such file behaves as before. Two more cases of the
-  same kind: a kill switch that drops an assignment whose own write had failed
+  them. A launch with no such file behaves as before. A launch that cannot
+  read the file drops every restored experiment fact rather than send the
+  withdrawn ones, and keeps the file for a launch that can; a spool purge that
+  lands (a consent denial, or a launch without a persisted grant or with the
+  spool disabled) clears the file with the spool, so the event ids and
+  timestamps it names do not outlive the facts. Two more cases of the same
+  kind: a kill switch that drops an assignment whose own write had failed
   now keeps its fact-key history write owed until it lands (and `persist()`
   reports `experiments_pending` meanwhile), instead of losing the key when that
   write fails; and an unanswered non-adult declaration whose fetch was answered

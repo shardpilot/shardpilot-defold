@@ -10814,6 +10814,141 @@ function extra_tests.test_age_refusal_stale_debt_spent_at_relaunch()
 	storage.reset()
 end
 
+-- The debt file cannot be read at the relaunch: it may name any spooled
+-- fact, so every restored experiment fact is dropped, the host's spooled
+-- event still delivers, and the file is kept for a launch that can read it.
+function extra_tests.test_age_refusal_unreadable_debt_fails_closed()
+	local client, restore, stores, state = extra_tests.spooled_debt_scene()
+	assert_true(client:track("host-spooled"))
+	assert_true(client:persist(), "setup: the host's event is spooled")
+	extra_tests.refuse_through_failing_spool(client, state)
+	local armed = extra_tests.armed_debts(stores)
+	local load = sys.load
+	sys.load = function(path)
+		if path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn" then
+			error("corrupt save file")
+		end
+		return load(path)
+	end
+	local relaunch = extra_tests.relaunch_after(state)
+	local from = extra_tests.deliver_all(relaunch)
+	sys.load = load
+	local _, _, envelopes = extra_tests.delivered_facts(from, "exposure-banner")
+	local host = 0
+	for i = 1, #envelopes do
+		if envelopes[i].event_name == "host-spooled" then
+			host = host + 1
+		end
+	end
+	local observed = ("debt=%d delivered=%d host delivered=%d debt after=%d"):format(
+		armed, extra_tests.delivered_count(from, "exposure-banner"), host,
+		extra_tests.armed_debts(stores))
+	print(("withdrawal debt scene, an unreadable debt: %s"):format(observed))
+	assert_equal(observed, "debt=1 delivered=0 host delivered=1 debt after=1",
+		"an unreadable debt restores the withdrawn facts as sendable")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- A consent denial purges the spool, and the debt goes with it: the event
+-- ids and timestamps it names do not outlive the copies they named.
+function extra_tests.test_age_refusal_debt_spent_by_a_consent_denial()
+	local client, restore, stores, state = extra_tests.spooled_debt_scene()
+	extra_tests.refuse_through_failing_spool(client, state)
+	local armed = extra_tests.armed_debts(stores)
+	state.fail_save = nil
+	assert_true(client:set_consent(false), "setup: the denial's purge lands")
+	local observed = ("debt=%d after the denial=%d"):format(
+		armed, extra_tests.armed_debts(stores))
+	print(("withdrawal debt scene, a consent denial: %s"):format(observed))
+	assert_equal(observed, "debt=1 after the denial=0",
+		"the debt outlives the denial's spool purge")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- The denial's purge fails with the spool store, and its retry lands: the
+-- debt goes with the retried purge.
+function extra_tests.test_age_refusal_debt_spent_by_a_retried_purge()
+	local client, restore, stores, state = extra_tests.spooled_debt_scene()
+	extra_tests.refuse_through_failing_spool(client, state)
+	client:set_consent(false)
+	assert_true(client.spool_purge_pending, "setup: the denial's purge is owed")
+	local owed = extra_tests.armed_debts(stores)
+	state.fail_save = nil
+	client:persist()
+	assert_true(not client.spool_purge_pending, "setup: the retried purge lands")
+	local observed = ("debt while the purge is owed=%d after the retry=%d"):format(
+		owed, extra_tests.armed_debts(stores))
+	print(("withdrawal debt scene, a retried purge: %s"):format(observed))
+	assert_equal(observed, "debt while the purge is owed=1 after the retry=0",
+		"the debt outlives the retried spool purge")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- The app exits with the debt on disk, and relaunches with consent denied:
+-- the launch's spool purge takes the debt with it.
+function extra_tests.test_age_refusal_debt_spent_by_a_denied_launch()
+	local client, restore, stores, state = extra_tests.spooled_debt_scene()
+	extra_tests.refuse_through_failing_spool(client, state)
+	local armed = extra_tests.armed_debts(stores)
+	storage.reset() -- SIMULATED PROCESS DEATH
+	state.fail_save = nil
+	local scope = { workspace_id = "workspace-test", app_id = "exposure-app" }
+	local identity = storage.load(scope)
+	identity.consent_analytics = "denied"
+	assert_true(storage.save(scope, identity), "setup: the denial is persisted")
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local exposures, outcomes = extra_tests.disk_facts(relaunch, "exposure-banner")
+	assert_equal(exposures + outcomes, 0, "setup: the launch purged the spool")
+	local observed = ("debt=%d after the denied launch=%d"):format(
+		armed, extra_tests.armed_debts(stores))
+	print(("withdrawal debt scene, a denied launch: %s"):format(observed))
+	assert_equal(observed, "debt=1 after the denied launch=0",
+		"the debt outlives the launch's spool purge")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- The control: with no debt, no purge creates a debt file (a consent
+-- denial whose purge fails, its retry, and a denied launch).
+function extra_tests.test_spool_purges_without_a_debt_create_no_debt_file()
+	reset()
+	local restore, stores, state = install_fake_sys_storage()
+	local client = granted_client({ app_id = "exposure-app" })
+	client:set_consent(true)
+	assert_true(client:session_start())
+	extra_tests.admit(client)
+	assert_true(client:persist(), "setup: the exposure is spooled")
+	state.fail_save = extra_tests.fail_spool_saves
+	client:set_consent(false)
+	assert_true(client.spool_purge_pending, "setup: the denial's purge is owed")
+	state.fail_save = nil
+	client:persist()
+	assert_true(not client.spool_purge_pending, "setup: the retried purge lands")
+	client:shutdown()
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local files = 0
+	for path in pairs(stores) do
+		if path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn" then
+			files = files + 1
+		end
+	end
+	local observed = ("debt files after three purges=%d"):format(files)
+	print(("withdrawal debt scene, purges without a debt: %s"):format(observed))
+	assert_equal(observed, "debt files after three purges=0",
+		"a purge with no debt creates a debt file")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
 -- #127, first follow-up: the entry under A never reached the disk, and a kill
 -- switch drops it while the experiments store still fails, so the drop's
 -- history-only save fails too. That save is owed: persist() reports it, the
@@ -11233,6 +11368,11 @@ local tests = {
 	extra_tests.test_declaration_end_after_auth_latch_withdraws_under_an_older_stored_key,
 	extra_tests.test_age_refusal_debt_write_retried_with_the_rewrite,
 	extra_tests.test_age_refusal_stale_debt_spent_at_relaunch,
+	extra_tests.test_age_refusal_unreadable_debt_fails_closed,
+	extra_tests.test_age_refusal_debt_spent_by_a_consent_denial,
+	extra_tests.test_age_refusal_debt_spent_by_a_retried_purge,
+	extra_tests.test_age_refusal_debt_spent_by_a_denied_launch,
+	extra_tests.test_spool_purges_without_a_debt_create_no_debt_file,
 }
 
 for _, test in ipairs(tests) do
