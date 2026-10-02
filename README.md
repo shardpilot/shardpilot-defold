@@ -635,6 +635,21 @@ README, `docs/`, and the skill above are the reference.
 | `spool_max_bytes` | `262144` | Approx. spool size budget (1024–393216); oldest evicted first |
 | `schema_revision` | built-in revision | Schema-set revision declared on batch ingest (`X-ShardPilot-Schema-Revision` request header); a string overrides the value, `false`/`""` stops declaring ([details](docs/configuration.md#schema-revision-declaration)) |
 
+**One client per app.** Keep one live client per configured app
+(`workspace_id` and `app_id`) in a process. The identity and consent record,
+the event spool and the experiment records are stored per app, and each client
+works from its own in-memory copy of them. Two live clients of one app do not
+see each other's changes: an `age_ineligible` refusal received by one does not
+stop the other serving that experiment or delivering its queued and spooled
+facts. To replace a client, retry `shutdown()` until it returns `true`, and
+let any `fetch_remote_config()` callback of the old client run, then create
+the next one. Clients of different apps are independent; create each with
+`new(config)` and keep every instance (`init` holds one default client). Ids
+that differ only in characters other than letters, digits, `-` and `_` count
+as one app. The SDK does not yet refuse a second client of a live app
+([#146](https://github.com/shardpilot/shardpilot-defold/issues/146)); see
+[`docs/configuration.md`](docs/configuration.md#one-client-per-app).
+
 > `ingest.shardpilot.com` is a **planned** public domain and is not provisioned.
 > Use local/develop endpoints until a release explicitly publishes production
 > infrastructure. See [`docs/configuration.md`](docs/configuration.md).
@@ -1536,7 +1551,7 @@ implement all three.
 - **Keep `analytics_running` until `shardpilot.shutdown()` returns true, retry
   it, and never `init()` over a live client.** The analytics client has the
   same pending posture, and a re-`init` while one is still settling produces
-  two clients over one spool.
+  two clients over one spool ([one client per app](#configuration)).
 - **A cached decision can outlive its window if the wall clock steps
   backwards.** Only fully closed decisions are cached, so the worst this does
   is keep a *closed* answer alive longer than its plan — the safe direction —

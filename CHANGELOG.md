@@ -2,6 +2,13 @@
 
 ### Unreleased
 
+- The README and `docs/configuration.md` now state that the SDK supports one
+  live client per app in a process, and how to replace one. Two live clients
+  of one app work from separate in-memory copies of the app's records, so an
+  `age_ineligible` refusal received by one does not reach the other. Docs
+  only; no behaviour change.
+  ([#126](https://github.com/shardpilot/shardpilot-defold/issues/126),
+  [#145](https://github.com/shardpilot/shardpilot-defold/issues/145))
 - An `age_ineligible` withdrawal, or the withdrawal of an unanswered non-adult
   age declaration, now survives a storage failure followed by an exit. When
   the offline spool cannot be rewritten to remove the withdrawn facts, the SDK
