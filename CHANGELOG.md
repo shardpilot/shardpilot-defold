@@ -1,6 +1,6 @@
 # Changelog
 
-### Unreleased
+## v0.11.2 — 2026-10-02
 
 - The README and `docs/configuration.md` now state that the SDK supports one
   live client per app in a process, and how to replace one. Two live clients
