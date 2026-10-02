@@ -52,6 +52,22 @@
   no outcome under a server fact key): an unanswered declaration keeps it and
   withdraws only the client-id applications still owed from before it.
   ([#125](https://github.com/shardpilot/shardpilot-defold/issues/125))
+- An `age_ineligible` refusal, or the real-subjects sentinel, that removes
+  every event of the spool a launch restored now also clears the Retry-After
+  deadline restored with them. Before, the deadline stayed in memory and in
+  the spool file, so an unrelated event tracked afterwards was not sent even
+  by an explicit `flush()` until it expired, up to the Retry-After cap. The
+  spool file drops the deadline at once too, even when newer events had
+  already pushed the restored ones out of a full spool, so the next launch
+  does not restore it and hold those events. A deadline still has its effect
+  while restored events remain, or while a failed batch is held for retry.
+  ([#123](https://github.com/shardpilot/shardpilot-defold/issues/123))
+- The exposure slots an `age_ineligible` withdrawal retires (so that a
+  re-admitted player is exposed under a new event id) are now forgotten once
+  their session has ended or been renewed and no exposure still owed from that
+  session remains. Before, each session with such a withdrawal left a small
+  entry in memory for the life of the process.
+  ([#124](https://github.com/shardpilot/shardpilot-defold/issues/124))
 
 ## v0.11.1 — 2026-09-29 — undeclared cached experiment assignments are not restored
 
