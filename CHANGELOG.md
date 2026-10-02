@@ -9,6 +9,28 @@
   only; no behaviour change.
   ([#126](https://github.com/shardpilot/shardpilot-defold/issues/126),
   [#145](https://github.com/shardpilot/shardpilot-defold/issues/145))
+- An `age_ineligible` withdrawal, or the withdrawal of an unanswered non-adult
+  age declaration, now survives a storage failure followed by an exit. When
+  the offline spool cannot be rewritten to remove the withdrawn facts, the SDK
+  records them, by event id and timestamp, in a separate
+  `experiments-withdrawn` save file; the next launch drops them from the
+  restored spool before anything is sent, with experiments enabled or not, and
+  any spool write that lands clears the file. Before, the next launch sent
+  them. A launch with no such file behaves as before. A launch that cannot
+  read the file drops every restored experiment fact rather than send the
+  withdrawn ones, and keeps the file for a launch that can; a spool purge that
+  lands (a consent denial, or a launch without a persisted grant or with the
+  spool disabled) clears the file with the spool, so the event ids and
+  timestamps it names do not outlive the facts. Two more cases of the same
+  kind: a kill switch that drops an assignment whose own write had failed
+  now keeps its fact-key history write owed until it lands (and `persist()`
+  reports `experiments_pending` meanwhile), instead of losing the key when that
+  write fails; and an unanswered non-adult declaration whose fetch was answered
+  with a 401 or 403 now withdraws the queued facts under the key the cached
+  assignment carried when the declaration was made, which the latch had
+  cleared from memory.
+  ([#127](https://github.com/shardpilot/shardpilot-defold/issues/127))
+
 - An `age_ineligible` experiment refusal now withdraws what the refused player
   still owes for that experiment: an exposure not yet emitted, and the
   experiment's exposure and outcome facts that are queued, held for a retry,

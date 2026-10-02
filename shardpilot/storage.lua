@@ -2531,6 +2531,81 @@ function M.clear_experiments_clear(scope)
 	return true
 end
 
+-- Durable age-withdrawal debt: the spooled experiment facts an age
+-- withdrawal (an age_ineligible refusal, or a non-adult declaration's
+-- unconfirmed end) marked settled while the spool rewrite that removes them
+-- could not land. Each is named by its event_id AND its event_ts, so a
+-- later capture that re-derived the id with a fresh identity is never taken
+-- for the withdrawn copy. The next launch drops the named copies from the
+-- restored spool before anything re-sends; any spool write or purge that
+-- lands spends the debt. A separate file, like the condemnation marker: the
+-- spool file's write is what failed. Returns a map event_id -> event_ts (""
+-- when the envelope carried none), or nil and "unreadable" when the read
+-- errored.
+local withdrawn_facts_memory = {}
+
+function M.load_withdrawn_facts(scope)
+	local ns = spool_namespace(scope)
+	local record = nil
+	local path = save_path(ns, "experiments-withdrawn")
+	if path then
+		local ok, loaded = pcall(sys.load, path)
+		if ok and type(loaded) == "table" then
+			record = loaded
+		elseif not ok then
+			return nil, "unreadable"
+		end
+	else
+		record = withdrawn_facts_memory[ns]
+	end
+	if type(record) ~= "table" or type(record.events) ~= "table" then
+		return nil
+	end
+	local debt = nil
+	for i = 1, #record.events do
+		local named = record.events[i]
+		if type(named) == "table" and type(named.event_id) == "string"
+			and named.event_id ~= "" then
+			debt = debt or {}
+			debt[named.event_id] = type(named.event_ts) == "string"
+				and named.event_ts or ""
+		end
+	end
+	return debt
+end
+
+function M.save_withdrawn_facts(scope, debt)
+	local ns = spool_namespace(scope)
+	local ids = {}
+	for event_id in pairs(debt or {}) do
+		ids[#ids + 1] = event_id
+	end
+	table.sort(ids)
+	local events = {}
+	for i = 1, #ids do
+		events[i] = { event_id = ids[i], event_ts = debt[ids[i]] }
+	end
+	local stored = { events = events }
+	local path = save_path(ns, "experiments-withdrawn")
+	if not path then
+		withdrawn_facts_memory[ns] = stored
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, stored)
+	return ok and saved == true
+end
+
+function M.clear_withdrawn_facts(scope)
+	local ns = spool_namespace(scope)
+	local path = save_path(ns, "experiments-withdrawn")
+	if not path then
+		withdrawn_facts_memory[ns] = nil
+		return true
+	end
+	local ok, saved = pcall(sys.save, path, {})
+	return ok and saved == true
+end
+
 -- Drop the cached experiment-assignment record: an empty record is written in
 -- its place (which loads as "no cache") and the in-memory fallback is cleared.
 -- Returns true when the clear landed.
@@ -2558,6 +2633,7 @@ function M.reset()
 	spool_memory = {}
 	consent_outbox_memory = {}
 	outbox_resolution = {}
+	withdrawn_facts_memory = {}
 	remote_config_memory = {}
 	experiments_memory = {}
 	experiments_clear_memory = {}
