@@ -2,6 +2,13 @@
 
 ### Unreleased
 
+- The README and `docs/configuration.md` now state that the SDK supports one
+  live client per app in a process, and how to replace one. Two live clients
+  of one app work from separate in-memory copies of the app's records, so an
+  `age_ineligible` refusal received by one does not reach the other. Docs
+  only; no behaviour change.
+  ([#126](https://github.com/shardpilot/shardpilot-defold/issues/126),
+  [#145](https://github.com/shardpilot/shardpilot-defold/issues/145))
 - An `age_ineligible` experiment refusal now withdraws what the refused player
   still owes for that experiment: an exposure not yet emitted, and the
   experiment's exposure and outcome facts that are queued, held for a retry,
