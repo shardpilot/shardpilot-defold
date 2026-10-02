@@ -1444,6 +1444,7 @@ function Experiments:on_session_ended(ended_session_id)
 	end
 	self.session_marker = id.uuid()
 	self.exposed = {}
+	self:prune_retired_arms()
 end
 
 -- A renewed analytics session (an explicit session_start) re-arms the
@@ -1463,6 +1464,29 @@ end
 -- session is open to renew. The client passes is_renewal = false for it, so
 -- snapshots armed after the end MIGRATE to the new session like a first
 -- session's.
+-- The retired arms whose session marker nothing can reach any more: not the
+-- current marker, and no owed exposure snapshot's. Only an emission under
+-- that marker reads an entry (the automatic slot, a snapshot's own fact, a
+-- drop-time capture), so once the marker has rotated away and its last owed
+-- snapshot has drained, the entry is dead weight. Run when the marker
+-- rotates; an entry whose snapshot drains later goes at the next rotation.
+function Experiments:prune_retired_arms()
+	if next(self.retired_arms) == nil then
+		return
+	end
+	local reachable = { [self.session_marker] = true }
+	for _, list in pairs(self.pending_exposure) do
+		for i = 1, #list do
+			reachable[list[i].session] = true
+		end
+	end
+	for key in pairs(self.retired_arms) do
+		if not reachable[key:match("^([^\31]*)\31")] then
+			self.retired_arms[key] = nil
+		end
+	end
+end
+
 function Experiments:on_session_renewed(is_renewal, previous_session_id)
 	local previous = self.session_marker
 	self.session_marker = id.uuid()
@@ -1519,6 +1543,7 @@ function Experiments:on_session_renewed(is_renewal, previous_session_id)
 			self:arm_exposure(key, entry)
 		end
 	end
+	self:prune_retired_arms()
 end
 
 -- A consent denial purges queued-but-unpublished analytics facts — the OWED
