@@ -5751,7 +5751,7 @@ function Client:withdraw_experiment_facts(experiment_key, fact_keys)
 		-- them at the next launch.
 		self:owe_withdrawn_facts(marked)
 	end
-	if deadline_cleared and not marked then
+	if deadline_cleared and #marked == 0 then
 		self:drop_cleared_spool_deadline()
 	end
 	if withdrawn > 0 then
