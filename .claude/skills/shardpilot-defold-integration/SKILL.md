@@ -1192,13 +1192,17 @@ surface — no guessing from logs.
 11. **Shutdown**: `shardpilot.shutdown("app_final")` returns `true` (or
     retry it while pumping `update`; see the shutdown notes above).
 
-## Known limitations (release preparation 2026-09-29 for `v0.11.1`)
+## Known limitations (release preparation 2026-10-02 for `v0.11.2`)
 
 The consent-regime host requirements and limits are recorded in the
 [v0.11.0 release notes](../../../CHANGELOG.md); preparing a policy does not
-replace the application's lifecycle or consent handling. The only source
-change in `v0.11.1` is the experiment cache restore, which none of the limits
-below describes.
+replace the application's lifecycle or consent handling. Rechecked the three
+existing limits against source at `247b6615` on 2026-10-02, including all four
+changed library files since `v0.11.1`. They still hold: `v0.11.2` changes
+experiment age withdrawal, fact-key history and pending age declarations,
+without changing the CI, script-error-handler or deployment boundaries.
+The additional experiment limits below follow from those source changes;
+this is not a verification of a deployed service.
 
 - **CI builds the library but does not run your integrated game.** CI runs
   every `test/test_*.lua` suite under Lua 5.1, LuaJIT and host-only Lua 5.4,
@@ -1213,3 +1217,23 @@ below describes.
   hosted documentation availability are not verified by this source check.
   Use the endpoint supplied for your environment and the in-repo `docs/`
   for the SDK contract.
+- **One live client per configured app.** Clients sharing `workspace_id`
+  and `app_id` use the same persisted records but separate in-memory state;
+  one client's age refusal does not stop the other's serving or delivery.
+  Follow the replacement lifecycle in
+  [configuration](../../../docs/configuration.md#one-client-per-app).
+- **Age withdrawal cannot recall facts already on the wire.** They may have
+  been delivered; the client filters them from a retained failed batch and
+  from a pre-settle persistence snapshot so they are not retried. This is
+  not a server-side erasure guarantee.
+- **Withdrawal durability depends on successful storage.** If removing
+  withdrawn facts from the spool fails, a separate debt record prevents
+  their replay on restart. If both the spool rewrite and that debt write
+  keep failing through process exit, the old durable facts can replay.
+  Without the save-file API, the fallback is process-local memory.
+- **The experiment record's size cap can discard fact-key history.** When
+  its approximate 393216-byte cap still cannot be met after evicting all
+  assignment entries, the stored history is omitted too. Memory retains
+  those keys for this process, but a restart can lose the keys needed to
+  match older spooled facts to a later age refusal. This bounds the durable
+  record; it does not guarantee complete history across restarts.
