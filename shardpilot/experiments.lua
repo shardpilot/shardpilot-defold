@@ -1729,16 +1729,17 @@ end
 
 -- Write `record` (the durable record of the history's scope, or a fresh
 -- stub for it) when its section differs from the settled history. A stub
--- is written only when a history remains to carry. Best-effort, like a
--- prune: a failed save leaves the key in memory for the next write that
--- lands.
+-- is written only when a history remains to carry. Returns false when that
+-- write failed: the key stays in memory for the next write that lands, and
+-- the caller decides whether the write is owed.
 function Experiments:save_fact_key_history(record)
 	local on_disk = record.fact_key_history or {}
 	local settled = self:settle_fact_key_history(record.scope, on_disk)
 	if not same_fact_keys(settled, on_disk) then
 		record.fact_key_history = settled
-		storage.save_experiments(self.config, record)
+		return (storage.save_experiments(self.config, record))
 	end
+	return true
 end
 
 -- Prune the current subject's history, and rewrite the durable section when
@@ -1880,14 +1881,27 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 				end
 				return false
 			end
-			self.durable_pending[composite] = nil
 			-- Nothing is stored to drop: the entry never reached the disk
 			-- (its own write failed, or the size cap evicted it). The key
 			-- this sync just retired can still name spooled facts, so the
 			-- record's section takes it now; otherwise a relaunch would
-			-- have no key to withdraw them by.
-			self:save_fact_key_history(record)
-			return true
+			-- have no key to withdraw them by. That write is the drop's
+			-- durable work: when it fails, the drop stays owed, so the
+			-- retry lands the section and persist() reports it meanwhile.
+			if self:save_fact_key_history(record) then
+				self.durable_pending[composite] = nil
+				return true
+			end
+			self.durable_pending[composite] = {
+				key = experiment_key,
+				scope = scope,
+				as_of = as_of,
+				drop = true,
+			}
+			if not is_retry then
+				self:diagnose("persist_failed", "cache")
+			end
+			return false
 		end
 		local deciding = not is_retry
 			or (prior ~= nil and prior.undecided == true)
@@ -3044,7 +3058,9 @@ end
 -- SCOPE: this experiment key and this subject, never plane-wide — other
 -- experiments' owed facts are legitimate and untouched. The subject's facts
 -- are named by its server-minted fact keys: the dropped entry's, the refusal
--- body's, that of any owed snapshot of this same subject, and the ones the
+-- body's (`refused_fact_key`, one key or a list: an unconfirmed
+-- declaration's end may name two), that of any owed snapshot of this same
+-- subject, and the ones the
 -- fact-key history retired for this experiment (an earlier version's, or an
 -- entry a kill switch deleted). When none is
 -- known, no accepted fact is withdrawn: the experiment key alone would take
@@ -3077,7 +3093,13 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 		end
 	end
 	refuse_fact_key(dropped and dropped.subject_fact_key)
-	refuse_fact_key(refused_fact_key)
+	if type(refused_fact_key) == "table" then
+		for i = 1, #refused_fact_key do
+			refuse_fact_key(refused_fact_key[i])
+		end
+	else
+		refuse_fact_key(refused_fact_key)
+	end
 	-- The fact-key history: this subject's keys of the experiment that no
 	-- entry carries any more — a republish rotated the key, or a drop (a
 	-- kill switch's included) deleted the entry — while facts under them are
@@ -3209,6 +3231,15 @@ end
 function Experiments:begin_host_declaration(experiment_key, attributes)
 	if declares_non_adult_age(attributes) then
 		local declaration = { fence_seq = self.fetch_seq, seq = nil, decided = false }
+		-- The subject's fact key as the live entry carries it now. The end
+		-- may find neither the entry (an auth latch clears it) nor the key
+		-- in the durable record (the entry's own write failed, or an older
+		-- entry is stored), while facts under it are still queued.
+		local live = self.entries[experiment_key]
+		if live and type(live.subject_fact_key) == "string" then
+			declaration.fact_key = live.subject_fact_key
+			declaration.subject = self:current_subject_id()
+		end
 		self.declaring[experiment_key] = declaration
 		return declaration
 	end
@@ -3267,6 +3298,13 @@ function Experiments:end_non_adult_declaration(experiment_key, declaration)
 				fact_key = stored.subject_fact_key
 			end
 		end
+	end
+	-- The key the live entry carried when the declaration was made, for the
+	-- same subject: the entry is gone, and the record names no key or an
+	-- older one.
+	if not self.entries[experiment_key] and declaration.fact_key
+		and declaration.subject == subject and declaration.fact_key ~= fact_key then
+		fact_key = fact_key and { fact_key, declaration.fact_key } or declaration.fact_key
 	end
 	self:diagnose("withdrawn", "age_declaration_unconfirmed")
 	if age_exempt(entry) then

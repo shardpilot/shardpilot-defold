@@ -1151,6 +1151,13 @@ function M.new(config, defer_init_diagnostics)
 		spool_settled = {},
 		spool_rewrite_pending = false,
 		spool_purge_pending = false,
+		-- The durable age-withdrawal debt (event_id -> event_ts): spooled
+		-- facts an age withdrawal settled while their removal rewrite could
+		-- not land, also in the storage debt file so a relaunch drops them.
+		-- Spent by any spool write or purge that lands.
+		-- `withdrawn_debt_save_owed` marks a debt the file does not hold yet.
+		withdrawn_fact_debt = nil,
+		withdrawn_debt_save_owed = false,
 		-- Server-requested backpressure deadline (epoch ms) stored with the
 		-- record; spool_disk_deadline_ms mirrors what the record carries.
 		spool_retry_after_ms = nil,
@@ -1743,6 +1750,9 @@ function M.new(config, defer_init_diagnostics)
 			-- dispatch points keep retrying it until it lands.
 			client.stats.spool_persist_failed = client.stats.spool_persist_failed + 1
 			client.spool_purge_pending = true
+		else
+			-- The purge landed: the age-withdrawal debt goes with it.
+			client:purge_withdrawn_facts()
 		end
 	else
 		local spooled, stored_deadline, spool_miss, spool_migrated, spool_dropped =
@@ -1945,13 +1955,60 @@ function M.new(config, defer_init_diagnostics)
 				})
 			end
 		end
+		-- The durable age-withdrawal debt: spooled copies an age withdrawal
+		-- settled before the process exited without the rewrite that removes
+		-- them landing. Honoured whether or not experiments are enabled on
+		-- this launch, like the condemnation marker: the spool is live either
+		-- way. A copy is the withdrawn one only when its event_ts matches too.
+		-- A debt that names nothing restored is stale (the rewrite landed, the
+		-- file's clear did not) and is spent below with the rest.
+		-- An UNREADABLE debt file may name any spooled fact: it fails closed
+		-- like an unreadable condemnation marker without a stamp, dropping
+		-- every restored experiment fact while host events restore. Nothing
+		-- is held or spent for it: the file stays for a launch that can read
+		-- it, where a debt the rewrite below already honoured names nothing
+		-- and is spent as stale.
+		local withdrawn = 0
+		local debt, debt_miss = storage.load_withdrawn_facts(normalized)
+		if debt or debt_miss == "unreadable" then
+			client.withdrawn_fact_debt = debt
+			local kept = {}
+			for i = 1, #spooled do
+				local env = spooled[i]
+				local named
+				if debt then
+					local ts = type(env) == "table" and debt[env.event_id] or nil
+					named = ts ~= nil and ts == (type(env.event_ts) == "string"
+						and env.event_ts or "")
+				else
+					named = type(env) == "table"
+						and (env.event_name == "experiment_exposure"
+							or env.event_name == "experiment_outcome")
+				end
+				if named then
+					withdrawn = withdrawn + 1
+				else
+					kept[#kept + 1] = env
+				end
+			end
+			if withdrawn > 0 then
+				spooled = kept
+				client:diagnose({
+					scope = "spool",
+					status = "dropped",
+					code = "experiments_withdrawn",
+					count = withdrawn,
+				})
+			end
+		end
 		-- spool_migrated counts entries the loader RENAMED or DROPPED for legacy
 		-- wire names. It belongs in this guard because it is the one repair the
 		-- surviving count cannot express: an all-removed backlog sanitizes to an
 		-- empty list, and without the rewrite the durable file keeps those names
 		-- -- re-filtered every launch, and replayed onto the wire by a rollback
 		-- to an SDK that has no migration.
-		if #spooled > 0 or mismatched > 0 or condemned > 0 or (spool_migrated or 0) > 0 then
+		if #spooled > 0 or mismatched > 0 or condemned > 0 or withdrawn > 0
+			or (spool_migrated or 0) > 0 then
 			if #spooled == 0 then
 				client.spool_retry_after_ms = nil
 			end
@@ -1985,6 +2042,14 @@ function M.new(config, defer_init_diagnostics)
 				-- without the migration replays those names onto the wire.
 				client.spool_rewrite_pending = true
 			end
+			if withdrawn > 0 and client.withdrawn_fact_debt ~= nil then
+				-- The rewrite that drops the withdrawn copies failed again:
+				-- they stay on disk, and so does the debt that names them.
+				client.spool_rewrite_pending = true
+			end
+		elseif client.withdrawn_fact_debt ~= nil and spool_miss ~= "unreadable" then
+			-- Nothing restored for the debt to name: a stale debt.
+			client:spend_withdrawn_facts()
 		end
 		if (spool_dropped or 0) > 0 then
 			-- ⚠ A DROP IS A LOSS AND IS REPORTED. The migration rationale rests
@@ -2766,6 +2831,9 @@ function Client:set_consent(decision)
 			-- clean — instead of surviving the whole process on a stale
 			-- flag.
 			self.condemned_spool_pending = false
+			-- Nor can a withdrawn copy remain: the age-withdrawal debt goes
+			-- with the spool.
+			self:purge_withdrawn_facts()
 		else
 			if not self.spool_purge_pending then
 				self.stats.spool_persist_failed = self.stats.spool_persist_failed + 1
@@ -5667,18 +5735,23 @@ function Client:withdraw_experiment_facts(experiment_key, fact_keys)
 	-- Durable spool: the durable shadows of copies counted above, or of a
 	-- drop-time capture, or of a persist() snapshot taken before the
 	-- refusal — marked settled and rewritten away, never counted again.
-	local marked = false
+	local marked = {}
 	for i = 1, #self.spool_record do
 		local env = self.spool_record[i]
 		if matches(env) and type(env.event_id) == "string" then
 			self.spool_settled[env.event_id] = true
-			marked = true
+			marked[#marked + 1] = env
 		end
 	end
-	if marked and not self:write_spool_record(self.spool_record) then
+	if #marked > 0 and not self:write_spool_record(self.spool_record) then
 		self.spool_rewrite_pending = true
+		-- The withdrawn copies are still on disk, and the settled marks
+		-- that keep them from re-sending die with the process: owe them
+		-- durably, so an exit before a later write lands does not replay
+		-- them at the next launch.
+		self:owe_withdrawn_facts(marked)
 	end
-	if deadline_cleared and not marked then
+	if deadline_cleared and #marked == 0 then
 		self:drop_cleared_spool_deadline()
 	end
 	if withdrawn > 0 then
@@ -5888,8 +5961,53 @@ function Client:write_spool_record(events)
 	-- The whole file was just rewritten from the filtered state: no
 	-- condemned content can remain on disk.
 	self.condemned_spool_pending = false
+	-- Nor any withdrawn copy: the age-withdrawal debt is spent.
+	self:spend_withdrawn_facts()
 	self.spool_disk_deadline_ms = self.spool_retry_after_ms
 	return true
+end
+
+-- Owe the withdrawn spool copies `envelopes` durably (the age-withdrawal
+-- debt): merged into the debt this process already holds, and written to the
+-- debt file. A failed debt write is retried with the spool rewrite; both
+-- failing through an exit is the storage-down residual.
+function Client:owe_withdrawn_facts(envelopes)
+	local debt = self.withdrawn_fact_debt or {}
+	for i = 1, #envelopes do
+		local env = envelopes[i]
+		debt[env.event_id] = type(env.event_ts) == "string" and env.event_ts or ""
+	end
+	self.withdrawn_fact_debt = debt
+	self.withdrawn_debt_save_owed = not storage.save_withdrawn_facts(self.config, debt)
+end
+
+-- A spool write landed, so the file no longer holds any withdrawn copy: clear
+-- the debt file. A failed clear keeps the debt for the next write that lands;
+-- a stale debt names nothing a relaunch restores, and that launch spends it.
+function Client:spend_withdrawn_facts()
+	if self.withdrawn_fact_debt == nil then
+		return
+	end
+	if storage.clear_withdrawn_facts(self.config) then
+		self.withdrawn_fact_debt = nil
+		self.withdrawn_debt_save_owed = false
+	end
+end
+
+-- A spool purge landed, so no withdrawn copy remains for the debt to name:
+-- its event ids and timestamps go with the spool. The debt file is cleared
+-- when this process holds a debt or one is on disk, an unreadable one
+-- included; with neither, no file is created. A failed clear keeps the debt
+-- like a failed spend does.
+function Client:purge_withdrawn_facts()
+	if self.withdrawn_fact_debt == nil then
+		local debt, miss = storage.load_withdrawn_facts(self.config)
+		if debt == nil and miss ~= "unreadable" then
+			return
+		end
+		self.withdrawn_fact_debt = debt or {}
+	end
+	self:spend_withdrawn_facts()
 end
 
 -- Retry a denied/disabled purge that could not land. While the purge is owed
@@ -5911,6 +6029,8 @@ function Client:retry_spool_purge()
 		-- whole-file write proves it, so the fail-closed marker may retire
 		-- once the record side settles.
 		self.condemned_spool_pending = false
+		-- And the age-withdrawal debt goes with the spool.
+		self:purge_withdrawn_facts()
 		return true
 	end
 	return false
@@ -5923,6 +6043,12 @@ end
 function Client:retry_spool_rewrite()
 	if not self.spool_rewrite_pending then
 		return true
+	end
+	if self.withdrawn_debt_save_owed and self.withdrawn_fact_debt ~= nil then
+		-- The debt write failed with the rewrite: it goes first, so the
+		-- withdrawn copies are owed durably while the rewrite still fails.
+		self.withdrawn_debt_save_owed = not storage.save_withdrawn_facts(
+			self.config, self.withdrawn_fact_debt)
 	end
 	return self:write_spool_record(self.spool_record)
 end
