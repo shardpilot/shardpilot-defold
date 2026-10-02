@@ -63,10 +63,12 @@
   in the same environment also stops serving the experiment, withdraws its
   owed exposure, and discards that older answer. The refused facts are also
   removed from the spool file itself, including any a client wrote there at
-  shutdown. The earlier subject fact keys the refusal also reaches are kept
-  while any of these clients holds a fact under one, owes one, or serves the
-  assignment that carries it; before, one client could drop a key another
-  client's facts still needed.
+  shutdown, and under a subject fact key only another client of the same
+  player knew, such as one it refreshed to a newer version. The earlier
+  subject fact keys the refusal also reaches are kept while any of these
+  clients holds a fact under one, owes one, or serves the assignment that
+  carries it, or while the spool file holds such a fact; before, one client
+  could drop a key another client's facts still needed.
   ([#126](https://github.com/shardpilot/shardpilot-defold/issues/126))
 
 ## v0.11.1 — 2026-09-29 — undeclared cached experiment assignments are not restored

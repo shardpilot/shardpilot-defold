@@ -1697,6 +1697,9 @@ function M.new(config, defer_init_diagnostics)
 			sibling_live_fact_keys = function(experiment_key)
 				return client:sibling_live_experiment_fact_keys(experiment_key)
 			end,
+			sibling_refused_fact_keys = function(scope, experiment_key, keep_assignment)
+				return client:sibling_refused_experiment_fact_keys(scope, experiment_key, keep_assignment)
+			end,
 			capture_fact = function(event_name, props, event_id, overrides)
 				-- Drop-time durable capture: a durable entry delete with
 				-- an exposure still owed must not let a process kill lose
@@ -5648,7 +5651,35 @@ function Client:sibling_live_experiment_fact_keys(experiment_key)
 			siblings[i].experiments:add_held_fact_keys(experiment_key, live)
 		end
 	end
+	-- And the facts in the current spool file: what a client that is gone
+	-- (shut down and collected) spooled is only there. An unreadable file
+	-- adds nothing.
+	local on_disk, _, err = storage.load_spool(self.config)
+	if err == nil and type(on_disk) == "table" then
+		for i = 1, #on_disk do
+			local event = on_disk[i]
+			if is_experiment_fact(event) and type(event.props) == "table"
+				and event.props.experiment_key == experiment_key
+				and type(event.props.assignment_key) == "string" then
+				live[event.props.assignment_key] = true
+			end
+		end
+	end
 	return live
+end
+
+-- The subject-fact keys the other clients of the app in the process would
+-- refuse for an age refusal of `experiment_key` for `scope`
+-- (Experiments:add_refused_fact_keys).
+function Client:sibling_refused_experiment_fact_keys(scope, experiment_key, keep_assignment)
+	local keys = {}
+	local siblings = storage.spool_siblings(self.config, self)
+	for i = 1, #siblings do
+		if siblings[i].experiments then
+			siblings[i].experiments:add_refused_fact_keys(scope, experiment_key, keep_assignment, keys)
+		end
+	end
+	return keys
 end
 
 function Client:withdraw_experiment_facts(experiment_key, fact_keys, memory_only)

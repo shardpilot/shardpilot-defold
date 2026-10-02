@@ -10834,24 +10834,35 @@ function extra_tests.test_age_refusal_reaches_a_restored_copy_without_experiment
 	extra_tests.assert_refusal_reaches_a_restored_copy({ experiments_enabled = false }, "a client without experiments")
 end
 
+-- A sibling of `first` records an outcome of exposure-banner and shuts down
+-- while the ingest fails, so its facts go to the shared spool; the game then
+-- drops it and it is collected. Under LuaJIT a compiled trace can hold the
+-- client as a constant, which keeps it reachable until the trace is flushed,
+-- so the traces are flushed before the collection.
+function extra_tests.spool_from_a_collected_sibling(first)
+	local function spool_and_drop()
+		local second = extra_tests.sibling_of(first)
+		assert_true(second:session_start())
+		second:update(0.016)
+		assert_true(second:track_outcome("exposure-banner", "score", 1), "premise: the sibling records an outcome")
+		responder = extra_tests.batch_answer(503)
+		second:shutdown()
+		responder = nil
+	end
+	spool_and_drop()
+	if type(jit) == "table" and type(jit.flush) == "function" then
+		jit.flush()
+	end
+	collectgarbage("collect")
+	collectgarbage("collect")
+	assert_equal(#storage.spool_siblings(first.config, first), 0, "premise: the collected client left the registry")
+end
+
 function extra_tests.test_age_refusal_reaches_what_a_collected_sibling_spooled()
 	local first, restore = extra_tests.age_client()
 	assert_true(first:session_start())
 	extra_tests.admit(first)
-	local second = extra_tests.sibling_of(first)
-	assert_true(second:session_start())
-	second:update(0.016)
-	assert_true(second:track_outcome("exposure-banner", "score", 1), "premise: the sibling records an outcome")
-	responder = extra_tests.batch_answer(503)
-	second:shutdown()
-	responder = nil
-	-- The game drops the shut-down client, and it is collected.
-	second = nil
-	collectgarbage("collect")
-	collectgarbage("collect")
-	if storage.spool_siblings then
-		assert_equal(#storage.spool_siblings(first.config, first), 0, "premise: the collected client left the registry")
-	end
+	extra_tests.spool_from_a_collected_sibling(first)
 
 	extra_tests.refuse(first, "age_ineligible")
 	first:shutdown()
@@ -11047,6 +11058,72 @@ function extra_tests.test_fact_key_history_prune_counts_a_sibling_clients_facts(
 	storage.reset()
 end
 
+
+-- A same-scope sibling refreshed the experiment to a new version (key B) and
+-- persisted facts under B; the receiving client still holds key A and gets a
+-- refusal that names no key. The refusal covers what the sibling would
+-- refuse too, so the facts under B leave the shared spool.
+function extra_tests.test_age_refusal_reaches_a_siblings_own_key_in_the_spool()
+	local key_b = extra_tests.republished_fact_key
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	local second = extra_tests.sibling_of(first)
+	assert_true(second:session_start())
+	second:update(0.016)
+	extra_tests.admit_republished(second)
+	assert_true(second:track_outcome("exposure-banner", "score", 1), "premise: the sibling records an outcome under B")
+	assert_true(second:persist(), "premise: the sibling persists")
+	local exposures, outcomes = extra_tests.disk_facts(first, "exposure-banner", key_b)
+	assert_true(exposures == 1 and outcomes == 1, "premise: the sibling's facts under B are spooled")
+	assert_equal(first.experiments.entries["exposure-banner"].subject_fact_key, extra_tests.age_fact_key(),
+		"premise: the receiving client still holds A")
+
+	extra_tests.refuse_with(first, 1, false)
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local from = extra_tests.deliver_all(relaunch)
+	local outcome = ("after a relaunch, delivered B=%d"):format(extra_tests.delivered_count(from, "exposure-banner", key_b))
+	print("sibling's own key scene: " .. outcome)
+	assert_equal(outcome, "after a relaunch, delivered B=0",
+		"the refusal withdraws the facts under the sibling's own key from the shared spool")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
+-- A sibling spooled facts under A and was collected; the surviving client
+-- republished to B, retiring A. The prune counts the facts in the current
+-- spool file, so A stays in the history and a refusal that names only B
+-- still withdraws them.
+function extra_tests.test_fact_key_history_prune_counts_what_a_collected_sibling_spooled()
+	local key_a = extra_tests.age_fact_key()
+	local first, restore = extra_tests.age_client()
+	assert_true(first:session_start())
+	extra_tests.admit(first)
+	assert_true(first:flush({ include_summaries = false }), "premise: the first client's own facts under A deliver")
+	extra_tests.spool_from_a_collected_sibling(first)
+	local exposures, outcomes = extra_tests.disk_facts(first, "exposure-banner", key_a)
+	assert_true(exposures + outcomes >= 1, "premise: the sibling's facts under A are only in the file")
+
+	extra_tests.admit_republished(first)
+	first:update(0.016)
+	local history = extra_tests.named_keys(extra_tests.disk_history(first, "exposure-banner"))
+	extra_tests.refuse_with(first, 2, extra_tests.republished_fact_key)
+	first:shutdown()
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local from = extra_tests.deliver_all(relaunch)
+	local outcome = ("history after the republish=[%s] after a relaunch, delivered A=%d"):format(
+		history, extra_tests.delivered_count(from, "exposure-banner", key_a))
+	print("collected sibling history scene: " .. outcome)
+	assert_equal(outcome, "history after the republish=[A] after a relaunch, delivered A=0",
+		"the prune keeps A while the spool file holds facts under it")
+	relaunch:shutdown()
+	restore()
+	storage.reset()
+end
+
 local tests = {
 	extra_tests.test_age_remote_config_keeps_targeting_rules,
 	extra_tests.test_age_api_lifecycle_precedes_arguments,
@@ -11100,6 +11177,8 @@ local tests = {
 	extra_tests.test_age_refusal_reaches_another_environments_restored_copy,
 	extra_tests.test_age_refusal_reaches_a_restored_copy_without_experiments,
 	extra_tests.test_age_refusal_reaches_what_a_collected_sibling_spooled,
+	extra_tests.test_age_refusal_reaches_a_siblings_own_key_in_the_spool,
+	extra_tests.test_fact_key_history_prune_counts_what_a_collected_sibling_spooled,
 	extra_tests.test_fact_key_history_prune_counts_a_sibling_serving_the_key,
 	extra_tests.test_fact_key_history_prune_counts_a_sibling_owing_the_key,
 	extra_tests.test_unanswered_declaration_reaches_a_sibling,

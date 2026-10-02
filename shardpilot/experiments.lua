@@ -3062,6 +3062,41 @@ end
 -- CLIENT-ID applications of the experiment are withdrawn with their facts.
 -- `options.from_sibling`: another client of the app received the refusal;
 -- this client withdraws from memory only and reaches no further client.
+-- For another client's age refusal of `experiment_key` for `scope`: add to
+-- `keys` the subject-fact keys this consumer would refuse there, when it
+-- serves the same subject. They are its entry's (unless the withdrawal keeps
+-- the assignment), its history's and its owed snapshots'. A key only this
+-- client knows, such as an entry it refreshed to a new version, then joins
+-- the receiving client's withdrawal, which is the one that filters the shared
+-- spool file.
+function Experiments:add_refused_fact_keys(scope, experiment_key, keep_assignment, keys)
+	local subject = self:current_subject_id()
+	if not subject or self:scope_for(subject) ~= scope then
+		return
+	end
+	local function add(value)
+		if type(value) == "string" and value ~= "" then
+			keys[value] = true
+		end
+	end
+	local entry = self.entries[experiment_key]
+	if entry and not keep_assignment then
+		add(entry.subject_fact_key)
+	end
+	for fact_key in pairs(self:history_of(scope)[experiment_key] or {}) do
+		add(fact_key)
+	end
+	local owed = self.pending_exposure[experiment_key]
+	if type(owed) == "table" then
+		for i = 1, #owed do
+			local held = owed[i].entry
+			if held and held.subject_key == subject and not (keep_assignment and age_exempt(held)) then
+				add(held.subject_fact_key)
+			end
+		end
+	end
+end
+
 function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms, refused_fact_key, options)
 	options = options or {}
 	local keep_assignment = options.keep_assignment == true
@@ -3092,6 +3127,15 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 	-- still queued, spooled or captured.
 	for fact_key in pairs(self:history_of(scope)[experiment_key] or {}) do
 		refuse_fact_key(fact_key)
+	end
+	-- And what the same subject's other clients in the process would refuse
+	-- (Experiments:add_refused_fact_keys): the pass over the shared spool
+	-- file then reaches the facts they wrote under a key this client never
+	-- held.
+	if not from_sibling and self.deps.sibling_refused_fact_keys then
+		for fact_key in pairs(self.deps.sibling_refused_fact_keys(scope, experiment_key, keep_assignment) or {}) do
+			refuse_fact_key(fact_key)
+		end
 	end
 	local owed = self.pending_exposure[experiment_key]
 	if type(owed) == "table" then
