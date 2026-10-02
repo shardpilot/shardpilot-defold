@@ -637,13 +637,16 @@ README, `docs/`, and the skill above are the reference.
 
 **One client per app.** Keep one live client per configured app
 (`workspace_id` and `app_id`) in a process. The identity and consent record,
-the event spool and the experiment records are stored per app, and each
-client works from its own in-memory copy of them. Two live clients of one app
-do not see each other's changes: an `age_ineligible` refusal received by one
-does not stop the other serving that experiment or delivering its queued and
-spooled facts. To replace a client, retry `shutdown()` until it returns
-`true`, then create the next one. Clients of different apps are independent.
-The SDK does not yet refuse a second client of a live app
+the event spool and the experiment records are stored per app, and each client
+works from its own in-memory copy of them. Two live clients of one app do not
+see each other's changes: an `age_ineligible` refusal received by one does not
+stop the other serving that experiment or delivering its queued and spooled
+facts. To replace a client, retry `shutdown()` until it returns `true`, and
+let any `fetch_remote_config()` callback of the old client run, then create
+the next one. Clients of different apps are independent; create each with
+`new(config)` and keep every instance (`init` holds one default client). Ids
+that differ only in characters other than letters, digits, `-` and `_` count
+as one app. The SDK does not yet refuse a second client of a live app
 ([#146](https://github.com/shardpilot/shardpilot-defold/issues/146)); see
 [`docs/configuration.md`](docs/configuration.md#one-client-per-app).
 
