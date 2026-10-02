@@ -5456,16 +5456,35 @@ end
 -- was set for remains, so it is cleared, as it is for an emptied retained
 -- batch (the consent-purge stale-deadline rule). Left armed, it would hold an
 -- unrelated later event, even from an explicit flush(), for up to the
--- Retry-After cap. The durable record drops it at its next write. A batch on
--- the wire keeps the deadline: its settle decides.
+-- Retry-After cap. The withdrawal's own rewrite drops it from the durable
+-- record; when that rewrite has nothing to withdraw, the caller drops it
+-- with drop_cleared_spool_deadline. A batch on the wire keeps the deadline:
+-- its settle decides. Returns true when the deadline was cleared.
 function Client:clear_emptied_restore_deferral()
 	if #self.spool_batches > 0 or self.in_flight_batch ~= nil then
-		return
+		return false
 	end
 	self.publish_retry_after_ms = nil
 	self.publish_server_retry_after_ms = nil
 	self.publish_backoff_attempt = 0
 	self.spool_retry_after_ms = nil
+	return true
+end
+
+-- A withdrawal that cleared the restored deadline but found no durable fact
+-- to withdraw: the restored facts had already left the record (a later
+-- append evicted them at the caps), so no withdrawal write follows, and the
+-- record keeps the deadline. Left there, the next launch restores it and
+-- holds what the record kept. The record is rewritten without it, under the
+-- append path's guards: never a disabled spool, a non-granted actor's, or one
+-- whose purge is still owed (fail-closed). A failed write leaves it to the
+-- next write that lands.
+function Client:drop_cleared_spool_deadline()
+	if self.spool_disk_deadline_ms ~= nil and self.spool_retry_after_ms == nil
+		and self.config.spool_enabled and self.consent_state == "granted"
+		and not self.spool_purge_pending then
+		self:write_spool_record(self.spool_record)
+	end
 end
 
 -- Purge experiment facts from every analytics pipeline surface. Invoked by
@@ -5504,6 +5523,7 @@ function Client:purge_experiment_facts()
 			end
 		end
 	end
+	local deadline_cleared = false
 	if #self.spool_batches > 0 then
 		local kept_chunks = {}
 		for i = 1, #self.spool_batches do
@@ -5521,7 +5541,7 @@ function Client:purge_experiment_facts()
 			end
 		end
 		self.spool_batches = kept_chunks
-		self:clear_emptied_restore_deferral()
+		deadline_cleared = self:clear_emptied_restore_deferral()
 	end
 	-- Durable spool: mark the fact envelopes settled — every successful
 	-- write drops settled entries — and attempt the rewrite immediately; a
@@ -5543,6 +5563,9 @@ function Client:purge_experiment_facts()
 		-- The withdrawn facts are still on disk: durable debt — the
 		-- condemnation marker must not retire until a write lands.
 		self.condemned_spool_pending = true
+	end
+	if deadline_cleared and not marked then
+		self:drop_cleared_spool_deadline()
 	end
 	if purged > 0 then
 		-- Terminal non-delivery by server mandate: counted like the
@@ -5621,6 +5644,7 @@ function Client:withdraw_experiment_facts(experiment_key, fact_keys)
 			end
 		end
 	end
+	local deadline_cleared = false
 	if #self.spool_batches > 0 then
 		local kept_chunks = {}
 		for i = 1, #self.spool_batches do
@@ -5638,7 +5662,7 @@ function Client:withdraw_experiment_facts(experiment_key, fact_keys)
 			end
 		end
 		self.spool_batches = kept_chunks
-		self:clear_emptied_restore_deferral()
+		deadline_cleared = self:clear_emptied_restore_deferral()
 	end
 	-- Durable spool: the durable shadows of copies counted above, or of a
 	-- drop-time capture, or of a persist() snapshot taken before the
@@ -5653,6 +5677,9 @@ function Client:withdraw_experiment_facts(experiment_key, fact_keys)
 	end
 	if marked and not self:write_spool_record(self.spool_record) then
 		self.spool_rewrite_pending = true
+	end
+	if deadline_cleared and not marked then
+		self:drop_cleared_spool_deadline()
 	end
 	if withdrawn > 0 then
 		self.stats.dropped = self.stats.dropped + withdrawn

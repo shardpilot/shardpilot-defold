@@ -10627,7 +10627,8 @@ end
 
 -- Writes that spool, then simulates the process death. With `with_host`, a
 -- host event rides the spool too (restored work that outlives the refusal).
-function extra_tests.spool_with_deadline(with_host)
+-- `spool_max_events` caps the relaunched client's spool.
+function extra_tests.spool_with_deadline(with_host, spool_max_events)
 	local first, restore = extra_tests.age_client()
 	assert_true(first:session_start())
 	extra_tests.admit(first)
@@ -10647,7 +10648,7 @@ function extra_tests.spool_with_deadline(with_host)
 	assert_true(storage.save_spool(first.config, kept, first.config.spool_max_events,
 		first.config.spool_max_bytes, math.floor(socket.now * 1000) + 600000), "setup: the spool is rewritten")
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local second = assert(sdk.new(config({ app_id = "exposure-app", spool_max_events = spool_max_events })))
 	assert_true(second:spool_pending(), "setup: the spooled envelopes await re-send")
 	assert_true(second:publish_server_deferred(), "setup: the restored deadline defers the re-send")
 	return second, restore
@@ -10753,6 +10754,61 @@ function extra_tests.test_age_refusal_keeps_a_retained_batchs_deadline()
 	client:shutdown()
 	restore()
 	storage.reset()
+end
+
+-- The restored facts no longer in the record: in a one-event spool, the
+-- relaunch's persist() snapshots evicted them, the last one keeping only a
+-- host event, and the record kept the deadline. The withdrawal empties the
+-- restored chunk with no durable fact left to withdraw, and the process then
+-- exits. The next launch must not restore the deadline and hold that event.
+function extra_tests.deadline_of_a_record_without_restored_facts(label, withdraw)
+	local client, restore = extra_tests.spool_with_deadline(false, 1)
+	-- The session's re-armed exposure is persisted first, so the host event
+	-- is the newest entry and the one the cap keeps.
+	assert_true(client:session_start())
+	client:persist()
+	assert_true(client:track("host-event-before-exit"))
+	client:persist()
+	local chunk_exposures, chunk_outcomes = extra_tests.chunk_facts(client, "exposure-banner")
+	local disk_exposures, disk_outcomes = extra_tests.disk_facts(client, "exposure-banner")
+	local stored_events, stored = storage.load_spool(client.config)
+	assert_true(chunk_exposures + chunk_outcomes > 0 and disk_exposures + disk_outcomes == 0,
+		"setup: the restored facts left the record, not the chunks")
+	assert_true(#stored_events == 1 and stored_events[1].event_name == "host-event-before-exit"
+		and stored ~= nil, "setup: the record keeps the host event and the deadline")
+	withdraw(client)
+	assert_equal(#client.spool_batches, 0, "setup: the withdrawal emptied the restored chunk")
+	local _, at_exit = storage.load_spool(client.config)
+	storage.reset() -- SIMULATED PROCESS DEATH
+	local relaunched = assert(sdk.new(config({ app_id = "exposure-app", spool_max_events = 1 })))
+	local from = #requests
+	relaunched:flush({ include_summaries = false })
+	local _, _, delivered = extra_tests.delivered_facts(from, "exposure-banner")
+	local observed = string.format("stored deadline at exit=%s delivered on the first flush=%d",
+		at_exit ~= nil and "yes" or "none", #delivered)
+	print("  restored-spool deadline scene, facts evicted from the record, " .. label .. ": " .. observed)
+	assert_equal(observed, "stored deadline at exit=none delivered on the first flush=1",
+		"the " .. label .. " that empties restored chunks the record no longer holds")
+	assert_true(extra_tests.has_event(delivered, "host-event-before-exit"), "the host event is the one delivered")
+	relaunched:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_refusal_clears_the_deadline_of_a_record_without_restored_facts()
+	extra_tests.deadline_of_a_record_without_restored_facts("age refusal", function(client)
+		extra_tests.refuse(client, "age_ineligible")
+	end)
+end
+
+function extra_tests.test_sentinel_clears_the_deadline_of_a_record_without_restored_facts()
+	extra_tests.deadline_of_a_record_without_restored_facts("sentinel", function(client)
+		next_status = 403
+		next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+		fetch(client, "exposure-banner")
+		next_status = 200
+		next_response_body = nil
+	end)
 end
 
 -- ── retired exposure arms (#124) ─────────────────────────────────────────────
@@ -11108,6 +11164,8 @@ local tests = {
 	extra_tests.test_sentinel_emptying_restored_spool_clears_its_deadline,
 	extra_tests.test_age_refusal_keeps_the_deadline_while_restored_work_remains,
 	extra_tests.test_age_refusal_keeps_a_retained_batchs_deadline,
+	extra_tests.test_age_refusal_clears_the_deadline_of_a_record_without_restored_facts,
+	extra_tests.test_sentinel_clears_the_deadline_of_a_record_without_restored_facts,
 	extra_tests.test_retired_arms_stay_bounded_across_renewals,
 	extra_tests.test_retired_arms_leave_with_an_ended_session,
 	extra_tests.test_retired_arm_of_an_owed_readmission_survives_a_renewal,

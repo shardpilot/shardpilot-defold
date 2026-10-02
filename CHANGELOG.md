@@ -56,9 +56,11 @@
   every event of the spool a launch restored now also clears the Retry-After
   deadline restored with them. Before, the deadline stayed in memory and in
   the spool file, so an unrelated event tracked afterwards was not sent even
-  by an explicit `flush()` until it expired, up to the Retry-After cap. A
-  deadline still has its effect while restored events remain, or while a
-  failed batch is held for retry.
+  by an explicit `flush()` until it expired, up to the Retry-After cap. The
+  spool file drops the deadline at once too, even when newer events had
+  already pushed the restored ones out of a full spool, so the next launch
+  does not restore it and hold those events. A deadline still has its effect
+  while restored events remain, or while a failed batch is held for retry.
   ([#123](https://github.com/shardpilot/shardpilot-defold/issues/123))
 - The exposure slots an `age_ineligible` withdrawal retires (so that a
   re-admitted player is exposed under a new event id) are now forgotten once
