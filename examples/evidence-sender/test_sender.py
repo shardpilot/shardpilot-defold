@@ -172,6 +172,15 @@ class SenderTest(unittest.TestCase):
                                      "message": "synthetic fixture result"})
                         if not oversized:
                             seen.add(event["event_id"])
+                    # The SDK's own session lifecycle names are registered like
+                    # any other plan entry; only the operator-supplied name is
+                    # under test for registration.
+                    registered = ("play_cta_click", "fixture_registered_click",
+                                  "app.session_started", "app.session_ended")
+                    unregistered = set() if mode == "legacy" else {
+                        index for index, event in enumerate(body["events"]) if event["event_name"] not in registered}
+                    for index in unregistered:
+                        rows[index].update(status="rejected", code="schema_not_found")
                     if mode == "suppressed_row" and rows:
                         rows[0].update(status="suppressed_no_consent", code="suppressed_no_consent")
                     # A rejection OUTSIDE mixed-size: only the deliberate
@@ -195,12 +204,13 @@ class SenderTest(unittest.TestCase):
                         reply["suppressed"] = {"counter_null": None, "counter_string": "0",
                                                "counter_bool": False, "counter_negative": -1,
                                                "counter_positive": 1}[mode]
-                    # The SDK's own session lifecycle names are registered like
-                    # any other plan entry; only the operator-supplied name is
-                    # under test for registration.
-                    registered = ("play_cta_click", "fixture_registered_click",
-                                  "app.session_started", "app.session_ended")
-                    if mode != "legacy" and any(e["event_name"] not in registered for e in body["events"]):
+                    # The server refuses an unregistered name per event inside
+                    # the 202 and stores its neighbours; only a batch in which
+                    # every event is unregistered is a whole-batch 400. This
+                    # sender first sends each name as its batch's only event, so
+                    # its runs reach the 400; the per-event rows keep the fixture
+                    # faithful to a batch that mixes names.
+                    if unregistered and len(unregistered) == len(body["events"]):
                         status, reply = 400, {"code": "validation_error", "message": "schema_not_found"}
                     if mode == "empty_202":
                         reply = {}
@@ -405,7 +415,10 @@ class SenderTest(unittest.TestCase):
                 self.assertNotIn("/must-not-follow", [r[0] for r in requests])
                 self.assertFalse(json.loads(result.stdout.splitlines()[-1]).get("contract_match", False))
 
-    def test_unregistered_name_fails_whole_batch(self):
+    def test_unregistered_name_alone_fails_its_batch(self):
+        # `single` sends the operator's name as the batch's only event, so the
+        # server refuses every event in it: a whole-batch 400, and the run
+        # stops there.
         result, requests = self.run_sender(event_name="fixture_unregistered")
         replies = [json.loads(line) for line in result.stdout.splitlines() if '"latency_ms"' in line]
         self.assertEqual(next(r for r in replies if r["stage"] == "minimal")["status"], 400)
