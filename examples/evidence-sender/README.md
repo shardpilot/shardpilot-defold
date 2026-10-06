@@ -130,12 +130,16 @@ shutdown leaves its session open the same way.
 
 Analytics events other than the session events use `SP_EVENT_NAME`; every event
 uses source `client`. The target must register that name, the two
-`app.session_*` names and the synthetic properties. An unregistered name can
-reject the whole batch with 400, unlike an oversize element's rejection within
-202. The `unauthenticated` case is a fresh SDK event, never a replay of an
-accepted one: reusing an accepted event ID would make the "no stored facts from
-this ID" readback unjudgeable. Only `duplicate` replays captured bytes; it
-demonstrates the idempotency contract, not the SDK's retry scheduler.
+`app.session_*` names and the synthetic properties. The service refuses an
+unregistered name per event inside the 202 (`schema_not_found`) when its batch
+also carries a registered event, and with a whole-batch 400 when every event in
+the batch is unregistered. Each of these names is first sent as its batch's only
+event (`session-open`, `single`, `session-close`), so an unregistered name gets
+the 400 and the run stops at that case. The `unauthenticated` case is a fresh
+SDK event, never a replay of an accepted one: reusing an accepted event ID would
+make the "no stored facts from this ID" readback unjudgeable. Only `duplicate`
+replays captured bytes; it demonstrates the idempotency contract, not the SDK's
+retry scheduler.
 Compression is disabled so the byte counts describe sent elements. No automatic
 retry loop, polling or shutdown event is added.
 
