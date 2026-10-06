@@ -435,9 +435,15 @@ class SenderTest(unittest.TestCase):
         replies = [json.loads(line) for line in result.stdout.splitlines() if '"latency_ms"' in line]
         batch = next(r for r in replies if r["case"] == "realistic-batch")
         self.assertEqual(batch["status"], 202)
+        # Bind each verdict to the name it was sent under: only the
+        # unregistered name is refused, never its registered neighbour.
+        sent = next(body for path, body, _ in requests
+                    if len({e["event_name"] for e in body.get("events", [])}) > 1)
+        names = {e["event_id"]: e["event_name"] for e in sent["events"]}
         rows = batch["event_result"]["events"]
-        self.assertEqual(sorted((row["status"], row["code"]) for row in rows),
-                         [("accepted", "")] * 2 + [("rejected", "schema_not_found")] * 2)
+        self.assertEqual(sorted((names[row["event_id"]], row["status"], row["code"]) for row in rows),
+                         [("app.session_ended", "rejected", "schema_not_found")] * 2
+                         + [("app.session_started", "accepted", "")] * 2)
         self.assertFalse(batch["contract_match"])
 
     def test_missing_configuration_sends_nothing(self):
