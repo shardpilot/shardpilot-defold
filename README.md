@@ -160,11 +160,12 @@ Minimal Defold script (see [`examples/minimal/`](examples/minimal)):
 > which loads the persisted scope record and mints an anonymous identifier.
 > Calling it before the decision would create an identity for a player whose
 > consent regime had not been established yet. A decision is **not** consent,
-> and it is not legal advice: it carries the `STRICT_OPT_IN` regime or, for a
-> workspace that has accepted ShardPilot's advisory estimates, an advisory,
-> non-binding estimate, and whether the optional lane stays closed whatever
-> the player answers. You, the integrating studio, decide what to do with it —
-> and you still have to ask the player. When the resolver
+> and it is not legal advice: its regime is `STRICT_OPT_IN`, and it says
+> whether the optional lane stays closed whatever the player answers. A
+> workspace that has accepted ShardPilot's advisory estimates may additionally
+> receive an advisory, non-binding estimate; you, the integrating studio,
+> decide what to do with it. Either way, you still have to ask the player.
+> When the resolver
 > is unreachable or answers something this build will not accept, the callback
 > receives the strict fallback (`plan_used = false`), which tightens and never
 > relaxes.
@@ -1430,11 +1431,11 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 
 ## Consent regime
 
-`shardpilot/consent_policy.lua` fetches a consent regime for this player
-before the SDK exists: the `STRICT_OPT_IN` regime or, for a workspace that has
-accepted ShardPilot's advisory estimates, an **advisory, non-binding
-estimate**. It is not legal advice; you, the integrating studio, decide what
-to do with it. It is a standalone module —
+`shardpilot/consent_policy.lua` fetches the consent regime for this player
+before the SDK exists. The regime is `STRICT_OPT_IN`. A workspace that has
+accepted ShardPilot's advisory estimates may additionally receive an
+**advisory, non-binding estimate**; you, the integrating studio, decide what
+to do with it. Neither is legal advice. It is a standalone module —
 it imports nothing from this SDK, so preparing a regime cannot mint an
 identifier, load a spool or install a capture hook.
 

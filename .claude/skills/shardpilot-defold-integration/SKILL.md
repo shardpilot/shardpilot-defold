@@ -766,11 +766,11 @@ function final(self)
 end
 ```
 
-A decision is **not** consent, and it is not legal advice: it carries the
-`STRICT_OPT_IN` regime or, for a workspace that has accepted ShardPilot's
-advisory estimates, an advisory, non-binding estimate, and whether the optional
-lane is closed whatever the player answers. You, the integrating studio, decide
-what to do with it. `decision.crash_profile`
+A decision is **not** consent, and it is not legal advice: its regime is
+`STRICT_OPT_IN`, and it says whether the optional lane is closed whatever the
+player answers. A workspace that has accepted ShardPilot's advisory estimates
+may additionally receive an advisory, non-binding estimate; you, the
+integrating studio, decide what to do with it. `decision.crash_profile`
 decides the crash lane **separately** — crash reporting is ON by default, so an
 unconditional `crash.init` is how a closed lane gets opened — and
 `decision.valid_for_seconds` is how long the verdict is good for; re-resolve by
