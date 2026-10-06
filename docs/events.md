@@ -55,8 +55,8 @@ and are suppressed unless analytics consent is granted.
 
 These three helpers were removed in 2026-08-29. They emitted event names with no
 schema in the registry, so their events already produced no fact anywhere, and
-once ingest begins rejecting unregistered names they would have taken whole
-batches down with them.
+ingest now refuses each of them per event (a whole-batch `400` only for a batch
+of nothing but unregistered events).
 
 They were not renamed, because no registered equivalent exists, and no schema was
 minted for them: game-specific names and tracking helpers belong in a game's own
