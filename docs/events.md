@@ -34,10 +34,11 @@ where it differs):
 - `network_summary`
 
 Every name on this list is registered in the platform's schema registry, as
-measured on 2026-08-29. An event name with no registered schema produces no fact
-today, and once ingest begins rejecting unregistered names it is refused
-**together with every event batched alongside it** — so this list being accurate
-is not documentation hygiene.
+measured on 2026-08-29. Ingest refuses an event name with no registered schema
+**per event**: inside the `202` it is `rejected` with `schema_not_found`, and
+the events batched alongside it are stored. Only a batch in which every event is
+unregistered is a whole-batch `400`. Either way the event produces no fact, so
+this list being accurate is not documentation hygiene.
 
 ## Session end reasons
 

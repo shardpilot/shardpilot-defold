@@ -177,6 +177,12 @@ class SenderTest(unittest.TestCase):
                     # under test for registration.
                     registered = ("play_cta_click", "fixture_registered_click",
                                   "app.session_started", "app.session_ended")
+                    # No sender case carries an unregistered name beside a
+                    # registered one, so this mode plants that batch: the target
+                    # lacks `app.session_ended` only where it travels with
+                    # `app.session_started` (realistic-batch).
+                    if mode == "mixed_unregistered" and len({e["event_name"] for e in body["events"]}) > 1:
+                        registered = tuple(name for name in registered if name != "app.session_ended")
                     unregistered = set() if mode == "legacy" else {
                         index for index, event in enumerate(body["events"]) if event["event_name"] not in registered}
                     for index in unregistered:
@@ -206,10 +212,7 @@ class SenderTest(unittest.TestCase):
                                                "counter_positive": 1}[mode]
                     # The server refuses an unregistered name per event inside
                     # the 202 and stores its neighbours; only a batch in which
-                    # every event is unregistered is a whole-batch 400. This
-                    # sender first sends each name as its batch's only event, so
-                    # its runs reach the 400; the per-event rows keep the fixture
-                    # faithful to a batch that mixes names.
+                    # every event is unregistered is a whole-batch 400.
                     if unregistered and len(unregistered) == len(body["events"]):
                         status, reply = 400, {"code": "validation_error", "message": "schema_not_found"}
                     if mode == "empty_202":
@@ -423,6 +426,19 @@ class SenderTest(unittest.TestCase):
         replies = [json.loads(line) for line in result.stdout.splitlines() if '"latency_ms"' in line]
         self.assertEqual(next(r for r in replies if r["stage"] == "minimal")["status"], 400)
         self.assertEqual(result.returncode, 1)
+
+    def test_unregistered_name_beside_a_registered_one_is_refused_per_event(self):
+        # The refusal stays inside the 202: the registered neighbours are
+        # accepted, and the sender still fails the case and the run on it.
+        result, requests = self.run_sender("mixed_unregistered")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        replies = [json.loads(line) for line in result.stdout.splitlines() if '"latency_ms"' in line]
+        batch = next(r for r in replies if r["case"] == "realistic-batch")
+        self.assertEqual(batch["status"], 202)
+        rows = batch["event_result"]["events"]
+        self.assertEqual(sorted((row["status"], row["code"]) for row in rows),
+                         [("accepted", "")] * 2 + [("rejected", "schema_not_found")] * 2)
+        self.assertFalse(batch["contract_match"])
 
     def test_missing_configuration_sends_nothing(self):
         result, requests = self.run_sender(omit="SP_CRASH_KEY")
