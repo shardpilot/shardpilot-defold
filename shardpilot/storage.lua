@@ -898,10 +898,12 @@ end
 -- Wire names an older release of this SDK persisted, and what a load must do
 -- with them. The spool re-sends stored envelopes VERBATIM, so an upgrade that
 -- only fixes the enqueue path leaves the old backlog on the wire under names
--- ingest no longer accepts -- and an unregistered name is refused for the WHOLE
--- BATCH, which takes the valid events stored beside it down too. The load is
--- the one place every persisted envelope passes through, so it is where the
--- backlog is made sendable.
+-- ingest no longer accepts. Ingest refuses an unregistered name per event:
+-- `rejected` with `schema_not_found` inside the 202, its batch-mates stored,
+-- and a whole-batch 400 only when every event in the batch is unregistered.
+-- Either way such an event produces no fact. The load is the one place every
+-- persisted envelope passes through, so it is where the backlog is made
+-- sendable.
 --
 -- The wire-name epoch a record was WRITTEN under. Bumped whenever this SDK
 -- changes a name it emits, and stored in the spool record. Migration keys on it
@@ -919,13 +921,15 @@ local spool_wire_name_epoch = 1
 -- something a public caller produces. No property on the envelope distinguishes
 -- them.
 --
--- Three costs, and dropping adds none. These events are unregistered: they
--- produce no fact today and never will under a name nobody registered. Renaming
--- makes the SDK's own land while filing customers' events as session
--- boundaries, which session facts then carry. Keeping them means a whole-batch
--- refusal once ingest stops accepting unregistered names, which takes their
--- valid batch-mates down. Dropping loses only what the platform was already
--- discarding, and the count makes the loss visible.
+-- Two costs decide it, and dropping adds neither. These events are
+-- unregistered: they produce no fact today and never will under a name nobody
+-- registered. Renaming makes the SDK's own land while filing customers' events
+-- as session boundaries, which session facts then carry. A third cost once
+-- argued for dropping too -- that keeping them would take their valid
+-- batch-mates down -- and no longer holds: ingest refuses an unregistered name
+-- per event inside the 202 and stores its batch-mates. The decision stands on
+-- the other two. Dropping loses only what the platform was already discarding,
+-- and the count makes the loss visible.
 -- Empty today: `session_end` moved to the drop set because nothing distinguishes
 -- an SDK summary from a caller's event. Kept with its shape because the next
 -- name that needs migrating will face the same question — and it carries the
@@ -1111,8 +1115,8 @@ function M.load_spool(scope)
 	-- "-1" and "1.5", and a NEGATIVE epoch fails `epoch >= rule.since` for every
 	-- rule -- so a garbled header skips the whole migration, the legacy names
 	-- survive, and the boot rewrite then re-stamps the file at the current
-	-- epoch, putting it permanently beyond repair while it keeps causing
-	-- whole-batch rejection. Epoch 0 is the right reading for anything
+	-- epoch, putting it permanently beyond repair while its legacy events keep
+	-- being refused. Epoch 0 is the right reading for anything
 	-- unusable: it is what an unstamped record means, it runs every rule, and
 	-- it is the only value that can only ever REPAIR.
 	local stamp = tonumber(record.wire_names)

@@ -8217,7 +8217,7 @@ local tests = {
 	-- "-1", and a negative epoch fails `epoch >= rule.since` for every rule --
 	-- so a garbled header would skip the whole migration, and the boot rewrite
 	-- would then re-stamp the file at the current epoch, putting it permanently
-	-- beyond repair while it kept causing whole-batch rejection. And the DROP is
+	-- beyond repair while its legacy events kept being refused. And the DROP is
 	-- reported: the migration rationale rests on the count making the loss
 	-- visible, and an earlier revision consumed the count only to decide whether
 	-- a rewrite was owed, so the deletion itself was silent.
