@@ -1,8 +1,8 @@
--- A6 spool-overflow benchmark, Defold SDK.
+-- Spool-overflow benchmark, Defold SDK.
 --
 -- Drives the REAL Client:spool_envelopes under sustained overflow -- one
 -- envelope per append, the shape a full queue produces -- and reports the two
--- numbers docs/SPOOL_OVERFLOW_LATENCY_BOUND.md bounds.
+-- numbers the spool's overflow bound is about.
 --
 -- ⚠ WHAT THIS HARNESS DOES AND DOES NOT MEASURE. sys.save here STORES A
 -- REFERENCE and returns; it does not serialize. Every millisecond below is

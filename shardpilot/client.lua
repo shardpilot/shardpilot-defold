@@ -6123,8 +6123,7 @@ function Client:spool_envelopes(envelopes)
 	-- ⚠ THE APPEND PATH, AND WHY IT IS NARROW. Appending one envelope used to
 	-- copy the whole record, re-estimate every entry in it (json.encode per
 	-- envelope on real Defold), and rebuild the id index over the result --
-	-- 437.6 envelopes re-measured per appended envelope at the default caps,
-	-- measured in docs/SPOOL_OVERFLOW_LATENCY_BOUND.md.
+	-- 437.6 envelopes re-measured per appended envelope at the default caps.
 	--
 	-- This handles the CLEAN STEADY STATE only: nothing settled awaiting a
 	-- removal rewrite, nothing replaced in place, no rewrite or condemnation

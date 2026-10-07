@@ -125,14 +125,9 @@ normally created from the merge of the matching version-bump commit, so
 immediately after that merge lands there is a short window in which the URL
 404s.
 
-**If it 404s, wait — do not pin an earlier tag.** `v0.10.1` is the deletion-only
-patch that removes the two internal agent skills. Measured across every tag:
-`v0.8.0`, `v0.8.1`, `v0.9.0`, `v0.9.1` and `v0.10.0` carry all eight of those
-files through this same dependency URL, and `v0.6.0` and `v0.7.0` carry two of
-them. `v0.5.0` and earlier predate the files entirely — but they also predate
-most of what this README documents. This paragraph used to say "pin the previous
-tag until the new one is published", which after `v0.10.1` pointed at exactly
-the artifact being withdrawn.
+**If it 404s, wait — do not pin an earlier tag.** `v0.10.1` supersedes `v0.6.0`
+through `v0.10.0`; do not pin any of them. `v0.5.0` and earlier predate most of
+what this README documents.
 
 The historical `v0.10.1` tag lacks request compression, the 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history. These are included in `v0.10.2`.
 
@@ -656,7 +651,7 @@ as one app. The SDK does not yet refuse a second client of a live app
 [`docs/configuration.md`](docs/configuration.md#one-client-per-app).
 
 > `ingest.shardpilot.com` is a **planned** public domain and is not provisioned.
-> Use local/develop endpoints until a release explicitly publishes production
+> Use non-production endpoints until a release explicitly publishes production
 > infrastructure. See [`docs/configuration.md`](docs/configuration.md).
 
 ## Batch verdicts

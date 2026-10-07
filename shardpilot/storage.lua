@@ -1185,7 +1185,7 @@ end
 --
 -- ⚠ THE MEASURING is O(#fresh): appending one envelope used to re-estimate
 -- every envelope already spooled -- 437.6 of them per append at the default
--- caps, measured in docs/SPOOL_OVERFLOW_LATENCY_BOUND.md -- and entries now
+-- caps -- and entries now
 -- carry their estimate from the moment they are admitted, so nothing is
 -- measured twice. That is the cost this exists to remove.
 --
@@ -1193,8 +1193,8 @@ end
 -- shifts every surviving element, so an eviction costs O(#state) pointer
 -- moves in two arrays. That term stays, deliberately: the write it
 -- accompanies hands the WHOLE table to sys.save, which serialises every
--- surviving envelope on the same call -- the platform has no append (see
--- docs/SPOOL_OVERFLOW_LATENCY_BOUND.md). Replacing the shift with a head
+-- surviving envelope on the same call -- the platform has no append.
+-- Replacing the shift with a head
 -- offset would still have to materialise a contiguous array for that write,
 -- trading two pointer shifts for one copy while the serialisation it sits
 -- inside is untouched.

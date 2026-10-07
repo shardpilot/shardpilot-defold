@@ -12832,8 +12832,7 @@ end)()
 -- envelopes re-measured per appended envelope, counted exactly rather than
 -- timed, so no machine or interpreter can be bought to satisfy it.
 --
--- Baseline and bound: docs/SPOOL_OVERFLOW_LATENCY_BOUND.md (437.6 per append
--- before this, bounded at 1.0).
+-- Baseline and bound: 437.6 per append before this, bounded at 1.0.
 ;(function()
 	-- approx_envelope_bytes uses json.encode when a `json` global exists,
 	-- which real Defold provides. Counting its calls counts exactly the work
