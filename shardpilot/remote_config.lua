@@ -38,7 +38,7 @@
 -- successful fetch. There is no experiment assignment, no exposure events,
 -- and no automatic refresh here by design — the game triggers every fetch.
 --
--- Targeting attributes (dark opt-in, ADR-0310): with
+-- Targeting attributes (dark opt-in): with
 -- `remote_config_attributes_enabled = true` the attribute set stored via
 -- set_attributes rides each fetch as query parameters, so server-side
 -- delivery rules can target this client. PRIVACY CONTRACT (non-negotiable):
@@ -405,7 +405,7 @@ RemoteConfig.__index = RemoteConfig
 -- later set_anonymous_id naturally invalidates the cache through the scope
 -- check instead of silently fetching configuration for a stale client id.
 -- `consent` (optional) is a function returning the client's current consent
--- state, read the same live way — it gates ONLY the ADR-0310 attribute
+-- state, read the same live way — it gates ONLY the attribute
 -- pass-through, never the fetch itself.
 function M.new(config, identity, consent)
 	local rc = setmetatable({
@@ -662,7 +662,7 @@ end
 -- Fetch the configuration. `callback(result)` receives
 -- { ok, from_cache, error?, values?, version? }; it is optional and — like
 -- every http.request callback — fires asynchronously on the real runtime.
--- Replace the targeting attribute set enabled fetches send (ADR-0310).
+-- Replace the targeting attribute set enabled fetches send.
 -- `nil` or an empty table clears it. The table is copied shallowly, so a
 -- caller mutating its table after the call cannot change what later fetches
 -- send. Storing is unconditional — the opt-in and consent gates apply at
@@ -681,7 +681,7 @@ function RemoteConfig:set_attributes(attributes)
 end
 
 -- The ordered, normalized attribute pairs the CURRENT fetch may carry, or
--- nil. Three gates, all required (the ADR-0310 privacy contract): the dark
+-- nil. Three gates, all required (the privacy contract): the dark
 -- `remote_config_attributes_enabled` opt-in, a stored attribute set, and a
 -- "granted" consent state read at dispatch time. Unknown consent and both
 -- denied states (forced-minor included) keep the fetch attribute-less —

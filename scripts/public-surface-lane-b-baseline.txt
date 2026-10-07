@@ -16,17 +16,4 @@
 # version moved because the numbers mean something different, not
 # because the layout changed -- reading a format-2 file with this
 # parser would understate every count that has such a line.
-20 shardpilot/client.lua
-2 shardpilot/crash.lua
-13 shardpilot/crash/client.lua
-6 shardpilot/crash/dump.lua
-4 shardpilot/experiments.lua
-4 shardpilot/remote_config.lua
-2 shardpilot/schema_revision.lua
-1 shardpilot/sdk.lua
-1 shardpilot/storage.lua
-1 shardpilot/transport.lua
-9 test/test_crash.lua
-4 test/test_experiments.lua
-2 test/test_remote_config.lua
-28 test/test_sdk.lua
+

@@ -450,7 +450,7 @@ local function test_config_validation()
 	assert_equal(client, nil)
 	assert_equal(err, "invalid_experiments_enabled")
 
-	-- The assignment endpoint lives on the control-plane host the
+	-- The assignment endpoint lives on the host the
 	-- remote-config base names, so the flag requires that base URL.
 	local no_base = config()
 	no_base.remote_config_url = nil
@@ -3003,7 +3003,7 @@ end
 local function test_shutdown_captures_deferred_session_end_when_flush_cannot_send()
 	reset()
 	local restore, stores = install_fake_sys_storage()
-	-- Mode B ingest (token provider) alongside the Mode A control plane:
+	-- Mode B ingest (token provider) alongside Mode A remote config:
 	-- the provider cannot supply a token, so the shutdown flush fails
 	-- BEFORE moving anything out of the queue.
 	local client = granted_client({
@@ -4147,8 +4147,8 @@ end
 local function test_mode_b_rotation_blocked_while_exposure_owed()
 	reset()
 	seed_granted_consent()
-	-- Mode B analytics (token_provider) + the publishable api_key for the
-	-- control plane: a valid dual-credential configuration. Owed exposure
+	-- Mode B analytics (token_provider) + the publishable api_key for
+	-- remote config: a valid dual-credential configuration. Owed exposure
 	-- snapshots hold the OLD anon identity outside the queue, so a flushed
 	-- queue must not admit rotation while one is owed — the later sweep
 	-- would send an old-anon fact under a token minted for the new anon.
@@ -7445,7 +7445,7 @@ function extra_tests.test_spool_purge_clears_condemnation_debt()
 	storage.reset()
 end
 
--- Codex #40 round 4 (P2): the consumer used to be constructed BEFORE the
+-- the consumer used to be constructed BEFORE the
 -- boot belt, so a stale granted record armed a LIVE pending_exposure from
 -- the cached assignment — and when the belt then flipped the boot state to
 -- denied, that denied-boot snapshot was never reconciled: it could emit

@@ -21,7 +21,7 @@ function M.init(config)
 		return false, err
 	end
 	default_client = client
-	-- ADR-0297 §7c boot auto-capture (ON by default; disable with
+	-- boot auto-capture (ON by default; disable with
 	-- `capture_previous_on_boot = false`): forward the previous session's
 	-- native crash dump — and run the serial resend pass over any pending
 	-- backlog — as part of init, so integrators no longer wire the manual

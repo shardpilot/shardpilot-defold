@@ -40,9 +40,7 @@ jobs:
   #
   # ⚠ THIS REPOSITORY IS PUBLIC, which inverts the usual urgency. Everywhere
   # else a missing secret scan is a gap to close before a visibility flip; here
-  # a credential is exposed at the moment it is pushed. It was measured on
-  # 2026-08-20 that this was one of only two candidate repositories running no
-  # secret scanner at all — and the only two already public.
+  # a credential is exposed at the moment it is pushed.
   #
   # fetch-depth: 0 is required by the history pass and by nothing else in this
   # workflow.
@@ -88,10 +86,10 @@ jobs:
   # Independent of the public scanner's result, not of this workflow's author:
   # a branch-controlled workflow can delete or hollow out this job. Required
   # check names do not close that whole class; trusted-workflow enforcement is
-  # an owner settings decision, outside this change (shardpilot-go issue 97).
+  # a repository settings decision, outside this change (shardpilot-go issue 97).
   # Red by design ONLY for exit 1: "alters the gate that judges it" and
-  # "a change may not supply its own judge". The coordinator/owner ACK_RED_CHECK
-  # route applies only within scripts/** and .github/workflows/**;
+  # "a change may not supply its own judge". A maintainer acknowledgement
+  # applies only within scripts/** and .github/workflows/**;
   # structural refusals (exit 2) and all other failed checks remain blockers.
   gate-integrity:
     runs-on: ubuntu-latest
@@ -170,7 +168,7 @@ jobs:
       #
       # The first four happened while this was three lines of YAML and every one
       # was found by reading, because nothing executed the choice.
-      # scripts/lane_b_base_ref.sh is that choice with inputs and one output, and
+      # scripts/surface_base_ref.sh is that choice with inputs and one output, and
       # the ratchet harness drives every case. The rules it applies, and why, are
       # documented there.
       #
@@ -237,7 +235,7 @@ jobs:
           git fetch --no-tags origin \
             "+refs/heads/$SP_DEFAULT:refs/remotes/origin/$SP_DEFAULT"
           [ -n "$SP_PR_BASE" ] && git fetch --depth=1 origin "$SP_PR_BASE" || true
-          bases="$(./scripts/lane_b_base_ref.sh \
+          bases="$(./scripts/surface_base_ref.sh \
             --event "$SP_EVENT" \
             --pr-base "$SP_PR_BASE" \
             --before "$SP_BEFORE" \
@@ -250,15 +248,14 @@ jobs:
           done
           echo "SP_LANE_B_BASES=$(printf '%s ' $bases)" >> "$GITHUB_ENV"
 
-      # This repository is already public, so it is NOT in the org's
-      # publication-candidate list and nothing else scans it. The script's
-      # header states which lane is gated and which is only reported.
+      # The script's header states which lane is gated and which is only
+      # reported.
       # ⚠ ONCE PER BASE, AND ZERO RUNS IS A REFUSAL. The selector emits one or
       # more accepted states and the count may rise against none of them; a rise
       # against any of them is a rise. An empty list would run the gate no times
       # at all and report success, which is the shape of every defect this step
       # has produced -- so it is refused rather than treated as "nothing to do".
-      - name: No internal material in the published non-source surface
+      - name: Public surface check
         if: github.event.deleted != true
         run: |
           set -euo pipefail
@@ -345,7 +342,7 @@ jobs:
   # ⚠ NO env HERE, deliberately: every comparison target is synthesized from
   # HEAD, so a CI-provided base ref could only replace a target the harness
   # built on purpose. It needs no network and no history depth.
-  lane-b-ratchet-controls:
+  surface-ratchet-controls:
     runs-on: ubuntu-latest
     timeout-minutes: 65
 
@@ -354,12 +351,10 @@ jobs:
         uses: actions/checkout@v7
 
       # ⚠ THE GATE PASSING SAYS NOTHING ABOUT WHETHER ITS CHECKS STILL EXIST.
-      # In shardpilot-go, two of the lane B ratchet's review findings were checks
-      # that had been correct two rounds earlier and were dropped in a
-      # restructure -- and both survived a green run of the gate. This drives
-      # each refusal to its condition and fails when one stops firing.
-      - name: Every lane B refusal still fires
-        run: ./scripts/test_lane_b_ratchet.sh
+      # A green gate says nothing about whether its checks still exist. This
+      # drives each refusal to its condition and fails when one stops firing.
+      - name: Every surface-check refusal still fires
+        run: ./scripts/test_surface_ratchet.sh
 
   # Engine-real leg: proves on every PR that the WORKING TREE still packages
   # and builds as a real Defold library dependency — scripts/package_release.sh
@@ -491,7 +486,7 @@ jobs:
           done
           exit "$status"
 
-      # A5: allocation bytes per track(), the metric that matters on a game
+      # Allocation bytes per track(), the metric that matters on a game
       # client — a per-frame allocation is somebody's GC pause, and it is the
       # one cost an engine integration cannot hide on a background thread.
       #
@@ -515,10 +510,10 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # A6: the spool's cost under sustained overflow. The assertion that
-      # holds this lives in test_sdk.lua (estimates per append, counted); this
-      # prints the numbers behind docs/SPOOL_OVERFLOW_LATENCY_BOUND.md so a
-      # regression is visible as a shape and not only as a failed bound.
+      # The spool's cost under sustained overflow. The assertion that holds
+      # this lives in test_sdk.lua (estimates per append, counted); this prints
+      # the numbers behind it so a regression is visible as a shape and not
+      # only as a failed bound.
       - name: Spool overflow benchmark
         run: ${{ matrix.interpreter }} test/bench_spool_append.lua | tee spool-${{ matrix.interpreter }}.txt
 

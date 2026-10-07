@@ -211,7 +211,7 @@ local function validate_config(config)
 		and type(config.session_id) ~= "string" then
 		return nil, "invalid_session_id"
 	end
-	-- ADR-0297 §7c boot auto-capture: ON by default (crash.init forwards the
+	-- boot auto-capture: ON by default (crash.init forwards the
 	-- previous-session dump itself — the Defold auto-capture model); an
 	-- explicit `capture_previous_on_boot = false` keeps the manual
 	-- capture_previous() flow. Boolean-or-absent, like spool_enabled on the
@@ -219,7 +219,7 @@ local function validate_config(config)
 	if config.capture_previous_on_boot ~= nil and type(config.capture_previous_on_boot) ~= "boolean" then
 		return nil, "invalid_capture_previous_on_boot"
 	end
-	-- ADR-0297 §7c script-error auto-capture: DARK by default (the
+	-- script-error auto-capture: DARK by default (the
 	-- experiments_enabled `== true` shape). While off, ZERO handler code
 	-- runs — sys.set_error_handler is never called. Opting in installs the
 	-- SDK's handler; Defold has a single process-wide error-handler slot, so
@@ -355,19 +355,19 @@ function M.new(config)
 			-- deadline is surfaced here.
 			resend_deferred_until_ms = nil,
 		},
-		-- Script-error reports forwarded this session (ADR-0297 §7c). Bounded
+		-- Script-error reports forwarded this session. Bounded
 		-- by script_error_report_cap so a per-frame error loop can never
 		-- flood the ingest door — fatal reports bypass sampling, so the cap
 		-- is the only brake on this path.
 		script_error_reports = 0,
 		initialized = true,
 	}, Client)
-	-- ADR-0297 §7c script-error auto-capture (opt-in, dark by default): the
+	-- script-error auto-capture (opt-in, dark by default): the
 	-- handler installs at construction so an error thrown before the host's
 	-- first frame still reports. Install-only-on-opt-in keeps the dark
 	-- posture absolute: with the flag off, sys.set_error_handler is never
 	-- read, let alone called. Install-only-while-ENABLED keeps the opt-out
-	-- honest too (Codex #41 round 1): Defold has ONE process-wide handler
+	-- honest too: Defold has ONE process-wide handler
 	-- slot, so an opted-out (or fail-closed) boot must not replace the
 	-- game's handler with an inert ShardPilot one — a later
 	-- set_enabled(true) installs it then.
@@ -377,7 +377,7 @@ function M.new(config)
 	return client
 end
 
--- Maximum script-error reports forwarded per session (ADR-0297 §7c). A Lua
+-- Maximum script-error reports forwarded per session. A Lua
 -- error in a per-frame callback fires the handler every frame; without a cap
 -- the fatal path (never sampled) would flood the pending sidecar and the
 -- ingest door with near-identical reports. The first occurrences carry all
@@ -431,7 +431,7 @@ function Client:on_script_error(source, message, traceback)
 			-- No traceback (some runtime callbacks pass none): the message
 			-- doubles as raw_text so the report still satisfies the
 			-- frames-or-raw_text contract instead of being silently dropped
-			-- (Codex #41 round 1).
+			--.
 			event.raw_text = message
 		else
 			-- Neither message nor traceback: still ship a marker rather than
@@ -495,7 +495,7 @@ function Client:set_enabled(enabled)
 	self.enabled = enabled
 	self.enabled_reason = (not enabled) and "opt_out" or nil
 	if enabled and self.config.script_error_capture_enabled and not self.script_error_handler_installed then
-		-- The §7c handler defers past a disabled boot (see M.new); a
+		-- The script-error handler defers past a disabled boot (see M.new); a
 		-- re-enable is the first enabled instant, so install here. A runtime
 		-- opt-out AFTER an install cannot restore the game's previous
 		-- handler (the sys API has no read), so the installed handler stays

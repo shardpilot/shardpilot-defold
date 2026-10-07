@@ -93,7 +93,7 @@ def main():
     print('a change may not supply its own judge', file=sys.stderr)
     for path in sorted(affected):
         print(json.dumps(os.fsdecode(path), ensure_ascii=True), file=sys.stderr)
-    print('Deliberate judge changes require the coordinator/owner ACK_RED_CHECK route; '
+    print('Deliberate judge changes need a maintainer acknowledgement; '
           'all other gates still apply.', file=sys.stderr)
     return 1
 

@@ -426,7 +426,7 @@ local function test_fresh_fetch_serves_values_and_writes_cache()
 	assert_equal(request.url, "http://localhost:18081/config/v1/workspace-test/develop/anon-client")
 	assert_equal(request.headers["Authorization"], "Bearer sp_ingest_publishable_key")
 	assert_nil(request.headers["If-None-Match"], "the first fetch must not revalidate")
-	-- The schema-revision declaration (GAP-036) belongs to events:batch
+	-- The schema-revision declaration belongs to events:batch
 	-- ingest only; the remote-config fetch must never carry it.
 	assert_nil(request.headers["X-ShardPilot-Schema-Revision"],
 		"the remote-config fetch must not carry the schema-revision header")
@@ -1758,7 +1758,7 @@ local function test_denied_consent_does_not_gate_the_fetch()
 	assert_equal(result.values.a, 1)
 end
 
--- ── targeting attributes (ADR-0310, dark opt-in) ──────────────────────────────
+-- ── targeting attributes (dark opt-in) ──────────────────────────────
 
 local attributeless_fetch_url =
 	"http://localhost:18081/config/v1/workspace-test/develop/anon-client"
