@@ -12,14 +12,14 @@ sys = {
 	get_sys_info = function()
 		return { system_name = "Linux" }
 	end,
-	-- ADR-0297 §7c: the engine build identity dump.lua synthesizes the
+	-- the engine build identity dump.lua synthesizes the
 	-- dmengine debug_id from. Overridable per test; reset() restores it.
 	engine_info = { version = "1.9.8", version_sha1 = "8f3e0a1b2c4d5e6f708192a3b4c5d6e7f8091a2b" },
 	get_engine_info = function()
 		return sys.engine_info
 	end,
-	-- The single process-wide Defold error-handler slot (ADR-0297 §7c
-	-- script-error capture installs into it). reset() clears it.
+	-- The single process-wide Defold error-handler slot (script-error
+	-- capture installs into it). reset() clears it.
 	error_handler = nil,
 	set_error_handler = function(handler)
 		sys.error_handler = handler
@@ -427,7 +427,7 @@ local function test_routes_to_dedicated_crash_endpoint()
 	assert_equal(request.method, "POST")
 	assert_equal(request.headers["Authorization"], "Bearer sp_crash_write_key")
 	assert_equal(request.headers["Content-Type"], "application/json")
-	-- The schema-revision declaration (GAP-036) belongs to events:batch
+	-- The schema-revision declaration belongs to events:batch
 	-- ingest only; the crash route must never carry it.
 	assert_equal(request.headers["X-ShardPilot-Schema-Revision"], nil,
 		"the crash route must not carry the schema-revision header")
@@ -1396,7 +1396,7 @@ local function fake_crash_module(opts)
 		SYSFIELD_ENGINE_HASH = 3,
 		load_previous = function()
 			-- Counted so the opt-out tests can assert the one-shot dump was
-			-- left UNREAD (ADR-0297 §7c boot auto-capture).
+			-- left UNREAD (boot auto-capture).
 			opts.load_calls = (opts.load_calls or 0) + 1
 			return opts.handle
 		end,
@@ -1509,7 +1509,7 @@ local function test_capture_previous_forwards_native_dump()
 end
 
 -- ---------------------------------------------------------------------------
--- ADR-0297 §7c: engine-module symbol identity, boot auto-capture, and the
+-- engine-module symbol identity, boot auto-capture, and the
 -- opt-in script-error capture.
 -- ---------------------------------------------------------------------------
 

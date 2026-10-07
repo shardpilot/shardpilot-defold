@@ -358,8 +358,7 @@ local function unreadable_trail_stands(self)
 	return storage.consent_outbox_unaccounted_cause(self.config) ~= nil
 end
 
--- Canonical-actor selection for consent receipts (ADR-0222 §1, the ADR-0202
--- 2026-07-20 amendment), mirroring how the event plane binds identity in
+-- Canonical-actor selection for consent receipts, mirroring how the event plane binds identity in
 -- Mode B: a host-supplied user_id is an identity the SDK can stand behind
 -- only when a Mode B token_provider backs the session — the per-tenant JWT
 -- the host mints is the credential that vouches for it. So the receipt keys
@@ -368,7 +367,7 @@ end
 -- Mode A, or a Mode B decision made before identify() — it keys to the
 -- SDK-managed anonymous_id with kind "anon". A Mode A self-asserted user_id
 -- is NEVER the receipt actor (that class is spoofable by any caller, and
--- the publishable-key ingress binds the write to the caller's own anon
+-- the server binds a publishable-key write to the caller's own anon
 -- scope regardless — a user-keyed receipt could misrecord the decision
 -- under an actor the server never consults). This deliberately supersedes
 -- the v0.9.1 user-first snapshot. Returns actor_identifier, kind — the
@@ -572,7 +571,7 @@ local function validate_config(config, diagnostics)
 	local has_remote_config = config.remote_config_url ~= nil
 	-- Experiments (dark by default): `experiments_enabled = true` opts into
 	-- the assignment consumer. The assignment endpoint lives on the same
-	-- control-plane host as the remote-config fetch and authenticates with
+	-- host as the remote-config fetch and authenticates with
 	-- the same publishable api_key, so the flag requires `remote_config_url`
 	-- (which in turn requires the api_key). Default false — and while false,
 	-- zero experiment code paths execute.
@@ -583,7 +582,7 @@ local function validate_config(config, diagnostics)
 	if experiments_enabled and not has_remote_config then
 		return nil, "experiments_requires_remote_config_url"
 	end
-	-- Remote-config targeting attributes (dark by default, ADR-0310):
+	-- Remote-config targeting attributes (dark by default):
 	-- `remote_config_attributes_enabled = true` opts fetches into carrying
 	-- the set stored via set_remote_config_attributes as query parameters —
 	-- and even then only while consent is granted (the privacy gate lives in
@@ -638,7 +637,7 @@ local function validate_config(config, diagnostics)
 	if not batch_size then
 		return nil, batch_size_err
 	end
-	-- 1000 is the cross-SDK canonical default (SP-059): the Go, Unity, and
+	-- 1000 is the cross-SDK canonical default: the Go, Unity, and
 	-- Unreal SDKs and the platform docs all use a 1000-event in-memory queue.
 	local buffer_size, buffer_size_err = normalize_integer(config.buffer_size, 1000, 1, nil, "invalid_buffer_size")
 	if not buffer_size then
@@ -697,11 +696,11 @@ local function validate_config(config, diagnostics)
 	if not spool_max_bytes then
 		return nil, spool_max_bytes_err
 	end
-	-- Schema-revision declaration (GAP-036). Default (nil): every
+	-- Schema-revision declaration. Default (nil): every
 	-- events:batch request declares the SDK's built-in schema-set revision
 	-- (shardpilot/schema_revision.lua) in the X-ShardPilot-Schema-Revision
 	-- request header. A non-empty string overrides the declared value (e.g.
-	-- matched to a self-hosted analytics-service build); `false` or `""`
+	-- matched to a self-hosted server build); `false` or `""`
 	-- stops declaring entirely — the escape hatch the server contract
 	-- documents: an undeclared batch always passes the server's check, in
 	-- every handshake mode. The header rides only on batches, and only ones
@@ -717,11 +716,11 @@ local function validate_config(config, diagnostics)
 	else
 		return nil, "invalid_schema_revision"
 	end
-	-- Consent-receipt `kind` emission (ADR-0202 2026-07-20 amendment).
+	-- Consent-receipt `kind` emission.
 	-- Default (nil/true): every `POST /v1/consent` body carries the
 	-- receipt's stored actor class next to `actor_identifier`. `false` is
-	-- the escape hatch for a deployment whose ingest service still runs the
-	-- pre-amendment `INGEST_CONSENT_KIND_MODE=off` strict decoder, which
+	-- the escape hatch for a deployment whose server still runs the older
+	-- strict consent decoder, which
 	-- 400-rejects a kind-bearing body as an unknown field — a terminal
 	-- outcome that would drop the receipt, denials included. Suppression is
 	-- wire-build-time only: the kind is always chosen, persisted with the
@@ -928,7 +927,7 @@ function M.new(config, defer_init_diagnostics)
 	local restored_decided_at = nil
 	local restored_decision_seq = 0
 	if marker_valid and marker.anonymous_id == anonymous_id then
-		-- STALE-MARKER GUARD (Codex #40 round 3): a marker whose decision
+		-- STALE-MARKER GUARD: a marker whose decision
 		-- pair the RECORD strictly supersedes is RETIRED, never imposed —
 		-- the record proves a newer decision (a later grant included)
 		-- landed durably while this marker's best-effort retirement failed
@@ -1323,7 +1322,7 @@ function M.new(config, defer_init_diagnostics)
 		and imposed_marker_code ~= "denial_marker_unreadable" then
 		-- The anonymous-id self-heal rewrite (corrupt/oversized/missing
 		-- stored anon) — but NEVER while the unreadable-marker arm has
-		-- imposed its transient fail-closed denial (Codex #40 round 3):
+		-- imposed its transient fail-closed denial:
 		-- persist_identity writes the CURRENT consent state, so this
 		-- rewrite would durably overwrite a real granted record with a
 		-- denial manufactured from an unreadable file. The imposed state is
@@ -1365,7 +1364,7 @@ function M.new(config, defer_init_diagnostics)
 		client.remote_config = remote_config_mod.new(normalized, function()
 			return client.anonymous_id
 		end, function()
-			-- Read live at every dispatch: the ADR-0310 attribute gate must
+			-- Read live at every dispatch: the attribute gate must
 			-- see the consent state of the fetch's moment, so a downgrade
 			-- strips attributes from the very next fetch.
 			return client.consent_state
@@ -1575,7 +1574,7 @@ function M.new(config, defer_init_diagnostics)
 			if not client:persist_identity() then
 				client.stats.consent_persist_failed =
 					client.stats.consent_persist_failed + 1
-				-- WITNESS PRESERVATION (Codex #40 round 3): this retained
+				-- WITNESS PRESERVATION: this retained
 				-- receipt is the denial's ONLY durable proof, and it is
 				-- about to dispatch — a successful delivery removes it from
 				-- the outbox, and with the convergence write failed the
@@ -1600,7 +1599,7 @@ function M.new(config, defer_init_diagnostics)
 	end
 	-- Experiment-assignment consumer (dark unless `experiments_enabled`).
 	-- Constructed AFTER the consent-outbox load and the boot BELT above
-	-- (Codex #40 round 4): the construction-time cache restore decides
+	--: the construction-time cache restore decides
 	-- between arming a LIVE exposure snapshot and a re-arm INTENT by
 	-- reading deps.consent(), so it must see the FINAL belt-settled boot
 	-- state - constructed before the belt, a stale granted restore armed
@@ -2609,7 +2608,7 @@ function Client:remote_config_values()
 	return self.remote_config:get_values()
 end
 
--- Replace the ADR-0310 targeting attribute set enabled fetches send
+-- Replace the targeting attribute set enabled fetches send
 -- (`nil`/empty clears). Inert without `remote_config_attributes_enabled`,
 -- and even then attributes ride only while consent is granted — an unknown
 -- or denied state fetches attribute-less. See shardpilot/remote_config.lua.
@@ -3827,8 +3826,8 @@ function Client:update(dt)
 	-- flush() runs on every frame for the length of a window approaching 60s,
 	-- repeating the consent-outbox and deferred-storage work each tick. The
 	-- retry clock below is what publishes this batch when its window ends —
-	-- the same reason publish_retry_due() does not fire inside it (Codex on
-	-- #46).
+	-- the same reason publish_retry_due() does not fire inside it
+	-- .
 	-- The consent plane holds the queue the same way and needs the same
 	-- suppression: an undispatched GRANT receipt blocks every event leg by
 	-- design (ordering, not pacing), so while that receipt sits inside its own
@@ -4092,7 +4091,7 @@ function Client:refresh_token()
 			-- A nudge rather than a backoff, unlike a failed settlement:
 			-- nothing failed, and the next tick mints fresh under the new
 			-- epoch. It cannot spin, because reaching this branch requires an
-			-- identify() to have landed mid-mint (Codex on #46).
+			-- identify() to have landed mid-mint.
 			self:wake_pending_publish_work()
 			return
 		end
@@ -4144,7 +4143,7 @@ function Client:refresh_token()
 		-- attempt asks for a new token. The wake made that once per FRAME;
 		-- without it, it is once per flush, which is what this SDK did before
 		-- this PR. Narrowing the lead to fit a short-lived token is a
-		-- configuration question, not a wake one (Codex on #46).
+		-- configuration question, not a wake one.
 		if not born_stale then
 			self:wake_pending_publish_work()
 		end
@@ -4329,7 +4328,7 @@ function Client:apply_error_envelope(err, response)
 			-- callback and aborts flush() before the failure can be
 			-- classified, retained or dropped. The body is attacker- and
 			-- middlebox-controlled, so a malformed envelope must degrade to
-			-- "no codes matched", never to a throw (Codex on #46).
+			-- "no codes matched", never to a throw.
 			if type(detail) == "table" and type(detail.code) == "string" then
 				detail_codes = detail_codes or {}
 				detail_codes[#detail_codes + 1] = detail.code
@@ -4340,7 +4339,7 @@ function Client:apply_error_envelope(err, response)
 		self.stats.last_error = err .. ":" .. tostring(error_obj.code)
 	end
 	if error_obj.code == "schema_revision_mismatch" then
-		-- Terminal by server contract (GAP-036): the declared schema
+		-- Terminal by server contract: the declared schema
 		-- revision no longer matches the schema set the ingest service
 		-- serves, and retrying the same batch from the same build can never
 		-- succeed (the 409 carries no Retry-After). The batch takes the
@@ -4392,7 +4391,7 @@ local backoff_cap_seconds = 60
 -- The FIRST failure shares the second's window rather than returning nil.
 -- Nil meant "arm no deadline", which handed the retry to the next flush
 -- tick — indistinguishable from immediate while that tick was one second, and
--- a fifteen-second stall at the interval A6 moves this SDK to. Giving it
+-- a fifteen-second stall at the interval this SDK now uses. Giving it
 -- exactly the base reproduces the timing the old default actually
 -- delivered while owing nothing to the batching cadence.
 local function backoff_delay_seconds(attempt)
@@ -4445,7 +4444,7 @@ end
 -- holding only parked receipts or receipts the publishable key carries, armed
 -- a consent deadline nothing was blocked on. Nothing clears it when it
 -- expires with nothing dispatchable, so the wake fires forever and update()
--- calls flush() every frame (Codex on #46).
+-- calls flush() every frame.
 function Client:fail_token_settlement()
 	self.token = nil
 	self.token_expires_at_ms = nil
@@ -4456,14 +4455,14 @@ function Client:fail_token_settlement()
 	-- failed, and the caller never overrode that. Leaving it set would let the
 	-- next cadence flush call itself the caller's continuation and skip the
 	-- new deadline — hitting the failing provider on the batching clock, which
-	-- is the pacing this path exists to impose (Codex on #46).
+	-- is the pacing this path exists to impose.
 	self.publish_bypass_owed = false
 	-- PENDING, not retained: a mint started for an ordinary partial queue has
 	-- not drained it yet (can_publish runs before the drain), so the retained
 	-- predicate is false and this armed nothing at all — while the flush that
 	-- started the mint had already zeroed the cadence and a below-batch_size
 	-- queue cannot trigger another. A failing provider was retried no sooner
-	-- than the full interval (Codex on #46).
+	-- than the full interval.
 	if self:has_pending_publish_work() then
 		self:defer_backoff()
 	end
@@ -4473,7 +4472,7 @@ function Client:fail_token_settlement()
 	-- already; arming again would double-count the backoff ladder. Worse, the
 	-- in-flight receipt can come back TERMINAL, and the terminal branch drops
 	-- it without clearing a deadline that was armed in its name, so the next
-	-- receipt in the trail inherits a window it never earned (Codex on #46).
+	-- receipt in the trail inherits a window it never earned.
 	local awaiting = not self:consent_dispatch_blocked() and self:receipt_awaiting_token() or nil
 	if awaiting ~= nil then
 		self:defer_consent_backoff()
@@ -4481,7 +4480,7 @@ function Client:fail_token_settlement()
 		-- the actor-change cleanup cannot tell that its owner parked when
 		-- identify() switches actors, and a freshly queued receipt for the
 		-- new actor inherits a backoff it never earned — up to the 60s cap
-		-- after repeated failures (Codex on #46).
+		-- after repeated failures.
 		self.consent_deferral_armed_key = awaiting.idempotency_key
 	end
 end
@@ -4620,7 +4619,7 @@ function Client:publish_retry_due()
 	-- explicit caller stopped by a mint has no wake of its own — the
 	-- settlement arms one, but a consent handoff can swallow that flush, and
 	-- then the only thing left is this predicate suppressing itself against a
-	-- deadline the caller outranks (Codex on #46).
+	-- deadline the caller outranks.
 	if self:publish_dispatch_deferred(true) then
 		return false
 	end
@@ -4631,7 +4630,7 @@ function Client:publish_retry_due()
 	-- HTTP request is on the wire, so publish_in_flight above cannot see it.
 	-- Nothing is stranded by waiting: every settlement path re-arms this work
 	-- — success and stale-epoch through wake_pending_publish_work, failure
-	-- through fail_token_settlement's backoff (Codex on #46).
+	-- through fail_token_settlement's backoff.
 	if self.token_request_in_flight then
 		return false
 	end
@@ -4642,7 +4641,7 @@ function Client:publish_retry_due()
 	-- Retry-After runs to 24 hours, not 60 seconds. The receipt's own clock
 	-- is the wake that ends this: consent_retry_due() fires when its window
 	-- expires, the grant is handed over, the gate releases by key identity,
-	-- and the same flush() goes on to publish this batch (Codex on #46).
+	-- and the same flush() goes on to publish this batch.
 	--
 	-- BLOCKED, not merely deferred: an earlier receipt already on the wire
 	-- holds the grant back exactly as an armed window does, and that state
@@ -4688,7 +4687,7 @@ end
 -- while the events that started the whole thing sit in the queue. A
 -- below-batch_size queue cannot trigger a flush by itself, and the flush that
 -- started the mint already zeroed the cadence, so nothing moved for the full
--- interval (Codex on #46).
+-- interval.
 function Client:has_pending_publish_work()
 	if self:has_retained_publish_work() then
 		return true
@@ -4875,7 +4874,7 @@ end
 -- behind it goes on holding every event leg meanwhile. The wakes that would
 -- otherwise fire into that state have to test BOTH halves; testing only the
 -- window is what left the in-flight case spinning after the deferred one was
--- fixed (Codex on #46).
+-- fixed.
 function Client:consent_dispatch_blocked()
 	return self.consent_send_in_flight or self:consent_send_deferred()
 end
@@ -5118,8 +5117,8 @@ function Client:denial_receipt_retained_durably()
 		if type(receipt.categories) == "table"
 			and receipt.categories.analytics == false
 			and receipt.anonymous_id == self.anonymous_id
-			-- An IN-FLIGHT receipt cannot witness across a teardown (Codex
-			-- #40 round 4): its durability is about to be CONSUMED by its
+			-- An IN-FLIGHT receipt cannot witness across a teardown: its
+			-- durability is about to be CONSUMED by its
 			-- own acknowledgment — the async ack callback prunes it from
 			-- the durable outbox, possibly after shutdown() already
 			-- finalized on its evidence, leaving the stale pre-denial
@@ -5155,7 +5154,7 @@ function Client:send_consent_decision()
 		app_id = self.config.app_id,
 		environment_id = self.config.environment_id,
 		actor_identifier = actor,
-		-- The actor's ADR-0222 identity class, chosen by the same canonical
+		-- The actor's identity class, chosen by the same canonical
 		-- selection as the actor itself. Persisted with the receipt and
 		-- re-sent verbatim; it also drives the per-receipt dispatch
 		-- credential and the parked predicate.
@@ -5177,7 +5176,7 @@ function Client:send_consent_decision()
 		anonymous_id = self.anonymous_id,
 	}
 	if self.consent_state == "denied_forced_minor" then
-		-- AC-8: the receipt itself records that this denial was band-forced,
+		-- The receipt itself records that this denial was band-forced,
 		-- not chosen — the reason is the only difference from a plain denial.
 		payload.reason = "denied_forced_minor"
 	end
@@ -5324,7 +5323,7 @@ function Client:try_send_consent_outbox()
 				self.consent_deferral_armed_key = nil
 				self.consent_auth_retried_key = nil
 				self.consent_zero_retried_key = nil
-				-- WITNESS HANDOFF (Codex #40 round 4): the prune below
+				-- WITNESS HANDOFF: the prune below
 				-- removes this receipt from the durable outbox — and while
 				-- the standing denial's identity record AND marker writes
 				-- are both still owed, a retained denial receipt may be the
@@ -5394,7 +5393,7 @@ function Client:try_send_consent_outbox()
 					-- wake, and a second for the same receipt means the fresh
 					-- token did not help, so it paces on the backoff. Without
 					-- that bound an endpoint answering 401 forever mints a
-					-- token every frame (Codex on #46).
+					-- token every frame.
 					if self.consent_auth_retried_key == payload.idempotency_key then
 						self:defer_consent_backoff()
 						self.consent_deferral_armed_key = payload.idempotency_key
@@ -6434,8 +6433,8 @@ function Client:start_publish_batch(automatic)
 	-- politeness toward an endpoint that just failed, and it paces the
 	-- AUTOMATIC retries update() drives; a host calling flush() or shutdown()
 	-- has said what it wants. The suite is full of hosts doing precisely that
-	-- — "must keep the singleton alive for a host retry loop" — and until A6
-	-- the distinction never had to be drawn, because the first hint-less
+	-- — "must keep the singleton alive for a host retry loop" — and until the
+	-- pacing change the distinction never had to be drawn, because the first hint-less
 	-- failure armed no deadline at all and an immediate caller retry went
 	-- straight out. Now that it arms one, the two cases have to be told
 	-- apart rather than collapsed in either direction.
@@ -6579,8 +6578,8 @@ function Client:start_publish_batch(automatic)
 			-- accepts it as a valid non-negative delay. Falling through to
 			-- the backoff below turned the server's own zero into a
 			-- one-second wait — a regression this PR would have introduced,
-			-- since the first failure used to arm nothing at all (Codex on
-			-- #46).
+			-- since the first failure used to arm nothing at all
+			-- .
 			if events.zero_retried then
 				-- A SECOND zero for the same batch means "retry now" is not
 				-- working: the server is answering immediately and failing
@@ -6602,7 +6601,7 @@ function Client:start_publish_batch(automatic)
 				-- approaching 60s. Cleared exactly as the 401 and
 				-- encoding-refusal paths below clear it; the SERVER's deadline
 				-- survives, because Retry-After outlives the attempt that
-				-- received it (Codex on #46).
+				-- received it.
 				self.publish_retry_after_ms = self.publish_server_retry_after_ms
 				self.publish_backoff_attempt = 0
 				self.flush_elapsed_seconds = self.config.flush_interval_seconds
@@ -6673,7 +6672,7 @@ function Client:start_publish_batch(automatic)
 				-- window approaching 60s. Cleared exactly as the
 				-- compression-refusal path above clears it, and for the same
 				-- reason; the SERVER's deadline survives, because Retry-After
-				-- outlives the attempt that received it (Codex on #46).
+				-- outlives the attempt that received it.
 				self.publish_retry_after_ms = self.publish_server_retry_after_ms
 				self.publish_backoff_attempt = 0
 				self.flush_elapsed_seconds = self.config.flush_interval_seconds
@@ -6749,7 +6748,7 @@ function Client:flush(options)
 	-- cadence as queued events and are handed to the transport strictly
 	-- BEFORE this cycle's event batch; their outcome never affects the flush
 	-- result. The order is load-bearing on strict-enforce workspaces
-	-- (GAP-041): dispatching the receipt first shrinks the window in which a
+	--: dispatching the receipt first shrinks the window in which a
 	-- post-grant batch reaches the server before the grant's /v1/consent row
 	-- exists and is terminally suppressed (per-event suppressed_no_consent).
 	-- Sequencing only — the batch never waits on the receipt's

@@ -136,7 +136,7 @@ class GateIntegrityTests(unittest.TestCase):
     def test_existing_workflow_control(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         self.assertIn('  static:\n', workflow)
-        self.assertIn('run: ./scripts/test_lane_b_ratchet.sh', workflow)
+        self.assertIn('run: ./scripts/test_surface_ratchet.sh', workflow)
 
     def test_workflow_wires_independent_job(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()

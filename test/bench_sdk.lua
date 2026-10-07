@@ -1,8 +1,8 @@
--- A5's Defold leg: allocation bytes per `track()` and per-call cost.
+-- Allocation bytes per `track()` and per-call cost, Defold SDK.
 --
--- WHAT THIS MEASURES, AND WHY IT IS THE METRIC A5 ASKS FOR
--- -------------------------------------------------------
--- A5 wants "allocation bytes per Track()" for the client SDKs, because on a
+-- WHAT THIS MEASURES, AND WHY IT IS THE METRIC
+-- --------------------------------------------
+-- "Allocation bytes per Track()" is the client-SDK metric because on a
 -- game client the number that hurts is not throughput — it is garbage. A
 -- per-frame allocation that survives to the next collection is a GC pause in
 -- somebody's frame budget, and it is the one cost an engine integration cannot
@@ -22,7 +22,7 @@
 --    a phone: allocator behaviour under memory pressure is not reproduced here,
 --    and the ALLOCATION SHAPE (how many tables one `track()` builds) is what
 --    transfers, not the exact byte count.
---  * **Not build-size delta.** A5 asks for that too, and it needs `bob`
+--  * **Not build-size delta.** That needs `bob`
 --    building the bundle twice; that belongs with `scripts/ci_bob_build.sh`,
 --    not here.
 --  * **Not per-frame cost in an engine.** Per-call wall time is reported as an
@@ -251,7 +251,7 @@ local function config()
 		end,
 		flush_interval_seconds = 3600, -- never inside the measured window
 		publish_timeout_seconds = 2,
-		spool_enabled = false, -- disk I/O is A6's measurement, not this one
+		spool_enabled = false, -- disk I/O is the spool benchmark's measurement, not this one
 		-- A queue big enough that nothing DROPS. THIS is the defect that
 		-- produced this file's first, nonsensical table — confirmed by
 		-- measurement, after a first diagnosis blamed the json shim and was

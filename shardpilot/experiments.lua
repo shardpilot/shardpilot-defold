@@ -1,6 +1,6 @@
--- Experiment-assignment consumer (ADR-0259 SDK leg): GETs the server-evaluated
+-- Experiment-assignment consumer: GETs the server-evaluated
 -- assignment for one (app, environment, experiment, subject) tuple from the
--- control-plane assignment endpoint and serves the assigned variant to game
+-- server's assignment endpoint and serves the assigned variant to game
 -- code, with a durable last-known-good cache, periodic revalidation (the
 -- SDK-side kill-switch reach), and an exposure-fact lane riding the normal
 -- analytics pipeline. Deliberately separate from shardpilot/remote_config.lua
@@ -24,7 +24,7 @@
 --   Authorization: Bearer <publishable api_key>   (same credential as the
 --   remote-config fetch; the endpoint requires the experiment-assignment
 --   read scope on that key, granted server-side)
--- The base URL is the configured `remote_config_url` — the control-plane
+-- The base URL is the configured `remote_config_url` — the remote-config
 -- host — with the path swapped; no new endpoint configuration exists.
 --
 -- Outcomes (decided by M.apply, pure):
@@ -106,12 +106,11 @@
 -- distinct deterministic id). The `assignment_key` prop carries the
 -- server-minted subject-fact key VERBATIM for client_id-unit assignments
 -- (the raw subject id is structurally rejected there) and the subject key
--- for synthetic-unit ones. NOTE: the analytics service currently rejects
--- these event names from game-embedded publishable keys by design; until
--- the platform's producer-lane decision lands, an emitted exposure is
--- expected to come back as a per-event reject, surfaced through diagnostics
--- and tolerated silently otherwise. That server-side block is load-bearing
--- and this SDK deliberately relies on it staying authoritative.
+-- for synthetic-unit ones. NOTE: the server may reject these event names
+-- from game-embedded publishable keys; an emitted exposure then comes back
+-- as a per-event reject, surfaced through diagnostics and tolerated silently
+-- otherwise. That server-side block is load-bearing and this SDK
+-- deliberately relies on it staying authoritative.
 
 local clock = require "shardpilot.clock"
 local id = require "shardpilot.id"

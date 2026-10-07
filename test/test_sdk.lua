@@ -380,7 +380,7 @@ local function test_config_validation()
 	client, err = sdk.new(config())
 	assert_true(client, err)
 	assert_equal(client.config.batch_size, 25)
-	-- 1000 is the cross-SDK canonical buffer default (SP-059).
+	-- 1000 is the cross-SDK canonical buffer default.
 	assert_equal(client.config.buffer_size, 1000)
 	assert_equal(client.config.platform, "linux")
 	assert_equal(client.config.token_refresh_lead_ms, 60000)
@@ -1220,7 +1220,7 @@ local function test_consent_send_failure_is_quiet()
 	-- was dropped): the next dispatch point retries it until acknowledged.
 	assert_equal(#client.consent_outbox, 1, "a transient receipt failure must retain the receipt")
 	next_status = 202
-	-- The failure armed the receipt's own backoff deadline (A6: the first
+	-- The failure armed the receipt's own backoff deadline (the first
 	-- hint-less failure paces on the retry clock now, where it used to arm
 	-- nothing and let the next flush tick decide). Advance the harness clock
 	-- past that window, then tick: the receipt must go out on the RETRY wake,
@@ -2232,7 +2232,7 @@ local function test_singleton_guard()
 	end
 end
 
--- L1 §5: a 202 body carries a per-event events[] array; non-accepted outcomes
+-- A 202 body carries a per-event events[] array; non-accepted outcomes
 -- (observed / rejected / duplicate / suppressed_no_consent) must be surfaced
 -- through the diagnostics hook and the snapshot, not silently counted as
 -- accepted.
@@ -2282,7 +2282,7 @@ local function test_batch_response_surfaces_per_event_outcomes()
 	storage.reset()
 end
 
--- L1 §5: a suppressed_no_consent per-event status surfaces distinctly.
+-- A suppressed_no_consent per-event status surfaces distinctly.
 local function test_batch_response_surfaces_suppressed_no_consent()
 	reset()
 	storage.reset()
@@ -2303,7 +2303,7 @@ local function test_batch_response_surfaces_suppressed_no_consent()
 	storage.reset()
 end
 
--- L1 §5: a 202 with no parseable events[] must not regress the accepted count.
+-- A 202 with no parseable events[] must not regress the accepted count.
 local function test_batch_response_without_events_array_keeps_accepted()
 	reset()
 	storage.reset()
@@ -2318,7 +2318,7 @@ local function test_batch_response_without_events_array_keeps_accepted()
 	storage.reset()
 end
 
--- L1 §6: a 429 Retry-After (whole seconds) defers the next publish attempt at
+-- A 429 Retry-After (whole seconds) defers the next publish attempt at
 -- least that long; the batch is retained, not dropped or re-sent immediately.
 local function test_retry_after_defers_next_publish()
 	reset()
@@ -2350,7 +2350,7 @@ local function test_retry_after_defers_next_publish()
 	storage.reset()
 end
 
--- L1 §6: a 5xx Retry-After is honored exactly like the 429 one. The server's
+-- A 5xx Retry-After is honored exactly like the 429 one. The server's
 -- strict-consent mode-unknown lane answers a whole-batch 503 with
 -- `Retry-After: 5`; the transport must pass the parsed header through so the
 -- deferral paces recovery on the server's hint instead of falling back to the
@@ -2409,7 +2409,7 @@ local function test_flush_sends_consent_receipt_before_event_batch()
 	-- event batch second — and the batch is dispatched in the SAME cycle (no
 	-- ack-gating deferral to a later flush).
 	--
-	-- The clock advance is A6's, and it is a real behaviour change rather
+	-- The clock advance is the pacing change's, and it is a real behaviour change rather
 	-- than test scaffolding. The receipt's FIRST failure now arms its own
 	-- retry window where it armed none, and an undispatched grant holds the
 	-- event legs by design (ordering, not pacing — see
@@ -2573,7 +2573,7 @@ local function test_grant_behind_head_holds_events_until_dispatched()
 end
 
 
--- L1 §6: a successful publish clears any active backpressure deferral. A
+-- A successful publish clears any active backpressure deferral. A
 -- deferral whose deadline has already elapsed does not block the publish.
 local function test_successful_publish_clears_deferral()
 	reset()
@@ -2592,7 +2592,7 @@ local function test_successful_publish_clears_deferral()
 	storage.reset()
 end
 
--- L1 §6: transient failures with no Retry-After header back off on the
+-- Transient failures with no Retry-After header back off on the
 -- CLIENT'S OWN clock, first failure included.
 local function test_backoff_on_sustained_transient_failures()
 	reset()
@@ -2627,7 +2627,7 @@ local function test_backoff_on_sustained_transient_failures()
 	storage.reset()
 end
 
--- A6: the retained batch's retry is driven by the RETRY clock, through a wake
+-- The retained batch's retry is driven by the RETRY clock, through a wake
 -- in update(), not by the flush cadence.
 --
 -- This client has no timer of its own — update(dt) is the only thing that
@@ -3091,7 +3091,7 @@ local function test_retry_wake_republishes_without_a_flush_tick()
 	storage.reset()
 end
 
--- L1 §6: the { error: { code, message, details } } envelope on a non-2xx is
+-- The { error: { code, message, details } } envelope on a non-2xx is
 -- parsed and surfaced (error.code + detail codes), not just the bare status.
 local function test_error_envelope_is_surfaced()
 	reset()
@@ -4646,7 +4646,7 @@ local function test_same_second_regrant_outranks_undelivered_denial()
 	storage.reset()
 end
 
--- Codex #40 round 3: a marker from an earlier denial whose grant-side
+-- a marker from an earlier denial whose grant-side
 -- retirement failed used to be imposed UNCONDITIONALLY at the next boot,
 -- overriding the newer successfully-persisted grant. The imposition now
 -- compares decision pairs: a marker the record strictly supersedes is
@@ -4701,7 +4701,7 @@ local function test_stale_denial_marker_never_beats_newer_grant()
 	storage.reset()
 end
 
--- Codex #40 round 3: the unreadable-marker fail-closed state is memory-only
+-- the unreadable-marker fail-closed state is memory-only
 -- by design — but the anonymous-id self-heal rewrite used to persist it,
 -- durably overwriting a real granted record off an unreadable file. The
 -- rewrite is now skipped while the unreadable imposition is in effect; the
@@ -4745,7 +4745,7 @@ local function test_unreadable_marker_fail_closed_stays_transient()
 end
 
 
--- Codex #40 round 4 (P1): a denial receipt whose POST is IN FLIGHT used to
+-- a denial receipt whose POST is IN FLIGHT used to
 -- satisfy the shutdown witness check — but its own acknowledgment prunes it
 -- from the durable outbox, possibly after teardown already finalized on its
 -- evidence, leaving the stale granted record alone for the next launch. An
@@ -4807,7 +4807,7 @@ local function test_shutdown_refuses_while_witness_receipt_in_flight()
 	storage.reset()
 end
 
--- Codex #40 round 4 (P1, the handoff half): when the ack prunes a denial
+-- when the ack prunes a denial
 -- receipt while the record AND marker writes are still owed, the prune
 -- consumes the only durable evidence — so the ack path now retries the
 -- marker write (the CURRENT decision's pair) before removing the receipt.
@@ -4865,7 +4865,7 @@ local function test_ack_prune_hands_witness_to_marker()
 	storage.reset()
 end
 
--- Codex #40 round 3: when the belt's convergence write fails, the retained
+-- when the belt's convergence write fails, the retained
 -- denial receipt — the decision's only durable proof — still dispatches and
 -- leaves the outbox, so the next launch would restore the stale grant with
 -- no witness anywhere. The failed convergence now writes the write-ahead
@@ -5398,7 +5398,7 @@ local function test_persisted_retry_after_defers_startup_resend()
 	-- the server never asked for — and the loader restores whatever it finds
 	-- as SERVER-owned, which is the one kind an explicit flush may not
 	-- bypass. A relaunch would then hold explicit flushes off for the
-	-- remainder of OUR backoff, on the server's authority (Codex on #46).
+	-- remainder of OUR backoff, on the server's authority.
 	--
 	-- Folded in here rather than given its own function because the file is
 	-- at Lua's 200-local ceiling for a main chunk, and this is the same
@@ -5576,7 +5576,7 @@ local function stored_consent_outbox_record(stores)
 	return nil
 end
 
--- AC-8 (consent & age-gate UX spec §7/§10): in a forced-minor session the
+-- In a forced-minor session the
 -- ONLY analytics-plane request permitted on the wire is the
 -- denied_forced_minor receipt POST to /v1/consent — asserted as EXACTLY one
 -- captured request across init, the decision, gameplay-shaped SDK usage,
@@ -5631,7 +5631,7 @@ end
 
 -- denied_forced_minor is persisted, reloads as the same state, discards a
 -- retained batch when it lands mid-flight, purges the durable spool exactly
--- like a denial, and a later explicit choice (the spec §6 band-correction
+-- like a denial, and a later explicit choice (the band-correction
 -- path) supersedes it with a fresh, reason-less receipt.
 local function test_forced_minor_persists_and_gates_like_denied()
 	reset()
@@ -5718,7 +5718,7 @@ local function test_consent_receipt_survives_restart_and_retries_until_acked()
 		"the receipt re-sends verbatim")
 	assert_equal(#second.consent_outbox, 1, "a failed re-send stays retained")
 	assert_equal(second.consent_backoff_attempt, 1)
-	-- The first failure arms the receipt's own window now (A6). It armed
+	-- The first failure arms the receipt's own window now. It armed
 	-- nothing before, which meant the retry happened whenever the next
 	-- dispatch point came round — the flush tick, in practice — so the
 	-- receipt's schedule described nothing.
@@ -6215,7 +6215,7 @@ local function test_outbox_load_drops_run_before_cap_enforcement()
 
 	-- The surviving grant actually delivers once the endpoint recovers. The
 	-- clock advance waits out the receipt's own retry window, which its first
-	-- failure now arms (A6); the consent gate is ordering, not pacing, so an
+	-- failure now arms; the consent gate is ordering, not pacing, so an
 	-- explicit flush honours it.
 	reset()
 	next_status = 202
@@ -6458,9 +6458,9 @@ local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 	storage.reset()
 end
 
--- Canonical-actor keying (ADR-0222 §1 / the ADR-0202 2026-07-20 amendment):
+-- Canonical-actor keying:
 -- a Mode A self-asserted user id is NEVER the receipt actor — the
--- publishable key cannot vouch for it, and the ingress binds the write to
+-- publishable key cannot vouch for it, and the server binds the write to
 -- the caller's own anon scope regardless — so the receipt keys to the
 -- SDK-managed anonymous id with kind "anon". Replaces the retired v0.9.1
 -- user-first snapshot rule (which took a set user_id even in Mode A).
@@ -6500,8 +6500,8 @@ local function test_receipt_kind_verified_in_mode_b_and_emitted_by_default()
 	storage.reset()
 end
 
--- The kind-emission escape hatch for deployments whose ingest service still
--- runs the pre-amendment INGEST_CONSENT_KIND_MODE=off strict decoder (which
+-- The kind-emission escape hatch for deployments whose server still runs
+-- the older strict consent decoder (which
 -- 400-rejects a kind-bearing body as an unknown field):
 -- consent_kind_emission_enabled = false suppresses the WIRE field only —
 -- the kind is still chosen, persisted with the receipt, and drives
@@ -6524,7 +6524,7 @@ local function test_consent_kind_emission_escape_hatch_suppresses_wire_field()
 	storage.reset()
 end
 
--- Parking (the amended §12 path-5 narrowing): a user_verified-keyed receipt
+-- Parking: a user_verified-keyed receipt
 -- parks while the current session cannot VOUCH FOR ITS ACTOR — no
 -- token_provider (a signed-out relaunch under the publishable key), no
 -- identify() yet, or a DIFFERENT user signed in. Parked = retained,
@@ -7178,7 +7178,7 @@ local function test_most_vouching_credential_and_401_follows_credential_used()
 end
 
 -- Outbox upgrade path for kind: a LEGACY record written before kind existed
--- loads with kind backfilled to "anon" — the pre-kind ingress bound every
+-- loads with kind backfilled to "anon" — the server before kind bound every
 -- client write to the caller's anon scope, so anon is the class those
 -- receipts were recorded under — while an entry carrying a non-allowlisted
 -- kind ("user_unverified" included, which the SDK never produces) is
@@ -7564,7 +7564,7 @@ local function test_set_consent_surfaces_receipt_persist_failure()
 
 	-- and a delivery that acks synchronously needs no durability error even
 	-- while outbox writes fail. The clock advance waits out the receipt
-	-- window an earlier failure in this fixture armed (A6).
+	-- window an earlier failure in this fixture armed.
 	reset()
 	outbox_writes_fail = true
 	next_status = 202
@@ -7703,8 +7703,8 @@ local function test_identifier_byte_clamp_boundary()
 	storage.reset()
 end
 
--- The wedge the identifier clamp exists to prevent (GAP-075 follow-up to
--- #30's SECURITY caveats): Defold's sys.save caps a record at ~512 KB and a
+-- The wedge the identifier clamp exists to prevent (a follow-up to #30's
+-- SECURITY caveats): Defold's sys.save caps a record at ~512 KB and a
 -- failed consent-outbox write deliberately never evicts, so ONE receipt
 -- carrying an oversized host-supplied identifier used to fail the outbox
 -- write on every retry — the record stayed owed (dirty) forever and
@@ -7880,7 +7880,7 @@ end
 
 -- Capability discovery: a game feature-detects the new consent surface before
 -- init() and without version parsing; unknown names are false everywhere.
--- GAP-036 schema-revision handshake, emission side: every events:batch
+-- Schema-revision handshake, emission side: every events:batch
 -- request declares the SDK's schema-set revision in the
 -- X-ShardPilot-Schema-Revision request header — and ONLY the batch route.
 -- The consent route shares the same transport dispatch and must stay
@@ -7900,7 +7900,7 @@ local function test_schema_revision_header_on_batch_only()
 	local batch = requests[1]
 	assert_equal(batch.url, "http://localhost:8080/v1/events:batch")
 	-- The exact provisioned value: "sha256:" + the 64-hex digest of the
-	-- analytics-service schema set this SDK build was provisioned against
+	-- server schema set this SDK build was provisioned against
 	-- (a public content identity, re-synced when the schema set changes).
 	assert_equal(batch.headers["X-ShardPilot-Schema-Revision"], schema_revision.REVISION)
 	assert_equal(schema_revision.REVISION,
@@ -7963,7 +7963,7 @@ local function test_schema_revision_override_and_disable()
 	storage.reset()
 end
 
--- GAP-036, response side: a 409 whose error.code is
+-- Schema-revision handshake, response side: a 409 whose error.code is
 -- "schema_revision_mismatch" is TERMINAL for the batch — the server sends no
 -- Retry-After and a retry from the same build can never succeed. The batch
 -- must ride the existing terminal-failure path (dropped; never retained,
@@ -7979,7 +7979,7 @@ local function test_schema_revision_mismatch_409_is_terminal()
 	local issues = {}
 	next_status = 409
 	next_response_body = '{"error":{"code":"schema_revision_mismatch",'
-		.. '"message":"the declared schema revision does not match the schema revision this ingest-api serves",'
+		.. '"message":"the declared schema revision does not match the schema revision this server serves",'
 		.. '"details":[{"field":"X-ShardPilot-Schema-Revision","code":"schema_revision_mismatch"}]}}'
 	next_response_headers = { ["x-shardpilot-schema-revision"] = served }
 	local client = assert(sdk.new(config({
@@ -10558,7 +10558,7 @@ for _, test in ipairs(tests) do
 end
 
 
--- === A6 request compression ===============================================
+-- === Request compression ==================================================
 --
 -- Wrapped in an immediately-invoked FUNCTION on purpose. Lua caps a chunk at
 -- 200 locals, this file is close to it, and the limit is per FUNCTION — a
@@ -10572,7 +10572,7 @@ end
 -- What they CANNOT cover, stated plainly rather than implied away: whether the
 -- ENGINE's zlib.deflate actually emits RFC 1950 framing. That is an engine
 -- fact, this SDK only forwards the bytes, and no interpreter in CI has the
--- module. The SERVER end of the same contract IS verified — analytics-service
+-- module. The SERVER end of the same contract IS verified — the server
 -- reads Go's zlib writer output and refuses a raw RFC 1951 body — so the
 -- unproven link is exactly one: the engine's own framing. It needs an
 -- on-device capture and is owed as an acceptance artifact.
@@ -10706,7 +10706,7 @@ end
 	batches = assert_no_compression("opt-out")
 	assert_equal(#calls, 0, "the opt-out must not call the compressor at all")
 	assert_true(#batches[1].body >= 1024,
-		"fixture must exceed the threshold or the opt-out is untested")
+		"fixture must exceed the threshold for the opt-out to be exercised")
 
 	-- No engine module: an ordinary uncompressed publish, never an error. A
 	-- missing compressor is a missed optimisation, not a dropped batch. This
@@ -10892,7 +10892,7 @@ end
 	assert_equal(bad_err, "invalid_request_compression_enabled")
 end)()
 
--- === Codex round: retry ownership and wake sources ========================
+-- === Retry ownership and wake sources =====================================
 --
 -- Same immediately-invoked-function trick as the block above: the main chunk
 -- is at Lua's 200-local ceiling, and the limit is per FUNCTION (a `do` block
@@ -11127,7 +11127,7 @@ end)()
 	storage.reset()
 end)()
 
--- === Codex round: wakes that fire on work nothing can dispatch =============
+-- === Wakes that fire on work nothing can dispatch ==========================
 --
 -- Every case here is the same defect: a wake stays due while the thing it
 -- would wake CANNOT go out, so update() calls flush() on every frame and each
@@ -12819,7 +12819,7 @@ end)()
 	rrestore(); storage.reset()
 end)()
 
--- === A6 spool overflow: the append must not re-measure the backlog =========
+-- === Spool overflow: the append must not re-measure the backlog ============
 --
 -- Wrapped in an immediately-invoked FUNCTION for the same 200-local reason as
 -- the block above.
@@ -12876,7 +12876,7 @@ end)()
 	drive_appends(client, 200, 60)
 	local per_append = encodes() / 200
 	assert_true(per_append <= 1.0, string.format(
-		"A6: an append must not re-measure the backlog -- %.1f estimates per "
+		"an append must not re-measure the backlog -- %.1f estimates per "
 		.. "append at a 50-entry cap (bound 1.0; it was the whole backlog)",
 		per_append))
 	restore_json()

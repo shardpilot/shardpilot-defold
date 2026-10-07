@@ -71,7 +71,7 @@ local function dispatch(config, token, route, payload, callback, compress)
 			headers[compression.HEADER] = compression.CODING
 		end
 	end
-	-- Schema-revision handshake (GAP-036): declare the schema-set revision
+	-- Schema-revision handshake: declare the schema-set revision
 	-- the SDK was built against, on the events-batch route ONLY. `dispatch`
 	-- is shared with the consent route, and the handshake is defined for
 	-- batch ingest alone — /v1/consent (and the separate crash and

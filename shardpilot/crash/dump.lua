@@ -75,7 +75,7 @@ local function read_sys_field(crash_module, handle, field)
 end
 
 -- The Defold engine module's canonical name. Its symbol identity is
--- special-cased below (ADR-0297 §7c).
+-- special-cased below.
 local ENGINE_MODULE_NAME = "dmengine"
 
 -- is_engine_module_name normalizes a dump module name before the engine
@@ -83,7 +83,7 @@ local ENGINE_MODULE_NAME = "dmengine"
 -- `[lib]dmengine[.exe|.so]` depending on platform (plus `.dylib` on macOS
 -- builds), and the dump list may carry a path. The wire keeps the ORIGINAL
 -- name; only the debug-id synthesis matches on the normalized basename
--- (Codex #41 round 1 — an exact "dmengine" match missed `libdmengine.so`
+-- (an exact "dmengine" match missed `libdmengine.so`
 -- and `dmengine.exe`, silently falling back to name keying).
 local function is_engine_module_name(name)
 	local base = name:match("([^/\\]+)$") or name
@@ -119,7 +119,7 @@ local function engine_version_sha1()
 	return sha1
 end
 
--- The engine identity of the CRASHED process (Codex #41 round 3): the dump
+-- The engine identity of the CRASHED process: the dump
 -- belongs to the PREVIOUS session, and an app/engine update between the
 -- crash and this launch makes the current runtime's sha1 the WRONG identity
 -- (uploaded symbols for the crashed binary would never match). Defold stores
@@ -139,7 +139,7 @@ local function engine_dump_sha1(crash_module, handle)
 end
 
 -- Build the modules[] from the dump's module list. Each module carries a name +
--- a base load address. Symbol identity (ADR-0297 §7c): the ENGINE module's
+-- a base load address. Symbol identity: the ENGINE module's
 -- debug_id is synthesized as `dmengine-<engine sha1>` from the CRASHED
 -- process's own hash (engine_dump_sha1 above; current engine info is the
 -- fallback) — collision-free across engine versions and matching

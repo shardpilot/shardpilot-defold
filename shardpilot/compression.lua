@@ -85,7 +85,7 @@ end
 -- a terminally rejected batch is retained and retried, and compression is
 -- latched off for the session. The whole point of discriminating on codes
 -- rather than the bare 400 is exactness, so the match has to be exact
--- (Codex on #46).
+--.
 function M.is_encoding_refusal(detail_codes)
 	if type(detail_codes) ~= "string" or detail_codes == "" then
 		return false

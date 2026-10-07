@@ -710,7 +710,7 @@
   (`kind = "user_verified"`); the SDK-managed `anonymous_id` with
   `kind = "anon"` in every other case — a Mode A self-asserted `user_id` is
   never the receipt actor (the publishable key cannot vouch for it, and the
-  ingress binds the write to the caller's own anon scope regardless). This
+  server binds the write to the caller's own anon scope regardless). This
   retires the v0.9.1 user-first snapshot, which took a set `user_id` even in
   Mode A. Delivery selects the dispatch credential PER RECEIPT,
   most-vouching first: the minted Mode B token whenever it vouches for the
@@ -740,7 +740,7 @@
   dispatch-credential selection. The outbox load sanitizer holds records to
   the same closed set: entries with a non-allowlisted kind drop fail-safe,
   and legacy pre-kind entries are kept with kind backfilled to `"anon"`
-  (the pre-kind ingress bound every client write to the caller's anon
+  (the server bound every pre-kind client write to the caller's anon
   scope, so anon is the class those receipts were recorded under).
 - **Denial-preferring consent-outbox cap eviction.** Overflow at the fixed
   32-entry cap now evicts the oldest PURE-GRANT receipt first; a
@@ -1142,8 +1142,7 @@
     `consent_outbox_persist_failed`. Durable storage grows from five to
     **six** small bounded per-app records.
 - **New consent decision `set_consent("denied_forced_minor")`** — the
-  age-gate-forced denial state the consent & age-gate UX spec's minor mode
-  requires (its AC-8). Analytics-wise it is IDENTICAL to `denied`: events
+  age-gate-forced denial state the age gate's minor mode requires. Analytics-wise it is IDENTICAL to `denied`: events
   drop at enqueue with `consent_denied`, the queue clears, in-flight batches
   are discarded, the durable spool purges fail-closed, samplers reset, and a
   launch that starts with the persisted state purges the spool and transmits
@@ -1151,8 +1150,8 @@
   `reason = "denied_forced_minor"`, so the backend per-actor gate can tell a
   band-forced denial from a chosen one. In a forced-minor session the sole
   analytics-plane request on the wire is that receipt POST (covered by a
-  dedicated AC-8 test). The state is superseded like any other: a later
-  `set_consent(true)`/`set_consent(false)` (the spec's band-correction path)
+  dedicated test). The state is superseded like any other: a later
+  `set_consent(true)`/`set_consent(false)` (the band-correction path)
   applies normally and posts a fresh, reason-less receipt. Any other string
   is still rejected with `invalid_consent`; the `set_consent` parameter is
   now documented as `decision` (`true` | `false` | `"denied_forced_minor"`).

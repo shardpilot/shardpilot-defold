@@ -1423,14 +1423,14 @@ local function valid_receipt_identifier(value)
 	return valid_receipt_field(value) and #value <= M.max_identifier_bytes
 end
 
--- The ADR-0222 actor-identity classes a receipt may carry. The SDK itself
+-- The actor-identity classes a receipt may carry. The SDK itself
 -- produces only these two — never "user_unverified" (a self-asserted Mode A
 -- user id is a class any caller could spoof, and the ingest service rejects
 -- SDK writes carrying it) — and the sanitizer holds loaded records to the
 -- same closed set: an entry with any other kind is dropped fail-safe like
 -- any malformed field, while a LEGACY entry with no kind at all (written
--- before kind existed) is kept and backfilled "anon" — the pre-kind ingress
--- bound every client write to the caller's anon scope, so anon is the class
+-- before kind existed) is kept and backfilled "anon" — the server before kind
+-- existed bound every client write to the caller's anon scope, so anon is the class
 -- those receipts were recorded under.
 local valid_receipt_kinds = { anon = true, user_verified = true }
 
