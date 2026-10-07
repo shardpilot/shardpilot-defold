@@ -8,8 +8,7 @@
 -- REFERENCE and returns; it does not serialize. Every millisecond below is
 -- therefore the SDK's OWN work in Lua, with the engine's durable write
 -- excluded entirely. That is deliberate -- it is the half this SDK controls --
--- but it means the absolute figures are NOT an end-to-end frame cost, and the
--- bound document says so rather than implying otherwise.
+-- but it means the absolute figures are NOT an end-to-end frame cost.
 --
 --   lua5.1 test/bench_spool_append.lua [appends]
 package.path = "./?.lua;./?/init.lua;" .. package.path
