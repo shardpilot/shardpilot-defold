@@ -125,9 +125,9 @@ normally created from the merge of the matching version-bump commit, so
 immediately after that merge lands there is a short window in which the URL
 404s.
 
-**If it 404s, wait — do not pin an earlier tag.** `v0.10.1` supersedes `v0.6.0`
-through `v0.10.0`; do not pin any of them. `v0.5.0` and earlier predate most of
-what this README documents.
+**If it 404s, wait — do not pin an earlier tag.** Do not pin `v0.6.0` through
+`v0.10.0`; use `v0.10.1` or later (`v0.10.1` has no source difference from
+`v0.10.0`). `v0.5.0` and earlier predate most of what this README documents.
 
 The historical `v0.10.1` tag lacks request compression, the 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history. These are included in `v0.10.2`.
 

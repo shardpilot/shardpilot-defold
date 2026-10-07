@@ -11,8 +11,8 @@ step the version named here is **pending**, not published, and its archive URL
 404s. `git tag -l` on a fresh fetch is the authority on what is actually
 published, not this line.
 
-**Do not fall back to an earlier tag.** `v0.10.1` supersedes `v0.6.0` through
-`v0.10.0`. If the pending tag 404s, WAIT for it.
+**Do not fall back to an earlier tag.** Do not use `v0.6.0` through `v0.10.0`
+as a fallback. If the pending tag 404s, WAIT for it.
 
 **`v0.10.1` itself is an exception to the ordering below**, and it is worth
 knowing so its tree does not look like a mistake. It was cut as a

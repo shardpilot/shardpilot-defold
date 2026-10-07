@@ -74,8 +74,8 @@ The earlier off-main `v0.10.1` tag still declares `0.10.0`; see the [changelog](
 Ordinary tags DO come from the merge of the matching version-bump commit, never
 before it, so for those there is a short window right after the merge in which
 the URL above does not resolve yet — if it 404s, WAIT for the tag rather than
-pinning an earlier one. `v0.10.1` supersedes `v0.6.0` through `v0.10.0`; do not
-fall back to any of them. Note there
+pinning an earlier one. Do not fall back to `v0.6.0` through `v0.10.0`. Note
+there
 is no packaged ZIP asset attached to any GitHub Release — the tag source
 archive is the only hosted dependency URL. Pin a tag rather than tracking
 `main` so your build does not shift under you between releases.
