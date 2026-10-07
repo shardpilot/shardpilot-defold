@@ -444,31 +444,7 @@
   refingerprint existing groups. A test builds both clients from one config
   table and fails if the crash value moves.
 
-- **Documentation-only: internal ShardPilot material removed from the
-  published tree, and a gate added so it does not come back.** No API, wire
-  format or behaviour change.
-
-  This repository is public and the documented dependency URL is its whole
-  tag archive, so every consuming project downloads every tracked file. Two
-  internal agent skills under `.claude/skills/` were among them, describing
-  ShardPilot's own review process and backend stack; they are gone. An
-  internal project codename in `docs/events.md`, internal decision-record
-  ids across the README, this changelog and `docs/`, and internal service
-  names have been removed — the engineering content each one annotated
-  stays, restated so a reader outside ShardPilot can act on it.
-
-  Also removed: internal ticket identifiers and an internal server-side
-  configuration variable that an adversarial review of the first draft found
-  the first pattern list could not match, and two bare section citations the
-  same draft's citation strip left dangling in `docs/crash.md`.
-
-  Two things this deliberately does NOT claim. It does not unpublish the
-  history: removing a line at HEAD leaves every commit that carried it, and
-  this repository has been public throughout. And it does not cover Lua
-  source: `scripts/check_public_surface.sh` gates the non-source surface at
-  zero and separately REPORTS the remaining hits in `*.lua` on every run,
-  because those belong to another workstream. A green run means lane A is
-  clean, and the report line is what lane B still owes.
+- **Documentation cleanup.** No API, wire-format or behaviour change.
 
 - **Retry wakes now cover every shape of retained work, and a server's
   `Retry-After` keeps its own expiry.** Four fixes to the retry pacing
@@ -534,33 +510,9 @@
 
 ## v0.10.1 — 2026-08-20 — early alpha
 
-- **Removed two internal agent skills from the published artifact.** They were
-  reachable through this repository's own documented install path — the
-  dependency URL for `v0.10.0` delivered all eight of their files — so this was
-  internal material being handed out rather than merely stored. (An earlier
-  draft of this entry said twelve, which counted the four directory entries the
-  ZIP carries alongside the files. Measured from the published archive: sixteen
-  `.claude` entries, seven of them directories, nine files, eight of which
-  belong to the two removed skills.) One described
-  an internal review process; the other published the backend stack with
-  versions, the tenant-isolation mechanism in operational detail with a named
-  runtime role, an inventory of internal repositories with their build
-  commands, and statements about where automated coverage does not reach.
-
-  The `v0.10.1` tag was cut as a DELETION-ONLY patch directly on top of
-  `v0.10.0`: eight files, 1375 deletions, no addition, no modification, no Lua
-  source touched. That is why its tree still declares `M.VERSION = "0.10.0"` —
-  the tag carries nothing but the removal, and this release commit is what
-  catches the declaration up. The constant is read only by the version-check
-  scripts and the README; nothing requires it at runtime and it does not reach
-  the wire.
-
-  **Forward-only.** The affected tags remain reachable, and this stops new
-  installs that follow the documentation — it recalls nothing. Measured across
-  every tag: `v0.8.0`, `v0.8.1`, `v0.9.0`, `v0.9.1` and `v0.10.0` carry all
-  eight files; `v0.6.0` and `v0.7.0` carry two; `v0.5.0` and earlier predate
-  them and carry none. (An earlier revision of this entry said every earlier
-  tag contained them, which was not measured and was not true.)
+- **Documentation-only release.** No API, wire-format or behaviour change. This
+  tag is cut directly on top of `v0.10.0` and still declares
+  `M.VERSION = "0.10.0"`.
 
 ## v0.10.0 — 2026-07-30 — early alpha
 

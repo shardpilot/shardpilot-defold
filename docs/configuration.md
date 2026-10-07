@@ -47,7 +47,7 @@ ShardPilot Defold SDK v0 is configured with a Lua table:
 ```
 
 `ingest.shardpilot.com` is a planned public ingest domain and is not provisioned
-by this wave. Use local/develop endpoints for source evaluation until a later
+in this release. Use non-production endpoints for source evaluation until a later
 release explicitly publishes production infrastructure.
 
 Required fields are `ingest_url`, `workspace_id`, `app_id`, `environment_id`,

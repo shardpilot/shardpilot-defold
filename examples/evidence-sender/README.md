@@ -259,7 +259,7 @@ An unavailable Python/Lupa installation fails before the sender starts. Each run
 creates fresh event/crash IDs under the configured synthetic identity and sends
 real mutations when given live endpoints.
 Only an authorized operator runs it against production. The live ingest/crash
-contract observations supplied by the coordinator on 2026-09-11 are inputs to
+contract observations recorded on 2026-09-11 are inputs to
 these fixtures, not production results reproduced by this example's author.
 
 Local verification (synthetic loopback only, no production credentials):

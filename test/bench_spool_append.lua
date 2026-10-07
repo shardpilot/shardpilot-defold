@@ -1,15 +1,14 @@
--- A6 spool-overflow benchmark, Defold SDK.
+-- Spool-overflow benchmark, Defold SDK.
 --
 -- Drives the REAL Client:spool_envelopes under sustained overflow -- one
 -- envelope per append, the shape a full queue produces -- and reports the two
--- numbers docs/SPOOL_OVERFLOW_LATENCY_BOUND.md bounds.
+-- numbers the spool's overflow bound is about.
 --
 -- ⚠ WHAT THIS HARNESS DOES AND DOES NOT MEASURE. sys.save here STORES A
 -- REFERENCE and returns; it does not serialize. Every millisecond below is
 -- therefore the SDK's OWN work in Lua, with the engine's durable write
 -- excluded entirely. That is deliberate -- it is the half this SDK controls --
--- but it means the absolute figures are NOT an end-to-end frame cost, and the
--- bound document says so rather than implying otherwise.
+-- but it means the absolute figures are NOT an end-to-end frame cost.
 --
 --   lua5.1 test/bench_spool_append.lua [appends]
 package.path = "./?.lua;./?/init.lua;" .. package.path
