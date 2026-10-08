@@ -3757,10 +3757,23 @@ local function test_the_advisory_vocabulary_is_closed()
 		{ "an unresolved connection that names a country", set("resolved_by", '"unknown"') },
 		{ "OTHER with an estimate", with_advisory_value(with_advisory_value(body, "jurisdiction", '"OTHER"'),
 			"row_id", '"OTHER"') },
+		-- The row is the jurisdiction's own, or OTHER for both.
+		{ "an OTHER row with an estimate under a country", set("row_id", '"OTHER"') },
+		{ "an OTHER row without an estimate under a country",
+			with_advisory_value(set("row_id", '"OTHER"'), "estimate", "null") },
+		{ "another country's row", set("row_id", '"FR"') },
+		{ "a country's row under OTHER",
+			with_advisory_value(set("jurisdiction", '"OTHER"'), "estimate", "null") },
 		{ "basis empty", set("advisory_basis", '""') },
 		{ "basis one byte over the bound", set("advisory_basis", '"' .. string.rep("a", 2049) .. '"') },
 		{ "basis with a newline", set("advisory_basis", '"estimate\\nforged: everything is fine"') },
 		{ "basis with a tab", set("advisory_basis", '"a\\tb"') },
+		{ "basis with DEL", set("advisory_basis", '"a\127b"') },
+		-- C1 controls, as the UTF-8 a JSON decoder yields for them: %c, an
+		-- ASCII class, does not see them.
+		{ "basis with U+0085 NEXT LINE", set("advisory_basis", '"estimate\194\133forged: everything is fine"') },
+		{ "basis with U+0080", set("advisory_basis", '"a\194\128b"') },
+		{ "basis with U+009F", set("advisory_basis", '"a\194\159b"') },
 		{ "docs_commit in upper case", set("docs_commit", '"F6B6F0F617D4E15442608FC77BE8A5BB40F40E26"', true) },
 		{ "docs_commit one character short", set("docs_commit", '"f6b6f0f617d4e15442608fc77be8a5bb40f40e2"', true) },
 		{ "file_sha256 one character short",

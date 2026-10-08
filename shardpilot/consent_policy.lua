@@ -1174,6 +1174,13 @@ local function advisory_refusal(advisory)
 	if advisory.estimate ~= nil and not ADVISORY_ESTIMATES[advisory.estimate] then
 		return "advisory.estimate is outside the closed vocabulary"
 	end
+	-- The row is the jurisdiction's own, or OTHER for both: the contract makes
+	-- the jurisdiction OTHER for a connection with no row of its own, and the
+	-- resolver sets both members from one row. Checked first, so the OTHER rule
+	-- below holds for the row as well as the jurisdiction.
+	if advisory.row_id ~= advisory.jurisdiction then
+		return "advisory.row_id is not the jurisdiction's row"
+	end
 	-- The contract states both of these in its own words: OTHER never carries
 	-- an estimate, and an unresolved connection is OTHER.
 	if advisory.jurisdiction == ADVISORY_OTHER and advisory.estimate ~= nil then
@@ -1196,8 +1203,11 @@ local function advisory_refusal(advisory)
 	end
 	-- ⚠ NO CONTROL CHARACTERS. The text is a table cell, which holds none, and
 	-- it is the free text a host is most likely to log or show: a newline here
-	-- could write a second line into a log that nothing authorised.
-	if advisory.advisory_basis:find("%c") then
+	-- could write a second line into a log that nothing authorised. %c sees
+	-- only C0 and DEL, so C1 (U+0080-U+009F, "\194\128"-"\194\159" in UTF-8)
+	-- is matched on its encoding: some log sinks read U+0085 NEXT LINE as a
+	-- line break.
+	if advisory.advisory_basis:find("%c") or advisory.advisory_basis:find("\194[\128-\159]") then
 		return "advisory.advisory_basis carries a control character"
 	end
 	local matrix = advisory.matrix
