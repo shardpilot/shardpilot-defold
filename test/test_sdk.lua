@@ -468,7 +468,7 @@ local function test_app_first_payload()
 	assert_not_contains(request.body, '"build_version"')
 end
 
--- ── C3 typed progression verbs ──────────────────────────────────────────
+-- ── Typed progression verbs ─────────────────────────────────────────────
 local progression_tests = {}
 
 function progression_tests.emit_the_canonical_events()
@@ -650,7 +650,7 @@ function progression_tests.refuse_a_non_client_source()
 	assert_contains(requests[1].body, '"event_name":"custom_event"')
 end
 
--- ── C3 typed ad verb (in the progression table: Lua 5.1 caps a function
+-- ── Typed ad verb (in the progression table: Lua 5.1 caps a function
 -- at 200 locals and this file sits at the ceiling) ──────────────────────
 function progression_tests.ad_emits_the_canonical_event()
 	reset()
@@ -3314,7 +3314,7 @@ local spool_scope = { workspace_id = "workspace-example", app_id = "app-example"
 -- Lua 5.4's generic `for` needs registers the 5.1 one does not, so the CI leg
 -- for 5.4 refused the file outright (`too many local variables`) while 5.1 and
 -- LuaJIT loaded it. Folding a cohesive family costs nothing at runtime and
--- buys the headroom back; the C3 scenes below use the same shape.
+-- buys the headroom back; the typed-verb scenes below use the same shape.
 local spool_tests = {}
 
 function spool_tests.persists_transient_failure_and_resends_next_launch()
