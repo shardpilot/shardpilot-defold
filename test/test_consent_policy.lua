@@ -266,7 +266,7 @@ local function context(overrides)
 end
 
 -- ⚠ THE FIXTURE IS THE RESOLVER'S ACTUAL SHAPE, not this module's idea of it.
--- It was a FLAT plan until R16, which is exactly the defect that round fixed:
+-- It was a FLAT plan until a later fix, which is exactly the defect it fixed:
 -- the module and the server were written from the same prose and neither ever
 -- parsed the other's bytes. Every field, nesting and value here is copied from
 -- the golden bodies in test/golden/, which are the handler's own output.
@@ -874,7 +874,7 @@ end
 -- to another, past the scope check that only ever saw the first context.
 local function test_the_cache_is_scoped_to_the_whole_context()
 	-- The control first: the SAME context is still served privately. The
-	-- fixture is a STRICT plan, because since R15 only a non-permissive
+	-- fixture is a STRICT plan, because now only a non-permissive
 	-- decision is cached at all.
 	reset()
 	next_response_body = plan()
@@ -1692,7 +1692,7 @@ end
 -- name is not mistaken for the top-level one.
 local function test_an_escaped_key_cannot_hide_an_object()
 	-- signals_used is the only TOP-LEVEL list the contract has;
-	-- operation_blocks moved inside flags with R16 and prohibited_purposes left
+	-- operation_blocks moved inside flags in the contract migration and prohibited_purposes left
 	-- the schema, so this is now the one key the top-level scan can be asked
 	-- about. The flags walk covers its own array separately.
 	local escaped = {
@@ -1719,8 +1719,8 @@ local function test_an_escaped_key_cannot_hide_an_object()
 	local body = plan()
 	next_response_body = body:gsub('"scope":{', '"scope":{"operation_blocks":{},', 1)
 	local nested = prepare()
-	-- ⚠ THE REASON IS THE CONTROL, NOT THE VERDICT. Since R14 every schema
-	-- object has a closed key set, so this IS refused — but it must be refused
+	-- ⚠ THE REASON IS THE CONTROL, NOT THE VERDICT. Every schema
+	-- object now has a closed key set, so this IS refused — but it must be refused
 	-- as "scope carries an unknown key", never as "operation_blocks is a JSON
 	-- object where the schema says a list". A scan that matched the name
 	-- anywhere in the document would give the second answer.
@@ -1918,7 +1918,7 @@ end
 -- unverifiable signature must not admit or the field's arrival becomes a
 -- downgrade.
 --
--- Until R16 this module refused the null too — which meant it refused every
+-- Until the contract migration this module refused the null too — which meant it refused every
 -- real response the resolver sends.
 local function test_the_signature_is_present_and_null_or_refused()
 	reset()
@@ -2386,8 +2386,8 @@ local function test_the_example_stops_when_identify_refuses()
 		"an accepted identify must reach the consent write: " .. calls)
 end
 
--- ⚠ EVERY OBJECT IN THE SCHEMA HAS AN EXACT KEY SET. The root was closed in
--- R8, age_band in R12, the context's age_band in R13 — the same finding
+-- ⚠ EVERY OBJECT IN THE SCHEMA HAS AN EXACT KEY SET. The root was closed
+-- first, then age_band, then the context's age_band — the same finding
 -- arriving at one door after another, which is what a roster is for. This
 -- asks it of all four at once, and of the shape that would otherwise slip
 -- past: an unknown member spelled `null`, which decodes to the same nil an
@@ -2609,7 +2609,7 @@ end
 
 -- ⚠ THE CLOCK-ROLLBACK ENTRY GUARD IS GONE, DELIBERATELY, AND THIS IS WHAT
 -- REPLACED IT. It existed so a stored PERMISSION could not outlive its plan
--- when the wall clock stepped backwards. Since R15 no permission is stored at
+-- when the wall clock stepped backwards. Now no permission is stored at
 -- all, so there is nothing for a rolled-back clock to over-serve: the worst it
 -- can do is keep a CLOSED answer alive longer, which relaxes nothing. Rather
 -- than keep a guard whose reason has gone, the invariant it was protecting is
@@ -3164,7 +3164,7 @@ end
 -- ⚠ THE HAZARD THE SENTINEL AT THE BOTTOM OF THIS FILE EXISTS FOR, kept as a
 -- test rather than as a one-off check: ipairs STOPS at a nil hole. A scene
 -- renamed or deleted but left in the `tests` list is exactly that, and every
--- scene after it silently never runs. It happened here during the R16
+-- scene after it silently never runs. It happened here during the contract
 -- migration and the suite stayed green.
 --
 -- HONEST LIMIT: this proves the LANGUAGE behaves that way. The sentinel proves
@@ -3509,7 +3509,7 @@ local tests = {
 -- ⚠ ipairs STOPS AT A NIL HOLE, SILENTLY. A scene renamed or deleted but left
 -- in the list above is a nil entry, and every scene AFTER it simply never runs
 -- — the suite goes green having skipped half of itself. That happened during
--- the R16 contract migration: five scenes were lost in an edit and four
+-- the contract migration: five scenes were lost in an edit and four
 -- mutants "survived" that were in fact never tested. This sentinel is the
 -- cheapest thing that makes it impossible to miss again.
 local reached_the_end = false

@@ -1482,7 +1482,7 @@ local function test_facade_and_capability()
 	assert_true(sdk.shutdown())
 end
 
--- ── round-1 regressions ───────────────────────────────────────────────────────
+-- ── regressions, part 1 ───────────────────────────────────────────────────────
 
 local function test_auth_latch_survives_prelatch_inflight_success()
 	reset()
@@ -1738,7 +1738,7 @@ local function test_session_renewal_rearms_exposure()
 	assert_equal(#queued_events(client, "experiment_exposure"), 2)
 end
 
--- ── round-2 regressions ───────────────────────────────────────────────────────
+-- ── regressions, part 2 ───────────────────────────────────────────────────────
 
 local function test_regenerated_assignment_key_does_not_reexpose()
 	reset()
@@ -1966,7 +1966,7 @@ local function test_prelatch_response_fails_closed_to_caller()
 	assert_nil(client:experiment_variant("exp-a"))
 end
 
--- ── round-3 regressions ───────────────────────────────────────────────────────
+-- ── regressions, part 3 ───────────────────────────────────────────────────────
 
 local function test_failed_refresh_write_never_leaves_superseded_variant()
 	reset()
@@ -2136,7 +2136,7 @@ local function test_no_callback_install_or_persist_after_shutdown()
 	restore()
 end
 
--- ── round-4 regressions ───────────────────────────────────────────────────────
+-- ── regressions, part 4 ───────────────────────────────────────────────────────
 
 local function test_clock_rollback_cannot_revive_killed_variant()
 	reset()
@@ -2324,7 +2324,7 @@ local function test_owed_exposures_queue_across_replacements()
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 end
 
--- ── round-5 regressions ───────────────────────────────────────────────────────
+-- ── regressions, part 5 ───────────────────────────────────────────────────────
 
 local function test_ordinary_auth_failure_keeps_durable_cache_despite_owed_write()
 	reset()
@@ -2527,7 +2527,7 @@ local function test_shutdown_sweeps_owed_exposure_after_flush()
 	assert_equal(published[1].props.variant_key, "treatment")
 end
 
--- ── round-6 regressions ───────────────────────────────────────────────────────
+-- ── regressions, part 6 ───────────────────────────────────────────────────────
 
 local function test_shutdown_retries_owed_durable_drop()
 	reset()
@@ -2695,7 +2695,7 @@ local function test_stale_grammar_reject_does_not_remint()
 		"the genuine reject re-mints the subject (budget was not consumed)")
 end
 
--- ── round-7 regressions ───────────────────────────────────────────────────────
+-- ── regressions, part 7 ───────────────────────────────────────────────────────
 
 local function test_owed_exposures_stay_session_scoped()
 	reset()
@@ -2934,7 +2934,7 @@ local function test_stale_scope_retry_after_does_not_park_revalidation()
 		"a stale-scope Retry-After must not park the current subject's revalidation")
 end
 
--- ── round-8 regressions ───────────────────────────────────────────────────────
+-- ── regressions, part 8 ───────────────────────────────────────────────────────
 
 local function test_restored_exposure_migrates_to_first_session()
 	reset()
@@ -3082,7 +3082,7 @@ local function test_shutdown_completes_with_active_session_and_full_queue()
 		"the deferred session end rides a shutdown batch")
 end
 
--- ── round-9 regressions (post-merge audit absorption) ─────────────────────────
+-- ── regressions, part 9 (post-merge audit absorption) ─────────────────────────
 
 local function test_stale_auth_refusal_does_not_latch()
 	reset()
@@ -3245,7 +3245,7 @@ local function test_failed_sentinel_clear_never_resurrects_serving()
 	restore()
 end
 
--- ── round-10 regressions ──────────────────────────────────────────────────────
+-- ── regressions, part 10 ──────────────────────────────────────────────────────
 
 local function test_non_string_reason_is_malformed()
 	reset()
@@ -3389,7 +3389,7 @@ local function test_mismatched_app_or_environment_is_malformed()
 		"another environment's payload must never install")
 end
 
--- ── round-11 regressions ──────────────────────────────────────────────────────
+-- ── regressions, part 11 ──────────────────────────────────────────────────────
 
 local function test_non_string_scope_echo_is_malformed()
 	reset()
@@ -3474,7 +3474,7 @@ local function test_rotation_cancels_owed_writes()
 	-- it instead: the server rejected the subject's grammar, so a failed
 	-- identity persist must not let a relaunch under the restored old
 	-- subject serve the rejected subject's assignments. (Flipped from the
-	-- pre-R23 "keeps its last durable state" pin — the D23-7 tombstone
+	-- earlier "keeps its last durable state" pin — the tombstone
 	-- rule supersedes it.)
 	state.fail_save = function(path)
 		return fail_experiment_saves(path)
@@ -7296,7 +7296,7 @@ function extra_tests.test_later_sentinel_cancels_covered_snapshot_write()
 
 	-- Sentinel ONE goes out; after its dispatch exp-b lands with its
 	-- install save failing. The first wipe preserves exp-b's owed write as
-	-- a pending.entry snapshot (the R23 rule).
+	-- a pending.entry snapshot (the pending-entry snapshot rule).
 	local held = {}
 	responder = function(url, _, callback)
 		if not url:find("/runtime/experiments/assignment", 1, true) then

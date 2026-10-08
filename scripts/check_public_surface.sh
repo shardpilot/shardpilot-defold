@@ -273,8 +273,8 @@ gate_tmp() {
 gate_finished=no
 # ⚠ AND EVERY OTHER INTERNAL FLAG IS INITIALISED HERE TOO, FOR THE REASON THE ONE
 # ABOVE ALWAYS WAS. A flag that is only ever ASSIGNED where its condition holds,
-# and READ with `${flag:-no}`, inherits whatever the environment exported. Review
-# round 10: `lane_b_compared=yes ./check_public_surface.sh` made an uncompared run
+# and READ with `${flag:-no}`, inherits whatever the environment exported. In review,
+# `lane_b_compared=yes ./check_public_surface.sh` made an uncompared run
 # print "the number may fall and may not rise" -- the log attesting to work that
 # did not happen, which is the third round running that the defect was in what the
 # run SAYS. Measured: with the export, the strong sentence; without it, the weak
@@ -408,7 +408,7 @@ fi
 # the classes, so they are written plainly.
 GATE_DATA_NAMES='ROSTER_SALT ROSTER_DIGESTS ROSTER_CANARY KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_ENTITY_BODY FIXTURE_ENTITY_NAME FIXTURE_AMPPROSE_BODY FIXTURE_AMPPROSE_NAME FIXTURE_NBSPPHRASE_BODY FIXTURE_NBSPPHRASE_NAME FIXTURE_RAWHTMLENT_BODY FIXTURE_RAWHTMLENT_NAME FIXTURE_LEGACYSECT_BODY FIXTURE_LEGACYSECT_NAME FIXTURE_ENTITYLANEB_BODY FIXTURE_ENTITYLANEB_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME FIXTURE_SPLITID_BODY FIXTURE_SPLITID_NAME'
 
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)*( [A-Za-z][A-Za-z-]*)? (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)*( [A-Za-z][A-Za-z-]*)? (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Code[x] (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER_SALT='shardpilot-surface-roster-v1'
 ROSTER_DIGESTS='9,7 174ead9ac7f4fc41cae883b2fdedda32bb8f4221d83b5f36bf20fc43709a5c21
 7,5 f37497f378e89c146abbf58631622024e00212d83c0c23349796be7501357e23
@@ -431,7 +431,7 @@ nobody[] looks at that dashboard
 tracked as SP-[]999 on the board
 filed as AC-Q[]A-999 during triage
 the sample app lacks auto[]mated tests
-Codex []review
+Code[]x review
 EXAMPLE_SYNTH[]ETIC_FL[]AG_MODE=off
 The crash path isn'"'"'t []tested.
 The crash path hasn'"'"'t be[]en tested.
@@ -886,7 +886,7 @@ AUDIT_CLASSES="$AUDIT_CLASSES"'|(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 # were missing: the optional backtick in the commit form, and the review
 # reference entirely. A class the matcher rewards and the audit ignores is a
 # published live reference the self-test calls correct.
-AUDIT_CLASSES="$AUDIT_CLASSES"'|Codex [a-z]*#[0-9]+'
+AUDIT_CLASSES="$AUDIT_CLASSES"'|Code[x] [a-z]*#[0-9]+'
 
 # roster_grep MODE FILE...  — the roster matcher, grep-compatible.
 #   MODE q: quiet, exit 0 on the first hit; n: print "LINE:TEXT" per matching
@@ -1782,7 +1782,7 @@ scan_tree() {
         # status out and dropped the rest of the pipeline: a `tr` killed after
         # grep had produced matches handed back TRUNCATED output with a status
         # of success, and a tally that still equalled the baseline passed on
-        # data it never fully read. The round-2 fix for the sibling defect
+        # data it never fully read. The earlier fix for the sibling defect
         # landed on the instance; this is the class.
         lane_b_count_pass() {  # $1 = grep flags, $2 = pattern, $3 = file
           local lane_b_ps
@@ -1903,7 +1903,7 @@ scan_tree() {
         #
         # Measured on both corpora before changing it: this rule refuses 0 of 13
         # files here and 0 of 11 there, while still refusing every spelling the
-        # sibling's three P1 findings were about — the underscore-hidden word and
+        # sibling's three serious findings were about — the underscore-hidden word and
         # the emphasis-split identifier — and admitting the two that only ever
         # made the raw reading see MORE.
         #
@@ -1954,7 +1954,7 @@ scan_tree() {
               # agrees up to that byte then produced the SAME a[2], so `best`
               # took their maximum instead of their sum: adding the second one
               # to an already-baselined line left the count unchanged and passed
-              # the ratchet with no baseline edit. That is the round-1 defect --
+              # the ratchet with no baseline edit. That is the original defect --
               # an occurrence hiding on a counted line -- re-entering through
               # the encoding of the key. Measured: the split form counts two
               # such matches as 1, this form as 2.
@@ -2758,7 +2758,7 @@ fi
 # resolved worktree, a canonical-path derivation with an outer-repository
 # anchor, exclusions for both administrative directories, working-tree and
 # index symlink checks, a hard-link count, and a rename that could not be raced.
-# Every P1 among them -- a truncated .git/index, an escape through a symlinked
+# Every serious one among them -- a truncated .git/index, an escape through a symlinked
 # parent, a hard-linked target -- was reachable ONLY by someone who set the
 # variable. Removing the variable removes the reachability, and the guards with
 # it. What is deleted here is not coverage; it is refusals whose subject can no
@@ -2832,8 +2832,8 @@ LANE_B_BASELINE=scripts/public-surface-lane-b-baseline.txt
 # go through the index, so the link is not followed there either.
 #
 # I found the stale premise myself, in an audit of all fifty refusals, and drew
-# the wrong conclusion from it: keep the refusal, correct its wording. Review
-# round 5 pointed out what that misses -- a refusal blocking its own remedy is
+# the wrong conclusion from it: keep the refusal, correct its wording. A later
+# review pointed out what that misses -- a refusal blocking its own remedy is
 # not a refusal with a bad sentence, it is one that should not fire. The index
 # symlink refusal below stays: there the two sides genuinely disagree.
 # ⚠ AND A SYMLINK IS EXEMPT, because `-e` follows it. A link to a DIRECTORY or a
@@ -2906,7 +2906,7 @@ fi
 # between the operator and the remedy.
 #
 # ⚠ THIS ONE MATTERS MORE THAN THE OTHER TWO, because I audited all fifty
-# refusals after round 4, examined this one, and recorded it as still earned. The
+# refusals in an earlier pass, examined this one, and recorded it as still earned. The
 # audit's instrument was my own reading of each stated reason, and it got this
 # wrong in the direction that keeps code: a guard I did not have to defend.
 
@@ -2989,7 +2989,7 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # directory cannot be entered by anyone else. Two refusals and their two
     # pre-existence checks go away with it -- the states they enumerated are no
     # longer reachable.
-    # ⚠ MODE 700 PROTECTS THE DIRECTORY, NOT ITS NAME. Review round 4: after
+    # ⚠ MODE 700 PROTECTS THE DIRECTORY, NOT ITS NAME. After
     # `mkdir` returns, a process with the same uid -- or anyone able to rename
     # entries in a group-writable scripts/ -- can move this directory aside and
     # leave a symlink standing at the name. Every later use of the NAME would then
@@ -3040,7 +3040,7 @@ if [ "${1:-}" = "--write-baseline" ]; then
   || gate_probe_refused lane_b_workdir "the inode of the private write directory" \
        "It was created a moment ago and is left standing: $lane_b_workdir."
     # ⚠ THE CLEANUP RE-OPENED THE NAME THE REST OF THIS BLOCK REFUSES TO TRUST.
-    # Review round 5: the parent check is not enough. Rename this directory aside
+    # The parent check is not enough. Rename this directory aside
     # and put a DIFFERENT directory at the same name in the same parent, and the
     # parent inode still matches -- so `rm -rf <name>` deleted whatever now stood
     # there. Every write above was careful to resolve against a held inode, and
@@ -3182,8 +3182,8 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # extension: a real rename in the held directory, not a scrape of --help.
     # Where it is missing the gate refuses instead of falling back to semantics
     # it has just measured to be unsafe.
-    # ⚠ AND THE PROBE LIVES IN THAT DIRECTORY TOO. Round 2 found it built its
-    # evidence file with an ordinary redirect at a predictable name; round 3
+    # ⚠ AND THE PROBE LIVES IN THAT DIRECTORY TOO. A review found it built its
+    # evidence file with an ordinary redirect at a predictable name; the next
     # found that the exclusive create which replaced it still let a FIFO block,
     # and that `mv -fT` would happily replace a destination planted between the
     # check and the move. Both were races against paths anyone could reach.
@@ -3282,7 +3282,7 @@ if ! git cat-file blob ":$LANE_B_BASELINE" > "$lane_b_base_blob" 2>/dev/null; th
   exit 2
 fi
 
-# Same rule, and this is the read the P2 above is really about: `-f` passed, so
+# Same rule, and this is the read the finding above is really about: `-f` passed, so
 # the file exists; a failure here is permission or I/O, not absence.
 # ⚠ THE TARGET'S COPY IS FROM AN EARLIER COMMIT, so it can predate a change to
 # this format. Version 1 was "<path> <occurrences>"; reading one of those with
@@ -3330,7 +3330,7 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
   # ⚠ A THIRD ANSWER, BECAUSE "NO ANCESTRY" IS NOT "NOTHING TO COMPARE". A push
   # that creates an orphan branch, or tags a root commit, has no parent and no
   # merge base -- and the workflow used to answer that by comparing against the
-  # DEFAULT BRANCH, which the commit does not descend from. Review round 5: such
+  # DEFAULT BRANCH, which the commit does not descend from. Such
   # a ref can then add occurrences, write matching counts, and pass on whatever
   # slack the default branch's baseline happens to carry.
   #
@@ -3539,7 +3539,7 @@ fi
 # sentence on a run that did not do the work is how a log becomes a false record.
 # ⚠ NOT `grep -c .`, WHICH EXITS 1 WHEN THE ANSWER IS ZERO. That was harmless
 # while the count sat inside an `echo` argument -- the echo's status was what
-# errexit saw -- and fatal the moment round 7 lifted it into an assignment of its
+# errexit saw -- and fatal the moment a later fix lifted it into an assignment of its
 # own: on a tree whose lane B debt is fully PAID, `lane_b_now` is empty, grep
 # prints 0, exits 1, and the gate dies there without setting the dead-run marker
 # and without printing a summary. The one path this whole ratchet exists to reach

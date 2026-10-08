@@ -509,7 +509,7 @@ expect() {
 # ⚠ THE NEEDLE IS THE PREFIX, NOT THE CLAIM. This runs with no comparison
 # target, and the summary now says which of two things the run established;
 # asserting the strong wording here would demand a sentence this run has not
-# earned -- which is what review round 7 found the gate printing.
+# earned -- which is what a review found the gate printing.
 expect "clean tree holds"            0 "LANE B RATCHET —"
 mv "$BASELINE" "$BASELINE.bak"
 expect "a missing baseline refuses"  2 "is missing"
@@ -639,7 +639,7 @@ expect_ref "an older-format target is skipped, not misparsed" "$old_commit" 0 "t
 
 # ⚠ AND THE SKIP ABOVE IS THE ANTI-CHEAT'S OFF SWITCH. The control above asserts
 # that a skew SKIPS; it says nothing about what may ride along with the skew.
-# Review round 3: bump the format and raise lane B counts in one change, and the
+# Bump the format and raise lane B counts in one change, and the
 # comparison is discarded, leaving only the raised baseline checked against the
 # raised tree. Green, with the ratchet switched off by the change it was meant
 # to measure. Asserting the skip and asserting the bypass are two questions, and
@@ -995,9 +995,9 @@ expect_env "an mv without --no-target-directory refuses" \
 rm -rf "$lane_b_notstub"
 
 # ⚠ AND THE PATHS THAT ANSWER THAT QUESTION ARE NOW INSIDE A PRIVATE DIRECTORY.
-# Three review rounds walked this one down. Round 2: the probe was built with an
+# Successive reviews walked this one down. First, the probe was built with an
 # ordinary redirect at a predictable name, so a planted symlink was followed.
-# Round 3: the exclusive create that replaced it does not refuse a FIFO -- bash's
+# Then the exclusive create that replaced it does not refuse a FIFO -- bash's
 # noclobber is specified for REGULAR files, so `set -C; : > fifo` opens the entry
 # and waits for a reader, and the job hangs to its CI timeout instead of
 # refusing; and `mv -fT` still replaces a destination planted between the check
@@ -1249,7 +1249,7 @@ rm -f "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
 restore
 
 # ⚠ THE PAID PATH, WHICH NOTHING HERE HAD EVER RUN. When the last lane B
-# occurrence is gone the scan produces nothing, and round 7 lifted the file count
+# occurrence is gone the scan produces nothing, and a later fix lifted the file count
 # into an assignment of its own -- where `grep -c .` printing 0 and exiting 1
 # killed the gate under errexit before it could say anything. The outcome this
 # ratchet exists to reach was the one it could not survive.
@@ -1293,8 +1293,8 @@ fi
 restore
 
 # ⚠ THE TARGET THAT PREDATES THE BASELINE -- which is this change's own CI case.
-# The comparison cannot run, and the summary must not claim it did. Review round
-# 8: the strong sentence was selected by the variable being SET rather than by
+# The comparison cannot run, and the summary must not claim it did. In review,
+# the strong sentence was selected by the variable being SET rather than by
 # the comparison having happened, so exactly the run that established least
 # announced the most.
 lane_b_pre_commit="$(synth_target '')"
@@ -1316,7 +1316,7 @@ fi
 restore
 
 # ⚠ AND A SYMLINK TO A DIRECTORY IS NOT THAT SHAPE, THOUGH `-e`/`-f` cannot tell
-# them apart. Review round 7: the generic guard above still refused a link whose
+# them apart. The generic guard above still refused a link whose
 # target is a directory -- and refused it on the writer path, where the repair
 # lives -- because `-e` follows the link. `mv -fT` replaces the link itself; the
 # gate's own measured table says so two hundred lines down. This asserts the
@@ -1351,7 +1351,7 @@ restore
 
 # ⚠ AND THE SUMMARY MUST NOT CLAIM WHAT THE RUN DID NOT DO. With no comparison
 # target the gate establishes only that the baseline agrees with the tree; a
-# change raising both together satisfies that. Review round 7 found the run
+# change raising both together satisfies that. A review found the run
 # printing "may not rise" on exactly those runs, and the skip line asserting "CI
 # sets it" on a path where CI deliberately does not.
 lane_b_nobase_rc=0
@@ -1456,7 +1456,7 @@ rm -rf "$STUB"
 # because the index and the working tree can disagree, and a control that stages
 # first can only ever drive one of them.
 # ⚠ ONE CONTROL REMOVED HERE. It asserted that an unstaged working-tree symlink
-# refuses -- the exact shape review round 5 showed is safe and that the writer
+# refuses -- the exact shape a review showed is safe and that the writer
 # repairs. A control asserting a refusal that should not fire is worse than no
 # control: it defends the defect.
 
@@ -1691,7 +1691,7 @@ restore
 # split it back apart in END -- so two distinct matches whose text agrees up to
 # that byte collapsed into one, `best` took their maximum instead of their sum,
 # and adding the second to an already-baselined line passed with no baseline
-# edit. That is the round-1 defect re-entering through the encoding of the key.
+# edit. That is the original defect re-entering through the encoding of the key.
 printf -- '-- See %s and\034 %s for the freeze.\nreturn {}\n' "$marker" "$marker" > "$NEW_FILE"
 git add -A >/dev/null 2>&1 || true
 must_write_baseline "two matches around a SUBSEP byte count as two"

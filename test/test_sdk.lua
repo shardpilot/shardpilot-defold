@@ -507,7 +507,7 @@ function progression_tests.optional_keys_are_absent_not_zero()
 	-- An extra spelling a reserved optional key must not ride under it when
 	-- the typed argument says the key is absent: the schema types score as an
 	-- integer, so an inherited string is rejected per event inside an accepted
-	-- batch (shardpilot-godot#20 round 1).
+	-- batch.
 	assert_true(client:track_level_complete("forest-3", 1, 900, nil, { score = "high" }))
 	assert_true(client:track_level_fail("forest-3", 1, 900, nil, { fail_reason = "inherited" }))
 	assert_true(client:flush())
@@ -522,7 +522,7 @@ function progression_tests.props_in_the_optional_slot_are_props()
 	seed_granted_consent()
 	local client = assert(sdk.new(config_mode_a()))
 	assert_true(client:identify("user-example"))
-	-- Round 3: score and fail_reason are INDEPENDENTLY optional in the
+	-- Score and fail_reason are INDEPENDENTLY optional in the
 	-- documented signature, and Lua cannot skip a positional argument, so a
 	-- call written exactly as the skill shows it put the props table in the
 	-- typed slot and was refused as invalid_score / invalid_fail_reason.
@@ -585,7 +585,7 @@ function progression_tests.refuse_the_schema_bounds()
 	assert_equal(#requests, 1)
 	assert_contains(requests[1].body, '"event_name":"level_start"')
 
-	-- Review round 1: 2.0 is NOT a rejection case, and the assertion lives
+	-- 2.0 is NOT a rejection case, and the assertion lives
 	-- here rather than among the refusals because it ENQUEUES. Lua 5.1 has
 	-- one number type, so an integral float IS the integer and the check is
 	-- mathematical; the docs promise that and no more.
@@ -742,7 +742,7 @@ function progression_tests.ad_refuses_non_finite_revenue()
 	seed_granted_consent()
 	local client = assert(sdk.new(config_mode_a()))
 	assert_true(client:identify("user-example"))
-	-- Round 1: math.floor(math.huge) == math.huge, so an infinity passed the
+	-- math.floor(math.huge) == math.huge, so an infinity passed the
 	-- integrality test and json.encode then failed on it, dropping the WHOLE
 	-- batch with terminal json_encode_failed.
 	local ok, err = client:track_ad_impression_revenue("imp-99", "admob", math.huge, "USD")
@@ -763,7 +763,7 @@ function progression_tests.ad_measures_lengths_in_code_points()
 	seed_granted_consent()
 	local client = assert(sdk.new(config_mode_a()))
 	assert_true(client:identify("user-example"))
-	-- Round 1: # counts BYTES in Lua 5.1 while the schema counts code points.
+	-- The # operator counts BYTES in Lua 5.1 while the schema counts code points.
 	-- 100 CJK characters are 300 bytes and inside the schema's 128-code-point
 	-- network bound.
 	local cjk_network = string.rep("\228\184\173", 100)
@@ -784,7 +784,7 @@ function progression_tests.ad_whitespace_optional_is_absent_not_fatal()
 	seed_granted_consent()
 	local client = assert(sdk.new(config_mode_a()))
 	assert_true(client:identify("user-example"))
-	-- shardpilot-godot#23 round 1, carried here: a whitespace placeholder in
+	-- shardpilot-godot#23, carried here: a whitespace placeholder in
 	-- an optional field must omit the field, not refuse the impression.
 	assert_true(client:track_ad_impression_revenue("imp-97", "admob", 4200, "USD", " ", "  ", "", "\t"))
 	assert_true(client:flush())
@@ -3892,7 +3892,7 @@ local function test_persist_snapshots_queue_while_running()
 	storage.reset()
 end
 
--- P2 review fix (round 1): persist() must make owed summaries durable. A
+-- Review fix: persist() must make owed summaries durable. A
 -- full-queue refusal turns a built perf/network summary into an owed entry
 -- whose sampler window is already consumed; a focus-loss persist() that
 -- snapshots only the queue/in-flight tail would report the tail durable
@@ -3980,11 +3980,11 @@ local function test_persist_captures_owed_summaries_across_relaunch()
 	storage.reset()
 end
 
--- P2 review fix (round 1): an owed summary replays under the identity it
+-- Review fix: an owed summary replays under the identity it
 -- was BUILT with. Mode A (no per-session credential): identify() after the
 -- refusal proceeds, and the drained summary lands attributed to the
 -- original user and session while post-switch events carry the new user.
--- (Round 2 re-choreography: flush() now drains owed summaries within the
+-- (A later re-choreography: flush() now drains owed summaries within the
 -- same call, so the lingering owed state is produced the way production
 -- produces it — an ASYNC publish settling between flushes.)
 local function test_owed_summary_preserves_actor_across_identify_mode_a()
@@ -4049,7 +4049,7 @@ local function test_owed_summary_preserves_actor_across_identify_mode_a()
 	storage.reset()
 end
 
--- P2 review fix (round 1), Mode B arm: an owed summary snapshotted to
+-- Review fix, Mode B arm: an owed summary snapshotted to
 -- another verified user is undrained event work a credential minted for
 -- the incoming user cannot vouch for — identify() refuses (events_pending,
 -- the same pending-work family as queued/in-flight/spooled events) until
@@ -4102,7 +4102,7 @@ local function test_identify_refused_while_owed_summary_pending_mode_b()
 	storage.reset()
 end
 
--- P2 review fix (round 1), Mode B rotation arm: owed summaries are pending
+-- Review fix, Mode B rotation arm: owed summaries are pending
 -- old-anon work that sits outside the queue (their built envelopes carry
 -- the old anon verbatim), so set_anonymous_id refuses like it does for
 -- queued/in-flight/spooled work until they drain.
@@ -4151,14 +4151,14 @@ local function test_set_anonymous_id_rejected_while_owed_summary_pending_mode_b(
 	storage.reset()
 end
 
--- P2 review fix (round 2): flush() treats newly owed summaries as ITS OWN
+-- Review fix: flush() treats newly owed summaries as ITS OWN
 -- pending work. Building summaries against a full queue used to park them
 -- owed while the same flush drained the queue and returned true — a Mode B
 -- caller following the documented flush-then-re-identify recourse hit
 -- events_pending right after a "successful" flush, and outside
 -- shutdown/persist the built summary sat memory-only until another explicit
 -- flush. The loop now re-drains owed entries into the room it frees and only
--- reports success once nothing stays owed. P3 fix pinned alongside: the
+-- reports success once nothing stays owed. A smaller fix pinned alongside: the
 -- refuse→owe→deliver cycle counts the summary once as published, never as
 -- dropped — the denial wipe is the one point where an owed summary counts
 -- as a real loss.
@@ -4220,7 +4220,7 @@ local function test_flush_drains_owed_summaries_within_same_call()
 	storage.reset()
 end
 
--- P2 review fix (round 2): persist() captures the WHOLE remnant in one
+-- Review fix: persist() captures the WHOLE remnant in one
 -- durable write. Direct-spooling still-owed summaries in a second append
 -- used to evict just-captured queue/in-flight envelopes on a near-full
 -- spool (oldest first) while only the second write's own batch was
@@ -4301,7 +4301,7 @@ local function test_persist_single_write_keeps_whole_remnant_under_caps()
 	storage.reset()
 end
 
--- P1 (denial-marker gap, folded from the godot#1 round-10 fleet finding):
+-- Denial-marker gap (folded from the godot#1 fleet finding):
 -- with a persisted grant on disk, a denial whose identity persist FAILED
 -- only surfaced consent_persist_failed — an app exit before a successful
 -- retry made the next init() restore GRANTED and events flowed against an
@@ -4374,7 +4374,7 @@ local function test_denial_marker_imposes_over_stale_granted_record()
 	storage.reset()
 end
 
--- P1 denial marker: the denied_forced_minor flavor survives the marker path
+-- Denial marker: the denied_forced_minor flavor survives the marker path
 -- — the imposed boot state is the band-forced denial, not a generic one.
 local function test_denial_marker_preserves_forced_minor_flavor()
 	reset()
@@ -4401,7 +4401,7 @@ local function test_denial_marker_preserves_forced_minor_flavor()
 	storage.reset()
 end
 
--- P1 denial marker, actor scope: a marker witnesses ITS OWN actor's denial.
+-- Denial marker, actor scope: a marker witnesses ITS OWN actor's denial.
 -- A fresh identity (configured override replacing a different persisted
 -- actor) never inherits it — no manufactured decision — and the foreign
 -- marker is NOT silently deleted while its own actor's record is
@@ -4444,7 +4444,7 @@ local function test_foreign_actor_denial_marker_stays_inert_and_undeleted()
 	storage.reset()
 end
 
--- P1 denial marker, belt leg: a RETAINED (undelivered) denial receipt for
+-- Denial marker, belt leg: a RETAINED (undelivered) denial receipt for
 -- this actor stamped strictly newer than the restored record's decision
 -- blocks a granted restore — the cheap cross-check for trails where the
 -- marker is gone. Strictness pinned both ways: an older receipt (a
@@ -4516,7 +4516,7 @@ local function test_newer_denial_receipt_blocks_granted_restore()
 	storage.reset()
 end
 
--- Godot round-11 parity (P1 tie-break): clock.iso_utc is SECOND-precision,
+-- Godot parity (tie-break): clock.iso_utc is SECOND-precision,
 -- so a grant→denial inside one second used to leave the belt's
 -- strictly-newer stamp comparison unable to break the tie when the denial's
 -- marker AND record writes both failed — relaunch restored the stale grant
@@ -4817,7 +4817,7 @@ local function test_ack_prune_hands_witness_to_marker()
 	local stores, restore = install_stub_sys_storage()
 	-- NB the harness clock starts near the epoch, so the live-minted
 	-- denial's stamp must be able to EXCEED the seeded record stamp — a
-	-- 2026 seed here would make the round-3 stale-marker guard (correctly)
+	-- 2026 seed here would make the stale-marker guard (correctly)
 	-- retire the handed-off marker as record-superseded.
 	assert_true(storage.save(identity_scope, {
 		anonymous_id = "anon-handoff-witness",
@@ -4930,7 +4930,7 @@ local function test_belt_convergence_failure_writes_marker_witness()
 	storage.reset()
 end
 
--- P1 denial marker, teardown leg: shutdown() refuses (consent_pending
+-- Denial marker, teardown leg: shutdown() refuses (consent_pending
 -- family) while the latest denial has NO durable witness anywhere — record
 -- write failed, marker write failed, and the receipt already delivered and
 -- left the outbox (a delivered receipt proves nothing to the next boot).
@@ -6131,7 +6131,7 @@ end
 -- A malformed outbox record on disk is fail-safe: garbled entries are dropped
 -- at load — never sent, never a crash into game code — and they never block
 -- the deliverable receipts stored around them.
--- Load-order pin (fleet audit, from unreal round 2): the outbox load-side
+-- Load-order pin (fleet audit, from the Unreal SDK): the outbox load-side
 -- drops — the sanitizer inside load_consent_outbox and the M.new
 -- identity/vouch drop — run BEFORE any cap enforcement, which lives only in
 -- save_consent_outbox. Were the 32-cap applied to the loaded file first, the
@@ -6889,7 +6889,7 @@ local function test_receipt_parking_in_flight_settles_without_arming_window()
 	storage.reset()
 end
 
--- P1 (round-2 review): identify() REFUSES a Mode B identity CHANGE while
+-- Review fix: identify() REFUSES a Mode B identity CHANGE while
 -- event work snapshotted to another verified user is still undrained —
 -- queued in this process, or reloaded on the durable spool. Events snapshot
 -- their user at enqueue time, so accepting the switch would drop the token
@@ -6940,7 +6940,7 @@ local function test_identify_refused_while_other_user_events_pending()
 	assert_equal(requests[#requests].headers["Authorization"], "Bearer token-1")
 	assert_equal(token_calls, 1, "draining A's events must not mint a new credential")
 
-	-- Drained: the switch succeeds, and the round-1 invalidation (now safe)
+	-- Drained: the switch succeeds, and the invalidation (now safe)
 	-- still drops the cached token so B's next work mints fresh.
 	assert_true(client:identify("user-b"), "identify allowed once A's events drained")
 	assert_equal(client.token, nil, "an accepted identity change still drops the cached token")
@@ -7232,7 +7232,7 @@ local function test_legacy_kindless_receipt_backfills_anon_and_invalid_kind_drop
 	storage.reset()
 end
 
--- P1 (round-2 review): a receipt NO configured credential can vouch for
+-- Review fix: a receipt NO configured credential can vouch for
 -- must never ride the minted token. The concrete case: a legacy kindless
 -- receipt that stored v0.9.1's user-first ACTOR backfills to kind="anon"
 -- at load with its retained anon snapshot still matching the current anon
