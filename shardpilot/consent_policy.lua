@@ -106,8 +106,8 @@ local MAX_ENDPOINT = 256
 -- basis.notice is a paragraph the host must show or log verbatim, so it is
 -- bounded generously and not interpreted here.
 local MAX_NOTICE = 2048
--- advisory.advisory_basis is the matrix row's basis, verbatim, with the same
--- published bound.
+-- advisory.advisory_basis is the matrix row's basis in its own words, with the
+-- same published bound.
 local MAX_ADVISORY_BASIS = 2048
 
 local STORES = { steam = true, apple = true, google_play = true, standalone = true }

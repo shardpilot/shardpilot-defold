@@ -45,7 +45,7 @@ through a renamed tag, a re-nesting, or a `null` where an empty array was.
 
 The advisory pair was recorded the same way, from
 `internal/httpserver/testdata/consent_policy_resolved_strict_with_advisory.json`
-(blob `62b6f2e3`), which the `.indented.json` here copies byte for byte. It
+(blob `e4b01af8`), which the `.indented.json` here copies byte for byte. It
 answers the same request with `advisory: true` added, for a workspace admitted
 to the advisory, from a connection the resolver located in GB. Its plan is the
 resolved plan above, unchanged; the advisory sits beside it and does not alter
