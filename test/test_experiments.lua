@@ -3474,7 +3474,7 @@ local function test_rotation_cancels_owed_writes()
 	-- it instead: the server rejected the subject's grammar, so a failed
 	-- identity persist must not let a relaunch under the restored old
 	-- subject serve the rejected subject's assignments. (Flipped from the
-	-- pre-R23 "keeps its last durable state" pin — the D23-7 tombstone
+	-- earlier "keeps its last durable state" pin — the tombstone
 	-- rule supersedes it.)
 	state.fail_save = function(path)
 		return fail_experiment_saves(path)
@@ -7296,7 +7296,7 @@ function extra_tests.test_later_sentinel_cancels_covered_snapshot_write()
 
 	-- Sentinel ONE goes out; after its dispatch exp-b lands with its
 	-- install save failing. The first wipe preserves exp-b's owed write as
-	-- a pending.entry snapshot (the R23 rule).
+	-- a pending.entry snapshot (the pending-entry snapshot rule).
 	local held = {}
 	responder = function(url, _, callback)
 		if not url:find("/runtime/experiments/assignment", 1, true) then

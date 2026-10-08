@@ -3892,7 +3892,7 @@ local function test_persist_snapshots_queue_while_running()
 	storage.reset()
 end
 
--- P2 review fix: persist() must make owed summaries durable. A
+-- Review fix: persist() must make owed summaries durable. A
 -- full-queue refusal turns a built perf/network summary into an owed entry
 -- whose sampler window is already consumed; a focus-loss persist() that
 -- snapshots only the queue/in-flight tail would report the tail durable
@@ -3980,7 +3980,7 @@ local function test_persist_captures_owed_summaries_across_relaunch()
 	storage.reset()
 end
 
--- P2 review fix: an owed summary replays under the identity it
+-- Review fix: an owed summary replays under the identity it
 -- was BUILT with. Mode A (no per-session credential): identify() after the
 -- refusal proceeds, and the drained summary lands attributed to the
 -- original user and session while post-switch events carry the new user.
@@ -4049,7 +4049,7 @@ local function test_owed_summary_preserves_actor_across_identify_mode_a()
 	storage.reset()
 end
 
--- P2 review fix, Mode B arm: an owed summary snapshotted to
+-- Review fix, Mode B arm: an owed summary snapshotted to
 -- another verified user is undrained event work a credential minted for
 -- the incoming user cannot vouch for — identify() refuses (events_pending,
 -- the same pending-work family as queued/in-flight/spooled events) until
@@ -4102,7 +4102,7 @@ local function test_identify_refused_while_owed_summary_pending_mode_b()
 	storage.reset()
 end
 
--- P2 review fix, Mode B rotation arm: owed summaries are pending
+-- Review fix, Mode B rotation arm: owed summaries are pending
 -- old-anon work that sits outside the queue (their built envelopes carry
 -- the old anon verbatim), so set_anonymous_id refuses like it does for
 -- queued/in-flight/spooled work until they drain.
@@ -4151,14 +4151,14 @@ local function test_set_anonymous_id_rejected_while_owed_summary_pending_mode_b(
 	storage.reset()
 end
 
--- P2 review fix: flush() treats newly owed summaries as ITS OWN
+-- Review fix: flush() treats newly owed summaries as ITS OWN
 -- pending work. Building summaries against a full queue used to park them
 -- owed while the same flush drained the queue and returned true — a Mode B
 -- caller following the documented flush-then-re-identify recourse hit
 -- events_pending right after a "successful" flush, and outside
 -- shutdown/persist the built summary sat memory-only until another explicit
 -- flush. The loop now re-drains owed entries into the room it frees and only
--- reports success once nothing stays owed. P3 fix pinned alongside: the
+-- reports success once nothing stays owed. A smaller fix pinned alongside: the
 -- refuse→owe→deliver cycle counts the summary once as published, never as
 -- dropped — the denial wipe is the one point where an owed summary counts
 -- as a real loss.
@@ -4220,7 +4220,7 @@ local function test_flush_drains_owed_summaries_within_same_call()
 	storage.reset()
 end
 
--- P2 review fix: persist() captures the WHOLE remnant in one
+-- Review fix: persist() captures the WHOLE remnant in one
 -- durable write. Direct-spooling still-owed summaries in a second append
 -- used to evict just-captured queue/in-flight envelopes on a near-full
 -- spool (oldest first) while only the second write's own batch was
@@ -4301,7 +4301,7 @@ local function test_persist_single_write_keeps_whole_remnant_under_caps()
 	storage.reset()
 end
 
--- P1 (denial-marker gap, folded from the godot#1 fleet finding):
+-- Denial-marker gap (folded from the godot#1 fleet finding):
 -- with a persisted grant on disk, a denial whose identity persist FAILED
 -- only surfaced consent_persist_failed — an app exit before a successful
 -- retry made the next init() restore GRANTED and events flowed against an
@@ -4374,7 +4374,7 @@ local function test_denial_marker_imposes_over_stale_granted_record()
 	storage.reset()
 end
 
--- P1 denial marker: the denied_forced_minor flavor survives the marker path
+-- Denial marker: the denied_forced_minor flavor survives the marker path
 -- — the imposed boot state is the band-forced denial, not a generic one.
 local function test_denial_marker_preserves_forced_minor_flavor()
 	reset()
@@ -4401,7 +4401,7 @@ local function test_denial_marker_preserves_forced_minor_flavor()
 	storage.reset()
 end
 
--- P1 denial marker, actor scope: a marker witnesses ITS OWN actor's denial.
+-- Denial marker, actor scope: a marker witnesses ITS OWN actor's denial.
 -- A fresh identity (configured override replacing a different persisted
 -- actor) never inherits it — no manufactured decision — and the foreign
 -- marker is NOT silently deleted while its own actor's record is
@@ -4444,7 +4444,7 @@ local function test_foreign_actor_denial_marker_stays_inert_and_undeleted()
 	storage.reset()
 end
 
--- P1 denial marker, belt leg: a RETAINED (undelivered) denial receipt for
+-- Denial marker, belt leg: a RETAINED (undelivered) denial receipt for
 -- this actor stamped strictly newer than the restored record's decision
 -- blocks a granted restore — the cheap cross-check for trails where the
 -- marker is gone. Strictness pinned both ways: an older receipt (a
@@ -4516,7 +4516,7 @@ local function test_newer_denial_receipt_blocks_granted_restore()
 	storage.reset()
 end
 
--- Godot parity (P1 tie-break): clock.iso_utc is SECOND-precision,
+-- Godot parity (tie-break): clock.iso_utc is SECOND-precision,
 -- so a grant→denial inside one second used to leave the belt's
 -- strictly-newer stamp comparison unable to break the tie when the denial's
 -- marker AND record writes both failed — relaunch restored the stale grant
@@ -4930,7 +4930,7 @@ local function test_belt_convergence_failure_writes_marker_witness()
 	storage.reset()
 end
 
--- P1 denial marker, teardown leg: shutdown() refuses (consent_pending
+-- Denial marker, teardown leg: shutdown() refuses (consent_pending
 -- family) while the latest denial has NO durable witness anywhere — record
 -- write failed, marker write failed, and the receipt already delivered and
 -- left the outbox (a delivered receipt proves nothing to the next boot).
@@ -6889,7 +6889,7 @@ local function test_receipt_parking_in_flight_settles_without_arming_window()
 	storage.reset()
 end
 
--- P1 (review): identify() REFUSES a Mode B identity CHANGE while
+-- Review fix: identify() REFUSES a Mode B identity CHANGE while
 -- event work snapshotted to another verified user is still undrained —
 -- queued in this process, or reloaded on the durable spool. Events snapshot
 -- their user at enqueue time, so accepting the switch would drop the token
@@ -7232,7 +7232,7 @@ local function test_legacy_kindless_receipt_backfills_anon_and_invalid_kind_drop
 	storage.reset()
 end
 
--- P1 (review): a receipt NO configured credential can vouch for
+-- Review fix: a receipt NO configured credential can vouch for
 -- must never ride the minted token. The concrete case: a legacy kindless
 -- receipt that stored v0.9.1's user-first ACTOR backfills to kind="anon"
 -- at load with its retained anon snapshot still matching the current anon

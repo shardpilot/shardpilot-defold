@@ -2771,7 +2771,7 @@ function Client:set_consent(decision)
 	if state_changed and self.experiments then
 		-- Every consent TRANSITION opens a new consent epoch: responses
 		-- dispatched before it must not install their constructive half
-		-- (destructive directives still land — the R22 partition). A
+		-- (destructive directives still land — the partition rule). A
 		-- repeated same-state call is not a transition and fences nothing.
 		self.experiments.consent_epoch = self.experiments.consent_epoch + 1
 	end
