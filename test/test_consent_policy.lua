@@ -3406,6 +3406,36 @@ local function test_caller_mutation_cannot_relabel_operation_blocks()
 	assert_blocks(prepare(golden_context()), { "restricted" }, "preserved")
 end
 
+-- ⚠ THE ADVISORY OPT-IN DOES NOT DECIDE WHICH RESTRICTIONS ARE RETAINED. It asks
+-- for an optional extra part and changes no policy field, so a request that
+-- differs from the last one only by the opt-in keeps the blocks that plan
+-- installed, in both directions and back again. With the opt-in in the
+-- restriction key, dropping it forgot the blocks, and a failure right after
+-- served none: a blocked operation reopened.
+local function test_the_advisory_opt_in_keeps_operation_blocks()
+	for _, first_asks in ipairs({ true, false }) do
+		reset()
+		local first, second = golden_context(), golden_context()
+		first.advisory = first_asks or nil
+		second.advisory = (not first_asks) or nil
+		learn_blocks({ "restricted" }, first)
+		next_response_body = "not JSON"
+		assert_blocks(prepare(second), { "restricted" }, "preserved")
+		next_response_body = "not JSON"
+		assert_blocks(prepare(first), { "restricted" }, "preserved")
+	end
+	-- Control: the opt-in together with a real context change still starts a
+	-- new context, which forgets them.
+	reset()
+	local first, second = golden_context(), golden_context()
+	first.advisory = true
+	second.app_id = "second-app"
+	learn_blocks({ "restricted" }, first)
+	next_response_body = "not JSON"
+	assert_blocks(prepare(second), {}, "none")
+	print("operation blocks kept across the advisory opt-in: both directions")
+end
+
 local function test_the_example_keeps_blocks_after_resume_outage()
 	reset()
 	local ctx = context({ workspace_id = "workspace-example", app_id = "app-example",
@@ -3804,6 +3834,7 @@ local tests = {
 	test_module_reload_forgets_operation_blocks,
 	test_invalid_context_does_not_forget_operation_blocks,
 	test_caller_mutation_cannot_relabel_operation_blocks,
+	test_the_advisory_opt_in_keeps_operation_blocks,
 	test_the_example_keeps_blocks_after_resume_outage,
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,

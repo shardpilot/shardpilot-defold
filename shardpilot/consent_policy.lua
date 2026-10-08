@@ -902,16 +902,28 @@ local function copy_value(value, depth)
 	return out
 end
 
--- ⚠ THE CACHE KEY IS THE WHOLE CONTEXT. One in-memory entry is shared by
--- every caller in the process, and serving it on liveness alone applied one
--- app's, environment's or endpoint's plan to another — past the scope check
--- in parse_plan, which only ever saw the context that produced the entry.
--- Length-prefixed, so no two different contexts can spell the same key.
-local function context_key(context)
+-- Length-prefixed, so no two different values can spell the same key.
+local function key_field(value)
+	value = value or ""
+	return string.format("%d:%s", #value, value)
+end
+
+-- ⚠ THE RESTRICTION KEY IS THE WHOLE POLICY CONTEXT. It names the context the
+-- retained restrictions (active_context, known_blocks) and the dispatch order
+-- belong to. One in-memory entry is shared by every caller in the process,
+-- and serving it on liveness alone applied one app's, environment's or
+-- endpoint's plan to another — past the scope check in parse_plan, which only
+-- ever saw the context that produced the entry.
+--
+-- ⚠ AND IT LEAVES OUT THE ADVISORY OPT-IN. The opt-in asks for an optional
+-- extra part and changes no policy field, so it cannot decide which
+-- restrictions are retained: with it in this key, a request that only
+-- dropped the opt-in forgot the blocks the previous plan installed, and a
+-- failure right after served none.
+local function restriction_key(context)
 	local parts = {}
 	local function field(value)
-		value = value or ""
-		parts[#parts + 1] = string.format("%d:%s", #value, value)
+		parts[#parts + 1] = key_field(value)
 	end
 	field(context.workspace_id)
 	field(context.app_id)
@@ -923,10 +935,14 @@ local function context_key(context)
 	field(context.endpoint)
 	field(context.age_band and context.age_band.vocabulary)
 	field(context.age_band and context.age_band.band)
-	-- A request that asked for the advisory is a different question from one
-	-- that did not, so it never shares a cache entry with it.
-	field(context.advisory == true and "advisory" or nil)
 	return table.concat(parts, "|")
+end
+
+-- The response cache's key: the restriction key plus the opt-in. A request
+-- that asked for the advisory is a different question from one that did not,
+-- so it never shares a cache entry with it.
+local function cache_key(context)
+	return restriction_key(context) .. "|" .. key_field(context.advisory == true and "advisory" or nil)
 end
 
 -- ⚠ THE SAME FALLBACK clock.lua ALREADY USES (clock.lua:4-9), and for the same
@@ -1460,7 +1476,8 @@ function M.prepare(context, callback)
 	-- response or the restrictions learned from it. A context change also fences
 	-- callbacks dispatched before the change, even if that context returns later.
 	context = copy_value(context, 0)
-	key = context_key(context)
+	key = restriction_key(context)
+	local entry = cache_key(context)
 	if active_context ~= key then
 		M.invalidate()
 		active_context = key
@@ -1495,7 +1512,7 @@ function M.prepare(context, callback)
 		return
 	end
 
-	if cached and cached.key == key and cached.until_at > at then
+	if cached and cached.key == entry and cached.until_at > at then
 		-- ⚠ A COPY, NOT THE ENTRY. The cache used to hand out the very table it
 		-- kept, so a caller that wrote a field on the decision it was given —
 		-- or that read prohibited_purposes and sorted it in place — edited what
@@ -1701,7 +1718,7 @@ function M.prepare(context, callback)
 		if lifetime > 0 and not decision_is_permissive(decision) then
 			-- The entry gets its OWN copy too, so the table delivered below and
 			-- the table kept here are never the same object.
-			cached = { key = key, decision = copy_value(decision, 0), until_at = arrived + lifetime }
+			cached = { key = entry, decision = copy_value(decision, 0), until_at = arrived + lifetime }
 		else
 			cached = nil
 		end
