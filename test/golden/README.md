@@ -9,6 +9,8 @@ policy handler emits**, recorded by the resolver's own golden test.
 | `consent-policy-refusal.json` | `400`, a refusal with `reason: "invalid_scope"` — the wire bytes |
 | `consent-policy-resolved.indented.json` | the same response in the **review form** the resolver's repository stores |
 | `consent-policy-refusal.indented.json` | the same, for the refusal |
+| `consent-policy-resolved-advisory.json` | `200`, the same resolved STRICT plan with the optional **advisory part** — the wire bytes |
+| `consent-policy-resolved-advisory.indented.json` | the same, in the review form |
 
 **Provenance, and it is a scene rather than a sentence.** The two `.json`
 files are the bytes the handler writes on the wire. The resolver's own golden
@@ -40,6 +42,14 @@ platform: windows}`; the refusal is the same request with an invalid
 the handler's own output, compared as **bytes** rather than through a struct:
 a round trip through the type the handler marshalled from would stay green
 through a renamed tag, a re-nesting, or a `null` where an empty array was.
+
+The advisory pair was recorded the same way, from
+`internal/httpserver/testdata/consent_policy_resolved_strict_with_advisory.json`
+(blob `62b6f2e3`), which the `.indented.json` here copies byte for byte. It
+answers the same request with `advisory: true` added, for a workspace admitted
+to the advisory, from a connection the resolver located in GB. Its plan is the
+resolved plan above, unchanged; the advisory sits beside it and does not alter
+it.
 
 **Why they exist.** This SDK and that resolver were written from the same prose
 and never parsed each other's bytes: the module validated a *flat* plan with
