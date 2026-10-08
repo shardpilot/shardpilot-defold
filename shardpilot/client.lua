@@ -851,7 +851,7 @@ function M.new(config, defer_init_diagnostics)
 	-- records carry neither — seq reads 0). The belt below compares retained
 	-- denial receipts against the PAIR: clock.iso_utc is second-precision,
 	-- so the monotonic per-install decision seq is what breaks a
-	-- same-second stamp tie (godot round-11 parity).
+	-- same-second stamp tie (Godot parity).
 	local consent_decided_at = nil
 	local consent_decision_seq = 0
 	if consent_state ~= "unknown" and type(stored.consent_decided_at) == "string"
@@ -2874,7 +2874,7 @@ function Client:set_consent(decision)
 	-- a denied-state write-ahead marker carries it. The stamp is
 	-- second-precision; the monotonic seq — minted strictly above the boot
 	-- floor and every seq this session already minted — is what orders two
-	-- decisions that share a second (godot round-11 parity).
+	-- decisions that share a second (Godot parity).
 	self.consent_decided_at = clock.iso_utc()
 	self.consent_decision_seq = math.max(self.consent_seq_floor or 0,
 		self.consent_decision_seq or 0) + 1
@@ -3318,12 +3318,12 @@ local MAX_LEVEL_UNSIGNED_32 = 4294967295
 -- sees them and json.decode("2.0") is indistinguishable from json.decode("2").
 -- The check is therefore mathematical -- 2.5 is refused, 2.0 is the integer 2
 -- -- and the docs say exactly that rather than promising a rejection this
--- language cannot deliver (review round 1).
+-- language cannot deliver.
 local function is_integer(value)
 	-- Finite, too: math.floor(math.huge) == math.huge, so an infinity passes
 	-- an integrality test and json.encode then fails on it, dropping the
 	-- WHOLE batch with terminal json_encode_failed — unrelated events
-	-- included (shardpilot-defold#76 round 1). NaN fails value == value.
+	-- included. NaN fails value == value.
 	return type(value) == "number"
 		and value == math.floor(value)
 		and value == value
@@ -3369,7 +3369,7 @@ end
 -- envelope carries the CONFIGURED source, so a dedicated server's events
 -- could never satisfy the schema: they would be rejected per event inside an
 -- accepted batch and the fact lost. The verbs refuse instead, as the Go SDK's
--- backend-lane verbs refuse a non-backend source (shardpilot-godot#20 round 1).
+-- backend-lane verbs refuse a non-backend source.
 function Client:_require_client_source()
 	if self.config and self.config.source and self.config.source ~= "client" then
 		return false
@@ -3404,7 +3404,7 @@ function Client:track_level_complete(level_id, attempt, duration_ms, score, prop
 	-- README and the integration skill says, and Lua has no way to skip a
 	-- positional argument. A table in the score slot with no props argument
 	-- is therefore the props table: shift it, rather than refusing a call
-	-- written exactly as documented (round 3). score is always a number, so
+	-- written exactly as documented. score is always a number, so
 	-- the two can never be confused.
 	if props == nil and type(score) == "table" then
 		props = score
@@ -3433,7 +3433,7 @@ function Client:track_level_fail(level_id, attempt, duration_ms, fail_reason, pr
 		return self:_record_refusal("source_not_client")
 	end
 	-- As in track_level_complete: fail_reason is always a string, so a table
-	-- in its slot with no props argument is the props table (round 3).
+	-- in its slot with no props argument is the props table.
 	if props == nil and type(fail_reason) == "table" then
 		props = fail_reason
 		fail_reason = nil
@@ -3552,7 +3552,7 @@ function Client:track_ad_impression_revenue(
 			-- Emptiness is judged AFTER trimming: a mediation network's
 			-- whitespace placeholder (" ") is an ABSENT field, not a fatal
 			-- one. The raw check that preceded this refused the whole
-			-- impression over a space (shardpilot-godot#23 round 1).
+			-- impression over a space.
 			if type(value) ~= "string" then
 				return self:_record_refusal("invalid_" .. key)
 			end
