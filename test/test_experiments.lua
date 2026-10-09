@@ -11351,14 +11351,17 @@ end
 -- Control: a re-admission's exposure still owed across a renewal keeps the
 -- fresh arm its marker's entry gives it, so its id is not the withdrawn one.
 function extra_tests.test_retired_arm_of_an_owed_readmission_survives_a_renewal()
-	local client, restore = extra_tests.age_client({ buffer_size = 1 })
+	-- A replacement now needs room for both its end and start. Fill both
+	-- slots so the exposure remains owed across the same renewal as before.
+	local client, restore = extra_tests.age_client({ buffer_size = 2 })
 	assert_true(client:session_start())
 	assert_true(client:flush({ include_summaries = false }))
 	extra_tests.admit(client)
 	local withdrawn = queued_events(client, "experiment_exposure")[1]
 	assert_true(withdrawn ~= nil, "setup: the exposure is queued")
 	extra_tests.refuse(client, "age_ineligible")
-	assert_true(client:track("filler-host-event"), "setup: the queue fills")
+	assert_true(client:track("filler-host-event"))
+	assert_true(client:track("second-filler-host-event"), "setup: the queue fills")
 	extra_tests.admit(client)
 	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "setup: the re-admission's exposure is owed")
 	assert_true(client:flush({ include_summaries = false }), "setup: the queue drains")

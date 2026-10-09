@@ -2,6 +2,14 @@
 
 ### Unreleased
 
+- Replacing an open analytics session now queues its end with reason
+  `session_start` before the new start, atomically with respect to queue
+  capacity. A refused replacement preserves the old session and sequence.
+  Its summaries keep their original session; an expired pause still ends
+  with `idle_timeout`. The shared boundary timestamp never precedes the old
+  session's last event, even after a wall-clock rollback. Replacement needs
+  two free queue slots.
+
 - `set_consent(decision, notice)` accepts optional notice-version, locale and
   policy-version identifiers per decision. Valid values are snapshotted through
   durable receipt retry/reload. Malformed metadata on denial is omitted with

@@ -912,6 +912,14 @@ signal (and returns its result), and it drives the automatic session boundary:
   session starts at once. Host activity that arrives past the deadline, before
   the foreground signal, runs the boundary first. Below the timeout, nothing
   happens. The startup focus gain is nothing.
+- **Replacing an open session.** `session_start()` first queues its
+  `app.session_ended` with reason `session_start`, then the new session's start.
+  Both events share the boundary timestamp, never before the old session's
+  last event even if the wall clock moves back, and retain their own session
+  ids and sequences. Replacement requires two free queue slots; `false,
+  "queue_full"` leaves the existing session unchanged. Flush and retry; with
+  `buffer_size = 1`, explicitly end and flush the old session before starting
+  the next. Invalid start properties also leave the old session unchanged.
 - **A session that opens in the background is paused from its own start.**
   That covers the next session after a boundary run by host activity, a
   `session_start()`, and a session the next event opens. A second stay of
