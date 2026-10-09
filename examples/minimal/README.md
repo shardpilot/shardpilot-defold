@@ -31,6 +31,12 @@ those record and persist a player's choice, and nobody chose anything. The
 player's standing answer survives a suspension and is discarded only when the
 notice text or language changes.
 
+**Notice provenance stays with the answer.** Before showing a notice, the
+example snapshots its text version, presented language and policy version. The
+explicit setter receives those three identifiers even if a later resolution
+changes the policy; it never receives the notice text. An applied warning is
+reported separately from a refused decision.
+
 **The lanes are orthogonal.** Analytics being closed does not close the crash
 lane, and a permitted crash lane does not open analytics. Crash reporting is ON
 by default in this SDK, which is why an unconditional `crash.init` is how a

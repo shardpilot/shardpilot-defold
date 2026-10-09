@@ -119,8 +119,8 @@ end
 -- (denied), or the string "denied_forced_minor" — a band-forced denial that
 -- gates analytics exactly like denied and differs only in the reason its
 -- receipt records. See docs/privacy.md.
-function M.set_consent(decision)
-	return with_default("set_consent", decision)
+function M.set_consent(decision, notice)
+	return with_default("set_consent", decision, notice)
 end
 
 -- Remote config. `fetch_remote_config` reports "not_initialized" through the

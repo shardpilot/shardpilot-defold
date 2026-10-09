@@ -39,7 +39,7 @@ does not prove that a decision is durable or its receipt was delivered. The
 module returns `unknown` without a default client, including after successful
 shutdown; a still-held client instance reports that instance's last state.
 
-`set_consent(decision)` records an explicit consent decision — `true`
+`set_consent(decision, notice)` records an explicit consent decision — `true`
 (granted), `false` (denied), or the string `"denied_forced_minor"` (an
 age-gate-forced denial) — over the consent states {unknown, granted, denied,
 denied_forced_minor}. The analytics client is **consent-first**: only an
@@ -327,6 +327,12 @@ by the service on the stable event id). This spool:
   any previously persisted spool record at the next init.
 
 ## Consent-receipt outbox
+
+Optional notice provenance is three short identifiers, never notice text. The
+[per-call carrier](../README.md#privacy--consent) is captured with its decision
+and retained through retry and reload; it is not mutable client configuration.
+A malformed tuple already on disk follows the existing unreadable-receipt hold,
+rather than being silently stripped and resent under the original retry key.
 
 Every explicit `set_consent` decision produces one consent receipt for
 `POST {ingest_url}/v1/consent`. Until the server acknowledges it, the receipt

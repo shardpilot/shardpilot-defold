@@ -8,6 +8,13 @@
   Its summaries keep their original session; an expired pause still ends
   with `idle_timeout`. Replacement needs two free queue slots.
 
+- `set_consent(decision, notice)` accepts optional notice-version, locale and
+  policy-version identifiers per decision. Valid values are snapshotted through
+  durable receipt retry/reload. Malformed metadata on denial is omitted with
+  warning `consent_notice_invalid`; on grant it refuses without changing state.
+  The minimal policy example forwards the identifiers from the presented notice,
+  never its text. Existing forced-minor no-op and durability warnings remain.
+
 - Analytics and crash constructors now reject unsupported configuration keys
   with `unknown_config_key` instead of silently ignoring them. This includes
   misspellings and options belonging to the other client. Remove unsupported

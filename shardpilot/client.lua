@@ -2,6 +2,7 @@ local envelope = require "shardpilot.envelope"
 local envelope_platform = require "shardpilot.envelope_platform"
 local clock = require "shardpilot.clock"
 local compression = require "shardpilot.compression"
+local consent_notice = require "shardpilot.consent_notice"
 local experiments_mod = require "shardpilot.experiments"
 local id = require "shardpilot.id"
 local platform = require "shardpilot.platform"
@@ -2736,7 +2737,7 @@ function Client:track_outcome(experiment_key, outcome_key, outcome_value)
 	return self.experiments:track_outcome(experiment_key, outcome_key, outcome_value)
 end
 
-function Client:set_consent(decision)
+function Client:set_consent(decision, notice)
 	if not self.initialized then
 		return false, "shutdown"
 	end
@@ -2763,6 +2764,8 @@ function Client:set_consent(decision)
 		-- erase its server provenance, so an ordinary denial is a no-op.
 		if decision == false then return true end
 	end
+	local captured_notice, notice_warning = consent_notice.snapshot(notice)
+	if notice_warning and granted then return false, notice_warning end
 	local state_changed = self.consent_state ~= next_state
 	-- Revocation cleanup completes before a new grant takes effect. The
 	-- purge-owed flag is memory-only: if a grant were applied (and persisted)
@@ -2996,19 +2999,19 @@ function Client:set_consent(decision)
 	end
 	self.consent_denial_record_pending = (not granted) and not persisted
 	self.consent_denial_marker_pending = (not granted) and not marker_durable
-	local receipt_safe = self:send_consent_decision()
+	local receipt_safe = self:send_consent_decision(captured_notice)
+	if not purged then
+		-- The denial applied, but the durable spool purge
+		-- failed: previously spooled envelopes are still on disk. Calling
+		-- the same denial again retries it, and later dispatch points
+		-- keep retrying on their own.
+		return true, nil, "spool_purge_failed"
+	end
 	if not persisted then
 		-- The decision is applied in memory and reported to the wire, but
 		-- the durable write failed: success carries a durability warning.
 		-- Repeating the same decision retries persistence.
 		return true, nil, "consent_persist_failed"
-	end
-	if not purged then
-		-- The denial applied (and persisted), but the durable spool purge
-		-- failed: previously spooled envelopes are still on disk. Calling
-		-- the same denial again retries it, and later dispatch points
-		-- keep retrying on their own.
-		return true, nil, "spool_purge_failed"
 	end
 	if not receipt_safe then
 		-- The decision applied and persisted, and its receipt is queued and
@@ -3020,7 +3023,7 @@ function Client:set_consent(decision)
 		-- retried automatically at every dispatch point.
 		return true, nil, "consent_outbox_persist_failed"
 	end
-	return true
+	return true, nil, notice_warning
 end
 
 -- Queue insertion has no callbacks. A replacement checks room for both events
@@ -5186,13 +5189,16 @@ end
 -- acknowledged by a synchronous delivery — and false when it is still
 -- undelivered with the durable append owed (a process death would lose it);
 -- set_consent surfaces that as consent_outbox_persist_failed.
-function Client:send_consent_decision()
+function Client:send_consent_decision(notice)
 	local actor, kind = receipt_actor(self)
 	local payload = {
 		workspace_id = self.config.workspace_id,
 		app_id = self.config.app_id,
 		environment_id = self.config.environment_id,
 		actor_identifier = actor,
+		notice_version = notice and notice.notice_version,
+		notice_locale = notice and notice.notice_locale,
+		policy_version = notice and notice.policy_version,
 		-- The actor's identity class, chosen by the same canonical
 		-- selection as the actor itself. Persisted with the receipt and
 		-- re-sent verbatim; it also drives the per-receipt dispatch
@@ -5348,6 +5354,9 @@ function Client:try_send_consent_outbox()
 		decided_at = payload.decided_at,
 		idempotency_key = payload.idempotency_key,
 		reason = payload.reason,
+		notice_version = payload.notice_version,
+		notice_locale = payload.notice_locale,
+		policy_version = payload.policy_version,
 	}
 	self.consent_send_in_flight = true
 	self.consent_in_flight_key = payload.idempotency_key

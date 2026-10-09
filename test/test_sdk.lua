@@ -1750,7 +1750,7 @@ local function test_set_consent_reports_persist_failure()
 	assert_true(client:identify("user-example"))
 	local ok, err, warning = client:set_consent(false)
 	assert_equal(ok, true)
-	assert_equal(warning, "consent_persist_failed")
+	assert_equal(warning, "spool_purge_failed", "purge outranks identity when every save fails")
 	assert_equal(client:snapshot().consent_persist_failed, 1)
 	assert_equal(client:snapshot().last_consent_error, "consent_persist_failed")
 
@@ -15376,6 +15376,327 @@ end)()
 	end
 	print(string.format("Config validation: %d passed, %d failed", passed, failed))
 	assert_equal(failed, 0, "config validation scene failures")
+end)()
+
+-- Notice identifiers belong to each decision and survive its receipt lifecycle.
+;(function()
+	local scenes = {}
+	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
+	local function notice()
+		return { notice_version = "nv_2026_10_1", notice_locale = "en", policy_version = "pv_2026_10_1" }
+	end
+	local function receipt()
+		for i = #requests, 1, -1 do
+			if requests[i].url:find("/v1/consent", 1, true) then return json.decode(requests[i].body), requests[i].body end
+		end
+		error("real consent request was not emitted")
+	end
+	local function tuple_equal(actual, expected)
+		for _, key in ipairs({ "notice_version", "notice_locale", "policy_version" }) do
+			assert_equal(actual[key], expected and expected[key] or nil, key)
+		end
+		assert_equal(actual.notice, nil, "notice text is never sent")
+	end
+	local function fresh(api, mode, run)
+		reset(); storage.reset()
+		local _, restore = install_stub_sys_storage()
+		next_status = 200; next_response_body = '{"recorded":true,"replayed":false}'
+		local opts = config({ app_id = "synthetic-notice", anonymous_id = "synthetic-actor" })
+		if mode == "publishable" then opts.token_provider = nil; opts.api_key = "sp_ingest_synthetic" end
+		local mod = dofile("shardpilot/sdk.lua")
+		local client = assert(mod[api](opts))
+		local function call(name, ...)
+			if api == "new" then return client[name](client, ...) end
+			return mod[name](...)
+		end
+		local ok, err = pcall(run, call, opts, mod, api == "new" and client or nil)
+		restore(); storage.reset(); assert_true(ok, err)
+	end
+	local malformed = {
+		{ "missing-notice", { notice_locale = "en", policy_version = "p1" } },
+		{ "missing-locale", { notice_version = "n1", policy_version = "p1" } },
+		{ "missing-policy", { notice_version = "n1", notice_locale = "en" } },
+		{ "empty-version", { notice_version = "", notice_locale = "en", policy_version = "p1" } },
+		{ "long-version", { notice_version = string.rep("n", 65), notice_locale = "en", policy_version = "p1" } },
+		{ "text-version", { notice_version = "notice text", notice_locale = "en", policy_version = "p1" } },
+		{ "invalid-policy", { notice_version = "n1", notice_locale = "en", policy_version = false } },
+		{ "locale-separators", { notice_version = "n1", notice_locale = "en--US", policy_version = "p1" } },
+		{ "locale-underscore", { notice_version = "n1", notice_locale = "en_US", policy_version = "p1" } },
+		{ "long-locale", { notice_version = "n1", notice_locale = "x-abcdefgh-abcdefgh-abcdefgh-abcdefg", policy_version = "p1" } },
+		{ "non-table", "synthetic notice text" },
+	}
+	for _, api in ipairs({ "new", "init" }) do
+		for _, mode in ipairs({ "publishable", "token" }) do
+			for _, decision in ipairs({ true, false, "denied_forced_minor" }) do
+				for _, supplied in ipairs({ true, false }) do
+					scene(api .. " " .. mode .. " " .. tostring(decision) .. " tuple=" .. tostring(supplied), function()
+						fresh(api, mode, function(call)
+							local tuple = supplied and notice() or nil
+							local ok, code, warning = call("set_consent", decision, tuple)
+							assert_equal(ok, true); assert_equal(code, nil); assert_equal(warning, nil)
+							local payload = receipt(); tuple_equal(payload, tuple)
+							assert_equal(payload.categories.analytics, decision == true)
+							assert_equal(payload.reason, decision == "denied_forced_minor" and decision or nil)
+						end)
+					end)
+				end
+				for _, invalid in ipairs(malformed) do
+					scene(api .. " " .. mode .. " " .. tostring(decision) .. " malformed " .. invalid[1], function()
+						fresh(api, mode, function(call, opts)
+							local before = storage.load(opts); local wire_before = #requests
+							local ok, code, warning = call("set_consent", decision, invalid[2])
+							if decision == true then
+								assert_equal(ok, false); assert_equal(code, "consent_notice_invalid"); assert_equal(warning, nil)
+								assert_equal(call("get_consent_state"), "unknown")
+								assert_equal(#requests, wire_before, "refused grant emits nothing")
+								assert_equal(encode_value(storage.load(opts)), encode_value(before), "refused grant preserves identity")
+							else
+								assert_equal(ok, true); assert_equal(code, nil); assert_equal(warning, "consent_notice_invalid")
+								assert_equal(call("get_consent_state"), decision == false and "denied" or decision)
+								tuple_equal(receipt(), nil)
+							end
+						end)
+					end)
+				end
+			end
+		end
+	end
+	for _, mode in ipairs({ "publishable", "token" }) do
+		scene(mode .. " retry and disk reload preserve decision tuple", function()
+			fresh("new", mode, function(call, opts, _, client)
+				next_status = 500; next_response_body = "{}"
+				local tuple = notice(); assert_true(call("set_consent", false, tuple))
+				local first = receipt(); tuple_equal(first, notice())
+				tuple.notice_version = "synthetic-changed"; tuple.notice_locale = "fr"; tuple.policy_version = "synthetic-changed"
+				socket.now = socket.now + 60; client:update(0)
+				local retry = receipt(); tuple_equal(retry, notice()); assert_equal(retry.idempotency_key, first.idempotency_key)
+				storage.reset(); requests = {}; next_status = 200; next_response_body = '{"recorded":true,"replayed":false}'
+				assert(dofile("shardpilot/sdk.lua").new(opts))
+				local restored = receipt(); tuple_equal(restored, notice()); assert_equal(restored.idempotency_key, first.idempotency_key)
+			end)
+		end)
+		scene(mode .. " forced-minor ordinary denial preserves original tuple", function()
+			fresh("new", mode, function(call, opts)
+				next_status = 500; next_response_body = "{}"
+				assert_true(call("set_consent", "denied_forced_minor", notice()))
+				tuple_equal(receipt(), notice())
+				local before = encode_value(storage.load_consent_outbox(opts)); local wire_before = #requests
+				assert_true(call("set_consent", false, { notice_version = "invalid-partial" }))
+				assert_equal(#requests, wire_before); assert_equal(call("get_consent_state"), "denied_forced_minor")
+				assert_equal(encode_value(storage.load_consent_outbox(opts)), before)
+			end)
+		end)
+	end
+	for _, locale in ipairs({ "zz", "abcd", "en-foobar", "zh-Hant-TW", "de-1901", "en-u-ca-gregory", "i-klingon", "sgn-BE-FR", "en-GB-oed", "x-abcdefgh-abcdefgh-abcdefgh-abcdef" }) do
+		scene("grammar-only locale " .. locale, function()
+			fresh("new", "token", function(call)
+				local tuple = notice(); tuple.notice_locale = locale
+				local ok, code, warning = call("set_consent", false, tuple)
+				assert_equal(ok, true); assert_equal(code, nil); assert_equal(warning, nil)
+				tuple_equal(receipt(), tuple)
+			end)
+		end)
+	end
+	for _, locale in ipairs({ "-en", "en-", "e", "abcdefghi", "en-12", "abcd-efg", "en-US-Latn", "en-abc-def-ghi-jkl", "en-abcde-ABCDE", "en-a-foo-A-bar", "en-u", "en-x", "x" }) do
+		scene("malformed locale grammar " .. locale, function()
+			fresh("new", "token", function(call)
+				local tuple = notice(); tuple.notice_locale = locale
+				local ok, code = call("set_consent", true, tuple)
+				assert_equal(ok, false); assert_equal(code, "consent_notice_invalid")
+				local applied, err, warning = call("set_consent", false, tuple)
+				assert_equal(applied, true); assert_equal(err, nil); assert_equal(warning, "consent_notice_invalid")
+				tuple_equal(receipt(), nil)
+			end)
+		end)
+	end
+	for _, locale in ipairs({ "EN-lAtN-us", "en-abc-def-ghi-Latn-123-1994", "en-a-foo-b-bar-x-a", "x-a", "abcde", "en-1234" }) do
+		scene("locale branches and version bounds " .. locale, function()
+			fresh("new", "token", function(call)
+				local tuple = { notice_version = string.rep("n", 64), notice_locale = locale, policy_version = "_" }
+				assert_true(call("set_consent", false, tuple)); tuple_equal(receipt(), tuple)
+			end)
+		end)
+	end
+	scene("notice carrier rejects text and inherited fields", function()
+		fresh("new", "token", function(call)
+			local tuple = notice(); tuple.notice = "synthetic text"
+			local ok, code = call("set_consent", true, tuple)
+			assert_equal(ok, false); assert_equal(code, "consent_notice_invalid")
+			local reads = 0
+			local inherited = setmetatable({}, { __index = function() reads = reads + 1; return "en" end })
+			ok, code = call("set_consent", true, inherited)
+			assert_equal(ok, false); assert_equal(code, "consent_notice_invalid"); assert_equal(reads, 0)
+		end)
+	end)
+	scene("snapshot precedes persistence callback mutation", function()
+		fresh("new", "token", function(call)
+			local tuple = notice(); local save = sys.save
+			local called = false
+			sys.save = function(...)
+				called = true; tuple.notice_version = "synthetic-mutated"
+				return save(...)
+			end
+			assert_true(call("set_consent", false, tuple)); assert_true(called)
+			tuple_equal(receipt(), notice())
+		end)
+	end)
+	scene("later decisions cannot relabel retained receipts", function()
+		fresh("new", "token", function(call, opts)
+			next_status = 500; next_response_body = "{}"
+			assert_true(call("set_consent", false, notice()))
+			local next_notice = notice(); next_notice.notice_version = "synthetic-next"
+			assert_true(call("set_consent", false, next_notice))
+			local retained = storage.load_consent_outbox(opts)
+			assert_equal(#retained, 2); tuple_equal(retained[1], notice()); tuple_equal(retained[2], next_notice)
+			assert_not_equal(retained[1].idempotency_key, retained[2].idempotency_key)
+		end)
+	end)
+	scene("corrupt durable tuple is not rewritten under the old key", function()
+		fresh("new", "token", function(call, opts)
+			next_status = 500; next_response_body = "{}"
+			assert_true(call("set_consent", false, notice()))
+			local load = sys.load
+			sys.load = function(...)
+				local record = load(...)
+				if type(record) == "table" and record.receipts and record.receipts[1] then
+					record.receipts[1].notice_locale = nil
+				end
+				return record
+			end
+			storage.reset(); requests = {}
+			local restored = assert(dofile("shardpilot/sdk.lua").new(opts))
+			assert_equal(#requests, 0, "corrupted tuple must not be resent without provenance")
+			assert_true(restored.consent_outbox_unreadable, "existing malformed-receipt hold applies")
+		end)
+	end)
+	scene("accepted server golden request and response bytes", function()
+		fresh("new", "token", function()
+			local function read(path) local f = assert(io.open(path)); local data = f:read("*a"); f:close(); return data end
+			local expected = read("test/golden/consent-notice-request.json")
+			local payload = json.decode(expected)
+			local clock, id = require "shardpilot.clock", require "shardpilot.id"
+			local old_time, old_id = clock.iso_utc, id.uuid_v7
+			clock.iso_utc = function() return payload.decided_at end
+			id.uuid_v7 = function() return payload.idempotency_key end
+			local ok, err = pcall(function()
+				local client = assert(dofile("shardpilot/sdk.lua").new(config({
+					workspace_id = payload.workspace_id, app_id = payload.app_id, environment_id = payload.environment_id,
+					anonymous_id = payload.actor_identifier, consent_kind_emission_enabled = false,
+				})))
+				next_status = 200; next_response_body = read("test/golden/consent-notice-response.json")
+				assert_true(client:set_consent(false, notice()))
+				local _, body = receipt(); assert_equal(body, expected, "wire must match the accepted server bytes")
+				assert_equal(#client.consent_outbox, 0, "accepted response acknowledged the real receipt")
+			end)
+			clock.iso_utc, id.uuid_v7 = old_time, old_id
+			assert_true(ok, err)
+		end)
+	end)
+	for _, api in ipairs({ "new", "init" }) do
+		for _, fault in ipairs({ "identity", "purge", "outbox", "purge+identity" }) do
+			scene(api .. " notice with " .. fault .. " warning and recovery", function()
+				fresh(api, "token", function(call)
+					local save, clear, disk = storage.save, storage.clear_spool, sys.save
+					if fault == "identity" or fault == "purge+identity" then storage.save = function() return false end end
+					if fault == "purge" or fault == "purge+identity" then storage.clear_spool = function() return false end end
+					if fault == "outbox" then
+						next_status = 500; next_response_body = "{}"
+						sys.save = function(path, record)
+							if path:sub(-15) == "/consent-outbox" then return false end
+							return disk(path, record)
+						end
+					end
+					local ok, code, warning = call("set_consent", false, { notice_version = "partial" })
+					storage.save, storage.clear_spool, sys.save = save, clear, disk
+					assert_equal(ok, true); assert_equal(code, nil)
+					local expected = fault == "identity" and "consent_persist_failed" or
+						(fault == "outbox" and "consent_outbox_persist_failed" or "spool_purge_failed")
+					assert_equal(warning, expected, "single-slot priority")
+					assert_equal(call("get_consent_state"), "denied"); tuple_equal(receipt(), nil)
+					next_status = 200; next_response_body = '{"recorded":true,"replayed":false}'
+					socket.now = socket.now + 60
+					ok, code, warning = call("set_consent", false, { notice_version = "partial" })
+					assert_equal(ok, true); assert_equal(code, nil); assert_equal(warning, "consent_notice_invalid", "notice warning reappears after recovery")
+				end)
+			end)
+		end
+	end
+	for _, api in ipairs({ "new", "init" }) do
+		for _, decision in ipairs({ true, false }) do
+			for _, value in ipairs({ "strict-fallback/1", "build+7/patch_1", string.rep("v", 64), "space value", string.rep("v", 65) }) do
+				scene(api .. " policy version " .. value .. " decision=" .. tostring(decision), function()
+					fresh(api, "token", function(call)
+						local tuple = { notice_version = value, notice_locale = "en", policy_version = value }
+						local valid = value ~= "space value" and #value <= 64
+						local ok, code, warning = call("set_consent", decision, tuple)
+						if not valid and decision then
+							assert_equal(ok, false); assert_equal(code, "consent_notice_invalid")
+							assert_equal(#requests, 0, "invalid version grant has no wire effect")
+						else
+							assert_equal(ok, true); assert_equal(code, nil)
+							assert_equal(warning, not valid and "consent_notice_invalid" or nil)
+							tuple_equal(receipt(), valid and tuple or nil)
+						end
+					end)
+				end)
+			end
+		end
+	end
+	for _, granted in ipairs({ true, false }) do
+		scene("actual example resolved-policy golden decision=" .. tostring(granted), function()
+			reset(); storage.reset()
+			local _, restore = install_stub_sys_storage()
+			local saved, globals = {}, {}
+			for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform", "shardpilot.consent_policy" }) do saved[name] = package.loaded[name] end
+			for _, name in ipairs({ "init", "update", "final", "on_message", "on_input", "host_age_band", "present_consent_notice", "window", "print" }) do globals[name] = _G[name] end
+			local request = http.request
+			local ok, err = pcall(function()
+				local file = assert(io.open("test/golden/consent-policy-resolved.json", "rb"))
+				local body = file:read("*a"); file:close()
+				-- Only scope is adapted to the shipped example; identifier bytes stay exact.
+				body = body:gsub('"ws_1"', '"workspace-example"'):gsub('"app_1"', '"app-example"'):gsub('"env_1"', '"develop"')
+				http.request = function(url, method, callback, headers, payload)
+					requests[#requests + 1] = { url = url, body = payload }
+					local response = url:find("/api/cp/v1/consent/policy", 1, true) and body or '{"recorded":true,"replayed":false}'
+					callback(nil, nil, { status = 200, response = response })
+				end
+				package.loaded["shardpilot.consent_policy"] = dofile("shardpilot/consent_policy.lua")
+				package.loaded["shardpilot.sdk"] = dofile("shardpilot/sdk.lua")
+				package.loaded["shardpilot.platform"] = { detect = function() return "windows" end }
+				package.loaded["shardpilot.crash"] = { shutdown = function() return true end }
+				window = { set_listener = function() end }
+				local logs, answer = {}, nil
+				print = function(...) local parts = {}; for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end; logs[#logs + 1] = table.concat(parts, " ") end
+				assert(loadfile("examples/minimal/main.script"))()
+				host_age_band = function() return "adult" end
+				present_consent_notice = function(decision, callback)
+					assert_true(decision.plan_used, "real policy golden must be used, not fallback")
+					assert_equal(decision.policy_version, "strict-fallback/1")
+					assert_equal(decision.consent_text_version, "strict-fallback/1")
+					answer = callback
+				end
+				init(nil); assert_true(type(answer) == "function", "example must present the golden plan")
+				assert_equal(#requests, 1, "no SDK wire before the answer")
+				answer(granted); update(nil, 0)
+				local wire = receipt()
+				tuple_equal(wire, { notice_version = "strict-fallback/1", notice_locale = "en", policy_version = "strict-fallback/1" })
+				assert_equal(wire.categories.analytics, granted)
+				assert_true(not table.concat(logs, " "):find("consent_notice_invalid", 1, true), "real setter must accept the displayed versions")
+			end)
+			http.request = request
+			for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform", "shardpilot.consent_policy" }) do package.loaded[name] = saved[name] end
+			for _, name in ipairs({ "init", "update", "final", "on_message", "on_input", "host_age_band", "present_consent_notice", "window", "print" }) do _G[name] = globals[name] end
+			restore(); storage.reset(); assert_true(ok, err)
+		end)
+	end
+	local passed, failed = 0, 0
+	for _, entry in ipairs(scenes) do
+		local ok, err = pcall(entry.run)
+		if ok then passed = passed + 1 else failed = failed + 1 end
+		print("consent notice scene " .. entry.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	print(string.format("Consent notice: %d passed, %d failed", passed, failed))
+	assert_equal(failed, 0, "consent notice scene failures")
 end)()
 
 -- Replacing a live session admits its end and the new start as one boundary.
