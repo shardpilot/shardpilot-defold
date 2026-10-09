@@ -98,9 +98,10 @@ explicit **granted** decision opens the event pipeline.
   a band-forced denial from one the player chose. In a forced-minor session
   the **only** analytics-plane request that leaves the device is that receipt
   POST. An ordinary grant is refused with `false, "consent_forced_minor"`,
-  even after storage and purge recover. An ordinary denial still succeeds
-  and reports `denied`, preserving the forced-minor exclusion for the actor
-  across durable writes and restarts. Ordinary setters cannot reverse that
+  even after storage and purge recover. An ordinary denial still succeeds,
+  keeps `denied_forced_minor`, and creates no new receipt. The scoped persisted
+  state and original forced-denial receipt retain the restriction across restart;
+  no separate exclusion flag is stored. Ordinary setters cannot reverse that
   exclusion. A successful anonymous-ID replacement clears the prior actor's
   exclusion and starts the replacement at `unknown`; same-ID and refused
   replacements keep it. The per-app store holds the current identity, so the
@@ -116,7 +117,7 @@ that is their warning order. Refused decisions return `false, code` without
 applying the requested state. Healthy decisions return `true`.
 
 Explicit decisions are reported to `POST {ingest_url}/v1/consent` and never
-ride the event envelope. Each decision becomes exactly one receipt —
+ride the event envelope. Each new decision becomes exactly one receipt —
 workspace/app/environment, the actor identifier and its `kind`,
 `categories{analytics}`, a `decided_at` stamp, an `idempotency_key`, and
 (forced-minor only) the `reason` — retained in the **durable

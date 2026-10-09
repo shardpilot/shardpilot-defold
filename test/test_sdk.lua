@@ -14989,23 +14989,25 @@ end)()
 				call("flush")
 				result(call, true, false, "consent_forced_minor")
 				result(call, false, true)
-				assert_equal(call("get_consent_state"), "denied")
-				assert_equal(storage.load(options).consent_forced_minor, true, "ordinary denial retains exclusion")
+				assert_equal(call("get_consent_state"), "denied_forced_minor")
+				assert_equal(storage.load(options).consent_analytics, "denied_forced_minor", "ordinary denial keeps persisted state")
 				result(call, true, false, "consent_forced_minor")
 				no_analytics()
 			end)
 		end)
 	end
 	for _, witness in ipairs({ "identity", "marker", "receipt" }) do
-		scene(witness .. " retains forced-minor exclusion after ordinary denial and restart", function()
+		for _, prior in ipairs({ "unknown", "denied", "granted" }) do
+		scene(witness .. " retains forced-minor state over " .. prior .. " after denial and restart", function()
 			fresh("instance", function(call, options, facade, saved)
+				if prior ~= "unknown" then result(call, prior == "granted", true) end
 				if witness ~= "identity" then storage.save = function() return false end end
 				if witness == "receipt" then storage.save_consent_denial_marker = function() return false end end
-				call("set_consent", "denied_forced_minor")
 				next_status = witness == "receipt" and 500 or 202
+				call("set_consent", "denied_forced_minor")
 				local applied = call("set_consent", false)
 				assert_equal(applied, true, "ordinary denial applies even if a write fails")
-				assert_equal(call("get_consent_state"), "denied")
+				assert_equal(call("get_consent_state"), "denied_forced_minor")
 				for key, original in pairs(saved) do storage[key] = original end
 				storage.reset(); reset()
 				local restored = assert(facade.new(options))
@@ -15017,12 +15019,25 @@ end)()
 			end)
 		end)
 	end
+	end
+	scene("ordinary receipt does not impose on unknown", function()
+		fresh("instance", function(call, options, facade, saved)
+			storage.save = function() return false end
+			storage.save_consent_denial_marker = function() return false end
+			next_status = 500; call("set_consent", false)
+			for key, original in pairs(saved) do storage[key] = original end
+			storage.reset(); reset()
+			local restored = assert(facade.new(options))
+			assert_equal(restored:get_consent_state(), "unknown", "ordinary receipt cannot manufacture an unknown actor's state")
+			assert_true(restored:set_consent(true))
+		end)
+	end)
 	scene("receipt exclusion hands off before its acknowledgement", function()
 		fresh("instance", function(call, options, facade, saved)
 			storage.save = function() return false end
 			storage.save_consent_denial_marker = function() return false end
-			call("set_consent", "denied_forced_minor")
-			next_status = 500; call("set_consent", false)
+			next_status = 500; call("set_consent", "denied_forced_minor")
+			call("set_consent", false)
 			storage.save_consent_denial_marker = saved.save_consent_denial_marker
 			storage.reset(); reset()
 			local restored = assert(facade.new(options))
@@ -15057,7 +15072,7 @@ end)()
 						assert_true(call("set_anonymous_id", "synthetic-actor-b"))
 						local record = storage.load(options)
 						assert_equal(record.anonymous_id, "synthetic-actor-b")
-						assert_equal(record.consent_forced_minor, nil, "A's exclusion is not written under B")
+						assert_equal(record.consent_analytics, nil, "A's state is not written under B")
 						if reboot then
 							options.anonymous_id = nil
 							storage.reset(); reset()
@@ -15079,7 +15094,7 @@ end)()
 				local ok, code = call("set_anonymous_id", "")
 				assert_equal(ok, false); assert_equal(code, "invalid_anonymous_id")
 				result(call, true, false, "consent_forced_minor")
-				assert_equal(storage.load(options).consent_forced_minor, true)
+				assert_equal(storage.load(options).consent_analytics, "denied_forced_minor")
 			end, mode)
 		end)
 	end
@@ -15091,9 +15106,44 @@ end)()
 			assert_equal(ok, false); assert_equal(code, "events_pending")
 			assert_equal(call("get_anonymous_id"), options.anonymous_id)
 			result(call, true, false, "consent_forced_minor")
-			assert_equal(storage.load(options).consent_forced_minor, true)
+			assert_equal(storage.load(options).consent_analytics, "denied_forced_minor")
 		end)
 	end)
+	for _, mode in ipairs({ "token", "publishable" }) do
+		for _, api in ipairs({ "instance", "facade" }) do
+			for _, pending in ipairs({ false, true }) do
+				scene(mode .. " " .. api .. " repeated denial preserves receipt pending=" .. tostring(pending), function()
+					fresh(api, function(call, options, facade)
+						next_status = pending and 500 or 202
+						result(call, "denied_forced_minor", true)
+						local record = storage.load(options)
+						local count, sent = #storage.load_consent_outbox(options), #requests
+						result(call, false, true)
+						assert_equal(call("get_consent_state"), "denied_forced_minor")
+						assert_equal(#storage.load_consent_outbox(options), count, "no new receipt retained")
+						assert_equal(#requests, sent, "no new receipt dispatched")
+						assert_equal(storage.load(options).consent_decision_seq, record.consent_decision_seq, "no new decision")
+						result(call, true, false, "consent_forced_minor")
+						storage.reset(); reset()
+						local restored = assert(facade.new(options))
+						assert_equal(restored:get_consent_state(), "denied_forced_minor", "disk state survives a fresh client")
+						for _, request in ipairs(requests) do
+							if request.url:find("/v1/consent", 1, true) then
+								assert_contains(request.body, '"reason":"denied_forced_minor"', "retained receipt still names forced denial")
+							end
+						end
+						local after_reload = #requests
+						assert_true(restored:set_consent(false))
+						assert_equal(restored:get_consent_state(), "denied_forced_minor")
+						assert_equal(#requests, after_reload, "no post-reload replacement receipt")
+						local ok, code = restored:set_consent(true)
+						assert_equal(ok, false); assert_equal(code, "consent_forced_minor")
+						no_analytics()
+					end, mode)
+				end)
+			end
+		end
+	end
 	local passed, failed = 0, 0
 	for _, entry in ipairs(scenes) do
 		local ok, err = pcall(entry.run)

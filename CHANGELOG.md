@@ -8,8 +8,9 @@
   `consent_persist_failed`, `spool_purge_failed` and
   `consent_outbox_persist_failed` warnings instead of treating them as refusal.
   A forced-minor grant returns `false, "consent_forced_minor"` even after purge
-  recovery. Ordinary denial still applies and reports `denied`, retaining the
-  forced-minor exclusion across durable writes and restarts. A successful
+  recovery. Ordinary denial still succeeds, keeps
+  `denied_forced_minor`, and creates no new receipt. The persisted state retains
+  the restriction across restart without a separate exclusion flag. A successful
   anonymous-ID replacement clears the prior actor's exclusion and starts the
   replacement at `unknown`; same-ID and refused replacements retain it.
 

@@ -1755,8 +1755,9 @@ top-level one.
   band-forced denial from a chosen one. In a forced-minor session the sole
   analytics-plane request on the wire is that receipt POST. An ordinary grant
   is refused with `false, "consent_forced_minor"`, including after purge recovery.
-  `set_consent(false)` still succeeds and reports `denied`, but preserves the
-  forced-minor exclusion for that actor across durable writes and restarts.
+  `set_consent(false)` still succeeds, keeps `denied_forced_minor`, and creates
+  no new receipt. The persisted state and original forced-denial receipt retain
+  the restriction across restart; no separate exclusion flag is stored.
   It cannot make a later grant eligible; ordinary consent calls do not provide
   an age-band reversal mechanism. A successful `set_anonymous_id` replacement
   of that actor clears the old exclusion and starts the replacement at `unknown`;
@@ -1774,14 +1775,16 @@ top-level one.
   later dispatch points; an otherwise permitted `set_consent(true)` retries that purge first
   and is **not applied** (same `false, "spool_purge_failed"` return, persisted
   decision stays denied) until the purge lands — revocation cleanup completes
-  before a new grant takes effect. Call `set_consent` again to retry
-  persistence, otherwise the decision can be lost on restart. When several
+  before a new grant takes effect. Retry the same decision with `set_consent`
+  to retry persistence, otherwise the decision can be lost on restart. An ordinary
+  denial under `denied_forced_minor` is a no-op, not a persistence retry. When several
   writes fail together, the warning precedence remains identity persistence,
   spool purge, then consent-outbox persistence.
 - Explicit consent decisions are reported to `POST {ingest_url}/v1/consent` over
   the same authenticated transport; consent never rides the event envelope.
-  Every decision becomes exactly one receipt (with its own `idempotency_key`),
-  keyed to the **canonical actor** at decision time — the verified `user_id`
+  Every new decision becomes exactly one receipt (with its own `idempotency_key`);
+  ordinary denial under `denied_forced_minor` preserves the existing decision. Receipts
+  are keyed to the **canonical actor** at decision time — the verified `user_id`
   with `kind = "user_verified"` only when a Mode B `token_provider` backs an
   identified session; the SDK-managed `anonymous_id` with `kind = "anon"` in
   every other case (a Mode A self-asserted `user_id` is never the receipt

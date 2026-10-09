@@ -293,7 +293,6 @@ local function denial_marker_payload(self, state)
 	at, by, seq = supersession_pair(at, by, seq)
 	return {
 		consent_analytics = state,
-		consent_forced_minor = self.consent_forced_minor or nil,
 		anonymous_id = self.anonymous_id,
 		decided_at = self.consent_decided_at,
 		decision_seq = self.consent_decision_seq,
@@ -825,8 +824,6 @@ function M.new(config, defer_init_diagnostics)
 		-- the per-receipt credential rules.
 		consent_state = stored.consent_analytics
 	end
-	local consent_forced_minor = not override_replaced_actor
-		and (consent_state == "denied_forced_minor" or stored.consent_forced_minor == true)
 	-- The (stamp, seq) pair of the decision the restored state came from
 	-- (persisted by persist_identity since the denial-marker fix; legacy
 	-- records carry neither — seq reads 0). The belt below compares retained
@@ -908,8 +905,6 @@ function M.new(config, defer_init_diagnostics)
 	local restored_decided_at = nil
 	local restored_decision_seq = 0
 	if marker_valid and marker.anonymous_id == anonymous_id then
-		consent_forced_minor = consent_forced_minor or marker.consent_forced_minor == true
-			or marker.consent_analytics == "denied_forced_minor"
 		-- STALE-MARKER GUARD: a marker whose decision
 		-- pair the RECORD strictly supersedes is RETIRED, never imposed —
 		-- the record proves a newer decision (a later grant included)
@@ -1061,7 +1056,6 @@ function M.new(config, defer_init_diagnostics)
 		user_id = valid_identity(config.user_id) and config.user_id or nil,
 		anonymous_id = anonymous_id,
 		consent_state = consent_state,
-		consent_forced_minor = consent_forced_minor,
 		-- The ISO stamp of the decision consent_state came from (an explicit
 		-- set_consent, the restored record, an imposed marker, or the belt
 		-- receipt below) — persisted with the identity record so a later
@@ -1481,12 +1475,17 @@ function M.new(config, defer_init_diagnostics)
 		belt_decided_at = client.consent_restored_decided_at
 		belt_decision_seq = client.consent_restored_decision_seq
 	end
-	if belt_state == "granted" then
+	-- A retained forced denial also restores an older unknown/denied record
+	-- when both its identity and marker writes failed. Reuse the same durable
+	-- handoff before delivery can retire that last witness. Ordinary receipts
+	-- still correct only grants; they do not manufacture consent on an unknown.
+	if belt_state == "granted" or belt_state == "unknown" or belt_state == "denied" then
 		local stale_denial = nil
 		for i = 1, #client.consent_outbox do
 			local receipt = client.consent_outbox[i]
 			if type(receipt.categories) == "table"
 				and receipt.categories.analytics == false
+				and (belt_state == "granted" or receipt.reason == "denied_forced_minor")
 				and receipt.anonymous_id == client.anonymous_id
 				and type(receipt.decided_at) == "string"
 				and decision_pair_newer(receipt.decided_at,
@@ -1578,27 +1577,6 @@ function M.new(config, defer_init_diagnostics)
 				status = "restored",
 				code = "denial_receipt_newer",
 			})
-		end
-	end
-	-- The exclusion is separate from the latest decision: an ordinary denial
-	-- succeeds without making a later grant eligible. Restore it from every
-	-- retained witness for this actor before opening any analytics consumer.
-	for _, receipt in ipairs(client.consent_outbox) do
-		if receipt.anonymous_id == anonymous_id and receipt.categories.analytics == false
-			and (receipt.consent_forced_minor == true or receipt.reason == "denied_forced_minor") then
-			client.consent_forced_minor = true
-		end
-	end
-	if client.consent_forced_minor then
-		if not consent_denied_state(client.consent_state) then
-			client.consent_state = "denied_forced_minor"
-		end
-		consent_state = client.consent_state
-		-- Consolidate before receipt delivery can retire the only witness.
-		if not client:persist_identity() then
-			client.consent_denial_record_pending = true
-			client.consent_denial_marker_pending = not storage.save_consent_denial_marker(
-				normalized, denial_marker_payload(client, client.consent_state))
 		end
 	end
 	-- Experiment-assignment consumer (dark unless `experiments_enabled`).
@@ -2121,10 +2099,7 @@ function Client:persist_identity()
 		self.stats.consent_persist_failed = self.stats.consent_persist_failed + 1
 		return false
 	end
-	local record = {
-		anonymous_id = self.anonymous_id,
-		consent_forced_minor = self.consent_forced_minor or nil,
-	}
+	local record = { anonymous_id = self.anonymous_id }
 	local state = self.consent_state
 	local decided_at = self.consent_decided_at
 	local decision_seq = self.consent_decision_seq
@@ -2405,8 +2380,7 @@ function Client:set_anonymous_id(anonymous_id)
 	if anonymous_id ~= self.anonymous_id then
 		-- A replacement actor does not inherit this actor's exclusion or
 		-- the denied state from which a restart would reconstruct it.
-		if self.consent_forced_minor then
-			self.consent_forced_minor = false
+		if self.consent_state == "denied_forced_minor" then
 			self.consent_state = "unknown"
 			self.consent_decided_at = nil
 			self.consent_decision_seq = 0
@@ -2733,10 +2707,12 @@ function Client:set_consent(decision)
 		return false, "invalid_consent"
 	end
 	local granted = next_state == "granted"
-	if granted and self.consent_forced_minor then
-		return false, "consent_forced_minor"
+	if self.consent_state == "denied_forced_minor" then
+		if granted then return false, "consent_forced_minor" end
+		-- The forced denial already stands. A new reasonless receipt would
+		-- erase its server provenance, so an ordinary denial is a no-op.
+		if decision == false then return true end
 	end
-	self.consent_forced_minor = self.consent_forced_minor or next_state == "denied_forced_minor"
 	local state_changed = self.consent_state ~= next_state
 	-- Revocation cleanup completes before a new grant takes effect. The
 	-- purge-owed flag is memory-only: if a grant were applied (and persisted)
@@ -2974,13 +2950,13 @@ function Client:set_consent(decision)
 	if not persisted then
 		-- The decision is applied in memory and reported to the wire, but
 		-- the durable write failed: success carries a durability warning.
-		-- Calling set_consent again retries persistence.
+		-- Repeating the same decision retries persistence.
 		return true, nil, "consent_persist_failed"
 	end
 	if not purged then
 		-- The denial applied (and persisted), but the durable spool purge
 		-- failed: previously spooled envelopes are still on disk. Calling
-		-- set_consent(false) again retries it, and later dispatch points
+		-- the same denial again retries it, and later dispatch points
 		-- keep retrying on their own.
 		return true, nil, "spool_purge_failed"
 	end
@@ -4746,7 +4722,7 @@ end
 
 -- ── consent-receipt outbox ────────────────────────────────────────────────────
 --
--- Every explicit set_consent decision becomes exactly ONE receipt — the
+-- Every new set_consent decision becomes exactly ONE receipt — the
 -- `POST /v1/consent` payload snapshotted at decision time — appended to a
 -- small durable outbox (storage.lua, per-app record "consent-outbox") so it
 -- survives process death and offline play, and retried until the server
@@ -5169,8 +5145,6 @@ function Client:send_consent_decision()
 		-- never send.
 		anonymous_id = self.anonymous_id,
 	}
-	-- Local retention metadata; the wire body uses an explicit field list.
-	payload.consent_forced_minor = self.consent_forced_minor or nil
 	if self.consent_state == "denied_forced_minor" then
 		-- The receipt itself records that this denial was band-forced,
 		-- not chosen — the reason is the only difference from a plain denial.
