@@ -9530,7 +9530,9 @@ local tests = {
 	local b = client.session_id
 	socket.now = socket.now + 15
 	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
-	assert_equal(#named(client, "app.session_ended"), 0, "no idle end for a session the host replaced")
+	local ends = named(client, "app.session_ended")
+	assert_equal(#ends, 1, "only the replacement end, no extra idle end")
+	assert_equal(ends[1].props.reason, "session_start", "the host replacement owns the end")
 	assert_equal(client.session_id, b, "and the replacement stays open")
 	window = nil
 	end,
@@ -15374,4 +15376,144 @@ end)()
 	end
 	print(string.format("Config validation: %d passed, %d failed", passed, failed))
 	assert_equal(failed, 0, "config validation scene failures")
+end)()
+
+-- Replacing a live session admits its end and the new start as one boundary.
+;(function()
+	local scenes = {}
+	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
+	local function events()
+		local out = {}
+		for _, request in ipairs(requests) do
+			if request.url:find("events:batch", 1, true) then
+				for _, event in ipairs(json.decode(request.body).events or {}) do out[#out + 1] = event end
+			end
+		end
+		return out
+	end
+	local function fresh(api, options, run, consent)
+		reset(); storage.reset()
+		local _, restore = install_stub_sys_storage()
+		local facade = dofile("shardpilot/sdk.lua")
+		local client = assert(facade[api](config(options)))
+		local function call(name, ...)
+			if api == "new" then return client[name](client, ...) end
+			return facade[name](...)
+		end
+		local ok, err = pcall(function()
+			if consent ~= "unknown" then
+				next_status = 200; next_response_body = '{"recorded":true,"replayed":false}'
+				assert_true(call("set_consent", consent ~= "denied"))
+			end
+			next_status = 202; next_response_body = '{"accepted":100}'
+			run(call)
+		end)
+		restore(); storage.reset(); assert_true(ok, err)
+	end
+	for _, api in ipairs({ "new", "init" }) do
+		for _, lazy in ipairs({ false, true }) do
+			scene(api .. " " .. (lazy and "lazy" or "explicit") .. " replacement wire", function()
+				fresh(api, {}, function(call)
+					assert_true(call(lazy and "track" or "session_start", lazy and "synthetic-play" or nil))
+					local old_id = call("get_session_id")
+					assert_true(call("session_start", { label = "synthetic-new" }))
+					local new_id = call("get_session_id"); assert_not_equal(new_id, old_id)
+					call("flush"); local wire = events()
+					assert_equal(#wire, 3, "replacement must add exactly end+start")
+					assert_equal(wire[2].event_name, "app.session_ended"); assert_equal(wire[2].props.reason, "session_start")
+					assert_equal(wire[2].session_id, old_id); assert_equal(wire[2].session_sequence, 2)
+					assert_equal(wire[3].event_name, "app.session_started"); assert_equal(wire[3].session_id, new_id)
+					assert_equal(wire[3].session_sequence, 1); assert_equal(wire[3].props.label, "synthetic-new")
+					assert_equal(wire[2].event_ts, wire[3].event_ts, "replacement has one boundary instant")
+				end)
+			end)
+		end
+		scene(api .. " one free slot refuses whole pair then retry", function()
+			fresh(api, { buffer_size = 2, batch_size = 2 }, function(call)
+				assert_true(call("session_start")); local old_id = call("get_session_id")
+				local ok, code = call("session_start")
+				assert_equal(ok, false, "one slot cannot admit a two-event boundary"); assert_equal(code, "queue_full")
+				assert_equal(call("get_session_id"), old_id); call("flush")
+				assert_equal(#events(), 1, "refusal queues neither boundary event")
+				assert_true(call("session_start")); call("flush"); local wire = events()
+				assert_equal(#wire, 3); assert_equal(wire[2].session_id, old_id)
+				assert_equal(wire[2].session_sequence, 2, "refusal consumes no old sequence")
+				assert_equal(wire[2].props.reason, "session_start"); assert_equal(wire[3].session_sequence, 1)
+			end)
+		end)
+		scene(api .. " capacity one retains session and explicit end control", function()
+			fresh(api, { buffer_size = 1, batch_size = 1 }, function(call)
+				assert_true(call("session_start")); local old_id = call("get_session_id")
+				local ok, code = call("session_start"); assert_equal(ok, false); assert_equal(code, "queue_full")
+				call("flush"); ok, code = call("session_start")
+				assert_equal(ok, false, "even empty capacity one cannot fit the pair"); assert_equal(code, "queue_full")
+				assert_equal(call("get_session_id"), old_id)
+				assert_true(call("session_end", "synthetic-explicit-end")); call("flush")
+				local wire = events(); assert_equal(#wire, 2)
+				assert_equal(wire[2].props.reason, "synthetic-explicit-end"); assert_equal(wire[2].session_sequence, 2)
+				assert_true(call("session_start")); call("flush"); assert_equal(#events(), 3)
+			end)
+		end)
+		scene(api .. " replaced summaries retain their old session under pressure", function()
+			fresh(api, { buffer_size = 3, batch_size = 3 }, function(call)
+				assert_true(call("session_start")); local old_id = call("get_session_id")
+				call("observe_ping_ms", 42)
+				assert_true(call("session_start")); local new_id = call("get_session_id")
+				call("flush"); call("flush"); local summaries, ends = 0, 0
+				for _, event in ipairs(events()) do
+					if event.event_name == "network_summary" then
+						summaries = summaries + 1; assert_equal(event.session_id, old_id)
+						assert_equal(event.session_sequence, 3, "summary follows its old session end")
+					elseif event.event_name == "app.session_ended" then ends = ends + 1 end
+				end
+				assert_equal(ends, 1); assert_equal(summaries, 1, "retained summary delivered exactly once")
+				assert_equal(call("get_session_id"), new_id)
+			end)
+		end)
+		scene(api .. " invalid props leave old session untouched", function()
+			fresh(api, {}, function(call)
+				assert_true(call("session_start")); local old_id = call("get_session_id"); call("flush")
+				local cyclic = {}; cyclic.self = cyclic
+				local ok, code = call("session_start", cyclic); assert_equal(ok, false); assert_equal(code, "invalid_props")
+				assert_equal(call("get_session_id"), old_id); call("flush"); assert_equal(#events(), 1)
+				assert_true(call("session_end", "synthetic-control")); call("flush")
+				assert_equal(events()[2].session_sequence, 2)
+			end)
+		end)
+		for _, consent in ipairs({ "unknown", "denied" }) do
+			scene(api .. " " .. consent .. " emits no session boundary", function()
+				fresh(api, {}, function(call)
+					local ok, code = call("session_start"); assert_equal(ok, false); assert_equal(code, "consent_" .. consent)
+					call("flush"); assert_equal(#events(), 0)
+				end, consent)
+			end)
+		end
+		scene(api .. " no open session end is a no-op", function()
+			fresh(api, {}, function(call)
+				assert_true(call("session_end")); call("flush"); assert_equal(#events(), 0)
+				assert_true(call("session_start")); call("flush"); assert_equal(#events(), 1)
+			end)
+		end)
+		scene(api .. " expired pause keeps idle boundary", function()
+			local previous = window; window = { WINDOW_EVENT_ICONFIED = "synthetic-background" }
+			local ok, err = pcall(function()
+				fresh(api, { session_timeout_seconds = 10, platform = "linux" }, function(call)
+					assert_true(call("session_start")); local old_id = call("get_session_id")
+					call("on_window_event", "synthetic-background"); socket.now = socket.now + 11
+					assert_true(call("session_start")); call("flush"); local wire = events()
+					assert_equal(#wire, 3); assert_equal(wire[2].props.reason, "idle_timeout")
+					assert_equal(wire[2].session_id, old_id); assert_equal(wire[3].event_name, "app.session_started")
+				end)
+			end)
+			window = previous; assert_true(ok, err)
+		end)
+	end
+	local passed, failed = 0, 0
+	for _, entry in ipairs(scenes) do
+		local ok, err = pcall(entry.run)
+		if ok then passed = passed + 1 else failed = failed + 1 end
+		print("session replacement " .. entry.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	print(string.format("Session replacement: %d passed, %d failed", passed, failed))
+	assert_equal(failed, 0, "session replacement failures")
 end)()

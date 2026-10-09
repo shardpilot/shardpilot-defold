@@ -2,6 +2,12 @@
 
 ### Unreleased
 
+- Replacing an open analytics session now queues its end with reason
+  `session_start` before the new start, atomically with respect to queue
+  capacity. A refused replacement preserves the old session and sequence.
+  Its summaries keep their original session; an expired pause still ends
+  with `idle_timeout`. Replacement needs two free queue slots.
+
 - Analytics and crash constructors now reject unsupported configuration keys
   with `unknown_config_key` instead of silently ignoring them. This includes
   misspellings and options belonging to the other client. Remove unsupported

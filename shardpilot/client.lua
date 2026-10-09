@@ -3023,6 +3023,19 @@ function Client:set_consent(decision)
 	return true
 end
 
+-- Queue insertion has no callbacks. A replacement checks room for both events
+-- before committing either, while ordinary enqueue keeps its single push.
+local function commit_event(client, event, stream, now_ms)
+	if not queue.push(client.queue, event) then return false end
+	stream.sequence = event.session_sequence
+	if now_ms then
+		-- A backward clock change must not lower the session's high-water mark.
+		stream.last_event_ms = math.max(stream.last_event_ms or 0, now_ms)
+	end
+	client.stats.enqueued = client.stats.enqueued + 1
+	return true
+end
+
 function Client:session_start(props)
 	if self.initialized and self:timed_out_in_background() then
 		-- ⚠ A START PAST THE DEADLINE ENDS THE TIMED-OUT SESSION FIRST, at the
@@ -3042,8 +3055,8 @@ end
 -- lost, and must not count as a dropped event.
 --
 -- ⚠ THE NEW SESSION IS BUILT OFF TO THE SIDE and swapped in only once its
--- app.session_started is ACCEPTED into the queue. The start's event is stamped
--- from the new value (its id, sequence 1); a refused start therefore leaves
+-- complete end/start boundary is ACCEPTED into the queue. The start is stamped
+-- from the new value (its id, sequence 1); a refused replacement leaves
 -- the open session, its samplers and its sequence exactly as they were --
 -- nothing to roll back, because nothing was touched.
 function Client:start_session(props, fact)
@@ -3053,10 +3066,23 @@ function Client:start_session(props, fact)
 	if first then
 		self:adopt_sessionless_samplers(fresh)
 	end
-	local start_fact = { session_table = fresh, retryable = fact ~= nil and fact.retryable or nil }
-	local ok, err = self:enqueue_event("app.session_started", props, nil, start_fact)
+	local start_fact = { session_table = fresh, retryable = fact ~= nil and fact.retryable or nil,
+		stage = replaced ~= nil }
+	local ok, err, staged_start = self:enqueue_event("app.session_started", props, nil, start_fact)
 	if not ok then
 		return false, err
+	end
+	if replaced then
+		local ended, end_err, staged_end = self:enqueue_event("app.session_ended", { reason = "session_start" }, nil,
+			{ session_table = replaced, event_ts = staged_start.event.event_ts, stage = true })
+		if not ended then return false, end_err end
+		staged_end.now_ms = staged_start.now_ms
+		if queue.size(self.queue) + 2 > self.queue.limit then
+			if not start_fact.retryable then self.stats.dropped = self.stats.dropped + 1 end
+			return false, "queue_full"
+		end
+		commit_event(self, staged_end.event, staged_end.stream, staged_end.now_ms)
+		commit_event(self, staged_start.event, staged_start.stream, staged_start.now_ms)
 	end
 	local previous_session_id = (replaced or self.ended_session or {}).id
 	if first then
@@ -3778,7 +3804,8 @@ function Client:enqueue_event(event_name, props, context, fact)
 		props = props_snapshot,
 		context = context_snapshot,
 	}
-	local ok = queue.push(self.queue, event)
+	if fact and fact.stage then return true, nil, { event = event, stream = stream, now_ms = now_ms } end
+	local ok = commit_event(self, event, stream, now_ms)
 	if not ok then
 		-- The lazy session above was committed before the push. If the push
 		-- fails the event never enters the queue, so roll the session back —
@@ -3808,19 +3835,11 @@ function Client:enqueue_event(event_name, props, context, fact)
 		-- from, which rides with it. Other callers ignore the extra values.
 		return false, "queue_full", event, stream
 	end
-	stream.sequence = event.session_sequence
-	if now_ms then
-		-- The session boundary never stamps an end before this. A HIGH-WATER
-		-- MARK: an event stamped after the wall clock stepped back must not
-		-- lower it below an event the session already carries.
-		stream.last_event_ms = math.max(stream.last_event_ms or 0, now_ms)
-	end
 	if opened_lazy_session then
 		-- committed: the lazy first session keeps the samplers it adopted
 		self:renew_sessionless_samplers()
 	end
 	self:mirror_session()
-	self.stats.enqueued = self.stats.enqueued + 1
 	return true
 end
 
