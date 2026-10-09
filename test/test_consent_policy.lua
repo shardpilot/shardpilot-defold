@@ -1094,7 +1094,8 @@ local function run_example(between, window_events, dts, finalize, opts)
 			end
 			return true
 		end,
-		set_consent = function(value)
+		set_consent = function(value, notice)
+			if opts and opts.on_consent then opts.on_consent(value, notice) end
 			seen[#seen + 1] = "sdk.set_consent:" .. tostring(value)
 			if sdk_consent_refusals > 0 then
 				sdk_consent_refusals = sdk_consent_refusals - 1
@@ -1215,6 +1216,7 @@ local function run_example(between, window_events, dts, finalize, opts)
 				end
 			end
 			seen[#seen + 1] = "notice:default=" .. tostring(decision.analytics_choice_default)
+			if opts.before_notice_answer then opts.before_notice_answer() end
 			deliver(decision, function(default_answer)
 				if this_answer == nil then
 					callback(default_answer)
@@ -3835,7 +3837,31 @@ local function test_a_refusal_never_carries_an_advisory()
 	assert_true(decision.advisory == nil, "and no advisory reaches the host from it")
 end
 
+local function test_example_sends_the_presented_notice_tuple()
+	reset()
+	next_response_body = example_plan()
+	local shown = json.decode(next_response_body)
+	local called = false
+	run_example(nil, nil, nil, false, {
+		age_band = function() return "adult" end,
+		answer = true,
+		before_notice_answer = function()
+			next_response_body = example_plan({ policy_version = "synthetic-new-policy" })
+		end,
+		on_consent = function(_, notice)
+			called = true
+			assert_true(type(notice) == "table", "example must forward the presented notice")
+			assert_equal(notice.notice_version, shown.consent_text_version)
+			assert_equal(notice.notice_locale, shown.presented_language)
+			assert_equal(notice.policy_version, shown.policy_version, "later policy cannot relabel the presented notice")
+			assert_true(notice.notice == nil, "notice text stays out of the carrier")
+		end,
+	})
+	assert_true(called, "real example must reach the setter")
+end
+
 local tests = {
+	test_example_sends_the_presented_notice_tuple,
 	test_known_operation_blocks_survive_fallbacks,
 	test_unlearned_block_fallback_is_empty,
 	test_operation_blocks_survive_invalidation,

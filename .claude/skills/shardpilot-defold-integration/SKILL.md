@@ -326,7 +326,7 @@ host-requirements list:
 -- trail as a player changing their mind.
 -- Returns whether the fresh answer was CONSUMED — false means the write is
 -- owed and the caller must keep it pending.
-local function start_analytics(granted, decision, newly_answered)
+local function start_analytics(granted, decision, newly_answered, notice)
 	-- ⚠ init CAN FAIL, and a lane marked running on a client that was never
 	-- built is a lane final() will try to shut down and update() will try to
 	-- drive.
@@ -396,11 +396,14 @@ local function start_analytics(granted, decision, newly_answered)
 	-- write. Starting the session anyway would emit events under a grant that
 	-- was never recorded, which is the one ordering the consent outbox exists
 	-- to prevent. The answer stays pending and is retried on the next trigger.
-	local recorded, consent_err = shardpilot.set_consent(granted)
+	local recorded, consent_err, consent_warning = shardpilot.set_consent(granted, notice)
 	if not recorded then
 		print("shardpilot consent not recorded: " .. tostring(consent_err) ..
 			"; owed (retrying it is the host's — see the README)")
 		return false
+	end
+	if consent_warning then
+		print("shardpilot consent applied with warning: " .. consent_warning)
 	end
 	if granted then
 		shardpilot.session_start()
@@ -594,12 +597,20 @@ reconcile = function(fresh)
 		end
 	elseif not analytics_running then
 		if answered then
-			if start_analytics(answered.granted, fresh, answered.fresh_answer == true) then
+			if start_analytics(answered.granted, fresh, answered.fresh_answer == true, answered.notice) then
 				answered.fresh_answer = nil
 			end
 		elseif not notice_open then
 			notice_open = true
 			local generation = notice_generation
+			local presented_notice
+			if fresh.plan_used then
+				presented_notice = {
+					notice_version = fresh.consent_text_version,
+					notice_locale = fresh.presented_language,
+					policy_version = fresh.policy_version,
+				}
+			end
 			present_consent_notice(fresh, function(granted)
 				if generation ~= notice_generation then
 					-- The band was corrected while this screen was open. The
@@ -613,6 +624,7 @@ reconcile = function(fresh)
 				answered = {
 					text_version = fresh.consent_text_version,
 					language = fresh.presented_language,
+					notice = presented_notice,
 					granted = granted,
 					-- The BASIS the answer was given under. A non-objection
 					-- does not satisfy a regime that requires an explicit
