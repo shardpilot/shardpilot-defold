@@ -117,9 +117,32 @@ local function normalize_positive_number(value, default_value, error_code)
 	return value
 end
 
+local config_keys = {
+	anonymous_id = true,
+	app_build = true,
+	app_id = true,
+	app_version = true,
+	capture_previous_on_boot = true,
+	crash_api_key = true,
+	crash_component = true,
+	crash_ingest_url = true,
+	crash_source = true,
+	diagnostics = true,
+	platform = true,
+	publish_timeout_seconds = true,
+	sample_every = true,
+	sampler = true,
+	script_error_capture_enabled = true,
+	session_id = true,
+}
+
 local function validate_config(config)
 	if type(config) ~= "table" then
 		return nil, "config_required"
+	end
+	-- Enumerate the supplied keys directly; a __pairs hook cannot hide one.
+	for key in next, config do
+		if not config_keys[key] then return nil, "unknown_config_key" end
 	end
 	local required = { "crash_ingest_url", "app_id" }
 	for _, key in ipairs(required) do

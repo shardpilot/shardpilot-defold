@@ -16,6 +16,12 @@ independent of the analytics client.
 
 ## Configuration
 
+Unknown keys, including misspelled options or analytics-only options, are refused
+with `unknown_config_key` before any storage or HTTP work. `crash.new()` returns
+`nil, code`; `crash.init()` returns `false, code` and keeps its previous client.
+Both the preferred `crash_component` and the deprecated `crash_source` option
+remain supported.
+
 ```lua
 local crash = require "shardpilot.crash"
 

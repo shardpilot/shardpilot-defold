@@ -2,6 +2,13 @@
 
 ### Unreleased
 
+- Analytics and crash constructors now reject unsupported configuration keys
+  with `unknown_config_key` instead of silently ignoring them. This includes
+  misspellings and options belonging to the other client. Remove unsupported
+  keys before upgrading; existing supported options keep their behavior.
+  Analytics `transport` is an optional string label for network summaries;
+  non-string values now return `invalid_transport` before storage or wire work.
+
 - `set_consent` now reports applied decisions with `true, nil, warning` when
   identity persistence, spool purge or receipt persistence remains owed.
   Refused decisions retain `false, code`. Read the third return value for

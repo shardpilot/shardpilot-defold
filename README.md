@@ -606,6 +606,11 @@ README, `docs/`, and the skill above are the reference.
 `workspace_id`, `app_id`, `environment_id`, and **exactly one** of
 `token_provider` (Mode B) or `api_key` (Mode A) — see [Authentication](#authentication).
 
+Unsupported keys return `unknown_config_key`, including misspellings and keys
+belonging to the other client. A constructor returns `nil, code`; a facade
+`init` returns `false, code`, before storage, token callbacks or HTTP work.
+See the [configuration guide](docs/configuration.md) for the error behavior.
+
 The module holds one default client. While it is being constructed or remains
 live, another `init(config)` returns `false, "already_initialized"` without
 constructing a replacement. Retry `shutdown()` until it succeeds before calling
@@ -624,6 +629,7 @@ initialization attempt. `new(config)` creates an independent client instance.
 | `token_provider` | — | **Mode B** (one of `token_provider`/`api_key` required): `function(callback)` → `callback(token, expires_at_unix_ms, err)` |
 | `api_key` | — | **Mode A** (one of `token_provider`/`api_key` required): non-secret publishable `sp_ingest_…` key used directly as the `Bearer` |
 | `source` | `"client"` | One of `client`, `server`, `backend` |
+| `transport` | omitted | Optional string label on `network_summary`, such as `"websocket"`; non-strings return `invalid_transport`. This does not select the SDK HTTP transport. |
 | `app_version` | `nil` | Sent in the envelope |
 | `app_build` | `nil` | Sent in the envelope |
 | `platform` | auto-detected | Analytics uses the detected or configured canonical value; missing or unknown values use `other`. See `docs/configuration.md`. |

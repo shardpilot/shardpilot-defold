@@ -523,9 +523,49 @@ local function resolve_envelope_platform(config, diagnostics)
 	return "other"
 end
 
+local config_keys = {
+	anonymous_id = true,
+	api_key = true,
+	app_build = true,
+	app_id = true,
+	app_version = true,
+	batch_size = true,
+	buffer_size = true,
+	consent_kind_emission_enabled = true,
+	diagnostics = true,
+	environment_id = true,
+	experiments_enabled = true,
+	flush_interval_seconds = true,
+	ingest_url = true,
+	platform = true,
+	publish_timeout_seconds = true,
+	rejection_capacity = true,
+	remote_config_attributes_enabled = true,
+	remote_config_url = true,
+	request_compression_enabled = true,
+	schema_revision = true,
+	session_timeout_seconds = true,
+	source = true,
+	spool_enabled = true,
+	spool_max_bytes = true,
+	spool_max_events = true,
+	token_provider = true,
+	token_refresh_lead_ms = true,
+	transport = true,
+	user_id = true,
+	workspace_id = true,
+}
+
 local function validate_config(config, diagnostics)
 	if type(config) ~= "table" then
 		return nil, "config_required"
+	end
+	-- Enumerate the supplied keys directly; a __pairs hook cannot hide one.
+	for key in next, config do
+		if not config_keys[key] then return nil, "unknown_config_key" end
+	end
+	if config.transport ~= nil and type(config.transport) ~= "string" then
+		return nil, "invalid_transport"
 	end
 	local required = { "ingest_url", "workspace_id", "app_id", "environment_id" }
 	for _, key in ipairs(required) do

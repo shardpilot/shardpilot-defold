@@ -15153,3 +15153,154 @@ end)()
 	print(string.format("Consent results: %d passed, %d failed", passed, failed))
 	assert_equal(failed, 0, "consent result scene failures")
 end)()
+
+-- Configuration rejects unsupported keys and non-string network labels before effects.
+;(function()
+	local scenes = {}
+	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
+	local function fresh(run)
+		reset(); storage.reset()
+		local _, restore = install_stub_sys_storage()
+		local counts = { reads = 0, writes = 0, tokens = 0 }
+		local load, save = sys.load, sys.save
+		sys.load = function(...) counts.reads = counts.reads + 1; return load(...) end
+		sys.save = function(...) counts.writes = counts.writes + 1; return save(...) end
+		local ok, err = pcall(run, counts)
+		restore(); storage.reset()
+		assert_true(ok, err)
+	end
+	local function options(kind, counts)
+		if kind == "analytics" then
+			return config({ app_id = "synthetic-config", anonymous_id = "synthetic-actor", token_provider = function(cb)
+				counts.tokens = counts.tokens + 1; cb("synthetic-fixture", nil, nil)
+			end })
+		end
+		return { crash_ingest_url = "http://localhost:8080", app_id = "synthetic-config-crash", crash_api_key = "synthetic-fixture", capture_previous_on_boot = false }
+	end
+	local function facade(kind) return dofile(kind == "analytics" and "shardpilot/sdk.lua" or "shardpilot/crash.lua") end
+	local function refused(module, api, opts, code, counts)
+		local ok, err = module[api](opts)
+		assert_equal(not not ok, false, "constructor must refuse")
+		assert_equal(err, code)
+		assert_equal(counts.reads, 0, "no storage read before refusal")
+		assert_equal(counts.writes, 0, "no storage write before refusal")
+		assert_equal(counts.tokens, 0, "no token callback before refusal")
+		assert_equal(#requests, 0, "no HTTP before refusal")
+	end
+	for _, kind in ipairs({ "analytics", "crash" }) do
+		for _, api in ipairs({ "new", "init" }) do
+			for _, entry in ipairs({ { "arbitrary", "synthetic_unknown_option" }, { "typo", "diagnositcs" }, { "empty", "" }, { "numeric", 1 }, { "boolean", false }, { "table", {} }, { "other-plane", kind == "analytics" and "crash_ingest_url" or "workspace_id" } }) do
+				scene(kind .. " " .. api .. " unknown " .. entry[1], function()
+					fresh(function(counts)
+						local opts = options(kind, counts); opts[entry[2]] = true
+						refused(facade(kind), api, opts, "unknown_config_key", counts)
+					end)
+				end)
+			end
+			scene(kind .. " " .. api .. " raw keys ignore pairs masking", function()
+				fresh(function(counts)
+					local opts = options(kind, counts); opts.synthetic_hidden_key = true
+					setmetatable(opts, { __pairs = function() return next, {}, nil end })
+					refused(facade(kind), api, opts, "unknown_config_key", counts)
+				end)
+			end)
+			scene(kind .. " " .. api .. " supported key census", function()
+				fresh(function(counts)
+					local opts = options(kind, counts)
+					local extra
+					if kind == "analytics" then
+						extra = {
+							api_key = "sp_ingest_synthetic",
+							remote_config_url = "http://localhost:8081",
+							user_id = "synthetic-user",
+							app_version = "1.0",
+							app_build = "1",
+							source = "client",
+							schema_revision = false,
+							consent_kind_emission_enabled = false,
+							request_compression_enabled = false,
+							platform = "linux",
+							transport = "websocket",
+							experiments_enabled = true,
+							remote_config_attributes_enabled = true,
+							diagnostics = function() end,
+							rejection_capacity = 8,
+							batch_size = 10,
+							buffer_size = 20,
+							flush_interval_seconds = 5,
+							session_timeout_seconds = 30,
+							publish_timeout_seconds = 2,
+							token_refresh_lead_ms = 100,
+							spool_enabled = false,
+							spool_max_events = 50,
+							spool_max_bytes = 4096,
+						}
+					else
+						extra = {
+							app_version = "1.0",
+							app_build = "1",
+							crash_component = "synthetic-component",
+							crash_source = "synthetic-legacy-component",
+							platform = "Linux",
+							sample_every = 1,
+							publish_timeout_seconds = 2,
+							diagnostics = function() end,
+							sampler = function() return true end,
+							anonymous_id = function() return "synthetic-actor" end,
+							session_id = function() return "synthetic-session" end,
+							script_error_capture_enabled = false,
+						}
+					end
+					for key, value in pairs(extra) do opts[key] = value end
+					local count = 0; for _ in pairs(opts) do count = count + 1 end
+					assert_equal(count, kind == "analytics" and 30 or 16, "all supported caller keys are exercised")
+					local ok, err = facade(kind)[api](opts); assert_true(ok, err)
+					assert_true(counts.reads > 0, "real accepted constructor reached storage")
+				end)
+			end)
+			scene(kind .. " " .. api .. " invalid known field control", function()
+				fresh(function(counts)
+					local opts = options(kind, counts); local key = kind == "analytics" and "ingest_url" or "crash_ingest_url"; opts[key] = 12
+					refused(facade(kind), api, opts, "invalid_" .. key, counts)
+				end)
+			end)
+		end
+	end
+	for _, api in ipairs({ "new", "init" }) do
+		for _, entry in ipairs({ { "false", false }, { "true", true }, { "number", 4 }, { "object", { synthetic = "object" } }, { "function", function() end }, { "thread", coroutine.create(function() end) } }) do
+			scene("analytics " .. api .. " invalid transport " .. entry[1], function()
+				fresh(function(counts)
+					local opts = options("analytics", counts); opts.transport = entry[2]
+					refused(facade("analytics"), api, opts, "invalid_transport", counts)
+				end)
+			end)
+		end
+		for _, label in ipairs({ "omitted", "", "websocket", "synthetic-protocol" }) do
+			scene("analytics " .. api .. " transport wire control " .. label, function()
+				fresh(function(counts)
+					local opts = options("analytics", counts); if label ~= "omitted" then opts.transport = label end
+					local mod = facade("analytics"); local client, err = mod[api](opts); assert_true(client, err)
+					local function call(name, ...) if api == "new" then return client[name](client, ...) end; return mod[name](...) end
+					assert_true(call("set_consent", true)); assert_true(call("session_start")); call("observe_ping_ms", 12); assert_true(call("flush"))
+					local found = false
+					for _, request in ipairs(requests) do
+						if request.url:find("/v1/events:batch", 1, true) and request.body:find('"event_name":"network_summary"', 1, true) then
+							found = true
+							if label == "omitted" then assert_not_contains(request.body, '"transport":')
+							else assert_contains(request.body, '"transport":' .. encode_string(label)) end
+						end
+					end
+					assert_true(found, "real client emitted network summary")
+				end)
+			end)
+		end
+	end
+	local passed, failed = 0, 0
+	for _, entry in ipairs(scenes) do
+		local ok, err = pcall(entry.run)
+		if ok then passed = passed + 1 else failed = failed + 1 end
+		print("config validation scene " .. entry.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	print(string.format("Config validation: %d passed, %d failed", passed, failed))
+	assert_equal(failed, 0, "config validation scene failures")
+end)()
