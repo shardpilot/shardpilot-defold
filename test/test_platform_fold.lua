@@ -194,17 +194,25 @@ end
 
 -- 8. THE CRASH PLATFORM IS NOT THIS FIELD.
 --
--- The worst case for the exception: the host hands ONE table to both
--- constructors. A crash platform may be any lowercase token and rides the group
--- fingerprint, so a fold reaching it would refingerprint existing crash groups.
+-- Each constructor owns its key set. A mixed table is refused; carrying the
+-- same platform into valid per-client tables must still preserve crash groups.
 do
 	local shared = base_config({
 		platform = "Win64_Shipping",
 		crash_ingest_url = "https://crash.example.com",
 		crash_api_key = "sp_crash_write_key",
 	})
-	local analytics = assert(client_mod.new(shared))
-	local crash = assert(crash_client.new(shared))
+	local invalid, err = client_mod.new(shared)
+	check(invalid == nil and err == "unknown_config_key", "analytics accepted crash-only keys")
+	invalid, err = crash_client.new(shared)
+	check(invalid == nil and err == "unknown_config_key", "crash accepted analytics-only keys")
+	local analytics_options = base_config({ platform = shared.platform })
+	local crash_options = { platform = shared.platform, app_id = shared.app_id,
+		crash_ingest_url = shared.crash_ingest_url, crash_api_key = shared.crash_api_key }
+	local analytics = assert(client_mod.new(analytics_options))
+	local crash = assert(crash_client.new(crash_options))
+	check(analytics_options.platform == shared.platform, "analytics config platform was mutated")
+	check(crash_options.platform == shared.platform, "crash config platform was mutated")
 	check(shared.platform == "Win64_Shipping", "the fold mutated the caller's own table")
 	check(crash.config.platform == "Win64_Shipping",
 		"the fold reached the CRASH wire: crash platform is "

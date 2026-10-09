@@ -1,6 +1,22 @@
 # Configuration
 
-ShardPilot Defold SDK v0 is configured with a Lua table:
+ShardPilot Defold SDK v0 is configured with a Lua table. Unsupported keys,
+including misspellings, return `unknown_config_key`: `new()` returns `nil, code`
+and `init()` returns `false, code`. Validation happens before storage, token
+callbacks or HTTP requests. Pass analytics options only to the analytics client;
+crash has its own configuration. An already initialized analytics facade still
+returns `already_initialized` before attempting replacement.
+
+Constructors capture the table's raw entries once before validation or host
+hooks. Metatable-provided fields are absent; use explicit table entries for
+required options. Later changes to the caller's table do not change the captured
+configuration. Function options retain their normal callback behavior.
+
+The optional `transport` setting is a string label included in
+`network_summary`, for example `"websocket"`. Omit it to omit that property.
+Empty and custom strings are accepted; there is no fixed protocol list. It does
+not select the SDK's HTTP transport. A non-string value returns
+`invalid_transport` at construction.
 
 ```lua
 {
@@ -17,6 +33,8 @@ ShardPilot Defold SDK v0 is configured with a Lua table:
   app_version = "1.0.0",
   app_build = "100",
   source = "client",
+  -- Optional network-summary label (not the SDK HTTP implementation):
+  -- transport = "websocket",
   -- Auth: configure EXACTLY ONE of token_provider (Mode B) or
   -- api_key (Mode A). See "Authentication modes" below.
   token_provider = function(callback)

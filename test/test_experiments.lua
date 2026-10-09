@@ -575,9 +575,13 @@ local function test_no_host_override_path_for_subject_id()
 	reset()
 	seed_granted_consent()
 	local injected = "spcid_" .. string.rep("c", 32)
-	-- A config field carrying a subject id is not part of the configuration
-	-- contract and must be ignored outright.
-	local client = assert(sdk.new(config({ experiments_client_id = injected })))
+	-- A host-supplied subject id is outside the configuration contract.
+	-- Refuse the unsupported key before any assignment request is possible.
+	local invalid, err = sdk.new(config({ experiments_client_id = injected }))
+	assert_equal(invalid, nil)
+	assert_equal(err, "unknown_config_key")
+	assert_equal(#requests, 0)
+	local client = assert(sdk.new(config()))
 	next_response_body = assignment_body()
 	fetch(client, "exp-checkout")
 	local params = query_params(last_assignment_request().url)

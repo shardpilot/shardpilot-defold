@@ -523,9 +523,56 @@ local function resolve_envelope_platform(config, diagnostics)
 	return "other"
 end
 
-local function validate_config(config, diagnostics)
+local config_keys = {
+	anonymous_id = true,
+	api_key = true,
+	app_build = true,
+	app_id = true,
+	app_version = true,
+	batch_size = true,
+	buffer_size = true,
+	consent_kind_emission_enabled = true,
+	diagnostics = true,
+	environment_id = true,
+	experiments_enabled = true,
+	flush_interval_seconds = true,
+	ingest_url = true,
+	platform = true,
+	publish_timeout_seconds = true,
+	rejection_capacity = true,
+	remote_config_attributes_enabled = true,
+	remote_config_url = true,
+	request_compression_enabled = true,
+	schema_revision = true,
+	session_timeout_seconds = true,
+	source = true,
+	spool_enabled = true,
+	spool_max_bytes = true,
+	spool_max_events = true,
+	token_provider = true,
+	token_refresh_lead_ms = true,
+	transport = true,
+	user_id = true,
+	workspace_id = true,
+}
+
+local function snapshot_config(config)
 	if type(config) ~= "table" then
 		return nil, "config_required"
+	end
+	-- Capture raw entries once, before hooks or validation. Metamethods cannot
+	-- supply a different value later or conceal an unsupported option.
+	local snapshot = {}
+	for key, value in next, config do
+		if not config_keys[key] then return nil, "unknown_config_key" end
+		snapshot[key] = value
+	end
+	return snapshot
+end
+
+local function validate_config(config, diagnostics)
+	if config.transport ~= nil and type(config.transport) ~= "string" then
+		return nil, "invalid_transport"
 	end
 	local required = { "ingest_url", "workspace_id", "app_id", "environment_id" }
 	for _, key in ipairs(required) do
@@ -760,6 +807,9 @@ local function new_session(session_id)
 end
 
 function M.new(config, defer_init_diagnostics)
+	local snapshot, snapshot_err = snapshot_config(config)
+	if not snapshot then return nil, snapshot_err end
+	config = snapshot
 	-- Buffer the shared hook before validation: configuration warnings and all
 	-- constructor/subcomponent diagnostics must cross the same adoption boundary.
 	-- Keep the caller's configuration and the synchronous stats latches intact.

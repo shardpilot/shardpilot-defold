@@ -117,10 +117,40 @@ local function normalize_positive_number(value, default_value, error_code)
 	return value
 end
 
-local function validate_config(config)
+local config_keys = {
+	anonymous_id = true,
+	app_build = true,
+	app_id = true,
+	app_version = true,
+	capture_previous_on_boot = true,
+	crash_api_key = true,
+	crash_component = true,
+	crash_ingest_url = true,
+	crash_source = true,
+	diagnostics = true,
+	platform = true,
+	publish_timeout_seconds = true,
+	sample_every = true,
+	sampler = true,
+	script_error_capture_enabled = true,
+	session_id = true,
+}
+
+local function snapshot_config(config)
 	if type(config) ~= "table" then
 		return nil, "config_required"
 	end
+	-- Capture raw entries once, before hooks or validation. Metamethods cannot
+	-- supply a different value later or conceal an unsupported option.
+	local snapshot = {}
+	for key, value in next, config do
+		if not config_keys[key] then return nil, "unknown_config_key" end
+		snapshot[key] = value
+	end
+	return snapshot
+end
+
+local function validate_config(config)
 	local required = { "crash_ingest_url", "app_id" }
 	for _, key in ipairs(required) do
 		if config[key] == nil or config[key] == "" then
@@ -254,6 +284,9 @@ local Client = {}
 Client.__index = Client
 
 function M.new(config)
+	local snapshot, snapshot_err = snapshot_config(config)
+	if not snapshot then return nil, snapshot_err end
+	config = snapshot
 	local normalized, err = validate_config(config)
 	if not normalized then
 		return nil, err
