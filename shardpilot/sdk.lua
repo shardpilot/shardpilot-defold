@@ -2,6 +2,7 @@ local client_mod = require "shardpilot.client"
 
 local M = {}
 local default_client = nil
+local initializing = false
 local pending_init_flush = nil
 local active_init_drain = nil
 
@@ -49,7 +50,14 @@ function M.new(config)
 end
 
 function M.init(config)
-	local client, err, flush_init_diagnostics = client_mod.new(config, true)
+	if default_client or initializing then
+		return false, "already_initialized"
+	end
+	-- Reserve the singleton before construction can invoke a host hook.
+	initializing = true
+	local constructed, client, err, flush_init_diagnostics = pcall(client_mod.new, config, true)
+	initializing = false
+	if not constructed then error(client, 0) end
 	if not client then
 		return false, err
 	end
@@ -98,7 +106,7 @@ function M.get_session_id()
 end
 
 function M.get_anonymous_id()
-	return with_default("get_anonymous_id")
+	return value_from_default("get_anonymous_id")
 end
 
 -- Record an explicit analytics consent decision: true (granted), false

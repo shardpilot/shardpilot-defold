@@ -2,6 +2,11 @@
 
 ### Unreleased
 
+- The module's `init(config)` refuses another initialization while its default
+  client is live or being constructed, returning `false, "already_initialized"`.
+  Call `shutdown()` successfully before initializing a replacement. The module's
+  `get_anonymous_id()` returns `nil` when no default client is installed.
+
 - Analytics preserves all twelve canonical platform values and uses `other`
   when configuration or detection cannot supply one. Existing aliases and
   diagnostics remain; present stored platform fields use the same fallback.

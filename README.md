@@ -606,6 +606,12 @@ README, `docs/`, and the skill above are the reference.
 `workspace_id`, `app_id`, `environment_id`, and **exactly one** of
 `token_provider` (Mode B) or `api_key` (Mode A) — see [Authentication](#authentication).
 
+The module holds one default client. While it is being constructed or remains
+live, another `init(config)` returns `false, "already_initialized"` without
+constructing a replacement. Retry `shutdown()` until it succeeds before calling
+`init` again. A refused configuration leaves the module available for another
+initialization attempt. `new(config)` creates an independent client instance.
+
 | Field | Default | Notes |
 |---|---|---|
 | `ingest_url` | — (required) | `https://…`, or `http://` only for `localhost`/`127.0.0.1`/`::1`; no query/fragment/path |
@@ -647,7 +653,7 @@ let any `fetch_remote_config()` callback of the old client run, then create
 the next one. Clients of different apps are independent; create each with
 `new(config)` and keep every instance (`init` holds one default client). Ids
 that differ only in characters other than letters, digits, `-` and `_` count
-as one app. The SDK does not yet refuse a second client of a live app
+as one app. `new(config)` does not yet refuse a second client of a live app
 ([#146](https://github.com/shardpilot/shardpilot-defold/issues/146)); see
 [`docs/configuration.md`](docs/configuration.md#one-client-per-app).
 
@@ -1710,6 +1716,8 @@ top-level one.
   Lua test host) it degrades gracefully to in-memory state. `get_anonymous_id()`
   returns the persisted anonymous ID so a host can hand it to its own backend at
   token-mint time (Mode B); the SDK always sends that same anonymous ID on the wire.
+  The module getter returns `nil` before initialization and after successful
+  shutdown; it keeps returning the current ID while shutdown still needs retrying.
 - **`set_consent(decision)`** records an explicit decision — `true`
   (granted), `false` (denied), or the string `"denied_forced_minor"` — over
   the states `unknown` (the default), `granted`, `denied`, and
