@@ -1748,9 +1748,9 @@ local function test_set_consent_reports_persist_failure()
 
 	local client = assert(sdk.new(config()))
 	assert_true(client:identify("user-example"))
-	local ok, err = client:set_consent(false)
-	assert_equal(ok, false)
-	assert_equal(err, "consent_persist_failed")
+	local ok, err, warning = client:set_consent(false)
+	assert_equal(ok, true)
+	assert_equal(warning, "consent_persist_failed")
 	assert_equal(client:snapshot().consent_persist_failed, 1)
 	assert_equal(client:snapshot().last_consent_error, "consent_persist_failed")
 
@@ -4325,9 +4325,9 @@ local function test_denial_marker_imposes_over_stale_granted_record()
 		end
 		return real_save(path, record)
 	end
-	local ok, err = client:set_consent(false)
-	assert_equal(ok, false)
-	assert_equal(err, "consent_persist_failed")
+	local ok, err, warning = client:set_consent(false)
+	assert_equal(ok, true)
+	assert_equal(warning, "consent_persist_failed")
 	local identity_path = nil
 	local marker_record = nil
 	for path, record in pairs(stores) do
@@ -4389,9 +4389,9 @@ local function test_denial_marker_preserves_forced_minor_flavor()
 		end
 		return real_save(path, record)
 	end
-	local ok, err = client:set_consent("denied_forced_minor")
-	assert_equal(ok, false)
-	assert_equal(err, "consent_persist_failed")
+	local ok, err, warning = client:set_consent("denied_forced_minor")
+	assert_equal(ok, true)
+	assert_equal(warning, "consent_persist_failed")
 	sys.save = real_save
 	reset()
 	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
@@ -4420,8 +4420,9 @@ local function test_foreign_actor_denial_marker_stays_inert_and_undeleted()
 		end
 		return real_save(path, record)
 	end
-	local ok = client:set_consent(false)
-	assert_equal(ok, false, "the denial persist fails, arming the marker")
+	local ok, _, warning = client:set_consent(false)
+	assert_equal(ok, true, "the denial applies despite the failed identity write")
+	assert_equal(warning, "consent_persist_failed", "the denial persist fails, arming the marker")
 	sys.save = real_save
 
 	reset()
@@ -4547,9 +4548,9 @@ local function test_same_second_denial_tie_imposes_fail_closed()
 		end
 		return real_save(path, record)
 	end
-	local ok, err = client:set_consent(false)
-	assert_equal(ok, false)
-	assert_equal(err, "consent_persist_failed")
+	local ok, err, warning = client:set_consent(false)
+	assert_equal(ok, true)
+	assert_equal(warning, "consent_persist_failed")
 	sys.save = real_save
 	local identity_path = nil
 	for path in pairs(stores) do
@@ -4774,9 +4775,9 @@ local function test_shutdown_refuses_while_witness_receipt_in_flight()
 		return real_save(path, record)
 	end
 	local held, restore_http = hold_http_requests()
-	local ok, err = client:set_consent(false)
-	assert_equal(ok, false)
-	assert_equal(err, "consent_persist_failed")
+	local ok, err, warning = client:set_consent(false)
+	assert_equal(ok, true)
+	assert_equal(warning, "consent_persist_failed")
 	assert_equal(#held, 1, "the denial receipt is on the wire")
 	-- The in-flight receipt must NOT count as the denial's durable witness:
 	-- shutdown stays refusable until a settled witness exists.
@@ -4834,9 +4835,9 @@ local function test_ack_prune_hands_witness_to_marker()
 		return real_save(path, record)
 	end
 	local held, restore_http = hold_http_requests()
-	local ok, err = client:set_consent(false)
-	assert_equal(ok, false)
-	assert_equal(err, "consent_persist_failed")
+	local ok, err, warning = client:set_consent(false)
+	assert_equal(ok, true)
+	assert_equal(warning, "consent_persist_failed")
 	-- The marker path heals while the POST is on the wire (the identity
 	-- store stays broken): the ack's handoff must land the marker before
 	-- consuming the receipt.
@@ -4954,9 +4955,9 @@ local function test_shutdown_refuses_denial_with_no_durable_witness()
 		end
 		return real_save(path, record)
 	end
-	local ok, err = client:set_consent(false)
-	assert_equal(ok, false)
-	assert_equal(err, "consent_persist_failed")
+	local ok, err, warning = client:set_consent(false)
+	assert_equal(ok, true)
+	assert_equal(warning, "consent_persist_failed")
 	assert_equal(#client.consent_outbox, 0,
 		"the receipt delivered and left the outbox")
 
@@ -5223,9 +5224,9 @@ local function test_set_consent_denied_reports_failed_spool_purge_and_retries()
 
 	local heal = break_spool_saves()
 	next_status = 202
-	local ok, err = client:set_consent(false)
-	assert_equal(ok, false)
-	assert_equal(err, "spool_purge_failed")
+	local ok, err, warning = client:set_consent(false)
+	assert_equal(ok, true)
+	assert_equal(warning, "spool_purge_failed")
 	assert_equal(client.spool_purge_pending, true)
 	assert_equal(#storage.load_spool(spool_scope), 1, "the record is still on disk")
 	assert_equal(#client.spool_record, 0, "the in-memory spool is already cleared")
@@ -5500,9 +5501,9 @@ local function test_grant_blocked_until_owed_purge_lands()
 
 	local heal = break_spool_saves()
 	next_status = 202
-	local ok, err = client:set_consent(false)
-	assert_equal(ok, false)
-	assert_equal(err, "spool_purge_failed")
+	local ok, err, warning = client:set_consent(false)
+	assert_equal(ok, true)
+	assert_equal(warning, "spool_purge_failed")
 	assert_equal(#requests, 2, "the denial receipt is still reported")
 
 	-- the grant is refused while the purge is owed; the persisted decision
@@ -5631,8 +5632,7 @@ end
 
 -- denied_forced_minor is persisted, reloads as the same state, discards a
 -- retained batch when it lands mid-flight, purges the durable spool exactly
--- like a denial, and a later explicit choice (the band-correction
--- path) supersedes it with a fresh, reason-less receipt.
+-- like a denial, and an ordinary grant remains refused after restart.
 local function test_forced_minor_persists_and_gates_like_denied()
 	reset()
 	storage.reset()
@@ -5669,13 +5669,12 @@ local function test_forced_minor_persists_and_gates_like_denied()
 	assert_equal(ok, false)
 	assert_equal(err, "invalid_consent")
 
-	-- the band-correction path: a later explicit grant supersedes the forced
-	-- state; its receipt carries no reason
-	assert_true(second:set_consent(true))
-	assert_equal(second.consent_state, "granted")
-	assert_equal(#requests, 1)
-	assert_contains(requests[1].body, '"categories":{"analytics":true}')
-	assert_not_contains(requests[1].body, '"reason"')
+	-- An ordinary grant is not an authorized age-band reversal.
+	ok, err = second:set_consent(true)
+	assert_equal(ok, false)
+	assert_equal(err, "consent_forced_minor")
+	assert_equal(second.consent_state, "denied_forced_minor")
+	assert_equal(#requests, 0, "refused grant sends no receipt")
 	restore()
 	storage.reset()
 end
@@ -7523,7 +7522,7 @@ local function test_override_mismatch_purge_failure_fails_closed()
 end
 
 -- A failed durable append is SURFACED, not silent: set_consent returns
--- false, "consent_outbox_persist_failed" while the undelivered receipt exists
+-- true, nil, "consent_outbox_persist_failed" while the undelivered receipt exists
 -- only in memory (delivery is still attempted — the server-side record is the
 -- point; durability is the process-death backstop). persist() retries the
 -- owed write even with the event spool disabled — the outbox is independent
@@ -7544,9 +7543,9 @@ local function test_set_consent_surfaces_receipt_persist_failure()
 	next_status = 500
 	local client = assert(sdk.new(config({ spool_enabled = false })))
 	assert_true(client:identify("user-example"))
-	local ok, err = client:set_consent(false)
-	assert_equal(ok, false)
-	assert_equal(err, "consent_outbox_persist_failed",
+	local ok, err, warning = client:set_consent(false)
+	assert_equal(ok, true)
+	assert_equal(warning, "consent_outbox_persist_failed",
 		"an undelivered receipt without a durable copy must be surfaced")
 	assert_equal(client:snapshot().consent_outbox_persist_failed >= 1, true)
 	assert_equal(#client.consent_outbox, 1, "the receipt still delivers from memory")
@@ -12444,10 +12443,10 @@ end)()
 		if path:sub(-9) == "/identity" then return false end
 		return real_save(path, record)
 	end
-	local kok, kerr = kc:set_consent(false)
+	local kok, kerr, warning = kc:set_consent(false)
 	sys.save = real_save
-	assert_equal(kok, false, "the identity write failed, which is the path under test")
-	assert_equal(kerr, "consent_persist_failed")
+	assert_equal(kok, true, "the identity write failed, which is the path under test")
+	assert_equal(warning, "consent_persist_failed")
 	local mpath = nil
 	for path in pairs(kstores) do
 		if path:sub(-15) == "/consent-denial" then mpath = path end
@@ -12490,9 +12489,10 @@ end)()
 		if path:sub(-9) == "/identity" then return false end
 		return l_real_save(path, record)
 	end
-	local lok = lb:set_consent(false)
+	local lok, _, lwarning = lb:set_consent(false)
 	sys.save = l_real_save
-	assert_equal(lok, false, "the identity save failed, which is the path under test")
+	assert_equal(lok, true, "the denial applied")
+	assert_equal(lwarning, "consent_persist_failed", "the identity save failed, which is the path under test")
 	local lmpath = nil
 	for path in pairs(lstores) do
 		if path:sub(-15) == "/consent-denial" then lmpath = path end
@@ -13289,7 +13289,7 @@ end)()
 	local cases = {}
 	local clock = require "shardpilot.clock"
 	local function fresh(source)
-		reset()
+		reset(); storage.reset()
 		seed_granted_consent()
 		window = W
 		return assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999,
@@ -13308,6 +13308,18 @@ end)()
 		end
 		return events
 	end
+	local function regrant(client, denial)
+		local ok, code = client:set_consent(true)
+		if denial == "denied_forced_minor" then
+			assert_equal(ok, false); assert_equal(code, "consent_forced_minor")
+			assert_equal(client:get_consent_state(), "denied_forced_minor")
+			assert_equal(client:track("still_denied"), false)
+			assert_equal(#client.queue.items, 0, "forced-minor grant cannot restart analytics")
+			return false
+		end
+		assert_true(ok, code)
+		return true
+	end
 	for _, decision in ipairs({ false, "denied_forced_minor" }) do
 		local deny = decision
 		for _, seconds in ipairs({ 5, 40 }) do
@@ -13319,7 +13331,7 @@ end)()
 				pause(client)
 				assert_true(client:set_consent(deny))
 				socket.now = socket.now + away
-				assert_true(client:set_consent(true))
+				if not regrant(client, deny) then return end
 				local regrant = clock.iso_utc()
 				assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
 				assert_equal(#named(client, "app.session_ended"), 0, "no end for the denied interval")
@@ -13345,7 +13357,7 @@ end)()
 			socket.now = socket.now + 40
 			assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
 			assert_equal(#client.queue.items, 0, "denied resume emits nothing")
-			assert_true(client:set_consent(true))
+			if not regrant(client, deny) then return end
 			assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
 			assert_equal(#named(client, "app.session_started"), 1, "repeated denial preserves the fresh-start obligation")
 		end
@@ -13354,7 +13366,7 @@ end)()
 			assert_true(client:session_start())
 			local old = client:get_session_id()
 			assert_true(client:set_consent(deny))
-			assert_true(client:set_consent(true))
+			if not regrant(client, deny) then return end
 			assert_true(client:track("after_regrant"))
 			assert_equal(#named(client, "app.session_ended"), 0)
 			assert_equal(#named(client, "app.session_started"), 1, "activity announces a fresh session")
@@ -13390,7 +13402,7 @@ end)()
 				pause(client)
 				assert_true(client:set_consent(deny))
 				if ended_when == "before grant" then assert_true(client:session_end()) end
-				assert_true(client:set_consent(true))
+				if not regrant(client, deny) then return end
 				if ended_when == "after grant" then assert_true(client:session_end()) end
 				assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
 				assert_equal(#client.queue.items, 0, "explicit end cancels the denied-resume obligation")
@@ -14818,9 +14830,9 @@ end)()
 			assert_true(client:set_consent(true))
 			local real_clear = storage.clear_spool
 			storage.clear_spool = function() return false end
-			local ok, code = client:set_consent(false)
+			local ok, code, warning = client:set_consent(false)
 			storage.clear_spool = real_clear
-			assert_equal(ok, false); assert_equal(code, "spool_purge_failed")
+			assert_equal(ok, true); assert_equal(code, nil); assert_equal(warning, "spool_purge_failed")
 			assert_true(client.spool_purge_pending, "real denial retains purge debt")
 			read_only(function() return client:get_consent_state() end, "denied")
 			assert_true(client.spool_purge_pending, "getter does not settle purge debt")
@@ -14848,4 +14860,197 @@ end)()
 	end
 	print(string.format("Consent getter: %d passed, %d failed", passed, failed))
 	assert_equal(failed, 0, "consent getter scene failures")
+end)()
+
+-- Applied consent decisions carry warnings; forced-minor exclusion survives denial.
+;(function()
+	local scenes = {}
+	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
+	local function fresh(api, run)
+		reset(); storage.reset()
+		local _, restore = install_stub_sys_storage()
+		local saved = {}
+		for _, key in ipairs({ "save", "clear_spool", "save_consent_outbox", "save_consent_denial_marker" }) do
+			saved[key] = storage[key]
+		end
+		local facade = dofile("shardpilot/sdk.lua")
+		local options = config({ app_id = "synthetic-consent-results", anonymous_id = "synthetic-actor" })
+		local ok, err = pcall(function()
+			local client
+			if api == "instance" then client = assert(facade.new(options))
+			else assert_true(facade.init(options)) end
+			local function call(method, ...)
+				if client then return client[method](client, ...) end
+				return facade[method](...)
+			end
+			run(call, options, facade, saved, client)
+		end)
+		for key, original in pairs(saved) do storage[key] = original end
+		restore(); storage.reset()
+		assert_true(ok, err)
+	end
+	local function result(call, decision, applied, code, warning)
+		local ok, err, warn = call("set_consent", decision)
+		assert_equal(ok, applied, "decision applied result")
+		assert_equal(err, code, "refusal code")
+		assert_equal(warn, warning, "applied warning")
+	end
+	local function no_analytics()
+		for _, request in ipairs(requests) do
+			assert_not_contains(request.url, "/v1/events:batch")
+			assert_not_contains(request.body or "", '"consent_forced_minor"')
+		end
+	end
+	for _, api in ipairs({ "instance", "facade" }) do
+		scene(api .. " healthy and refused controls", function()
+			fresh(api, function(call)
+				result(call, false, true)
+				assert_equal(call("get_consent_state"), "denied")
+				result(call, "invalid-synthetic", false, "invalid_consent")
+				assert_equal(call("get_consent_state"), "denied")
+				result(call, true, true)
+				assert_true(call("track", "synthetic_granted_event"))
+				assert_true(call("flush"))
+				local dispatched = false
+				for _, request in ipairs(requests) do
+					if request.url:find("/v1/events:batch", 1, true) then dispatched = true end
+				end
+				assert_true(dispatched, "real analytics publisher ran in the passing control")
+				assert_true(call("shutdown"))
+				result(call, false, false, api == "instance" and "shutdown" or "not_initialized")
+			end)
+		end)
+		for _, decision in ipairs({ true, false }) do
+			scene(api .. " identity warning " .. tostring(decision), function()
+				fresh(api, function(call)
+					storage.save = function() return false end
+					result(call, decision, true, nil, "consent_persist_failed")
+					assert_equal(call("get_consent_state"), decision and "granted" or "denied")
+					assert_true(#requests > 0, "actual consent receipt dispatch ran")
+				end)
+			end)
+		end
+		scene(api .. " outbox warning", function()
+			fresh(api, function(call, options, _, saved)
+				next_status = 500
+				local plain_save = sys.save
+				sys.save = function(path, record)
+					if path:sub(-15) == "/consent-outbox" then return false end
+					return plain_save(path, record)
+				end
+				result(call, false, true, nil, "consent_outbox_persist_failed")
+				assert_equal(call("get_consent_state"), "denied")
+				assert_true(#requests > 0, "actual receipt delivery attempted")
+				sys.save = plain_save
+				call("persist")
+				assert_true(#storage.load_consent_outbox(options) > 0, "owed receipt becomes durable")
+				no_analytics()
+			end)
+		end)
+		for _, decision in ipairs({ false, "denied_forced_minor" }) do
+			scene(api .. " purge warning " .. tostring(decision), function()
+				fresh(api, function(call)
+					result(call, true, true)
+					storage.clear_spool = function() return false end
+					result(call, decision, true, nil, "spool_purge_failed")
+					assert_equal(call("get_consent_state"), decision == false and "denied" or decision)
+					local ok, code = call("track", "synthetic_denied_event")
+					assert_equal(ok, false); assert_equal(code, "consent_denied")
+					call("flush"); no_analytics()
+				end)
+			end)
+		end
+		scene(api .. " ordinary purge refusal and recovery", function()
+			fresh(api, function(call, _, _, saved)
+				result(call, true, true)
+				storage.clear_spool = function() return false end
+				call("set_consent", false)
+				result(call, true, false, "spool_purge_failed")
+				assert_equal(call("get_consent_state"), "denied")
+				no_analytics()
+				local cleared = false
+				storage.clear_spool = function(options)
+					assert_equal(call("get_consent_state"), "denied", "purge runs before grant")
+					cleared = true; return saved.clear_spool(options)
+				end
+				result(call, true, true)
+				assert_true(cleared); assert_equal(call("get_consent_state"), "granted")
+			end)
+		end)
+		scene(api .. " forced-minor refusal and ordinary denial", function()
+			fresh(api, function(call, options, _, saved)
+				storage.clear_spool = function() return false end
+				call("set_consent", "denied_forced_minor")
+				result(call, true, false, "consent_forced_minor")
+				assert_equal(call("get_consent_state"), "denied_forced_minor")
+				storage.clear_spool = saved.clear_spool
+				result(call, true, false, "consent_forced_minor")
+				call("flush")
+				result(call, true, false, "consent_forced_minor")
+				result(call, false, true)
+				assert_equal(call("get_consent_state"), "denied")
+				assert_equal(storage.load(options).consent_forced_minor, true, "ordinary denial retains exclusion")
+				result(call, true, false, "consent_forced_minor")
+				no_analytics()
+			end)
+		end)
+	end
+	for _, witness in ipairs({ "identity", "marker", "receipt" }) do
+		scene(witness .. " retains forced-minor exclusion after ordinary denial and restart", function()
+			fresh("instance", function(call, options, facade, saved)
+				if witness ~= "identity" then storage.save = function() return false end end
+				if witness == "receipt" then storage.save_consent_denial_marker = function() return false end end
+				call("set_consent", "denied_forced_minor")
+				next_status = witness == "receipt" and 500 or 202
+				local applied = call("set_consent", false)
+				assert_equal(applied, true, "ordinary denial applies even if a write fails")
+				assert_equal(call("get_consent_state"), "denied")
+				for key, original in pairs(saved) do storage[key] = original end
+				storage.reset(); reset()
+				local restored = assert(facade.new(options))
+				local ok, code = restored:set_consent(true)
+				assert_equal(ok, false); assert_equal(code, "consent_forced_minor", witness .. " restores exclusion")
+				assert_true(restored:get_consent_state() ~= "granted")
+				assert_equal(restored.spool_purge_pending, false, "storage is healthy after restart")
+				no_analytics()
+			end)
+		end)
+	end
+	scene("receipt exclusion hands off before its acknowledgement", function()
+		fresh("instance", function(call, options, facade, saved)
+			storage.save = function() return false end
+			storage.save_consent_denial_marker = function() return false end
+			call("set_consent", "denied_forced_minor")
+			next_status = 500; call("set_consent", false)
+			storage.save_consent_denial_marker = saved.save_consent_denial_marker
+			storage.reset(); reset()
+			local restored = assert(facade.new(options))
+			assert_equal(restored:set_consent(true), false)
+			assert_equal(#storage.load_consent_outbox(options), 0, "real receipt acknowledgement retired outbox")
+			storage.save = saved.save
+			storage.reset(); reset()
+			local again = assert(facade.new(options))
+			local ok, code = again:set_consent(true)
+			assert_equal(ok, false); assert_equal(code, "consent_forced_minor", "marker survives receipt retirement")
+			no_analytics()
+		end)
+	end)
+	scene("forced-minor exclusion is scoped to the actor", function()
+		fresh("instance", function(call, options, facade)
+			assert_true(call("set_consent", "denied_forced_minor"))
+			assert_true(call("set_consent", false))
+			options.anonymous_id = "synthetic-other-actor"
+			local other = assert(facade.new(options))
+			assert_equal(other:get_consent_state(), "unknown")
+			assert_true(other:set_consent(true), "different actor does not inherit exclusion")
+		end)
+	end)
+	local passed, failed = 0, 0
+	for _, entry in ipairs(scenes) do
+		local ok, err = pcall(entry.run)
+		if ok then passed = passed + 1 else failed = failed + 1 end
+		print("consent result scene " .. entry.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	print(string.format("Consent results: %d passed, %d failed", passed, failed))
+	assert_equal(failed, 0, "consent result scene failures")
 end)()

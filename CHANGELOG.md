@@ -2,6 +2,15 @@
 
 ### Unreleased
 
+- `set_consent` now reports applied decisions with `true, nil, warning` when
+  identity persistence, spool purge or receipt persistence remains owed.
+  Refused decisions retain `false, code`. Read the third return value for
+  `consent_persist_failed`, `spool_purge_failed` and
+  `consent_outbox_persist_failed` warnings instead of treating them as refusal.
+  A forced-minor grant returns `false, "consent_forced_minor"` even after purge
+  recovery. Ordinary denial still applies and reports `denied`, retaining the
+  forced-minor exclusion across durable writes and restarts.
+
 - Crash reports emit the root `component` key. `crash_component` is the preferred
   configuration option; `crash_source` remains a deprecated fallback when blank.
   Durable replay renames old root `source` keys without changing value bytes,

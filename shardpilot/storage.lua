@@ -1502,6 +1502,7 @@ local function sanitize_outbox_entries(entries)
 					and math.floor(entry.decision_seq) or 0,
 				categories = { analytics = entry.categories.analytics },
 				reason = entry.reason,
+				consent_forced_minor = entry.consent_forced_minor == true or nil,
 				anonymous_id = entry.anonymous_id,
 			}
 		else
