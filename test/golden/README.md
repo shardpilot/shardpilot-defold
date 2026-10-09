@@ -85,3 +85,19 @@ both.
 
 `test_consent_policy.lua` asserts on these files directly. If the contract
 moves, the golden scene is what says so.
+
+## Consent notice acceptance
+
+`consent-notice-request.json` and `consent-notice-response.json` are byte-for-byte
+copies of the accepted consent-notice contract request/response at
+`b4baa8258258c286df8ed36e1e09e2a0dd8477da`, with server producer head
+`09c13dac19d66ea5050b931aed115beb3fba7dae` (`internal/ingest/testdata/consent_notice`).
+The response retains the captured newline. SHA-256:
+
+- request: `fb88987ab60fd3836d86428e74e7ea3674c6905e56485c9b5c37cc177d47153b`
+- response: `8add729673ccd76ee0baee7352dccff01efebc6387439a56c03c523ed34f2e0b`
+
+The scene runs the real setter and serializer with synthetic identifiers and
+controlled time/retry-key sources, matches the complete request bytes, and feeds
+the accepted response into the actual receipt acknowledgement path. The source
+capture used a synthetic service principal; the local fixture runs in process.

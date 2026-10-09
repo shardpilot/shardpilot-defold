@@ -489,12 +489,20 @@ reconcile = function(fresh)
 		end
 	elseif not analytics_running then
 		if answered then
-			if start_analytics(answered.granted, fresh, answered.fresh_answer == true) then
+			if start_analytics(answered.granted, fresh, answered.fresh_answer == true, answered.notice) then
 				answered.fresh_answer = nil
 			end
 		elseif not notice_open then
 			notice_open = true
 			local generation = notice_generation
+			local presented_notice
+			if fresh.plan_used then
+				presented_notice = {
+					notice_version = fresh.consent_text_version,
+					notice_locale = fresh.presented_language,
+					policy_version = fresh.policy_version,
+				}
+			end
 			present_consent_notice(fresh, function(granted)
 				if generation ~= notice_generation then
 					-- The band was corrected while this screen was open. The
@@ -508,6 +516,7 @@ reconcile = function(fresh)
 				answered = {
 					text_version = fresh.consent_text_version,
 					language = fresh.presented_language,
+					notice = presented_notice,
 					granted = granted,
 					-- The BASIS the answer was given under. A non-objection
 					-- does not satisfy a regime that requires an explicit
@@ -1660,6 +1669,43 @@ top-level one.
 > initial release has no path that emits it.
 
 ## Privacy & consent
+
+`set_consent(decision, notice)` optionally takes a per-call table with exactly
+`notice_version`, `notice_locale`, and `policy_version`. Map a presented
+`consent_policy.prepare` result as follows; use the result whose notice the
+player actually saw, not a later resolution:
+
+<!-- doc-region: none -- Per-call notice mapping, not the complete integration flow. -->
+```lua
+local notice = {
+  notice_version = presented.consent_text_version,
+  notice_locale = presented.presented_language,
+  policy_version = presented.policy_version,
+}
+local applied, code, warning = shardpilot.set_consent(granted, notice)
+```
+
+Omitting the table preserves the existing behavior. A supplied table must carry
+all three strings, with version ids of 1–64 ASCII letters, digits, dots,
+underscores, plus signs, slashes or hyphens and a locale of 2–35 bytes matching
+BCP 47 structure. The version rule is shared with the policy validator.
+Locale spelling is preserved; this is a syntax check, not a language registry
+lookup. Notice text and other members are refused. Invalid notice metadata on
+a grant returns `false, "consent_notice_invalid"` without changing the decision.
+On denial it applies the decision, sends the receipt without any notice fields,
+and returns `true, nil, "consent_notice_invalid"` when there is no other pending
+warning. When several applied warnings coexist, the single returned slot uses
+this priority: `spool_purge_failed`, `consent_persist_failed`,
+`consent_outbox_persist_failed`, `consent_actor_invalid`, `consent_notice_invalid`.
+
+The values are copied before host callbacks and stored with that receipt for
+retry and restart. A later call, caller-table mutation or policy response cannot
+relabel an earlier receipt. Ordinary denial while already forced-minor remains
+a no-op preserving its original receipt; the notice carrier cannot authorize
+an ordinary grant over that state. The [minimal example](examples/minimal/README.md)
+shows the policy-to-receipt handoff. Server acceptance and deployment are
+separate prerequisites; the client does not prove the notice was displayed.
+
 
 - **iOS manifest (new in `v0.11.0`):** merge the supplied
   [`PrivacyInfo.xcprivacy` fragment](shardpilot/privacy/PrivacyInfo.xcprivacy)

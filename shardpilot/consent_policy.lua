@@ -1,13 +1,14 @@
 -- Consent-regime policy preparation, and the ONE thing to understand about it:
 -- it runs BEFORE the telemetry SDK exists.
 --
--- ⚠ IT IMPORTS NOTHING FROM THIS SDK. Not sdk.lua, not client.lua, not
+-- ⚠ IT IMPORTS NO SDK RUNTIME. Not sdk.lua, not client.lua, not
 -- queue.lua, not storage.lua, not id.lua. That is a design rule rather than a
 -- preference: requiring storage would create the persisted scope record and
 -- requiring id would mint an anonymous identifier, and the first-run contract
 -- forbids any SDK init, identity generation, spool load, capture hook or
 -- buffered event before the player's final choice. A module that quietly
 -- created one of those would break the rule it exists to serve.
+-- Its shared consent-version predicate is pure and touches no runtime state.
 --
 -- WHAT IT IS NOT:
 --   * not a consent grant — a plan says which regime applies, never that a
@@ -39,6 +40,7 @@
 -- the supported default until the applicable policy has been confirmed.
 
 local M = {}
+local version_ok = require "shardpilot.consent_version"
 
 M.STRICT_OPT_IN = "STRICT_OPT_IN"
 M.SOFT_OPT_OUT = "SOFT_OPT_OUT"
@@ -87,7 +89,6 @@ local CACHE_SECONDS = 300
 -- Bounds, mirrored from the published schema so a value outside them is
 -- refused HERE rather than sent and refused there. A refusal that costs a
 -- request is a refusal that told a server something about this player.
-local MAX_VERSION = 64
 local MAX_LANGUAGE = 35
 local MAX_BAND = 32
 local MAX_ENTRY = 64
@@ -999,14 +1000,6 @@ end
 
 local function bounded_string(value, limit)
 	return type(value) == "string" and #value > 0 and #value <= limit
-end
-
--- ⚠ "/" IS PERMITTED, because the resolver's own fallback names itself
--- "strict-fallback/1" — a real identifier rather than an empty string, so a
--- receipt that records it can be told apart from one whose writer forgot the
--- field. A pattern that refused it refused every response this release sends.
-local function version_ok(value)
-	return bounded_string(value, MAX_VERSION) and value:match("^[A-Za-z0-9._+/-]+$") ~= nil
 end
 
 -- Validates the CALLER's context before anything is sent. A value outside the

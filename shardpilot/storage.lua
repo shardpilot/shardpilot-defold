@@ -13,6 +13,7 @@
 -- `shardpilot` namespace is only used when no scope is configured.
 
 local clock = require "shardpilot.clock"
+local consent_notice = require "shardpilot.consent_notice"
 
 local M = {}
 
@@ -1473,7 +1474,8 @@ local function sanitize_outbox_entries(entries)
 	end
 	for i = 1, prefix do
 		local entry = entries[i]
-		if type(entry) == "table"
+		local notice, notice_error = consent_notice.from_receipt(entry)
+		if not notice_error and type(entry) == "table"
 			and valid_receipt_field(entry.idempotency_key)
 			and valid_receipt_field(entry.workspace_id)
 			and valid_receipt_field(entry.app_id)
@@ -1502,6 +1504,9 @@ local function sanitize_outbox_entries(entries)
 					and math.floor(entry.decision_seq) or 0,
 				categories = { analytics = entry.categories.analytics },
 				reason = entry.reason,
+				notice_version = notice and notice.notice_version,
+				notice_locale = notice and notice.notice_locale,
+				policy_version = notice and notice.policy_version,
 				anonymous_id = entry.anonymous_id,
 			}
 		else
