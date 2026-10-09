@@ -7,6 +7,11 @@ callbacks or HTTP requests. Pass analytics options only to the analytics client;
 crash has its own configuration. An already initialized analytics facade still
 returns `already_initialized` before attempting replacement.
 
+Constructors capture the table's raw entries once before validation or host
+hooks. Metatable-provided fields are absent; use explicit table entries for
+required options. Later changes to the caller's table do not change the captured
+configuration. Function options retain their normal callback behavior.
+
 The optional `transport` setting is a string label included in
 `network_summary`, for example `"websocket"`. Omit it to omit that property.
 Empty and custom strings are accepted; there is no fixed protocol list. It does

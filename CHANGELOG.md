@@ -5,7 +5,9 @@
 - Analytics and crash constructors now reject unsupported configuration keys
   with `unknown_config_key` instead of silently ignoring them. This includes
   misspellings and options belonging to the other client. Remove unsupported
-  keys before upgrading; existing supported options keep their behavior.
+  keys before upgrading. Both constructors snapshot raw table entries before
+  validation and host hooks; inherited fields count as absent, and later caller
+  mutations cannot change the captured values.
   Analytics `transport` is an optional string label for network summaries;
   non-string values now return `invalid_transport` before storage or wire work.
 

@@ -611,6 +611,11 @@ belonging to the other client. A constructor returns `nil, code`; a facade
 `init` returns `false, code`, before storage, token callbacks or HTTP work.
 See the [configuration guide](docs/configuration.md) for the error behavior.
 
+Constructors capture the table's raw entries once before validation or host
+hooks. Metatable-provided fields are absent; use explicit table entries for
+required options. Later changes to the caller's table do not change the captured
+configuration. Function options retain their normal callback behavior.
+
 The module holds one default client. While it is being constructed or remains
 live, another `init(config)` returns `false, "already_initialized"` without
 constructing a replacement. Retry `shutdown()` until it succeeds before calling

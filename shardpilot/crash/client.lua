@@ -136,14 +136,21 @@ local config_keys = {
 	session_id = true,
 }
 
-local function validate_config(config)
+local function snapshot_config(config)
 	if type(config) ~= "table" then
 		return nil, "config_required"
 	end
-	-- Enumerate the supplied keys directly; a __pairs hook cannot hide one.
-	for key in next, config do
+	-- Capture raw entries once, before hooks or validation. Metamethods cannot
+	-- supply a different value later or conceal an unsupported option.
+	local snapshot = {}
+	for key, value in next, config do
 		if not config_keys[key] then return nil, "unknown_config_key" end
+		snapshot[key] = value
 	end
+	return snapshot
+end
+
+local function validate_config(config)
 	local required = { "crash_ingest_url", "app_id" }
 	for _, key in ipairs(required) do
 		if config[key] == nil or config[key] == "" then
@@ -277,6 +284,9 @@ local Client = {}
 Client.__index = Client
 
 function M.new(config)
+	local snapshot, snapshot_err = snapshot_config(config)
+	if not snapshot then return nil, snapshot_err end
+	config = snapshot
 	local normalized, err = validate_config(config)
 	if not normalized then
 		return nil, err

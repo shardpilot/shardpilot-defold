@@ -14637,13 +14637,14 @@ end)()
 		reset(); storage.reset()
 		local facade = dofile("shardpilot/sdk.lua")
 		local core = require "shardpilot.client"
-		local real_new, calls = core.new, 0
+		local real_new, real_load, calls = core.new, storage.load, 0
 		core.new = function(...)
 			calls = calls + 1
 			return real_new(...)
 		end
 		local ok, err = pcall(run, facade, function() return calls end)
 		core.new = real_new
+		storage.load = real_load
 		storage.reset()
 		assert_true(ok, err)
 	end
@@ -14689,14 +14690,16 @@ end)()
 	scene("reentrant construction cannot adopt another client", function()
 		fresh(function(facade, calls)
 			local entered, nested_ok, nested_code = false, nil, nil
-			local outer = setmetatable(cfg("synthetic-outer"), { __index = function()
+			local real_load = storage.load
+			storage.load = function(...)
 				if not entered then
 					entered = true
 					nested_ok, nested_code = facade.init(cfg("synthetic-inner"))
 				end
-			end })
-			assert_true(facade.init(outer))
-			assert_true(entered, "real constructor reached the configuration hook")
+				return real_load(...)
+			end
+			assert_true(facade.init(cfg("synthetic-outer")))
+			assert_true(entered, "real constructor reached the storage hook")
 			assert_equal(nested_ok, false)
 			assert_equal(nested_code, "already_initialized")
 			assert_equal(calls(), 1)
@@ -14705,12 +14708,12 @@ end)()
 	end)
 	scene("throwing construction releases its reservation", function()
 		fresh(function(facade)
-			local poison = setmetatable(cfg("synthetic-poison"), { __index = function()
-				error("synthetic configuration hook failed")
-			end })
-			local ok, err = pcall(facade.init, poison)
+			local real_load = storage.load
+			storage.load = function() error("synthetic storage hook failed") end
+			local ok, err = pcall(facade.init, cfg("synthetic-poison"))
+			storage.load = real_load
 			assert_equal(ok, false)
-			assert_contains(tostring(err), "synthetic configuration hook failed")
+			assert_contains(tostring(err), "synthetic storage hook failed")
 			assert_true(facade.init(cfg("synthetic-after-error")))
 			assert_equal(facade.get_anonymous_id(), "synthetic-after-error")
 		end)
@@ -15294,6 +15297,74 @@ end)()
 				end)
 			end)
 		end
+	end
+	for _, kind in ipairs({ "analytics", "crash" }) do
+		for _, api in ipairs({ "new", "init" }) do
+			scene(kind .. " " .. api .. " ignores stateful inherited options", function()
+				fresh(function(counts)
+					local opts = options(kind, counts)
+					local reads = 0
+					setmetatable(opts, { __index = function()
+						reads = reads + 1
+						if reads > 1 then return {} end
+					end })
+					local ok, err = facade(kind)[api](opts); assert_true(ok, err)
+					assert_equal(reads, 0, "only raw entries supply configuration")
+					assert_true(counts.reads > 0, "real constructor reached storage")
+				end)
+			end)
+			scene(kind .. " " .. api .. " inherited required fields are absent", function()
+				fresh(function(counts)
+					local inherited = options(kind, counts)
+					local reads = 0
+					local opts = setmetatable({}, { __index = function(_, key)
+						reads = reads + 1
+						if reads > 1 then return {} end
+						return inherited[key]
+					end })
+					refused(facade(kind), api, opts, kind == "analytics" and "ingest_url_required" or "crash_ingest_url_required", counts)
+					assert_equal(reads, 0, "required fields cannot invoke __index")
+				end)
+			end)
+		end
+	end
+	for _, api in ipairs({ "new", "init" }) do
+		scene("analytics " .. api .. " stateful transport never reaches wire", function()
+			fresh(function(counts)
+				local opts = options("analytics", counts)
+				local reads = 0
+				setmetatable(opts, { __index = function(_, key)
+					if key == "transport" then
+						reads = reads + 1
+						if reads > 1 then return { synthetic = "object" } end
+					end
+				end })
+				local mod = facade("analytics"); local client, err = mod[api](opts); assert_true(client, err)
+				local function call(name, ...) if api == "new" then return client[name](client, ...) end; return mod[name](...) end
+				assert_true(call("set_consent", true)); assert_true(call("session_start")); call("observe_ping_ms", 12); assert_true(call("flush"))
+				local found = false
+				for _, request in ipairs(requests) do
+					if request.url:find("/v1/events:batch", 1, true) and request.body:find('"event_name":"network_summary"', 1, true) then
+						found = true; assert_not_contains(request.body, '"transport":')
+					end
+				end
+				assert_true(found, "real client emitted network summary")
+			end)
+		end)
+		scene("analytics " .. api .. " actor snapshot precedes storage callbacks", function()
+			fresh(function(counts)
+				local opts = options("analytics", counts)
+				local load = sys.load
+				sys.load = function(...)
+					opts.anonymous_id = "synthetic-replaced-actor"
+					return load(...)
+				end
+				local mod = facade("analytics"); local client, err = mod[api](opts); assert_true(client, err)
+				local actor = api == "new" and client:get_anonymous_id() or mod.get_anonymous_id()
+				assert_equal(actor, "synthetic-actor", "constructor keeps the actor captured at entry")
+				assert_true(counts.reads > 0, "storage callback really ran")
+			end)
+		end)
 	end
 	local passed, failed = 0, 0
 	for _, entry in ipairs(scenes) do

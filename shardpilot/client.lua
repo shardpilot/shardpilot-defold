@@ -556,14 +556,21 @@ local config_keys = {
 	workspace_id = true,
 }
 
-local function validate_config(config, diagnostics)
+local function snapshot_config(config)
 	if type(config) ~= "table" then
 		return nil, "config_required"
 	end
-	-- Enumerate the supplied keys directly; a __pairs hook cannot hide one.
-	for key in next, config do
+	-- Capture raw entries once, before hooks or validation. Metamethods cannot
+	-- supply a different value later or conceal an unsupported option.
+	local snapshot = {}
+	for key, value in next, config do
 		if not config_keys[key] then return nil, "unknown_config_key" end
+		snapshot[key] = value
 	end
+	return snapshot
+end
+
+local function validate_config(config, diagnostics)
 	if config.transport ~= nil and type(config.transport) ~= "string" then
 		return nil, "invalid_transport"
 	end
@@ -800,6 +807,9 @@ local function new_session(session_id)
 end
 
 function M.new(config, defer_init_diagnostics)
+	local snapshot, snapshot_err = snapshot_config(config)
+	if not snapshot then return nil, snapshot_err end
+	config = snapshot
 	-- Buffer the shared hook before validation: configuration warnings and all
 	-- constructor/subcomponent diagnostics must cross the same adoption boundary.
 	-- Keep the caller's configuration and the synchronous stats latches intact.

@@ -22,6 +22,11 @@ with `unknown_config_key` before any storage or HTTP work. `crash.new()` returns
 Both the preferred `crash_component` and the deprecated `crash_source` option
 remain supported.
 
+Constructors capture the table's raw entries once before validation or host
+hooks. Metatable-provided fields are absent; use explicit table entries for
+required options. Later changes to the caller's table do not change the captured
+configuration. Function options retain their normal callback behavior.
+
 ```lua
 local crash = require "shardpilot.crash"
 
