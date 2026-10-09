@@ -6524,8 +6524,8 @@ function Client:start_publish_batch(automatic)
 		elseif retain and retry_after and retry_after == 0 then
 			-- Retry-After: 0 is an explicit "retry NOW", and the transport
 			-- accepts it as a valid non-negative delay. Falling through to
-			-- the backoff below would turn the first explicit zero into a
-			-- one-second wait.
+			-- the backoff below would apply client backoff instead of honoring
+			-- the explicit zero.
 			if events.zero_retried then
 				-- A SECOND zero for the same batch means "retry now" is not
 				-- working: the server is answering immediately and failing
