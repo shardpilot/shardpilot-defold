@@ -35,10 +35,8 @@
 -- SOFT_OPT_OUT is implemented so a future plan parses. It is NOT reachable
 -- today: every row of the jurisdiction matrix is marked pending counsel
 -- confirmation, so the resolver's initial release has no path that emits it.
--- Owner statement of 2026-09-18 (rendering): that matrix has no counsel
--- confirmation outside the platform's own records and was prepared as an AI
--- draft. So STRICT is not a temporary default waiting for the table to be
--- filled in; it is what an unconfirmed table can support.
+-- An unconfirmed matrix cannot justify a permissive default. STRICT remains
+-- the supported default until the applicable policy has been confirmed.
 
 local M = {}
 
@@ -46,16 +44,10 @@ M.STRICT_OPT_IN = "STRICT_OPT_IN"
 M.SOFT_OPT_OUT = "SOFT_OPT_OUT"
 M.UNKNOWN = "UNKNOWN"
 
--- ⚠ THE VALUES ARE THE SERVER'S, NOT THIS MODULE'S. Three lanes implemented
--- one ADR from prose and nobody parsed the other's bytes: this module read a
--- FLAT plan with "OFF"/"MINIMAL"/"DENIED" while the resolver answers a nested
--- one with "off"/"minimal_diagnostics_for_minors"/"denied". Every real
--- response was refused as unreadable — invisible while the answer is STRICT
--- anyway, and fatal the day it is not.
---
--- The contract of record is the resolver's published OpenAPI schema
--- (ConsentPolicyPlan) and the constructor behind it; these constants are
--- copied from it, not chosen here.
+-- The resolver returns a nested plan with case-sensitive values such as
+-- "off", "minimal_diagnostics_for_minors" and "denied". A flat plan or
+-- uppercase variants do not satisfy that contract. These constants follow
+-- the resolver's published OpenAPI schema (ConsentPolicyPlan).
 M.CRASH_OFF = "off"
 M.CRASH_MINIMAL = "minimal_diagnostics_for_minors"
 
@@ -1702,18 +1694,13 @@ function M.prepare(context, callback)
 			lifetime = plan.max_age_seconds
 		end
 		decision.valid_for_seconds = lifetime
-		-- ⚠ A PERMISSIVE DECISION IS NEVER STORED. THIS IS THE DESIGN, not an
-		-- optimisation, and it replaces a family of defects rather than one.
+		-- A permissive decision is never stored: an offline state may tighten
+		-- restrictions but must never relax them.
 		--
-		-- The whole cache existed under a promise — "an offline state can
-		-- tighten but never relax" — that a cache cannot keep. http.request
-		-- being present says NOTHING about connectivity, and Defold offers no
-		-- reliable online signal, so there is no moment at which this module
-		-- can know that a stored permission is still true. Every round of this
-		-- review found another way for a stored permission to outlive its plan
-		-- — the ceiling beating the expiry, a clock stepping backwards, a
-		-- rollback in flight, an older response landing last — because they
-		-- were all the same defect wearing different clothes.
+		-- The presence of http.request does not establish connectivity, and
+		-- Defold offers no reliable online signal. Cached permissions could
+		-- outlive their plan through expiry, a clock moving backwards, policy
+		-- rollback during a request, or an older response arriving last.
 		--
 		-- So a permissive answer is used for the call that FETCHED it and is
 		-- not kept. Every later prepare() goes to the wire, and a request that
