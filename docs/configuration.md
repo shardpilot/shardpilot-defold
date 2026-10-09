@@ -125,13 +125,15 @@ keeps serving the experiment from memory, and delivers the facts it holds.
 - Clients of different apps (another `app_id`, or another `workspace_id`) are
   independent and may run side by side. Create each with `new(config)` and
   keep every instance: `init(config)` holds one default client, and a second
-  `init` replaces the module's reference to the first.
+  `init` returns `false, "already_initialized"` while that client remains live
+  or is being constructed. Successful shutdown releases the default client;
+  a later `init` can then create its replacement.
 - Two ids that differ only in characters other than letters, digits, `-` and
   `_` (for example `com.game` and `com_game`) share the identity and consent
   record, so they count as one app here
   ([#148](https://github.com/shardpilot/shardpilot-defold/issues/148)).
 
-The SDK does not yet refuse a second client of a live app; that guard is
+`new(config)` does not yet refuse a second client of a live app; that guard is
 tracked in [#146](https://github.com/shardpilot/shardpilot-defold/issues/146).
 The decision to support one client per app, instead of coordinating several,
 is recorded in [#145](https://github.com/shardpilot/shardpilot-defold/issues/145).

@@ -10771,6 +10771,7 @@ end
 	assert_true(#batches >= 2, "the refused batch must be retried, not dropped")
 	assert_equal(batches[2].headers["Content-Encoding"], nil,
 		"the retry must be uncompressed")
+	assert_true(sdk.shutdown())
 
 	-- And the same rescue must survive an EXPLICIT flush that bypassed a
 	-- client-owned backoff to make the refused attempt.
@@ -13237,6 +13238,7 @@ end)()
 			end)
 			restore_http()
 			if not ok then error(failure, 0) end
+			assert_true(singleton.shutdown())
 			assert_true(singleton.init(config(settings)))
 			assert_equal(#singleton.get_rejections(), 0, "a new client starts fresh diagnostic history")
 			assert_equal(singleton.snapshot().rejected, 0)
@@ -13998,6 +14000,7 @@ end)()
 				return sdk[method](...)
 			end
 			local ok, err = pcall(fn, call)
+			if not client and sdk.get_anonymous_id() ~= nil then assert_true(sdk.shutdown()) end
 			restore()
 			storage.reset()
 			if ok then passed = passed + 1 else failed = failed + 1 end
@@ -14189,7 +14192,7 @@ end)()
 ;(function()
 	local scenes = {}
 	local function scene(name, body) scenes[#scenes + 1] = { name = name, body = body } end
-	local function with_boot(kind, body)
+	local function with_boot(kind, body, keep_previous)
 		reset(); storage.reset()
 		local saved = { get_save_file = sys.get_save_file, save = sys.save, load = sys.load }
 		local stores, clients, paths = {}, {}, {}
@@ -14214,6 +14217,7 @@ end)()
 		end
 		local ok, err = pcall(function()
 			assert_true(facade.init(cfg("boot-previous")))
+			if not keep_previous then assert_true(facade.shutdown()) end
 			local outer = cfg("boot-outer")
 			assert_true(storage.save(outer, { anonymous_id = outer.anonymous_id, consent_analytics = "granted" }))
 			if kind == "legacy" or kind == "both" then
@@ -14239,7 +14243,10 @@ end)()
 						seen[#seen + 1] = { actor = facade.get_anonymous_id(), code = issue.code }
 						if #seen == 1 then
 							if action == "shutdown" then action_ok = facade.shutdown()
-							else action_ok = facade.init(cfg("boot-nested")) end
+							else
+								assert_true(facade.shutdown())
+								action_ok = facade.init(cfg("boot-nested"))
+							end
 						else
 							-- A second OLD callback must not reach and shut down the replacement.
 							facade.shutdown()
@@ -14259,7 +14266,7 @@ end)()
 					end
 					assert_equal(seen[1].actor, "boot-outer-actor", "hook acts on this client, not the previous one")
 					assert_equal(before_tick, 0, "init returns before invoking host diagnostics")
-					assert_equal(clients["boot-previous"].initialized, true, "previous client was not shut down")
+					assert_equal(clients["boot-previous"].initialized, false, "previous client completed shutdown before replacement")
 					assert_equal(clients["boot-outer"].flush_elapsed_seconds, 0, "last hook cannot fall through to the old pump")
 				end)
 			end)
@@ -14331,7 +14338,10 @@ end)()
 				outer.diagnostics = function() calls = calls + 1 end
 				assert_true(facade.init(outer))
 				if action == "shutdown" then assert_true(facade.shutdown())
-				else assert_true(facade.init(cfg("boot-replacement"))) end
+				else
+					assert_true(facade.shutdown())
+					assert_true(facade.init(cfg("boot-replacement")))
+				end
 				facade.update(0)
 				assert_equal(calls, 0, "an unadopted client's pending boot hooks are discarded")
 			end)
@@ -14350,7 +14360,7 @@ end)()
 				assert_equal(seen[2], "legacy_event_name")
 				assert_equal(client:snapshot().last_event_issue, "dropped:legacy_event_name")
 				assert_equal(facade.get_anonymous_id(), "boot-previous-actor", "new never adopts the singleton")
-			end)
+			end, true)
 		end)
 	end
 	scene("invalid config control", function()
@@ -14359,7 +14369,7 @@ end)()
 			local ok, err = facade.init(outer)
 			assert_equal(ok, false)
 			assert_equal(err, "invalid_diagnostics")
-			assert_equal(facade.get_anonymous_id(), "boot-previous-actor", "failed init preserves adoption")
+			assert_equal(facade.get_anonymous_id(), nil, "invalid first init adopts no client")
 		end)
 	end)
 	scene("deferred core drain once", function()
@@ -14385,6 +14395,7 @@ end)()
 					seen[#seen + 1] = next_issue.code
 				end)
 				nested.platform = "synthetic-unmapped"
+				assert_true(facade.shutdown())
 				assert_true(facade.init(nested))
 			end
 			assert_true(facade.init(outer))
@@ -14396,10 +14407,10 @@ end)()
 			assert_equal(seen[2], "platform_unmapped")
 		end)
 	end)
-	scene("shutdown callback preserves replacement", function()
+	scene("shutdown callback cannot replace a closing client", function()
 		with_boot("legacy", function(facade, outer, clients, cfg)
 			local request = http.request
-			local replaced, shutdown_ok = false, nil
+			local attempted, shutdown_ok, nested_ok, nested_code = false, nil, nil, nil
 			http.request = function(url, method, callback, headers, body)
 				local events = json.decode(body).events
 				local outcomes = {}
@@ -14413,16 +14424,20 @@ end)()
 					if issue.code == "legacy_event_name" then
 						assert_true(facade.track("boot_activity", { synthetic = true }))
 						shutdown_ok = facade.shutdown()
-					elseif issue.code == "shutdown-reentry" and not replaced then
-						replaced = true
-						assert_true(facade.init(cfg("boot-nested")))
+					elseif issue.code == "shutdown-reentry" and not attempted then
+						attempted = true
+						nested_ok, nested_code = facade.init(cfg("boot-nested"))
 					end
 				end
 				assert_true(facade.init(outer))
 				facade.update(0)
-				assert_true(replaced, "real shutdown publish response invoked the host hook")
+				assert_true(attempted, "real shutdown publish response invoked the host hook")
 				assert_true(shutdown_ok)
-				assert_equal(facade.get_anonymous_id(), "boot-nested-actor", "shutdown cannot clear a replacement adopted by its response hook")
+				assert_equal(nested_ok, false)
+				assert_equal(nested_code, "already_initialized")
+				assert_equal(clients["boot-nested"], nil, "response hook cannot construct a replacement")
+				assert_equal(facade.get_anonymous_id(), nil, "completed shutdown releases ownership")
+				assert_true(facade.init(cfg("boot-nested")))
 			end)
 			http.request = request
 			assert_true(ok, err)
@@ -14470,6 +14485,7 @@ end)()
 			outer.diagnostics = function()
 				local nested = cfg("boot-nested", function() calls = calls + 1 end)
 				nested.platform = "synthetic-unmapped"
+				assert_true(facade.shutdown())
 				assert_true(facade.init(nested))
 				facade.update(0.75)
 			end
@@ -14598,4 +14614,131 @@ end)()
 	print(string.format("Captured vocabulary: %d passed, %d failed", passed, failed))
 	assert_equal(passed + failed, 60, "all captured and detected cases executed")
 	assert_equal(failed, 0, "captured vocabulary matches actual publisher")
+end)()
+
+-- The singleton owns its client until teardown succeeds; construction reserves
+-- that ownership before invoking configuration or storage hooks.
+;(function()
+	local scenes = {}
+	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
+	local function fresh(run)
+		reset(); storage.reset()
+		local facade = dofile("shardpilot/sdk.lua")
+		local core = require "shardpilot.client"
+		local real_new, calls = core.new, 0
+		core.new = function(...)
+			calls = calls + 1
+			return real_new(...)
+		end
+		local ok, err = pcall(run, facade, function() return calls end)
+		core.new = real_new
+		storage.reset()
+		assert_true(ok, err)
+	end
+	local function cfg(actor)
+		return config({ app_id = "synthetic-init", anonymous_id = actor })
+	end
+	scene("identity getter has a nullable value shape", function()
+		fresh(function(facade)
+			assert_equal(facade.get_anonymous_id(), nil, "no identity before init")
+			assert_true(facade.init(cfg("synthetic-first")))
+			assert_equal(facade.get_anonymous_id(), "synthetic-first")
+			assert_true(facade.shutdown())
+			assert_equal(facade.get_anonymous_id(), nil, "no identity after shutdown")
+		end)
+	end)
+	scene("live client refuses replacement before constructing", function()
+		fresh(function(facade, calls)
+			assert_true(facade.init(cfg("synthetic-first")))
+			local ok, code = facade.init(cfg("synthetic-replacement"))
+			assert_equal(ok, false, "live client cannot be orphaned")
+			assert_equal(code, "already_initialized")
+			assert_equal(calls(), 1, "refusal does not construct a replacement")
+			assert_equal(facade.get_anonymous_id(), "synthetic-first")
+			ok, code = facade.init({})
+			assert_equal(ok, false)
+			assert_equal(code, "already_initialized", "ownership refusal precedes config validation")
+			assert_equal(calls(), 1)
+			assert_true(facade.shutdown())
+			assert_true(facade.init(cfg("synthetic-next")), "completed shutdown releases the facade")
+			assert_equal(calls(), 2)
+			assert_equal(facade.get_anonymous_id(), "synthetic-next")
+		end)
+	end)
+	scene("invalid first configuration releases construction", function()
+		fresh(function(facade)
+			local ok, code = facade.init({})
+			assert_equal(ok, false)
+			assert_equal(code, "ingest_url_required")
+			assert_true(facade.init(cfg("synthetic-after-invalid")))
+			assert_equal(facade.get_anonymous_id(), "synthetic-after-invalid")
+		end)
+	end)
+	scene("reentrant construction cannot adopt another client", function()
+		fresh(function(facade, calls)
+			local entered, nested_ok, nested_code = false, nil, nil
+			local outer = setmetatable(cfg("synthetic-outer"), { __index = function()
+				if not entered then
+					entered = true
+					nested_ok, nested_code = facade.init(cfg("synthetic-inner"))
+				end
+			end })
+			assert_true(facade.init(outer))
+			assert_true(entered, "real constructor reached the configuration hook")
+			assert_equal(nested_ok, false)
+			assert_equal(nested_code, "already_initialized")
+			assert_equal(calls(), 1)
+			assert_equal(facade.get_anonymous_id(), "synthetic-outer")
+		end)
+	end)
+	scene("throwing construction releases its reservation", function()
+		fresh(function(facade)
+			local poison = setmetatable(cfg("synthetic-poison"), { __index = function()
+				error("synthetic configuration hook failed")
+			end })
+			local ok, err = pcall(facade.init, poison)
+			assert_equal(ok, false)
+			assert_contains(tostring(err), "synthetic configuration hook failed")
+			assert_true(facade.init(cfg("synthetic-after-error")))
+			assert_equal(facade.get_anonymous_id(), "synthetic-after-error")
+		end)
+	end)
+	scene("retryable shutdown retains facade ownership", function()
+		fresh(function(facade, calls)
+			local original = cfg("synthetic-pending")
+			original.spool_enabled = false
+			seed_granted_consent(original)
+			assert_true(facade.init(original))
+			assert_true(facade.session_start())
+			next_status = 500
+			local ok = facade.shutdown()
+			assert_equal(ok, false, "real shutdown has work left")
+			assert_true(#requests > 0, "real publisher ran")
+			local code
+			ok, code = facade.init(cfg("synthetic-replacement"))
+			assert_equal(ok, false)
+			assert_equal(code, "already_initialized")
+			assert_equal(calls(), 1)
+			assert_equal(facade.get_anonymous_id(), "synthetic-pending")
+			next_status = 202
+			assert_true(facade.shutdown())
+			assert_true(facade.init(cfg("synthetic-next")))
+		end)
+	end)
+	scene("standalone construction does not replace the facade", function()
+		fresh(function(facade)
+			assert_true(facade.init(cfg("synthetic-default")))
+			local other = assert(facade.new(config({ app_id = "synthetic-other", anonymous_id = "synthetic-independent" })))
+			assert_equal(other:get_anonymous_id(), "synthetic-independent")
+			assert_equal(facade.get_anonymous_id(), "synthetic-default")
+		end)
+	end)
+	local passed, failed = 0, 0
+	for _, entry in ipairs(scenes) do
+		local ok, err = pcall(entry.run)
+		if ok then passed = passed + 1 else failed = failed + 1 end
+		print("facade ownership scene " .. entry.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	print(string.format("Facade ownership: %d passed, %d failed", passed, failed))
+	assert_equal(failed, 0, "facade ownership scene failures")
 end)()
