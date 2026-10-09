@@ -2,6 +2,12 @@
 
 ### Unreleased
 
+- Crash reports emit the root `component` key. `crash_component` is the preferred
+  configuration option; `crash_source` remains a deprecated fallback when blank.
+  Durable replay renames old root `source` keys without changing value bytes,
+  nested fields or crash IDs. Older prepared-table records are encoded once and
+  receive the same rename. Both-key records remain queued without dispatch.
+
 - Added `get_consent_state()` on the module and client to read the current
   in-memory consent decision without sending or persisting it. The module returns
   `unknown` before initialization and after successful shutdown.

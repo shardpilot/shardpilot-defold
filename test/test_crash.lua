@@ -48,10 +48,10 @@ http = {
 	end,
 }
 
--- Reuse the same minimal JSON encoder the analytics harness uses so wire-shape
--- assertions can grep the encoded body.
+-- Minimal JSON encoder for transport-body assertions, including valid
+-- control-character escapes in raw crash text.
 local function encode_string(value)
-	return '"' .. tostring(value):gsub("\\", "\\\\"):gsub('"', '\\"') .. '"'
+	return '"' .. tostring(value):gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("[%z\1-\31]", function(c) return string.format("\\u%04x", c:byte()) end) .. '"'
 end
 
 local function encode_value(value)
@@ -352,13 +352,13 @@ local function test_source_stamped_on_every_report()
 	local client = assert(crash.new(config({ crash_source = "main-server", sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event()))
 	assert_equal(#requests, 1)
-	assert_contains(requests[1].body, '"source":"main-server"')
+	assert_contains(requests[1].body, '"component":"main-server"')
 
 	-- A per-event source overrides the configured default.
 	reset()
 	assert_true(client:emit(presymbolicated_event({ source = "per-event-slug" })))
-	assert_contains(requests[1].body, '"source":"per-event-slug"')
-	assert_not_contains(requests[1].body, '"source":"main-server"')
+	assert_contains(requests[1].body, '"component":"per-event-slug"')
+	assert_not_contains(requests[1].body, '"component":"main-server"')
 end
 
 local function test_bare_app_omits_source()
@@ -366,7 +366,7 @@ local function test_bare_app_omits_source()
 	local client = assert(crash.new(config({ sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event()))
 	assert_equal(#requests, 1)
-	assert_not_contains(requests[1].body, '"source"')
+	assert_not_contains(requests[1].body, '"component"')
 end
 
 local function test_per_event_invalid_source_rejected()
@@ -410,9 +410,9 @@ local function test_non_string_source_rejected_nonfatal_omitted_fatal()
 	})
 	assert_equal(sent, true, "a fatal crash must never be dropped over a non-string source")
 	assert_equal(#requests, 1, "the fatal crash must reach the wire")
-	assert_not_contains(requests[1].body, '"source":"main-server"',
+	assert_not_contains(requests[1].body, '"component":"main-server"',
 		"a fatal must not silently inherit the configured default over a bad source")
-	assert_not_contains(requests[1].body, '"source":123')
+	assert_not_contains(requests[1].body, '"component":123')
 end
 
 -- ── wire route + shape ───────────────────────────────────────────────────────
@@ -1498,7 +1498,7 @@ local function test_capture_previous_forwards_native_dump()
 	local body = requests[1].body
 	assert_equal(requests[1].url, "http://localhost:8080/api/v1/crashes/ingest")
 	assert_contains(body, '"type":"SIGSEGV"')
-	assert_contains(body, '"source":"game-client"')
+	assert_contains(body, '"component":"game-client"')
 	assert_contains(body, '"os":{')
 	assert_contains(body, '"name":"Android"')
 	-- native modules + address frames
@@ -1771,7 +1771,7 @@ local function test_singleton_guard_and_flow()
 	assert_true(crash.record_breadcrumb("menu.open"))
 	assert_true(crash.emit_fatal(presymbolicated_event()))
 	assert_equal(#requests, 1)
-	assert_contains(requests[1].body, '"source":"game-client"')
+	assert_contains(requests[1].body, '"component":"game-client"')
 
 	assert_true(crash.shutdown())
 	ok, err = crash.emit(presymbolicated_event())
@@ -3369,7 +3369,7 @@ local function test_per_report_invalid_scrubbed_source()
 	local body = requests[1].body
 	-- the bad source is omitted entirely (no PII, no bogus slug on the wire)
 	assert_not_contains(body, "user_123")
-	assert_not_contains(body, '"source"')
+	assert_not_contains(body, '"component"')
 	assert_not_contains(body, "ops@example.com")
 end
 
@@ -3391,7 +3391,7 @@ local function test_long_valid_slug_source_preserved()
 	local ok, err = client:emit(presymbolicated_event({ source = long_slug }))
 	assert_equal(ok, true, "a valid long slug source must not be rejected: " .. tostring(err))
 	assert_equal(#requests, 1)
-	assert_contains(requests[1].body, '"source":"' .. long_slug .. '"')
+	assert_contains(requests[1].body, '"component":"' .. long_slug .. '"')
 
 	-- per-report, FATAL: the long valid slug survives (the source dimension is NOT
 	-- silently lost from a fatal)
@@ -3399,14 +3399,14 @@ local function test_long_valid_slug_source_preserved()
 	assert_true(client:emit_fatal(presymbolicated_event({ source = long_slug })),
 		"a fatal must keep a valid long slug source")
 	assert_equal(#requests, 1, "the fatal crash must reach the wire")
-	assert_contains(requests[1].body, '"source":"' .. long_slug .. '"')
+	assert_contains(requests[1].body, '"component":"' .. long_slug .. '"')
 
 	-- config-default: the same long slug stamped from config survives on every report
 	reset()
 	local client2 = assert(crash.new(config({ crash_source = long_slug, sample_every = 1 })))
 	assert_true(client2:emit(presymbolicated_event()))
 	assert_equal(#requests, 1)
-	assert_contains(requests[1].body, '"source":"' .. long_slug .. '"')
+	assert_contains(requests[1].body, '"component":"' .. long_slug .. '"')
 
 	-- MUTATION GUARD: a same-length value that is NOT a valid slug (it carries an
 	-- email) must still be rejected for a non-fatal report — the keep-valid path must
@@ -5584,7 +5584,101 @@ local function test_singleton_set_enabled_flow()
 	assert_true(crash.shutdown())
 end
 
+local function test_component_replay_structural_keys()
+	local transport_mod = require("shardpilot.crash.transport")
+	for _, row in ipairs({
+		{ '{"metadata":{"source":"nested"},"source":"game-client"}', '{"metadata":{"source":"nested"},"component":"game-client"}' },
+		{ '{"so\\u0075rce":"game-client"}', '{"component":"game-client"}' },
+		{ '{"source":"game-client","component":"main-server"}', false },
+		{ '{"source":"game-client","so\\u0075rce":"main-server"}', false },
+		{ '{"source":null}', false },
+		{ '{"source":"Bad_Slug"}', false },
+		{ '{"component":"game-client"}', '{"component":"game-client"}' },
+		{ '{"source":"game-client","metadata":{"x":01}}', false },
+		{ '{"source":"game-client","metadata":{"x":1.25e-3}}', '{"component":"game-client","metadata":{"x":1.25e-3}}' },
+	}) do
+		assert_equal(transport_mod.migrate_component(row[1]), row[2] or nil)
+	end
+end
+
+local function test_component_option_precedence()
+	for _, row in ipairs({ { "game-client", "main-server", "game-client" }, { "", "main-server", "main-server" }, { "  ", "main-server", "main-server" }, { " game-client ", "main-server", "game-client" } }) do
+		reset()
+		local client = assert(crash.new(config({ crash_component = row[1], crash_source = row[2] })))
+		assert_equal(client.config.crash_component, row[3])
+	end
+	local client, err = crash.new(config({ crash_component = "Bad_Slug", crash_source = "main-server" }))
+	assert_equal(client, nil)
+	assert_equal(err, "invalid_crash_source")
+end
+
+local function test_legacy_component_replay_and_ambiguity()
+	for _, shape in ipairs({ "body", "report", "both" }) do
+		reset()
+		storage.reset()
+		local restore = install_fake_sys_storage()
+		local producer = assert(crash.new(config({ crash_component = "game-client", sample_every = 1 })))
+		assert_true(producer:emit_fatal(presymbolicated_event({ metadata = { source = "nested-preserved" } })))
+		local fresh = requests[1].body
+		local legacy = fresh:gsub('"component":"game%-client"', '"source":"game-client"', 1)
+		if shape == "both" then legacy = legacy:gsub("^{", '{"component":"main-server",', 1) end
+		local record = { body = legacy, crash_id = json.decode(fresh).crash_id, fatal = true }
+		local scope = producer:pending_scope()
+		if shape == "report" then
+			local ns, saved_get = nil, sys.get_save_file
+			sys.get_save_file = function(application_id, file_name)
+				if application_id:find("pending%-crashes") then ns = application_id .. "/" .. (file_name or "identity") end
+				return saved_get(application_id, file_name)
+			end
+			storage.load_pending_entries(scope)
+			sys.get_save_file = saved_get
+			assert_true(ns ~= nil)
+			assert_true(sys.save(ns, { items = { json.decode(legacy) } }))
+		else
+			assert_true(storage.save_pending_crash(scope, record) ~= nil)
+		end
+		storage.reset()
+		requests = {}
+		local consumer = assert(crash.new(config({ sample_every = 1 })))
+		assert_true(consumer:resend_pending())
+		if shape == "both" then
+			assert_equal(#requests, 0, "ambiguous record never dispatched")
+			local retained = storage.load_pending_entries(scope)
+			assert_equal(#retained, 1)
+			assert_equal(retained[1].body, legacy, "ambiguous body retained unchanged")
+		else
+			assert_equal(#requests, 1, "old record reached transport")
+			local expected = shape == "report" and json.encode(json.decode(legacy)):gsub('"source":"game%-client"', '"component":"game-client"', 1) or fresh
+			assert_equal(requests[1].body, expected, "legacy replay changes only root key")
+			assert_equal(#storage.load_pending_crashes(scope), 0, "accepted record drains")
+		end
+		restore()
+		storage.reset()
+	end
+end
+
+local function test_component_wire_rejects_retired_key()
+	reset()
+	local client = assert(crash.new(config({ crash_source = "game-client", sample_every = 1 })))
+	local prepared = assert(event_mod.prepare(client, presymbolicated_event(), true, {}))
+	assert_equal(prepared.source, nil, "prepared crash has no retired root key")
+	assert_equal(prepared.component, "game-client", "prepared crash carries component")
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(#requests, 1)
+	local body = json.decode(requests[1].body)
+	assert_equal(body.source, nil, "retired root source key absent")
+	assert_equal(body.component, "game-client", "legacy option emits component")
+	assert_equal(body.fatal, true)
+	local expected = { app = true, component = true, crash_id = true, exception = true, fatal = true, occurred_at = true, platform = true, threads = true }
+	for key in pairs(body) do assert_true(expected[key], "unexpected golden root key " .. key); expected[key] = nil end
+	assert_equal(next(expected), nil, "all expected golden keys reached wire")
+end
+
 local tests = {
+	test_component_replay_structural_keys,
+	test_component_option_precedence,
+	test_legacy_component_replay_and_ambiguity,
+	test_component_wire_rejects_retired_key,
 	test_config_validation,
 	test_source_stamped_on_every_report,
 	test_bare_app_omits_source,

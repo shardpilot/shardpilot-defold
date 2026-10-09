@@ -3,7 +3,7 @@
 -- across our SDKs.
 --
 -- An event table carries (snake_case wire keys throughout):
---   crash_id, occurred_at, app{id,version,build_id}, source, platform,
+--   crash_id, occurred_at, app{id,version,build_id}, component, platform,
 --   os{name,version}, device{}, context{}, exception{type,reason,
 --   crashed_thread_id}, modules[], threads[]{id,name,crashed,frames[]},
 --   raw_text, breadcrumbs[], fingerprint_components[], metadata{}.
@@ -1437,7 +1437,7 @@ function M.prepare(client, event, trusted_frame_functions, options)
 		end
 	end
 	if not source_omitted_for_fatal and not non_empty(event.source) then
-		event.source = client.config.crash_source
+		event.source = client.config.crash_component
 	end
 	if not non_empty(event.platform) then
 		event.platform = client.config.platform
@@ -1510,7 +1510,10 @@ function M.prepare(client, event, trusted_frame_functions, options)
 	if not ok then
 		return nil, validate_err
 	end
-	return compact_event(sanitized)
+	local wire = compact_event(sanitized)
+	wire.component = wire.source
+	wire.source = nil
+	return wire
 end
 
 return M
