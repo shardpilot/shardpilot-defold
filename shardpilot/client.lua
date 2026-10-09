@@ -250,24 +250,18 @@ end
 -- supersession on an ordinary later decision -- replacing accurate provenance
 -- with a false, later event. The hold is the shared fact; the flag is a cache of
 -- it, and a cache is not the fact.
--- THE DURABILITY BOUND OF THIS FACT, stated because it was never stated and the
--- absence of a bound is what made the mechanism grow without one. The
--- supersession provenance is durable in exactly TWO places: the identity record,
+-- Supersession provenance is durable in two places: the identity record,
 -- and the write-ahead denial marker that covers an identity write which failed.
 -- It is NOT reconstructed from anywhere else, and two paths are known to lose it:
 --
 --   * a superseding GRANT whose identity write fails has no marker (markers are
---     denial-only, by Decision 5c's write-ahead design), so a process exit there
+--     denial-only), so a process exit there
 --     loses the fact;
 --   * the whole-record merge reads the RECORD, not the marker, so provenance
 --     that exists only in a marker is not merged forward by a sibling.
 --
--- Both are real and both are DECLINED here rather than left unsaid. Closing them
--- needs a grant-side durable witness and a marker-reading merge -- more
--- machinery for an audit fact than the fact is worth, on a change that has grown
--- 3.6x from its first submission across five review rounds. An audit fact whose
--- preservation costs more than the decision it annotates is the wrong trade, and
--- the honest form of that judgement is a written bound, not a sixth round.
+-- These are known durability limitations. Preserving provenance across both
+-- paths would require a durable grant witness and a merge that reads markers.
 --
 -- ONE BUILDER for every denial-marker payload. There are FOUR writers -- the
 -- belt's convergence fallback, set_consent, the delivery callback and the
@@ -1235,8 +1229,7 @@ function M.new(config, defer_init_diagnostics)
 	-- denied or unknown restore still dispatches the salvageable receipts and
 	-- their acknowledgment rewrites the mirror over an entry that may be an
 	-- undelivered denial. WITHHOLDING A GRANT is what stays conditional on
-	-- there being a grant. (Ported from the godot review before this repo's own
-	-- round could re-find it.)
+	-- there being a grant.
 	if outbox_err ~= nil then
 		client.consent_outbox_unreadable = true
 		client.stats.consent_denial_possibly_undelivered = 1
@@ -4096,16 +4089,14 @@ function Client:refresh_token()
 		-- withholds the wake rather than routing to fail_token_settlement:
 		-- refresh_token() returns true whenever a token is present, so the
 		-- publish goes out on the old credential while the refresh runs, and
-		-- test_token_expiry_refresh — older than this PR — pins exactly that
+		-- test_token_expiry_refresh pins exactly that
 		-- contract. Discarding the token would break a provider whose tokens
 		-- are simply shorter-lived than the configured lead.
 		--
-		-- What remains is pre-existing and NOT repaired here: with a lead
-		-- longer than the provider's whole token lifetime, every publish
-		-- attempt asks for a new token. The wake made that once per FRAME;
-		-- without it, it is once per flush, which is what this SDK did before
-		-- this PR. Narrowing the lead to fit a short-lived token is a
-		-- configuration question, not a wake one.
+		-- With a lead longer than the provider's whole token lifetime, every
+		-- publish attempt still asks for a new token. Withholding the wake
+		-- limits this to once per flush instead of once per frame. Configure
+		-- the lead to fit the provider's token lifetime to avoid that refresh.
 		if not born_stale then
 			self:wake_pending_publish_work()
 		end
@@ -4959,21 +4950,16 @@ end
 -- success would let a transient disk failure silently undo the operation the
 -- caller just performed.
 -- `evicted` is ONLY ever an append's eviction count. A drop passes nil rather
--- than its removal count: overloading one parameter with "evicted" and
--- "removed" needed a flag at the call site to tell them apart, which is two
--- facts on one channel -- the defect this whole PR exists to remove, invented
--- while removing it.
+-- than its removal count so removals cannot be mistaken for evictions.
 -- THE HOLD STAYS WHERE IT WAS: in the client, in ONE place, in front of every
 -- operation. While the trail is unreadable the damaged file is the evidence
 -- this session's refusal rests on, and the in-memory list is only its
 -- salvageable subset -- writing the subset over it destroys the evidence with
 -- an ordinary acknowledgment rather than with anything resembling a decision.
 --
--- Deliberately NOT moved into the storage layer by this change. It is a POLICY
--- about when a write is allowed, and this PR changes the SHAPE of the write.
--- Moving it would also break the one path that legitimately clears it -- a
--- fresh decision supersedes the unknown trail -- because the client clears its
--- own flag and the resolution would not know. That is the subject of PR 3.
+-- The hold belongs to the client because it decides when writes are allowed
+-- and clears its own flag when a fresh decision supersedes the unknown trail.
+-- The storage resolution does not observe that flag transition.
 -- THE HOLD IS ABOUT DISK, AND ONLY ABOUT DISK. The operation still happens in
 -- memory: an acknowledged receipt cannot be re-sent by this process, and a
 -- fresh decision applies now. Withholding both would leave the caller re-sending
@@ -6538,20 +6524,15 @@ function Client:start_publish_batch(automatic)
 		elseif retain and retry_after and retry_after == 0 then
 			-- Retry-After: 0 is an explicit "retry NOW", and the transport
 			-- accepts it as a valid non-negative delay. Falling through to
-			-- the backoff below turned the server's own zero into a
-			-- one-second wait — a regression this PR would have introduced,
-			-- since the first failure used to arm nothing at all
-			-- .
+			-- the backoff below would apply client backoff instead of honoring
+			-- the explicit zero.
 			if events.zero_retried then
 				-- A SECOND zero for the same batch means "retry now" is not
 				-- working: the server is answering immediately and failing
 				-- immediately, and honouring it again buys a request PER
 				-- FRAME for as long as it keeps saying so. Pace it like any
 				-- other retryable failure — the same bound, and for the same
-				-- reason, as a second 401 falling back to the backoff. Not
-				-- from the review: the unbounded loop is in the zero handling
-				-- this PR itself added, and it surfaced while fixing the
-				-- superseded-deadline half below.
+				-- reason, as a second 401 falling back to the backoff.
 				self:defer_backoff()
 			else
 				events.zero_retried = true
