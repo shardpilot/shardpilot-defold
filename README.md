@@ -76,7 +76,7 @@ not the platform boundary.
   `observe_disconnect(reason)`.
 - Reports **crashes** through a separate `require "shardpilot.crash"`
   module to a dedicated crash ingest endpoint with a `crash:write` key — never as
-  an analytics event. Stamps a component-slug `source`, scrubs PII, samples
+  an analytics event. Stamps a component-slug `component`, scrubs PII, samples
   non-fatal reports while **always** sending fatal ones, and forwards a
   previous-session native crash dump on next launch — automatically from
   `crash.init` (disable with `capture_previous_on_boot = false`), with the
@@ -1421,7 +1421,7 @@ Crashes use a **separate** module and endpoint. The crash client
 (`require "shardpilot.crash"`) sends one report per crash as
 `POST {crash_ingest_url}/api/v1/crashes/ingest` with a `crash:write` API key as
 the `Bearer`, carrying the crash report JSON body: `crash_id`
-(UUIDv7), `occurred_at`, `app{id,version,build_id}`, a component-slug `source`,
+(UUIDv7), `occurred_at`, `app{id,version,build_id}`, a component-slug `component`,
 `platform`, `os`, `exception`, `modules[]`, `threads[]`/`frames[]`,
 `breadcrumbs[]`, `fingerprint_components[]`, and `metadata`. A crash is **never**
 wrapped as a `mobile_crash` analytics event on `/v1/events:batch`. Fatal reports

@@ -436,7 +436,7 @@ local function start_crash()
 		crash_ingest_url = "http://localhost:8080",
 		crash_api_key = "sp_crash_write_placeholder",
 		app_id = "app-example",
-		crash_source = "game-client",
+		crash_component = "game-client",
 		-- script_error_capture_enabled = true, -- opt-in Lua error auto-capture
 	})
 	crash_running = ok and true or false

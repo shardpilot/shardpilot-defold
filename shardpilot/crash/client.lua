@@ -1,6 +1,6 @@
 -- The crash ingest client: a dedicated client that POSTs crash reports to
 -- {crash_ingest_url}/api/v1/crashes/ingest with a `crash:write` API key, stamps
--- the component-slug `source` on every report, samples NON-fatal reports, and
+-- the component-slug `component` on every report, samples NON-fatal reports, and
 -- ALWAYS sends a fatal crash (emit_fatal bypasses the sampler). Behavior is
 -- consistent across our SDKs.
 local breadcrumbs = require "shardpilot.crash.breadcrumbs"
@@ -152,7 +152,9 @@ local function validate_config(config)
 	-- is configured (a config field defaulted onto every event), but the VALUE
 	-- space is the component slug, not the analytics client/server/backend enum.
 	-- Empty/absent = bare app.
-	local crash_source = config.crash_source or ""
+	local crash_source = config.crash_component
+	if type(crash_source) == "string" then crash_source = crash_source:match("^%s*(.-)%s*$") end
+	if crash_source == nil or crash_source == "" then crash_source = config.crash_source or "" end
 	if not event_mod.valid_source(crash_source) then
 		return nil, "invalid_crash_source"
 	end
@@ -235,6 +237,7 @@ local function validate_config(config)
 		app_version = config.app_version,
 		app_build = config.app_build,
 		crash_source = crash_source ~= "" and crash_source or nil,
+		crash_component = crash_source ~= "" and crash_source or nil,
 		platform = resolved_platform,
 		sample_every = sample_every,
 		publish_timeout_seconds = publish_timeout_seconds,
@@ -1070,6 +1073,14 @@ function Client:dispatch_pending(entry, on_settled)
 					pending_token)
 			end
 		end
+	end
+	if type(entry.body) == "string" then
+		local migrated = transport.migrate_component(entry.body)
+		if not migrated then
+			if on_settled then on_settled(false) end
+			return false, "ambiguous_crash_component"
+		end
+		entry.body = migrated
 	end
 	self.stats.emitted = self.stats.emitted + 1
 	self.in_flight = self.in_flight + 1

@@ -25,7 +25,7 @@ crash.init({
   app_id           = "app-example",                  -- must match the key's app scope
   app_version      = "1.4.2",
   app_build        = "4201",
-  crash_source     = "game-client",                  -- component slug (optional)
+  crash_component  = "game-client",                  -- component slug (optional)
   -- sample_every      = 10,  -- every-Nth NON-fatal is sent (deterministic counter; fatal always sent)
   -- publish_timeout_seconds = 30,
   -- sampler = function(event) return true end,       -- custom NON-fatal sampler
@@ -42,7 +42,8 @@ crash.init({
 | `app_id` | yes | App/project scope; must match the API key's app scope. A product slug such as `user_app` or `customer_portal` is fine; a value carrying real PII (an email, an IP, a token, a digit-bearing raw actor id) fails `crash.init` with `invalid_app_id`. |
 | `app_version`, `app_build` | no | Defaulted onto every report. |
 | `platform` | no | Auto-detected from `sys.get_sys_info` (`ios`/`android`/`windows`/`macos`/`linux`/`web`). Set it explicitly when running outside Defold or on an unrecognized system; if it is neither configured nor auto-detectable, `crash.init` fails with `platform_required` rather than returning a client that can never send a report. |
-| `crash_source` | no | The component slug (see below). |
+| `crash_component` | no | Preferred component slug (see below). |
+| `crash_source` | no | Deprecated fallback when `crash_component` is blank. |
 | `sample_every` | no | Every-Nth sampling for **non-fatal** reports (default 10): a deterministic per-process counter transmits calls N, 2N, 3N, … — the first N−1 non-fatals of a process are always dropped, so a process emitting fewer than N non-fatals in its lifetime reports none (set `1` to send every one). Fatal reports are **never** sampled. |
 | `publish_timeout_seconds` | no | Per-request timeout (default 30). |
 | `sampler` | no | A custom `function(event) -> boolean` for non-fatal reports. A fatal report bypasses it. |
@@ -52,16 +53,16 @@ crash.init({
 | `capture_previous_on_boot` | no | **Default `true`**: `crash.init` itself forwards the previous-session native dump and runs one resend pass — no manual `capture_previous()` call needed. Set `false` to keep the manual flow (e.g. to defer the network work past your loading screen). Instance clients built with `crash.new` are unaffected either way — they always use the manual call. |
 | `script_error_capture_enabled` | no | **Default `false` (dark)** — opt-in Lua script-error auto-capture. When `true`, the SDK installs a [`sys.set_error_handler`](https://defold.com/ref/stable/sys/#sys.set_error_handler) handler — at construction while crash reporting is enabled, or at the `set_enabled(true)` that re-enables it (an opted-out or fail-closed boot leaves the game's handler slot untouched; a runtime opt-out after install leaves the SDK's handler in place as a guaranteed no-op, since the sys API cannot restore a previous handler) — that forwards each unhandled script error as a **fatal** `lua_error` report (message → `exception.reason`, traceback → `raw_text`, source → context), capped at **10 reports per session** so a per-frame error loop cannot flood the ingest door. Defold has a **single** process-wide error-handler slot: opting in replaces any handler the game installed (and a later `sys.set_error_handler` by game code replaces the SDK's). Keep this off and call `emit_fatal` from your own handler if you need both. |
 
-### The `source` component slug
+### The `component` slug
 
-`crash_source` is the **component slug** within the app: the game client vs each
+`crash_component` is the **component slug** within the app: the game client vs each
 backend service, so a multi-repo product attributes crashes per component under
-one app id. It is stamped on **every** report and is part of the server-side
+one app id. A nonempty slug is stamped on every report as the root `component` key and is part of the server-side
 crash group key.
 
 This mirrors how the analytics SDK's `source` is configured (a config field
 defaulted onto every event), but the **value space is different**: the crash
-`source` is a lowercase DNS-style slug — `^[a-z0-9][a-z0-9-]{0,62}$`, max 63
+`component` is a lowercase DNS-style slug — `^[a-z0-9][a-z0-9-]{0,62}$`, max 63
 chars — **not** the analytics `client` / `server` / `backend` enum.
 
 - Omit it (or set `""`) for a **bare app** with no component dimension — the
@@ -70,6 +71,15 @@ chars — **not** the analytics `client` / `server` / `backend` enum.
   default.
 - The slug is validated **before** it reaches the wire; an invalid value is
   rejected.
+
+The preferred option wins over `crash_source`. A blank preferred option uses the
+legacy fallback; an invalid nonblank preferred value is rejected. The event-table
+`source` override remains supported, but its wire key is `component`.
+
+Durable reports written by older versions rename only their root `source` key on
+replay. Values, nested keys and crash IDs are preserved. Records containing both
+root keys remain queued without dispatch rather than guessing attribution or
+losing the report.
 
 ## Manual emit
 
