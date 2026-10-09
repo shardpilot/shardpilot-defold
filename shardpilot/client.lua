@@ -3001,7 +3001,7 @@ function Client:set_consent(decision, notice)
 	self.consent_denial_marker_pending = (not granted) and not marker_durable
 	local receipt_safe = self:send_consent_decision(captured_notice)
 	if not purged then
-		-- The denial applied (and persisted), but the durable spool purge
+		-- The denial applied, but the durable spool purge
 		-- failed: previously spooled envelopes are still on disk. Calling
 		-- the same denial again retries it, and later dispatch points
 		-- keep retrying on their own.
