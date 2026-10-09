@@ -14742,3 +14742,110 @@ end)()
 	print(string.format("Facade ownership: %d passed, %d failed", passed, failed))
 	assert_equal(failed, 0, "facade ownership scene failures")
 end)()
+
+-- Consent reads expose the current decision without changing or delivering it.
+;(function()
+	local scenes = {}
+	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
+	local function fresh(run)
+		reset(); storage.reset()
+		local facade = dofile("shardpilot/sdk.lua")
+		local options = config({ app_id = "synthetic-consent-getter", anonymous_id = "synthetic-reader" })
+		local ok, err = pcall(run, facade, options)
+		storage.reset()
+		assert_true(ok, err)
+	end
+	local function read_only(read, expected)
+		local before, saved = #requests, {}
+		for _, name in ipairs({ "save", "save_consent_outbox", "save_consent_denial_marker", "clear_spool" }) do
+			saved[name] = storage[name]
+			storage[name] = function() error("consent read attempted storage write") end
+		end
+		local ok, err = pcall(function()
+			assert_equal(read(), expected)
+			assert_equal(read(), expected, "repeated read is stable")
+			assert_equal(#requests, before, "getter does not dispatch")
+		end)
+		for name, original in pairs(saved) do storage[name] = original end
+		assert_true(ok, err)
+	end
+	scene("uninitialized facade is unknown", function()
+		fresh(function(facade)
+			read_only(function() return facade.get_consent_state() end, "unknown")
+		end)
+	end)
+	for _, api in ipairs({ "instance", "facade" }) do
+		scene(api .. " live decisions and rejected input", function()
+			fresh(function(facade, options)
+				local client
+				if api == "instance" then client = assert(facade.new(options))
+				else assert_true(facade.init(options)) end
+				local function call(method, ...)
+					if client then return client[method](client, ...) end
+					return facade[method](...)
+				end
+				local function read() return call("get_consent_state") end
+				read_only(read, "unknown")
+				for _, entry in ipairs({ { true, "granted" }, { false, "denied" }, { "denied_forced_minor", "denied_forced_minor" } }) do
+					assert_true(call("set_consent", entry[1]))
+					read_only(read, entry[2])
+					local ok, code = call("set_consent", "synthetic-invalid")
+					assert_equal(ok, false); assert_equal(code, "invalid_consent")
+					read_only(read, entry[2])
+				end
+				assert_true(call("shutdown"))
+				read_only(read, client and "denied_forced_minor" or "unknown")
+			end)
+		end)
+		scene(api .. " restored decisions", function()
+			for _, state in ipairs({ "unknown", "granted", "denied", "denied_forced_minor" }) do
+				fresh(function(facade, options)
+					assert_true(storage.save(options, { anonymous_id = options.anonymous_id, consent_analytics = state }))
+					local client
+					if api == "instance" then client = assert(facade.new(options))
+					else assert_true(facade.init(options)) end
+					read_only(function()
+						if client then return client:get_consent_state() end
+						return facade.get_consent_state()
+					end, state)
+				end)
+			end
+		end)
+	end
+	scene("applied denial remains readable after failed purge", function()
+		fresh(function(facade, options)
+			local client = assert(facade.new(options))
+			assert_true(client:set_consent(true))
+			local real_clear = storage.clear_spool
+			storage.clear_spool = function() return false end
+			local ok, code = client:set_consent(false)
+			storage.clear_spool = real_clear
+			assert_equal(ok, false); assert_equal(code, "spool_purge_failed")
+			assert_true(client.spool_purge_pending, "real denial retains purge debt")
+			read_only(function() return client:get_consent_state() end, "denied")
+			assert_true(client.spool_purge_pending, "getter does not settle purge debt")
+		end)
+	end)
+	scene("retryable shutdown retains the current facade state", function()
+		fresh(function(facade, options)
+			options.spool_enabled = false
+			seed_granted_consent(options)
+			assert_true(facade.init(options)); assert_true(facade.session_start())
+			next_status = 500
+			assert_equal(facade.shutdown(), false)
+			assert_true(#requests > 0, "real shutdown publisher ran")
+			read_only(function() return facade.get_consent_state() end, "granted")
+			next_status = 202
+			assert_true(facade.shutdown())
+			read_only(function() return facade.get_consent_state() end, "unknown")
+		end)
+	end)
+	local passed, failed = 0, 0
+	for _, entry in ipairs(scenes) do
+		local ok, err = pcall(entry.run)
+		if ok then passed = passed + 1 else failed = failed + 1 end
+		print("consent getter scene " .. entry.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	print(string.format("Consent getter: %d passed, %d failed", passed, failed))
+	assert_equal(failed, 0, "consent getter scene failures")
+end)()

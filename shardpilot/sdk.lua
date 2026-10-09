@@ -109,6 +109,12 @@ function M.get_anonymous_id()
 	return value_from_default("get_anonymous_id")
 end
 
+function M.get_consent_state()
+	local client = default()
+	if not client then return "unknown" end
+	return client:get_consent_state()
+end
+
 -- Record an explicit analytics consent decision: true (granted), false
 -- (denied), or the string "denied_forced_minor" — a band-forced denial that
 -- gates analytics exactly like denied and differs only in the reason its

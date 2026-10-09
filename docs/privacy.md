@@ -32,6 +32,13 @@ two games on the same device from sharing an anonymous ID or consent record.
 When the Defold `sys` API is unavailable, the record degrades to in-memory
 state for the process lifetime.
 
+Read the current in-memory decision with `client:get_consent_state()` or
+`shardpilot.get_consent_state()`: `unknown`, `granted`, `denied`, or
+`denied_forced_minor`. Reading has no network or persistence side effects and
+does not prove that a decision is durable or its receipt was delivered. The
+module returns `unknown` without a default client, including after successful
+shutdown; a still-held client instance reports that instance's last state.
+
 `set_consent(decision)` records an explicit consent decision — `true`
 (granted), `false` (denied), or the string `"denied_forced_minor"` (an
 age-gate-forced denial) — over the consent states {unknown, granted, denied,

@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- Added `get_consent_state()` on the module and client to read the current
+  in-memory consent decision without sending or persisting it. The module returns
+  `unknown` before initialization and after successful shutdown.
+
 - The module's `init(config)` refuses another initialization while its default
   client is live or being constructed, returning `false, "already_initialized"`.
   Call `shutdown()` successfully before initializing a replacement. The module's
