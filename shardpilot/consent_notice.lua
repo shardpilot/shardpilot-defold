@@ -1,5 +1,6 @@
 -- Per-decision provenance. Locale validation is structural, not registry lookup.
 local M = {}
+local version_ok = require "shardpilot.consent_version"
 local fields = { notice_version = true, notice_locale = true, policy_version = true }
 -- RFC 5646 section 2.1's fixed irregular productions; regular grandfathered
 -- tags already match the grammar below. This is not a locale registry.
@@ -7,11 +8,6 @@ local irregular = {}
 for tag in ("en-gb-oed i-ami i-bnn i-default i-enochian i-hak i-klingon i-lux " ..
 	"i-mingo i-navajo i-pwn i-tao i-tay i-tsu sgn-be-fr sgn-be-nl sgn-ch-de"):gmatch("%S+") do
 	irregular[tag] = true
-end
-
-local function version(value)
-	return type(value) == "string" and #value >= 1 and #value <= 64
-		and value:match("^[A-Za-z0-9._-]+$") ~= nil
 end
 
 local function locale(value)
@@ -64,7 +60,7 @@ function M.snapshot(value)
 		if not fields[key] then return nil, "consent_notice_invalid" end
 		captured[key] = item
 	end
-	if not version(captured.notice_version) or not version(captured.policy_version)
+	if not version_ok(captured.notice_version) or not version_ok(captured.policy_version)
 		or not locale(captured.notice_locale) then return nil, "consent_notice_invalid" end
 	return captured
 end

@@ -15619,6 +15619,74 @@ end)()
 			end)
 		end
 	end
+	for _, api in ipairs({ "new", "init" }) do
+		for _, decision in ipairs({ true, false }) do
+			for _, value in ipairs({ "strict-fallback/1", "build+7/patch_1", string.rep("v", 64), "space value", string.rep("v", 65) }) do
+				scene(api .. " policy version " .. value .. " decision=" .. tostring(decision), function()
+					fresh(api, "token", function(call)
+						local tuple = { notice_version = value, notice_locale = "en", policy_version = value }
+						local valid = value ~= "space value" and #value <= 64
+						local ok, code, warning = call("set_consent", decision, tuple)
+						if not valid and decision then
+							assert_equal(ok, false); assert_equal(code, "consent_notice_invalid")
+							assert_equal(#requests, 0, "invalid version grant has no wire effect")
+						else
+							assert_equal(ok, true); assert_equal(code, nil)
+							assert_equal(warning, not valid and "consent_notice_invalid" or nil)
+							tuple_equal(receipt(), valid and tuple or nil)
+						end
+					end)
+				end)
+			end
+		end
+	end
+	for _, granted in ipairs({ true, false }) do
+		scene("actual example resolved-policy golden decision=" .. tostring(granted), function()
+			reset(); storage.reset()
+			local _, restore = install_stub_sys_storage()
+			local saved, globals = {}, {}
+			for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform", "shardpilot.consent_policy" }) do saved[name] = package.loaded[name] end
+			for _, name in ipairs({ "init", "update", "final", "on_message", "on_input", "host_age_band", "present_consent_notice", "window", "print" }) do globals[name] = _G[name] end
+			local request = http.request
+			local ok, err = pcall(function()
+				local file = assert(io.open("test/golden/consent-policy-resolved.json", "rb"))
+				local body = file:read("*a"); file:close()
+				-- Only scope is adapted to the shipped example; identifier bytes stay exact.
+				body = body:gsub('"ws_1"', '"workspace-example"'):gsub('"app_1"', '"app-example"'):gsub('"env_1"', '"develop"')
+				http.request = function(url, method, callback, headers, payload)
+					requests[#requests + 1] = { url = url, body = payload }
+					local response = url:find("/api/cp/v1/consent/policy", 1, true) and body or '{"recorded":true,"replayed":false}'
+					callback(nil, nil, { status = 200, response = response })
+				end
+				package.loaded["shardpilot.consent_policy"] = dofile("shardpilot/consent_policy.lua")
+				package.loaded["shardpilot.sdk"] = dofile("shardpilot/sdk.lua")
+				package.loaded["shardpilot.platform"] = { detect = function() return "windows" end }
+				package.loaded["shardpilot.crash"] = { shutdown = function() return true end }
+				window = { set_listener = function() end }
+				local logs, answer = {}, nil
+				print = function(...) local parts = {}; for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end; logs[#logs + 1] = table.concat(parts, " ") end
+				assert(loadfile("examples/minimal/main.script"))()
+				host_age_band = function() return "adult" end
+				present_consent_notice = function(decision, callback)
+					assert_true(decision.plan_used, "real policy golden must be used, not fallback")
+					assert_equal(decision.policy_version, "strict-fallback/1")
+					assert_equal(decision.consent_text_version, "strict-fallback/1")
+					answer = callback
+				end
+				init(nil); assert_true(type(answer) == "function", "example must present the golden plan")
+				assert_equal(#requests, 1, "no SDK wire before the answer")
+				answer(granted); update(nil, 0)
+				local wire = receipt()
+				tuple_equal(wire, { notice_version = "strict-fallback/1", notice_locale = "en", policy_version = "strict-fallback/1" })
+				assert_equal(wire.categories.analytics, granted)
+				assert_true(not table.concat(logs, " "):find("consent_notice_invalid", 1, true), "real setter must accept the displayed versions")
+			end)
+			http.request = request
+			for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform", "shardpilot.consent_policy" }) do package.loaded[name] = saved[name] end
+			for _, name in ipairs({ "init", "update", "final", "on_message", "on_input", "host_age_band", "present_consent_notice", "window", "print" }) do _G[name] = globals[name] end
+			restore(); storage.reset(); assert_true(ok, err)
+		end)
+	end
 	local passed, failed = 0, 0
 	for _, entry in ipairs(scenes) do
 		local ok, err = pcall(entry.run)

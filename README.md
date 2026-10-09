@@ -1687,7 +1687,8 @@ local applied, code, warning = shardpilot.set_consent(granted, notice)
 
 Omitting the table preserves the existing behavior. A supplied table must carry
 all three strings, with version ids of 1–64 ASCII letters, digits, dots,
-underscores or hyphens and a locale of 2–35 bytes matching BCP 47 structure.
+underscores, plus signs, slashes or hyphens and a locale of 2–35 bytes matching
+BCP 47 structure. The version rule is shared with the policy validator.
 Locale spelling is preserved; this is a syntax check, not a language registry
 lookup. Notice text and other members are refused. Invalid notice metadata on
 a grant returns `false, "consent_notice_invalid"` without changing the decision.
