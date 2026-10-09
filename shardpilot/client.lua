@@ -3026,6 +3026,10 @@ function Client:set_consent(decision, notice)
 	return true, nil, notice_warning
 end
 
+local function session_boundary_ms(session, candidate_ms)
+	return math.max(session.last_event_ms or 0, candidate_ms)
+end
+
 -- Queue insertion has no callbacks. A replacement checks room for both events
 -- before committing either, while ordinary enqueue keeps its single push.
 local function commit_event(client, event, stream, now_ms)
@@ -3076,6 +3080,8 @@ function Client:start_session(props, fact)
 		return false, err
 	end
 	if replaced then
+		staged_start.now_ms = session_boundary_ms(replaced, staged_start.now_ms)
+		staged_start.event.event_ts = clock.iso_utc(staged_start.now_ms)
 		local ended, end_err, staged_end = self:enqueue_event("app.session_ended", { reason = "session_start" }, nil,
 			{ session_table = replaced, event_ts = staged_start.event.event_ts, stage = true })
 		if not ended then return false, end_err end
@@ -3338,7 +3344,7 @@ function Client:run_boundary(replace)
 	-- session's own last event: that is the one rule kept when a backward
 	-- correction makes it later than now.
 	local deadline_ms = paused.wall_ms + self.config.session_timeout_seconds * 1000
-	local stamp_ms = math.max(closing.last_event_ms or 0, math.min(deadline_ms, clock.unix_ms()))
+	local stamp_ms = session_boundary_ms(closing, math.min(deadline_ms, clock.unix_ms()))
 	local end_ts = clock.iso_utc(stamp_ms)
 	local ok, err = self:enqueue_event("app.session_ended", { reason = "idle_timeout" }, nil,
 		{ session_table = closing, event_ts = end_ts, retryable = true })

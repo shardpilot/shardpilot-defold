@@ -15749,6 +15749,37 @@ end)()
 				end)
 			end)
 		end
+		for _, timing in ipairs({ { delta = -30 }, { delta = 0 }, { delta = 30 }, { delta = -30, again = true } }) do
+			scene(api .. " replacement clock delta " .. timing.delta .. (timing.again and " then rollback again" or ""), function()
+				fresh(api, {}, function(call)
+					local gettime, previous_now = socket.gettime, socket.now
+					socket.gettime = function() return socket.now end
+					local ok, err = pcall(function()
+						socket.now = 1700000000
+						assert_true(call("session_start")); local old_id = call("get_session_id")
+						socket.now = socket.now + 60
+						assert_true(call("track", "synthetic-last-activity"))
+						socket.now = socket.now + timing.delta
+						assert_true(call("session_start")); call("flush"); local wire = events()
+						assert_equal(#wire, 4); assert_equal(wire[2].event_name, "synthetic-last-activity")
+						assert_equal(wire[3].event_name, "app.session_ended"); assert_equal(wire[3].session_id, old_id)
+						assert_true(wire[3].event_ts >= wire[2].event_ts, "replacement end must not predate old activity")
+						assert_equal(wire[3].event_ts, os.date("!%Y-%m-%dT%H:%M:%SZ", 1700000060 + math.max(0, timing.delta)))
+						assert_equal(wire[4].event_name, "app.session_started"); assert_equal(wire[4].event_ts, wire[3].event_ts)
+						assert_equal(wire[3].session_sequence, 3); assert_equal(wire[4].session_sequence, 1)
+						if timing.again then
+							socket.now = socket.now - 120
+							assert_true(call("session_start")); call("flush"); wire = events()
+							assert_equal(#wire, 6); assert_equal(wire[5].session_id, wire[4].session_id)
+							assert_equal(wire[5].event_name, "app.session_ended")
+							assert_true(wire[5].event_ts >= wire[4].event_ts, "replacement must retain the clamped start high-water mark")
+							assert_equal(wire[6].event_ts, wire[5].event_ts)
+						end
+					end)
+					socket.gettime, socket.now = gettime, previous_now; assert_true(ok, err)
+				end)
+			end)
+		end
 		scene(api .. " one free slot refuses whole pair then retry", function()
 			fresh(api, { buffer_size = 2, batch_size = 2 }, function(call)
 				assert_true(call("session_start")); local old_id = call("get_session_id")
