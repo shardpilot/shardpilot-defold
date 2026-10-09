@@ -768,8 +768,10 @@ A decision is **not** consent, and it is not legal advice: ShardPilot's
 resolver returns the `STRICT_OPT_IN` regime to every caller, and the decision
 says whether the optional lane is closed whatever the player answers. A
 workspace that has accepted ShardPilot's advisory estimates may additionally
-receive an advisory, non-binding estimate, which this module does not carry in
-this release; you, the integrating studio, decide what to do with it.
+receive an advisory, non-binding estimate when the context asks for it
+(`advisory = true`), as `decision.advisory`. It is not a regime and changes no
+other field of the decision; you, the integrating studio, decide what to do
+with it.
 `decision.crash_profile`
 decides the crash lane **separately** — crash reporting is ON by default, so an
 unconditional `crash.init` is how a closed lane gets opened — and

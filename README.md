@@ -159,9 +159,10 @@ Minimal Defold script (see [`examples/minimal/`](examples/minimal)):
 > `STRICT_OPT_IN` regime to every caller, and the decision says whether the
 > optional lane stays closed whatever the player answers. A workspace that has
 > accepted ShardPilot's advisory estimates may additionally receive an
-> advisory, non-binding estimate, which this module does not carry in this
-> release; you, the integrating studio, decide what to do with it. Either way,
-> you still have to ask the player. When the resolver
+> advisory, non-binding estimate when the context asks for it
+> (`advisory = true`), as `decision.advisory`; it changes nothing else in the
+> decision, and you, the integrating studio, decide what to do with it. Either
+> way, you still have to ask the player. When the resolver
 > is unreachable or answers something this build will not accept, the callback
 > receives the strict fallback (`plan_used = false`), which tightens and never
 > relaxes.
@@ -1431,9 +1432,10 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 before the SDK exists. ShardPilot's resolver returns `STRICT_OPT_IN` to every
 caller; the module still accepts every regime value in the table below. A
 workspace that has accepted ShardPilot's advisory estimates may additionally
-receive an **advisory, non-binding estimate**, which this module does not
-carry in this release; you, the integrating studio, decide what to do with
-it. Neither is legal advice. It is a standalone module —
+receive an **advisory, non-binding estimate** when you ask for it
+(`advisory = true` in the context, below). It arrives as `decision.advisory`
+and **never changes the regime or any other field**; you, the integrating
+studio, decide what to do with it. Neither is legal advice. It is a standalone module —
 it imports nothing from this SDK, so preparing a regime cannot mint an
 identifier, load a spool or install a capture hook.
 
@@ -1450,7 +1452,9 @@ its closed vocabulary **costs no request**: `endpoint` (the same URL rule
 for a loopback host**, no userinfo, query, fragment or path), `workspace_id`, `app_id`, `environment_id`,
 `app_version`, `locale`, `platform` (use `platform.detect()`), and optionally
 `store` and `age_band` — which is accepted, sent as given, and **ignored by
-the resolver in this release**. `store_region` is **not accepted** in this release: a
+the resolver in this release** — and `advisory`, which must be `true` or
+`false`: `true` asks the resolver for the advisory part, and without it the
+request is the one earlier releases sent. `store_region` is **not accepted** in this release: a
 non-null value carries a country claim, and refusing it here is what stops it
 travelling.
 
@@ -1469,6 +1473,7 @@ The callback receives **exactly one decision, exactly once**:
 | `plan_used` | `false` means the strict fallback was taken; `reason` says why |
 | `operation_blocks` | The operation restrictions the host must enforce. **New in `v0.11.0`:** always a list, retaining the last accepted plan's set on fallback; `[]` when none is known |
 | `operation_blocks_source` | **New in `v0.11.0`:** `plan` for an accepted plan, including a cache hit; `preserved` for a fallback retaining that plan's set (even `[]`); `none` when no plan is known for this context |
+| `advisory` | **New:** present only when you asked for it (`advisory = true`) and the resolver served it; `nil` otherwise and on every fallback. A table: `jurisdiction` (a two-letter code, or `OTHER` when the connection did not resolve or has no row of its own), `estimate` (`SOFT_OPT_OUT`, `STRICT_OPT_IN`, or `nil` where the row carries none, always for `OTHER`), `row_id`, `row_status` (`COUNSEL_PENDING`), `row_basis` (`ai_draft`), `advisory_basis` (the row's basis text, in the matrix's own words), `matrix` (`docs_commit`, `file_sha256`, `date`) and `resolved_by` (`server_country` or `unknown`). It is an unreviewed estimate, **not a regime**: nothing in the decision reads it, and a `SOFT_OPT_OUT` estimate beside a `STRICT_OPT_IN` plan leaves every other field strict. A malformed advisory makes the whole plan unreadable, like any other malformed member |
 | `valid_for_seconds` | How long this verdict is good for — the shortest of the cache ceiling, the plan's `expires_at` and its `max_age_seconds`. **Schedule your own re-resolution by it:** cache expiry protects the next lookup and stops nothing that is already running. `nil` on a fallback, which established nothing that could expire |
 
 **The conservative rule.** A plan that is missing, unreadable, out of scope,

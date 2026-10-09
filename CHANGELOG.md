@@ -1,5 +1,33 @@
 # Changelog
 
+### Unreleased
+
+- `consent_policy`: the resolver's optional **advisory part** can now be
+  requested and is delivered as `decision.advisory`. It is a non-binding
+  estimate for the connection's jurisdiction, served only to a request that
+  asks for it, for a workspace that accepted the advisory terms.
+  - Ask for it with `advisory = true` in the context. Absent or `false`
+    sends the request earlier releases sent, and any other value is refused
+    locally (`invalid_request`, no request made). A request that asked never
+    shares a cache entry with one that did not.
+  - The advisory is validated like the rest of the plan:
+    - `jurisdiction` and `row_id` are a two-letter code or `OTHER`;
+    - `estimate` is `SOFT_OPT_OUT`, `STRICT_OPT_IN` or `nil`, and always
+      `nil` for `OTHER`;
+    - `row_status` is `COUNSEL_PENDING` and `row_basis` is `ai_draft`;
+    - `advisory_basis` is non-empty, at most 2048 bytes and free of control
+      characters;
+    - `matrix` carries a 40-character commit, a 64-character SHA-256 and a
+      calendar date;
+    - `resolved_by` is `server_country` or `unknown`, and `unknown` means
+      `OTHER`.
+  - Every member is required once the advisory is present, and only the
+    estimate may be null. A malformed advisory, or one the request did not ask
+    for, makes the plan unreadable (`invalid_response`).
+  - It **never changes the decision**: the regime, `analytics_choice_default`,
+    `explicit_grant_required` and every flag are the plan's alone. A fallback
+    carries no advisory, and a refusal never exposes one.
+
 ## v0.11.2 — 2026-10-02
 
 - The README and `docs/configuration.md` now state that the SDK supports one

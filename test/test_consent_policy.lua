@@ -2956,7 +2956,7 @@ end
 -- reordered, a number respelled or an escape rewritten in either file would
 -- fail here instead of passing as "the same document".
 local function test_the_review_forms_compact_to_the_wire_bytes()
-	for _, name in ipairs({ "resolved", "refusal" }) do
+	for _, name in ipairs({ "resolved", "refusal", "resolved-advisory" }) do
 		local wire, review = golden(name), golden_indented(name)
 
 		-- ⚠ THE CONTROL COMES FIRST. Without it, a review form accidentally
@@ -3406,6 +3406,36 @@ local function test_caller_mutation_cannot_relabel_operation_blocks()
 	assert_blocks(prepare(golden_context()), { "restricted" }, "preserved")
 end
 
+-- ⚠ THE ADVISORY OPT-IN DOES NOT DECIDE WHICH RESTRICTIONS ARE RETAINED. It asks
+-- for an optional extra part and changes no policy field, so a request that
+-- differs from the last one only by the opt-in keeps the blocks that plan
+-- installed, in both directions and back again. With the opt-in in the
+-- restriction key, dropping it forgot the blocks, and a failure right after
+-- served none: a blocked operation reopened.
+local function test_the_advisory_opt_in_keeps_operation_blocks()
+	for _, first_asks in ipairs({ true, false }) do
+		reset()
+		local first, second = golden_context(), golden_context()
+		first.advisory = first_asks or nil
+		second.advisory = (not first_asks) or nil
+		learn_blocks({ "restricted" }, first)
+		next_response_body = "not JSON"
+		assert_blocks(prepare(second), { "restricted" }, "preserved")
+		next_response_body = "not JSON"
+		assert_blocks(prepare(first), { "restricted" }, "preserved")
+	end
+	-- Control: the opt-in together with a real context change still starts a
+	-- new context, which forgets them.
+	reset()
+	local first, second = golden_context(), golden_context()
+	first.advisory = true
+	second.app_id = "second-app"
+	learn_blocks({ "restricted" }, first)
+	next_response_body = "not JSON"
+	assert_blocks(prepare(second), {}, "none")
+	print("operation blocks kept across the advisory opt-in: both directions")
+end
+
 local function test_the_example_keeps_blocks_after_resume_outage()
 	reset()
 	local ctx = context({ workspace_id = "workspace-example", app_id = "app-example",
@@ -3422,6 +3452,389 @@ local function test_the_example_keeps_blocks_after_resume_outage()
 	end
 end
 
+-- ===== THE ADVISORY PART =====
+--
+-- The resolver can serve, beside a plan, a non-binding estimate for the
+-- connection's jurisdiction: only to a request that asked for it, only for a
+-- workspace admitted to it, and never in place of the plan. These scenes run
+-- on the resolver's own advisory bytes.
+
+-- The request the golden ADVISORY body answers: the resolved request, plus
+-- the opt-in.
+local function golden_advisory_context()
+	local ctx = golden_context()
+	ctx.advisory = true
+	return ctx
+end
+
+-- The resolver's advisory bytes with one edit, and the edit is ASSERTED to
+-- have applied: a replacement that matched nothing would leave the scene
+-- testing the unmodified body, which is used.
+local function advisory_body(from, to, form)
+	local body = form == "review" and golden_indented("resolved-advisory") or golden("resolved-advisory")
+	if not from then
+		return body
+	end
+	local start = body:find(from, 1, true)
+	assert(start, "the advisory golden does not contain " .. from)
+	return body:sub(1, start - 1) .. to .. body:sub(start + #from)
+end
+
+-- The value span of one advisory member (or, with `matrix`, of one matrix
+-- member), located by the same depth-aware walk the omission scenes use.
+local function advisory_member_span(body, name, in_matrix)
+	local _, from, to = member_span(body, "advisory", 1, #body)
+	assert(from, "the body carries no advisory")
+	if in_matrix then
+		_, from, to = member_span(body, "matrix", from, to)
+		assert(from, "the advisory carries no matrix")
+	end
+	return member_span(body, name, from, to)
+end
+
+local function with_advisory_value(body, name, raw_value, in_matrix)
+	local _, value_from, value_to = advisory_member_span(body, name, in_matrix)
+	assert(value_from, "no advisory member named " .. name)
+	return body:sub(1, value_from - 1) .. raw_value .. body:sub(value_to + 1)
+end
+
+local function without_advisory_member(body, name, in_matrix)
+	local pair_from, _, value_to, closer = advisory_member_span(body, name, in_matrix)
+	assert(pair_from, "no advisory member named " .. name)
+	local cut_to = value_to
+	if closer == "," then
+		cut_to = value_to + 1
+	else
+		local back = pair_from - 1
+		while back > 1 and body:sub(back, back):match("[ \t\r\n]") do
+			back = back - 1
+		end
+		if body:sub(back, back) == "," then
+			pair_from = back
+		end
+	end
+	return body:sub(1, pair_from - 1) .. body:sub(cut_to + 1)
+end
+
+local ADVISORY_MEMBERS = {
+	"jurisdiction", "estimate", "row_id", "row_status", "row_basis", "advisory_basis", "matrix", "resolved_by",
+}
+local MATRIX_MEMBERS = { "docs_commit", "file_sha256", "date" }
+
+local function assert_refused(decision, label)
+	assert_true(not decision.plan_used, label .. " must not be used")
+	assert_equal(decision.reason, "invalid_response", label)
+	assert_true(decision.advisory == nil, label .. " must not reach the host")
+	assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
+		label .. ": the choice defaults off")
+end
+
+-- ⚠ ASKED FOR, NEVER ASSUMED. Without the opt-in the request is the one every
+-- earlier release sent; with it, the member travels as a boolean; and anything
+-- else is refused before a byte leaves.
+local function test_the_advisory_is_asked_for_only_when_requested()
+	for _, override in ipairs({ {}, { advisory = false } }) do
+		reset()
+		next_response_body = plan()
+		local decision = prepare(context(override))
+		assert_true(decision.plan_used, "the control: " .. tostring(decision.detail))
+		assert_true(requests[1].body:find('"advisory"', 1, true) == nil,
+			"a request that did not ask must not carry the member: " .. requests[1].body)
+		assert_true(decision.advisory == nil, "and the decision carries no advisory")
+	end
+
+	reset()
+	next_response_body = golden("resolved-advisory")
+	prepare(golden_advisory_context())
+	assert_true(requests[1].body:find('"advisory":true', 1, true) ~= nil,
+		"the opt-in travels as the boolean true: " .. requests[1].body)
+
+	for _, value in ipairs({ "true", 1, {}, "yes" }) do
+		reset()
+		next_response_body = golden("resolved-advisory")
+		local decision, calls = prepare(context({ advisory = value }))
+		assert_equal(calls, 1, "exactly one callback")
+		assert_equal(#requests, 0, "a malformed opt-in must cost zero requests")
+		assert_equal(decision.reason, "invalid_request")
+	end
+end
+
+-- The resolver's advisory bytes, in both spellings, reach the host member for
+-- member — and the plan beside them is the strict plan, unchanged.
+local function test_the_resolvers_advisory_bytes_are_understood()
+	for _, form in ipairs({ "wire", "review" }) do
+		reset()
+		next_response_body = advisory_body(nil, nil, form)
+		local decision = prepare(golden_advisory_context())
+		assert_true(decision.plan_used,
+			"the resolver's advisory plan must be USED (" .. form .. "): "
+				.. tostring(decision.reason) .. " / " .. tostring(decision.detail))
+		local a = decision.advisory
+		assert_true(type(a) == "table", "the advisory part must reach the host (" .. form .. ")")
+		assert_equal(a.jurisdiction, "GB")
+		assert_equal(a.row_id, "GB")
+		assert_equal(a.estimate, "SOFT_OPT_OUT")
+		assert_equal(a.row_status, "COUNSEL_PENDING")
+		assert_equal(a.row_basis, "ai_draft")
+		assert_equal(a.resolved_by, "server_country")
+		local prefix = "`medium` · contested"
+		assert_equal(a.advisory_basis:sub(1, #prefix), prefix, "the basis is carried verbatim")
+		assert_equal(a.matrix.docs_commit, "f6b6f0f617d4e15442608fc77be8a5bb40f40e26")
+		assert_equal(a.matrix.file_sha256, "370b04f374d0c506b92a003d4c801f450d5e5c45aed369f14a1c9382e3d592cc")
+		assert_equal(a.matrix.date, "2026-10-07")
+		assert_equal(decision.regime, consent_policy.STRICT_OPT_IN,
+			"a SOFT_OPT_OUT estimate sits beside a STRICT plan")
+		assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF)
+		assert_true(decision.explicit_grant_required, "the grant is still required")
+	end
+
+	-- Asked for and not served — a workspace the resolver did not admit — is
+	-- the plan alone, and it is used.
+	reset()
+	next_response_body = golden("resolved")
+	local plain = prepare(golden_advisory_context())
+	assert_true(plain.plan_used, "a plan without the advisory part is a plan: " .. tostring(plain.detail))
+	assert_true(plain.advisory == nil, "and carries none")
+end
+
+-- ⚠ IT NEVER CHANGES THE DECISION. The same plan with and without its advisory
+-- part — whatever the estimate — gives the same answer to every question a
+-- host branches on.
+local function test_the_advisory_never_changes_the_decision()
+	reset()
+	next_response_body = golden("resolved")
+	local without = prepare(golden_context())
+	assert_true(without.plan_used, "the control: " .. tostring(without.detail))
+
+	for _, variant in ipairs({
+		{ "SOFT_OPT_OUT", nil },
+		{ "STRICT_OPT_IN", '"STRICT_OPT_IN"' },
+		{ "no estimate", "null" },
+	}) do
+		reset()
+		local body = golden("resolved-advisory")
+		if variant[2] then
+			body = with_advisory_value(body, "estimate", variant[2])
+		end
+		next_response_body = body
+		local with = prepare(golden_advisory_context())
+		assert_true(with.plan_used, variant[1] .. ": " .. tostring(with.detail))
+		assert_true(with.advisory ~= nil, variant[1] .. ": the advisory must be present")
+		for _, field in ipairs({ "regime", "crash_profile", "server_analytics", "child_rules",
+			"analytics_choice_default", "explicit_grant_required", "plan_used", "reason",
+			"policy_version", "consent_text_version", "presented_language", "notice",
+			"band_vocabulary", "band_vocabulary_version", "operation_blocks_source" }) do
+			assert_equal(tostring(with[field]), tostring(without[field]),
+				variant[1] .. ": the advisory changed " .. field)
+		end
+		assert_equal(#with.operation_blocks, #without.operation_blocks,
+			variant[1] .. ": the advisory changed the operation blocks")
+	end
+end
+
+-- ⚠ A COPY, AND A CACHE KEY OF ITS OWN. A caller writing into the advisory it
+-- was given cannot reach the cached entry; and a request that asked for the
+-- advisory never shares an entry with one that did not.
+local function test_the_advisory_is_copied_and_keyed()
+	reset()
+	next_response_body = golden("resolved-advisory")
+	local first = prepare(golden_advisory_context())
+	assert_true(first.advisory ~= nil, "the control: the advisory arrived")
+	first.advisory.estimate = "STRICT_OPT_IN"
+	first.advisory.jurisdiction = "FR"
+	first.advisory.matrix.date = "1970-01-01"
+
+	local second = prepare(golden_advisory_context())
+	assert_equal(#requests, 1, "the second call must be served from the cache, or this proves nothing")
+	assert_equal(second.advisory.estimate, "SOFT_OPT_OUT", "a caller rewrote the cached estimate")
+	assert_equal(second.advisory.jurisdiction, "GB", "a caller rewrote the cached jurisdiction")
+	assert_equal(second.advisory.matrix.date, "2026-10-07", "a caller rewrote the cached matrix")
+
+	-- The same context WITHOUT the opt-in is a different question: it goes to
+	-- the wire, and it cannot be answered with the advisory entry.
+	next_response_body = golden("resolved")
+	local plain = prepare(golden_context())
+	assert_equal(#requests, 2, "a request that did not ask must not be served the advisory entry")
+	assert_true(plain.plan_used and plain.advisory == nil, "and it carries no advisory")
+end
+
+-- Every advisory member the resolver sends is required once the part is
+-- present, and the refusal NAMES it. Driven from the recorded bytes.
+local function test_every_advisory_member_is_required()
+	for _, form in ipairs({ "wire", "review" }) do
+		local body = advisory_body(nil, nil, form)
+		local checked = 0
+		local function omission_is_refused(removed, named)
+			reset()
+			next_response_body = removed
+			local decision = prepare(golden_advisory_context())
+			assert_refused(decision, "a plan missing " .. named .. " (" .. form .. ")")
+			assert_true(decision.detail:find("missing the required key " .. named, 1, true) ~= nil,
+				"and the reason must NAME " .. named .. ": " .. tostring(decision.detail))
+			checked = checked + 1
+		end
+		for _, member in ipairs(member_names(body, "advisory")) do
+			omission_is_refused(without_advisory_member(body, member), "advisory." .. member)
+		end
+		for _, member in ipairs(MATRIX_MEMBERS) do
+			omission_is_refused(without_advisory_member(body, member, true), "advisory.matrix." .. member)
+		end
+		assert_equal(checked, 11, "the advisory carries 8 members and its matrix 3 (" .. form .. ")")
+	end
+end
+
+-- ⚠ ONE ADVISORY MEMBER MAY BE NULL, AND THE ADVISORY ITSELF IS NOT IT.
+local function test_only_the_estimate_may_be_null()
+	local body = golden("resolved-advisory")
+	for _, member in ipairs(ADVISORY_MEMBERS) do
+		reset()
+		next_response_body = with_advisory_value(body, member, "null")
+		local decision = prepare(golden_advisory_context())
+		if member == "estimate" then
+			assert_true(decision.plan_used, "a null estimate is the contract's own spelling: " .. tostring(decision.detail))
+			assert_true(decision.advisory.estimate == nil, "and it reaches the host as nil")
+		else
+			assert_refused(decision, "a null advisory." .. member)
+			assert_true(decision.detail:find("advisory." .. member .. " is present and null", 1, true) ~= nil,
+				"named: " .. tostring(decision.detail))
+		end
+	end
+	for _, member in ipairs(MATRIX_MEMBERS) do
+		reset()
+		next_response_body = with_advisory_value(body, member, "null", true)
+		assert_refused(prepare(golden_advisory_context()), "a null advisory.matrix." .. member)
+	end
+	reset()
+	local _, from, to = member_span(body, "advisory", 1, #body)
+	next_response_body = body:sub(1, from - 1) .. "null" .. body:sub(to + 1)
+	local decision = prepare(golden_advisory_context())
+	assert_refused(decision, "a null advisory")
+end
+
+-- The shapes the contract permits beyond the recorded one are all used.
+local function test_the_advisory_shapes_the_contract_permits()
+	local body = golden("resolved-advisory")
+	local function set(b, member, raw) return with_advisory_value(b, member, raw) end
+	for _, case in ipairs({
+		{ "an unresolved connection", set(set(set(set(body, "jurisdiction", '"OTHER"'), "row_id", '"OTHER"'),
+			"estimate", "null"), "resolved_by", '"unknown"'), "OTHER", nil },
+		{ "a located country without its own row", set(set(set(body, "jurisdiction", '"OTHER"'), "row_id", '"OTHER"'),
+			"estimate", "null"), "OTHER", nil },
+		{ "a row without an estimate", set(set(set(body, "jurisdiction", '"TD"'), "row_id", '"TD"'),
+			"estimate", "null"), "TD", nil },
+		{ "a STRICT_OPT_IN estimate", set(body, "estimate", '"STRICT_OPT_IN"'), "GB", "STRICT_OPT_IN" },
+		{ "a basis at exactly the bound", set(body, "advisory_basis", '"' .. string.rep("a", 2048) .. '"'),
+			"GB", "SOFT_OPT_OUT" },
+	}) do
+		reset()
+		next_response_body = case[2]
+		local decision = prepare(golden_advisory_context())
+		assert_true(decision.plan_used, case[1] .. ": " .. tostring(decision.detail))
+		assert_equal(decision.advisory.jurisdiction, case[3], case[1])
+		assert_equal(decision.advisory.estimate, case[4], case[1])
+	end
+end
+
+-- ⚠ AND EVERY SHAPE OUTSIDE IT MAKES THE PLAN UNREADABLE.
+local function test_the_advisory_vocabulary_is_closed()
+	local body = golden("resolved-advisory")
+	local function set(member, raw, in_matrix)
+		return with_advisory_value(body, member, raw, in_matrix)
+	end
+	local cases = {
+		{ "jurisdiction in lower case", set("jurisdiction", '"gb"') },
+		{ "jurisdiction of three letters", set("jurisdiction", '"GBR"') },
+		{ "jurisdiction empty", set("jurisdiction", '""') },
+		{ "jurisdiction OTHERS", set("jurisdiction", '"OTHERS"') },
+		{ "jurisdiction as a number", set("jurisdiction", "1") },
+		{ "row_id with a digit", set("row_id", '"G1"') },
+		{ "estimate outside the vocabulary", set("estimate", '"UNKNOWN"') },
+		{ "estimate in lower case", set("estimate", '"soft_opt_out"') },
+		{ "estimate as an object", set("estimate", "{}") },
+		{ "row_status claims review", set("row_status", '"REVIEWED"') },
+		{ "row_basis claims acceptance", set("row_basis", '"owner_accepted"') },
+		{ "resolved_by outside the vocabulary", set("resolved_by", '"geoip"') },
+		{ "an unresolved connection that names a country", set("resolved_by", '"unknown"') },
+		{ "OTHER with an estimate", with_advisory_value(with_advisory_value(body, "jurisdiction", '"OTHER"'),
+			"row_id", '"OTHER"') },
+		-- The row is the jurisdiction's own, or OTHER for both.
+		{ "an OTHER row with an estimate under a country", set("row_id", '"OTHER"') },
+		{ "an OTHER row without an estimate under a country",
+			with_advisory_value(set("row_id", '"OTHER"'), "estimate", "null") },
+		{ "another country's row", set("row_id", '"FR"') },
+		{ "a country's row under OTHER",
+			with_advisory_value(set("jurisdiction", '"OTHER"'), "estimate", "null") },
+		{ "basis empty", set("advisory_basis", '""') },
+		{ "basis one byte over the bound", set("advisory_basis", '"' .. string.rep("a", 2049) .. '"') },
+		{ "basis with a newline", set("advisory_basis", '"estimate\\nforged: everything is fine"') },
+		{ "basis with a tab", set("advisory_basis", '"a\\tb"') },
+		{ "basis with DEL", set("advisory_basis", '"a\127b"') },
+		-- C1 controls, as the UTF-8 a JSON decoder yields for them: %c, an
+		-- ASCII class, does not see them.
+		{ "basis with U+0085 NEXT LINE", set("advisory_basis", '"estimate\194\133forged: everything is fine"') },
+		{ "basis with U+0080", set("advisory_basis", '"a\194\128b"') },
+		{ "basis with U+009F", set("advisory_basis", '"a\194\159b"') },
+		{ "docs_commit in upper case", set("docs_commit", '"F6B6F0F617D4E15442608FC77BE8A5BB40F40E26"', true) },
+		{ "docs_commit one character short", set("docs_commit", '"f6b6f0f617d4e15442608fc77be8a5bb40f40e2"', true) },
+		{ "file_sha256 one character short",
+			set("file_sha256", '"370b04f374d0c506b92a003d4c801f450d5e5c45aed369f14a1c9382e3d592c"', true) },
+		{ "date without leading zeros", set("date", '"2026-10-7"', true) },
+		{ "date that does not exist", set("date", '"2026-02-30"', true) },
+		{ "date as a timestamp", set("date", '"2026-10-07T00:00:00Z"', true) },
+		{ "matrix as a string", set("matrix", '"f6b6f0f6"') },
+		{ "matrix as a list", set("matrix", "[]") },
+		{ "an unknown advisory member", advisory_body('"advisory":{', '"advisory":{"note":"x",') },
+		{ "an unknown matrix member", advisory_body('"matrix":{', '"matrix":{"branch":"main",') },
+		{ "estimate twice", advisory_body('"estimate":"SOFT_OPT_OUT"',
+			'"estimate":"STRICT_OPT_IN","estimate":"SOFT_OPT_OUT"') },
+		{ "estimate twice, once escaped", advisory_body('"estimate":"SOFT_OPT_OUT"',
+			'"\\u0065stimate":"STRICT_OPT_IN","estimate":"SOFT_OPT_OUT"') },
+	}
+	local _, from, to = member_span(body, "advisory", 1, #body)
+	cases[#cases + 1] = { "the advisory as a string", body:sub(1, from - 1) .. '"SOFT_OPT_OUT"' .. body:sub(to + 1) }
+	cases[#cases + 1] = { "the advisory as a list", body:sub(1, from - 1) .. "[]" .. body:sub(to + 1) }
+	-- Where the raw text is the only witness, the refusal must NAME it: a list
+	-- decodes to a table, so only the scan can say it was not an object.
+	local named = {
+		["matrix as a list"] = "advisory.matrix is not an object",
+		["the advisory as a list"] = "advisory is not an object",
+		["an unknown advisory member"] = "advisory carries an unknown key",
+		["an unknown matrix member"] = "advisory.matrix carries an unknown key",
+		["estimate twice"] = "advisory carries the key estimate twice",
+		["estimate twice, once escaped"] = "advisory carries the key estimate twice",
+	}
+	for _, case in ipairs(cases) do
+		assert_true(case[2] ~= body, case[1] .. ": the mutation did not apply")
+		reset()
+		next_response_body = case[2]
+		local decision = prepare(golden_advisory_context())
+		assert_refused(decision, case[1])
+		if named[case[1]] then
+			assert_true(decision.detail:find(named[case[1]], 1, true) ~= nil,
+				case[1] .. " must be named: " .. tostring(decision.detail))
+		end
+	end
+
+	-- An advisory this request did not ask for is an answer to another question.
+	reset()
+	next_response_body = body
+	assert_refused(prepare(golden_context()), "an advisory nobody asked for")
+end
+
+-- A refusal is settled by its reason, and whatever else it carries never
+-- reaches the host.
+local function test_a_refusal_never_carries_an_advisory()
+	local body = golden("resolved-advisory")
+	local _, from, to = member_span(body, "advisory", 1, #body)
+	local advisory = body:sub(from, to)
+	reset()
+	next_response_body = golden("refusal"):sub(1, -2) .. ',"advisory":' .. advisory .. "}"
+	local decision = prepare(golden_advisory_context())
+	assert_true(not decision.plan_used, "a refusal is not a plan")
+	assert_equal(decision.reason, "invalid_scope", "and keeps its own reason")
+	assert_true(decision.advisory == nil, "and no advisory reaches the host from it")
+end
+
 local tests = {
 	test_known_operation_blocks_survive_fallbacks,
 	test_unlearned_block_fallback_is_empty,
@@ -3434,6 +3847,7 @@ local tests = {
 	test_module_reload_forgets_operation_blocks,
 	test_invalid_context_does_not_forget_operation_blocks,
 	test_caller_mutation_cannot_relabel_operation_blocks,
+	test_the_advisory_opt_in_keeps_operation_blocks,
 	test_the_example_keeps_blocks_after_resume_outage,
 	test_a_valid_plan_is_used,
 	test_the_module_touches_no_sdk_state,
@@ -3504,6 +3918,15 @@ local tests = {
 	test_the_regime_sets_the_default_not_the_silence,
 	test_ipairs_stops_at_a_nil_hole,
 	test_example_forwards_window_events,
+	test_the_advisory_is_asked_for_only_when_requested,
+	test_the_resolvers_advisory_bytes_are_understood,
+	test_the_advisory_never_changes_the_decision,
+	test_the_advisory_is_copied_and_keyed,
+	test_every_advisory_member_is_required,
+	test_only_the_estimate_may_be_null,
+	test_the_advisory_shapes_the_contract_permits,
+	test_the_advisory_vocabulary_is_closed,
+	test_a_refusal_never_carries_an_advisory,
 }
 
 -- ⚠ ipairs STOPS AT A NIL HOLE, SILENTLY. A scene renamed or deleted but left

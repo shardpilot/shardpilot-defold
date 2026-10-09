@@ -14,7 +14,9 @@
 --     player agreed to anything;
 --   * not permission to send anything — a valid plan is still not admission;
 --   * not a geolocator — no address is read here, and a plan carrying no
---     country is normal rather than an error;
+--     country is normal rather than an error. The optional ADVISORY part, when
+--     the host asks for it, carries the resolver's own reading of the
+--     connection's jurisdiction; that reading is carried, never made here;
 --   * not persistent — nothing is written to disk. A cached plan on disk would
 --     outlive the session this contract scopes it to.
 --
@@ -104,6 +106,9 @@ local MAX_ENDPOINT = 256
 -- basis.notice is a paragraph the host must show or log verbatim, so it is
 -- bounded generously and not interpreted here.
 local MAX_NOTICE = 2048
+-- advisory.advisory_basis is the matrix row's basis in its own words, with the
+-- same published bound.
+local MAX_ADVISORY_BASIS = 2048
 
 local STORES = { steam = true, apple = true, google_play = true, standalone = true }
 local PLATFORMS = {
@@ -122,6 +127,13 @@ local SERVER_ANALYTICS = { denied = true }
 local CHILD_RULES = { minimised = true }
 local BASIS_CHARACTERS = { informational_reference = true }
 local TABLE_PROVENANCES = { ai_draft = true, owner_accepted = true }
+-- The advisory part's own vocabularies. ITS ESTIMATE IS NOT A REGIME: the two
+-- spellings coincide, and nothing in this module ever reads one as the other.
+local ADVISORY_ESTIMATES = { SOFT_OPT_OUT = true, STRICT_OPT_IN = true }
+local ADVISORY_ROW_STATUSES = { COUNSEL_PENDING = true }
+local ADVISORY_ROW_BASES = { ai_draft = true }
+local ADVISORY_RESOLVED_BY = { server_country = true, unknown = true }
+local ADVISORY_OTHER = "OTHER"
 
 -- The resolver's closed refusal vocabulary. A reason outside it is reported as
 -- the generic one rather than echoed into a caller's control flow.
@@ -217,26 +229,41 @@ local SCHEMA_KEYS = {
 	signature = true,
 	basis = true,
 	reason = true,
+	advisory = true,
 }
+
+-- ⚠ THE ADVISORY PART HAS ITS OWN EXACT KEY SETS, and it is NOT in
+-- NESTED_OBJECT_KEYS because that roster's members are REQUIRED: the advisory
+-- is present only when the host asked for it and the resolver admitted the
+-- request. When it IS present, every member below is required, and only the
+-- estimate may be null (where its row carries none, and always for OTHER).
+local ADVISORY_KEYS = {
+	jurisdiction = true, estimate = true, row_id = true, row_status = true,
+	row_basis = true, advisory_basis = true, matrix = true, resolved_by = true,
+}
+local ADVISORY_MATRIX_KEYS = { docs_commit = true, file_sha256 = true, date = true }
+local ADVISORY_NULLABLE_KEYS = { estimate = true }
 
 -- ⚠ THE ONE NULLABLE KEY IN THE SCHEMA, and it is nullable by contract rather
 -- than by accident: the resolver sends `"signature": null` on EVERY response
 -- in this release. Present-and-null is the unsigned state and the only
 -- admissible one here; present and NOT null is a signature this build cannot
--- verify, which is refused. No other key may be null.
+-- verify, which is refused. No other key may be null. (The advisory part's
+-- estimate is nullable inside that part; see ADVISORY_NULLABLE_KEYS.)
 local NULLABLE_KEYS = { signature = true }
 
 -- ⚠ REQUIRED IS THE DEFAULT, AND THAT DIRECTION IS THE WHOLE POINT. The
 -- contract of record sends every name in SCHEMA_KEYS on every plan; only
--- `reason` is conditional, and it marks a refusal rather than a plan. So the
--- required roster is DERIVED from the schema roster minus one explicit
--- exception, which means a key added to SCHEMA_KEYS becomes required without
+-- `reason` and `advisory` are conditional: one marks a refusal rather than a
+-- plan, and the other is present only when the request asked for it. So the
+-- required roster is DERIVED from the schema roster minus those explicit
+-- exceptions, which means a key added to SCHEMA_KEYS becomes required without
 -- anyone remembering to require it. The other direction — a roster of
 -- required names kept beside the schema — is how flags.operation_blocks came
 -- to be optional here: absent was read as "no restrictions", so a malformed
 -- plan could drop every restriction it carried by leaving the key out and
 -- still be USED. That was one key; the shape of the mistake was the roster.
-local OPTIONAL_KEYS = { reason = true }
+local OPTIONAL_KEYS = { reason = true, advisory = true }
 
 -- Sorted, so a plan missing several keys names the same one every run. A
 -- refusal reason that varies between runs is a refusal nobody can test.
@@ -462,6 +489,84 @@ local function scan_flags(body, pos)
 	end
 end
 
+-- ⚠ THE ADVISORY PART, WALKED WHERE THE RAW TEXT STILL KNOWS IT. Lua has no
+-- null, so a member sent as null decodes to the same nil an absent one does,
+-- and only the estimate may be null; an unknown or repeated member is a part
+-- this module did not fully read; and `matrix` must be an object, which the
+-- decoded table can no longer say. Every member is required once the part is
+-- present. The same walk serves the matrix, one level down.
+local scan_advisory_object
+scan_advisory_object = function(body, pos, keys, nullable, where)
+	local seen = {}
+	pos = skip_space(body, pos + 1)
+	if body:sub(pos, pos) ~= "}" then
+		while true do
+			if body:sub(pos, pos) ~= '"' then
+				return false, "a key of " .. where .. " is not a string"
+			end
+			local key, after = read_string(body, pos)
+			if not key then
+				return false, "a key of " .. where .. " is not readable"
+			end
+			if seen[key] then
+				return false, where .. " carries the key " .. key .. " twice"
+			end
+			if not keys[key] then
+				return false, where .. " carries an unknown key"
+			end
+			seen[key] = true
+			pos = skip_space(body, after)
+			if body:sub(pos, pos) ~= ":" then
+				return false, "a key of " .. where .. " carries no value"
+			end
+			pos = skip_space(body, pos + 1)
+			local next_pos
+			if body:sub(pos, pos + 3) == "null" then
+				if not nullable[key] then
+					return false, where .. "." .. key .. " is present and null"
+				end
+				next_pos = skip_value(body, pos, 1)
+			elseif key == "matrix" and keys == ADVISORY_KEYS then
+				if body:sub(pos, pos) ~= "{" then
+					return false, "advisory.matrix is not an object"
+				end
+				local matrix_ok, matrix_refusal, matrix_end =
+					scan_advisory_object(body, pos, ADVISORY_MATRIX_KEYS, {}, "advisory.matrix")
+				if not matrix_ok then
+					return false, matrix_refusal
+				end
+				next_pos = matrix_end
+			else
+				next_pos = skip_value(body, pos, 1)
+			end
+			if not next_pos then
+				return false, "the plan is not readable"
+			end
+			pos = skip_space(body, next_pos)
+			local delimiter = body:sub(pos, pos)
+			if delimiter == "}" then
+				break
+			end
+			if delimiter ~= "," then
+				return false, "the plan is not readable"
+			end
+			pos = skip_space(body, pos + 1)
+		end
+	end
+	-- Sorted, so a part missing several members names the same one every run.
+	local missing = {}
+	for key in pairs(keys) do
+		if not seen[key] then
+			missing[#missing + 1] = key
+		end
+	end
+	if #missing > 0 then
+		table.sort(missing)
+		return false, "the plan is missing the required key " .. where .. "." .. missing[1]
+	end
+	return true, nil, pos + 1
+end
+
 local function scan_plan_text(body)
 	local present = {}
 	local present_signals = {}
@@ -549,6 +654,20 @@ local function scan_plan_text(body)
 				return false, flags_refusal, present, present_signals
 			end
 			pos = flags_end
+			handled = true
+		end
+		-- `"advisory": null` is left to the present-and-null rule below, which
+		-- refuses it: the resolver omits an advisory it does not serve.
+		if key == "advisory" and body:sub(pos, pos + 3) ~= "null" then
+			if body:sub(pos, pos) ~= "{" then
+				return false, "advisory is not an object", present, present_signals
+			end
+			local advisory_ok, advisory_refusal, advisory_end =
+				scan_advisory_object(body, pos, ADVISORY_KEYS, ADVISORY_NULLABLE_KEYS, "advisory")
+			if not advisory_ok then
+				return false, advisory_refusal, present, present_signals
+			end
+			pos = advisory_end
 			handled = true
 		end
 
@@ -783,16 +902,28 @@ local function copy_value(value, depth)
 	return out
 end
 
--- ⚠ THE CACHE KEY IS THE WHOLE CONTEXT. One in-memory entry is shared by
--- every caller in the process, and serving it on liveness alone applied one
--- app's, environment's or endpoint's plan to another — past the scope check
--- in parse_plan, which only ever saw the context that produced the entry.
--- Length-prefixed, so no two different contexts can spell the same key.
-local function context_key(context)
+-- Length-prefixed, so no two different values can spell the same key.
+local function key_field(value)
+	value = value or ""
+	return string.format("%d:%s", #value, value)
+end
+
+-- ⚠ THE RESTRICTION KEY IS THE WHOLE POLICY CONTEXT. It names the context the
+-- retained restrictions (active_context, known_blocks) and the dispatch order
+-- belong to. One in-memory entry is shared by every caller in the process,
+-- and serving it on liveness alone applied one app's, environment's or
+-- endpoint's plan to another — past the scope check in parse_plan, which only
+-- ever saw the context that produced the entry.
+--
+-- ⚠ AND IT LEAVES OUT THE ADVISORY OPT-IN. The opt-in asks for an optional
+-- extra part and changes no policy field, so it cannot decide which
+-- restrictions are retained: with it in this key, a request that only
+-- dropped the opt-in forgot the blocks the previous plan installed, and a
+-- failure right after served none.
+local function restriction_key(context)
 	local parts = {}
 	local function field(value)
-		value = value or ""
-		parts[#parts + 1] = string.format("%d:%s", #value, value)
+		parts[#parts + 1] = key_field(value)
 	end
 	field(context.workspace_id)
 	field(context.app_id)
@@ -805,6 +936,13 @@ local function context_key(context)
 	field(context.age_band and context.age_band.vocabulary)
 	field(context.age_band and context.age_band.band)
 	return table.concat(parts, "|")
+end
+
+-- The response cache's key: the restriction key plus the opt-in. A request
+-- that asked for the advisory is a different question from one that did not,
+-- so it never shares a cache entry with it.
+local function cache_key(context)
+	return restriction_key(context) .. "|" .. key_field(context.advisory == true and "advisory" or nil)
 end
 
 -- ⚠ THE SAME FALLBACK clock.lua ALREADY USES (clock.lua:4-9), and for the same
@@ -896,6 +1034,7 @@ local CONTEXT_KEYS = {
 	locale = true,
 	platform = true,
 	age_band = true,
+	advisory = true,
 }
 
 function M.validate_context(context)
@@ -946,6 +1085,13 @@ function M.validate_context(context)
 	if not PLATFORMS[context.platform] then
 		return false, "platform is not one of the permitted values"
 	end
+	-- ⚠ THE ADVISORY PART IS ASKED FOR, NEVER ASSUMED. true asks the resolver
+	-- for it; absent or false sends the request without the member, which the
+	-- resolver answers with the plan alone. Anything else is refused here,
+	-- including the string "true": the wire takes a boolean and nothing else.
+	if context.advisory ~= nil and type(context.advisory) ~= "boolean" then
+		return false, "advisory must be true or false"
+	end
 	if context.age_band ~= nil then
 		local band = context.age_band
 		if type(band) ~= "table" or not bounded_string(band.vocabulary, MAX_BAND)
@@ -983,7 +1129,101 @@ local function request_body(context)
 	if context.age_band ~= nil then
 		body.age_band = { vocabulary = context.age_band.vocabulary, band = context.age_band.band }
 	end
+	-- Sent only when asked: without it the request is the one every earlier
+	-- release sent, byte for byte.
+	if context.advisory == true then
+		body.advisory = true
+	end
 	return body
+end
+
+-- ⚠ THE ADVISORY PART IS VALIDATED LIKE EVERY OTHER MEMBER, and a malformed
+-- one makes the WHOLE plan unreadable: a plan this module cannot fully read is
+-- a plan it cannot act on. The raw scan has already settled its key set, its
+-- nulls and that matrix is an object; what is left is each value.
+local function advisory_code(value)
+	return type(value) == "string" and (value == ADVISORY_OTHER or value:match("^[A-Z][A-Z]$") ~= nil)
+end
+
+local function lower_hex(value, length)
+	return type(value) == "string" and #value == length and value:match("^[0-9a-f]+$") ~= nil
+end
+
+local function calendar_date(value)
+	if type(value) ~= "string" then
+		return false
+	end
+	local y, m, d = value:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
+	if not y then
+		return false
+	end
+	y, m, d = tonumber(y), tonumber(m), tonumber(d)
+	return m >= 1 and m <= 12 and d >= 1 and d <= days_in_month(y, m)
+end
+
+local function advisory_refusal(advisory)
+	if type(advisory) ~= "table" then
+		return "advisory is not an object"
+	end
+	if not advisory_code(advisory.jurisdiction) then
+		return "advisory.jurisdiction is neither a two-letter code nor OTHER"
+	end
+	if not advisory_code(advisory.row_id) then
+		return "advisory.row_id is neither a two-letter code nor OTHER"
+	end
+	if advisory.estimate ~= nil and not ADVISORY_ESTIMATES[advisory.estimate] then
+		return "advisory.estimate is outside the closed vocabulary"
+	end
+	-- The row is the jurisdiction's own, or OTHER for both: the contract makes
+	-- the jurisdiction OTHER for a connection with no row of its own, and the
+	-- resolver sets both members from one row. Checked first, so the OTHER rule
+	-- below holds for the row as well as the jurisdiction.
+	if advisory.row_id ~= advisory.jurisdiction then
+		return "advisory.row_id is not the jurisdiction's row"
+	end
+	-- The contract states both of these in its own words: OTHER never carries
+	-- an estimate, and an unresolved connection is OTHER.
+	if advisory.jurisdiction == ADVISORY_OTHER and advisory.estimate ~= nil then
+		return "advisory names OTHER and still carries an estimate"
+	end
+	if not ADVISORY_RESOLVED_BY[advisory.resolved_by] then
+		return "advisory.resolved_by is outside the closed vocabulary"
+	end
+	if advisory.resolved_by == "unknown" and advisory.jurisdiction ~= ADVISORY_OTHER then
+		return "advisory resolved nothing and still names a jurisdiction"
+	end
+	if not ADVISORY_ROW_STATUSES[advisory.row_status] then
+		return "advisory.row_status is outside the closed vocabulary"
+	end
+	if not ADVISORY_ROW_BASES[advisory.row_basis] then
+		return "advisory.row_basis is outside the closed vocabulary"
+	end
+	if not bounded_string(advisory.advisory_basis, MAX_ADVISORY_BASIS) then
+		return "advisory.advisory_basis is empty or over its bound"
+	end
+	-- ⚠ NO CONTROL CHARACTERS. The text is a table cell, which holds none, and
+	-- it is the free text a host is most likely to log or show: a newline here
+	-- could write a second line into a log that nothing authorised. %c sees
+	-- only C0 and DEL, so C1 (U+0080-U+009F, "\194\128"-"\194\159" in UTF-8)
+	-- is matched on its encoding: some log sinks read U+0085 NEXT LINE as a
+	-- line break.
+	if advisory.advisory_basis:find("%c") or advisory.advisory_basis:find("\194[\128-\159]") then
+		return "advisory.advisory_basis carries a control character"
+	end
+	local matrix = advisory.matrix
+	if type(matrix) ~= "table" then
+		return "advisory.matrix is not an object"
+	end
+	if not lower_hex(matrix.docs_commit, 40) then
+		return "advisory.matrix.docs_commit is not a 40-character hex commit"
+	end
+	if not lower_hex(matrix.file_sha256, 64) then
+		return "advisory.matrix.file_sha256 is not a 64-character hex digest"
+	end
+	if not calendar_date(matrix.date) then
+		return "advisory.matrix.date is not a calendar date"
+	end
+	return nil
 end
 
 -- ⚠ PRIVATE. The public surface is prepare() and invalidate(), and this is
@@ -1137,6 +1377,18 @@ local function parse_plan(plan, context, now)
 	if plan.signature ~= nil then
 		return nil, "the plan carries a signature this build cannot verify"
 	end
+	if plan.advisory ~= nil then
+		-- ⚠ AN ANSWER TO A QUESTION THIS REQUEST DID NOT ASK. The resolver
+		-- serves the advisory part only to a request that asked for it, so one
+		-- arriving unasked is a response to a different request.
+		if context.advisory ~= true then
+			return nil, "the plan carries an advisory part this request did not ask for"
+		end
+		local refusal = advisory_refusal(plan.advisory)
+		if refusal then
+			return nil, refusal
+		end
+	end
 	return plan, nil, expires_at
 end
 
@@ -1187,6 +1439,14 @@ local function decision_from_plan(plan)
 		-- Carried VERBATIM and interpreted nowhere here. The host shows or logs
 		-- it as the contract requires.
 		notice = plan.basis.notice,
+		-- ⚠ THE ADVISORY PART, COPIED AND INTERPRETED NOWHERE. Present only when
+		-- the host asked for it and the resolver served it; nil otherwise, and
+		-- on every fallback. Nothing above reads it: the regime, the default,
+		-- the grant requirement and every flag are the plan's alone, and a
+		-- SOFT_OPT_OUT estimate beside a STRICT plan changes none of them. Its
+		-- estimate is nil where the row carries none. It is the decoded table
+		-- of this response alone, and the cache copies it like every member.
+		advisory = plan.advisory,
 	}
 end
 
@@ -1226,7 +1486,8 @@ function M.prepare(context, callback)
 	-- response or the restrictions learned from it. A context change also fences
 	-- callbacks dispatched before the change, even if that context returns later.
 	context = copy_value(context, 0)
-	key = context_key(context)
+	key = restriction_key(context)
+	local entry = cache_key(context)
 	if active_context ~= key then
 		M.invalidate()
 		active_context = key
@@ -1261,7 +1522,7 @@ function M.prepare(context, callback)
 		return
 	end
 
-	if cached and cached.key == key and cached.until_at > at then
+	if cached and cached.key == entry and cached.until_at > at then
 		-- ⚠ A COPY, NOT THE ENTRY. The cache used to hand out the very table it
 		-- kept, so a caller that wrote a field on the decision it was given —
 		-- or that read prohibited_purposes and sorted it in place — edited what
@@ -1467,7 +1728,7 @@ function M.prepare(context, callback)
 		if lifetime > 0 and not decision_is_permissive(decision) then
 			-- The entry gets its OWN copy too, so the table delivered below and
 			-- the table kept here are never the same object.
-			cached = { key = key, decision = copy_value(decision, 0), until_at = arrived + lifetime }
+			cached = { key = entry, decision = copy_value(decision, 0), until_at = arrived + lifetime }
 		else
 			cached = nil
 		end
