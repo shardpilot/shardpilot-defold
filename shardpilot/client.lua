@@ -501,29 +501,13 @@ local function diag_field(value)
 	return ""
 end
 
--- Resolve the platform that goes on the EVENT ENVELOPE.
---
--- Two inputs with different standing, which is the whole of this function:
---
---   * The host SET one. It is folded to the ingest vocabulary; a value that
---     folds to nothing is OMITTED (the key is optional at the door, so an
---     omitted platform is accepted while an out-of-vocabulary one fails the
---     entire batch) -- and reported, because omitting it silently is how a host
---     who typed something meaningful never learns it was not understood.
---
---   * The host set nothing. `platform.detect()` answers, and it already answers
---     in the canonical vocabulary. This is the ordinary default path and it is
---     SILENT: a warning here would fire on every correctly-configured game,
---     which is how a diagnostic gets switched off before the day it matters.
---
--- A blank string counts as "set nothing" -- it carries no more intent than nil,
--- and warning about it would be noise. Note this also stops a blank reaching
--- the wire, which it previously did (`config.platform or ...` treats "" as
--- present, Lua having no falsy empty string).
+-- Resolve configured or detected analytics platforms. Configured unknowns retain
+-- their diagnostic; missing detection silently uses the explicit fallback.
+-- A blank configured string still means the host asked for detection.
 local function resolve_envelope_platform(config, diagnostics)
 	local configured = config.platform
 	if configured == nil or configured == "" then
-		return platform.detect()
+		return envelope_platform.normalize(platform.detect()) or "other"
 	end
 
 	local folded = envelope_platform.normalize(configured)
@@ -542,7 +526,7 @@ local function resolve_envelope_platform(config, diagnostics)
 			platform = diag_field(configured),
 		})
 	end
-	return nil
+	return "other"
 end
 
 local function validate_config(config, diagnostics)
@@ -1801,37 +1785,15 @@ function M.new(config, defer_init_diagnostics)
 				})
 			end
 		end
-		-- AND THE BACKLOG IS FOLDED TOO. Envelopes spooled by an earlier launch
-		-- carry the platform THAT launch put on them, and the resend path sends
-		-- them verbatim rather than rebuilding them. Folding only the live
-		-- config would therefore leave exactly the events that motivated the
-		-- upgrade still failing -- and a batch is rejected WHOLE, so each such
-		-- envelope takes the fresh events batched beside it down with it.
-		--
-		-- Same rule as at config time: a value that folds is canonicalised
-		-- silently (no fact changes), one that does not is dropped from the
-		-- envelope and reported with a count. `event_id` and `event_ts` are
-		-- untouched, so the round trip the resend path depends on still holds.
-		--
-		-- EVERY PRESENT VALUE, not just a non-empty string. An earlier launch
-		-- put `config.platform` on the envelope unvalidated, so a blank, a
-		-- number or a table could be sitting there -- and the blank is not
-		-- hypothetical, it is the case this version stopped producing
-		-- (`config.platform or ...` treats "" as present, Lua having no falsy
-		-- empty string). Skipping those would fix the live config while leaving
-		-- the backlog carrying exactly the values that fail the batch. An ABSENT
-		-- key is left absent: there is nothing to fold and nothing was lost.
-		--
-		-- A blank is silent at config time and reported here, and the asymmetry
-		-- is deliberate: at config time nothing had reached an envelope yet and
-		-- detection answers for it, while here it is already ON one that is
-		-- about to be sent, so removing it changes that envelope.
+		-- Normalize every present stored platform before replay. Unknown values use
+		-- the fallback and retain their diagnostic count. Absent historical fields,
+		-- event IDs and timestamps remain unchanged.
 		local unfoldable = 0
 		for i = 1, #spooled do
 			local raw = spooled[i].platform
 			if raw ~= nil then
 				local folded = envelope_platform.normalize(raw)
-				spooled[i].platform = folded
+				spooled[i].platform = folded or "other"
 				if not folded then
 					unfoldable = unfoldable + 1
 				end

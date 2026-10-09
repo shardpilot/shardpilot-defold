@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- Analytics preserves all twelve canonical platform values and uses `other`
+  when configuration or detection cannot supply one. Existing aliases and
+  diagnostics remain; present stored platform fields use the same fallback.
+
 - `consent_policy`: the resolver's optional **advisory part** can now be
   requested and is delivered as `decision.advisory`. It is a non-binding
   estimate for the connection's jurisdiction, served only to a request that

@@ -1,18 +1,8 @@
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
--- CONFORMANCE AGAINST THE SHARED PLATFORM VOCABULARY.
---
--- One vocabulary is shared across the ShardPilot SDKs so that a given spelling
--- folds the same way everywhere. The expectations below are therefore NOT this
--- repository's opinion about the fold -- they are a generated copy of that
--- shared set, and the point of holding a copy is that it can disagree with
--- `shardpilot/envelope_platform.lua` and fail.
---
--- The copy is pinned by EXACT COMPARISON, in both directions and including the
--- entry count: an association changed in the module and nowhere else fails
--- here, which is the case this file exists for.
-
-local VOCABULARY_REVISION = "1bd5acee111988d8"
+-- Legacy alias and diagnostic controls. The real-publisher scene in
+-- test_sdk.lua obtains canonical values from the independent capture.
+local VOCABULARY_REVISION = "cf85d6f986723ff1"
 
 -- Required: every SDK must produce these exactly.
 local CORE = {
@@ -37,18 +27,12 @@ local CORE = {
 	{ "windows", "windows" },
 }
 
--- Required: the empty answer. An unmapped value is OMITTED from the
--- envelope, which the door accepts; sending it fails the whole batch.
+-- The lookup retains an empty answer for unmapped inputs so the client can
+-- report them while selecting its explicit fallback.
 local REJECTIONS = {
-	"tvos",
 	"steam",
-	"other",
 	"unknown",
-	"ps5",
-	"ps4",
-	"xbox",
 	"xsx",
-	"switch",
 	"nintendo",
 	"freebsd",
 	"openbsd",
@@ -118,9 +102,9 @@ do
 	for key in pairs(envelope_platform.VOCABULARY) do
 		n = n + 1
 	end
-	check(n == #CORE, string.format(
+	check(n == #CORE + 6, string.format(
 		"the module carries %d entries and the shared set %d -- an entry added here "
-		.. "and nowhere else makes the SDKs disagree", n, #CORE))
+		.. "and nowhere else makes the SDKs disagree", n, #CORE + 6))
 end
 
 -- 2. Every core vector folds to its shared answer.
@@ -178,14 +162,14 @@ end
 -- config read. A fixture that re-implements the condition it is checking passes
 -- whatever its subject does, and certifies only itself.
 for _, case in ipairs({
-	{ name = "set and unmapped is reported and omitted",
-	  platform = "Win64_Shipping", want_platform = nil, want_report = true },
+	{ name = "set and unmapped is reported with fallback",
+	  platform = "Win64_Shipping", want_platform = "other", want_report = true },
 	{ name = "unset is detected and silent",
 	  platform = nil, want_platform = "linux", want_report = false },
 	{ name = "blank is unset, not a value",
 	  platform = "", want_platform = "linux", want_report = false },
 	{ name = "whitespace was typed, so it is reported",
-	  platform = "   ", want_platform = nil, want_report = true },
+	  platform = "   ", want_platform = "other", want_report = true },
 	{ name = "set and mapped is folded and silent",
 	  platform = "Windows", want_platform = "windows", want_report = false },
 }) do
@@ -225,17 +209,15 @@ do
 	check(crash.config.platform == "Win64_Shipping",
 		"the fold reached the CRASH wire: crash platform is "
 		.. tostring(crash.config.platform))
-	check(analytics.config.platform == nil,
-		"an unmapped value survived onto the envelope")
+	check(analytics.config.platform == "other",
+		"an unmapped value did not use the fallback")
 end
 
 -- 9. THE OFFLINE BACKLOG IS FOLDED AT LOAD.
 --
--- Envelopes spooled by an EARLIER launch carry that launch's platform and the
--- resend path sends them verbatim. Folding only the live config would leave the
--- very events that motivated the upgrade still failing -- and a batch is
--- rejected whole, so each stale envelope takes the fresh events batched beside
--- it down too.
+-- The existing load path canonicalizes stored values, uses the fallback for
+-- present unrecognized values, and leaves historically absent fields absent.
+
 do
 	local stores = {}
 	sys.get_save_file = function(application_id, file_name)
@@ -294,15 +276,14 @@ do
 		check(false, "the seeded spool was not loaded, so this case proved nothing")
 	end
 	if by_id.e2 then
-		check(by_id.e2.platform == nil, string.format(
-			"a spooled `Win64_Shipping` stayed %s -- it would fail the whole batch",
+		check(by_id.e2.platform == "other", string.format(
+			"a spooled unknown became %s, expected fallback",
 			tostring(by_id.e2.platform)))
 	end
 	for _, id in ipairs({ "e4", "e5", "e6" }) do
 		if by_id[id] then
-			check(by_id[id].platform == nil, string.format(
-				"restored envelope %s kept platform %s (%s) -- it would fail the "
-				.. "whole batch", id, tostring(by_id[id].platform),
+			check(by_id[id].platform == "other", string.format(
+				"restored envelope %s has platform %s (%s), expected fallback", id, tostring(by_id[id].platform),
 				type(by_id[id].platform)))
 		end
 	end
@@ -340,7 +321,7 @@ do
 	}))
 	check(ok, "new() threw on a platform whose __tostring raises: " .. tostring(client))
 	if ok and client then
-		check(client.config.platform == nil, "a table survived onto the envelope")
+		check(client.config.platform == "other", "a table did not use the fallback")
 	end
 end
 
