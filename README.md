@@ -1718,6 +1718,12 @@ top-level one.
   token-mint time (Mode B); the SDK always sends that same anonymous ID on the wire.
   The module getter returns `nil` before initialization and after successful
   shutdown; it keeps returning the current ID while shutdown still needs retrying.
+- **`get_consent_state()`** reads `unknown`, `granted`, `denied`, or
+  `denied_forced_minor` from the client, without sending or persisting anything.
+  Both a client instance and the module expose it. The module returns `unknown`
+  before initialization and after successful shutdown. A retained instance still
+  reports its last state after shutdown. This is the current in-memory decision,
+  not confirmation that its storage write or receipt delivery succeeded.
 - **`set_consent(decision)`** records an explicit decision — `true`
   (granted), `false` (denied), or the string `"denied_forced_minor"` — over
   the states `unknown` (the default), `granted`, `denied`, and

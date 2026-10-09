@@ -2419,6 +2419,10 @@ function Client:get_anonymous_id()
 	return self.anonymous_id
 end
 
+function Client:get_consent_state()
+	return self.consent_state
+end
+
 -- Expose the CURRENT session id so the host can correlate other telemetry (a
 -- crash report, a support ticket) with the analytics session it happened in.
 -- Returns nil when no session is open — a `backend`-source client never opens
