@@ -426,55 +426,33 @@ transient/`Retry-After` rules) are in the README's "Experiments" section.
 
 ## Platform
 
-`platform` is optional. Leave it unset and the SDK detects it from
-`sys.get_sys_info`; set it when you run outside Defold or on a system the
-detector does not recognise.
+Leave `platform` unset or empty to use `sys.get_sys_info` detection, or set a
+value explicitly. Analytics accepts the canonical values `windows`, `macos`,
+`linux`, `android`, `ios`, `tvos`, `web`, `ps4`, `ps5`, `xbox`, `switch` and
+`other`. Existing aliases such as `WIN32`, `OSX`, `html5`, `browser` and
+`steamdeck` are folded, ignoring case and surrounding whitespace. Human-supplied
+build suffixes are not inferred.
 
-**A value you set is folded to the vocabulary ingest accepts** — `web`, `ios`,
-`android`, `windows`, `macos`, `linux` — so `Windows`, `WIN32`, `OSX`,
-`html5`, `browser` and `steamdeck` all arrive as the canonical member. The fold
-is case- and padding-insensitive.
-
-This matters because the ingest vocabulary is **closed**, and a batch carrying
-one out-of-vocabulary platform is rejected **in full** — every event in it, not
-just the one with the odd field. Before the fold, `platform = "Windows 11"`
-did exactly that.
-
-**A value that is not recognised is omitted rather than sent.** `platform` is
-optional at the door, so an event without it is accepted while an event with a
-wrong one is not. Because dropping it silently would leave you believing a
-value you set was understood, the omission is reported through `diagnostics`:
+A missing or unrecognized detected value uses `other` silently. A configured
+unknown value also uses `other`, and retains the existing diagnostic:
 
 ```lua
 { scope = "config", status = "ignored", code = "platform_unmapped",
   platform = "Windows 11" }
 ```
 
-Nothing is reported when you set nothing — detection is the ordinary path, and
-a warning there would fire on every correctly configured game. A blank string
-counts as unset.
+Here `ignored` refers to the unrecognized input, which is replaced by the
+fallback. A blank string means detection; whitespace-only input is reported
+as unrecognized. Known configured values remain silent.
 
-If your platform is genuinely absent from that list — a console, say — it has
-no representation on the analytics envelope today; do not invent a spelling for
-it, because every spelling fails the batch equally.
-
-**A backlog spooled by an earlier launch is folded too, at load.** Offline
-envelopes are re-sent *verbatim* rather than rebuilt, so events spooled before
-this version — carrying whatever platform that launch wrote — would otherwise
-keep failing after the upgrade, and take the fresh events batched beside them
-down with them. **Every** value present on a restored envelope is folded or removed — an
-earlier launch wrote `config.platform` unvalidated, so a blank or a non-string
-may be sitting there; an absent key is left absent. Values that fold are
-canonicalised silently; values that do not are dropped from the envelope and
-reported once with a count, as
+**Stored envelopes are normalized at load.** Every present platform is folded
+or replaced by `other`; historically absent fields remain absent. Unknown
+stored values retain the aggregate diagnostic
 `{ scope = "spool", status = "ignored", code = "platform_unmapped", count = N }`.
-`event_id` and `event_ts` are untouched.
+`event_id` and `event_ts` remain unchanged. Source is `client` by default and
+country is omitted; platform normalization changes neither.
 
-> **The crash platform is a different field and is not folded.** `crash.init`
-> resolves its own platform, a crash report may carry any lowercase token
-> (`ps5`, `switch`, `steam`), and that value takes part in crash-group
-> fingerprinting — folding it would refingerprint existing groups. See
-> `docs/crash.md`.
+Crash configuration retains its separate platform behavior. See `docs/crash.md`.
 
 ## Schema-revision declaration
 

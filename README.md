@@ -620,7 +620,7 @@ README, `docs/`, and the skill above are the reference.
 | `source` | `"client"` | One of `client`, `server`, `backend` |
 | `app_version` | `nil` | Sent in the envelope |
 | `app_build` | `nil` | Sent in the envelope |
-| `platform` | auto-detected | From `sys.get_sys_info`; falls back to `nil` outside Defold |
+| `platform` | auto-detected | Analytics uses the detected or configured canonical value; missing or unknown values use `other`. See `docs/configuration.md`. |
 | `anonymous_id` | generated | UUIDv7 generated on first init if not provided |
 | `user_id` | `nil` | Initial known-user attribution |
 | `batch_size` | `25` | Flush trigger, 1–100 |

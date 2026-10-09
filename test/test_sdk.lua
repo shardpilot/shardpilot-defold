@@ -14526,3 +14526,76 @@ end)()
 	end
 	assert_equal(failed, 0, "init diagnostic scene failures")
 end)()
+
+-- Compare the real publisher output with the retained handler capture.
+;(function()
+	local file = assert(io.open("test/golden/analytics-vocabulary.json", "rb"))
+	local capture = json.decode(file:read("*a"))
+	file:close()
+	assert_equal(#capture, 35, "complete vocabulary capture")
+	local fallback
+	for _, row in ipairs(capture) do
+		if row.name == "canonical/other" then fallback = row.published[1].platform end
+	end
+	assert_true(fallback ~= nil, "captured fallback witness")
+	local passed, failed = 0, 0
+	local function observe(actual, expected, name)
+		if actual == expected then passed = passed + 1
+		else failed = failed + 1; print("vocabulary mismatch: " .. name) end
+	end
+	local detected = sys.get_sys_info
+	sys.get_sys_info = function() return { system_name = "synthetic-unsupported" } end
+	for _, row in ipairs(capture) do
+		if row.status == "accepted" and row.country == "" then
+			local expected = row.published[1].platform
+			if expected == "" then expected = fallback end
+			for _, restored in ipairs({ false, true }) do
+				reset()
+				storage.reset()
+				local _, restore = install_stub_sys_storage()
+				assert_true(storage.save(identity_scope, {
+					anonymous_id = "synthetic-vocabulary-actor", consent_analytics = "granted",
+				}))
+				local event_id, event_ts = "synthetic-vocabulary-event", "2026-01-01T00:00:00Z"
+				if restored then
+					assert_true(storage.save_spool(spool_scope, {{
+						event_id = event_id, event_ts = event_ts, event_name = "app.session_started",
+						anonymous_id = "synthetic-vocabulary-actor", source = "client", platform = row.platform,
+					}}, 500, 262144) ~= nil)
+				end
+				local client = assert(sdk.new(config_mode_a({
+					ingest_url = "https://ingest.example.invalid", platform = row.platform,
+					flush_interval_seconds = 9999,
+				})))
+				if not restored then assert_true(client:session_start()) end
+				assert_true(client:flush())
+				assert_equal(#requests, 1, "real publisher called once")
+				assert_equal(requests[1].method, "POST", "real publisher method")
+				local batch = json.decode(requests[1].body)
+				assert_equal(#batch.events, 1, "real publisher carries one event")
+				local sent = batch.events[1]
+				observe(sent.platform, expected, row.name .. (restored and "/spool" or "/fresh"))
+				assert_equal(sent.source, row.published[1].source, "source default witness")
+				assert_equal(sent.country, nil, "country default remains omitted")
+				if restored then
+					assert_equal(sent.event_id, event_id, "restored event identity")
+					assert_equal(sent.event_ts, event_ts, "restored event time")
+				end
+				restore()
+			end
+		end
+	end
+	-- An unset detector result uses the same fallback; known detection is retained.
+	for _, entry in ipairs({ { "synthetic-unsupported", fallback }, { "Linux", "linux" } }) do
+		sys.get_sys_info = function() return { system_name = entry[1] } end
+		reset(); storage.reset(); seed_granted_consent()
+		local client = assert(sdk.new(config_mode_a({ ingest_url = "https://ingest.example.invalid" })))
+		assert_true(client:session_start()); assert_true(client:flush())
+		observe(json.decode(requests[1].body).events[1].platform, entry[2], "detected/" .. entry[1])
+	end
+	sys.get_sys_info = detected
+	storage.reset()
+	print(string.format("Captured vocabulary: %d passed, %d failed", passed, failed))
+	assert_equal(passed + failed, 60, "all captured and detected cases executed")
+	assert_equal(failed, 0, "captured vocabulary matches actual publisher")
+end)()
