@@ -101,7 +101,11 @@ explicit **granted** decision opens the event pipeline.
   even after storage and purge recover. An ordinary denial still succeeds
   and reports `denied`, preserving the forced-minor exclusion for the actor
   across durable writes and restarts. Ordinary setters cannot reverse that
-  exclusion. Feature-detect with
+  exclusion. A successful anonymous-ID replacement clears the prior actor's
+  exclusion and starts the replacement at `unknown`; same-ID and refused
+  replacements keep it. The per-app store holds the current identity, so the
+  host supplies the replacement actor's own consent and age decision.
+  Feature-detect with
   `shardpilot.supports("consent_state_denied_forced_minor")`.
 
 Setter success means the decision applied. An applied decision whose identity

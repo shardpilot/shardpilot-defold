@@ -9,7 +9,9 @@
   `consent_outbox_persist_failed` warnings instead of treating them as refusal.
   A forced-minor grant returns `false, "consent_forced_minor"` even after purge
   recovery. Ordinary denial still applies and reports `denied`, retaining the
-  forced-minor exclusion across durable writes and restarts.
+  forced-minor exclusion across durable writes and restarts. A successful
+  anonymous-ID replacement clears the prior actor's exclusion and starts the
+  replacement at `unknown`; same-ID and refused replacements retain it.
 
 - Crash reports emit the root `component` key. `crash_component` is the preferred
   configuration option; `crash_source` remains a deprecated fallback when blank.

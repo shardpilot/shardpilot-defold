@@ -14866,7 +14866,7 @@ end)()
 ;(function()
 	local scenes = {}
 	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
-	local function fresh(api, run)
+	local function fresh(api, run, mode)
 		reset(); storage.reset()
 		local _, restore = install_stub_sys_storage()
 		local saved = {}
@@ -14875,6 +14875,7 @@ end)()
 		end
 		local facade = dofile("shardpilot/sdk.lua")
 		local options = config({ app_id = "synthetic-consent-results", anonymous_id = "synthetic-actor" })
+		if mode == "publishable" then options.token_provider = nil; options.api_key = "sp_ingest_synthetic" end
 		local ok, err = pcall(function()
 			local client
 			if api == "instance" then client = assert(facade.new(options))
@@ -15043,6 +15044,54 @@ end)()
 			local other = assert(facade.new(options))
 			assert_equal(other:get_consent_state(), "unknown")
 			assert_true(other:set_consent(true), "different actor does not inherit exclusion")
+		end)
+	end)
+	for _, mode in ipairs({ "token", "publishable" }) do
+		for _, ordinary_denial in ipairs({ false, true }) do
+			for _, reboot in ipairs({ false, true }) do
+				scene(mode .. " rotation after ordinary denial=" .. tostring(ordinary_denial) .. " restart=" .. tostring(reboot), function()
+					fresh("instance", function(call, options, facade, _, client)
+						result(call, "denied_forced_minor", true)
+						if ordinary_denial then result(call, false, true) end
+						assert_equal(#client.consent_outbox, 0, "A's receipt drained before rotation")
+						assert_true(call("set_anonymous_id", "synthetic-actor-b"))
+						local record = storage.load(options)
+						assert_equal(record.anonymous_id, "synthetic-actor-b")
+						assert_equal(record.consent_forced_minor, nil, "A's exclusion is not written under B")
+						if reboot then
+							options.anonymous_id = nil
+							storage.reset(); reset()
+							client = assert(facade.new(options))
+						end
+						assert_equal(client:get_consent_state(), "unknown", "replacement actor has no inherited restriction")
+						local ok, code = client:set_consent(true)
+						assert_true(ok, code)
+						assert_equal(client:get_consent_state(), "granted")
+					end, mode)
+				end)
+			end
+		end
+		scene(mode .. " same or invalid actor retains exclusion", function()
+			fresh("instance", function(call, options)
+				result(call, "denied_forced_minor", true)
+				assert_true(call("set_anonymous_id", options.anonymous_id))
+				result(call, true, false, "consent_forced_minor")
+				local ok, code = call("set_anonymous_id", "")
+				assert_equal(ok, false); assert_equal(code, "invalid_anonymous_id")
+				result(call, true, false, "consent_forced_minor")
+				assert_equal(storage.load(options).consent_forced_minor, true)
+			end, mode)
+		end)
+	end
+	scene("refused pending rotation retains exclusion", function()
+		fresh("instance", function(call, options)
+			next_status = 500
+			result(call, "denied_forced_minor", true)
+			local ok, code = call("set_anonymous_id", "synthetic-actor-b")
+			assert_equal(ok, false); assert_equal(code, "events_pending")
+			assert_equal(call("get_anonymous_id"), options.anonymous_id)
+			result(call, true, false, "consent_forced_minor")
+			assert_equal(storage.load(options).consent_forced_minor, true)
 		end)
 	end)
 	local passed, failed = 0, 0

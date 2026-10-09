@@ -2403,6 +2403,14 @@ function Client:set_anonymous_id(anonymous_id)
 		return false, "events_pending"
 	end
 	if anonymous_id ~= self.anonymous_id then
+		-- A replacement actor does not inherit this actor's exclusion or
+		-- the denied state from which a restart would reconstruct it.
+		if self.consent_forced_minor then
+			self.consent_forced_minor = false
+			self.consent_state = "unknown"
+			self.consent_decided_at = nil
+			self.consent_decision_seq = 0
+		end
 		-- PROVENANCE BELONGS TO THE SUBJECT WHO MADE THE DECISION, and this is
 		-- the SECOND place the actor changes. The boot path already refuses to
 		-- adopt a previous actor's provenance under a configured override; this

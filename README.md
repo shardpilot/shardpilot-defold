@@ -1758,7 +1758,10 @@ top-level one.
   `set_consent(false)` still succeeds and reports `denied`, but preserves the
   forced-minor exclusion for that actor across durable writes and restarts.
   It cannot make a later grant eligible; ordinary consent calls do not provide
-  an age-band reversal mechanism.
+  an age-band reversal mechanism. A successful `set_anonymous_id` replacement
+  of that actor clears the old exclusion and starts the replacement at `unknown`;
+  a same-ID call or refused replacement preserves it. Storage holds one current
+  identity per app; apply the replacement actor's own consent and age decision.
   The first result says whether the decision applied; `false, code` means it
   was refused, while `true, nil, warning` reports an applied decision with
   unfinished durability or purge work. A healthy decision returns `true`.
