@@ -93,16 +93,31 @@ explicit **granted** decision opens the event pipeline.
   persists for under-threshold players. Every analytics gate treats it
   exactly like **denied** — same `consent_denied` refusals, same queue/
   in-flight/spool cleanup, same zero analytics egress on every later launch.
-  The one difference is its consent receipt, which carries
+  Its consent receipt carries
   `reason = "denied_forced_minor"` so the server-side per-actor gate can tell
   a band-forced denial from one the player chose. In a forced-minor session
   the **only** analytics-plane request that leaves the device is that receipt
-  POST. A later explicit `set_consent` (the age-band-correction path)
-  supersedes the state normally. Feature-detect with
+  POST. An ordinary grant is refused with `false, "consent_forced_minor"`,
+  even after storage and purge recover. An ordinary denial still succeeds,
+  keeps `denied_forced_minor`, and creates no new receipt. The scoped persisted
+  state and original forced-denial receipt retain the restriction across restart;
+  no separate exclusion flag is stored. Ordinary setters cannot reverse that
+  exclusion. A successful anonymous-ID replacement clears the prior actor's
+  exclusion and starts the replacement at `unknown`; same-ID and refused
+  replacements keep it. The per-app store holds the current identity, so the
+  host supplies the replacement actor's own consent and age decision.
+  Feature-detect with
   `shardpilot.supports("consent_state_denied_forced_minor")`.
 
+Setter success means the decision applied. An applied decision whose identity
+write fails returns `true, nil, "consent_persist_failed"`; a failed spool purge or
+undelivered receipt write uses `spool_purge_failed` or
+`consent_outbox_persist_failed` in the same third value. When failures coincide,
+that is their warning order. Refused decisions return `false, code` without
+applying the requested state. Healthy decisions return `true`.
+
 Explicit decisions are reported to `POST {ingest_url}/v1/consent` and never
-ride the event envelope. Each decision becomes exactly one receipt —
+ride the event envelope. Each new decision becomes exactly one receipt —
 workspace/app/environment, the actor identifier and its `kind`,
 `categories{analytics}`, a `decided_at` stamp, an `idempotency_key`, and
 (forced-minor only) the `reason` — retained in the **durable
@@ -289,10 +304,10 @@ by the service on the stable event id). This spool:
   denied actor's
   events never linger on disk, and neither do envelopes that cannot be
   proven to have been captured under a grant. Should the durable purge itself fail, the
-  failure is reported (`spool_purge_failed`), the spool goes **fail-closed**
+  applied denial returns `true, nil, "spool_purge_failed"`; the spool goes **fail-closed**
   (nothing appended, loaded, or re-sent), and the purge is retried at later
   dispatch points and at the next launch until it lands. Revocation cleanup
-  completes **before** a new grant takes effect: `set_consent(true)` is not
+  completes **before** an otherwise permitted grant takes effect: `set_consent(true)` is not
   applied while that purge is owed (the persisted decision stays denied), so
   pre-revocation events can never replay under a granted decision;
 - is **cleared on acknowledgment** — entries are removed as soon as the
@@ -388,7 +403,7 @@ outbox:
   `user_verified` receipts are never dropped this way (they park, above);
 - **surfaces a failed durable append**: when the write fails while the
   receipt is still undelivered, `set_consent` returns
-  `false, "consent_outbox_persist_failed"` (the decision itself applied and
+  `true, nil, "consent_outbox_persist_failed"` (the decision itself applied and
   delivery still proceeds and retries) — the write is retried at every
   dispatch point, including `persist()` even with the event spool disabled;
 - is **per-app** (namespaced like the identity record) and goes through

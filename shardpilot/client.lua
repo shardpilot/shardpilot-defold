@@ -1475,12 +1475,17 @@ function M.new(config, defer_init_diagnostics)
 		belt_decided_at = client.consent_restored_decided_at
 		belt_decision_seq = client.consent_restored_decision_seq
 	end
-	if belt_state == "granted" then
+	-- A retained forced denial also restores an older unknown/denied record
+	-- when both its identity and marker writes failed. Reuse the same durable
+	-- handoff before delivery can retire that last witness. Ordinary receipts
+	-- still correct only grants; they do not manufacture consent on an unknown.
+	if belt_state == "granted" or belt_state == "unknown" or belt_state == "denied" then
 		local stale_denial = nil
 		for i = 1, #client.consent_outbox do
 			local receipt = client.consent_outbox[i]
 			if type(receipt.categories) == "table"
 				and receipt.categories.analytics == false
+				and (belt_state == "granted" or receipt.reason == "denied_forced_minor")
 				and receipt.anonymous_id == client.anonymous_id
 				and type(receipt.decided_at) == "string"
 				and decision_pair_newer(receipt.decided_at,
@@ -2373,6 +2378,13 @@ function Client:set_anonymous_id(anonymous_id)
 		return false, "events_pending"
 	end
 	if anonymous_id ~= self.anonymous_id then
+		-- A replacement actor does not inherit this actor's exclusion or
+		-- the denied state from which a restart would reconstruct it.
+		if self.consent_state == "denied_forced_minor" then
+			self.consent_state = "unknown"
+			self.consent_decided_at = nil
+			self.consent_decision_seq = 0
+		end
 		-- PROVENANCE BELONGS TO THE SUBJECT WHO MADE THE DECISION, and this is
 		-- the SECOND place the actor changes. The boot path already refuses to
 		-- adopt a previous actor's provenance under a configured override; this
@@ -2681,9 +2693,9 @@ function Client:set_consent(decision)
 	-- Accepted decisions: the two booleans (true = granted, false = denied)
 	-- plus the one string state "denied_forced_minor" — an age-gate-forced
 	-- denial that is analytics-wise IDENTICAL to denied (drop + purge + zero
-	-- analytics egress) and differs only in the reason its receipt records,
-	-- so the backend per-actor gate can tell a band-forced denial from a
-	-- chosen one. Feature-detect with sdk.supports("consent_state_denied_forced_minor").
+	-- analytics egress). Its exclusion also survives an ordinary denial,
+	-- which cannot make a later grant eligible. The receipt distinguishes a
+	-- band-forced decision from a chosen one. Feature-detect with sdk.supports("consent_state_denied_forced_minor").
 	local next_state
 	if decision == true then
 		next_state = "granted"
@@ -2695,6 +2707,12 @@ function Client:set_consent(decision)
 		return false, "invalid_consent"
 	end
 	local granted = next_state == "granted"
+	if self.consent_state == "denied_forced_minor" then
+		if granted then return false, "consent_forced_minor" end
+		-- The forced denial already stands. A new reasonless receipt would
+		-- erase its server provenance, so an ordinary denial is a no-op.
+		if decision == false then return true end
+	end
 	local state_changed = self.consent_state ~= next_state
 	-- Revocation cleanup completes before a new grant takes effect. The
 	-- purge-owed flag is memory-only: if a grant were applied (and persisted)
@@ -2931,16 +2949,16 @@ function Client:set_consent(decision)
 	local receipt_safe = self:send_consent_decision()
 	if not persisted then
 		-- The decision is applied in memory and reported to the wire, but
-		-- the durable write failed: surface it like track does (ok, err).
-		-- Calling set_consent again retries persistence.
-		return false, "consent_persist_failed"
+		-- the durable write failed: success carries a durability warning.
+		-- Repeating the same decision retries persistence.
+		return true, nil, "consent_persist_failed"
 	end
 	if not purged then
 		-- The denial applied (and persisted), but the durable spool purge
 		-- failed: previously spooled envelopes are still on disk. Calling
-		-- set_consent(false) again retries it, and later dispatch points
+		-- the same denial again retries it, and later dispatch points
 		-- keep retrying on their own.
-		return false, "spool_purge_failed"
+		return true, nil, "spool_purge_failed"
 	end
 	if not receipt_safe then
 		-- The decision applied and persisted, and its receipt is queued and
@@ -2950,7 +2968,7 @@ function Client:set_consent(decision)
 		-- death would lose it. Surfaced so the host knows the offline-commit
 		-- durability guarantee is not yet in effect; the write itself is
 		-- retried automatically at every dispatch point.
-		return false, "consent_outbox_persist_failed"
+		return true, nil, "consent_outbox_persist_failed"
 	end
 	return true
 end
@@ -4704,7 +4722,7 @@ end
 
 -- ── consent-receipt outbox ────────────────────────────────────────────────────
 --
--- Every explicit set_consent decision becomes exactly ONE receipt — the
+-- Every new set_consent decision becomes exactly ONE receipt — the
 -- `POST /v1/consent` payload snapshotted at decision time — appended to a
 -- small durable outbox (storage.lua, per-app record "consent-outbox") so it
 -- survives process death and offline play, and retried until the server

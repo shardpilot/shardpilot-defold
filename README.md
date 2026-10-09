@@ -840,11 +840,11 @@ at load without sending anything — the purge runs even when the record cannot
 be read (a corrupt record is still cleared); `set_consent(false)` at runtime
 purges it too. A denied player's events never linger on disk. If the durable
 purge itself fails (a storage error), `set_consent(false)` returns
-`false, "spool_purge_failed"` and the spool goes **fail-closed** — nothing is
+`true, nil, "spool_purge_failed"` and the spool goes **fail-closed** — nothing is
 appended, loaded, or re-sent — while the purge is retried at later dispatch
 points (and at the next launch) until it lands; calling `set_consent(false)`
 again retries it immediately. Revocation cleanup completes **before** a new
-grant takes effect: `set_consent(true)` while that purge is still owed
+ordinary grant takes effect: an otherwise permitted `set_consent(true)` while that purge is still owed
 retries it first and, if it still fails, returns `false, "spool_purge_failed"`
 without applying the grant — the persisted decision stays denied, so a
 relaunch cannot replay the pre-revocation record. A configured
@@ -1750,26 +1750,41 @@ top-level one.
   for the denied interval. `"denied_forced_minor"` — the persisted decision for
   age-gate under-threshold players — is treated by every analytics gate
   exactly like `denied` (same refusals, same cleanup, same
-  purge-at-every-launch); the one difference is its receipt, which carries
+  purge-at-every-launch). Its receipt carries
   `reason = "denied_forced_minor"` so the backend per-actor gate can tell a
   band-forced denial from a chosen one. In a forced-minor session the sole
-  analytics-plane request on the wire is that receipt POST; a later explicit
-  `set_consent` (the band-correction path) supersedes the state normally.
+  analytics-plane request on the wire is that receipt POST. An ordinary grant
+  is refused with `false, "consent_forced_minor"`, including after purge recovery.
+  `set_consent(false)` still succeeds, keeps `denied_forced_minor`, and creates
+  no new receipt. The persisted state and original forced-denial receipt retain
+  the restriction across restart; no separate exclusion flag is stored.
+  It cannot make a later grant eligible; ordinary consent calls do not provide
+  an age-band reversal mechanism. A successful `set_anonymous_id` replacement
+  of that actor clears the old exclusion and starts the replacement at `unknown`;
+  a same-ID call or refused replacement preserves it. Storage holds one current
+  identity per app; apply the replacement actor's own consent and age decision.
+  The first result says whether the decision applied; `false, code` means it
+  was refused, while `true, nil, warning` reports an applied decision with
+  unfinished durability or purge work. A healthy decision returns `true`.
   The decision is
   applied in memory and persisted to the identity record; if that durable write
-  fails, `set_consent` returns `false, "consent_persist_failed"` (the in-memory
+  fails, `set_consent` returns `true, nil, "consent_persist_failed"` (the in-memory
   decision and the wire report still proceed). If the identity record persisted
-  but the durable spool purge failed, it returns `false, "spool_purge_failed"`
+  but the durable spool purge failed, it returns `true, nil, "spool_purge_failed"`
   and the spool stays fail-closed while the purge is retried automatically at
-  later dispatch points; a later `set_consent(true)` retries that purge first
+  later dispatch points; an otherwise permitted `set_consent(true)` retries that purge first
   and is **not applied** (same `false, "spool_purge_failed"` return, persisted
   decision stays denied) until the purge lands — revocation cleanup completes
-  before a new grant takes effect. Call `set_consent` again to retry
-  persistence, otherwise the decision can be lost on restart.
+  before a new grant takes effect. Retry the same decision with `set_consent`
+  to retry persistence, otherwise the decision can be lost on restart. An ordinary
+  denial under `denied_forced_minor` is a no-op, not a persistence retry. When several
+  writes fail together, the warning precedence remains identity persistence,
+  spool purge, then consent-outbox persistence.
 - Explicit consent decisions are reported to `POST {ingest_url}/v1/consent` over
   the same authenticated transport; consent never rides the event envelope.
-  Every decision becomes exactly one receipt (with its own `idempotency_key`),
-  keyed to the **canonical actor** at decision time — the verified `user_id`
+  Every new decision becomes exactly one receipt (with its own `idempotency_key`);
+  ordinary denial under `denied_forced_minor` preserves the existing decision. Receipts
+  are keyed to the **canonical actor** at decision time — the verified `user_id`
   with `kind = "user_verified"` only when a Mode B `token_provider` backs an
   identified session; the SDK-managed `anonymous_id` with `kind = "anon"` in
   every other case (a Mode A self-asserted `user_id` is never the receipt
@@ -1807,7 +1822,7 @@ top-level one.
   denied or unknown — the receipt documents the decision itself — and the
   outbox never carries analytics events. If the receipt's durable append
   fails while it is still undelivered, `set_consent` returns
-  `false, "consent_outbox_persist_failed"` (the decision applied; delivery
+  `true, nil, "consent_outbox_persist_failed"` (the decision applied; delivery
   still proceeds and the write retries automatically — including from
   `persist()` even with the event spool disabled). On a **denial-full
   outbox** — 32 retained receipts with no pure grant available to evict —
