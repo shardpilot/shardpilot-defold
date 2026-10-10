@@ -58,6 +58,13 @@ not the platform boundary.
   background expiry.
 - Generates and persists a UUIDv7 anonymous ID per configured app and supports
   `identify(user_id)` to upgrade attribution to a known user.
+- Generates identifiers and retry jitter with a private xoshiro128** generator,
+  leaving the game's `math.random` / `math.randomseed` sequence untouched.
+  It seeds once per process from available high-resolution wall time, CPU time, wall-clock
+  seconds and a Lua table address, plus browser Web Crypto when available on
+  HTML5. These sources reduce same-time launch collisions but do not guarantee
+  unique seeds. IDs and pending-crash record tokens are **not cryptographic**
+  and must not be used as secrets or authentication credentials.
 - **Consent-first analytics.** Records an explicit consent decision over the
   states `unknown` / `granted` / `denied` / `denied_forced_minor` (the
   age-gate-forced denial, which gates exactly like `denied`) and transmits

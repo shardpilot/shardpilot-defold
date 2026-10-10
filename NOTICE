@@ -3,3 +3,7 @@ Copyright 2026 ShardPilot contributors
 
 This product includes software developed by ShardPilot contributors and is
 licensed under the Apache License, Version 2.0.
+
+The private random generator implements xoshiro128** 1.1 by David Blackman
+and Sebastiano Vigna, dedicated to the public domain by its authors:
+https://prng.di.unimi.it/xoshiro128starstar.c

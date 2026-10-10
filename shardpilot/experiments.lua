@@ -114,6 +114,7 @@
 
 local clock = require "shardpilot.clock"
 local id = require "shardpilot.id"
+local random = require "shardpilot.random"
 local storage = require "shardpilot.storage"
 
 local M = {}
@@ -3527,7 +3528,7 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 end
 
 function Experiments:arm_revalidation(now_ms)
-	local jitter = 1 + (math.random() * 2 - 1) * revalidate_jitter
+	local jitter = 1 + (random.unit() * 2 - 1) * revalidate_jitter
 	self.revalidate_at_ms = now_ms + math.floor(revalidate_interval_seconds * jitter * 1000)
 end
 
@@ -3579,7 +3580,7 @@ function Experiments:pace_transient(retry_after)
 		ceiling = backoff_cap_seconds
 	end
 	self:defer_revalidation(
-		backoff_base_seconds + math.random() * (ceiling - backoff_base_seconds))
+		backoff_base_seconds + random.unit() * (ceiling - backoff_base_seconds))
 end
 
 -- One assignment fetch. `attributes` is optional; `callback(result)` receives

@@ -14,6 +14,7 @@
 
 local clock = require "shardpilot.clock"
 local consent_notice = require "shardpilot.consent_notice"
+local random = require "shardpilot.random"
 
 local M = {}
 
@@ -237,37 +238,12 @@ end
 -- on acceptance/terminal rejection without disturbing other entries.
 local pending_token_counter = 0
 
--- Seed the RNG once for this module so token suffixes do not repeat across
--- restarts. The counter and os.time() both reset/repeat when the app relaunches
--- within the same second, so a random suffix is what actually keeps a freshly
--- minted token from colliding with an entry persisted by a previous launch (a
--- collision would let remove_pending_crash delete the wrong, still-pending report).
-local token_seeded = false
-
-local function seed_token_rng()
-	if token_seeded then
-		return
-	end
-	local seed = (os.time and os.time() or 0)
-	if socket and socket.gettime then
-		seed = seed + math.floor(socket.gettime() * 1000000)
-	end
-	local address = tostring({}):match("0x(%x+)")
-	if address then
-		seed = seed + (tonumber(address:sub(-7), 16) or 0)
-	end
-	math.randomseed(seed)
-	math.random()
-	math.random()
-	token_seeded = true
-end
-
 local function next_pending_token()
-	seed_token_rng()
 	pending_token_counter = pending_token_counter + 1
-	-- counter + launch time keeps tokens human-readable and roughly ordered; the
-	-- random suffix makes them robustly unique even across a same-second restart.
-	local suffix = string.format("%x%x", math.random(0, 0xffffff), math.random(0, 0xffffff))
+	-- This is a local record identifier, never an authentication credential.
+	-- The private suffix separates launches; the stored-token check below also
+	-- prevents a collision from removing another still-pending report.
+	local suffix = random.hex(24)
 	return "p" .. tostring(pending_token_counter)
 		.. "-" .. tostring(os.time and os.time() or 0)
 		.. "-" .. suffix
@@ -612,8 +588,8 @@ function M.save_pending_crash(scope, entry, token, created_at_ms)
 	else
 		-- Mint a token that is not already present in the stored list, so a new
 		-- entry can never reuse a still-pending entry's token (which would let a
-		-- later remove delete the wrong report). The random suffix makes a collision
-		-- almost impossible; this loop closes the gap entirely.
+		-- later remove delete the wrong report), including if two launches happen
+		-- to produce the same suffix.
 		repeat
 			token = next_pending_token()
 			local clash = false
