@@ -15643,7 +15643,7 @@ end)()
 		end
 	end
 	for _, granted in ipairs({ true, false }) do
-		scene("actual example resolved-policy golden decision=" .. tostring(granted), function()
+		scene("actual example unsigned-policy golden stays closed decision=" .. tostring(granted), function()
 			reset(); storage.reset()
 			local _, restore = install_stub_sys_storage()
 			local saved, globals = {}, {}
@@ -15665,23 +15665,26 @@ end)()
 				package.loaded["shardpilot.platform"] = { detect = function() return "windows" end }
 				package.loaded["shardpilot.crash"] = { shutdown = function() return true end }
 				window = { set_listener = function() end }
-				local logs, answer = {}, nil
+				local logs, answer, init_calls = {}, nil, 0
+				local actual_sdk = package.loaded["shardpilot.sdk"]
+				local actual_init = actual_sdk.init
+				actual_sdk.init = function(...)
+					init_calls = init_calls + 1
+					return actual_init(...)
+				end
 				print = function(...) local parts = {}; for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end; logs[#logs + 1] = table.concat(parts, " ") end
 				assert(loadfile("examples/minimal/main.script"))()
 				host_age_band = function() return "adult" end
-				present_consent_notice = function(decision, callback)
-					assert_true(decision.plan_used, "real policy golden must be used, not fallback")
-					assert_equal(decision.policy_version, "strict-fallback/1")
-					assert_equal(decision.consent_text_version, "strict-fallback/1")
+				present_consent_notice = function(_, callback)
 					answer = callback
+					callback(granted)
 				end
-				init(nil); assert_true(type(answer) == "function", "example must present the golden plan")
-				assert_equal(#requests, 1, "no SDK wire before the answer")
-				answer(granted); update(nil, 0)
-				local wire = receipt()
-				tuple_equal(wire, { notice_version = "strict-fallback/1", notice_locale = "en", policy_version = "strict-fallback/1" })
-				assert_equal(wire.categories.analytics, granted)
-				assert_true(not table.concat(logs, " "):find("consent_notice_invalid", 1, true), "real setter must accept the displayed versions")
+				init(nil); update(nil, 0)
+				assert_equal(init_calls, 0, "unknown restrictions must stop real SDK initialization")
+				assert_equal(answer, nil, "an unsigned plan must not open the notice flow")
+				assert_equal(#requests, 1, "only the policy request is sent; no receipt or SDK wire")
+				assert_true(table.concat(logs, " "):find("operation restrictions are unknown; no lane opened", 1, true) ~= nil,
+					"the example must report its unknown restriction set")
 			end)
 			http.request = request
 			for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform", "shardpilot.consent_policy" }) do package.loaded[name] = saved[name] end
