@@ -129,7 +129,12 @@ Tokens are memory-only in the SDK — auth material is never written to disk.
 builds the client, which loads the persisted scope record and **mints an
 anonymous identifier** — an identity created for a player whose consent regime
 has not been established yet. Resolve the policy first, and initialise only
-when the decision permits it:
+when policy authority permits it. This build cannot authenticate consent plans:
+`plan_used` stays false and `operation_blocks` is nil (unknown). The quick start
+keeps all plan-dependent lanes closed, even with an adult player's grant. An
+unsigned strict plan, unsigned SOFT plan or unsigned empty block list supplies
+no authority. The later flow requires established policy authority; the quick
+start has no independent one:
 
 > Every block below is extracted byte for byte from
 > `examples/minimal/main.script`. `test/test_documented_regions.lua` checks
@@ -144,6 +149,10 @@ The state the flow keeps, and why each piece of it exists:
 
 <!-- doc-region: state -->
 ```lua
+-- This build cannot authenticate consent plans. The unknown-block guard below
+-- keeps every plan-dependent lane closed, including under a player grant.
+-- The later consent/lifecycle flow is reached only with established policy
+-- authority; this quick start supplies no independent authority.
 -- ⚠ POLICY FIRST, AND ONE RECONCILE PATH FOR THE WHOLE LIFECYCLE. A consent
 -- regime is not decided once at launch: the plan expires, the notice text
 -- changes, the policy is revoked, the app comes back after a week. Every one
@@ -242,8 +251,7 @@ end
 <!-- doc-region: present-notice -->
 ```lua
 -- ⚠ YOUR CONSENT UI GOES HERE. It is a GLOBAL so you can replace it with your
--- own screen — and so this repository's suite can drive both answers, which is
--- the only way the granted path is ever exercised.
+-- own screen when an authenticated policy can authorize that flow.
 --
 -- Until you replace it, it answers with the REGIME'S OWN DEFAULT, which is
 -- what a player who closes the screen without touching the switch does: off
@@ -522,20 +530,16 @@ reconcile = function(fresh)
 	revalidate_backoff = MIN_REVALIDATE_SECONDS
 	revalidate_at = fresh.valid_for_seconds and (elapsed + fresh.valid_for_seconds) or nil
 
-	-- (c2) OPERATION BLOCKS CLOSE EVERYTHING, BECAUSE THIS QUICK START CANNOT
-	-- READ THEM. They are restrictions no consent choice lifts — transfer, age
-	-- and capacity, localisation, safety — and mapping a block NAME to the
-	-- client action it restricts needs a vocabulary this file would have to
-	-- invent. The module parses them and puts them on the decision; a quick
-	-- start that then ignored them would let a player's grant open a lane the
-	-- plan had just closed, which is the permissive default in its worst
-	-- place. So: while the list is non-empty, NO lane opens — no question, no
-	-- analytics, no crash — and the reason says which.
-	--
-	-- A production host does the mapping and refuses the restricted actions;
-	-- an unmapped name closes everything, exactly as here. See the README's
-	-- host requirements. In this release the resolver always sends [].
-	if fresh.operation_blocks and #fresh.operation_blocks > 0 then
+	-- (c2) Unknown restrictions cannot authorize any plan-dependent operation.
+	-- A known non-empty list also closes this quick start: it has no mapping
+	-- from restriction names to individual actions. A player grant lifts neither.
+	if fresh.operation_blocks == nil then
+		print("shardpilot: operation restrictions are unknown; no lane opened")
+		suspend_analytics("operation_blocks_unknown")
+		suspend_crash("operation_blocks_unknown")
+		return
+	end
+	if #fresh.operation_blocks > 0 then
 		print("shardpilot: the plan carries " .. #fresh.operation_blocks
 			.. " operation block(s) this quick start cannot map ("
 			.. table.concat(fresh.operation_blocks, ", ") .. "); no lane opened")
@@ -546,13 +550,9 @@ reconcile = function(fresh)
 
 	-- (d) The ANALYTICS lane.
 	--
-	-- ⚠ THE REGIME DECIDES THE DEFAULT OF THE QUESTION, NOT WHETHER IT IS
-	-- ASKED. STRICT means ask with the switch OFF and start only on an
-	-- explicit grant; SOFT means a prominent purpose notice with the switch ON
-	-- and one tap to turn it off. An earlier cut of this example read STRICT as
-	-- "nothing to ask" — and since the resolver answers STRICT to every request
-	-- in this release, a host copying it would never ask anyone and never start
-	-- analytics, for every player, forever.
+	-- This later flow requires established operation restrictions above.
+	-- A strict choice defaults off and requires an explicit grant; a regime
+	-- default never overrides the independent policy-authority gate.
 	--
 	-- The AGE step comes first and is the host's own: an unknown or minor band
 	-- means minimised handling, so the question is not put at all.
@@ -628,13 +628,8 @@ reconcile = function(fresh)
 					grant_required = fresh.explicit_grant_required,
 					fresh_answer = true,
 				}
-				-- ⚠ RE-RESOLVE BEFORE ACTING ON THE ANSWER, AND INVALIDATE
-				-- FIRST. The player was reading the screen; the plan may have
-				-- expired or the policy may have been revoked meanwhile — and
-				-- without the invalidation this resolution is answered by the
-				-- private cache entry the LAUNCH wrote, which is the very
-				-- decision being checked for staleness. It has to reach the
-				-- resolver to mean anything.
+				-- Re-resolve after the answer and fence responses dispatched
+				-- before it; the earlier decision is not fresh authority.
 				consent_policy.invalidate()
 				resolve_and_reconcile()
 			end)
@@ -699,10 +694,8 @@ function init(self)
 		window.set_listener(function(self, event, data)
 			-- ... your existing resize/focus/iconify handling ...
 			if event == window.WINDOW_EVENT_FOCUS_GAINED then
-				-- Resume is a named re-resolution trigger, and the cache must
-				-- not answer it: the whole point is that time has passed. It
-				-- runs first, so a changed decision applies before the SDK
-				-- starts a session for the resume.
+				-- Resume fences previous requests and resolves again before
+				-- forwarding the event to any running client.
 				consent_policy.invalidate()
 				resolve_and_reconcile()
 			end
@@ -772,23 +765,12 @@ function final(self)
 end
 ```
 
-A decision is **not** consent, and it is not legal advice: ShardPilot's
-resolver returns the `STRICT_OPT_IN` regime to every caller, and the decision
-says whether the optional lane is closed whatever the player answers. A
-workspace that has accepted ShardPilot's advisory estimates may additionally
-receive an advisory, non-binding estimate when the context asks for it
-(`advisory = true`), as `decision.advisory`. It is not a regime and changes no
-other field of the decision; you, the integrating studio, decide what to do
-with it.
-`decision.crash_profile`
-decides the crash lane **separately** — crash reporting is ON by default, so an
-unconditional `crash.init` is how a closed lane gets opened — and
-`decision.valid_for_seconds` is how long the verdict is good for; re-resolve by
-it, and on resume, and when `consent_text_version` or `presented_language`
-changes. A lane the policy later closes is stopped with `shutdown()`, **never**
-with `set_consent(false)` or `crash.set_enabled(false)`: those record a
-player's decision, and a policy change is not one. See the repository README's
-**Consent regime** section and `examples/minimal/main.script`.
+The local fallback is strict, default OFF, explicit grant required, crash OFF,
+server analytics denied and child handling minimised. A well-formed unsigned
+response reports `plan_unsigned`. No plan text, advisory, restriction list or
+validity window is forwarded or cached. Preserve independent host restrictions
+and treat unknown operation blocks as closed, never as an empty authorized set.
+See the README's **Consent regime** section for the full contract.
 
 The configuration itself:
 
@@ -1147,12 +1129,11 @@ against a reachable ingest endpoint. Every observation below is the SDK's real
 surface — no guessing from logs.
 
 1. **Policy first**: `consent_policy.prepare(context, cb)` calls back exactly
-   once. ⚠ `STRICT_OPT_IN` — which is what the resolver emits today — means
-   **ask with the switch off**, not "do not ask": read
-   `decision.analytics_choice_default` for the switch's state and
-   `decision.explicit_grant_required` for whether a click is what opens the
-   lane. Your age step comes first; an unknown or minor band means the
-   question is not put and `init` is not reached at all.
+   once. In this build every response is unused: verify `plan_used = false`,
+   strict default OFF, and `operation_blocks = nil` (unknown). The quick start
+   must initialize no processing lane, even for an adult granting consent.
+   Remaining runtime checks below require an independent host policy; the
+   unsigned policy response cannot establish that prerequisite.
 2. **Init**: inside that callback, `shardpilot.init(cfg)` returns `true`. A
    `false, err` here is a config mistake; the `err` code names the field.
 3. **Consent-first sanity**: before any grant, `shardpilot.track("t")` returns

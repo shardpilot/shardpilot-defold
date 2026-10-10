@@ -1,4 +1,8 @@
 -- doc-region: state
+-- This build cannot authenticate consent plans. The unknown-block guard below
+-- keeps every plan-dependent lane closed, including under a player grant.
+-- The later consent/lifecycle flow is reached only with established policy
+-- authority; this quick start supplies no independent authority.
 -- ⚠ POLICY FIRST, AND ONE RECONCILE PATH FOR THE WHOLE LIFECYCLE. A consent
 -- regime is not decided once at launch: the plan expires, the notice text
 -- changes, the policy is revoked, the app comes back after a week. Every one
@@ -88,8 +92,7 @@ end
 
 -- doc-region: present-notice
 -- ⚠ YOUR CONSENT UI GOES HERE. It is a GLOBAL so you can replace it with your
--- own screen — and so this repository's suite can drive both answers, which is
--- the only way the granted path is ever exercised.
+-- own screen when an authenticated policy can authorize that flow.
 --
 -- Until you replace it, it answers with the REGIME'S OWN DEFAULT, which is
 -- what a player who closes the screen without touching the switch does: off
@@ -345,20 +348,16 @@ reconcile = function(fresh)
 	revalidate_backoff = MIN_REVALIDATE_SECONDS
 	revalidate_at = fresh.valid_for_seconds and (elapsed + fresh.valid_for_seconds) or nil
 
-	-- (c2) OPERATION BLOCKS CLOSE EVERYTHING, BECAUSE THIS QUICK START CANNOT
-	-- READ THEM. They are restrictions no consent choice lifts — transfer, age
-	-- and capacity, localisation, safety — and mapping a block NAME to the
-	-- client action it restricts needs a vocabulary this file would have to
-	-- invent. The module parses them and puts them on the decision; a quick
-	-- start that then ignored them would let a player's grant open a lane the
-	-- plan had just closed, which is the permissive default in its worst
-	-- place. So: while the list is non-empty, NO lane opens — no question, no
-	-- analytics, no crash — and the reason says which.
-	--
-	-- A production host does the mapping and refuses the restricted actions;
-	-- an unmapped name closes everything, exactly as here. See the README's
-	-- host requirements. In this release the resolver always sends [].
-	if fresh.operation_blocks and #fresh.operation_blocks > 0 then
+	-- (c2) Unknown restrictions cannot authorize any plan-dependent operation.
+	-- A known non-empty list also closes this quick start: it has no mapping
+	-- from restriction names to individual actions. A player grant lifts neither.
+	if fresh.operation_blocks == nil then
+		print("shardpilot: operation restrictions are unknown; no lane opened")
+		suspend_analytics("operation_blocks_unknown")
+		suspend_crash("operation_blocks_unknown")
+		return
+	end
+	if #fresh.operation_blocks > 0 then
 		print("shardpilot: the plan carries " .. #fresh.operation_blocks
 			.. " operation block(s) this quick start cannot map ("
 			.. table.concat(fresh.operation_blocks, ", ") .. "); no lane opened")
@@ -369,13 +368,9 @@ reconcile = function(fresh)
 
 	-- (d) The ANALYTICS lane.
 	--
-	-- ⚠ THE REGIME DECIDES THE DEFAULT OF THE QUESTION, NOT WHETHER IT IS
-	-- ASKED. STRICT means ask with the switch OFF and start only on an
-	-- explicit grant; SOFT means a prominent purpose notice with the switch ON
-	-- and one tap to turn it off. An earlier cut of this example read STRICT as
-	-- "nothing to ask" — and since the resolver answers STRICT to every request
-	-- in this release, a host copying it would never ask anyone and never start
-	-- analytics, for every player, forever.
+	-- This later flow requires established operation restrictions above.
+	-- A strict choice defaults off and requires an explicit grant; a regime
+	-- default never overrides the independent policy-authority gate.
 	--
 	-- The AGE step comes first and is the host's own: an unknown or minor band
 	-- means minimised handling, so the question is not put at all.
@@ -451,13 +446,8 @@ reconcile = function(fresh)
 					grant_required = fresh.explicit_grant_required,
 					fresh_answer = true,
 				}
-				-- ⚠ RE-RESOLVE BEFORE ACTING ON THE ANSWER, AND INVALIDATE
-				-- FIRST. The player was reading the screen; the plan may have
-				-- expired or the policy may have been revoked meanwhile — and
-				-- without the invalidation this resolution is answered by the
-				-- private cache entry the LAUNCH wrote, which is the very
-				-- decision being checked for staleness. It has to reach the
-				-- resolver to mean anything.
+				-- Re-resolve after the answer and fence responses dispatched
+				-- before it; the earlier decision is not fresh authority.
 				consent_policy.invalidate()
 				resolve_and_reconcile()
 			end)
@@ -519,10 +509,8 @@ function init(self)
 		window.set_listener(function(self, event, data)
 			-- ... your existing resize/focus/iconify handling ...
 			if event == window.WINDOW_EVENT_FOCUS_GAINED then
-				-- Resume is a named re-resolution trigger, and the cache must
-				-- not answer it: the whole point is that time has passed. It
-				-- runs first, so a changed decision applies before the SDK
-				-- starts a session for the resume.
+				-- Resume fences previous requests and resolves again before
+				-- forwarding the event to any running client.
 				consent_policy.invalidate()
 				resolve_and_reconcile()
 			end

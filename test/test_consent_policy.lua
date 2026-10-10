@@ -308,7 +308,7 @@ local function plan(overrides)
 			notice = NOTICE,
 		},
 		-- Present and null, which is what the resolver sends on every response
-		-- in this release and the only admissible signature state here.
+		-- in this release and the valid unsigned wire shape, still refused for authority.
 		signature = NULL,
 	}
 	for key, value in pairs(overrides or {}) do
@@ -580,12 +580,53 @@ end
 
 -- The control: without it, every refusal below would be satisfied by a module
 -- that refuses everything.
-local function test_a_valid_plan_is_used()
+-- A positive shape control must reach the authentication boundary, not merely fall back.
+local function assert_unsigned(decision, label)
+	assert_true(not decision.plan_used, label)
+	assert_equal(decision.reason, "plan_unsigned", label)
+	assert_true(decision.operation_blocks == nil, "an unsigned plan supplies no block authority")
+end
+
+local function test_no_unauthenticated_plan_has_authority()
+	local cases = {
+		{ "unsigned strict", {} },
+		{ "unsigned soft", { regime = consent_policy.SOFT_OPT_OUT } },
+		{ "unsigned unknown", { regime = consent_policy.UNKNOWN } },
+		{ "unsigned empty blocks", { flags = { operation_blocks = {} } } },
+		{ "unsigned blocks", { flags = { operation_blocks = { "transfer_review" } } } },
+		{ "missing signature", { signature = "__nil__" } },
+		{ "empty signature", { signature = "" } },
+		{ "unverifiable signature", { signature = "ed25519:synthetic" } },
+		{ "unknown signing key", { signature = "unknown-key:synthetic" } },
+	}
+	for _, case in ipairs(cases) do
+		reset()
+		next_response_body = plan(case[2])
+		local decision, calls = prepare()
+		assert_equal(calls, 1, case[1] .. " settles once")
+		assert_equal(#requests, 1, case[1] .. " reaches the response gate")
+		assert_true(not decision.plan_used, case[1] .. " must not be used")
+		assert_equal(decision.regime, consent_policy.STRICT_OPT_IN, case[1])
+		assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF, case[1])
+		assert_true(decision.explicit_grant_required, case[1])
+		assert_equal(decision.crash_profile, consent_policy.CRASH_OFF, case[1])
+		assert_equal(decision.server_analytics, consent_policy.SERVER_ANALYTICS_DENIED, case[1])
+		assert_equal(decision.child_rules, consent_policy.CHILD_RULES_MINIMISED, case[1])
+		assert_true(decision.operation_blocks == nil, case[1] .. " cannot authenticate an empty block set")
+		assert_equal(decision.operation_blocks_source, "none", case[1])
+		assert_true(decision.advisory == nil and decision.valid_for_seconds == nil, case[1])
+		if case[2].signature == nil then
+			assert_equal(decision.reason, "plan_unsigned", case[1] .. " reaches the authentication refusal")
+		end
+	end
+end
+
+local function test_a_well_formed_unsigned_plan_is_unused()
 	reset()
 	next_response_body = plan()
 	local decision, calls = prepare()
 	assert_equal(calls, 1, "exactly one callback")
-	assert_true(decision.plan_used, "a valid plan must be used: " .. tostring(decision.reason))
+	assert_unsigned(decision, "a valid shape must reach the unsigned refusal: " .. tostring(decision.reason))
 	assert_equal(decision.regime, consent_policy.STRICT_OPT_IN)
 	assert_true(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, "STRICT closes optional processing on this verdict alone")
 	assert_equal(#requests, 1, "one request")
@@ -619,28 +660,20 @@ local function test_the_module_touches_no_sdk_state()
 	assert_equal(saves, 0, "prepare wrote to disk")
 end
 
--- ⚠ RULE (b): OFFLINE CAN TIGHTEN, NEVER RELAX. A cached permissive result
--- reused when the network is gone is the failure this rule exists for.
-local function test_an_error_never_reuses_a_cached_permission()
-	reset()
-	-- Cache a SOFT plan first, so there is a permission to reuse.
-	next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT })
-	local first = prepare()
-	assert_equal(first.regime, consent_policy.SOFT_OPT_OUT, "the fixture must cache a permissive plan")
-	assert_equal(first.analytics_choice_default, consent_policy.CHOICE_DEFAULT_ON,
-		"SOFT defaults the choice ON")
 
-	-- Now the network fails. The cache is still warm, and must not be served
-	-- as a permission... but it also must not be served at all once the host
-	-- invalidates it on the named trigger.
+local function test_an_outage_after_an_unsigned_plan_stays_closed()
+	reset()
+	next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT })
+	assert_unsigned(prepare(), "unsigned SOFT is unused before the outage")
 	consent_policy.invalidate()
 	next_status = 500
 	next_response_body = encode_value({ reason = "policy_unavailable" })
 	local second = prepare()
-	assert_true(not second.plan_used, "an error must not report a used plan")
-	assert_equal(second.regime, consent_policy.STRICT_OPT_IN, "an error is STRICT")
-	assert_true(second.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, "an error closes optional processing")
-	assert_equal(second.crash_profile, consent_policy.CRASH_OFF, "an error closes the crash lane")
+	assert_equal(second.reason, "policy_unavailable")
+	assert_equal(second.regime, consent_policy.STRICT_OPT_IN)
+	assert_equal(second.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF)
+	assert_equal(second.crash_profile, consent_policy.CRASH_OFF)
+	assert_true(second.operation_blocks == nil, "an outage cannot establish restrictions")
 end
 
 -- ⚠ RULE (c): ONE CALLBACK, EVER, AND A LATE RESPONSE IS DROPPED. A response
@@ -720,7 +753,7 @@ local function test_every_malformed_plan_is_strict()
 		reset()
 		next_response_body = case[2]
 		local decision = prepare()
-		assert_true(not decision.plan_used, case[1] .. " must not report a used plan")
+		assert_equal(decision.reason, "invalid_response", case[1] .. " must not report a used plan")
 		assert_equal(decision.regime, consent_policy.STRICT_OPT_IN, case[1] .. " must be STRICT")
 		assert_true(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, case[1] .. " must close optional processing")
 		assert_equal(decision.child_rules, consent_policy.CHILD_RULES_MINIMISED,
@@ -728,86 +761,43 @@ local function test_every_malformed_plan_is_strict()
 	end
 end
 
--- UNKNOWN is a VERIFIED plan that still closes optional processing: the
--- resolver said it could not classify, and that is not permission.
+-- UNKNOWN is a valid wire regime and is still unauthenticated.
 local function test_unknown_closes_optional_processing()
 	reset()
 	next_response_body = plan({ regime = consent_policy.UNKNOWN })
 	local decision = prepare()
-	assert_true(decision.plan_used, "UNKNOWN is a verified plan")
+	assert_unsigned(decision, "unsigned UNKNOWN reaches the authentication boundary")
 	assert_true(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, "UNKNOWN closes optional processing")
 end
 
--- The private cache is a ceiling, and the host's invalidation is what the
--- named re-resolution triggers call.
-local function test_the_cache_is_private_and_invalidatable()
-	reset()
-	next_response_body = plan()
-	prepare()
-	assert_equal(#requests, 1)
-	prepare()
-	assert_equal(#requests, 1, "a second call inside the window is served privately")
-	consent_policy.invalidate()
-	prepare()
-	assert_equal(#requests, 2, "invalidation forces a re-resolution")
+
+local function test_unsigned_responses_are_never_cached()
+	for _, regime in ipairs({ consent_policy.STRICT_OPT_IN, consent_policy.SOFT_OPT_OUT, consent_policy.UNKNOWN }) do
+		reset()
+		next_response_body = plan({ regime = regime })
+		assert_unsigned(prepare(), regime)
+		assert_unsigned(prepare(), regime)
+		assert_equal(#requests, 2, "an unsigned response is never cached")
+		consent_policy.invalidate()
+		assert_unsigned(prepare(), regime)
+		assert_equal(#requests, 3)
+	end
 end
 
--- ⚠ EXPIRY IS ENFORCED, NOT MERELY DESCRIBED. The shape of expires_at was
--- checked and then the plan was used and cached for the full five minutes
--- regardless — so an expired SOFT_OPT_OUT went on reporting optional
--- processing open, and a plan with seconds of life left was served for
--- minutes.
-local function test_expiry_is_enforced_before_use_and_before_caching()
-	-- (a) An already-expired permissive plan is not used AT ALL.
-	reset()
-	next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT, expires_at = "1970-01-01T00:00:00Z" })
-	local expired = prepare()
-	assert_true(not expired.plan_used, "an expired plan must not be used")
-	assert_equal(expired.regime, consent_policy.STRICT_OPT_IN, "an expired plan is STRICT")
-	assert_true(expired.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, "an expired plan closes optional processing")
 
-	-- (b) max_age_seconds = 0 says DO NOT REUSE. The answer stands; the cache
-	-- entry does not exist.
-	reset()
-	next_response_body = plan({ max_age_seconds = 0 })
-	local once = prepare()
-	assert_true(once.plan_used, "max_age_seconds = 0 is still a live plan for this one answer")
-	prepare()
-	assert_equal(#requests, 2, "max_age_seconds = 0 must not be cached")
-
-	-- (c) The cache never outlives max_age_seconds.
-	reset()
-	next_response_body = plan({ max_age_seconds = 1 })
-	prepare()
-	assert_equal(#requests, 1)
-	for _ = 1, 20 do
-		socket.gettime() -- 0.1 per reading: past a one-second life
+local function test_expiry_is_validated_before_authentication()
+	for _, stamp in ipairs({ "1970-01-01T00:00:00Z", "2099-13-01T00:00:00Z" }) do
+		reset()
+		next_response_body = plan({ expires_at = stamp })
+		assert_equal(prepare().reason, "invalid_response", "invalid expiry fails before authentication")
 	end
-	prepare()
-	assert_equal(#requests, 2, "the cache must not outlive max_age_seconds")
-
-	-- (d) ...and never outlives expires_at either, whatever max_age says.
-	reset()
-	socket.now = 0
-	next_response_body = plan({ expires_at = "1970-01-01T00:00:03Z", max_age_seconds = 300 })
-	local live = prepare()
-	assert_true(live.plan_used, "three seconds of life is still life: " .. tostring(live.reason))
-	prepare()
-	assert_equal(#requests, 1, "inside its life it is served privately")
-	socket.now = socket.now + 5
-	local stale = prepare()
-	assert_equal(#requests, 2, "the cache must not outlive expires_at")
-	assert_true(not stale.plan_used, "and the re-resolved plan is now expired")
-	socket.now = 1000
-
-	-- The control: an unreadable timestamp is refused rather than treated as
-	-- "no expiry", and a valid one is still accepted.
-	reset()
-	next_response_body = plan({ expires_at = "2099-13-01T00:00:00Z" })
-	assert_true(not prepare().plan_used, "an impossible month is not a timestamp")
-	reset()
-	next_response_body = plan({ expires_at = "2099-01-01T00:00:00+02:00" })
-	assert_true(prepare().plan_used, "a valid offset timestamp is still a timestamp")
+	for _, lifetime in ipairs({ 0, 1, 300 }) do
+		reset()
+		next_response_body = plan({ max_age_seconds = lifetime, expires_at = "2099-01-01T00:00:00+02:00" })
+		assert_unsigned(prepare(), "a fresh timestamp parses but supplies no authority")
+		assert_unsigned(prepare(), "a lifetime does not authenticate the response")
+		assert_equal(#requests, 2)
+	end
 end
 
 
@@ -855,7 +845,7 @@ local function test_a_json_object_is_not_an_empty_list()
 		reset()
 		next_response_body = case[2]
 		local decision = prepare()
-		assert_true(not decision.plan_used,
+		assert_equal(decision.reason, "invalid_response",
 			case[1] .. " supplied as an object must not read as an empty list")
 		assert_true(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, case[1] .. " must close optional processing")
 	end
@@ -865,39 +855,10 @@ local function test_a_json_object_is_not_an_empty_list()
 	reset()
 	next_response_body = plan({ flags = { operation_blocks = { "profiling" } } })
 	local accepted = prepare()
-	assert_true(accepted.plan_used, "a genuine array must still be accepted: " .. tostring(accepted.reason))
-	assert_equal(accepted.operation_blocks[1], "profiling", "and it is carried through")
+	assert_unsigned(accepted, "a genuine array must still be accepted: " .. tostring(accepted.reason))
+	assert_true(accepted.operation_blocks == nil, "unverified restrictions are not carried through")
 end
 
--- ⚠ THE CACHE IS SCOPED TO THE WHOLE CONTEXT. One process-wide entry served
--- on liveness alone handed one app's, environment's or endpoint's permission
--- to another, past the scope check that only ever saw the first context.
-local function test_the_cache_is_scoped_to_the_whole_context()
-	-- The control first: the SAME context is still served privately. The
-	-- fixture is a STRICT plan, because now only a non-permissive
-	-- decision is cached at all.
-	reset()
-	next_response_body = plan()
-	local first = prepare()
-	assert_true(first.plan_used, "the fixture must be used")
-	local again = prepare()
-	assert_equal(#requests, 1, "the same context is served from the cache")
-	assert_equal(again.regime, consent_policy.STRICT_OPT_IN, "with the decision that was cached")
-
-	for _, override in ipairs({
-		{ app_key = "app-other" }, { workspace_key = "ws-other" }, { environment_key = "env-other" },
-		{ endpoint = "https://policy.other.example" }, { locale = "de" },
-		{ platform = "macos" }, { app_version = "9.9.9" },
-		{ age_band = { vocabulary = "coarse", band = "adult" } },
-	}) do
-		reset()
-		next_response_body = plan()
-		prepare()
-		assert_equal(#requests, 1, "the cache is primed")
-		prepare(context(override))
-		assert_equal(#requests, 2, "a changed context field must re-resolve, not reuse the entry")
-	end
-end
 
 -- ⚠ THE ENDPOINT IS PART OF THE CONTEXT CONTRACT. An absent one was
 -- concatenated with the route and raised a Lua error out of prepare, so the
@@ -940,7 +901,7 @@ local function test_an_invalid_endpoint_is_an_invalid_request()
 		reset()
 		next_response_body = plan()
 		local decision = prepare(context({ endpoint = endpoint }))
-		assert_true(decision.plan_used, endpoint .. " must be accepted: " .. tostring(decision.reason))
+		assert_unsigned(decision, endpoint .. " must be accepted: " .. tostring(decision.reason))
 		assert_equal(#requests, 1, endpoint .. " must reach the wire")
 		assert_true(requests[1].url:find("//api/cp", 1, true) == nil,
 			"a trailing slash must be trimmed, not doubled: " .. requests[1].url)
@@ -983,7 +944,7 @@ local function test_a_signal_must_state_its_availability_as_a_boolean()
 		reset()
 		next_response_body = plan({ signals_used = { signal } })
 		local decision = prepare()
-		assert_true(not decision.plan_used, "a signal that does not state a boolean must not be used")
+		assert_equal(decision.reason, "invalid_response", "a signal that does not state a boolean must not be used")
 		assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
 			"and the choice defaults off")
 	end
@@ -993,40 +954,27 @@ local function test_a_signal_must_state_its_availability_as_a_boolean()
 	-- signal.
 	reset()
 	next_response_body = plan({ signals_used = { { name = "server_country", available = false, reason = "source_unavailable" } } })
-	assert_true(prepare().plan_used, "a stated false with a reason must parse")
+	assert_unsigned(prepare(), "a stated false with a reason must parse")
 	reset()
 	next_response_body = plan({ signals_used = { { name = "server_country", available = true } } })
-	assert_true(prepare().plan_used, "a stated true must parse")
+	assert_unsigned(prepare(), "a stated true must parse")
 end
 
--- ⚠ THE CALLER GETS A COPY, NOT THE CACHE ENTRY. The same table was handed to
--- every caller and kept as the entry, so a caller that wrote a field on its
--- decision — or sorted prohibited_purposes in place — edited what the next five
--- minutes of prepare calls would serve.
-local function test_a_returned_decision_is_a_copy()
-	reset()
-	next_response_body = plan({ flags = { operation_blocks = { "transfer_review" } } })
-	local first = prepare()
-	assert_equal(first.operation_blocks[1], "transfer_review", "the fixture must carry a block")
 
-	-- Mutate everything a caller could reach.
+local function test_fallback_decisions_are_independent()
+	reset()
+	next_response_body = plan()
+	local first = prepare()
 	first.regime = "PERMISSIVE"
 	first.analytics_choice_default = consent_policy.CHOICE_DEFAULT_ON
 	first.child_rules = "unrestricted"
-	first.operation_blocks[1] = "removed"
-
+	first.operation_blocks = {}
+	first.plan_used = true
 	local second = prepare()
-	assert_equal(#requests, 1, "the second call must be served from the cache, or this proves nothing")
-	assert_equal(second.regime, consent_policy.STRICT_OPT_IN, "a caller mutated the cached regime")
-	assert_true(second.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, "a caller reopened optional processing in the cache")
-	assert_equal(second.child_rules, consent_policy.CHILD_RULES_MINIMISED,
-		"a caller lifted the cached child rules")
-	assert_equal(second.operation_blocks[1], "transfer_review", "a caller mutated the cached block list")
-
-	-- And two cache hits do not share an array with each other either.
-	second.operation_blocks[1] = "removed"
-	local third = prepare()
-	assert_equal(third.operation_blocks[1], "transfer_review", "two cache hits shared one array")
+	assert_unsigned(second, "a caller cannot rewrite the next fallback")
+	assert_equal(second.regime, consent_policy.STRICT_OPT_IN)
+	assert_equal(second.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF)
+	assert_equal(second.child_rules, consent_policy.CHILD_RULES_MINIMISED)
 end
 
 -- ⚠ AN EMPTY SIGNATURE IS STILL A SIGNATURE. Treating "" as absence is a
@@ -1036,7 +984,7 @@ local function test_an_empty_signature_is_still_a_signature()
 	reset()
 	next_response_body = plan({ signature = "" })
 	local decision = prepare()
-	assert_true(not decision.plan_used, "an empty signature is not an absent one")
+	assert_equal(decision.reason, "invalid_response", "an empty signature is not an absent one")
 	assert_equal(decision.regime, consent_policy.STRICT_OPT_IN, "it takes the strict path")
 	assert_true(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, "and closes optional processing")
 end
@@ -1153,7 +1101,7 @@ local function run_example(between, window_events, dts, finalize, opts)
 
 	-- The example's own print() is the only place it reports the decision, so
 	-- it is captured rather than left on stdout: it is what tells this scene
-	-- the plan was USED, not merely that the branches were taken.
+	-- the refusal reason, not merely that the branches were taken.
 	local saved_print = print
 	print = function(...)
 		local parts = {}
@@ -1267,137 +1215,33 @@ local function example_plan(overrides)
 	return plan(body)
 end
 
-local function test_the_published_example_branches_on_the_decision()
-	-- ⚠ STRICT MEANS ASK, DEFAULT OFF — NOT "NOTHING IS ASKED". The resolver
-	-- answers STRICT to every request in this release, so an example that read
-	-- it as silence would mean no host ever asks anyone and no analytics ever
-	-- starts, for every player, forever. These scenes are the difference.
-	local eligible = "adult"
 
-	-- (a) STRICT + an explicit GRANT → the question was put with the switch
-	-- OFF, and the lane starts exactly once, after the answer.
-	reset()
-	next_response_body = example_plan()
-	local calls, before_choice = run_example(nil, nil, nil, false,
-		{ age_band = eligible, answer = true })
-	assert_true(calls:find("notice:default=off", 1, true) ~= nil,
-		"STRICT must put the question with the switch off: " .. calls)
-	assert_true(before_choice:find("sdk.", 1, true) == nil and before_choice:find("crash.", 1, true) == nil,
-		"nothing may exist while the notice is still on screen: " .. before_choice)
-	assert_true(calls:find("sdk.set_consent:true", 1, true) ~= nil,
-		"an explicit grant must be recorded: " .. calls)
-	assert_true(calls:find("sdk.session_start", 1, true) ~= nil,
-		"and the session must start: " .. calls)
-	local inits = 0
-	for _ in calls:gmatch("sdk%.init") do
-		inits = inits + 1
-	end
-	assert_equal(inits, 1, "exactly once: " .. calls)
-
-	-- (b) STRICT + the switch left UNTOUCHED (the default answer) → the
-	-- decline is recorded and no session starts. This is what the resolver's
-	-- own plan produces for a player who closes the screen.
-	reset()
-	next_response_body = example_plan()
-	calls = run_example(nil, nil, nil, false, { age_band = eligible })
-	assert_true(calls:find("notice:default=off", 1, true) ~= nil,
-		"the question is still put, with the switch off: " .. calls)
-	assert_true(calls:find("sdk.set_consent:false", 1, true) ~= nil,
-		"an untouched STRICT switch is a decline, recorded: " .. calls)
-	assert_true(calls:find("sdk.session_start", 1, true) == nil,
-		"and no session starts: " .. calls)
-
-	-- (c) A FALLBACK still asks, and a grant given under one is a valid strict
-	-- grant. Offline is not a reason to stop asking.
-	reset()
-	next_status = 500
-	next_response_body = encode_value({ reason = "policy_unavailable" })
-	calls = run_example(nil, nil, nil, false, { age_band = eligible, answer = true })
-	assert_true(calls:find("strict fallback", 1, true) ~= nil,
-		"the fixture must produce a fallback: " .. calls)
-	assert_true(calls:find("notice:default=off", 1, true) ~= nil,
-		"a fallback still puts the question: " .. calls)
-	assert_true(calls:find("sdk.set_consent:true", 1, true) ~= nil,
-		"and a grant under a fallback is a valid strict grant: " .. calls)
-	-- ⚠ AN ABSENT WINDOW IS NOT A ZERO ONE. A fallback carries no
-	-- valid_for_seconds at all — it established nothing that could expire — so
-	-- only a PRESENT non-positive window closes the lanes. Reading nil as
-	-- "no window" made every outage start nothing, which is the strict
-	-- fallback refusing the very grant it just asked for.
-	assert_true(calls:find("no validity window", 1, true) == nil,
-		"a fallback's absent window is not a zero window: " .. calls)
-	assert_true(calls:find("sdk.session_start", 1, true) ~= nil,
-		"and the granted session starts under it: " .. calls)
-
-	-- (d) An UNKNOWN or MINOR band means minimised handling: the question is
-	-- never presented and nothing optional starts. The age step is the host's
-	-- and it comes first.
-	for _, band in ipairs({ "minor", "__unknown__" }) do
+-- Unknown operation restrictions close the quick start, even for an adult willing to grant.
+local function test_example_stays_closed_without_authenticated_restrictions()
+	for _, overrides in ipairs({ {}, { regime = consent_policy.SOFT_OPT_OUT },
+		{ flags = { operation_blocks = {} } },
+		{ flags = { operation_blocks = { "restricted" }, crash_profile = consent_policy.CRASH_MINIMAL } },
+		{ signature = "synthetic-unverifiable" } }) do
 		reset()
-		next_response_body = example_plan()
-		calls = run_example(nil, nil, nil, false,
-			{ age_band = band ~= "__unknown__" and band or nil, answer = true })
-		assert_true(calls:find("minimised handling", 1, true) ~= nil,
-			"an unknown or minor band means minimised handling: " .. calls)
-		assert_true(calls:find("notice:default", 1, true) == nil,
-			"and the question is never presented (" .. band .. "): " .. calls)
-		assert_true(calls:find("sdk.init", 1, true) == nil,
-			"and nothing optional starts: " .. calls)
-	end
+		next_response_body = example_plan(overrides)
+		local calls, initial = run_example(function() next_response_body = "not JSON" end,
+			{ "focus_lost", "focus_gained" }, { 1, 1, 1 }, true,
+			{ age_band = "adult", answer = true })
+		for _, forbidden in ipairs({ "sdk.init", "notice:default=", "crash.init", "sdk.set_consent",
+			"sdk.identify", "sdk.session_start", "sdk.fetch_remote_config" }) do
+			assert_true(calls:find(forbidden, 1, true) == nil, "unknown blocks prevent " .. forbidden)
+		end
+		assert_true(initial:find("operation restrictions are unknown; no lane opened", 1, true) ~= nil,
+			"the real resolver must reach the unknown-block guard: " .. initial)
+		assert_equal(select(2, calls:gsub("operation restrictions are unknown; no lane opened", "")), 2,
+			"launch and resume outage must both close the lanes")
+		assert_equal(#requests, 2, "launch and resume re-resolve; frames do not spin")
 
-	-- (e) SOFT defaults the switch ON — and the SDK's consent API is not the
-	-- place a non-objection basis is recorded, so the example says so rather
-	-- than writing down a grant nobody gave.
-	reset()
-	next_response_body = example_plan({ regime = consent_policy.SOFT_OPT_OUT })
-	calls = run_example(nil, nil, nil, false, { age_band = eligible })
-	assert_true(calls:find("notice:default=on", 1, true) ~= nil,
-		"SOFT must put the question with the switch on: " .. calls)
-	assert_true(calls:find("sdk.set_consent", 1, true) == nil,
-		"and must not record a non-objection as a click: " .. calls)
-
-	-- (f) THE CRASH LANE under crash_profile "off": closed, because this quick
-	-- start has no separately reviewed crash gate of its own. A host that has
-	-- one keeps it — which is a README requirement, not example code.
-	reset()
-	next_response_body = example_plan()
-	calls = run_example(nil, nil, nil, false, { age_band = eligible, answer = true })
-	assert_true(calls:find("crash.init", 1, true) == nil,
-		'crash_profile "off" leaves the quick start\'s crash lane closed: ' .. calls)
-
-	-- The control: a permitted crash profile DOES open it, so (f) is about the
-	-- value and not about the example never starting crash at all.
-	reset()
-	next_response_body = example_plan({ flags = { crash_profile = consent_policy.CRASH_MINIMAL } })
-	calls = run_example(nil, nil, nil, false, { age_band = eligible, answer = true })
-	assert_true(calls:find("crash.init", 1, true) ~= nil,
-		"a permitted crash profile opens the lane: " .. calls)
-
-	-- ⚠ AND A MINOR OR UNKNOWN BAND CLOSES IT AGAIN, WHATEVER THE PROFILE
-	-- SAYS. `minimal_diagnostics_for_minors` is a release-2 path needing a
-	-- reviewed child flow the quick start does not have. The example's own
-	-- comment claimed this before the code did: `band` was local to the
-	-- analytics block and the crash block was reached by fall-through, so the
-	-- permitted profile above opened a reporter on a minor.
-	for _, band in ipairs({ "minor", "__unknown__" }) do
-		reset()
-		next_response_body = example_plan({ flags = { crash_profile = consent_policy.CRASH_MINIMAL } })
-		calls = run_example(nil, nil, nil, false, {
-			age_band = band ~= "__unknown__" and band or nil,
-			answer = true,
-		})
-		assert_true(calls:find("crash.init", 1, true) == nil,
-			"a " .. band .. " band keeps the crash lane shut under "
-				.. consent_policy.CRASH_MINIMAL .. ": " .. calls)
-		assert_true(calls:find("sdk.session_start", 1, true) == nil,
-			"and nothing analytics-side starts either: " .. calls)
 	end
 end
 
--- ⚠ TWO REQUESTS FOR THE SAME CONTEXT SHARE A GENERATION, so neither
--- supersedes the other and whichever answers LAST writes the cache. An older
--- permissive response landing after a newer restrictive one therefore reopened
--- what the newer one had just closed — purely by arriving second.
+-- Both responses are unused, but an older dispatch must retain its superseded
+-- reason instead of being treated as the current response.
 local function test_an_older_response_cannot_overwrite_a_newer_one()
 	reset()
 	-- A transport that holds every request until this scene releases it.
@@ -1421,18 +1265,17 @@ local function test_an_older_response_cannot_overwrite_a_newer_one()
 	http.request = saved_request
 
 	assert_equal(#second, 1, "the newer caller is answered exactly once")
-	assert_equal(second[1].regime, consent_policy.STRICT_OPT_IN, "and with its own plan")
+	assert_equal(second[1].regime, consent_policy.STRICT_OPT_IN, "with the local fallback")
 	assert_equal(#first, 1, "the older caller is answered exactly once, not dropped")
 	assert_equal(first[1].reason, "superseded", "and told why")
 	assert_equal(first[1].analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
 		"a superseded answer defaults off")
 
-	-- ⚠ AND THE CACHE KEEPS THE NEWER ANSWER. This is the whole point: the
-	-- older response must not reopen what the newer one closed.
+	-- A later prepare always makes a new request.
 	local served = prepare()
-	assert_equal(#requests, 2, "the third call must be served from the cache")
+	assert_equal(#requests, 3, "an unsigned response cannot populate a cache")
 	assert_equal(served.regime, consent_policy.STRICT_OPT_IN,
-		"an older permissive response overwrote the cache")
+		"the next response stays strict")
 end
 
 -- ⚠ AN ENCODER THAT RAISES IS NOT A STRICT DECISION, IT IS NO DECISION. The
@@ -1455,71 +1298,20 @@ local function test_an_encoder_failure_still_answers()
 			"and the choice defaults off")
 end
 
--- ⚠ A PERMISSIVE DECISION IS NEVER STORED, WHICH IS THE ONLY WAY "an offline
--- state can tighten but never relax" CAN BE TRUE. http.request being present
--- says nothing about connectivity and Defold offers no reliable online signal,
--- so there is no moment at which this module could know a stored permission is
--- still true. It is used for the call that fetched it and not kept.
-local function test_a_permissive_decision_is_never_served_twice()
-	-- (a) Permissive, then the transport is gone: STRICT, not the permission.
+
+local function test_unsigned_soft_cannot_authorize_an_offline_call()
 	reset()
 	next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT })
-	local first = prepare()
-	assert_equal(first.regime, consent_policy.SOFT_OPT_OUT, "the fixture must be permissive")
-	assert_equal(first.analytics_choice_default, consent_policy.CHOICE_DEFAULT_ON,
-		"and must default the choice on")
-
+	assert_unsigned(prepare(), "SOFT/null is unused")
 	local saved_http = http
 	http = nil
 	local offline, calls = prepare()
 	http = saved_http
-	assert_equal(calls, 1, "exactly one callback")
-	assert_equal(offline.reason, "transport_unavailable", "an outage answers strict")
-	assert_true(not offline.plan_used, "and reports no used plan")
-	assert_true(offline.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, "and closes optional processing")
-
-	-- (b) Permissive, then online: a SECOND REQUEST is made. The permission is
-	-- re-earned every time, or it is not served.
-	reset()
-	next_response_body = plan({ regime = consent_policy.SOFT_OPT_OUT })
-	prepare()
-	assert_equal(#requests, 1)
-	local second = prepare()
-	assert_equal(#requests, 2, "a permissive decision must be re-fetched, never reused")
-	assert_equal(second.regime, consent_policy.SOFT_OPT_OUT, "and the fresh one is delivered")
-
-	-- (c) Every axis counts, not just the regime. A STRICT plan that permits
-	-- the crash lane, or relaxes the child rules, has opened something — the
-	-- flags are orthogonal and none inherits an analytics permission.
-	--
-	-- server_analytics has only ONE value in the contract today ("denied"), so
-	-- there is no permissive spelling of it to test: any other value is an
-	-- unknown enum and therefore a REFUSAL, which is the row below.
-	-- child_rules has one value in the contract today, so there is no
-	-- permissive spelling of it to try: any other value is an unknown enum and
-	-- therefore a refusal, which test_every_plan_enum_is_closed holds down.
-	for _, override in ipairs({
-		{ flags = { crash_profile = consent_policy.CRASH_MINIMAL } },
-		{ regime = consent_policy.SOFT_OPT_OUT },
-	}) do
-		reset()
-		next_response_body = plan(override)
-		prepare()
-		prepare()
-		assert_equal(#requests, 2, "a plan that opens any lane must not be cached")
-	end
-
-	-- (d) THE CONTROL, and the half that must still work: a fully closed
-	-- decision IS cached, and survives the transport going away — reusing
-	-- "closed" can never open anything.
-	reset()
-	next_response_body = plan()
-	local strict_first = prepare()
-	assert_true(strict_first.plan_used, "the strict fixture must be used")
-	assert_equal(#requests, 1)
-	local served = prepare()
-	assert_equal(#requests, 1, "a strict decision is served from the cache")
-	assert_true(served.plan_used and served.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, "and is the closed answer")
+	assert_equal(calls, 1)
+	assert_equal(offline.reason, "transport_unavailable")
+	assert_true(not offline.plan_used)
+	assert_true(offline.operation_blocks == nil)
+	assert_equal(offline.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF)
 end
 
 -- ⚠ NO socket IS NOT A REASON TO BE PERMANENTLY STRICT. Returning nil made
@@ -1536,7 +1328,7 @@ local function test_the_clock_falls_back_to_os_time()
 	socket = saved_socket
 	assert_equal(calls, 1, "exactly one callback")
 	assert_equal(#requests, 1, "a target without socket must still reach the wire")
-	assert_true(decision.plan_used, "and use the plan: " .. tostring(decision.reason))
+	assert_unsigned(decision, "and use the plan: " .. tostring(decision.reason))
 
 	-- The control: with NEITHER clock the refusal stands, so the fallback did
 	-- not simply delete the rule.
@@ -1562,7 +1354,7 @@ local function test_an_empty_object_is_not_an_empty_list()
 			reset()
 			next_response_body = raw_field('"' .. name .. '"', spacing, { [name] = "__nil__" })
 			local decision = prepare()
-			assert_true(not decision.plan_used,
+			assert_equal(decision.reason, "invalid_response",
 				name .. " as a JSON object must not be used (" .. spacing .. ")")
 			assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
 			"and the choice defaults off")
@@ -1573,7 +1365,7 @@ local function test_an_empty_object_is_not_an_empty_list()
 	-- would be refusing the resolver's own output.
 	reset()
 	next_response_body = plan({ flags = { operation_blocks = {} }, signals_used = {} })
-	assert_true(prepare().plan_used, "empty arrays must still parse")
+	assert_unsigned(prepare(), "empty arrays must still parse")
 
 	-- ⚠ AND THE ONE INSIDE flags, which the top-level scan never sees. The
 	-- contract moved operation_blocks in there, so it is checked by the flags
@@ -1582,7 +1374,7 @@ local function test_an_empty_object_is_not_an_empty_list()
 	local body = plan()
 	next_response_body = body:gsub('"operation_blocks":%[%]', '"operation_blocks":{}', 1)
 	local blocks = prepare()
-	assert_true(not blocks.plan_used, "operation_blocks as an object must not read as no blocks")
+	assert_equal(blocks.reason, "invalid_response", "operation_blocks as an object must not read as no blocks")
 	-- ⚠ THE REASON IS THE ASSERTION. The walk refuses a malformed object one
 	-- way or another; what the explicit check adds is SAYING WHICH FIELD, and
 	-- a refusal that cannot name the field is the one an integrator cannot act
@@ -1597,95 +1389,12 @@ end
 local function test_an_offset_needs_its_colon()
 	reset()
 	next_response_body = plan({ expires_at = "2099-01-01T00:00:00+0200" })
-	assert_true(not prepare().plan_used, '"+0200" is not an RFC 3339 offset')
+	assert_equal(prepare().reason, "invalid_response", '"+0200" is not an RFC 3339 offset')
 	reset()
 	next_response_body = plan({ expires_at = "2099-01-01T00:00:00+02:00" })
-	assert_true(prepare().plan_used, '"+02:00" is')
+	assert_unsigned(prepare(), '"+02:00" is')
 end
 
--- ⚠ THE DECISION THAT OPENED THE NOTICE IS NOT THE ONE TO ACT ON. The player
--- was reading the screen; the plan may have expired or the policy may have
--- been revoked meanwhile, and acting on the captured decision starts a lane on
--- a verdict that is no longer true.
-local function test_the_example_re_resolves_after_the_answer()
-	reset()
-	-- The optional lane must be OPEN, or no notice is presented and there is
-	-- no answer to be stale about. The plan carries the NORMAL cache lifetime:
-	-- the re-resolution has to reach the resolver on its own merits, which it
-	-- only does because the example invalidates first. An earlier version of
-	-- this scene used max_age_seconds = 0 and so could not tell a real
-	-- re-resolution from a cache entry that had simply never been written.
-	next_response_body = example_plan({
-		regime = consent_policy.SOFT_OPT_OUT,
-		flags = { crash_profile = consent_policy.CRASH_MINIMAL },
-	})
-	local calls = run_example(function()
-		-- While the notice is on screen the policy changes: the crash lane closes.
-		next_response_body = example_plan({
-			regime = consent_policy.SOFT_OPT_OUT,
-			flags = { crash_profile = consent_policy.CRASH_OFF },
-		})
-	end, nil, nil, false, { age_band = "adult", answer = true })
-	assert_equal(#requests, 2, "the answer must be followed by a real request, not a cache hit")
-	assert_true(calls:find("crash.init", 1, true) == nil,
-		"the example acted on the stale decision and opened a lane the fresh one closes: " .. calls)
-end
-
--- ⚠ RESUME IS A NAMED RE-RESOLUTION TRIGGER, and one that cannot CLOSE
--- anything is not one. An app can sit in the background for days.
-local function test_the_example_closes_lanes_on_resume()
-	local function open_plan()
-		return example_plan({
-			regime = consent_policy.SOFT_OPT_OUT, flags = { crash_profile = consent_policy.CRASH_MINIMAL },
-		})
-	end
-
-	-- The control: with the policy unchanged, a resume closes nothing.
-	reset()
-	next_response_body = open_plan()
-	local calls = run_example(nil, { "focus_gained" }, nil, false, { age_band = "adult" })
-	assert_true(calls:find("sdk.init", 1, true) ~= nil and calls:find("crash.init", 1, true) ~= nil,
-		"both lanes must be open, or this scene proves nothing: " .. calls)
-	-- The placeholder notice declines, so set_consent:false appears either way;
-	-- what only a CLOSURE produces is the suspension lines.
-	assert_true(calls:find("suspended", 1, true) == nil,
-		"an unchanged policy must not close anything on resume: " .. calls)
-
-	-- Now the policy closes both lanes while the app is backgrounded. The
-	-- resume resolution is the SECOND request: launch is the first, and the
-	-- one after the player's answer is a private cache hit.
-	reset()
-	next_response_body = open_plan()
-	local resumed = false
-	local saved_request = http.request
-	http.request = function(url, method, callback, headers, body, options)
-		requests[#requests + 1] = { url = url }
-		-- Launch is 1, the post-notice re-resolution is 2, the resume is 3.
-		if #requests >= 3 then
-			next_response_body = example_plan({
-				regime = consent_policy.STRICT_OPT_IN, flags = { crash_profile = consent_policy.CRASH_OFF },
-			})
-			resumed = true
-		end
-		callback(nil, nil, { status = 200, response = next_response_body })
-	end
-	calls = run_example(nil, { "focus_gained" }, nil, false, { age_band = "adult" })
-	http.request = saved_request
-	assert_true(resumed, "resume must re-resolve rather than answer from the cache")
-	assert_true(calls:find("analytics suspended (explicit_grant_now_required)", 1, true) ~= nil,
-		"a regime that now requires an explicit grant must stop a lane opened without one: " .. calls)
-	assert_true(calls:find("crash reporting suspended (crash_profile_off)", 1, true) ~= nil,
-		"resume must stop the crash lane the new decision closes: " .. calls)
-	-- ⚠ AND IT MUST NOT WRITE A PLAYER DECISION. set_consent(false) records and
-	-- persists an explicit denial and queues its receipt; crash.set_enabled
-	-- persists an opt_out that outlives the launch. Nobody chose anything here
-	-- — the policy changed. The only set_consent in this run is the one the
-	-- placeholder notice produced, before the resume.
-	assert_true(calls:find("crash.set_enabled", 1, true) == nil,
-		"a policy closure must not persist a crash opt-out: " .. calls)
-	assert_true(calls:find("sdk.shutdown", 1, true) ~= nil and calls:find("crash.shutdown", 1, true) ~= nil,
-		"suspension is a shutdown, which writes no choice: " .. calls)
-end
 
 -- ⚠ A LITERAL SEARCH FOR THE KEY NAME IS BYPASSED BY ONE ESCAPE.
 -- "operation_blocks" decodes to the same key, json.decode restores it,
@@ -1704,14 +1413,14 @@ local function test_an_escaped_key_cannot_hide_an_object()
 		reset()
 		next_response_body = raw_field(spelling, "{}", { [name] = "__nil__" })
 		local decision = prepare()
-		assert_true(not decision.plan_used,
+		assert_equal(decision.reason, "invalid_response",
 			name .. " spelled with an escape must not hide an object: " .. tostring(decision.reason))
 
 		-- The control: the SAME escaped spelling with an ARRAY still parses,
 		-- so the rule is about the container and not about the escape.
 		reset()
 		next_response_body = raw_field(spelling, "[]", { [name] = "__nil__" })
-		assert_true(prepare().plan_used, name .. " spelled with an escape must still parse as a list")
+		assert_unsigned(prepare(), name .. " spelled with an escape must still parse as a list")
 	end
 
 	-- ⚠ AND A NESTED KEY OF THE SAME NAME IS NOT THE TOP-LEVEL ONE. The scan
@@ -1726,7 +1435,7 @@ local function test_an_escaped_key_cannot_hide_an_object()
 	-- as "scope carries an unknown key", never as "operation_blocks is a JSON
 	-- object where the schema says a list". A scan that matched the name
 	-- anywhere in the document would give the second answer.
-	assert_true(not nested.plan_used, "an unknown key inside scope is refused")
+	assert_equal(nested.reason, "invalid_response", "an unknown key inside scope is refused")
 	assert_true(nested.detail ~= nil and nested.detail:find("scope carries an unknown key", 1, true) ~= nil,
 		"it must be refused as a scope member, not as a top-level list shape: "
 			.. tostring(nested.detail))
@@ -1738,194 +1447,20 @@ end
 local function test_second_sixty_is_refused()
 	reset()
 	next_response_body = plan({ expires_at = "2099-01-01T00:00:60Z" })
-	assert_true(not prepare().plan_used, "second 60 must not be normalised into the next minute")
+	assert_equal(prepare().reason, "invalid_response", "second 60 must not be normalised into the next minute")
 	reset()
 	next_response_body = plan({ expires_at = "2099-01-01T00:00:59Z" })
-	assert_true(prepare().plan_used, "second 59 is still a second")
+	assert_unsigned(prepare(), "second 59 is still a second")
 end
 
--- ⚠ CACHE EXPIRY PROTECTS THE NEXT LOOKUP AND STOPS NOTHING THAT IS RUNNING.
--- A lane opened on a permissive plan would otherwise stay open indefinitely
--- while the app is foregrounded, until an unrelated trigger happened to fire.
-local function test_the_example_revalidates_at_the_plans_deadline()
-	reset()
-	next_response_body = example_plan({
-		regime = consent_policy.SOFT_OPT_OUT, flags = { crash_profile = consent_policy.CRASH_MINIMAL },
-		max_age_seconds = 2,
-	})
-	local swapped = false
-	local saved_request = http.request
-	http.request = function(url, method, callback, headers, body, options)
-		requests[#requests + 1] = { url = url }
-		-- Launch is 1, the post-notice re-resolution is 2, the deadline is 3.
-		if #requests >= 3 then
-			next_response_body = example_plan({
-				regime = consent_policy.STRICT_OPT_IN, flags = { crash_profile = consent_policy.CRASH_OFF },
-			})
-			swapped = true
-		end
-		callback(nil, nil, { status = 200, response = next_response_body })
-	end
-	-- Three seconds of frames, past the two-second plan.
-	local calls = run_example(nil, nil, { 1, 1, 1 }, false, { age_band = "adult" })
-	http.request = saved_request
-	assert_true(swapped, "the deadline must re-resolve rather than answer from the cache")
-	-- ⚠ SUSPENDED FIRST, then replaced. A lane whose plan has run out does not
-	-- keep running while the replacement is fetched.
-	assert_true(calls:find("analytics suspended (plan_expired)", 1, true) ~= nil,
-		"the analytics lane must stop when its plan expires: " .. calls)
-	assert_true(calls:find("crash reporting suspended (plan_expired)", 1, true) ~= nil,
-		"the crash lane must stop when its plan expires: " .. calls)
 
-	-- The control: inside the plan's life, nothing is suspended.
-	reset()
-	next_response_body = example_plan({
-		regime = consent_policy.SOFT_OPT_OUT, flags = { crash_profile = consent_policy.CRASH_MINIMAL },
-		max_age_seconds = 300,
-	})
-	calls = run_example(nil, nil, { 1, 1, 1 }, false, { age_band = "adult" })
-	assert_true(calls:find("suspended", 1, true) == nil,
-		"a live plan must not be revalidated out from under its lanes: " .. calls)
-end
 
--- ⚠ A GRANT BELONGS TO THE NOTICE THE PLAYER SAW. A new plan with a different
--- consent_text_version or presented_language means the running grant was given
--- against text nobody read, so processing stops and the notice is presented
--- again — closing on the policy's authority, reopening on the player's.
-local function test_the_example_re_presents_when_the_notice_text_changes()
-	for _, changed in ipairs({
-		{ consent_text_version = "ff-v2.0" },
-		{ presented_language = "de" },
-	}) do
-		reset()
-		next_response_body = example_plan({
-			regime = consent_policy.SOFT_OPT_OUT, flags = { crash_profile = consent_policy.CRASH_MINIMAL },
-		})
-		local saved_request = http.request
-		http.request = function(url, method, callback, headers, body, options)
-			requests[#requests + 1] = { url = url }
-			if #requests >= 3 then
-				local overrides = {
-					regime = consent_policy.SOFT_OPT_OUT,
-					flags = { crash_profile = consent_policy.CRASH_MINIMAL },
-				}
-				for key, value in pairs(changed) do
-					overrides[key] = value
-				end
-				next_response_body = example_plan(overrides)
-			end
-			callback(nil, nil, { status = 200, response = next_response_body })
-		end
-		local calls = run_example(nil, { "focus_gained" }, { 0, 0 }, false, { age_band = "adult" })
-		http.request = saved_request
-		assert_true(calls:find("analytics suspended (consent_text_changed)", 1, true) ~= nil,
-			"a changed notice text must suspend the running grant: " .. calls)
-		-- ⚠ AND THE CRASH LANE GOES WITH IT. A reporter left running under text
-		-- nobody saw is the same defect as an analytics client left running
-		-- under it.
-		assert_true(calls:find("crash reporting suspended (consent_text_changed)", 1, true) ~= nil,
-			"a changed notice text must suspend the crash lane too: " .. calls)
-		-- And it comes back only through a NEW answer: two init calls, because
-		-- the notice was presented a second time.
-		local inits = 0
-		for _ in calls:gmatch("sdk%.init") do
-			inits = inits + 1
-		end
-		assert_equal(inits, 2, "the notice must be presented again and the lane restarted: " .. calls)
-	end
-end
-
--- ⚠ A VERDICT SAYS HOW LONG IT IS GOOD FOR, because cache expiry protects the
--- next lookup and stops nothing that is already running. Without this the host
--- cannot schedule the revalidation that closes a lane whose plan has run out.
-local function test_a_verdict_carries_its_validity_window()
-	reset()
-	next_response_body = plan({ max_age_seconds = 7 })
-	local fresh = prepare()
-	assert_equal(fresh.valid_for_seconds, 7, "a fresh verdict must carry the shortest of its bounds")
-
-	local served = prepare()
-	assert_equal(#requests, 1, "the second call is a cache hit")
-	assert_true(served.valid_for_seconds ~= nil and served.valid_for_seconds < 7,
-		"a cache hit must count DOWN rather than restate the original window: "
-			.. tostring(served.valid_for_seconds))
-
-	-- A fallback established nothing that could expire, so it schedules nothing.
-	reset()
-	next_status = 500
-	next_response_body = encode_value({ reason = "policy_unavailable" })
-	assert_true(prepare().valid_for_seconds == nil, "a fallback carries no validity window")
-end
-
--- ⚠ shutdown() CAN SAY "NOT YET", AND THE STATE HAS TO SURVIVE THAT. A crash
--- POST in flight makes shutdown return false, "pending"; clearing the flag
--- anyway loses the retry — final() skips it, and a later start would
--- initialise over a client that never finished.
--- THE EXAMPLE FORWARDS ITS WINDOW EVENTS TO THE SDK. Its listener used to call
--- persist() on a background signal and nothing on a foreground one, so a host
--- copying it never paused a session or resumed one, and the automatic session
--- boundary never ran.
-local function test_example_forwards_window_events()
-	reset()
-	next_response_body = example_plan()
-	local calls = run_example(nil, { "focus_lost", "focus_gained" }, nil, false, { age_band = "adult" })
-	assert_true(calls:find("sdk.on_window_event:focus_lost", 1, true) ~= nil,
-		"a background signal reaches the SDK: " .. calls)
-	assert_true(calls:find("sdk.on_window_event:focus_gained", 1, true) ~= nil,
-		"and so does the foreground one: " .. calls)
-end
-
-local function test_a_pending_crash_shutdown_keeps_its_state()
-	reset()
-	crash_shutdown_pending = 1
-	next_response_body = example_plan({
-		regime = consent_policy.SOFT_OPT_OUT, flags = { crash_profile = consent_policy.CRASH_MINIMAL },
-	})
-	local saved_request = http.request
-	http.request = function(url, method, callback, headers, body, options)
-		requests[#requests + 1] = { url = url }
-		if #requests >= 3 then
-			next_response_body = example_plan({
-				regime = consent_policy.SOFT_OPT_OUT, flags = { crash_profile = consent_policy.CRASH_OFF },
-			})
-		end
-		callback(nil, nil, { status = 200, response = next_response_body })
-	end
-	-- Resume closes the crash lane; its shutdown comes back pending once, and
-	-- final() is what retries it.
-	local calls = run_example(nil, { "focus_gained" }, nil, true, { age_band = "adult" })
-	http.request = saved_request
-	assert_true(calls:find("crash.shutdown:pending", 1, true) ~= nil,
-		"the fixture must exercise a pending shutdown: " .. calls)
-	assert_true(calls:find("crash reporting suspended", 1, true) == nil,
-		"a pending shutdown is not a completed one: " .. calls)
-	-- final() retried it, and this time it completed. Counted over the exact
-	-- tokens, so "crash.shutdown:pending" is not mistaken for a completion.
-	local pending, completed = 0, 0
-	for token in (calls .. " | "):gmatch("(.-) | ") do
-		if token == "crash.shutdown:pending" then
-			pending = pending + 1
-		elseif token == "crash.shutdown" then
-			completed = completed + 1
-		end
-	end
-	assert_equal(pending, 1, "one pending attempt: " .. calls)
-	assert_equal(completed, 1, "final() must retry the pending shutdown until it completes: " .. calls)
-end
-
--- ⚠ THE SIGNATURE IS THE ONE NULLABLE KEY, AND IT IS NULLABLE BY CONTRACT.
--- The resolver sends `"signature": null` on EVERY response in this release, so
--- present-and-null is the unsigned state and the only admissible one. A
--- present, NON-null signature is one this build cannot verify, and an
--- unverifiable signature must not admit or the field's arrival becomes a
--- downgrade.
---
--- Until the contract migration this module refused the null too — which meant it refused every
--- real response the resolver sends.
+-- Present-null has valid unsigned syntax. Neither it nor an absent or
+-- non-null signature supplies authentication or plan authority.
 local function test_the_signature_is_present_and_null_or_refused()
 	reset()
 	next_response_body = raw_field('"signature"', "null")
-	assert_true(prepare().plan_used, "a null signature is the unsigned state")
+	assert_unsigned(prepare(), "a null signature is the unsigned state")
 
 	-- ⚠ AND ABSENT IS NOT THE SAME STATE. This scene asserted that it was,
 	-- until the required-key roster: the contract sends `"signature": null` on
@@ -1936,7 +1471,7 @@ local function test_the_signature_is_present_and_null_or_refused()
 	reset()
 	next_response_body = plan({ signature = "__nil__" })
 	local absent = prepare()
-	assert_true(not absent.plan_used, "an absent signature must not be used")
+	assert_equal(absent.reason, "invalid_response", "an absent signature must not be used")
 	assert_true(absent.detail:find("missing the required key signature", 1, true) ~= nil,
 		"and the reason must name the key: " .. tostring(absent.detail))
 
@@ -1944,7 +1479,7 @@ local function test_the_signature_is_present_and_null_or_refused()
 		reset()
 		next_response_body = raw_field('"signature"', forged)
 		local decision = prepare()
-		assert_true(not decision.plan_used,
+		assert_equal(decision.reason, "invalid_response",
 			"a present signature must not be used: " .. forged)
 		assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
 			"and the choice defaults off")
@@ -1981,46 +1516,6 @@ local function test_a_clock_rollback_during_the_request_is_refused()
 	assert_equal(#requests, 2, "a refused response must not have been cached")
 end
 
--- ⚠ A STRICT FALLBACK IS NOT A NOTICE CHANGE. A fallback carries no
--- consent_text_version at all, so comparing the standing answer against one
--- read every outage as "the text changed" and threw away an answer the player
--- really did give — meaning the next good plan asked them again for no reason.
--- A fallback CLOSES; it does not erase.
-local function test_a_fallback_does_not_erase_the_standing_answer()
-	reset()
-	-- STRICT with an explicit grant: the basis a fallback can carry forward.
-	-- (A non-objection cannot — a fallback is the strict regime, and
-	-- test_the_published_example_branches_on_the_decision holds that down.)
-	next_response_body = example_plan()
-	local saved_request = http.request
-	http.request = function(url, method, callback, headers, body, options)
-		requests[#requests + 1] = { url = url }
-		if #requests == 3 then
-			-- The resume resolution fails: a fallback, carrying no plan.
-			callback(nil, nil, { status = 500, response = encode_value({ reason = "policy_unavailable" }) })
-			return
-		end
-		callback(nil, nil, { status = 200, response = next_response_body })
-	end
-	local calls = run_example(nil, { "focus_gained", "focus_gained" }, nil, false,
-		{ age_band = "adult", answer = true })
-	http.request = saved_request
-
-	assert_true(calls:find("strict fallback", 1, true) ~= nil,
-		"the fixture must produce a fallback: " .. calls)
-	assert_true(calls:find("consent_text_changed", 1, true) == nil,
-		"an outage is not a notice change: " .. calls)
-	assert_true(calls:find("explicit_grant_now_required", 1, true) == nil,
-		"and an EXPLICIT grant survives a fallback: " .. calls)
-
-	-- The answer survived: exactly one consent write across the whole run, so
-	-- the player was never asked a second time.
-	local writes = 0
-	for _ in calls:gmatch("sdk%.set_consent") do
-		writes = writes + 1
-	end
-	assert_equal(writes, 1, "the standing answer must survive an outage: " .. calls)
-end
 
 -- ⚠ NO FIELD IN THIS SCHEMA IS NULLABLE, AND THAT IS ONE RULE. Lua has no
 -- null, so every present-and-null key decodes to exactly the nil an absent key
@@ -2042,7 +1537,7 @@ local function test_no_schema_field_is_nullable()
 		reset()
 		next_response_body = raw_field('"' .. name .. '"', "null", { [name] = "__nil__" })
 		local decision = prepare()
-		assert_true(not decision.plan_used, name .. " present and null must not be used")
+		assert_equal(decision.reason, "invalid_response", name .. " present and null must not be used")
 		assert_true(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, name .. " must close optional processing")
 	end
 
@@ -2050,13 +1545,13 @@ local function test_no_schema_field_is_nullable()
 	-- signature is the UNSIGNED state and must parse.
 	reset()
 	next_response_body = raw_field('"signature"', "null")
-	assert_true(prepare().plan_used, "a null signature is the unsigned state and must be used")
+	assert_unsigned(prepare(), "a null signature is unsigned and must reach the authentication refusal")
 
 	-- The control: the same plan with every key carrying a real value parses,
 	-- so the rule is about null rather than about the roster.
 	reset()
 	next_response_body = plan({ flags = { operation_blocks = { "transfer_review" } } })
-	assert_true(prepare().plan_used, "a plan with every schema field populated must parse")
+	assert_unsigned(prepare(), "a plan with every schema field populated must parse")
 end
 
 -- ⚠ AND A null ELEMENT INSIDE A LIST. Lua drops it: the decoded array comes
@@ -2066,18 +1561,18 @@ end
 local function test_a_null_list_entry_is_refused()
 	reset()
 	next_response_body = raw_field('"signals_used"', '["a",null,"b"]', { signals_used = "__nil__" })
-	assert_true(not prepare().plan_used, "signals_used with a null entry must not be used")
+	assert_equal(prepare().reason, "invalid_response", "signals_used with a null entry must not be used")
 
 	-- ⚠ AND THE ONE INSIDE flags, which the top-level walk never reaches.
 	reset()
 	local body = plan({ flags = { operation_blocks = { "transfer_review" } } })
 	next_response_body = body:gsub('"transfer_review"', '"transfer_review",null', 1)
-	assert_true(not prepare().plan_used, "operation_blocks with a null entry must not be used")
+	assert_equal(prepare().reason, "invalid_response", "operation_blocks with a null entry must not be used")
 
 	-- The control: the same lists without the null still parse.
 	reset()
 	next_response_body = plan({ flags = { operation_blocks = { "transfer_review", "age_capacity" } } })
-	assert_true(prepare().plan_used, "a dense list must still parse")
+	assert_unsigned(prepare(), "a dense list must still parse")
 end
 
 
@@ -2108,60 +1603,6 @@ local function test_an_error_envelope_keeps_its_reason()
 	end
 end
 
--- ⚠ init AND set_consent BOTH RETURN false, err, AND THE EXAMPLE IGNORED BOTH.
--- A lane marked running on a client that was never built is one final() will
--- try to shut down; a session started on a grant that was never recorded is
--- the exact ordering the consent outbox exists to prevent.
-local function test_the_example_notices_a_failed_write()
-	-- (a) A failed init must not mark the lane running.
-	reset()
-	sdk_init_failures = 1
-	next_response_body = example_plan()
-	local calls = run_example(nil, nil, nil, true, { age_band = "adult", answer = true })
-	assert_true(calls:find("init failed", 1, true) ~= nil, "the fixture must fail init: " .. calls)
-	assert_true(calls:find("sdk.set_consent", 1, true) == nil,
-		"a failed init must not be followed by a consent write: " .. calls)
-	assert_true(calls:find("sdk.shutdown", 1, true) == nil,
-		"and final() must not shut down a client that was never built: " .. calls)
-
-	-- (b) A refused consent write is REPORTED AND OWED — and the quick start
-	-- deliberately does not retry it. Four consecutive rounds found a defect in
-	-- the retry machinery this file used to carry; the obligation is now a
-	-- README host requirement, and what the example must do is NOT pretend the
-	-- write landed.
-	reset()
-	sdk_consent_refusals = 1
-	next_response_body = example_plan()
-	calls = run_example(nil, { "focus_gained" }, nil, false, { age_band = "adult", answer = true })
-	assert_true(calls:find("consent not recorded", 1, true) ~= nil,
-		"a refused write must be reported: " .. calls)
-	assert_true(calls:find("sdk.session_start", 1, true) == nil,
-		"and no session may start on a grant that was never recorded: " .. calls)
-end
-
--- ⚠ A VERDICT WITH NO LIFE IS NOT RUNNABLE, and scheduling by it directly is a
--- spin: max_age_seconds = 0 makes valid_for_seconds 0, so the example
--- re-resolved every single frame — a flood against the resolver dressed up as
--- diligence.
-local function test_a_zero_window_does_not_spin()
-	reset()
-	next_response_body = example_plan({ max_age_seconds = 0 })
-	-- Ten seconds of frames. The floor is thirty, so nothing may re-resolve.
-	local calls = run_example(nil, nil, { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, false,
-		{ age_band = "adult", answer = true })
-	assert_true(#requests <= 2, "a zero window must not re-resolve per frame: " .. #requests .. " requests")
-	assert_true(calls:find("no validity window; no lane started", 1, true) ~= nil,
-		"a verdict with no life must say so: " .. calls)
-	assert_true(calls:find("sdk.init", 1, true) == nil and calls:find("crash.init", 1, true) == nil,
-		"and must run no lane at all: " .. calls)
-
-	-- The control: the same plan with a real window DOES run, so the rule is
-	-- about the zero and not about the example refusing everything.
-	reset()
-	next_response_body = example_plan({ max_age_seconds = 300 })
-	calls = run_example(nil, nil, { 1, 1, 1 }, false, { age_band = "adult", answer = true })
-	assert_true(calls:find("sdk.init", 1, true) ~= nil, "a live window must run the lane: " .. calls)
-end
 
 -- ⚠ A DUPLICATE KEY IS AMBIGUOUS AT EVERY DEPTH. The root walk refused them
 -- and the nested walk skipped values whole, so a scope carrying workspace_key
@@ -2183,7 +1624,7 @@ local function test_nested_duplicate_keys_are_refused()
 		next_response_body = body:gsub(case[3]:gsub("%p", "%%%0"), case[3] .. case[2], 1)
 		assert_true(next_response_body ~= body, "the fixture must carry " .. case[1])
 		local decision = prepare()
-		assert_true(not decision.plan_used,
+		assert_equal(decision.reason, "invalid_response",
 			"a duplicate key inside " .. case[1] .. " must not be used: " .. tostring(decision.reason))
 	end
 
@@ -2191,7 +1632,7 @@ local function test_nested_duplicate_keys_are_refused()
 	-- spelled once each.
 	reset()
 	next_response_body = golden("resolved")
-	assert_true(prepare(golden_context()).plan_used, "well-formed nested objects must parse")
+	assert_unsigned(prepare(golden_context()), "well-formed nested objects must parse")
 end
 
 -- ⚠ THE CALLER'S FIELD NAMES ARE A CLOSED SET TOO, and the shape this takes in
@@ -2220,10 +1661,10 @@ local function test_an_unknown_context_field_is_refused()
 	-- ⚠ THE VOCABULARY MUST BE THE ONE THE RESOLVER NAMES. The contract has no
 	-- echo of the band, so a caller's vocabulary is checked against
 	-- band_vocabulary instead — "coarse" here, as the resolver sends.
-	assert_true(prepare(context({
+	assert_unsigned(prepare(context({
 		store = "steam",
 		age_band = { vocabulary = "coarse", band = "adult" },
-	})).plan_used, "a context using every optional field must be accepted")
+	})), "a context using every optional field must parse")
 end
 
 -- ⚠ THE NULLABILITY RULE HAS TO REACH INSIDE THE LIST, NOT STOP AT ITS NAME.
@@ -2255,7 +1696,7 @@ local function test_a_null_field_inside_a_signal_is_refused()
 		reset()
 		next_response_body = raw_field('"signals_used"', case[2], { signals_used = "__nil__" })
 		local decision = prepare()
-		assert_true(not decision.plan_used,
+		assert_equal(decision.reason, "invalid_response",
 			case[1] .. " must not be used: " .. tostring(decision.reason))
 		assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
 			"and the choice defaults off")
@@ -2266,13 +1707,13 @@ local function test_a_null_field_inside_a_signal_is_refused()
 	-- ones with reasons.
 	reset()
 	next_response_body = plan({ signals_used = { { name = "server_country", available = true } } })
-	assert_true(prepare().plan_used, "an available signal that mentions no reason must parse")
+	assert_unsigned(prepare(), "an available signal that mentions no reason must parse")
 	reset()
 	next_response_body = plan({ signals_used = {
 		{ name = "server_country", available = false, reason = "source_unavailable" },
 		{ name = "store_region", available = false, reason = "source_not_permitted" },
 	} })
-	assert_true(prepare().plan_used, "well-formed signal entries must parse")
+	assert_unsigned(prepare(), "well-formed signal entries must parse")
 end
 
 -- ⚠ A reason IS CHECKED WHEREVER IT APPEARS. The closed vocabulary was
@@ -2288,7 +1729,7 @@ local function test_a_signal_reason_is_always_from_the_vocabulary()
 	}) do
 		reset()
 		next_response_body = plan({ signals_used = { signal } })
-		assert_true(not prepare().plan_used, "a reason outside the vocabulary must not be used")
+		assert_equal(prepare().reason, "invalid_response", "a reason outside the vocabulary must not be used")
 	end
 
 	-- The controls: every member of the vocabulary parses on an available
@@ -2300,12 +1741,12 @@ local function test_a_signal_reason_is_always_from_the_vocabulary()
 			next_response_body = plan({
 				signals_used = { { name = "server_country", available = available, reason = reason } },
 			})
-			assert_true(prepare().plan_used, reason .. " must parse (available=" .. tostring(available) .. ")")
+			assert_unsigned(prepare(), reason .. " must parse (available=" .. tostring(available) .. ")")
 		end
 	end
 	reset()
 	next_response_body = plan({ signals_used = { { name = "server_country", available = true } } })
-	assert_true(prepare().plan_used, "an available signal may mention no reason")
+	assert_unsigned(prepare(), "an available signal may mention no reason")
 end
 
 
@@ -2356,37 +1797,11 @@ local function test_the_context_age_bands_keys_are_closed()
 	-- the wire.
 	reset()
 	next_response_body = plan()
-	assert_true(prepare(context({ age_band = { vocabulary = "coarse", band = "adult" } })).plan_used,
+	assert_unsigned(prepare(context({ age_band = { vocabulary = "coarse", band = "adult" } })),
 		"a well-formed context age_band must be accepted")
 	assert_equal(#requests, 1, "and must reach the wire")
 end
 
--- ⚠ identify CAN REFUSE, and the example ignored it. Under Mode B a switch
--- while the previous identity still has undelivered events returns
--- false, "events_pending" — recording a consent decision after that would
--- attach it to an identity the client did not accept.
-local function test_the_example_stops_when_identify_refuses()
-	reset()
-	sdk_identify_refusals = 1
-	next_response_body = example_plan()
-	local calls = run_example(nil, nil, nil, true, { age_band = "adult", answer = true })
-	assert_true(calls:find("identify refused", 1, true) ~= nil,
-		"the fixture must refuse identify: " .. calls)
-	assert_true(calls:find("sdk.set_consent", 1, true) == nil,
-		"no consent may be recorded for an identity the client refused: " .. calls)
-	assert_true(calls:find("sdk.session_start", 1, true) == nil,
-		"and no session may start: " .. calls)
-	-- The client WAS built, so teardown still owes it a shutdown.
-	assert_true(calls:find("sdk.shutdown", 1, true) ~= nil,
-		"an initialised client must still be shut down: " .. calls)
-
-	-- The control: with identify accepted, the same run records consent.
-	reset()
-	next_response_body = example_plan()
-	calls = run_example(nil, nil, nil, true, { age_band = "adult", answer = true })
-	assert_true(calls:find("sdk.set_consent", 1, true) ~= nil,
-		"an accepted identify must reach the consent write: " .. calls)
-end
 
 -- ⚠ EVERY OBJECT IN THE SCHEMA HAS AN EXACT KEY SET. The root was closed
 -- first, then age_band, then the context's age_band — the same finding
@@ -2438,7 +1853,7 @@ local function test_every_schema_object_has_a_closed_key_set()
 			reset()
 			next_response_body = object.build(raw)
 			local decision = prepare()
-			assert_true(not decision.plan_used,
+			assert_equal(decision.reason, "invalid_response",
 				"an unknown key in " .. object.what .. " (" .. raw .. ") must not be used: "
 					.. tostring(decision.reason))
 			assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
@@ -2450,7 +1865,7 @@ local function test_every_schema_object_has_a_closed_key_set()
 	-- exactly its own members, which must parse.
 	reset()
 	next_response_body = golden("resolved")
-	assert_true(prepare(golden_context()).plan_used, "the resolver's own response must parse")
+	assert_unsigned(prepare(golden_context()), "the resolver's own response must parse")
 end
 
 -- ⚠ "-00:00" IS NOT ZERO, IT IS "OFFSET UNKNOWN" (RFC 3339). An expiry
@@ -2460,14 +1875,14 @@ end
 local function test_an_unknown_offset_is_refused()
 	reset()
 	next_response_body = plan({ expires_at = "2099-01-01T00:00:00-00:00" })
-	assert_true(not prepare().plan_used, '"-00:00" is not an offset this build can place')
+	assert_equal(prepare().reason, "invalid_response", '"-00:00" is not an offset this build can place')
 	-- The controls: "+00:00" IS zero, and "Z" is the usual spelling of it.
 	reset()
 	next_response_body = plan({ expires_at = "2099-01-01T00:00:00+00:00" })
-	assert_true(prepare().plan_used, '"+00:00" is a stated offset of zero')
+	assert_unsigned(prepare(), '"+00:00" is a stated offset of zero')
 	reset()
 	next_response_body = plan({ expires_at = "2099-01-01T00:00:00Z" })
-	assert_true(prepare().plan_used, '"Z" is still UTC')
+	assert_unsigned(prepare(), '"Z" is still UTC')
 end
 
 -- ⚠ parse_plan IS PRIVATE. The public surface is prepare() and invalidate().
@@ -2488,57 +1903,6 @@ local function test_the_public_surface_is_prepare_and_invalidate()
 		"the exported functions are the contract; parse_plan is not one of them")
 end
 
--- ⚠ TWO DEBTS THE EXAMPLE USED TO DROP. An identity the client refused was
--- reported and forgotten, so the consent write it blocks never happened again;
--- and a RESTORED grant re-initialised the client without starting a session,
--- leaving the lane open with nothing behind it.
-local function test_the_example_pays_its_debts()
-	-- ⚠ WHAT THE QUICK START OWES IS HONESTY, NOT A RETRY. The Mode B
-	-- identify-retry machinery this file used to carry drew a finding in four
-	-- consecutive rounds; it is out, and the obligations are README host
-	-- requirements. What the example must still get right is never pretending a
-	-- refused write landed, and never building a second client over the first.
-	reset()
-	sdk_identify_refusals = 1
-	next_response_body = example_plan()
-	local calls = run_example(nil, { "focus_gained" }, nil, false,
-		{ age_band = "adult", answer = true })
-	assert_true(calls:find("identify refused", 1, true) ~= nil,
-		"the fixture must refuse identify: " .. calls)
-	assert_true(calls:find("sdk.set_consent", 1, true) == nil,
-		"no consent may be recorded for an identity the client refused: " .. calls)
-	assert_true(calls:find("sdk.session_start", 1, true) == nil,
-		"and nothing starts on it either — not the session: " .. calls)
-	assert_true(calls:find("sdk.fetch_remote_config", 1, true) == nil,
-		"and not the remote-config fetch behind it: " .. calls)
-	local inits = 0
-	for _ in calls:gmatch("sdk%.init") do
-		inits = inits + 1
-	end
-	assert_equal(inits, 1, "and no second client may be built over the first: " .. calls)
-
-	-- (b) A restored grant starts a session and writes no consent. The plan's
-	-- life runs out, the lane is suspended and restarted from the standing
-	-- answer; exactly one consent write across the run.
-	reset()
-	next_response_body = example_plan({ max_age_seconds = 2 })
-	calls = run_example(nil, nil, { 1, 1, 1 }, false, { age_band = "adult", answer = true })
-	assert_true(calls:find("analytics suspended (plan_expired)", 1, true) ~= nil,
-		"the fixture must exercise a restore: " .. calls)
-	local restarts, writes, starts = 0, 0, 0
-	for _ in calls:gmatch("sdk%.init") do
-		restarts = restarts + 1
-	end
-	for _ in calls:gmatch("sdk%.set_consent") do
-		writes = writes + 1
-	end
-	for _ in calls:gmatch("sdk%.session_start") do
-		starts = starts + 1
-	end
-	assert_true(restarts >= 2, "the lane must come back after the suspension: " .. calls)
-	assert_equal(writes, 1, "a restore must not re-write consent: " .. calls)
-	assert_equal(starts, 2, "and a restored GRANT still starts its session: " .. calls)
-end
 
 -- ⚠ THE RESOLVER'S OWN BYTES, AND THE REASON THIS SCENE EXISTS AT ALL.
 --
@@ -2559,25 +1923,20 @@ local function test_the_resolvers_own_bytes_are_understood()
 	reset()
 	next_response_body = golden("resolved")
 	local decision = prepare(golden_context())
-	assert_true(decision.plan_used,
-		"the resolver's resolved plan must be USED: " .. tostring(decision.reason)
+	assert_unsigned(decision,
+		"the resolver's resolved plan must reach the unsigned refusal: " .. tostring(decision.reason)
 			.. " / " .. tostring(decision.detail))
 	assert_equal(decision.regime, consent_policy.STRICT_OPT_IN)
 	assert_true(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, "STRICT closes optional processing")
 	assert_equal(decision.crash_profile, consent_policy.CRASH_OFF)
 	assert_equal(decision.server_analytics, consent_policy.SERVER_ANALYTICS_DENIED)
 	assert_equal(decision.child_rules, consent_policy.CHILD_RULES_MINIMISED)
-	assert_equal(decision.policy_version, "strict-fallback/1",
-		"policy_version must reach the host")
-	assert_equal(decision.consent_text_version, "strict-fallback/1",
-		"consent_text_version must reach the host")
-	assert_equal(decision.presented_language, "en")
-	assert_equal(decision.band_vocabulary, "coarse")
-	assert_equal(decision.band_vocabulary_version, "1")
-	assert_true(decision.notice ~= nil and #decision.notice > 100,
-		"the basis notice must reach the host verbatim")
-	assert_true(decision.notice:find("not legal advice", 1, true) ~= nil,
-		"and it must be the resolver's own words: " .. tostring(decision.notice))
+	assert_true(decision.policy_version == nil, "unauthenticated policy_version is not carried")
+	assert_true(decision.consent_text_version == nil, "unauthenticated consent_text_version is not carried")
+	assert_true(decision.presented_language == nil, "unauthenticated presented_language is not carried")
+	assert_true(decision.band_vocabulary == nil, "unauthenticated band_vocabulary is not carried")
+	assert_true(decision.band_vocabulary_version == nil, "unauthenticated band_vocabulary_version is not carried")
+	assert_true(decision.notice == nil, "unauthenticated notice text is not presented")
 
 	-- (ii) A REFUSAL: the resolver answers a COMPLETE strict plan with a reason
 	-- — every key present, scope as three empty strings — so what tells a
@@ -2604,66 +1963,29 @@ local function test_the_resolvers_own_bytes_are_understood()
 		reset()
 		next_response_body = golden("resolved"):gsub(renamed[1], renamed[2], 1)
 		local moved = prepare(golden_context())
-		assert_true(not moved.plan_used,
+		assert_equal(moved.reason, "invalid_response",
 			"a renamed " .. renamed[1] .. " must not be quietly accepted")
 	end
 end
 
--- ⚠ THE CLOCK-ROLLBACK ENTRY GUARD IS GONE, DELIBERATELY, AND THIS IS WHAT
--- REPLACED IT. It existed so a stored PERMISSION could not outlive its plan
--- when the wall clock stepped backwards. Now no permission is stored at
--- all, so there is nothing for a rolled-back clock to over-serve: the worst it
--- can do is keep a CLOSED answer alive longer, which relaxes nothing. Rather
--- than keep a guard whose reason has gone, the invariant it was protecting is
--- asserted directly.
---
--- (The in-flight rollback check in prepare() stays and is asserted separately
--- in test_a_clock_rollback_during_the_request_is_refused — that one guards the
--- deadline and expiry of the response being read right now, which still
--- matters for a permissive plan on its single permitted use.)
-local function test_a_stale_entry_can_only_ever_be_closed()
+-- A wall-clock change between calls cannot make an unsigned plan authoritative.
+local function test_clock_change_cannot_authorize_an_unsigned_plan()
 	reset()
 	next_response_body = plan()
-	assert_true(prepare().plan_used, "the fixture must be used")
+	assert_unsigned(prepare(), "the fixture must reach the unsigned refusal")
 	assert_equal(#requests, 1)
 
-	-- The clock goes backwards by a minute; the entry is now un-ageable.
+	-- The clock goes backwards by a minute before the next dispatch.
 	socket.now = socket.now - 60
 	local served = prepare()
 	socket.now = 1000
-	-- Whatever it does with the entry, what it serves cannot open anything.
-	assert_true(served.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, "a stale entry must stay closed")
+	-- Both requests remain unauthenticated and closed.
+	assert_true(served.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, "the response after a clock change must stay closed")
 	assert_equal(served.crash_profile, consent_policy.CRASH_OFF, "with the crash lane shut")
 	assert_equal(served.server_analytics, consent_policy.SERVER_ANALYTICS_DENIED, "and no server lane")
 	assert_equal(served.child_rules, consent_policy.CHILD_RULES_MINIMISED, "and the child rules minimised")
 end
 
--- ⚠ A RESTORED ANSWER IS NOT A NEW ONE. A policy suspension followed by a
--- revalidation restarts the client, and client.new reads the persisted consent
--- decision back — so calling set_consent again would re-persist a decision
--- nobody made twice and enqueue a second receipt, putting a policy change into
--- the consent trail as a player changing their mind.
-local function test_a_restored_answer_writes_no_consent()
-	reset()
-	-- STRICT with an explicit grant, so there IS a consent write to count;
-	-- only the plan's life runs out, which suspends the lane and restarts it
-	-- from the standing answer.
-	next_response_body = example_plan({ max_age_seconds = 2 })
-	local calls = run_example(nil, nil, { 1, 1, 1 }, false,
-		{ age_band = "adult", answer = true })
-	assert_true(calls:find("analytics suspended (plan_expired)", 1, true) ~= nil,
-		"the fixture must exercise a suspension: " .. calls)
-	local restarts = 0
-	for _ in calls:gmatch("sdk%.init") do
-		restarts = restarts + 1
-	end
-	assert_true(restarts >= 2, "the lane must come back after the suspension: " .. calls)
-	local writes = 0
-	for _ in calls:gmatch("sdk%.set_consent") do
-		writes = writes + 1
-	end
-	assert_equal(writes, 1, "only the newly completed notice may write consent: " .. calls)
-end
 
 -- ⚠ A PRESENT-AND-NULL LIST IS NOT AN ABSENT ONE, and for these three fields
 -- it is worse than for the signature: a null roster of operation blocks
@@ -2674,7 +1996,7 @@ local function test_a_null_list_is_not_an_absent_one()
 	reset()
 	next_response_body = raw_field('"signals_used"', "null")
 	local decision = prepare()
-	assert_true(not decision.plan_used, "signals_used present and null must not be used")
+	assert_equal(decision.reason, "invalid_response", "signals_used present and null must not be used")
 	assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
 			"and the choice defaults off")
 
@@ -2687,7 +2009,7 @@ local function test_a_null_list_is_not_an_absent_one()
 	reset()
 	next_response_body = plan({ signals_used = "__nil__" })
 	decision = prepare()
-	assert_true(not decision.plan_used, "signals_used absent must not be used either")
+	assert_equal(decision.reason, "invalid_response", "signals_used absent must not be used either")
 	assert_true(decision.detail:find("missing the required key signals_used", 1, true) ~= nil,
 		"and the reason must name the key: " .. tostring(decision.detail))
 end
@@ -2701,7 +2023,7 @@ local function test_an_unknown_top_level_key_is_refused()
 	reset()
 	next_response_body = raw_field('"tenant_override"', '"other"')
 	local decision = prepare()
-	assert_true(not decision.plan_used, "an unknown top-level key must not be used")
+	assert_equal(decision.reason, "invalid_response", "an unknown top-level key must not be used")
 	assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
 			"and the choice defaults off")
 
@@ -2710,7 +2032,7 @@ local function test_an_unknown_top_level_key_is_refused()
 	-- ones present, which are the easiest to forget in a roster.
 	reset()
 	next_response_body = golden("resolved")
-	assert_true(prepare(golden_context()).plan_used, "the resolver's own response must parse")
+	assert_unsigned(prepare(golden_context()), "the resolver's own response must parse")
 end
 
 -- ⚠ A DUPLICATE TOP-LEVEL KEY IS AMBIGUOUS AND THE DECODER RESOLVES IT
@@ -2722,14 +2044,14 @@ local function test_a_duplicate_top_level_key_is_refused()
 	-- The fixture keeps its own "regime"; this adds a second, permissive one.
 	next_response_body = duplicate_field('"regime"', '"' .. consent_policy.SOFT_OPT_OUT .. '"')
 	local decision = prepare()
-	assert_true(not decision.plan_used, "a duplicated key must not be used")
+	assert_equal(decision.reason, "invalid_response", "a duplicated key must not be used")
 	assert_true(decision.regime == consent_policy.STRICT_OPT_IN,
 		"and certainly not with the permissive spelling: " .. tostring(decision.regime))
 
 	-- The same key spelled with an escape is the same key.
 	reset()
 	next_response_body = raw_field('"regi\\u006de"', '"' .. consent_policy.SOFT_OPT_OUT .. '"')
-	assert_true(not prepare().plan_used, "an escaped duplicate is still a duplicate")
+	assert_equal(prepare().reason, "invalid_response", "an escaped duplicate is still a duplicate")
 end
 
 -- ⚠ EVERY ENUM IN THE PLAN IS CLOSED, AND AN UNKNOWN VALUE IS A REFUSAL — not
@@ -2754,7 +2076,7 @@ local function test_every_plan_enum_is_closed()
 		reset()
 		next_response_body = case[2]
 		local decision = prepare()
-		assert_true(not decision.plan_used,
+		assert_equal(decision.reason, "invalid_response",
 			"an unknown " .. case[1] .. " must not be used: " .. tostring(decision.detail))
 		assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
 			"and the choice defaults off")
@@ -2764,185 +2086,16 @@ local function test_every_plan_enum_is_closed()
 	for _, profile in ipairs({ consent_policy.CRASH_OFF, consent_policy.CRASH_MINIMAL }) do
 		reset()
 		next_response_body = plan({ flags = { crash_profile = profile } })
-		assert_true(prepare().plan_used, profile .. " must parse")
+		assert_unsigned(prepare(), profile .. " must parse")
 	end
 	for _, provenance in ipairs({ "ai_draft", "owner_accepted" }) do
 		reset()
 		next_response_body = plan({ basis = {
 			character = "informational_reference", table_provenance = provenance, notice = NOTICE } })
-		assert_true(prepare().plan_used, provenance .. " must parse")
+		assert_unsigned(prepare(), provenance .. " must parse")
 	end
 end
 
--- ⚠ THE BAND VOCABULARY IS A DECLARATION, NOT AN ECHO. The resolver states
--- which age scale it speaks as a constant and does not read the caller's band
--- at all in this release — it says so by naming age_band among the UNAVAILABLE
--- signals. So it is shape-checked and compared with NOTHING: an earlier cut
--- compared it to the caller's vocabulary, which would refuse every plan for
--- any host whose age scale is spelled differently.
--- ⚠ EVERY NAME THE CONTRACT SENDS IS REQUIRED, AND THIS SCENE IS DRIVEN BY
--- THE CONTRACT RATHER THAN BY A LIST TYPED HERE. The defect it repairs was one
--- key: flags.operation_blocks was optional, an absent one was read as an EMPTY
--- one, and those blocks govern transfer, age and capacity, localisation and
--- safety — restrictions no consent choice lifts. A malformed plan could drop
--- every restriction it carried by leaving the key out and still be USED.
---
--- One key was the instance. The class is a module that decides field by field
--- what absence means, so the roster is derived on both sides: the module's
--- from its schema roster minus `reason`, this scene's from the resolver's own
--- golden bytes. A key the resolver starts sending is covered here the day the
--- golden body is refreshed, with nobody remembering to add a row.
--- ⚠ THE AGE STEP IS RE-READ AFTER THE SCREEN CLOSES, NOT CARRIED OVER IT. A
--- consent notice is the one place in this flow where an unbounded amount of
--- real time passes with the player in front of another screen — an age gate, a
--- parental control, a profile edit. A band the host corrects to minor or
--- unknown while that screen was open must govern the answer that comes back
--- off it, or the quick start starts an analytics session for a child on the
--- strength of a reading taken before anyone asked.
---
--- The example gets this right by construction rather than by a check: the
--- notice callback invalidates the cache and RE-RESOLVES, so reconcile runs
--- again from the top and reads host_age_band() again. Nothing asserted it.
-local function test_the_age_band_is_read_again_after_the_notice()
-	for _, corrected in ipairs({ "minor", "__nil__" }) do
-		reset()
-		next_response_body = example_plan()
-		-- Adult when the screen opens, corrected while it is open.
-		local calls = run_example(nil, nil, nil, false,
-			{ age_bands = { "adult", corrected }, answer = true })
-		assert_true(calls:find("notice:default=", 1, true) ~= nil,
-			"the screen must have opened on the first, eligible reading: " .. calls)
-		assert_true(calls:find("minimised handling", 1, true) ~= nil,
-			"and the corrected band must reach minimised handling: " .. calls)
-		assert_true(calls:find("sdk.set_consent", 1, true) == nil,
-			"a grant given under the old reading must not be recorded: " .. calls)
-		assert_true(calls:find("sdk.session_start", 1, true) == nil,
-			"and no session may start: " .. calls)
-	end
-
-	-- The control: the same run with the band UNCHANGED does start, so the
-	-- scene is about the correction and not about this path never starting.
-	reset()
-	next_response_body = example_plan()
-	local calls = run_example(nil, nil, nil, false,
-		{ age_bands = { "adult", "adult" }, answer = true })
-	assert_true(calls:find("sdk.set_consent:true", 1, true) ~= nil,
-		"an unchanged eligible band records the grant: " .. calls)
-	assert_true(calls:find("sdk.session_start", 1, true) ~= nil,
-		"and starts the session: " .. calls)
-end
-
--- ⚠ THE THIRD READ, AND WHY THE SECOND-READ SCENE ABOVE COULD NOT SEE THIS.
--- test_the_age_band_is_read_again_after_the_notice proves the FIRST half: an
--- answer given while the band read adult starts nothing once the band is
--- corrected to minor. It stops there, and a two-read scene structurally
--- cannot ask what happens NEXT. The answer was that `answered` stayed
--- standing with fresh_answer = true, so the moment the band read eligible
--- again — a focus trigger, a revalidation — start_analytics recorded that
--- grant WITHOUT PRESENTING A NOTICE. One screen, one answer, a correction in
--- between, and a consent receipt for a player never asked a second time.
---
--- The band answers DIFFERENTLY on the two screens here, because with both
--- answers the same this scene could not tell a fresh answer from the stale
--- one being reused.
-local function test_a_fresh_answer_does_not_survive_minimised_handling()
-	reset()
-	next_response_body = example_plan()
-	-- adult when the screen opens -> minor on the post-answer resolution ->
-	-- adult again on the focus trigger. First screen GRANTS, second DECLINES.
-	local calls = run_example(nil, { "focus_lost", "focus_gained" }, nil, false, {
-		age_bands = { "adult", "minor", "adult", "adult" },
-		answers = { true, false },
-	})
-	local notices = select(2, calls:gsub("notice:default=", ""))
-	assert_equal(notices, 2, "the corrected band must cost the answer its screen, "
-		.. "and the recovered band must ASK AGAIN: " .. calls)
-	assert_true(calls:find("sdk.set_consent:false", 1, true) ~= nil,
-		"and the recorded answer must be the SECOND screen's: " .. calls)
-	assert_true(calls:find("sdk.set_consent:true", 1, true) == nil,
-		"never the one given before the correction: " .. calls)
-	assert_true(calls:find("sdk.session_start", 1, true) == nil,
-		"a decline starts no session: " .. calls)
-
-	-- ⚠ AND AN ANSWER ARRIVING FROM A SCREEN THAT WAS ALREADY OVERTAKEN is not
-	-- stored either. The example's placeholder notice answers from update(),
-	-- so `between` runs while the screen is open: the band turns minor there,
-	-- and the answer lands afterwards into a flow that is no longer asking.
-	-- The example's placeholder notice answers from update(), so `between` is
-	-- the one hook that runs with the screen genuinely OPEN. Resuming there is
-	-- a named re-resolution trigger, and it is the reconcile that reads the
-	-- corrected band and voids the screen the player is still looking at.
-	reset()
-	next_response_body = example_plan()
-	calls = run_example(function()
-		window.listener(nil, window.WINDOW_EVENT_FOCUS_GAINED, nil)
-	end, nil, nil, false, {
-		age_bands = { "adult", "minor", "adult", "adult" },
-		answers = { true, false },
-	})
-	assert_true(calls:find("answer discarded; the age band changed", 1, true) ~= nil,
-		"the answer from an overtaken screen must be discarded, and say so: " .. calls)
-	assert_true(calls:find("sdk.set_consent:true", 1, true) == nil,
-		"and must never be recorded: " .. calls)
-
-	-- The control: no correction at all, one screen, the grant recorded.
-	reset()
-	next_response_body = example_plan()
-	calls = run_example(nil, { "focus_lost", "focus_gained" }, nil, false, {
-		age_bands = { "adult", "adult", "adult", "adult" },
-		answers = { true, false },
-	})
-	assert_equal(select(2, calls:gsub("notice:default=", "")), 1,
-		"an unchanged band asks once: " .. calls)
-	assert_true(calls:find("sdk.set_consent:true", 1, true) ~= nil,
-		"and records that answer: " .. calls)
-end
-
--- ⚠ OPERATION BLOCKS ARE RESTRICTIONS NO CONSENT CHOICE LIFTS, and the quick
--- start cannot read them. The module parses the list and puts it on the
--- decision; mapping a block NAME to the client action it restricts needs a
--- vocabulary the example would have to invent. An example that carried them
--- and ignored them would let a player's grant open a lane the plan had just
--- closed — the permissive default in its worst place — so while the list is
--- non-empty nothing opens at all: no question, no analytics, no crash.
---
--- In this release the resolver always sends []. This scene is about the
--- release that does not.
-local function test_operation_blocks_close_every_lane()
-	for _, blocks in ipairs({ { "cross_border_transfer" },
-		{ "cross_border_transfer", "profiling_under_16" } }) do
-		reset()
-		next_response_body = example_plan({
-			flags = { crash_profile = consent_policy.CRASH_MINIMAL, operation_blocks = blocks },
-		})
-		local calls = run_example(nil, nil, nil, false, { age_band = "adult", answer = true })
-		assert_true(calls:find("operation block(s) this quick start cannot map", 1, true) ~= nil,
-			"the reason must name operation blocks: " .. calls)
-		assert_true(calls:find("notice:default=", 1, true) == nil,
-			"the question must not be put at all: " .. calls)
-		assert_true(calls:find("sdk.init", 1, true) == nil,
-			"no analytics client may be built: " .. calls)
-		assert_true(calls:find("crash.init", 1, true) == nil,
-			"and no crash reporter, though the profile permits one: " .. calls)
-		assert_true(calls:find("sdk.set_consent", 1, true) == nil,
-			"and nothing may be recorded: " .. calls)
-	end
-
-	-- The control: the SAME plan with an empty list runs the normal strict
-	-- flow, so the rule is about the blocks and not about this fixture never
-	-- starting anything.
-	reset()
-	next_response_body = example_plan({
-		flags = { crash_profile = consent_policy.CRASH_MINIMAL, operation_blocks = {} },
-	})
-	local calls = run_example(nil, nil, nil, false, { age_band = "adult", answer = true })
-	assert_true(calls:find("notice:default=off", 1, true) ~= nil,
-		"an empty list asks the question: " .. calls)
-	assert_true(calls:find("sdk.set_consent:true", 1, true) ~= nil,
-		"records the grant: " .. calls)
-	assert_true(calls:find("crash.init", 1, true) ~= nil,
-		"and opens the permitted crash lane: " .. calls)
-end
 
 -- ⚠ THE PROVENANCE, AS A SCENE RATHER THAN A SENTENCE. The README used to
 -- claim these files are the handler's own bytes and point at a commit. A
@@ -2993,14 +2146,14 @@ local function test_whitespace_does_not_change_the_answer()
 	reset()
 	next_response_body = golden_indented("resolved")
 	local indented = prepare(golden_context())
-	assert_true(indented.plan_used,
-		"the indented resolved plan must be USED: " .. tostring(indented.reason)
+	assert_unsigned(indented,
+		"the indented resolved plan must reach the unsigned refusal: " .. tostring(indented.reason)
 			.. " / " .. tostring(indented.detail))
 
 	reset()
 	next_response_body = golden("resolved")
 	local compact = prepare(golden_context())
-	assert_true(compact.plan_used, "the control: the wire form is used")
+	assert_unsigned(compact, "the control: the wire form is used")
 
 	-- Field by field, because "both were used" would hold even if the scanner
 	-- had quietly taken a different path through one of them.
@@ -3032,13 +2185,13 @@ local function test_every_key_the_contract_sends_is_required()
 	for _, form in ipairs({ "wire", "review" }) do
 	local body = form == "wire" and golden("resolved") or golden_indented("resolved")
 
-	-- The control first: unmodified, these bytes are USED. Without it every
+	-- The control first: unmodified, these bytes reach the unsigned refusal. Without it every
 	-- assertion below would also pass against a plan refused for some other
 	-- reason entirely.
 	reset()
 	next_response_body = body
-	assert_true(prepare(golden_context()).plan_used,
-		"the control: the resolver's own plan must be used unmodified (" .. form .. ")")
+	assert_unsigned(prepare(golden_context()),
+		"the control: the resolver's own plan must parse unmodified (" .. form .. ")")
 
 	local checked = 0
 	local function omission_is_refused(removed, named)
@@ -3077,22 +2230,22 @@ local function test_every_key_the_contract_sends_is_required()
 	-- than a plan, and the golden resolved body does not carry it at all.
 	reset()
 	next_response_body = body
-	assert_true(prepare(golden_context()).plan_used,
+	assert_unsigned(prepare(golden_context()),
 		"a plan without `reason` is a plan, not a refusal (" .. form .. ")")
 	end
 end
 
 local function test_the_band_vocabulary_is_shape_checked_only()
 	-- ⚠ THE CASE THE COMPARISON BROKE: a caller on its own vocabulary, a
-	-- resolver declaring another. The plan is USED.
+	-- resolver declaring another. The shape parses; the plan is still unsigned.
 	reset()
 	next_response_body = plan({ band_vocabulary = "coarse" })
 	local decision = prepare(context({ age_band = { vocabulary = "acme.bands.v3", band = "adult" } }))
-	assert_true(decision.plan_used,
+	assert_unsigned(decision,
 		"a caller's own vocabulary must not refuse the resolver's declaration: "
 			.. tostring(decision.detail))
-	assert_equal(decision.band_vocabulary, "coarse", "and it is delivered verbatim")
-	assert_equal(decision.band_vocabulary_version, "1", "with its version")
+	assert_true(decision.band_vocabulary == nil, "unauthenticated band_vocabulary is not carried")
+	assert_true(decision.band_vocabulary_version == nil, "unauthenticated band_vocabulary_version is not carried")
 
 	-- The shape is still checked: missing, empty or over its bound is malformed.
 	for _, override in ipairs({
@@ -3103,63 +2256,29 @@ local function test_the_band_vocabulary_is_shape_checked_only()
 	}) do
 		reset()
 		next_response_body = plan(override)
-		assert_true(not prepare().plan_used, "a malformed band vocabulary must not be used")
+		assert_equal(prepare().reason, "invalid_response", "a malformed band vocabulary must not be used")
 	end
 end
 
 
--- ⚠ THE NOTICE TEXT IS COMPARED WHOLE, not by prefix. It is the clause the
--- owner required every carrier to show; a truncation or a paraphrase is a
--- different disclaimer, and the SDK's job is to carry it verbatim rather than
--- to recognise it.
-local function test_the_notice_is_carried_whole()
+local function test_unsigned_notice_text_is_not_authority()
 	reset()
 	next_response_body = golden("resolved")
 	local decision = prepare(golden_context())
-	assert_true(decision.plan_used, "the golden must parse: " .. tostring(decision.detail))
-	local expected = "AI draft — owner-confirmed; counsel confirmation pending (Stage B): " ..
-		"The consent-policy resolver provides informational reference output based on " ..
-		"AI-collected jurisdiction data, not legal advice; ShardPilot makes no " ..
-		"representation as to the accuracy of those jurisdiction readings and accepts no " ..
-		"liability for reliance on them, subject to applicable mandatory-law limits; the " ..
-		"customer remains responsible for its consent design and its own compliance " ..
-		"decision, acting as controller or under its controller's instructions where it " ..
-		"acts as processor."
-	assert_equal(decision.notice, expected, "the notice must be carried byte for byte")
+	assert_unsigned(decision, "the complete notice parses")
+	assert_true(decision.notice == nil, "unsigned notice text cannot replace the host notice")
 end
 
--- ⚠ THE REGIME DECIDES THE DEFAULT, NOT WHETHER THE QUESTION EXISTS. This is
--- the module half of the correction: STRICT and UNKNOWN default the choice OFF
--- and require an explicit grant; only a USED SOFT plan defaults it on and
--- rests on notice and non-objection. Every fallback is strict.
-local function test_the_regime_sets_the_default_not_the_silence()
-	local cases = {
-		{ consent_policy.STRICT_OPT_IN, consent_policy.CHOICE_DEFAULT_OFF, true },
-		{ consent_policy.UNKNOWN, consent_policy.CHOICE_DEFAULT_OFF, true },
-		{ consent_policy.SOFT_OPT_OUT, consent_policy.CHOICE_DEFAULT_ON, false },
-	}
-	for _, case in ipairs(cases) do
-		reset()
-		next_response_body = plan({ regime = case[1] })
-		local decision = prepare()
-		assert_true(decision.plan_used, case[1] .. " must be used: " .. tostring(decision.detail))
-		assert_equal(decision.regime, case[1], "the regime is reported verbatim")
-		assert_equal(decision.analytics_choice_default, case[2], case[1] .. " default")
-		assert_equal(decision.explicit_grant_required, case[3], case[1] .. " grant rule")
-	end
 
-	-- Every fallback is the strict regime: the question is still put, with the
-	-- default off, and only an explicit grant opens the lane.
-	for _, body in ipairs({ "not json at all", encode_value({ reason = "policy_unavailable" }) }) do
+local function test_unsigned_regimes_cannot_change_the_local_default()
+	for _, regime in ipairs({ consent_policy.STRICT_OPT_IN, consent_policy.UNKNOWN, consent_policy.SOFT_OPT_OUT }) do
 		reset()
-		next_response_body = body
-		local fallback = prepare()
-		assert_true(not fallback.plan_used, "the fixture must fall back")
-		assert_equal(fallback.regime, consent_policy.STRICT_OPT_IN, "a fallback is STRICT")
-		assert_equal(fallback.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF,
-			"a fallback defaults the choice off")
-		assert_equal(fallback.explicit_grant_required, true,
-			"and requires an explicit grant")
+		next_response_body = plan({ regime = regime })
+		local decision = prepare()
+		assert_unsigned(decision, regime)
+		assert_equal(decision.regime, consent_policy.STRICT_OPT_IN)
+		assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF)
+		assert_equal(decision.explicit_grant_required, true)
 	end
 end
 
@@ -3203,25 +2322,8 @@ local function golden_block_plan(blocks, ctx, overrides)
 	return encode_value(body)
 end
 
-local function assert_blocks(decision, expected, source)
-	assert_equal(type(decision.operation_blocks), "table", "every decision carries a block list")
-	assert_equal(table.concat(decision.operation_blocks, ","), table.concat(expected, ","),
-		"the decision carries the complete expected restriction set")
-	if source then
-		assert_equal(decision.operation_blocks_source, source, "block provenance")
-	end
-end
 
-local function learn_blocks(blocks, ctx)
-	next_status = 200
-	next_response_body = golden_block_plan(blocks, ctx)
-	local decision = prepare(ctx)
-	assert_true(decision.plan_used, "the golden-derived plan must be accepted")
-	assert_blocks(decision, blocks)
-	return decision
-end
-
-local function test_known_operation_blocks_survive_fallbacks()
+local function test_operation_blocks_remain_unknown_across_fallbacks()
 	local cases = { "refusal", "malformed", "timeout", "signature", "out_of_scope",
 		"expired", "transport", "decoder", "encoder", "encode_error", "clock" }
 	local reasons = { refusal = "invalid_scope", malformed = "invalid_response",
@@ -3233,7 +2335,8 @@ local function test_known_operation_blocks_survive_fallbacks()
 	for _, mode in ipairs(cases) do
 		reset()
 		local ctx = golden_context()
-		learn_blocks({ "cross_border_transfer", "profiling_under_16" }, ctx)
+		next_response_body = golden_block_plan({ "cross_border_transfer", "profiling_under_16" }, ctx)
+		assert_unsigned(prepare(ctx), "unverified blocks are not learned")
 		local saved_http, saved_json, saved_socket, saved_os = http, json, socket, os
 		next_response_body = "not JSON"
 		if mode == "refusal" then
@@ -3265,94 +2368,16 @@ local function test_known_operation_blocks_survive_fallbacks()
 		assert_true(ok, mode .. " must return a decision")
 		assert_true(not decision.plan_used, mode .. " must reach a fallback")
 		assert_equal(decision.reason, reasons[mode], mode .. " reaches the intended refusal")
-		assert_blocks(decision, { "cross_border_transfer", "profiling_under_16" }, "preserved")
+		assert_true(decision.operation_blocks == nil, mode .. " leaves the block set unknown")
+		assert_equal(decision.operation_blocks_source, "none")
 		assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF)
 		assert_equal(decision.crash_profile, consent_policy.CRASH_OFF)
 	end
 	print("operation-block fallback cases passed: " .. #cases)
 end
 
-local function test_unlearned_block_fallback_is_empty()
-	reset()
-	next_response_body = "not JSON"
-	assert_blocks(prepare(golden_context()), {}, "none")
-end
 
-local function test_operation_blocks_survive_invalidation()
-	reset()
-	local ctx = golden_context()
-	learn_blocks({ "restricted" }, ctx)
-	consent_policy.invalidate()
-	next_response_body = "not JSON"
-	assert_blocks(prepare(ctx), { "restricted" }, "preserved")
-end
-
-local function test_operation_blocks_follow_validated_context()
-	local changes = {
-		{ "workspace_key", "second-workspace" }, { "app_key", "second-app" },
-		{ "environment_key", "second-environment" }, { "app_version", "2.0" },
-		{ "locale", "de" }, { "platform", "linux" }, { "store", "standalone" },
-		{ "endpoint", "https://other-policy.example" },
-		{ "age_band", { vocabulary = "other-vocabulary", band = "adult" } },
-		{ "age_band", { vocabulary = "host-age", band = "minor" } },
-	}
-	for _, change in ipairs(changes) do
-		reset()
-		local first, second = golden_context(), golden_context()
-		first.age_band = { vocabulary = "host-age", band = "adult" }
-		second.age_band = { vocabulary = "host-age", band = "adult" }
-		second[change[1]] = change[2]
-		learn_blocks({ "first-only" }, first)
-		next_response_body = "not JSON"
-		assert_blocks(prepare(second), {}, "none")
-		-- Returning after an explicit context change starts a new context epoch.
-		assert_blocks(prepare(first), {}, "none")
-	end
-	print("operation-block context fields checked: " .. #changes)
-end
-
-local function test_authoritative_operation_blocks_replace_prior_set()
-	reset()
-	local ctx = golden_context()
-	learn_blocks({ "one", "two" }, ctx)
-	assert_blocks(learn_blocks({ "two" }, ctx), { "two" }, "plan")
-	next_response_body = "not JSON"
-	assert_blocks(prepare(ctx), { "two" }, "preserved")
-	assert_blocks(learn_blocks({}, ctx), {}, "plan")
-	next_response_body = "not JSON"
-	assert_blocks(prepare(ctx), {}, "preserved")
-end
-
-local function test_operation_blocks_cannot_be_mutated_by_callers()
-	reset()
-	local ctx = golden_context()
-	local used = learn_blocks({ "restricted" }, ctx)
-	used.operation_blocks[1] = "edited-plan"
-	next_response_body = "not JSON"
-	local fallback = prepare(ctx)
-	assert_blocks(fallback, { "restricted" }, "preserved")
-	fallback.operation_blocks[1] = "edited-fallback"
-	assert_blocks(prepare(ctx), { "restricted" }, "preserved")
-end
-
-local function test_invalidated_callback_cannot_restore_operation_blocks()
-	reset()
-	local ctx = golden_context()
-	learn_blocks({ "first" }, ctx)
-	local saved_request, pending, stale = http.request
-	http.request = function(_, _, callback) pending = callback end
-	consent_policy.prepare(ctx, function(decision) stale = decision end)
-	http.request = saved_request
-	consent_policy.invalidate()
-	learn_blocks({ "current" }, ctx)
-	pending(nil, nil, { status = 200, response = golden_block_plan({ "old" }, ctx) })
-	assert_equal(stale.reason, "invalidated")
-	assert_blocks(stale, { "current" }, "preserved")
-	next_response_body = "not JSON"
-	assert_blocks(prepare(ctx), { "current" }, "preserved")
-end
-
-local function test_context_change_fences_operation_block_callbacks()
+local function test_context_change_fences_pending_responses()
 	reset()
 	local first, second = golden_context(), golden_context()
 	second.app_key = "second-app"
@@ -3360,99 +2385,29 @@ local function test_context_change_fences_operation_block_callbacks()
 	http.request = function(_, _, callback) pending = callback end
 	consent_policy.prepare(first, function(decision) stale = decision end)
 	http.request = saved_request
-	learn_blocks({ "second-only" }, second)
-	pending(nil, nil, { status = 200, response = golden_block_plan({ "old-first" }, first) })
-	assert_true(not stale.plan_used, "the previous context's callback cannot install its plan")
-	assert_blocks(stale, {}, "none")
-	next_response_body = "not JSON"
-	assert_blocks(prepare(second), { "second-only" }, "preserved")
-	assert_blocks(prepare(first), {}, "none")
+	next_response_body = golden_block_plan({}, second)
+	assert_unsigned(prepare(second), "the new context is also unsigned")
+	pending(nil, nil, { status = 200, response = golden_block_plan({}, first) })
+	assert_equal(stale.reason, "invalidated", "changing context fences the in-flight response")
+	assert_true(stale.operation_blocks == nil)
 end
 
-local function test_module_reload_forgets_operation_blocks()
-	reset()
-	local ctx = golden_context()
-	learn_blocks({ "restricted" }, ctx)
-	package.loaded["shardpilot.consent_policy"] = nil
-	consent_policy = require "shardpilot.consent_policy"
-	next_response_body = "not JSON"
-	assert_blocks(prepare(ctx), {}, "none")
-end
 
-local function test_invalid_context_does_not_forget_operation_blocks()
+local function test_caller_mutation_cannot_relabel_request_scope()
 	reset()
 	local ctx = golden_context()
-	learn_blocks({ "restricted" }, ctx)
-	local bad = golden_context()
-	bad.app_key = nil
-	local invalid = prepare(bad)
-	assert_equal(invalid.reason, "invalid_request")
-	assert_blocks(invalid, {}, "none")
-	next_response_body = "not JSON"
-	assert_blocks(prepare(ctx), { "restricted" }, "preserved")
-end
-
-local function test_caller_mutation_cannot_relabel_operation_blocks()
-	reset()
-	local ctx = golden_context()
-	learn_blocks({ "restricted" }, ctx)
 	local saved_request, pending, decision = http.request
 	http.request = function(_, _, callback) pending = callback end
 	consent_policy.prepare(ctx, function(value) decision = value end)
 	http.request = saved_request
 	ctx.app_key = "mutated-after-dispatch"
 	pending(nil, nil, { status = 200, response = golden_block_plan({}, ctx) })
-	assert_true(not decision.plan_used, "mutating the caller's table cannot change the request scope")
-	assert_blocks(decision, { "restricted" }, "preserved")
-	next_response_body = "not JSON"
-	assert_blocks(prepare(golden_context()), { "restricted" }, "preserved")
+	assert_equal(decision.reason, "invalid_response")
+	assert_equal(decision.detail, "the plan is scoped to another app, environment or workspace")
+	assert_true(decision.operation_blocks == nil)
 end
 
--- ⚠ THE ADVISORY OPT-IN DOES NOT DECIDE WHICH RESTRICTIONS ARE RETAINED. It asks
--- for an optional extra part and changes no policy field, so a request that
--- differs from the last one only by the opt-in keeps the blocks that plan
--- installed, in both directions and back again. With the opt-in in the
--- restriction key, dropping it forgot the blocks, and a failure right after
--- served none: a blocked operation reopened.
-local function test_the_advisory_opt_in_keeps_operation_blocks()
-	for _, first_asks in ipairs({ true, false }) do
-		reset()
-		local first, second = golden_context(), golden_context()
-		first.advisory = first_asks or nil
-		second.advisory = (not first_asks) or nil
-		learn_blocks({ "restricted" }, first)
-		next_response_body = "not JSON"
-		assert_blocks(prepare(second), { "restricted" }, "preserved")
-		next_response_body = "not JSON"
-		assert_blocks(prepare(first), { "restricted" }, "preserved")
-	end
-	-- Control: the opt-in together with a real context change still starts a
-	-- new context, which forgets them.
-	reset()
-	local first, second = golden_context(), golden_context()
-	first.advisory = true
-	second.app_key = "second-app"
-	learn_blocks({ "restricted" }, first)
-	next_response_body = "not JSON"
-	assert_blocks(prepare(second), {}, "none")
-	print("operation blocks kept across the advisory opt-in: both directions")
-end
 
-local function test_the_example_keeps_blocks_after_resume_outage()
-	reset()
-	local ctx = context({ workspace_key = "workspace-example", app_key = "app-example",
-		environment_key = "develop" })
-	next_response_body = golden_block_plan({ "restricted" }, ctx, { max_age_seconds = 300 })
-	local calls, initial = run_example(function() next_response_body = "not JSON" end,
-		{ "focus_lost", "focus_gained" }, nil, false, { age_band = "adult", answer = true })
-	assert_true(initial:find("operation block(s) this quick start cannot map", 1, true) ~= nil,
-		"the initial accepted plan must reach the example's block guard: " .. initial .. " / " .. calls)
-	assert_equal(select(2, calls:gsub("operation block%(s%) this quick start cannot map", "")), 2,
-		"resume plus outage must reach the same block guard")
-	for _, forbidden in ipairs({ "notice:default=", "sdk.init", "crash.init", "sdk.set_consent" }) do
-		assert_true(calls:find(forbidden, 1, true) == nil, "blocks prevent " .. forbidden)
-	end
-end
 
 -- ===== THE ADVISORY PART =====
 --
@@ -3539,7 +2494,7 @@ local function test_the_advisory_is_asked_for_only_when_requested()
 		reset()
 		next_response_body = plan()
 		local decision = prepare(context(override))
-		assert_true(decision.plan_used, "the control: " .. tostring(decision.detail))
+		assert_unsigned(decision, "the control: " .. tostring(decision.detail))
 		assert_true(requests[1].body:find('"advisory"', 1, true) == nil,
 			"a request that did not ask must not carry the member: " .. requests[1].body)
 		assert_true(decision.advisory == nil, "and the decision carries no advisory")
@@ -3561,42 +2516,18 @@ local function test_the_advisory_is_asked_for_only_when_requested()
 	end
 end
 
--- The resolver's advisory bytes, in both spellings, reach the host member for
--- member — and the plan beside them is the strict plan, unchanged.
+
 local function test_the_resolvers_advisory_bytes_are_understood()
 	for _, form in ipairs({ "wire", "review" }) do
 		reset()
 		next_response_body = advisory_body(nil, nil, form)
 		local decision = prepare(golden_advisory_context())
-		assert_true(decision.plan_used,
-			"the resolver's advisory plan must be USED (" .. form .. "): "
-				.. tostring(decision.reason) .. " / " .. tostring(decision.detail))
-		local a = decision.advisory
-		assert_true(type(a) == "table", "the advisory part must reach the host (" .. form .. ")")
-		assert_equal(a.jurisdiction, "GB")
-		assert_equal(a.row_id, "GB")
-		assert_equal(a.estimate, "SOFT_OPT_OUT")
-		assert_equal(a.row_status, "COUNSEL_PENDING")
-		assert_equal(a.row_basis, "ai_draft")
-		assert_equal(a.resolved_by, "server_country")
-		local prefix = "`medium` · contested"
-		assert_equal(a.advisory_basis:sub(1, #prefix), prefix, "the basis is carried verbatim")
-		assert_equal(a.matrix.docs_commit, "f6b6f0f617d4e15442608fc77be8a5bb40f40e26")
-		assert_equal(a.matrix.file_sha256, "370b04f374d0c506b92a003d4c801f450d5e5c45aed369f14a1c9382e3d592cc")
-		assert_equal(a.matrix.date, "2026-10-07")
-		assert_equal(decision.regime, consent_policy.STRICT_OPT_IN,
-			"a SOFT_OPT_OUT estimate sits beside a STRICT plan")
-		assert_equal(decision.analytics_choice_default, consent_policy.CHOICE_DEFAULT_OFF)
-		assert_true(decision.explicit_grant_required, "the grant is still required")
+		assert_unsigned(decision, "the advisory shape parses (" .. form .. ")")
+		assert_true(decision.advisory == nil, "unauthenticated advisory data is not forwarded")
 	end
-
-	-- Asked for and not served — a workspace the resolver did not admit — is
-	-- the plan alone, and it is used.
 	reset()
 	next_response_body = golden("resolved")
-	local plain = prepare(golden_advisory_context())
-	assert_true(plain.plan_used, "a plan without the advisory part is a plan: " .. tostring(plain.detail))
-	assert_true(plain.advisory == nil, "and carries none")
+	assert_unsigned(prepare(golden_advisory_context()), "an absent optional advisory also parses")
 end
 
 -- ⚠ IT NEVER CHANGES THE DECISION. The same plan with and without its advisory
@@ -3606,7 +2537,7 @@ local function test_the_advisory_never_changes_the_decision()
 	reset()
 	next_response_body = golden("resolved")
 	local without = prepare(golden_context())
-	assert_true(without.plan_used, "the control: " .. tostring(without.detail))
+	assert_unsigned(without, "the control: " .. tostring(without.detail))
 
 	for _, variant in ipairs({
 		{ "SOFT_OPT_OUT", nil },
@@ -3620,8 +2551,8 @@ local function test_the_advisory_never_changes_the_decision()
 		end
 		next_response_body = body
 		local with = prepare(golden_advisory_context())
-		assert_true(with.plan_used, variant[1] .. ": " .. tostring(with.detail))
-		assert_true(with.advisory ~= nil, variant[1] .. ": the advisory must be present")
+		assert_unsigned(with, variant[1] .. ": " .. tostring(with.detail))
+		assert_true(with.advisory == nil, variant[1] .. ": the advisory remains unauthenticated")
 		for _, field in ipairs({ "regime", "crash_profile", "server_analytics", "child_rules",
 			"analytics_choice_default", "explicit_grant_required", "plan_used", "reason",
 			"policy_version", "consent_text_version", "presented_language", "notice",
@@ -3629,36 +2560,11 @@ local function test_the_advisory_never_changes_the_decision()
 			assert_equal(tostring(with[field]), tostring(without[field]),
 				variant[1] .. ": the advisory changed " .. field)
 		end
-		assert_equal(#with.operation_blocks, #without.operation_blocks,
+		assert_equal(with.operation_blocks, without.operation_blocks,
 			variant[1] .. ": the advisory changed the operation blocks")
 	end
 end
 
--- ⚠ A COPY, AND A CACHE KEY OF ITS OWN. A caller writing into the advisory it
--- was given cannot reach the cached entry; and a request that asked for the
--- advisory never shares an entry with one that did not.
-local function test_the_advisory_is_copied_and_keyed()
-	reset()
-	next_response_body = golden("resolved-advisory")
-	local first = prepare(golden_advisory_context())
-	assert_true(first.advisory ~= nil, "the control: the advisory arrived")
-	first.advisory.estimate = "STRICT_OPT_IN"
-	first.advisory.jurisdiction = "FR"
-	first.advisory.matrix.date = "1970-01-01"
-
-	local second = prepare(golden_advisory_context())
-	assert_equal(#requests, 1, "the second call must be served from the cache, or this proves nothing")
-	assert_equal(second.advisory.estimate, "SOFT_OPT_OUT", "a caller rewrote the cached estimate")
-	assert_equal(second.advisory.jurisdiction, "GB", "a caller rewrote the cached jurisdiction")
-	assert_equal(second.advisory.matrix.date, "2026-10-07", "a caller rewrote the cached matrix")
-
-	-- The same context WITHOUT the opt-in is a different question: it goes to
-	-- the wire, and it cannot be answered with the advisory entry.
-	next_response_body = golden("resolved")
-	local plain = prepare(golden_context())
-	assert_equal(#requests, 2, "a request that did not ask must not be served the advisory entry")
-	assert_true(plain.plan_used and plain.advisory == nil, "and it carries no advisory")
-end
 
 -- Every advisory member the resolver sends is required once the part is
 -- present, and the refusal NAMES it. Driven from the recorded bytes.
@@ -3693,8 +2599,8 @@ local function test_only_the_estimate_may_be_null()
 		next_response_body = with_advisory_value(body, member, "null")
 		local decision = prepare(golden_advisory_context())
 		if member == "estimate" then
-			assert_true(decision.plan_used, "a null estimate is the contract's own spelling: " .. tostring(decision.detail))
-			assert_true(decision.advisory.estimate == nil, "and it reaches the host as nil")
+			assert_unsigned(decision, "a null estimate is the contract's own spelling: " .. tostring(decision.detail))
+			assert_true(decision.advisory == nil, "no unauthenticated advisory reaches the host")
 		else
 			assert_refused(decision, "a null advisory." .. member)
 			assert_true(decision.detail:find("advisory." .. member .. " is present and null", 1, true) ~= nil,
@@ -3731,9 +2637,8 @@ local function test_the_advisory_shapes_the_contract_permits()
 		reset()
 		next_response_body = case[2]
 		local decision = prepare(golden_advisory_context())
-		assert_true(decision.plan_used, case[1] .. ": " .. tostring(decision.detail))
-		assert_equal(decision.advisory.jurisdiction, case[3], case[1])
-		assert_equal(decision.advisory.estimate, case[4], case[1])
+		assert_unsigned(decision, case[1] .. ": " .. tostring(decision.detail))
+		assert_true(decision.advisory == nil, case[1] .. ": unauthenticated data stays unused")
 	end
 end
 
@@ -3837,28 +2742,6 @@ local function test_a_refusal_never_carries_an_advisory()
 	assert_true(decision.advisory == nil, "and no advisory reaches the host from it")
 end
 
-local function test_example_sends_the_presented_notice_tuple()
-	reset()
-	next_response_body = example_plan()
-	local shown = json.decode(next_response_body)
-	local called = false
-	run_example(nil, nil, nil, false, {
-		age_band = function() return "adult" end,
-		answer = true,
-		before_notice_answer = function()
-			next_response_body = example_plan({ policy_version = "synthetic-new-policy" })
-		end,
-		on_consent = function(_, notice)
-			called = true
-			assert_true(type(notice) == "table", "example must forward the presented notice")
-			assert_equal(notice.notice_version, shown.consent_text_version)
-			assert_equal(notice.notice_locale, shown.presented_language)
-			assert_equal(notice.policy_version, shown.policy_version, "later policy cannot relabel the presented notice")
-			assert_true(notice.notice == nil, "notice text stays out of the carrier")
-		end,
-	})
-	assert_true(called, "real example must reach the setter")
-end
 
 local function test_scope_key_wire_contract()
 	local passed, failed = 0, 0
@@ -3881,7 +2764,7 @@ local function test_scope_key_wire_contract()
 			if advisory then expected.advisory = true end
 			for key, value in pairs(expected) do assert_equal(sent[key], value, key) end
 			for key in pairs(sent) do assert_true(expected[key] ~= nil, "unexpected request field " .. key) end
-			assert_true(decision.plan_used, tostring(decision.reason))
+			assert_unsigned(decision, tostring(decision.reason))
 		end)
 	end
 	for _, axis in ipairs({ "workspace", "app", "environment", "all" }) do
@@ -3915,7 +2798,7 @@ local function test_scope_key_wire_contract()
 				elseif malformed then
 					assert_equal(decision.reason, "invalid_response")
 					assert_true(not decision.plan_used)
-				else assert_true(decision.plan_used, tostring(decision.reason)) end
+				else assert_unsigned(decision, tostring(decision.reason)) end
 			end
 			scene(name .. " canonical", function() response(read(name), false) end)
 			if name ~= "refusal" then
@@ -3954,94 +2837,66 @@ local function test_scope_key_wire_contract()
 end
 
 local tests = {
+	test_no_unauthenticated_plan_has_authority,
 	test_scope_key_wire_contract,
-	test_example_sends_the_presented_notice_tuple,
-	test_known_operation_blocks_survive_fallbacks,
-	test_unlearned_block_fallback_is_empty,
-	test_operation_blocks_survive_invalidation,
-	test_operation_blocks_follow_validated_context,
-	test_authoritative_operation_blocks_replace_prior_set,
-	test_operation_blocks_cannot_be_mutated_by_callers,
-	test_invalidated_callback_cannot_restore_operation_blocks,
-	test_context_change_fences_operation_block_callbacks,
-	test_module_reload_forgets_operation_blocks,
-	test_invalid_context_does_not_forget_operation_blocks,
-	test_caller_mutation_cannot_relabel_operation_blocks,
-	test_the_advisory_opt_in_keeps_operation_blocks,
-	test_the_example_keeps_blocks_after_resume_outage,
-	test_a_valid_plan_is_used,
+	test_operation_blocks_remain_unknown_across_fallbacks,
+	test_context_change_fences_pending_responses,
+	test_caller_mutation_cannot_relabel_request_scope,
+	test_a_well_formed_unsigned_plan_is_unused,
 	test_the_module_touches_no_sdk_state,
-	test_an_error_never_reuses_a_cached_permission,
+	test_an_outage_after_an_unsigned_plan_stays_closed,
 	test_a_late_response_is_dropped,
 	test_a_refused_value_costs_no_request,
 	test_every_malformed_plan_is_strict,
 	test_unknown_closes_optional_processing,
-	test_the_cache_is_private_and_invalidatable,
-	test_expiry_is_enforced_before_use_and_before_caching,
+	test_unsigned_responses_are_never_cached,
+	test_expiry_is_validated_before_authentication,
 	test_an_invalidated_request_cannot_answer,
 	test_a_json_object_is_not_an_empty_list,
-	test_the_cache_is_scoped_to_the_whole_context,
 	test_an_invalid_endpoint_is_an_invalid_request,
 	test_an_empty_signature_is_still_a_signature,
 	test_the_url_predicate_is_a_verbatim_copy,
 	test_a_signal_must_state_its_availability_as_a_boolean,
-	test_a_returned_decision_is_a_copy,
-	test_the_published_example_branches_on_the_decision,
+	test_fallback_decisions_are_independent,
+	test_example_stays_closed_without_authenticated_restrictions,
 	test_an_older_response_cannot_overwrite_a_newer_one,
 	test_an_encoder_failure_still_answers,
-	test_a_permissive_decision_is_never_served_twice,
+	test_unsigned_soft_cannot_authorize_an_offline_call,
 	test_the_clock_falls_back_to_os_time,
 	test_an_empty_object_is_not_an_empty_list,
 	test_an_offset_needs_its_colon,
-	test_the_example_re_resolves_after_the_answer,
-	test_the_example_closes_lanes_on_resume,
 	test_an_escaped_key_cannot_hide_an_object,
 	test_second_sixty_is_refused,
-	test_the_example_revalidates_at_the_plans_deadline,
-	test_the_example_re_presents_when_the_notice_text_changes,
-	test_a_verdict_carries_its_validity_window,
-	test_a_pending_crash_shutdown_keeps_its_state,
 	test_the_signature_is_present_and_null_or_refused,
-	test_a_stale_entry_can_only_ever_be_closed,
-	test_a_restored_answer_writes_no_consent,
+	test_clock_change_cannot_authorize_an_unsigned_plan,
 	test_a_null_list_is_not_an_absent_one,
 	test_an_unknown_top_level_key_is_refused,
 	test_a_duplicate_top_level_key_is_refused,
 	test_a_clock_rollback_during_the_request_is_refused,
-	test_a_fallback_does_not_erase_the_standing_answer,
 	test_no_schema_field_is_nullable,
 	test_a_null_list_entry_is_refused,
 	test_an_error_envelope_keeps_its_reason,
-	test_the_example_notices_a_failed_write,
-	test_a_zero_window_does_not_spin,
 	test_nested_duplicate_keys_are_refused,
 	test_an_unknown_context_field_is_refused,
 	test_a_null_field_inside_a_signal_is_refused,
 	test_a_signal_reason_is_always_from_the_vocabulary,
 	test_the_packaged_skill_snippets_compile,
 	test_the_context_age_bands_keys_are_closed,
-	test_the_example_stops_when_identify_refuses,
 	test_every_schema_object_has_a_closed_key_set,
 	test_an_unknown_offset_is_refused,
 	test_the_public_surface_is_prepare_and_invalidate,
-	test_the_example_pays_its_debts,
 	test_the_resolvers_own_bytes_are_understood,
 	test_every_plan_enum_is_closed,
-	test_the_age_band_is_read_again_after_the_notice,
-	test_a_fresh_answer_does_not_survive_minimised_handling,
-	test_operation_blocks_close_every_lane,
 	test_the_review_forms_compact_to_the_wire_bytes,
 	test_whitespace_does_not_change_the_answer,
 	test_every_key_the_contract_sends_is_required,
 	test_the_band_vocabulary_is_shape_checked_only,
-	test_the_notice_is_carried_whole,
-	test_the_regime_sets_the_default_not_the_silence,
+	test_unsigned_notice_text_is_not_authority,
+	test_unsigned_regimes_cannot_change_the_local_default,
 	test_ipairs_stops_at_a_nil_hole,
-	test_example_forwards_window_events,
 	test_the_advisory_is_asked_for_only_when_requested,
 	test_the_resolvers_advisory_bytes_are_understood,
 	test_the_advisory_never_changes_the_decision,
-	test_the_advisory_is_copied_and_keyed,
 	test_every_advisory_member_is_required,
 	test_only_the_estimate_may_be_null,
 	test_the_advisory_shapes_the_contract_permits,

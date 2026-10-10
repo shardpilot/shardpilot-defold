@@ -17,27 +17,21 @@
 --   * not a geolocator — no address is read here, and a plan carrying no
 --     country is normal rather than an error. The optional ADVISORY part, when
 --     the host asks for it, carries the resolver's own reading of the
---     connection's jurisdiction; that reading is carried, never made here;
+--     connection's jurisdiction; that reading is validated, never made here;
 --   * not persistent — nothing is written to disk. A cached plan on disk would
 --     outlive the session this contract scopes it to.
 --
--- The conservative rule, which is the whole point: a plan that is missing,
--- unreadable, out of scope, expired or carrying anything outside its bounded
--- vocabulary resolves to the STRICT regime — the choice is put with the
--- default OFF and the optional lane starts only on an explicit grant. An error
--- or an offline state can PRESERVE or ADD restrictions; it can never relax
--- one, and it can never reuse a cached permissive result.
+-- No authenticated plan means no plan authority. This build has no verifier
+-- or trusted signing key, so every response is unused, including a well-formed
+-- plan with signature: null. Shape, scope and time validation still distinguish
+-- malformed responses from well-formed unsigned ones.
 --
--- ⚠ AND STRICT IS NOT SILENCE. A fallback still asks, under the host's own
--- notice text, and a grant given under one is a valid strict grant. The
--- regimes differ in the DEFAULT of the question and the basis the answer is
--- recorded under, never in whether the question is put at all.
---
--- SOFT_OPT_OUT is implemented so a future plan parses. It is NOT reachable
--- today: every row of the jurisdiction matrix is marked pending counsel
--- confirmation, so the resolver's initial release has no path that emits it.
--- An unconfirmed matrix cannot justify a permissive default. STRICT remains
--- the supported default until the applicable policy has been confirmed.
+-- The local fallback is STRICT, default OFF, explicit grant required, crash
+-- OFF, server analytics denied and child handling minimised. Its operation
+-- block set is UNKNOWN (nil), never an empty authorized set. A host must keep
+-- plan-dependent operations closed while that set is unknown; an explicit
+-- consent grant alone cannot supply the missing policy authority.
+-- Nothing from an unauthenticated response is cached or retained as a policy.
 
 local M = {}
 local version_ok = require "shardpilot.consent_version"
@@ -57,18 +51,8 @@ M.SERVER_ANALYTICS_DENIED = "denied"
 
 M.CHILD_RULES_MINIMISED = "minimised"
 
--- ⚠ WHAT THE REGIME ACTUALLY DECIDES: THE DEFAULT OF THE CHOICE, NOT WHETHER A
--- CHOICE EXISTS. This module used to report `optional_processing_closed`, and
--- the documentation around it told every host that a closed lane meant nothing
--- was asked and the SDK was not started. The resolver answers STRICT_OPT_IN to
--- every request in this release — so a host following that reading would never
--- ask anyone, never start analytics, for every customer in every country. That
--- is not the strict regime; it is no product.
---
--- STRICT means: ASK, with the choice defaulted OFF, and start the optional
--- lane only on an explicit grant. SOFT means: a prominent purpose notice, the
--- choice defaulted ON, and one-tap off on the same screen. The difference is
--- the default and the basis it is recorded under.
+-- These constants also describe the wire vocabulary. Only OFF is returned by
+-- this build; a parsed SOFT value has no authority without authentication.
 M.CHOICE_DEFAULT_OFF = "off"
 M.CHOICE_DEFAULT_ON = "on"
 
@@ -82,10 +66,6 @@ local ROUTE = "/api/cp/v1/consent/policy"
 -- than a slow one.
 local DEADLINE_SECONDS = 2
 
--- Private cache lifetime. It is a ceiling, not a target, and it never outlives
--- the plan's own expiry.
-local CACHE_SECONDS = 300
-
 -- Bounds, mirrored from the published schema so a value outside them is
 -- refused HERE rather than sent and refused there. A refusal that costs a
 -- request is a refusal that told a server something about this player.
@@ -96,8 +76,7 @@ local MAX_ENTRIES = 64
 local MAX_SIGNALS = 16
 local MAX_BODY = 16 * 1024
 local MAX_ENDPOINT = 256
--- basis.notice is a paragraph the host must show or log verbatim, so it is
--- bounded generously and not interpreted here.
+-- Bound the wire notice without interpreting or forwarding unauthenticated text.
 local MAX_NOTICE = 2048
 -- advisory.advisory_basis is the matrix row's basis in its own words, with the
 -- same published bound.
@@ -135,30 +114,14 @@ local REFUSAL_REASONS = {
 	unsupported_app_version = true, policy_unavailable = true,
 }
 
--- The private cache: one entry, in memory, for this session only.
-local cached = nil
-
--- Restrictions outlive the response cache and ordinary invalidation. Only an
--- accepted plan replaces them; selecting another validated context forgets
--- them. Keep no history for contexts that are no longer active.
+-- Context epochs fence in-flight callbacks; no unauthenticated plan is cached.
 local active_context = nil
-local known_blocks = nil
 
--- ⚠ THE INVALIDATION COUNTER. invalidate() clearing the cache was not enough
--- on its own: a request already in flight could still complete inside its
--- deadline, deliver the decision the invalidation was meant to discard, and
--- write it back into the cache. The trigger would be undone by the very
--- request it fired against. A response is now refused unless the generation
--- it was dispatched under is still current.
+-- A response must belong to the current context epoch.
 local generation = 0
 
--- ⚠ THE GENERATION IS NOT ENOUGH ON ITS OWN. Two prepare calls for the SAME
--- context can be in flight together — they share a generation, so neither
--- supersedes the other, and whichever answers LAST writes the cache. An older
--- permissive response landing after a newer restrictive one therefore reopened
--- what the newer one had just closed. Each dispatch takes a number, the newest
--- number for a context key is remembered, and a response from an older
--- dispatch is refused rather than delivered or cached.
+-- Same-context requests share an epoch. Only the latest dispatch may finish
+-- parsing; an older one gets a distinct superseded fallback.
 local dispatch_counter = 0
 local latest_dispatch = {}
 
@@ -235,12 +198,10 @@ local ADVISORY_KEYS = {
 local ADVISORY_MATRIX_KEYS = { docs_commit = true, file_sha256 = true, date = true }
 local ADVISORY_NULLABLE_KEYS = { estimate = true }
 
--- ⚠ THE ONE NULLABLE KEY IN THE SCHEMA, and it is nullable by contract rather
--- than by accident: the resolver sends `"signature": null` on EVERY response
--- in this release. Present-and-null is the unsigned state and the only
--- admissible one here; present and NOT null is a signature this build cannot
--- verify, which is refused. No other key may be null. (The advisory part's
--- estimate is nullable inside that part; see ADVISORY_NULLABLE_KEYS.)
+-- Signature is the one nullable top-level wire member. Null is a valid
+-- unsigned shape, not authentication. Non-null signatures remain unverifiable;
+-- the final unsigned gate also refuses the present-null shape.
+-- The advisory estimate is nullable inside its part (ADVISORY_NULLABLE_KEYS).
 local NULLABLE_KEYS = { signature = true }
 
 -- ⚠ REQUIRED IS THE DEFAULT, AND THAT DIRECTION IS THE WHOLE POINT. The
@@ -875,10 +836,7 @@ local function trim_slash(value)
 	return (value:gsub("/+$", ""))
 end
 
--- Depth-bounded copy, the same shape the remote-config and experiments caches
--- use, so a decision handed to game code can be mutated freely without
--- corrupting the entry the next prepare serves. Decisions are acyclic; the cap
--- only bounds the walk.
+-- Freeze the validated request so caller mutation cannot change its scope.
 local function copy_value(value, depth)
 	if type(value) ~= "table" then
 		return value
@@ -899,19 +857,9 @@ local function key_field(value)
 	return string.format("%d:%s", #value, value)
 end
 
--- ⚠ THE RESTRICTION KEY IS THE WHOLE POLICY CONTEXT. It names the context the
--- retained restrictions (active_context, known_blocks) and the dispatch order
--- belong to. One in-memory entry is shared by every caller in the process,
--- and serving it on liveness alone applied one app's, environment's or
--- endpoint's plan to another — past the scope check in parse_plan, which only
--- ever saw the context that produced the entry.
---
--- ⚠ AND IT LEAVES OUT THE ADVISORY OPT-IN. The opt-in asks for an optional
--- extra part and changes no policy field, so it cannot decide which
--- restrictions are retained: with it in this key, a request that only
--- dropped the opt-in forgot the blocks the previous plan installed, and a
--- failure right after served none.
-local function restriction_key(context)
+-- The policy context defines an epoch for in-flight responses. Advisory is
+-- an optional extra part, so changing that opt-in shares the dispatch order.
+local function context_key(context)
 	local parts = {}
 	local function field(value)
 		parts[#parts + 1] = key_field(value)
@@ -927,13 +875,6 @@ local function restriction_key(context)
 	field(context.age_band and context.age_band.vocabulary)
 	field(context.age_band and context.age_band.band)
 	return table.concat(parts, "|")
-end
-
--- The response cache's key: the restriction key plus the opt-in. A request
--- that asked for the advisory is a different question from one that did not,
--- so it never shares a cache entry with it.
-local function cache_key(context)
-	return restriction_key(context) .. "|" .. key_field(context.advisory == true and "advisory" or nil)
 end
 
 -- ⚠ THE SAME FALLBACK clock.lua ALREADY USES (clock.lua:4-9), and for the same
@@ -972,25 +913,20 @@ end
 
 -- ⚠ STRICT IS BUILT IN ONE PLACE, so no path can invent a partial permissive
 -- result. Every failure comes through here.
-local function strict(reason, detail, key)
-	local blocks = key ~= nil and key == active_context and known_blocks or nil
+local function strict(reason, detail)
 	return {
 		regime = M.STRICT_OPT_IN,
 		crash_profile = M.CRASH_OFF,
 		server_analytics = M.SERVER_ANALYTICS_DENIED,
 		child_rules = M.CHILD_RULES_MINIMISED,
-		-- ⚠ A FALLBACK STILL ASKS. Offline, timed out, refused or malformed —
-		-- the answer is the STRICT regime, which means the question is put with
-		-- the default off under the host's own notice text, and a grant given
-		-- under a fallback is a valid strict grant. What a fallback can never
-		-- do is default ON, reuse a SOFT answer, or open the crash or server
-		-- lanes. It is also why flooding the resolver route degrades nothing:
-		-- strict still collects from the players who say yes.
+		-- This default describes a strict choice, not permission to process.
+		-- Unknown operation restrictions remain a separate admission barrier.
 		analytics_choice_default = M.CHOICE_DEFAULT_OFF,
 		explicit_grant_required = true,
 		plan_used = false,
-		operation_blocks = blocks and copy_value(blocks, 0) or {},
-		operation_blocks_source = blocks and "preserved" or "none",
+		-- No authenticated restriction set is known. Nil must not mean no blocks.
+		operation_blocks = nil,
+		operation_blocks_source = "none",
 		reason = reason,
 		detail = detail,
 	}
@@ -1304,7 +1240,7 @@ local function parse_plan(plan, context, now)
 	if not TABLE_PROVENANCES[basis.table_provenance] then
 		return nil, "unknown table provenance"
 	end
-	-- The notice is carried to the host VERBATIM and interpreted nowhere here.
+	-- Validate the notice shape without making its unauthenticated text authoritative.
 	if not bounded_string(basis.notice, MAX_NOTICE) then
 		return nil, "the basis carries no notice"
 	end
@@ -1352,11 +1288,8 @@ local function parse_plan(plan, context, now)
 		or plan.max_age_seconds % 1 ~= 0 then
 		return nil, "max_age_seconds is not a whole non-negative number"
 	end
-	-- ⚠ THE SIGNATURE IS RESERVED AND ALWAYS null IN THIS RELEASE, so the
-	-- decoded value is always nil. A NON-nil one is a signature this build
-	-- cannot verify, and an unverifiable signature must not admit or the
-	-- field's arrival becomes a downgrade. The raw scan is what tells the
-	-- difference between "sent as null" and "not sent"; both are unsigned.
+	-- This build cannot verify a non-null signature. A present-null signature
+	-- passes this shape check only, then reaches the final unsigned refusal.
 	if plan.signature ~= nil then
 		return nil, "the plan carries a signature this build cannot verify"
 	end
@@ -1372,75 +1305,11 @@ local function parse_plan(plan, context, now)
 			return nil, refusal
 		end
 	end
-	return plan, nil, expires_at
+	return plan
 end
 
--- ⚠ PERMISSIVE MEANS "ANYTHING BUT THE FULLY CLOSED TUPLE". Not "SOFT": a
--- STRICT plan that permits the crash lane, or an eligible server-analytics
--- basis, or one that lifts the objection requirement, has opened something —
--- and the three flags are orthogonal on purpose, so any one of them counts.
-local function decision_is_permissive(decision)
-	return decision.analytics_choice_default ~= M.CHOICE_DEFAULT_OFF
-		or decision.crash_profile ~= M.CRASH_OFF
-		or decision.server_analytics ~= M.SERVER_ANALYTICS_DENIED
-		or decision.child_rules ~= M.CHILD_RULES_MINIMISED
-end
-
-local function decision_from_plan(plan)
-	return {
-		regime = plan.regime,
-		crash_profile = plan.flags.crash_profile,
-		server_analytics = plan.flags.server_analytics,
-		child_rules = plan.flags.child_rules,
-		-- ⚠ THE REGIME IS REPORTED VERBATIM AND UNKNOWN IS TREATED AS STRICT.
-		-- A host needs to know the resolver could not classify — that belongs
-		-- in a receipt — but it must behave exactly as STRICT does while it
-		-- does not know.
-		analytics_choice_default = plan.regime == M.SOFT_OPT_OUT
-			and M.CHOICE_DEFAULT_ON or M.CHOICE_DEFAULT_OFF,
-		-- ⚠ AND "off" IS NOT "DO NOT ASK". It is the state of the switch when
-		-- the screen opens. Only an explicit grant starts the optional lane
-		-- under STRICT or UNKNOWN; under a used SOFT plan the basis is notice
-		-- and non-objection, which is recorded as such and never as a click.
-		explicit_grant_required = plan.regime ~= M.SOFT_OPT_OUT,
-		plan_used = true,
-		reason = nil,
-		-- ⚠ HOW LONG THIS VERDICT IS GOOD FOR, in seconds, set by prepare
-		-- rather than here because it depends on when the answer ARRIVED. The
-		-- host needs it: cache expiry protects the next lookup and stops
-		-- nothing that is already running, so a lane opened on a permissive
-		-- plan would otherwise stay open long past the plan's life. A fallback
-		-- carries no validity at all — it established nothing to be valid.
-		valid_for_seconds = nil,
-		policy_version = plan.policy_version,
-		consent_text_version = plan.consent_text_version,
-		presented_language = plan.presented_language,
-		band_vocabulary = plan.band_vocabulary,
-		band_vocabulary_version = plan.band_vocabulary_version,
-		operation_blocks = plan.flags.operation_blocks,
-		operation_blocks_source = "plan",
-		-- Carried VERBATIM and interpreted nowhere here. The host shows or logs
-		-- it as the contract requires.
-		notice = plan.basis.notice,
-		-- ⚠ THE ADVISORY PART, COPIED AND INTERPRETED NOWHERE. Present only when
-		-- the host asked for it and the resolver served it; nil otherwise, and
-		-- on every fallback. Nothing above reads it: the regime, the default,
-		-- the grant requirement and every flag are the plan's alone, and a
-		-- SOFT_OPT_OUT estimate beside a STRICT plan changes none of them. Its
-		-- estimate is nil where the row carries none. It is the decoded table
-		-- of this response alone, and the cache copies it like every member.
-		advisory = plan.advisory,
-	}
-end
-
--- Clears the response cache, retaining known operation blocks for this
--- context: a refresh is not authority to remove a restriction. The host calls
--- it on the named re-resolution
--- triggers: launch and resume, a network or permitted storefront change, an
--- age correction, a language or text change, a workspace or app change, a
--- policy revocation, and before the first optional admission.
+-- Invalidate every response dispatched under the previous context epoch.
 function M.invalidate()
-	cached = nil
 	generation = generation + 1
 	-- Nothing in flight may answer after this, so the per-key records go too;
 	-- they are the only thing that grows, and this is what bounds them.
@@ -1454,9 +1323,8 @@ end
 function M.prepare(context, callback)
 	assert(type(callback) == "function", "prepare requires a callback")
 
-	local key
 	local function fallback(reason, detail)
-		return strict(reason, detail, key)
+		return strict(reason, detail)
 	end
 
 	local ok, why = M.validate_context(context)
@@ -1466,15 +1334,13 @@ function M.prepare(context, callback)
 	end
 
 	-- Freeze the validated request: caller mutation cannot relabel an in-flight
-	-- response or the restrictions learned from it. A context change also fences
+	-- response. A context change also fences
 	-- callbacks dispatched before the change, even if that context returns later.
 	context = copy_value(context, 0)
-	key = restriction_key(context)
-	local entry = cache_key(context)
+	local key = context_key(context)
 	if active_context ~= key then
 		M.invalidate()
 		active_context = key
-		known_blocks = nil
 	end
 
 	local at = now_seconds()
@@ -1487,11 +1353,7 @@ function M.prepare(context, callback)
 		return
 	end
 
-	-- ⚠ THE TRANSPORT IS CHECKED BEFORE THE CACHE IS READ, AND THE ORDER IS THE
-	-- RULE. With the cache first, losing the network served the last permissive
-	-- answer for the rest of the window — the one thing "an offline state can
-	-- tighten but never relax" forbids, and it read as a cache hit rather than
-	-- as an outage. A missing transport is a fallback, and a fallback wins.
+	-- Missing dependencies return a local fallback before any request.
 	if not http or not http.request then
 		callback(fallback("transport_unavailable", "no http transport is available"))
 		return
@@ -1502,17 +1364,6 @@ function M.prepare(context, callback)
 	end
 	if not json.encode then
 		callback(fallback("encoder_unavailable", "no json encoder is available"))
-		return
-	end
-
-	if cached and cached.key == entry and cached.until_at > at then
-		-- ⚠ A COPY, NOT THE ENTRY. The cache used to hand out the very table it
-		-- kept, so a caller that wrote a field on the decision it was given —
-		-- or that read prohibited_purposes and sorted it in place — edited what
-		-- every later prepare would serve for the next five minutes.
-		local served = copy_value(cached.decision, 0)
-		served.valid_for_seconds = cached.until_at - at
-		callback(served)
 		return
 	end
 
@@ -1550,29 +1401,17 @@ function M.prepare(context, callback)
 			settle(fallback("clock_unavailable", "no clock is available to evaluate the plan's expiry"))
 			return
 		end
-		-- ⚠ THE CLOCK MOVED BACKWARDS WHILE THIS REQUEST WAS IN FLIGHT. Every
-		-- judgement below is a comparison against `arrived` — the deadline, the
-		-- expiry, the cache lifetime — and a reading earlier than the one this
-		-- request was dispatched with makes all of them meaningless in the
-		-- permissive direction: a plan looks fresher and an entry lives longer.
-		-- It is refused before anything is parsed or cached.
+		-- A clock rollback makes the deadline and expiry comparisons unreliable.
 		if arrived < at then
 			settle(fallback("clock_regressed", "the clock moved backwards while the request was in flight"))
 			return
 		end
-		-- ⚠ AN INVALIDATED REQUEST CANNOT ANSWER. A policy revocation or a
-		-- workspace change fired while this was in flight; its answer describes
-		-- the world the host has just declared gone, so it is refused here
-		-- rather than delivered — and, crucially, never written to the cache.
+		-- Invalidation fences every response from the previous epoch.
 		if dispatched_under ~= generation then
 			settle(fallback("invalidated", "the policy was invalidated while this request was in flight"))
 			return
 		end
-		-- ⚠ A LATER DISPATCH FOR THIS CONTEXT HAS ALREADY BEEN MADE, so this
-		-- answer describes an older question. It is still ANSWERED — exactly
-		-- one callback, strict — but it does not reach the cache, which is
-		-- where an older permissive plan used to overwrite a newer restrictive
-		-- one purely by arriving second.
+		-- Preserve request ordering even when both answers would be strict.
 		if latest_dispatch[key] ~= dispatch then
 			settle(fallback("superseded", "a later request for this context was dispatched first"))
 			return
@@ -1619,15 +1458,8 @@ function M.prepare(context, callback)
 			settle(fallback("invalid_response", shape_refusal))
 			return
 		end
-		-- ⚠ NO FIELD IN THIS SCHEMA IS NULLABLE, AND THAT IS ONE RULE RATHER
-		-- THAN A LIST OF FIELDS. Lua has no null, so every present-and-null key
-		-- decodes to exactly the nil an absent key decodes to — and this module
-		-- reads absence as a meaning everywhere: an absent signature is
-		-- unsigned, an absent objection requirement stands, an absent list is
-		-- no restrictions. Each of those was a separate hole, and patching them
-		-- one at a time is how the next added field arrives with the same one.
-		-- The raw scan knows which keys were present; anything present whose
-		-- decoded value is nil is malformed, whatever it is.
+		-- The raw scan distinguishes absent fields from present-null values.
+		-- Only the schema's nullable members may lose their value during decode.
 		for key in pairs(present) do
 			if decoded[key] == nil and not NULLABLE_KEYS[key] then
 				settle(fallback("invalid_response", key .. " is present and null"))
@@ -1662,55 +1494,15 @@ function M.prepare(context, callback)
 				end
 			end
 		end
-		local plan, refusal, expires_at = parse_plan(decoded, context, arrived)
+		local plan, refusal = parse_plan(decoded, context, arrived)
 		if not plan then
 			settle(fallback("invalid_response", refusal))
 			return
 		end
-		local decision = decision_from_plan(plan)
-		-- Only a current, accepted plan reaches here. Replacement includes []:
-		-- a newer plan may remove a restriction, while no failure may do so.
-		known_blocks = copy_value(decision.operation_blocks, 0)
-		-- ⚠ ONLY A LIVE, VERIFIED PLAN IS EVER CACHED, and never past the
-		-- SHORTEST of the cache ceiling, the plan's own expiry and its
-		-- max_age_seconds. The ceiling used to win outright, so a plan with ten
-		-- seconds of life left was served from memory for five minutes. An
-		-- error or offline state reaches this line never, which is what stops a
-		-- cached permission being reused when the network is gone.
-		local lifetime = CACHE_SECONDS
-		if expires_at - arrived < lifetime then
-			lifetime = expires_at - arrived
-		end
-		if plan.max_age_seconds < lifetime then
-			lifetime = plan.max_age_seconds
-		end
-		decision.valid_for_seconds = lifetime
-		-- A permissive decision is never stored: an offline state may tighten
-		-- restrictions but must never relax them.
-		--
-		-- The presence of http.request does not establish connectivity, and
-		-- Defold offers no reliable online signal. Cached permissions could
-		-- outlive their plan through expiry, a clock moving backwards, policy
-		-- rollback during a request, or an older response arriving last.
-		--
-		-- So a permissive answer is used for the call that FETCHED it and is
-		-- not kept. Every later prepare() goes to the wire, and a request that
-		-- fails, times out or finds no network answers STRICT. A strict answer
-		-- may be cached within its life, because reusing "closed" can never
-		-- open anything.
-		--
-		-- The cost is one request per prepare() while the regime is permissive.
-		-- prepare() is called at start, on resume and at expiry — not per
-		-- frame — and the resolver's initial release emits only strict plans,
-		-- so today this costs nothing at all.
-		if lifetime > 0 and not decision_is_permissive(decision) then
-			-- The entry gets its OWN copy too, so the table delivered below and
-			-- the table kept here are never the same object.
-			cached = { key = entry, decision = copy_value(decision, 0), until_at = arrived + lifetime }
-		else
-			cached = nil
-		end
-		settle(decision)
+		-- Shape, scope and time checks do not authenticate a plan. No verifier
+		-- or trusted key exists in this build, so even an unsigned strict plan
+		-- must not supply restrictions or remove ones a host already enforces.
+		settle(fallback("plan_unsigned", "this build cannot authenticate a consent plan"))
 	end, { ["Content-Type"] = "application/json" }, encoded, { timeout = DEADLINE_SECONDS })
 end
 
