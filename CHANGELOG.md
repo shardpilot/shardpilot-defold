@@ -530,9 +530,8 @@
 - **Documentation cleanup.** No API, wire-format or behaviour change.
 
 - **Retry wakes now cover every shape of retained work, and a server's
-  `Retry-After` keeps its own expiry.** Four fixes to the retry pacing
-  separated from `flush_interval_seconds` earlier in this release, all found by
-  review of that change:
+  `Retry-After` keeps its own expiry.** Retry pacing is independent of
+  `flush_interval_seconds` and handles these retained-work cases:
 
   - A retained **Mode B 401** arms no deadline on purpose — a freshly minted
     token should be tried at once — but the batch has already left the queue,

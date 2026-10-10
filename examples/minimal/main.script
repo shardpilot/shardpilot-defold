@@ -50,12 +50,9 @@ local MIN_REVALIDATE_SECONDS = 30
 local MAX_REVALIDATE_SECONDS = 300
 local revalidate_backoff = MIN_REVALIDATE_SECONDS
 
--- ⚠ THE RETRY MACHINERY IS DELIBERATELY NOT HERE. A quick start that carried
--- a Mode B identify-retry state machine drew a finding in four consecutive
--- review rounds — every fix added state and the next round found the next
--- interleaving. What a production host owes is listed in the README under
--- "host requirements"; what this file shows is the straight path, which is
--- what a quick start is for.
+-- This quick start shows the direct integration path without a Mode B
+-- identify-retry state machine. Production retry requirements are listed
+-- in the README under "host requirements".
 
 -- Where this example parks a remote-config value; your game reads it wherever
 -- it needs the tuned number.

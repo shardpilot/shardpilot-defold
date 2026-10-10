@@ -130,12 +130,10 @@ anonymous identifier** — an identity created for a player whose consent regime
 has not been established yet. Resolve the policy first, and initialise only
 when the decision permits it:
 
-> ⚠ **THIS IS NOT A SNIPPET TO ADAPT — IT IS `examples/minimal/main.script`,
-> QUOTED.** Every block below is extracted from that file byte for byte and
-> `test/test_documented_regions.lua` fails if one of them drifts. The flow used
-> to be written three times — there, in the repository README, and here — and a
-> single review round found five findings that were the same flow drifting
-> apart. Change the example; the documents follow.
+> Every block below is extracted byte for byte from
+> `examples/minimal/main.script`. `test/test_documented_regions.lua` checks
+> that the README and this guide match those source regions. Update the
+> example first, then regenerate its quoted blocks.
 >
 > Replace the placeholder values (`workspace-example`, `user-example`, the
 > localhost URLs) and the two globals — `host_age_band` is your age step and
@@ -196,12 +194,9 @@ local MIN_REVALIDATE_SECONDS = 30
 local MAX_REVALIDATE_SECONDS = 300
 local revalidate_backoff = MIN_REVALIDATE_SECONDS
 
--- ⚠ THE RETRY MACHINERY IS DELIBERATELY NOT HERE. A quick start that carried
--- a Mode B identify-retry state machine drew a finding in four consecutive
--- review rounds — every fix added state and the next round found the next
--- interleaving. What a production host owes is listed in the README under
--- "host requirements"; what this file shows is the straight path, which is
--- what a quick start is for.
+-- This quick start shows the direct integration path without a Mode B
+-- identify-retry state machine. Production retry requirements are listed
+-- in the README under "host requirements".
 
 -- Where this example parks a remote-config value; your game reads it wherever
 -- it needs the tuned number.
