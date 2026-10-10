@@ -194,7 +194,7 @@ local LIST_KEYS = { signals_used = true }
 -- check could see it.
 local NESTED_OBJECT_KEYS = {
 	flags = { crash_profile = true, server_analytics = true, child_rules = true, operation_blocks = true },
-	scope = { workspace_id = true, app_id = true, environment_id = true },
+	scope = { workspace_key = true, app_key = true, environment_key = true },
 	basis = { character = true, table_provenance = true, notice = true },
 }
 
@@ -353,7 +353,7 @@ skip_value = function(text, pos, depth, collect)
 		local close = c == "{" and "}" or "]"
 		-- ⚠ DUPLICATE KEYS ARE AMBIGUOUS AT EVERY DEPTH, NOT ONLY AT THE ROOT.
 		-- The root walk refused them and this one skipped nested values whole,
-		-- so a scope carrying workspace_id twice — once the caller's, once
+		-- so a scope carrying workspace_key twice — once the caller's, once
 		-- another tenant's — was decided silently by the decoder, last one
 		-- wins, and then compared against the caller's own scope.
 		local seen = c == "{" and {} or nil
@@ -918,9 +918,9 @@ local function restriction_key(context)
 	local function field(value)
 		parts[#parts + 1] = key_field(value)
 	end
-	field(context.workspace_id)
-	field(context.app_id)
-	field(context.environment_id)
+	field(context.workspace_key)
+	field(context.app_key)
+	field(context.environment_key)
 	field(context.app_version)
 	field(context.locale)
 	field(context.platform)
@@ -1010,9 +1010,9 @@ end
 -- band at all, so the request goes out claiming this player has none.
 local CONTEXT_KEYS = {
 	endpoint = true,
-	workspace_id = true,
-	app_id = true,
-	environment_id = true,
+	workspace_key = true,
+	app_key = true,
+	environment_key = true,
 	app_version = true,
 	store = true,
 	store_region = true,
@@ -1031,7 +1031,7 @@ function M.validate_context(context)
 			return false, "the context carries an unknown field"
 		end
 	end
-	for _, field in ipairs({ "workspace_id", "app_id", "environment_id" }) do
+	for _, field in ipairs({ "workspace_key", "app_key", "environment_key" }) do
 		if not bounded_string(context[field], MAX_ENTRY) then
 			return false, field .. " is missing or over its bound"
 		end
@@ -1099,9 +1099,9 @@ end
 
 local function request_body(context)
 	local body = {
-		workspace_id = context.workspace_id,
-		app_id = context.app_id,
-		environment_id = context.environment_id,
+		workspace_key = context.workspace_key,
+		app_key = context.app_key,
+		environment_key = context.environment_key,
 		app_version = context.app_version,
 		locale = context.locale,
 		platform = context.platform,
@@ -1114,8 +1114,8 @@ local function request_body(context)
 	if context.age_band ~= nil then
 		body.age_band = { vocabulary = context.age_band.vocabulary, band = context.age_band.band }
 	end
-	-- Sent only when asked: without it the request is the one every earlier
-	-- release sent, byte for byte.
+	-- Sent only when asked: otherwise the version 3 request asks for the
+	-- plan alone, without an advisory member.
 	if context.advisory == true then
 		body.advisory = true
 	end
@@ -1311,8 +1311,8 @@ local function parse_plan(plan, context, now)
 		return nil, "the basis carries no notice"
 	end
 	local scope = plan.scope
-	if scope.workspace_id ~= context.workspace_id
-		or scope.app_id ~= context.app_id or scope.environment_id ~= context.environment_id then
+	if scope.workspace_key ~= context.workspace_key
+		or scope.app_key ~= context.app_key or scope.environment_key ~= context.environment_key then
 		return nil, "the plan is scoped to another app, environment or workspace"
 	end
 	do

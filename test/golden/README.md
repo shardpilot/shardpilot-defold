@@ -12,7 +12,7 @@ policy handler emits**, recorded by the resolver's own golden test.
 | `consent-policy-resolved-advisory.json` | `200`, the same resolved STRICT plan with the optional **advisory part** — the wire bytes |
 | `consent-policy-resolved-advisory.indented.json` | the same, in the review form |
 
-**Provenance, and it is a scene rather than a sentence.** The two `.json`
+**Provenance, and it is a scene rather than a sentence.** The three wire `.json`
 files are the bytes the handler writes on the wire. The resolver's own golden
 test re-indents each raw response and compares *that* with the file it keeps,
 applying the indentation to both sides — so **indentation is the only
@@ -29,15 +29,15 @@ which is the weaker claim and the one that let this SDK and the resolver
 disagree for months. A key reordered, a number respelled or an escape
 rewritten fails that scene.
 
-Recorded from the resolver service's own test at commit `6f027a32`, from
+Recorded from the resolver service's own test at commit `d26a56f5284bf233cc0f8caf054ed772961438ca`, from
 `internal/httpserver/testdata/consent_policy_resolved_strict.json` (blob
-`6a36fcc4`) and `consent_policy_refusal_invalid_scope.json` (blob
-`b9eacf6f`); those are the stored review forms, and the `.indented.json` files
+`ba2795a09d6a591e2904b4d23f9aa81bef5b8ce3`) and `consent_policy_refusal_invalid_scope.json` (blob
+`ec6eb6c293b1d28f1b250c4a23058570755d04a6`); those are the stored review forms, and the `.indented.json` files
 here are copies of them. The resolved body answers the
-request `{workspace_id: ws_1, app_id: app_1, environment_id: env_1,
+request `{workspace_key: ws_1, app_key: app_1, environment_key: env_1,
 app_version: 1.2.3, store: steam, store_region: null, locale: en-GB,
 platform: windows}`; the refusal is the same request with an invalid
-`workspace_id`. Clock fixed at `2026-09-20T12:00:00Z` — the only seam, and why
+`workspace_key`. Clock fixed at `2026-09-20T12:00:00Z` — the only seam, and why
 `expires_at` is `12:05:00Z` with `max_age_seconds` `300`. Everything else is
 the handler's own output, compared as **bytes** rather than through a struct:
 a round trip through the type the handler marshalled from would stay green
@@ -45,7 +45,7 @@ through a renamed tag, a re-nesting, or a `null` where an empty array was.
 
 The advisory pair was recorded the same way, from
 `internal/httpserver/testdata/consent_policy_resolved_strict_with_advisory.json`
-(blob `e4b01af8`), which the `.indented.json` here copies byte for byte. It
+(blob `915ea00fc4cb461f0e9b96299a3e6a91c0167c51`), which the `.indented.json` here copies byte for byte. It
 answers the same request with `advisory: true` added, for a workspace admitted
 to the advisory, from a connection the resolver located in GB. Its plan is the
 resolved plan above, unchanged; the advisory sits beside it and does not alter
