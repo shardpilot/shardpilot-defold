@@ -291,9 +291,9 @@ drift apart:
 local function policy_context()
 	return {
 		endpoint = "http://localhost:8082",
-		workspace_id = "workspace-example",
-		app_id = "app-example",
-		environment_id = "develop",
+		workspace_key = "workspace-example",
+		app_key = "app-example",
+		environment_key = "develop",
 		app_version = "1.0.0",
 		locale = "en",
 		platform = platform.detect(),
