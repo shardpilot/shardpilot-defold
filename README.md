@@ -291,9 +291,9 @@ drift apart:
 local function policy_context()
 	return {
 		endpoint = "http://localhost:8082",
-		workspace_id = "workspace-example",
-		app_id = "app-example",
-		environment_id = "develop",
+		workspace_key = "workspace-example",
+		app_key = "app-example",
+		environment_key = "develop",
 		app_version = "1.0.0",
 		locale = "en",
 		platform = platform.detect(),
@@ -1483,12 +1483,14 @@ consent_policy.prepare(context, function(decision) ... end)
 `context` is validated locally before anything is sent, and a value outside
 its closed vocabulary **costs no request**: `endpoint` (the same URL rule
 `ingest_url` and `crash_ingest_url` obey — **https anywhere, plain http only
-for a loopback host**, no userinfo, query, fragment or path), `workspace_id`, `app_id`, `environment_id`,
+for a loopback host**, no userinfo, query, fragment or path), `workspace_key`, `app_key`, `environment_key`,
 `app_version`, `locale`, `platform` (use `platform.detect()`), and optionally
 `store` and `age_band` — which is accepted, sent as given, and **ignored by
 the resolver in this release** — and `advisory`, which must be `true` or
 `false`: `true` asks the resolver for the advisory part, and without it the
-request is the one earlier releases sent. `store_region` is **not accepted** in this release: a
+version 3 request asks for the plan alone. The scope uses public keys; retired
+`workspace_id`, `app_id`, and `environment_id` fields, including mixed contexts,
+are refused locally. `store_region` is **not accepted** in this release: a
 non-null value carries a country claim, and refusing it here is what stops it
 travelling.
 

@@ -248,9 +248,9 @@ end
 local function context(overrides)
 	local ctx = {
 		endpoint = "https://policy.example",
-		workspace_id = "ws-synthetic",
-		app_id = "app-synthetic",
-		environment_id = "env-synthetic",
+		workspace_key = "ws-synthetic",
+		app_key = "app-synthetic",
+		environment_key = "env-synthetic",
 		app_version = "1.2.3",
 		locale = "en",
 		platform = "windows",
@@ -290,9 +290,9 @@ local function plan(overrides)
 		consent_text_version = "ff-v1.3",
 		presented_language = "en",
 		scope = {
-			workspace_id = "ws-synthetic",
-			app_id = "app-synthetic",
-			environment_id = "env-synthetic",
+			workspace_key = "ws-synthetic",
+			app_key = "app-synthetic",
+			environment_key = "env-synthetic",
 		},
 		signals_used = {
 			{ name = "server_country", available = false, reason = "not_enabled_in_release" },
@@ -558,9 +558,9 @@ end
 -- genuinely in scope for it rather than approximately.
 local function golden_context()
 	return context({
-		workspace_id = "ws_1",
-		app_id = "app_1",
-		environment_id = "env_1",
+		workspace_key = "ws_1",
+		app_key = "app_1",
+		environment_key = "env_1",
 		app_version = "1.2.3",
 		store = "steam",
 		locale = "en-GB",
@@ -684,7 +684,7 @@ local function test_a_refused_value_costs_no_request()
 	-- The other closed vocabularies behave the same way.
 	for _, override in ipairs({
 		{ platform = "toaster" }, { store = "epic" }, { app_version = "1 2 3" },
-		{ locale = string.rep("x", 36) }, { workspace_id = "__nil__" },
+		{ locale = string.rep("x", 36) }, { workspace_key = "__nil__" },
 		{ age_band = { vocabulary = "v1" } },
 	}) do
 		reset()
@@ -708,7 +708,7 @@ local function test_every_malformed_plan_is_strict()
 		{ "unknown regime", plan({ regime = "PERMISSIVE" }) },
 		{ "unknown crash profile", plan({ flags = { crash_profile = "EVERYTHING" } }) },
 		{ "unknown server analytics", plan({ flags = { server_analytics = "MAYBE" } }) },
-		{ "another app's scope", plan({ scope = { workspace_id = "ws-synthetic", app_id = "other", environment_id = "env-synthetic" } }) },
+		{ "another app's scope", plan({ scope = { workspace_key = "ws-synthetic", app_key = "other", environment_key = "env-synthetic" } }) },
 		{ "no expiry", plan({ expires_at = "__nil__" }) },
 		{ "version outside its characters", plan({ policy_version = "2026 09 12" }) },
 		{ "unavailable signal with no reason", plan({ signals_used = { { name = "server_country", available = false } } }) },
@@ -885,7 +885,7 @@ local function test_the_cache_is_scoped_to_the_whole_context()
 	assert_equal(again.regime, consent_policy.STRICT_OPT_IN, "with the decision that was cached")
 
 	for _, override in ipairs({
-		{ app_id = "app-other" }, { workspace_id = "ws-other" }, { environment_id = "env-other" },
+		{ app_key = "app-other" }, { workspace_key = "ws-other" }, { environment_key = "env-other" },
 		{ endpoint = "https://policy.other.example" }, { locale = "de" },
 		{ platform = "macos" }, { app_version = "9.9.9" },
 		{ age_band = { vocabulary = "coarse", band = "adult" } },
@@ -1260,9 +1260,9 @@ end
 local function example_plan(overrides)
 	local body = overrides or {}
 	body.scope = {
-		workspace_id = "workspace-example",
-		app_id = "app-example",
-		environment_id = "develop",
+		workspace_key = "workspace-example",
+		app_key = "app-example",
+		environment_key = "develop",
 	}
 	return plan(body)
 end
@@ -2164,13 +2164,13 @@ local function test_a_zero_window_does_not_spin()
 end
 
 -- ⚠ A DUPLICATE KEY IS AMBIGUOUS AT EVERY DEPTH. The root walk refused them
--- and the nested walk skipped values whole, so a scope carrying workspace_id
+-- and the nested walk skipped values whole, so a scope carrying workspace_key
 -- twice — once the caller's, once another tenant's — was decided silently by
 -- the decoder, last one wins, and then compared against the caller's own scope
 -- and passed.
 local function test_nested_duplicate_keys_are_refused()
 	local cases = {
-		{ "scope", '"workspace_id":"ws-other",', '"scope":{' },
+		{ "scope", '"workspace_key":"ws-other",', '"scope":{' },
 		{ "flags", '"child_rules":"unrestricted",', '"flags":{' },
 		{ "basis", '"notice":"other",', '"basis":{' },
 		{ "a signal", '"name":"other",', '"signals_used":[{' },
@@ -3193,8 +3193,8 @@ local function golden_block_plan(blocks, ctx, overrides)
 	local body = json_decode(golden("resolved"))
 	body.signature = NULL
 	body.flags.operation_blocks = blocks
-	body.scope = { workspace_id = ctx.workspace_id, app_id = ctx.app_id,
-		environment_id = ctx.environment_id }
+	body.scope = { workspace_key = ctx.workspace_key, app_key = ctx.app_key,
+		environment_key = ctx.environment_key }
 	body.expires_at = "2099-01-01T00:00:00Z"
 	body.max_age_seconds = 0
 	for key, value in pairs(overrides or {}) do
@@ -3246,7 +3246,7 @@ local function test_known_operation_blocks_survive_fallbacks()
 		elseif mode == "signature" then
 			next_response_body = golden_block_plan({}, ctx, { signature = "unverified-fixture" })
 		elseif mode == "out_of_scope" then
-			next_response_body = golden_block_plan({}, context({ app_id = "another-app" }))
+			next_response_body = golden_block_plan({}, context({ app_key = "another-app" }))
 		elseif mode == "expired" then
 			next_response_body = golden_block_plan({}, ctx, { expires_at = "1970-01-01T00:00:00Z" })
 		elseif mode == "transport" then
@@ -3289,8 +3289,8 @@ end
 
 local function test_operation_blocks_follow_validated_context()
 	local changes = {
-		{ "workspace_id", "second-workspace" }, { "app_id", "second-app" },
-		{ "environment_id", "second-environment" }, { "app_version", "2.0" },
+		{ "workspace_key", "second-workspace" }, { "app_key", "second-app" },
+		{ "environment_key", "second-environment" }, { "app_version", "2.0" },
 		{ "locale", "de" }, { "platform", "linux" }, { "store", "standalone" },
 		{ "endpoint", "https://other-policy.example" },
 		{ "age_band", { vocabulary = "other-vocabulary", band = "adult" } },
@@ -3355,7 +3355,7 @@ end
 local function test_context_change_fences_operation_block_callbacks()
 	reset()
 	local first, second = golden_context(), golden_context()
-	second.app_id = "second-app"
+	second.app_key = "second-app"
 	local saved_request, pending, stale = http.request
 	http.request = function(_, _, callback) pending = callback end
 	consent_policy.prepare(first, function(decision) stale = decision end)
@@ -3384,7 +3384,7 @@ local function test_invalid_context_does_not_forget_operation_blocks()
 	local ctx = golden_context()
 	learn_blocks({ "restricted" }, ctx)
 	local bad = golden_context()
-	bad.app_id = nil
+	bad.app_key = nil
 	local invalid = prepare(bad)
 	assert_equal(invalid.reason, "invalid_request")
 	assert_blocks(invalid, {}, "none")
@@ -3400,7 +3400,7 @@ local function test_caller_mutation_cannot_relabel_operation_blocks()
 	http.request = function(_, _, callback) pending = callback end
 	consent_policy.prepare(ctx, function(value) decision = value end)
 	http.request = saved_request
-	ctx.app_id = "mutated-after-dispatch"
+	ctx.app_key = "mutated-after-dispatch"
 	pending(nil, nil, { status = 200, response = golden_block_plan({}, ctx) })
 	assert_true(not decision.plan_used, "mutating the caller's table cannot change the request scope")
 	assert_blocks(decision, { "restricted" }, "preserved")
@@ -3431,7 +3431,7 @@ local function test_the_advisory_opt_in_keeps_operation_blocks()
 	reset()
 	local first, second = golden_context(), golden_context()
 	first.advisory = true
-	second.app_id = "second-app"
+	second.app_key = "second-app"
 	learn_blocks({ "restricted" }, first)
 	next_response_body = "not JSON"
 	assert_blocks(prepare(second), {}, "none")
@@ -3440,8 +3440,8 @@ end
 
 local function test_the_example_keeps_blocks_after_resume_outage()
 	reset()
-	local ctx = context({ workspace_id = "workspace-example", app_id = "app-example",
-		environment_id = "develop" })
+	local ctx = context({ workspace_key = "workspace-example", app_key = "app-example",
+		environment_key = "develop" })
 	next_response_body = golden_block_plan({ "restricted" }, ctx, { max_age_seconds = 300 })
 	local calls, initial = run_example(function() next_response_body = "not JSON" end,
 		{ "focus_lost", "focus_gained" }, nil, false, { age_band = "adult", answer = true })
@@ -3531,9 +3531,9 @@ local function assert_refused(decision, label)
 		label .. ": the choice defaults off")
 end
 
--- ⚠ ASKED FOR, NEVER ASSUMED. Without the opt-in the request is the one every
--- earlier release sent; with it, the member travels as a boolean; and anything
--- else is refused before a byte leaves.
+-- ASKED FOR, NEVER ASSUMED. The version 3 request omits the advisory member
+-- without the opt-in; with it, the member travels as a boolean. Other values
+-- are refused before a byte leaves.
 local function test_the_advisory_is_asked_for_only_when_requested()
 	for _, override in ipairs({ {}, { advisory = false } }) do
 		reset()
@@ -3860,7 +3860,101 @@ local function test_example_sends_the_presented_notice_tuple()
 	assert_true(called, "real example must reach the setter")
 end
 
+local function test_scope_key_wire_contract()
+	local passed, failed = 0, 0
+	local function scene(name, run)
+		local ok, err = pcall(run)
+		if ok then passed = passed + 1 else failed = failed + 1; print("FAIL scope wire: " .. name .. ": " .. tostring(err)) end
+	end
+	local axes = { "workspace", "app", "environment" }
+	for _, advisory in ipairs({ false, true }) do
+		scene("request advisory=" .. tostring(advisory), function()
+			reset()
+			local ctx = golden_context(); ctx.advisory = advisory
+			next_response_body = golden(advisory and "resolved-advisory" or "resolved")
+			local decision, calls = prepare(ctx)
+			assert_equal(calls, 1); assert_equal(#requests, 1)
+			local sent = json.decode(requests[1].body)
+			local expected = { workspace_key = ctx.workspace_key, app_key = ctx.app_key,
+				environment_key = ctx.environment_key, app_version = ctx.app_version,
+				locale = ctx.locale, platform = ctx.platform, store = ctx.store }
+			if advisory then expected.advisory = true end
+			for key, value in pairs(expected) do assert_equal(sent[key], value, key) end
+			for key in pairs(sent) do assert_true(expected[key] ~= nil, "unexpected request field " .. key) end
+			assert_true(decision.plan_used, tostring(decision.reason))
+		end)
+	end
+	for _, axis in ipairs({ "workspace", "app", "environment", "all" }) do
+		for _, mixed in ipairs({ false, true }) do
+			scene("context " .. axis .. " mixed=" .. tostring(mixed), function()
+				reset()
+				local ctx = golden_context()
+				for _, field in ipairs(axis == "all" and axes or { axis }) do
+					ctx[field .. "_id"] = ctx[field .. "_key"]
+					if not mixed then ctx[field .. "_key"] = nil end
+				end
+				local decision, calls = prepare(ctx)
+				assert_equal(calls, 1); assert_equal(#requests, 0)
+				assert_equal(decision.reason, "invalid_request")
+			end)
+		end
+	end
+	for _, read in ipairs({ golden, golden_indented }) do
+		for _, name in ipairs({ "resolved", "refusal", "resolved-advisory" }) do
+			local function response(body, malformed)
+				reset()
+				next_response_body = body
+				if name == "refusal" then next_status = 400 end
+				local ctx = golden_context(); ctx.advisory = name == "resolved-advisory"
+				local decision, calls = prepare(ctx)
+				assert_equal(calls, 1); assert_equal(#requests, 1)
+				if name == "refusal" then
+					-- Refusals never become plans; their scope is not consumed.
+					assert_equal(decision.reason, "invalid_scope")
+					assert_true(not decision.plan_used)
+				elseif malformed then
+					assert_equal(decision.reason, "invalid_response")
+					assert_true(not decision.plan_used)
+				else assert_true(decision.plan_used, tostring(decision.reason)) end
+			end
+			scene(name .. " canonical", function() response(read(name), false) end)
+			if name ~= "refusal" then
+				for _, axis in ipairs(axes) do
+					scene(name .. " foreign " .. axis, function()
+						reset(); next_response_body = read(name)
+						local ctx = golden_context(); ctx[axis .. "_key"] = "other-scope"
+						ctx.advisory = name == "resolved-advisory"
+						local decision, calls = prepare(ctx)
+						assert_equal(calls, 1); assert_equal(#requests, 1)
+						assert_true(not decision.plan_used)
+						assert_equal(decision.reason, "invalid_response")
+						assert_equal(decision.detail, "the plan is scoped to another app, environment or workspace")
+					end)
+				end
+			end
+			for _, axis in ipairs({ "workspace", "app", "environment", "all" }) do
+				for _, mixed in ipairs({ false, true }) do
+					scene(name .. " " .. axis .. " mixed=" .. tostring(mixed), function()
+						local body = read(name)
+						for _, field in ipairs(axis == "all" and axes or { axis }) do
+							local key = '"' .. field .. '_key"'
+							local replacement = '"' .. field .. '_id"'
+							if mixed then replacement = replacement .. ':null,' .. key end
+							local count; body, count = body:gsub(key, replacement, 1)
+							assert_equal(count, 1, "golden must carry " .. key)
+						end
+						response(body, true)
+					end)
+				end
+			end
+		end
+	end
+	print("scope wire scenes: " .. passed .. " passed, " .. failed .. " failed")
+	assert_equal(failed, 0, "scope wire contract")
+end
+
 local tests = {
+	test_scope_key_wire_contract,
 	test_example_sends_the_presented_notice_tuple,
 	test_known_operation_blocks_survive_fallbacks,
 	test_unlearned_block_fallback_is_empty,
