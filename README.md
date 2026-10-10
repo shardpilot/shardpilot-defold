@@ -201,14 +201,10 @@ Minimal Defold script (see [`examples/minimal/`](examples/minimal)):
 > `crash.set_enabled(false)`**: those record a player's decision, and nobody
 > decided anything — the policy changed. See [Consent regime](#consent-regime).
 
-> ⚠ **QUOTED FROM `examples/minimal/main.script`, NOT RETYPED FROM IT.** The
-> blocks below are extracted byte for byte and
-> `test/test_documented_regions.lua` fails when one of them drifts. This flow
-> used to live in three places — the example, this section, and the packaged
-> skill — and one review round found five findings that were the three copies
-> disagreeing: an ordering fixed in one and not the others, retry state removed
-> from one and left in another, a fallback rejected here that the example
-> accepts. There is one copy now.
+> The blocks below are extracted byte for byte from
+> `examples/minimal/main.script`. `test/test_documented_regions.lua` checks
+> that the README and packaged integration guide match those source regions.
+> Update the example first, then regenerate its quoted blocks.
 >
 > The helpers this section does not quote — `suspend_analytics`,
 > `suspend_crash`, `start_analytics`, `start_crash` — are in the example, and
@@ -269,12 +265,9 @@ local MIN_REVALIDATE_SECONDS = 30
 local MAX_REVALIDATE_SECONDS = 300
 local revalidate_backoff = MIN_REVALIDATE_SECONDS
 
--- ⚠ THE RETRY MACHINERY IS DELIBERATELY NOT HERE. A quick start that carried
--- a Mode B identify-retry state machine drew a finding in four consecutive
--- review rounds — every fix added state and the next round found the next
--- interleaving. What a production host owes is listed in the README under
--- "host requirements"; what this file shows is the straight path, which is
--- what a quick start is for.
+-- This quick start shows the direct integration path without a Mode B
+-- identify-retry state machine. Production retry requirements are listed
+-- in the README under "host requirements".
 
 -- Where this example parks a remote-config value; your game reads it wherever
 -- it needs the tuned number.

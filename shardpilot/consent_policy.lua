@@ -183,10 +183,8 @@ local LIST_KEYS = { signals_used = true }
 -- ones we read and still be used. A key we do not understand is a plan we
 -- cannot say we fully read, and "use the parts I understood" is how a
 -- permissive default gets in.
--- ⚠ EVERY OBJECT IN THIS SCHEMA HAS AN EXACT KEY SET, and they live together
--- so that adding one is adding a row here rather than remembering a rule. The
--- root was closed first, then age_band, then these two — the same finding
--- arriving at four doors, which is what a roster is for.
+-- Every object in this schema has an exact key set. Keep the nested sets
+-- together so that each added object has an explicit allowed vocabulary.
 --
 -- They are checked on the RAW TEXT, not on the decoded tables, because a
 -- present-and-null member decodes to the same nil an absent one does: an
