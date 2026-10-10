@@ -35,7 +35,10 @@
 -- The cache is stamped with the (workspace, environment, client, url) scope
 -- it was fetched for; a cache written by any other scope is a miss (its ETag
 -- is never sent, its values never served) and is overwritten by the next
--- successful fetch. There is no experiment assignment, no exposure events,
+-- successful fetch. Unknown and both denied states omit the client path
+-- segment and use an empty client cache component; only granted consent
+-- permits the anonymous ID. The host user ID is never sent.
+-- There is no experiment assignment, no exposure events,
 -- and no automatic refresh here by design — the game triggers every fetch.
 --
 -- Targeting attributes (dark opt-in): with
@@ -46,8 +49,7 @@
 -- opt-in is on AND the consent state read at dispatch time is "granted" —
 -- configuration delivery itself stays consent-neutral (the fetch still
 -- happens), but an unknown or denied state (the forced-minor denial
--- included) keeps the URL byte-identical to the attribute-less path and
--- serves whatever the server publishes for an untargeted client. The
+-- included) uses the identifier-free route and serves its published values. The
 -- vocabulary, bounds, and normalization are the experiment consumer's,
 -- verbatim (shardpilot/experiments.lua normalize_attributes). Targeting is
 -- 100% server-evaluated, and the cache scope deliberately excludes the
@@ -88,8 +90,10 @@ end
 function M.build_url(base_url, workspace_id, environment_id, client_id, attributes)
 	local url = trim_slash(base_url) .. config_route_prefix
 		.. escape_segment(workspace_id) .. "/"
-		.. escape_segment(environment_id) .. "/"
-		.. escape_segment(client_id)
+		.. escape_segment(environment_id)
+	if client_id and client_id ~= "" then
+		url = url .. "/" .. escape_segment(client_id)
+	end
 	if type(attributes) == "table" and #attributes > 0 then
 		local parts = {}
 		for i = 1, #attributes do
@@ -405,17 +409,15 @@ RemoteConfig.__index = RemoteConfig
 -- later set_anonymous_id naturally invalidates the cache through the scope
 -- check instead of silently fetching configuration for a stale client id.
 -- `consent` (optional) is a function returning the client's current consent
--- state, read the same live way — it gates ONLY the attribute
--- pass-through, never the fetch itself.
+-- state, read the same live way: identity and attributes require a grant,
+-- while the fetch remains available in every state.
 function M.new(config, identity, consent)
 	local rc = setmetatable({
 		config = config,
 		identity = identity,
 		-- Function returning the client's CURRENT consent state string, read
-		-- at every dispatch (never captured) so the attribute gate below
-		-- always sees the live decision. Optional: absent reads as unknown,
-		-- which fails the gate closed — a directly constructed instance can
-		-- never leak attributes by accident.
+		-- at dispatch for identity and attribute selection. An absent accessor
+		-- reads as unknown and selects identifier-free delivery.
 		consent = consent,
 		-- The raw attribute set stored by set_attributes (nil = none).
 		-- Normalized per fetch, not at store time, so the vocabulary
@@ -449,7 +451,7 @@ function M.new(config, identity, consent)
 	-- Serve the persisted last-known-good snapshot immediately after a
 	-- restart: getters work before (and without) any fetch when a cache for
 	-- this exact scope exists.
-	local cache = rc:load_cache(rc:client_id())
+	local cache = rc:load_cache(rc:request_client_id())
 	if cache then
 		local values, version = parse_config(cache.body)
 		if values then
@@ -466,6 +468,16 @@ function RemoteConfig:client_id()
 		return nil
 	end
 	return value
+end
+
+-- The empty component selects identifier-free delivery and its own cache.
+-- Read consent once at the synchronous fetch boundary; a later decision
+-- cannot change the scope of the response already requested.
+function RemoteConfig:request_client_id()
+	if type(self.consent) ~= "function" or self.consent() ~= "granted" then
+		return ""
+	end
+	return self:client_id()
 end
 
 function RemoteConfig:scope_for(client_id)
@@ -567,8 +579,9 @@ end
 --     content came from (or predates) the held record, and adopting a
 --     captured older record could roll back a fresher body installed while
 --     the response was in flight;
---   * the scope must still be current — checked BEFORE anything settles: an
---     identity rotated while the response was in flight makes the response
+--   * an identified scope must still match the current identity, while
+--     the empty client scope remains valid across consent changes. Checked
+--     BEFORE anything settles: an identity rotated while the response was in flight makes the response
 --     another client's configuration (a different rollout bucket), which
 --     must not be served or persisted — and it says nothing about the
 --     CURRENT scope's configuration either, so it must not settle the fence
@@ -580,7 +593,8 @@ end
 -- getters read.
 function RemoteConfig:install(seq, result, new_cache, scope, authoritative, served_cache, revalidated_cache)
 	local current_id = self:client_id()
-	if not current_id or self:scope_for(current_id) ~= scope then
+	if scope ~= self:scope_for("")
+		and (not current_id or self:scope_for(current_id) ~= scope) then
 		return
 	end
 	-- The per-scope fence: an outcome settled under another identity never
@@ -716,7 +730,7 @@ function RemoteConfig:fetch(callback)
 		return result
 	end
 
-	local client_id = self:client_id()
+	local client_id = self:request_client_id()
 	if not client_id then
 		finish({ ok = false, from_cache = false, error = "client_id_unavailable" })
 		return false, "client_id_unavailable"

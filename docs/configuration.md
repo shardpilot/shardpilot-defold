@@ -205,7 +205,11 @@ the `api_key` authenticates only the remote-config fetch.
   always an explicit call (the SDK never fetches configuration on its own),
   responses are cached in one durable per-app record, and getters serve the
   last-known-good snapshot across restarts (the caller's default until any
-  configuration is available). Full semantics — ETag revalidation, offline
+  configuration is available). Granted consent permits the anonymous ID in the
+  URL; unknown and both denied states use `/config/v1/{workspace_id}/{environment_id}`
+  without identity or targeting attributes. Their empty client cache scope
+  prevents reuse of identified values or validators, including on restart.
+  Full semantics — ETag revalidation, offline
   fallback, the `401`/`403` fail-closed rule, and the cache's scope check —
   are in the README's "Remote config" section.
 - **`remote_config_attributes_enabled`** (default `false` = dark, boolean).
@@ -220,7 +224,7 @@ the `api_key` authenticates only the remote-config fetch.
   ≤512-byte values, 64-attribute cap, sorted, out-of-vocabulary names
   dropped client-side. **Privacy contract**: attributes ride ONLY while
   consent is granted — unknown or denied consent (forced-minor included)
-  keeps the fetch attribute-less and serves the untargeted defaults; see
+  keeps the fetch free of identity and attributes; see
   `docs/privacy.md`. Targeting is 100% server-evaluated.
 
 ## Experiments

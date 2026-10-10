@@ -26,7 +26,8 @@ the deeper reference.
   durable outbox.
 - **Remote config**: explicit `GET`-based fetch with an ETag-revalidated
   durable last-known-good cache and typed getters. No automatic refresh —
-  every fetch is an explicit call.
+  every fetch is an explicit call. Without granted consent it omits identity
+  and targeting attributes and uses a separate cache scope.
 - **Experiments (off by default)**: a server-evaluated variant assignment
   consumer behind `experiments_enabled = true`, which also requires
   `remote_config_url` AND `api_key`. It requires analytics consent `granted`,
@@ -1010,12 +1011,15 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
 ## Remote config
 
 Explicit fetch only — the SDK never fetches on its own; there is no automatic
-or interval refresh. The fetch is
-`GET {remote_config_url}/config/v1/{workspace_id}/{environment_id}/{client_id}`
-(the `/config/v1/` plane, a separate service from ingest), authenticated with
-the publishable `api_key`, ETag-revalidated, and **not consent-gated**
-(configuration delivery carries no analytics payload; `client_id` is the
-persisted anonymous ID and only scopes which config to serve).
+or interval refresh. With granted consent the fetch is
+`GET {remote_config_url}/config/v1/{workspace_id}/{environment_id}/{client_id}`,
+where `client_id` is the persisted anonymous ID. Unknown and both denied states
+omit that final segment and all targeting attributes. The host user ID is never
+sent and there is no request body. Both routes authenticate with the publishable
+`api_key`. Identifier-free requests use an empty client cache component and
+never reuse identified values or ETags, including on restart. Responses retain
+the scope selected at dispatch, even when consent changes before they arrive.
+Getters keep their last served snapshot until another response replaces it.
 
 <!-- doc-region: none -- the remote-config API, which the flow only parks a value from -->
 ```lua
@@ -1045,7 +1049,7 @@ carry the experiment attribute vocabulary (`geo`, `app_version`,
 ≤512-byte values, 64-attribute cap, sorted; out-of-vocabulary names dropped,
 never sent) as query parameters for server-side delivery rules. Attributes
 ride ONLY while consent is granted — unknown or denied consent (forced-minor
-included) fetches attribute-less and serves the untargeted defaults. Default
+included) fetches without identity or attributes. Default
 `false`: the fetch URL stays byte-identical to the attribute-less path and
 the setter is inert. The flag requires `remote_config_url`
 (`remote_config_attributes_requires_remote_config_url` otherwise).

@@ -93,7 +93,8 @@ not the platform boundary.
   ETag-revalidated durable cache and typed getters
   (`remote_config_number("spawn_rate", 1.0)`), serving the last-known-good
   snapshot across restarts and offline launches, and failing closed on
-  `401`/`403`. Every fetch is an explicit game-triggered call. See
+  `401`/`403`. Every fetch is an explicit game-triggered call; without granted
+  consent it omits identity and targeting attributes. See
   [Remote config](#remote-config).
 - Serves **experiments** — server-evaluated variant assignments with a durable
   last-known-good cache, periodic revalidation, and exposure/outcome facts.
@@ -628,7 +629,7 @@ initialization attempt. `new(config)` creates an independent client instance.
 |---|---|---|
 | `ingest_url` | — (required) | `https://…`, or `http://` only for `localhost`/`127.0.0.1`/`::1`; no query/fragment/path |
 | `remote_config_url` | `nil` (disabled) | Remote-config base URL (same shape rules as `ingest_url`); a **separate** service from the ingest endpoint. Requires `api_key` — see [Remote config](#remote-config) |
-| `remote_config_attributes_enabled` | `false` (dark) | Opt-in: fetches carry the attributes stored via `set_remote_config_attributes` as query parameters — only while consent is **granted** (unknown/denied fetch attribute-less). Requires `remote_config_url` — see [Remote config](#remote-config) |
+| `remote_config_attributes_enabled` | `false` (dark) | Opt-in: fetches carry the attributes stored via `set_remote_config_attributes` as query parameters — only while consent is **granted** (unknown/denied fetch without identity or attributes). Requires `remote_config_url` — see [Remote config](#remote-config) |
 | `experiments_enabled` | `false` (off) | Opts into the experiment-assignment consumer. Requires **both** `remote_config_url` and `api_key` — see [Experiments](#experiments) |
 | `workspace_id` | — (required) | Tenant key |
 | `app_id` | — (required) | Product key |
@@ -996,10 +997,12 @@ local motd = shardpilot.remote_config_string("motd", "")
 local hard_mode = shardpilot.remote_config_boolean("hard_mode", false)
 ```
 
-The fetch is `GET {remote_config_url}/config/v1/{workspace_id}/{environment_id}/{client_id}`
-with the publishable `api_key` as the `Bearer` (`client_id` = the persisted
-anonymous ID — the same identity the events carry, so per-client rollout
-bucketing is consistent with analytics). The endpoint answers
+The fetch uses the publishable `api_key` as the `Bearer`. With granted consent,
+its URL is `GET {remote_config_url}/config/v1/{workspace_id}/{environment_id}/{client_id}`,
+where `client_id` is the persisted anonymous ID used for per-client bucketing.
+With unknown, denied or forced-minor consent, it omits that final path segment
+and all targeting attributes: `GET {remote_config_url}/config/v1/{workspace_id}/{environment_id}`.
+The host user ID is never sent; config requests have no body. The endpoint answers
 `{ "version": <number>, "values": { key: value } }` with an `ETag`; the getters
 serve the `values` map, and `remote_config_version()` reads the wrapper's
 `version` only — it is response metadata, never a configuration value.
@@ -1035,8 +1038,12 @@ Fetch semantics:
 The cache is scoped to the `(workspace_id, environment_id, client_id,
 remote_config_url)` tuple; a record written by any other scope is a miss (its
 ETag is never sent, its values never served) and is overwritten by the next
-successful fetch. Rotating the anonymous ID re-scopes the next fetch the same
-way.
+successful fetch. Identifier-free requests use an empty client component, so
+identified values and ETags are not reused for them, including on restart.
+The scope selected at dispatch also labels the eventual response, even if
+consent changes while it is in flight. Rotating the anonymous ID re-scopes
+identified fetches. Getters retain the last served snapshot until another
+response replaces it; a consent change alone does not clear that snapshot.
 
 **Honest boundaries:**
 
@@ -1058,11 +1065,10 @@ way.
   left in place) so a restart serves the game's defaults rather than
   rolled-back values. Before the first successful fetch on a fresh install,
   getters serve the caller's defaults.
-- The fetch is **not consent-gated**: config delivery carries no analytics
-  payload — the client id in the URL only scopes which config to serve
-  (consistent across our SDKs). See [`docs/privacy.md`](docs/privacy.md).
-- **Targeting attributes (dark opt-in) are the one
-  granted-consent-only exception.** With
+- Fetching remains available in every consent state. The anonymous ID and
+  targeting attributes require granted consent; the other states use the
+  identifier-free route. See [`docs/privacy.md`](docs/privacy.md).
+- **Targeting attributes also require a dark opt-in.** With
   `remote_config_attributes_enabled = true`, attributes stored via
   `shardpilot.set_remote_config_attributes({ geo = "US", … })` ride each
   fetch as sorted, percent-escaped query parameters so **server-side**
@@ -1073,9 +1079,8 @@ way.
   (≤512-byte values, 64-attribute cap; out-of-vocabulary names are dropped
   client-side, never sent). Attributes ride **only while consent is
   granted**: unknown consent or either denied state (forced-minor included)
-  keeps the URL byte-identical to the attribute-less path — the fetch still
-  happens and serves the untargeted defaults, so config delivery stays
-  consent-neutral while "no grant = zero attribute bytes" holds. The SDK
+  uses the identifier-free route without targeting attributes. The fetch
+  still happens and serves the configuration published for that route. The SDK
   still evaluates no rules client-side, and the durable cache stays one
   record per (workspace, environment, client, url) scope, targeted or not —
   a cached body may reflect the previously sent attribute set until the
@@ -1920,12 +1925,11 @@ separate prerequisites; the client does not prove the notice was displayed.
   read (a retention limit), and any entry is removed as soon as its report is
   accepted or terminally rejected. See
   [`docs/crash.md`](docs/crash.md#privacy).
-- **Remote config is not consent-gated.** The fetch delivers configuration TO
-  the device and carries no analytics payload; the anonymous client id in the
-  URL only scopes which config to serve (per-client rollout bucketing). A
-  denied analytics consent therefore does not block `fetch_remote_config` —
-  consistent across our SDKs. The cached record holds only the served config
-  body and its ETag.
+- **Remote config remains available without a grant.** Unknown and both denied
+  states omit the anonymous ID and targeting attributes. Only granted consent
+  permits the ID in the URL; the host user ID is never sent. The cached record
+  holds the served body, ETag, scope and fetch timestamp, with an empty client
+  component for identifier-free requests.
 - The SDK does not log tokens or full payloads, and makes no
   provider/model/GitHub/billing/account-management write calls. See
   [`docs/privacy.md`](docs/privacy.md) and [`SECURITY.md`](SECURITY.md).

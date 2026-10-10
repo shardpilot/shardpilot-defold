@@ -1382,19 +1382,14 @@ function M.new(config, defer_init_diagnostics)
 			code = "identity_override_changed",
 		})
 	end
-	-- Remote config rides the client's identity: the persisted anonymous id
-	-- is the client id every fetch is scoped by, read through the accessor at
-	-- fetch time so a later set_anonymous_id is naturally picked up (and the
-	-- old identity's cache becomes a scope miss). Constructed here — after the
-	-- anonymous id is resolved — so a cached snapshot for this exact scope is
-	-- served by the getters immediately, before any fetch.
+	-- Remote config selects the anonymous ID only with granted consent; other
+	-- states select an empty client scope. Live accessors keep dispatch and
+	-- startup cache selection aligned with the client's current decision.
 	if normalized.remote_config_url then
 		client.remote_config = remote_config_mod.new(normalized, function()
 			return client.anonymous_id
 		end, function()
-			-- Read live at every dispatch: the attribute gate must
-			-- see the consent state of the fetch's moment, so a downgrade
-			-- strips attributes from the very next fetch.
+			-- Read live at dispatch: denial strips identity and attributes.
 			return client.consent_state
 		end)
 	end
@@ -2564,9 +2559,8 @@ end
 -- Thin delegates over the remote-config client (shardpilot/remote_config.lua),
 -- present only when `remote_config_url` is configured. The fetch is always an
 -- explicit game-triggered call — the SDK never fetches configuration on its
--- own — and it is deliberately NOT consent-gated: configuration delivery
--- carries no analytics payload (the client id in the URL only scopes which
--- configuration to serve), so a denied analytics consent does not block it.
+-- own. Every consent state can fetch, but only granted consent permits the
+-- anonymous ID in the URL. Other states omit identity and attributes.
 -- The typed getters never fail: without configuration (or without remote
 -- config at all) they serve the caller's default.
 

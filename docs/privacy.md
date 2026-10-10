@@ -158,9 +158,9 @@ is denied (either flavor) or unknown: the receipt documents the decision
 itself, which is its legal purpose — it is what drives server-side
 per-actor suppression and erasure consent rows, so a denial that never
 reached the server would be a denial the backend could not honor. This is
-the one deliberate exception to "a non-granted state produces zero wire
-traffic", it carries no event payload, and an install with no explicit
-decision (an empty outbox) still transmits nothing.
+consent traffic with no event payload. An install with no explicit decision
+(an empty outbox) sends no receipts. Explicit identifier-free remote-config
+fetches and separately configured crash reporting follow their own rules.
 
 **What the server accepts from a publishable key (Mode A).** The ingest
 service records **denial** receipts — `set_consent(false)` and the
@@ -483,21 +483,22 @@ offline launch still gets the previously fetched values. This cache:
   client id, or endpoint is never served and is overwritten by the next
   successful fetch;
 - is **one bounded record**, overwritten in place — it cannot accumulate;
-- is **not consent-gated**: the fetch delivers configuration and carries no
-  analytics payload (the anonymous client id in the URL only scopes which
-  configuration to serve, e.g. for per-client rollout percentages), so a
-  denied analytics consent does not block it or clear the cache — consistent
-  across our SDKs;
-- carries **targeting attributes only under an explicit grant** (the one
-  personal-data-shaped exception, dark by default): with the targeting opt-in
+- remains **available in every consent state**: unknown and both denied states
+  omit the anonymous ID path segment and targeting attributes. The anonymous
+  ID is sent only with granted consent; the host user ID is never sent and
+  the request has no body. Identifier-free requests use an empty client cache
+  component, so identified cache values and ETags are not loaded for them,
+  including on restart. Responses retain their dispatch scope across consent
+  changes. Getters keep their last served snapshot until a response replaces
+  it; denial alone does not clear that snapshot;
+- carries **targeting attributes only under an explicit grant** and opt-in
+  (dark by default): with the targeting opt-in
   (`remote_config_attributes_enabled = true`) the attributes the game stores
   via `set_remote_config_attributes` ride the fetch as query parameters so
   server-side delivery rules can target this client — and they ride ONLY
   while the consent state read at dispatch time is granted. Unknown consent
   and both denied states (the forced-minor denial included) keep the fetch
-  attribute-less — byte-identical to the no-opt-in URL — and serve the
-  untargeted defaults, so "no grant = zero attribute bytes egressed" holds
-  while configuration delivery itself stays consent-neutral. The cache scope
+  identifier-free and serve the configuration published for that route. The cache scope
   deliberately excludes the attribute set (one record per scope, targeted or
   not): a cached body may reflect the previously sent attributes until the
   next successful fetch; and
