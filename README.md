@@ -150,57 +150,22 @@ configured, run `.venv-evidence-sender/bin/python examples/evidence-sender/send.
 
 Minimal Defold script (see [`examples/minimal/`](examples/minimal)):
 
-> **Policy first.** `consent_policy.prepare` is the first integration call and
-> `shardpilot.init` runs **inside its callback**. Requiring the SDK is not the
-> barrier — that only loads code; `init` is, because it builds the client,
-> which loads the persisted scope record and mints an anonymous identifier.
-> Calling it before the decision would create an identity for a player whose
-> consent regime had not been established yet. A decision is **not** consent,
-> and it is not legal advice: ShardPilot's resolver returns the
-> `STRICT_OPT_IN` regime to every caller, and the decision says whether the
-> optional lane stays closed whatever the player answers. A workspace that has
-> accepted ShardPilot's advisory estimates may additionally receive an
-> advisory, non-binding estimate when the context asks for it
-> (`advisory = true`), as `decision.advisory`; it changes nothing else in the
-> decision, and you, the integrating studio, decide what to do with it. Either
-> way, you still have to ask the player. When the resolver
-> is unreachable or answers something this build will not accept, the callback
-> receives the strict fallback (`plan_used = false`), which tightens and never
-> relaxes.
+> **Policy first.** Resolve before `shardpilot.init`, which creates client
+> state and may mint an identifier. This build has no consent-plan verifier or
+> trusted signing key. Every plan is unused, including `signature: null`:
+> `plan_used = false`, strict default OFF, crash OFF, server analytics denied
+> and child handling minimised. A well-formed unsigned response reports
+> `reason = "plan_unsigned"`; malformed responses retain their validation reason.
 >
-> ⚠ **`STRICT_OPT_IN` MEANS "ASK, DEFAULT OFF" — NOT "DO NOT ASK".** The
-> resolver answers `STRICT_OPT_IN` to every request in this release. A host
-> that reads that as silence never asks anyone and never starts analytics, for
-> every player, forever — which is not the strict regime, it is no product. The
-> regime decides the **default of the question** and the **basis the answer is
-> recorded under**, never whether the question exists: `STRICT` and `UNKNOWN`
-> put the choice with the switch **off** and open the optional lane only on an
-> explicit grant; `SOFT_OPT_OUT` puts a prominent purpose notice with the
-> switch **on** and one tap to turn it off. **Every fallback is strict** — ask
-> with the default off under your own notice text, and a grant given under a
-> fallback is a valid strict grant. That is also why flooding the policy route
-> degrades nothing: strict still collects from the players who say yes.
+> **Unknown operation restrictions keep plan-dependent operations closed.**
+> `operation_blocks = nil` means unknown, not an authorized empty set. Neither
+> a player grant nor unsigned `SOFT_OPT_OUT` can remove that barrier. The minimal
+> example has no independent policy authority, so it starts no lane in this
+> build. A separately reviewed host policy remains the host's responsibility.
 >
-> **Branch on the decision** — `analytics_choice_default` is the state of the
-> switch when your screen opens; `explicit_grant_required` says whether a click
-> is what opens the lane; `crash_profile` decides the crash lane on its own,
-> and crash reporting is ON by default, so an unconditional `crash.init` is how
-> a closed lane gets opened; `server_analytics` gates only your backend's lane.
->
-> ⚠ **The values are the resolver's, and the plan is nested.** `flags` carries
-> `crash_profile`, `server_analytics`, `child_rules` and `operation_blocks`;
-> the vocabularies are lower-case (`off`, `minimal_diagnostics_for_minors`,
-> `denied`, `minimised`). This SDK read a flat plan with upper-case values
-> until it was checked against the resolver's actual bytes — and refused every
-> real response as unreadable. The contract of record is the resolver's
-> published `ConsentPolicyPlan` schema; `test/golden/` holds its output.
->
-> **And resolve again on every named trigger** — after the player answers, on
-> resume, at `valid_for_seconds`, and when the notice text or language changes
-> — then make the running lanes match the fresh answer. A lane that is now
-> closed is **suspended with `shutdown()`, never with `set_consent(false)` or
-> `crash.set_enabled(false)`**: those record a player's decision, and nobody
-> decided anything — the policy changed. See [Consent regime](#consent-regime).
+> Requests and response shapes still follow the published `ConsentPolicyPlan`
+> schema. Shape, scope and expiry checks cannot authenticate a response.
+> See [Consent regime](#consent-regime) for the fallback contract.
 
 > The blocks below are extracted byte for byte from
 > `examples/minimal/main.script`. `test/test_documented_regions.lua` checks
@@ -215,6 +180,10 @@ The state, and what each piece of it is for:
 
 <!-- doc-region: state -->
 ```lua
+-- This build cannot authenticate consent plans. The unknown-block guard below
+-- keeps every plan-dependent lane closed, including under a player grant.
+-- The later consent/lifecycle flow is reached only with established policy
+-- authority; this quick start supplies no independent authority.
 -- ⚠ POLICY FIRST, AND ONE RECONCILE PATH FOR THE WHOLE LIFECYCLE. A consent
 -- regime is not decided once at launch: the plan expires, the notice text
 -- changes, the policy is revoked, the app comes back after a week. Every one
@@ -311,7 +280,8 @@ function host_age_band()
 end
 ```
 
-**The screen is yours too.** The placeholder answers with the regime's own
+**The screen is yours too.** The current unknown-block guard prevents this
+placeholder from opening. Once policy authority is established, it answers with the regime's own
 default — off under `STRICT_OPT_IN`, on under `SOFT_OPT_OUT` — which is what a
 player who closes it without touching the switch does. It answers from
 `update()` rather than synchronously, because a real screen does.
@@ -319,8 +289,7 @@ player who closes it without touching the switch does. It answers from
 <!-- doc-region: present-notice -->
 ```lua
 -- ⚠ YOUR CONSENT UI GOES HERE. It is a GLOBAL so you can replace it with your
--- own screen — and so this repository's suite can drive both answers, which is
--- the only way the granted path is ever exercised.
+-- own screen when an authenticated policy can authorize that flow.
 --
 -- Until you replace it, it answers with the REGIME'S OWN DEFAULT, which is
 -- what a player who closes the screen without touching the switch does: off
@@ -412,20 +381,16 @@ reconcile = function(fresh)
 	revalidate_backoff = MIN_REVALIDATE_SECONDS
 	revalidate_at = fresh.valid_for_seconds and (elapsed + fresh.valid_for_seconds) or nil
 
-	-- (c2) OPERATION BLOCKS CLOSE EVERYTHING, BECAUSE THIS QUICK START CANNOT
-	-- READ THEM. They are restrictions no consent choice lifts — transfer, age
-	-- and capacity, localisation, safety — and mapping a block NAME to the
-	-- client action it restricts needs a vocabulary this file would have to
-	-- invent. The module parses them and puts them on the decision; a quick
-	-- start that then ignored them would let a player's grant open a lane the
-	-- plan had just closed, which is the permissive default in its worst
-	-- place. So: while the list is non-empty, NO lane opens — no question, no
-	-- analytics, no crash — and the reason says which.
-	--
-	-- A production host does the mapping and refuses the restricted actions;
-	-- an unmapped name closes everything, exactly as here. See the README's
-	-- host requirements. In this release the resolver always sends [].
-	if fresh.operation_blocks and #fresh.operation_blocks > 0 then
+	-- (c2) Unknown restrictions cannot authorize any plan-dependent operation.
+	-- A known non-empty list also closes this quick start: it has no mapping
+	-- from restriction names to individual actions. A player grant lifts neither.
+	if fresh.operation_blocks == nil then
+		print("shardpilot: operation restrictions are unknown; no lane opened")
+		suspend_analytics("operation_blocks_unknown")
+		suspend_crash("operation_blocks_unknown")
+		return
+	end
+	if #fresh.operation_blocks > 0 then
 		print("shardpilot: the plan carries " .. #fresh.operation_blocks
 			.. " operation block(s) this quick start cannot map ("
 			.. table.concat(fresh.operation_blocks, ", ") .. "); no lane opened")
@@ -436,13 +401,9 @@ reconcile = function(fresh)
 
 	-- (d) The ANALYTICS lane.
 	--
-	-- ⚠ THE REGIME DECIDES THE DEFAULT OF THE QUESTION, NOT WHETHER IT IS
-	-- ASKED. STRICT means ask with the switch OFF and start only on an
-	-- explicit grant; SOFT means a prominent purpose notice with the switch ON
-	-- and one tap to turn it off. An earlier cut of this example read STRICT as
-	-- "nothing to ask" — and since the resolver answers STRICT to every request
-	-- in this release, a host copying it would never ask anyone and never start
-	-- analytics, for every player, forever.
+	-- This later flow requires established operation restrictions above.
+	-- A strict choice defaults off and requires an explicit grant; a regime
+	-- default never overrides the independent policy-authority gate.
 	--
 	-- The AGE step comes first and is the host's own: an unknown or minor band
 	-- means minimised handling, so the question is not put at all.
@@ -518,13 +479,8 @@ reconcile = function(fresh)
 					grant_required = fresh.explicit_grant_required,
 					fresh_answer = true,
 				}
-				-- ⚠ RE-RESOLVE BEFORE ACTING ON THE ANSWER, AND INVALIDATE
-				-- FIRST. The player was reading the screen; the plan may have
-				-- expired or the policy may have been revoked meanwhile — and
-				-- without the invalidation this resolution is answered by the
-				-- private cache entry the LAUNCH wrote, which is the very
-				-- decision being checked for staleness. It has to reach the
-				-- resolver to mean anything.
+				-- Re-resolve after the answer and fence responses dispatched
+				-- before it; the earlier decision is not fresh authority.
 				consent_policy.invalidate()
 				resolve_and_reconcile()
 			end)
@@ -1460,16 +1416,13 @@ relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.m
 
 ## Consent regime
 
-`shardpilot/consent_policy.lua` fetches the consent regime for this player
-before the SDK exists. ShardPilot's resolver returns `STRICT_OPT_IN` to every
-caller; the module still accepts every regime value in the table below. A
-workspace that has accepted ShardPilot's advisory estimates may additionally
-receive an **advisory, non-binding estimate** when you ask for it
-(`advisory = true` in the context, below). It arrives as `decision.advisory`
-and **never changes the regime or any other field**; you, the integrating
-studio, decide what to do with it. Neither is legal advice. It is a standalone module —
-it imports nothing from this SDK, so preparing a regime cannot mint an
-identifier, load a spool or install a capture hook.
+`shardpilot/consent_policy.lua` requests a consent plan before SDK initialization.
+It imports only the pure consent-version predicate, so it cannot mint an
+identifier, load a spool or install a capture hook. **This build has no verifier
+or trusted signing key. No response supplies plan authority.** A missing,
+null, empty, malformed, unknown-key or otherwise unverifiable signature keeps
+the plan unused. A well-formed plan with `signature: null` reaches the explicit
+`plan_unsigned` refusal; other validation failures retain their own reasons.
 
 <!-- doc-region: none -- the consent-policy module surface, listed field by field below -->
 ```lua
@@ -1496,62 +1449,32 @@ The callback receives **exactly one decision, exactly once**:
 
 | Field | Meaning |
 |---|---|
-| `regime` | `STRICT_OPT_IN`, `SOFT_OPT_OUT` or `UNKNOWN` |
-| `crash_profile` | `off` or `minimal_diagnostics_for_minors` |
-| `server_analytics` | `denied` — the only value this release's contract names |
-| `child_rules` | `minimised` — the same |
-| `notice` | The resolver's own words about what kind of answer this is. Show or log it verbatim; the SDK does not interpret it |
-| `band_vocabulary` / `band_vocabulary_version` | The age scale the resolver **declares it speaks** — a constant, not an echo. Delivered verbatim and compared with nothing: in this release the resolver does not read your `age_band` at all, and says so by naming `age_band` among the unavailable `signals_used`. Your own age step governs the age-first flow |
-| `analytics_choice_default` | `off` for `STRICT_OPT_IN`, `UNKNOWN` and **every fallback**; `on` only for a used `SOFT_OPT_OUT` plan. This is the state of the switch when your screen opens — not whether to open one |
-| `explicit_grant_required` | `true` for strict, unknown and every fallback: the optional lane starts **only** after the player's explicit grant, and an untouched or declined choice starts nothing. `false` only for a used SOFT plan, whose basis is notice and non-objection — recorded as such, never as a click |
-| `plan_used` | `false` means the strict fallback was taken; `reason` says why |
-| `operation_blocks` | The operation restrictions the host must enforce. **New in `v0.11.0`:** always a list, retaining the last accepted plan's set on fallback; `[]` when none is known |
-| `operation_blocks_source` | **New in `v0.11.0`:** `plan` for an accepted plan, including a cache hit; `preserved` for a fallback retaining that plan's set (even `[]`); `none` when no plan is known for this context |
-| `advisory` | **New:** present only when you asked for it (`advisory = true`) and the resolver served it; `nil` otherwise and on every fallback. A table: `jurisdiction` (a two-letter code, or `OTHER` when the connection did not resolve or has no row of its own), `estimate` (`SOFT_OPT_OUT`, `STRICT_OPT_IN`, or `nil` where the row carries none, always for `OTHER`), `row_id`, `row_status` (`COUNSEL_PENDING`), `row_basis` (`ai_draft`), `advisory_basis` (the row's basis text, in the matrix's own words), `matrix` (`docs_commit`, `file_sha256`, `date`) and `resolved_by` (`server_country` or `unknown`). It is an unreviewed estimate, **not a regime**: nothing in the decision reads it, and a `SOFT_OPT_OUT` estimate beside a `STRICT_OPT_IN` plan leaves every other field strict. A malformed advisory makes the whole plan unreadable, like any other malformed member |
-| `valid_for_seconds` | How long this verdict is good for — the shortest of the cache ceiling, the plan's `expires_at` and its `max_age_seconds`. **Schedule your own re-resolution by it:** cache expiry protects the next lookup and stops nothing that is already running. `nil` on a fallback, which established nothing that could expire |
+| `regime` | Always `STRICT_OPT_IN` in this build |
+| `crash_profile` | `off` |
+| `server_analytics` | `denied` |
+| `child_rules` | `minimised` |
+| `analytics_choice_default` | `off`; this choice default supplies no processing authority |
+| `explicit_grant_required` | `true`; a grant alone does not establish unknown policy restrictions |
+| `plan_used` | Always `false`; `reason` says why |
+| `operation_blocks` | `nil`: the authenticated restriction set is unknown. **Do not coerce this to `{}` or authorize plan-dependent operations from it** |
+| `operation_blocks_source` | `none` |
+| `notice`, `policy_version`, `consent_text_version`, `presented_language`, `band_vocabulary`, `band_vocabulary_version` | `nil`; unsigned plan content is not forwarded as authority |
+| `advisory` | `nil`, including when requested; no unauthenticated estimate is forwarded |
+| `valid_for_seconds` | `nil`; no authenticated plan lifetime was established |
 
-**The conservative rule.** A plan that is missing, unreadable, out of scope,
-**expired**, or carrying anything outside its bounded vocabulary resolves to
-`STRICT_OPT_IN` with optional processing closed. An error or an offline state
-can preserve or add restrictions; it can never relax one, and it can never
-reuse a cached permissive result.
+**Local strict fallback.** Missing, unreadable, out-of-scope, expired and
+unauthenticated plans leave every plan-dependent operation closed. Host
+restrictions remain in force; a response cannot remove them. Unknown blocks
+are distinct from a known empty block list. This applies on the first call,
+after invalidation, on context changes, during outages and after process restart.
 
-**Operation-block retention (new in v0.11.0).** The module remembers
-the complete block list from the last accepted plan for the active context,
-independently of the response cache and its lifetime. Every newer accepted
-plan replaces that list, including with `[]`; a refusal, timeout, malformed
-response or rejected signature preserves it. Ordinary `invalidate()` also
-preserves it. This is retained restriction state, not permission to process.
-Plans still require `signature: null`; this change adds no signature verification.
-
-Selecting a different **validated** context clears the remembered list and
-fences earlier requests. The context includes workspace, app, environment,
-app version, locale, platform, store, endpoint and both age-band fields.
-Returning to a previous context starts fresh; the module keeps no history of
-inactive contexts. An invalid context gets `[]` and does not change the active
-context. Each returned list is a copy, so a caller cannot edit retained state.
-**A module reload or process restart followed by an outage starts with `[]`.**
-
-**Caching** is in memory, for this session only, never written to disk, and
-scoped to the *whole* context — a different app, environment or endpoint is
-re-resolved rather than served the previous one's answer. An entry never
-outlives the shorter of five minutes, the plan's own `expires_at` and its
-`max_age_seconds`.
-
-⚠ **And a permissive decision is never cached at all.** Anything that opens a
-lane — a `SOFT_OPT_OUT` regime, a `MINIMAL` crash profile, an `ELIGIBLE`
-server-analytics basis, or a lifted objection requirement — is used for the
-`prepare` call that fetched it and is not stored. Every later `prepare` for
-that context goes to the wire, and a request that fails, times out or finds no
-network answers **strict**. Only a fully closed decision may be reused within
-its lifetime, because reusing "closed" can never open anything. This is the
-only way *"an offline state can tighten but never relax"* can actually hold:
-the presence of `http.request` says nothing about connectivity, and Defold
-offers no reliable online signal, so there is no moment at which the SDK could
-know a stored permission is still true. The cost is **one request per
-`prepare` while the regime is permissive** — and `prepare` is called at start,
-on resume and at expiry, not per frame. Today it costs nothing at all, because
-the resolver's initial release emits only strict plans.
+**No response cache or learned restrictions.** Every locally valid `prepare`
+with available dependencies makes a request. Unsigned strict plans are unused
+just like unsigned permissive plans, and neither is retained. The module still
+fences invalidated and superseded responses and validates a frozen request
+context. Adding usable authenticated plans requires a verifier, trusted keys
+and tests of that complete authority path; replacing a null signature with a
+string is insufficient.
 
 ### The age step, and the two things it decides
 
@@ -1559,15 +1482,13 @@ the resolver's initial release emits only strict plans.
 and credential-free by construction, so it can never establish anyone's age —
 the SDK never sees a trusted one. An **unknown or minor** band means minimised
 handling: the analytics question is **not put**, nothing optional starts, and
-the crash lane stays closed. An eligible band from your own age step leads to
-the choice, with the default the decision carries.
+the crash lane stays closed. An eligible band alone cannot open the choice flow while operation restrictions
+are unknown; the minimal example remains closed.
 
-`flags.child_rules` is delivered verbatim and is `minimised` on every response
-in this release. Read it as what it is: the public bootstrap cannot establish
+The local fallback sets `child_rules = "minimised"`. Read it as what it is: the public bootstrap cannot establish
 age, so the minimised-mode prohibitions — no advertising identifiers, no
 profiling, no experiments, no third-party optional sharing — stand for
-**everyone** in this release, while the first-party analytics choice is
-governed by your age step and the regime's default.
+**everyone** in this release, and plan-dependent first-party analytics remains closed while restrictions are unknown.
 
 `flags.crash_profile` is `off` on every response too, and that means **the
 resolver offers no approved crash profile in this release** — not that crash
@@ -1581,10 +1502,9 @@ band keeps it shut.
 ### What the minimal example does not do — host requirements
 
 [`examples/minimal/main.script`](examples/minimal) is a **quick start**, not a
-production integration. Three lifecycle obligations are deliberately left to
-the host, because they belong to an application's own teardown discipline
-rather than to a twenty-line illustration. A production integration must
-implement all three.
+production integration. Its current unknown-block guard starts no processing lane. A production host
+with independent policy authority must also implement the lifecycle obligations
+below; the later flow in the example is not evidence of authenticated admission.
 
 - **Retry `crash.shutdown()` until it succeeds before treating a `CRASH_OFF`
   closure as enforced.** It returns `false, "pending"` while a crash POST is in
@@ -1596,18 +1516,12 @@ implement all three.
   it, and never `init()` over a live client.** The analytics client has the
   same pending posture, and a re-`init` while one is still settling produces
   two clients over one spool ([one client per app](#configuration)).
-- **A cached decision can outlive its window if the wall clock steps
-  backwards.** Only fully closed decisions are cached, so the worst this does
-  is keep a *closed* answer alive longer than its plan — the safe direction —
-  and the SDK no longer guards against it. A host that needs the window to be
-  exact should re-resolve on its own schedule rather than trusting
-  `valid_for_seconds` across a clock change.
 - **Check notice compatibility BEFORE paying an owed consent write.** A failed
   `set_consent` leaves a debt; if the next decision carries a different
   `consent_text_version` or `presented_language`, paying that debt records the
   **old** answer against text the player never saw. Discard the debt with the
   answer and present the notice again. (The minimal example applies the same
-  invariant at `examples/minimal/main.script:276`, where a plan whose text
+  invariant in `reconcile`, where a plan whose text
   version **or** language has moved discards the stored answer rather than
   reusing it.)
 - **Map every `operation_blocks` name to the action it restricts, and refuse
@@ -1615,7 +1529,8 @@ implement all three.
   does not open what a block closed. An **unmapped** name closes everything —
   no question, no analytics, no crash — which is what the minimal example does
   for every name, because a quick start has no vocabulary to map them with. In
-  this release the resolver always sends `[]`.
+  this build the authenticated set is unknown (`nil`), which also closes all
+  plan-dependent operations. An unsigned `[]` supplies no authority.
 - **Own the Mode B identity and consent retries.** The quick start does not
   carry them, deliberately — it shows the straight path. A production host
   must: mark the client as existing **before** calling `identify`, so a later
@@ -1659,9 +1574,7 @@ re-resolution triggers — launch and resume, a network or permitted storefront
 change, an age correction, a language or text change, a workspace or app
 change, a policy revocation, and before the first optional admission. A
 request already in flight when it fires can no longer answer.
-In v0.11.0, invalidation preserves known operation
-blocks; only a newer accepted plan, a validated context change or module
-reload/process restart can replace or forget them as described above.
+No plan or restriction list is retained by this build.
 
 **Plan text is read before it is decoded.** Defold's `json.decode` returns a
 plain table for both `{}` and `[]` and marks neither, so the container type is
@@ -1672,16 +1585,16 @@ is bypassed by `"operation\u005fblocks"`) and skips every value whole, so a
 key of the same name nested in another object is not mistaken for the
 top-level one.
 
-> `SOFT_OPT_OUT` parses but is **not reachable today**: every row of the
-> jurisdiction matrix is pending counsel confirmation, so the resolver's
-> initial release has no path that emits it.
+> `SOFT_OPT_OUT` is a recognized wire value. It never changes the decision
+> without authentication, regardless of what the resolver emits.
 
 ## Privacy & consent
 
 `set_consent(decision, notice)` optionally takes a per-call table with exactly
-`notice_version`, `notice_locale`, and `policy_version`. Map a presented
-`consent_policy.prepare` result as follows; use the result whose notice the
-player actually saw, not a later resolution:
+`notice_version`, `notice_locale`, and `policy_version`. Supply the identifiers
+of the notice the player actually saw from your independently established
+host policy. Current `consent_policy.prepare` fallbacks carry none; unsigned
+response fields must not be used to fill this mapping:
 
 <!-- doc-region: none -- Per-call notice mapping, not the complete integration flow. -->
 ```lua

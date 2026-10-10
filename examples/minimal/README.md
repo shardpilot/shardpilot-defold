@@ -14,37 +14,22 @@ Requiring the SDK is not the barrier — that only loads code; `shardpilot.init`
 is, because it builds the client, which loads the persisted scope record and
 mints an anonymous identifier. Nothing is initialised until a decision exists.
 
-**One reconcile path.** A consent regime is not decided once at launch. The
-plan expires, the notice text changes, the policy is revoked, the app comes
-back after a week — every one of those is the same question, so there is one
-`reconcile(fresh)` and every trigger calls it: the answer coming back from the
-notice, resume, the plan's own `valid_for_seconds` deadline, and a changed
-`consent_text_version` or `presented_language`.
+**No authenticated plan means no plan authority.** This SDK build has no
+verifier or trusted signing key. Present-null, missing and non-null signatures
+all leave the plan unused. The local fallback has unknown operation restrictions
+(`nil`), not a known empty set. The example therefore opens no notice or
+processing lane, even for an adult willing to grant consent. Unsigned SOFT
+responses and unsigned empty block lists do not change that result.
 
-**It closes on the policy's authority and opens on the player's.** A lane the
-new decision permits still needs an answer; a resume that could open a lane
-would be a grant issued by a focus event.
-
-**Suspension is not a decision.** A lane the policy closes is stopped with
-`shutdown()`, never with `set_consent(false)` or `crash.set_enabled(false)` —
-those record and persist a player's choice, and nobody chose anything. The
-player's standing answer survives a suspension and is discarded only when the
-notice text or language changes.
-
-**Notice provenance stays with the answer.** Before showing a notice, the
-example snapshots its text version, presented language and policy version. The
-explicit setter receives those three identifiers even if a later resolution
-changes the policy; it never receives the notice text. An applied warning is
-reported separately from a refused decision.
-
-**The lanes are orthogonal.** Analytics being closed does not close the crash
-lane, and a permitted crash lane does not open analytics. Crash reporting is ON
-by default in this SDK, which is why an unconditional `crash.init` is how a
-closed lane gets opened by accident.
+**One reconcile path.** Launch and resume both call the real resolver and
+remain closed while restrictions are unknown. The later notice and lifecycle
+flow requires established policy authority; this quick start supplies no
+independent authority. An integrating host must establish its own policy and
+follow the README's host requirements before initializing processing.
 
 ## Running it
 
 Drop `main.script` into a Defold collection, point `endpoint`, `ingest_url` and
 `remote_config_url` at your own services, and replace
 `present_consent_notice` — the placeholder declines immediately, so the example
-runs and is closed by default.
+runs with every plan-dependent lane closed while it cannot authenticate a plan.
