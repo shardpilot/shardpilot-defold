@@ -113,8 +113,10 @@ against what your service actually does with each type.
   and decision metadata while analytics is denied or unknown. A fresh install
   without a decision has no receipt to send.
 - An explicitly configured remote-config fetch transmits the anonymous client ID
-  without requiring analytics consent. Targeting attributes require their opt-in
-  and a grant. Experiments are off by default and have their own consent gates.
+  only with granted analytics consent. Unknown and both denied states fetch
+  without identity or targeting attributes; the host user ID is never sent.
+  Targeting attributes also require their opt-in. Experiments are off by default
+  and have their own consent gates.
 - Crash reporting requires separate initialization. Once initialized with valid
   configuration it is enabled by default on a fresh install, independent of
   analytics consent, with a persisted opt-out and failure-closed settings reads.

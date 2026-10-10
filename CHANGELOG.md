@@ -2,6 +2,12 @@
 
 ### Unreleased
 
+- Remote-config fetches omit the anonymous ID and targeting attributes under
+  unknown, denied and forced-minor consent. Granted requests keep per-client
+  bucketing; host user IDs are never sent. Identifier-free cache values and
+  validators use a separate scope, including on restart, and responses keep
+  the scope selected at dispatch when consent changes before arrival.
+
 - Replacing an open analytics session now queues its end with reason
   `session_start` before the new start, atomically with respect to queue
   capacity. A refused replacement preserves the old session and sequence.

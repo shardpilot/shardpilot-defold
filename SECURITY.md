@@ -39,7 +39,9 @@ details.
   each receipt carrying identifiers already clamped at acceptance, so
   per-entry size no longer scales with oversized host-supplied
   identifiers; the last-known-good remote-config cache
-  (size-capped before it is persisted); the crash opt-out settings record (a
+  (size-capped before it is persisted, with a separate empty client scope for
+  identifier-free fetches; only granted consent permits identity in the URL);
+  the crash opt-out settings record (a
   single boolean); and a per-app, TTL'd crash-retry sidecar with fixed
   entry, per-report, and total byte caps, holding only already-PII-scrubbed
   crash reports (resent then cleared on success). No other file or

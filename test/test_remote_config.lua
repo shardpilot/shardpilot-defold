@@ -271,6 +271,8 @@ local function config(overrides)
 	return out
 end
 
+local anonymous_fetch_url = config().remote_config_url .. "/config/v1/workspace-test/develop"
+
 local function values_body(values, version)
 	return json.encode({ version = version or 1, values = values })
 end
@@ -423,7 +425,7 @@ local function test_fresh_fetch_serves_values_and_writes_cache()
 
 	local request = last_request()
 	assert_equal(request.method, "GET")
-	assert_equal(request.url, "http://localhost:18081/config/v1/workspace-test/develop/anon-client")
+	assert_equal(request.url, anonymous_fetch_url)
 	assert_equal(request.headers["Authorization"], "Bearer sp_ingest_publishable_key")
 	assert_nil(request.headers["If-None-Match"], "the first fetch must not revalidate")
 	-- The schema-revision declaration belongs to events:batch
@@ -443,7 +445,7 @@ local function test_fresh_fetch_serves_values_and_writes_cache()
 	assert_true(record ~= nil, "the fetch must persist a cache record")
 	assert_equal(record.etag, '"rcfg-3-abc"')
 	assert_equal(record.scope,
-		remote_config.build_scope("workspace-test", "develop", "anon-client", "http://localhost:18081"))
+		remote_config.build_scope("workspace-test", "develop", "", config().remote_config_url))
 end
 
 local function test_revalidation_304_serves_cached_snapshot()
@@ -716,6 +718,7 @@ end
 local function test_identity_rotation_drops_inflight_response()
 	reset()
 	local client = assert(sdk.new(config()))
+	assert_true(client:set_consent(true))
 	local held = {}
 	local saved_request = http.request
 	http.request = function(url, method, callback, headers, body, options)
@@ -850,6 +853,7 @@ end
 local function test_stale_scope_response_does_not_fence_current_scope()
 	reset()
 	local client = assert(sdk.new(config()))
+	assert_true(client:set_consent(true))
 	local held = {}
 	local saved_request = http.request
 	http.request = function(url, method, callback, headers, body, options)
@@ -935,6 +939,7 @@ end
 local function test_scope_fence_survives_rotation_cycle()
 	reset()
 	local client = assert(sdk.new(config()))
+	assert_true(client:set_consent(true))
 	local held = {}
 	local saved_request = http.request
 	http.request = function(url, method, callback, headers, body, options)
@@ -1015,6 +1020,7 @@ end
 local function test_intermediate_scope_outcome_does_not_fence_original_scope()
 	reset()
 	local client = assert(sdk.new(config()))
+	assert_true(client:set_consent(true))
 	local held = {}
 	local saved_request = http.request
 	http.request = function(url, method, callback, headers, body, options)
@@ -1571,7 +1577,7 @@ local function test_corrupt_cache_record_reads_as_a_miss()
 	storage.reset()
 	stores[record_path] = {
 		scope = remote_config.build_scope(
-			"workspace-test", "develop", "anon-client", "http://localhost:18081"),
+			"workspace-test", "develop", "", config().remote_config_url),
 		etag = '"stale-etag"',
 		body = "garbage",
 		fetched_at_ms = 1,
@@ -1662,6 +1668,7 @@ end
 local function test_anonymous_id_rotation_moves_the_scope()
 	reset()
 	local client = assert(sdk.new(config()))
+	assert_true(client:set_consent(true))
 	next_status = 200
 	next_response_body = values_body({ a = 1 })
 	next_response_headers = { etag = '"anon-1"' }
@@ -1826,7 +1833,7 @@ local function test_opted_in_attributes_stay_off_the_wire_without_a_grant()
 	next_response_body = values_body({ a = 1 })
 	local result = fetch(client)
 	assert_true(result.ok, result.error)
-	assert_equal(last_request().url, attributeless_fetch_url,
+	assert_equal(last_request().url, anonymous_fetch_url,
 		"unknown consent must fetch attribute-less")
 
 	-- Both denied states, the forced-minor denial included.
@@ -1838,7 +1845,7 @@ local function test_opted_in_attributes_stay_off_the_wire_without_a_grant()
 		next_response_body = values_body({ a = 1 })
 		result = fetch(client)
 		assert_true(result.ok, result.error)
-		assert_equal(last_request().url, attributeless_fetch_url,
+		assert_equal(last_request().url, anonymous_fetch_url,
 			"denied consent (" .. tostring(decision) .. ") must fetch attribute-less")
 	end
 end
@@ -1889,21 +1896,20 @@ local function test_consent_downgrade_strips_attributes_from_the_next_fetch()
 	assert_equal(last_request().url, attributeless_fetch_url .. "?geo=US")
 
 	-- The downgrade is read at dispatch time: the very next fetch is
-	-- attribute-less, while ETag revalidation (unrelated to consent)
-	-- keeps riding.
+	-- identifier-free; the identified cache validator cannot ride either.
 	next_status = 202
 	next_response_body = '{"accepted":1}'
 	next_response_headers = nil
 	client:set_consent(false)
-	next_status = 304
-	next_response_body = nil
+	next_status = 200
+	next_response_body = values_body({ a = 2 }, 8)
 	local result = fetch(client)
 	assert_true(result.ok, result.error)
-	assert_equal(result.from_cache, true)
-	assert_equal(last_request().url, attributeless_fetch_url,
+	assert_equal(result.from_cache, false)
+	assert_equal(last_request().url, anonymous_fetch_url,
 		"a consent downgrade must strip attributes from the very next fetch")
-	assert_equal(last_request().headers["If-None-Match"], '"v7"',
-		"revalidation is consent-neutral and must keep riding")
+	assert_nil(last_request().headers["If-None-Match"],
+		"identified validator must not ride after denial")
 end
 
 -- ── degraded runtimes ─────────────────────────────────────────────────────────
@@ -2020,7 +2026,108 @@ local function test_facade_delegates_to_the_default_client()
 	sdk.shutdown("test_teardown")
 end
 
+-- Every consent state still fetches configuration. Inspect the entire request,
+-- including headers and body, with distinct anonymous and host user markers.
+local function test_config_identity_requires_granted_consent()
+	local failures = {}
+	for _, state in ipairs({ "unknown", "granted", "denied", "denied_forced_minor" }) do
+		local ok, err = pcall(function()
+			reset()
+			local client = assert(sdk.new(config({ remote_config_attributes_enabled = true })))
+			assert_true(client:identify("host-user-marker"))
+			if state ~= "unknown" then
+				local decision = state
+				if state == "granted" then decision = true end
+				if state == "denied" then decision = false end
+				assert_true(client:set_consent(decision))
+			end
+			assert_equal(client:get_consent_state(), state)
+			assert_true(client:set_remote_config_attributes({ geo = "US" }))
+			next_status = 200
+			next_response_body = values_body({ available = true })
+			assert_true(fetch(client).ok)
+			local request = last_request()
+			local expected = anonymous_fetch_url
+			if state == "granted" then expected = expected .. "/anon-client?geo=US" end
+			assert_equal(request.url, expected, state .. " complete request URL")
+			assert_equal(request.method, "GET")
+			assert_nil(request.body, state .. " config body")
+			assert_equal(request.headers.Authorization, "Bearer sp_ingest_publishable_key")
+			local wire = request.url .. json.encode(request.headers) .. (request.body or "")
+			assert_nil(wire:find("host-user-marker", 1, true), "host user must never ride")
+			if state ~= "granted" then
+				assert_nil(wire:find("anon-client", 1, true), "anonymous ID must not ride")
+			end
+			assert_true(client:remote_config_boolean("available", false))
+		end)
+		if not ok then failures[#failures + 1] = state .. ": " .. tostring(err) end
+	end
+	assert_equal(#failures, 0, table.concat(failures, "\n"))
+end
+
+local function test_anonymous_config_cache_is_separate_across_restart_and_regrant()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = assert(sdk.new(config()))
+	assert_true(client:set_consent(true))
+	next_status = 200
+	next_response_body = values_body({ v = 1 })
+	next_response_headers = { etag = '"identified"' }
+	assert_true(fetch(client).ok)
+	assert_true(client:set_consent(false))
+	storage.reset()
+	local restarted = assert(sdk.new(config()))
+	assert_equal(restarted:get_consent_state(), "denied")
+	assert_nil(restarted:remote_config_values(), "denied startup must not load identified config")
+	next_status = 200
+	next_response_body = values_body({ v = 2 })
+	next_response_headers = { etag = '"anonymous"' }
+	assert_true(fetch(restarted).ok)
+	assert_nil(last_request().headers["If-None-Match"], "identified validator must not ride anonymous fetch")
+	local scope = remote_config.build_scope("workspace-test", "develop", "", config().remote_config_url)
+	assert_equal(storage.load_remote_config(restarted.config).scope, scope)
+	storage.reset()
+	local anonymous = assert(sdk.new(config()))
+	assert_equal(anonymous:remote_config_number("v", 0), 2, "anonymous startup loads its own cache")
+	next_status = 304
+	next_response_body = nil
+	next_response_headers = nil
+	assert_true(fetch(anonymous).from_cache)
+	assert_equal(last_request().headers["If-None-Match"], '"anonymous"')
+	assert_true(anonymous:set_consent(true))
+	next_status = 200
+	next_response_body = values_body({ v = 3 })
+	assert_true(fetch(anonymous).ok)
+	assert_equal(last_request().url, anonymous_fetch_url .. "/anon-client")
+	assert_nil(last_request().headers["If-None-Match"], "anonymous validator must not ride identified fetch")
+	restore()
+end
+
+local function test_anonymous_response_keeps_dispatch_scope_after_grant()
+	reset()
+	local client = assert(sdk.new(config()))
+	local pending
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body)
+		pending = { url = url, callback = callback, headers = headers, body = body }
+	end
+	local result
+	assert_true(client:fetch_remote_config(function(value) result = value end))
+	http.request = saved_request
+	assert_equal(pending.url, anonymous_fetch_url)
+	assert_true(client:set_consent(true))
+	pending.callback(nil, nil, { status = 200, response = values_body({ v = 7 }), headers = { etag = '"anonymous-late"' } })
+	assert_true(result.ok)
+	assert_equal(client:remote_config_number("v", 0), 7, "anonymous response must still install after grant")
+	assert_equal(storage.load_remote_config(client.config).scope,
+		remote_config.build_scope("workspace-test", "develop", "", config().remote_config_url),
+		"late response persists the dispatch scope")
+end
+
 local tests = {
+	test_config_identity_requires_granted_consent,
+	test_anonymous_config_cache_is_separate_across_restart_and_regrant,
+	test_anonymous_response_keeps_dispatch_scope_after_grant,
 	test_build_url_joins_and_escapes_segments,
 	test_build_scope_keeps_distinct_tuples_distinct,
 	test_config_validation,

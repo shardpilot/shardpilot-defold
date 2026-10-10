@@ -123,7 +123,8 @@ function M.set_consent(decision, notice)
 	return with_default("set_consent", decision, notice)
 end
 
--- Remote config. `fetch_remote_config` reports "not_initialized" through the
+-- Remote config stays available without a grant, omitting identity and
+-- targeting attributes. `fetch_remote_config` reports "not_initialized" through the
 -- result callback too, so a game that only reads the callback still learns
 -- why nothing was fetched. The value getters deliberately do NOT use
 -- with_default: they must return the caller's DEFAULT when the SDK is not
