@@ -3586,7 +3586,7 @@ local function pending_body_entry(tag, options)
 	return { body = body, crash_id = tag, fatal = options.fatal ~= false }
 end
 
--- Two pending entries persisted in the same process must carry DISTINCT tokens,
+-- Two pending entries persisted across same-second launches must carry DISTINCT tokens,
 -- so removing one never deletes the other. The token includes a random suffix and
 -- save_pending_crash re-mints on any clash, so even a forced same-time /
 -- same-random collision (which a same-second app restart can otherwise produce,
@@ -3598,24 +3598,29 @@ local function test_pending_tokens_unique_under_forced_collision()
 	local restore = install_fake_sys_storage()
 
 	-- Force the volatile token inputs to constants: os.time() pinned and
-	-- math.random() always returning the same value. The only thing left varying is
-	-- the existence-check re-mint loop and the per-process counter — which is
-	-- exactly what must keep the tokens apart.
+	-- the private suffix always returning the same value. Reloading the store
+	-- also resets its counter, forcing the second launch through the clash check.
 	local saved_time = os.time
-	local saved_random = math.random
+	local private_random = require "shardpilot.random"
+	local saved_hex = private_random.hex
+	local suffix_calls = 0
 	os.time = function()
 		return 1700000000
 	end
-	math.random = function()
-		return 7
+	private_random.hex = function(count)
+		suffix_calls = suffix_calls + 1
+		return string.rep("7", count)
 	end
 
 	local scope = { app_id = "collide-app" }
-	local token1 = storage.save_pending_crash(scope, pending_body_entry("A"))
-	local token2 = storage.save_pending_crash(scope, pending_body_entry("B"))
+	local first_launch = dofile("shardpilot/storage.lua")
+	local token1 = first_launch.save_pending_crash(scope, pending_body_entry("A"))
+	local second_launch = dofile("shardpilot/storage.lua")
+	local token2 = second_launch.save_pending_crash(scope, pending_body_entry("B"))
 
 	os.time = saved_time
-	math.random = saved_random
+	private_random.hex = saved_hex
+	assert_equal(suffix_calls, 3, "second launch must detect the collision and mint again")
 
 	assert_true(type(token1) == "string", "first persist returns a token")
 	assert_true(type(token2) == "string", "second persist returns a token")

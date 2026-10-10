@@ -5,6 +5,7 @@ local compression = require "shardpilot.compression"
 local consent_notice = require "shardpilot.consent_notice"
 local experiments_mod = require "shardpilot.experiments"
 local id = require "shardpilot.id"
+local random = require "shardpilot.random"
 local platform = require "shardpilot.platform"
 local queue = require "shardpilot.queue"
 local remote_config_mod = require "shardpilot.remote_config"
@@ -4456,7 +4457,7 @@ local function backoff_delay_seconds(attempt)
 	if ceiling > backoff_cap_seconds then
 		ceiling = backoff_cap_seconds
 	end
-	return backoff_base_seconds + math.random() * (ceiling - backoff_base_seconds)
+	return backoff_base_seconds + random.unit() * (ceiling - backoff_base_seconds)
 end
 
 -- A mint that settled BADLY — the provider reported an error, handed back an
