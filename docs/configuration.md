@@ -54,9 +54,6 @@ not select the SDK's HTTP transport. A non-string value returns
   spool_enabled = true,
   spool_max_events = 500,
   spool_max_bytes = 262144,
-  -- Schema-revision declaration on batch ingest (default: the SDK's
-  -- built-in revision). A string overrides the declared value; false (or
-  -- "") stops declaring. See "Schema-revision declaration" below.
   diagnostics = function(issue)
     -- issue = { scope, event_id?, status, code?, message?, detail_codes? }
   end,
