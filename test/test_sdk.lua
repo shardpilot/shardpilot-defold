@@ -3025,6 +3025,9 @@ local function test_retry_wake_republishes_without_a_flush_tick()
 	assert_equal(parked:flush(), false)
 	assert_true(parked.in_flight_batch ~= nil, "the premise: the 503 retains the batch")
 	assert_true(parked:publish_deferred(), "the premise: and arms its own window")
+	-- Freeze reads so the measured frames stay inside the armed backoff.
+	local advancing_clock = socket.gettime
+	socket.gettime = function() return socket.now end
 	assert_true(parked:track("spin_queued_1"))
 	assert_true(parked:track("spin_queued_2"))
 	parked.flush_elapsed_seconds = 0
@@ -3034,6 +3037,9 @@ local function test_retry_wake_republishes_without_a_flush_tick()
 	assert_true(parked.flush_elapsed_seconds > 0.25,
 		"the full queue behind a deferred retained batch must not flush every frame: "
 			.. "elapsed = " .. tostring(parked.flush_elapsed_seconds))
+
+	assert_true(parked:publish_deferred(), "the measured ticks remain inside backoff")
+	socket.gettime = advancing_clock
 
 	-- The CONSENT plane holds the queue the same way: an undispatched grant
 	-- blocks every event leg by design, so while that receipt sits inside its
@@ -5379,9 +5385,9 @@ local function test_persisted_retry_after_defers_startup_resend()
 	-- an EXPIRED stored deadline does not delay the startup resend
 	reset()
 	storage.reset()
-	assert_true(storage.save_spool(spool_scope, {
-		{ event_id = "expired-e1", event_name = "expired_deadline_event", anonymous_id = "anon-x" },
-	}, 500, 262144, 1000) ~= nil)
+	local eligible = { event_id = "expired-e1", event_name = "expired_deadline_event", anonymous_id = "anon-x" }
+	require("shardpilot.analytics_retry").start(eligible)
+	assert_true(storage.save_spool(spool_scope, { eligible }, 500, 262144, 1000) ~= nil)
 	local third = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(#third.spool_batches, 1)
 	assert_true(not third:publish_deferred(), "an expired stored deadline must not defer")
@@ -11020,7 +11026,8 @@ end)()
 	local relaunched = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_enabled = true })))
 	assert_true(relaunched:spool_pending(), "the relaunch reloaded the spooled chunk")
 	assert_equal(relaunched.in_flight_batch, nil, "nothing is selected until a publish runs")
-	socket.now = socket.now + 3600
+	-- Let the retry deadline expire while the ambiguous batch remains eligible.
+	socket.now = socket.now + 60
 	relaunched:update(0)
 	assert_true(#requests > 0,
 		"an expired persisted deadline wakes the spool resend without a flush tick")
@@ -11435,7 +11442,7 @@ end)()
 	assert_true(cadence:identify("user-example"))
 	assert_true(cadence:track("cadence_event"))
 	assert_equal(cadence:flush(), false, "the first flush starts the mint")
-	cadence_mint("token-cadence", math.floor(socket.now * 1000) + 3600000, nil)
+	cadence_mint("token-cadence", math.floor(socket.now * 1000) + 300000, nil)
 	cadence_mint = nil
 
 	next_status = 500
@@ -11444,7 +11451,7 @@ end)()
 	assert_true(cadence.in_flight_batch ~= nil, "and is retained")
 
 	-- Past the token's life, then pin OUR window well beyond the cadence.
-	socket.now = socket.now + 7200
+	socket.now = socket.now + 600 -- expire the token while the retained event is eligible
 	cadence.publish_retry_after_ms = math.floor(socket.now * 1000) + 60000
 	assert_true(cadence:publish_deferred(), "a window far longer than the interval")
 	assert_equal(cadence:publish_server_deferred(), false, "and it is ours")
@@ -11700,7 +11707,7 @@ end)()
 	assert_equal(#requests, 0, "the verified receipt is PARKED until its actor signs in")
 	assert_true(preflight:track("preflight_event"))
 	assert_equal(preflight:flush(), false, "the first flush starts the mint")
-	pre_mint("token-preflight", math.floor(socket.now * 1000) + 3600000, nil)
+	pre_mint("token-preflight", math.floor(socket.now * 1000) + 300000, nil)
 	pre_mint = nil
 
 	next_status = 500
@@ -11709,7 +11716,7 @@ end)()
 	assert_true(preflight.in_flight_batch ~= nil, "and is retained")
 
 	-- Stale the token, then pin the caller-bypassable window at a minute.
-	socket.now = socket.now + 7200
+	socket.now = socket.now + 600 -- expire the token while the retained event is eligible
 	preflight.publish_retry_after_ms = math.floor(socket.now * 1000) + 60000
 	assert_equal(preflight:publish_server_deferred(), false, "the window is ours to bypass")
 
@@ -11771,13 +11778,13 @@ end)()
 	})))
 	assert_true(chained:track("chained_event"))
 	assert_equal(chained:flush(), false, "the first flush starts the mint")
-	chain_mint("token-chained", math.floor(socket.now * 1000) + 3600000, nil)
+	chain_mint("token-chained", math.floor(socket.now * 1000) + 300000, nil)
 	chain_mint = nil
 
 	next_status = 500
 	assert_equal(chained:flush(), false)
 	assert_true(chained.in_flight_batch ~= nil, "the batch is retained")
-	socket.now = socket.now + 7200
+	socket.now = socket.now + 600 -- expire the token while the retained event is eligible
 	chained.publish_retry_after_ms = math.floor(socket.now * 1000) + 60000
 	assert_equal(chained:publish_server_deferred(), false, "the window is ours to bypass")
 
@@ -11834,13 +11841,13 @@ end)()
 	-- below is not refused for stranding user-keyed work.
 	assert_true(dead:track("dead_mint_event"))
 	assert_equal(dead:flush(), false)
-	dead_mint("token-dead", math.floor(socket.now * 1000) + 3600000, nil)
+	dead_mint("token-dead", math.floor(socket.now * 1000) + 300000, nil)
 	dead_mint = nil
 
 	next_status = 500
 	assert_equal(dead:flush(), false)
 	assert_true(dead.in_flight_batch ~= nil, "the batch is retained")
-	socket.now = socket.now + 7200
+	socket.now = socket.now + 600 -- expire the token while the retained event is eligible
 	dead.publish_retry_after_ms = math.floor(socket.now * 1000) + 60000
 
 	-- Signing in invalidates the stale token, so the next attempt has no
@@ -11890,13 +11897,13 @@ end)()
 	})))
 	assert_true(asym:track("asym_first"))
 	assert_equal(asym:flush(), false)
-	asym_mint("token-asym", math.floor(socket.now * 1000) + 3600000, nil)
+	asym_mint("token-asym", math.floor(socket.now * 1000) + 300000, nil)
 	asym_mint = nil
 
 	next_status = 500
 	assert_equal(asym:flush(), false)
 	assert_true(asym.in_flight_batch ~= nil, "a retained batch holds the pipeline")
-	socket.now = socket.now + 7200
+	socket.now = socket.now + 600 -- expire the token while the retained event is eligible
 	asym.publish_retry_after_ms = math.floor(socket.now * 1000) + 60000
 
 	-- A full queue behind it, and a caller stopped by a mint.
@@ -14487,10 +14494,12 @@ end)()
 				}))
 				local event_id, event_ts = "synthetic-vocabulary-event", "2026-01-01T00:00:00Z"
 				if restored then
-					assert_true(storage.save_spool(spool_scope, {{
+					local eligible = {
 						event_id = event_id, event_ts = event_ts, event_name = "app.session_started",
 						anonymous_id = "synthetic-vocabulary-actor", source = "client", platform = row.platform,
-					}}, 500, 262144) ~= nil)
+					}
+					require("shardpilot.analytics_retry").start(eligible)
+					assert_true(storage.save_spool(spool_scope, { eligible }, 500, 262144) ~= nil)
 				end
 				local client = assert(sdk.new(config_mode_a({
 					ingest_url = "https://ingest.example.invalid", platform = row.platform,
@@ -15661,7 +15670,10 @@ end)()
 						socket.now = socket.now + 60
 						assert_true(call("track", "synthetic-last-activity"))
 						socket.now = socket.now + timing.delta
-						assert_true(call("session_start")); call("flush"); local wire = events()
+						assert_true(call("session_start"))
+						-- Observe the captured boundary after the delivery clock recovers.
+						socket.now = math.max(socket.now, 1700000060)
+						call("flush"); local wire = events()
 						assert_equal(#wire, 4); assert_equal(wire[2].event_name, "synthetic-last-activity")
 						assert_equal(wire[3].event_name, "app.session_ended"); assert_equal(wire[3].session_id, old_id)
 						assert_true(wire[3].event_ts >= wire[2].event_ts, "replacement end must not predate old activity")
@@ -15670,7 +15682,9 @@ end)()
 						assert_equal(wire[3].session_sequence, 3); assert_equal(wire[4].session_sequence, 1)
 						if timing.again then
 							socket.now = socket.now - 120
-							assert_true(call("session_start")); call("flush"); wire = events()
+							assert_true(call("session_start"))
+							socket.now = math.max(socket.now, 1700000060)
+							call("flush"); wire = events()
 							assert_equal(#wire, 6); assert_equal(wire[5].session_id, wire[4].session_id)
 							assert_equal(wire[5].event_name, "app.session_ended")
 							assert_true(wire[5].event_ts >= wire[4].event_ts, "replacement must retain the clamped start high-water mark")

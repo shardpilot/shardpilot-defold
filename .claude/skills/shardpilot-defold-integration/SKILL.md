@@ -1114,6 +1114,13 @@ crash.record_breadcrumb("menu.open")
   `event_ts`, so the server de-duplicates), chunked to `batch_size`, before
   fresh events, through the same token/consent/backoff gates. Entries leave
   the spool on server acknowledgment (ack-based, keyed by `event_id`).
+- Events expire after seven days from local intake or fifteen minutes from the
+  first potentially delivered HTTP attempt. Retries preserve both clocks and
+  original envelope bytes. Proven-unsent attempts and received `4xx` clear only
+  a newly started attempt clock. Missing, invalid or future clocks expire,
+  including legacy records. `snapshot().spool_expired` and the matching
+  diagnostic name each expired original event ID. See the README delivery-age
+  contract, including clock-write failures and one live client per app.
 - A `429 Retry-After` deadline persists with the record and is honored across
   relaunch (clamped to 24 h).
 - Consent rules override durability: denied purges the spool; only a

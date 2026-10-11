@@ -247,8 +247,8 @@ do
 	record.consent_analytics = "granted"
 	assert(storage.save(scope, record))
 
-	-- Seed a spool the way an older launch would have left it: envelopes whose
-	-- platform never went through a fold.
+	-- Seed eligible envelopes whose platform has not gone through a fold.
+	-- Delivery clocks are independent of the platform normalization subject.
 	local spool_path
 	for path in pairs(stores) do
 		if path:sub(-6) == "/spool" then spool_path = path end
@@ -267,6 +267,13 @@ do
 			{ event_id = "e6", event_ts = "2026-01-01T00:00:05Z", platform = {} },
 		},
 	}
+
+	stores[spool_path].delivery_age = {}
+	for _, event in ipairs(stores[spool_path].events) do
+		stores[spool_path].delivery_age[event.event_id] = {
+			intake_ms = require("shardpilot.clock").unix_ms(), ambiguous_ms = 0,
+		}
+	end
 
 	reports = {}
 	local client = assert(client_mod.new(config))
