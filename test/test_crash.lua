@@ -207,7 +207,7 @@ json = {
 	decode = json_decode,
 }
 
-local crash = require "shardpilot.crash"
+local crash = require("test.inspect_client").wrap(require "shardpilot.crash")
 local crash_client = require "shardpilot.crash.client"
 local sanitize = require "shardpilot.crash.sanitize"
 local event_mod = require "shardpilot.crash.event"
@@ -246,12 +246,12 @@ end
 
 local function config(overrides)
 	local out = {
-		crash_ingest_url = "http://localhost:8080",
-		crash_api_key = "sp_crash_write_key",
+		crash_url = "http://localhost:8080",
+		crash_key = "sp_crash_write_key",
 		app_id = "app-example",
 		app_version = "0.1.0",
 		app_build = "100",
-		publish_timeout_seconds = 5,
+		crash_http_timeout_seconds = 5,
 	}
 	for key, value in pairs(overrides or {}) do
 		out[key] = value
@@ -297,27 +297,27 @@ end
 local function test_config_validation()
 	local client, err = crash.new({})
 	assert_equal(client, nil)
-	assert_equal(err, "crash_ingest_url_required")
+	assert_equal(err, "crash_url_required")
 
 	local cases = {
-		{ { crash_ingest_url = 42 }, "invalid_crash_ingest_url" },
-		{ { crash_ingest_url = "ftp://x" }, "invalid_crash_ingest_url" },
-		{ { crash_ingest_url = "http://example.com" }, "invalid_crash_ingest_url" },
-		{ { crash_ingest_url = "https://ingest.example.com/path" }, "invalid_crash_ingest_url" },
-		{ { crash_ingest_url = "https://ingest.example.com?x=1" }, "invalid_crash_ingest_url" },
+		{ { crash_url = 42 }, "invalid_crash_url" },
+		{ { crash_url = "ftp://x" }, "invalid_crash_url" },
+		{ { crash_url = "http://example.com" }, "invalid_crash_url" },
+		{ { crash_url = "https://ingest.example.com/path" }, "invalid_crash_url" },
+		{ { crash_url = "https://ingest.example.com?x=1" }, "invalid_crash_url" },
 		{ { app_id = false }, "invalid_app_id" },
-		{ { sample_every = 0 }, "invalid_sample_every" },
-		{ { sample_every = 1.5 }, "invalid_sample_every" },
-		{ { publish_timeout_seconds = -1 }, "invalid_publish_timeout_seconds" },
-		{ { crash_source = "Bad_Slug" }, "invalid_crash_source" },
-		{ { crash_source = "-leadinghyphen" }, "invalid_crash_source" },
-		{ { crash_source = string.rep("a", 64) }, "invalid_crash_source" },
+		{ { crash_sample_every = -1 }, "invalid_crash_sample_every" },
+		{ { crash_sample_every = 1.5 }, "invalid_crash_sample_every" },
+		{ { crash_http_timeout_seconds = -1 }, "invalid_crash_http_timeout_seconds" },
+		{ { crash_component = "Bad_Slug" }, "invalid_crash_component" },
+		{ { crash_component = "-leadinghyphen" }, "invalid_crash_component" },
+		{ { crash_component = string.rep("a", 64) }, "invalid_crash_component" },
 		{ { diagnostics = 42 }, "invalid_diagnostics" },
 		{ { sampler = 42 }, "invalid_sampler" },
-		{ { capture_previous_on_boot = 1 }, "invalid_capture_previous_on_boot" },
-		{ { capture_previous_on_boot = "false" }, "invalid_capture_previous_on_boot" },
-		{ { script_error_capture_enabled = 1 }, "invalid_script_error_capture_enabled" },
-		{ { script_error_capture_enabled = "yes" }, "invalid_script_error_capture_enabled" },
+		{ { previous_crash_capture_enabled = 1 }, "invalid_previous_crash_capture_enabled" },
+		{ { previous_crash_capture_enabled = "false" }, "invalid_previous_crash_capture_enabled" },
+		{ { crash_hooks_enabled = 1 }, "invalid_crash_hooks_enabled" },
+		{ { crash_hooks_enabled = "yes" }, "invalid_crash_hooks_enabled" },
 	}
 	for _, entry in ipairs(cases) do
 		client, err = crash.new(config(entry[1]))
@@ -327,29 +327,29 @@ local function test_config_validation()
 
 	-- Missing the crash:write API key.
 	local no_key = config()
-	no_key.crash_api_key = nil
+	no_key.crash_key = nil
 	client, err = crash.new(no_key)
 	assert_equal(client, nil)
-	assert_equal(err, "crash_api_key_required")
+	assert_equal(err, "crash_key_required")
 
 	-- Valid configs: https remote, loopback variants, and a valid slug.
-	assert_true(crash.new(config({ crash_ingest_url = "https://crashes.example.com" })))
-	assert_true(crash.new(config({ crash_ingest_url = "http://127.0.0.1:8080" })))
-	assert_true(crash.new(config({ crash_ingest_url = "http://[::1]:8080" })))
-	local valid = assert(crash.new(config({ crash_source = "game-client" })))
-	assert_equal(valid.config.crash_source, "game-client")
+	assert_true(crash.new(config({ crash_url = "https://crashes.example.com" })))
+	assert_true(crash.new(config({ crash_url = "http://127.0.0.1:8080" })))
+	assert_true(crash.new(config({ crash_url = "http://[::1]:8080" })))
+	local valid = assert(crash.new(config({ crash_component = "game-client" })))
+	assert_equal(valid.config.crash_component, "game-client")
 
-	-- A bare-app (no source) config defaults crash_source to nil.
+	-- A bare-app (no source) config defaults crash_component to nil.
 	local bare = assert(crash.new(config()))
-	assert_equal(bare.config.crash_source, nil)
-	assert_equal(bare.config.sample_every, 10)
+	assert_equal(bare.config.crash_component, nil)
+	assert_equal(bare.config.crash_sample_every, 10)
 end
 
 -- ── source slug stamping ─────────────────────────────────────────────────────
 
 local function test_source_stamped_on_every_report()
 	reset()
-	local client = assert(crash.new(config({ crash_source = "main-server", sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_component = "main-server", crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event()))
 	assert_equal(#requests, 1)
 	assert_contains(requests[1].body, '"component":"main-server"')
@@ -363,7 +363,7 @@ end
 
 local function test_bare_app_omits_source()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event()))
 	assert_equal(#requests, 1)
 	assert_not_contains(requests[1].body, '"component"')
@@ -371,7 +371,7 @@ end
 
 local function test_per_event_invalid_source_rejected()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A per-event source carrying an uppercase/invalid slug must be rejected by
 	-- validation BEFORE it reaches the wire.
 	local ok, err = client:emit(presymbolicated_event({ source = "Invalid Slug" }))
@@ -389,7 +389,7 @@ local function test_non_string_source_rejected_nonfatal_omitted_fatal()
 	reset()
 	-- Configure a default source so we can prove a non-string per-report value does
 	-- NOT silently fall back to it.
-	local client = assert(crash.new(config({ crash_source = "main-server", sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_component = "main-server", crash_sample_every = 1 })))
 
 	-- Non-fatal: a non-string source is rejected, not defaulted.
 	local ok, err = client:emit(presymbolicated_event({ source = 123 }))
@@ -419,7 +419,7 @@ end
 
 local function test_routes_to_dedicated_crash_endpoint()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event()))
 	assert_equal(#requests, 1)
 	local request = requests[1]
@@ -452,7 +452,7 @@ end
 
 local function test_crash_id_defaults_to_uuid_v7()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event()))
 	local crash_id = requests[1].body:match('"crash_id":"([^"]+)"')
 	assert_true(crash_id ~= nil, "crash_id must be present")
@@ -461,7 +461,7 @@ end
 
 local function test_native_frames_require_modules()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A native (address-only) frame with no module map cannot be resolved: its
 	-- unresolvable address is dropped, leaving the frame with no identity, so it is
 	-- dropped too. With no frame and no raw text left, there is no crash content to
@@ -493,7 +493,7 @@ end
 
 local function test_presymbolicated_modules_omitted()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event()))
 	-- A pre-symbolicated crash carries no modules; the field must be absent (the
 	-- encoder drops nil), never an unresolvable empty native frame.
@@ -507,7 +507,7 @@ local function test_fatal_bypasses_sampler()
 	reset()
 	-- A 1-in-1000 sampler would almost never let a non-fatal report through, but
 	-- a fatal crash must be sent EVERY time.
-	local client = assert(crash.new(config({ sample_every = 1000 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1000 })))
 	for _ = 1, 20 do
 		assert_true(client:emit_fatal(presymbolicated_event()))
 	end
@@ -518,8 +518,8 @@ end
 
 local function test_non_fatal_is_sampled()
 	reset()
-	-- sample_every = 5 => the deterministic default sampler keeps 1 in 5.
-	local client = assert(crash.new(config({ sample_every = 5 })))
+	-- crash_sample_every = 5 => the deterministic default sampler keeps 1 in 5.
+	local client = assert(crash.new(config({ crash_sample_every = 5 })))
 	for _ = 1, 10 do
 		assert_true(client:emit(presymbolicated_event()))
 	end
@@ -580,7 +580,7 @@ local function test_fatal_dotted_exception_type_reaches_wire()
 	for _, exc_type in ipairs({ "java.lang.RuntimeException", "com.company.game.Crash",
 		"user_error", "player_died", "device_lost" }) do
 		reset()
-		local client = assert(crash.new(config({ sample_every = 1 })))
+		local client = assert(crash.new(config({ crash_sample_every = 1 })))
 		local ok = client:emit_fatal(presymbolicated_event({
 			exception = { type = exc_type, reason = "boom" },
 		}))
@@ -595,7 +595,7 @@ local function test_fatal_dotted_exception_type_reaches_wire()
 	-- then becomes empty and the fatal report is honestly rejected at validation
 	-- (the PII never reaches the wire). This is the safety counterpart.
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok, err = client:emit_fatal(presymbolicated_event({
 		exception = { type = "leaked_player@example.com", reason = "boom" },
 	}))
@@ -616,7 +616,7 @@ end
 local function test_fatal_dotted_module_name_reaches_wire()
 	for _, module_name in ipairs({ "com.company.game", "java.lang.RuntimeException", "libgame.so" }) do
 		reset()
-		local client = assert(crash.new(config({ sample_every = 1 })))
+		local client = assert(crash.new(config({ crash_sample_every = 1 })))
 		local ok = client:emit_fatal(presymbolicated_event({
 			modules = {
 				{ name = module_name, debug_id = "ABC123", load_address = "0x1000" },
@@ -636,7 +636,7 @@ local function test_fatal_dotted_module_name_reaches_wire()
 	-- without it — the PII never reaches the wire, and a fatal is not lost over an
 	-- optional module entry.
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal(presymbolicated_event({
 		modules = {
 			{ name = "handler_user_4242", debug_id = "ABC123", load_address = "0x1000" },
@@ -658,7 +658,7 @@ end
 local function test_fatal_long_build_id_reaches_wire()
 	reset()
 	local build_id = "a1b2c3d4e5f6071829304152637485960a1b2c3d" -- 40 hex chars, no dots
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal(presymbolicated_event({
 		modules = {
 			{ name = "libgame.so", debug_id = build_id, load_address = "0x1000" },
@@ -675,7 +675,7 @@ end
 
 local function test_pii_scrubbed_from_wire()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit({
 		exception = { type = "lua_error", reason = "boom" },
 		context = { build_channel = "beta" },
@@ -717,7 +717,7 @@ local function test_caller_cannot_supply_its_own_actor_key()
 	-- report carry a key when no identity is configured, or point a crash at a
 	-- different subject — mis-keying consent and erasure either way.
 	reset()
-	local unconfigured = assert(crash.new(config({ sample_every = 1 })))
+	local unconfigured = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(unconfigured:emit(presymbolicated_event({
 		anonymous_id = "0198f2c1-4b3a-7c2d-8e9f-callersupplied",
 		session_id = "0198f2c1-4b3a-7c2d-8e9f-callersession",
@@ -730,7 +730,7 @@ local function test_caller_cannot_supply_its_own_actor_key()
 	-- And a caller value cannot displace a CONFIGURED identity either.
 	reset()
 	local configured = assert(crash.new(config({
-		sample_every = 1,
+		crash_sample_every = 1,
 		anonymous_id = "0198f2c1-4b3a-7c2d-8e9f-configured00",
 	})))
 	assert_true(configured:emit(presymbolicated_event({
@@ -746,7 +746,7 @@ local function test_actor_key_stamped_from_configured_provider()
 	-- is picked up instead of being frozen at construction.
 	local current = "0198f2c1-4b3a-7c2d-8e9f-a1b2c3d4e5f6"
 	local client = assert(crash.new(config({
-		sample_every = 1,
+		crash_sample_every = 1,
 		anonymous_id = function() return current end,
 		session_id = function() return "0198f2c1-4b3a-7c2d-8e9f-000000000001" end,
 	})))
@@ -765,7 +765,7 @@ end
 
 local function test_actor_key_static_string_form()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1, anonymous_id = "install-abc123" })))
+	local client = assert(crash.new(config({ crash_sample_every = 1, anonymous_id = "install-abc123" })))
 	assert_true(client:emit(presymbolicated_event()))
 	assert_contains(requests[1].body, '"anonymous_id":"install-abc123"')
 end
@@ -774,7 +774,7 @@ local function test_no_actor_key_configured_omits_the_field()
 	-- The dark-default guarantee: a client that does not opt in must send the same
 	-- bytes it sent before the field existed — absent, not an empty string.
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event()))
 	assert_equal(#requests, 1)
 	assert_not_contains(requests[1].body, "anonymous_id")
@@ -783,7 +783,7 @@ end
 
 local function test_bad_actor_key_drops_the_field_not_the_report()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1, anonymous_id = "user_4242" })))
+	local client = assert(crash.new(config({ crash_sample_every = 1, anonymous_id = "user_4242" })))
 	assert_true(client:emit(presymbolicated_event()))
 	assert_equal(#requests, 1)
 	local body = requests[1].body
@@ -798,7 +798,7 @@ local function test_throwing_identity_provider_never_costs_the_crash()
 	-- The provider is HOST code running while the process is already dying.
 	reset()
 	local client = assert(crash.new(config({
-		sample_every = 1,
+		crash_sample_every = 1,
 		anonymous_id = function() error("identity backend is down") end,
 	})))
 	assert_true(client:emit(presymbolicated_event()))
@@ -843,7 +843,7 @@ local function test_caller_context_identity_wall_still_holds()
 	-- Adding an SDK-owned top-level field must NOT open a caller-side path: the
 	-- name-keyed wall over device/context/metadata is unchanged.
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event({
 		context = { anonymous_id = "0198f2c1-4b3a-7c2d-8e9f-a1b2c3d4e5f6", build_channel = "beta" },
 		metadata = { userId = "0198f2c1-4b3a-7c2d-8e9f-999999999999" },
@@ -864,7 +864,7 @@ end
 
 local function test_context_session_id_pii_rejects_event()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok, err = client:emit(presymbolicated_event({
 		context = { session_id = "user_12345" },
 	}))
@@ -1233,7 +1233,7 @@ end
 
 local function test_breadcrumbs_attached_and_bounded()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	for i = 1, event_mod.max_breadcrumbs + 10 do
 		client:record_breadcrumb("step." .. tostring(i))
 	end
@@ -1253,7 +1253,7 @@ end
 
 local function test_breadcrumb_pii_name_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A breadcrumb name is a user-provided label: a raw actor id is rejected as PII
 	-- whether or not it has a digit ("user_4242", "user_alice", "customer_acme"),
 	-- while a legitimate dotted name ("level.load.done") and a plain word
@@ -1276,7 +1276,7 @@ end
 -- does not affect the crash. A normal dotted label ("level.load.done") still ships.
 local function test_breadcrumb_long_opaque_name_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- a 44-char dotless base64url token (no separators a readable label would have)
 	local opaque = "AbCdEf0123456789AbCdEf0123456789AbCdEf012345"
 	assert_equal(#opaque >= 40, true, "the fixture is a long opaque run")
@@ -1293,7 +1293,7 @@ end
 
 local function test_accepted_increments_snapshot()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event()))
 	assert_equal(client:snapshot().accepted, 1)
 	assert_equal(client:snapshot().failed, 0)
@@ -1304,7 +1304,7 @@ local function test_rejected_surfaced_via_diagnostics()
 	next_status = 400
 	local issues = {}
 	local client = assert(crash.new(config({
-		sample_every = 1,
+		crash_sample_every = 1,
 		diagnostics = function(issue)
 			issues[#issues + 1] = issue
 		end,
@@ -1321,7 +1321,7 @@ end
 local function test_unauthorized_surfaced()
 	reset()
 	next_status = 401
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event()))
 	assert_equal(client:snapshot().failed, 1)
 	assert_equal(client:snapshot().last_error, "unauthorized")
@@ -1333,7 +1333,7 @@ local function test_suppressed_response_surfaced()
 	reset()
 	next_status = 202
 	next_response_body = '{"suppressed":true}'
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event()))
 	assert_equal(client:snapshot().suppressed, 1,
 		"a consent-suppressed 2xx must be surfaced as suppressed")
@@ -1345,7 +1345,7 @@ local function test_warning_surfaced()
 	reset()
 	next_status = 202
 	next_response_body = '{"crash_id":"x","warnings":["truncated breadcrumbs"]}'
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event()))
 	assert_equal(client:snapshot().accepted, 1)
 	assert_equal(client:snapshot().suppressed, 0)
@@ -1356,7 +1356,7 @@ local function test_garbage_2xx_body_still_accepted()
 	reset()
 	next_status = 202
 	next_response_body = "<<not json>>"
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event()))
 	assert_equal(client:snapshot().accepted, 1,
 		"a 2xx with an unparseable body is still an accepted crash")
@@ -1367,7 +1367,7 @@ local function test_retry_after_recorded_on_429()
 	reset()
 	next_status = 429
 	next_response_headers = { ["retry-after"] = "7" }
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event()))
 	assert_equal(client:snapshot().failed, 1)
 	assert_equal(client:snapshot().last_retry_after, 7,
@@ -1378,7 +1378,7 @@ local function test_retry_after_recorded_on_503()
 	reset()
 	next_status = 503
 	next_response_headers = { ["retry-after"] = "3" }
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event()))
 	assert_equal(client:snapshot().failed, 1)
 	assert_equal(client:snapshot().last_retry_after, 3,
@@ -1428,7 +1428,7 @@ end
 
 local function test_capture_previous_no_dump()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local module = fake_crash_module({ handle = nil })
 	local ok, sent = client:capture_previous(module)
 	assert_equal(ok, true)
@@ -1452,7 +1452,7 @@ local function test_previous_session_dump_never_borrows_the_live_identity()
 		backtrace = { { address = 0x1abc } },
 	})
 	local client = assert(crash.new(config({
-		sample_every = 1,
+		crash_sample_every = 1,
 		anonymous_id = "0198f2c1-4b3a-7c2d-8e9f-relaunchsubject",
 	})))
 	local ok, sent = client:capture_previous(module)
@@ -1489,7 +1489,7 @@ local function test_capture_previous_forwards_native_dump()
 		},
 	})
 	-- A 1-in-1000 sampler must NOT suppress the dump forward (it is fatal).
-	local client = assert(crash.new(config({ sample_every = 1000, crash_source = "game-client" })))
+	local client = assert(crash.new(config({ crash_sample_every = 1000, crash_component = "game-client" })))
 	local ok, sent = client:capture_previous(module)
 	assert_equal(ok, true)
 	assert_equal(sent, true)
@@ -1524,7 +1524,7 @@ local function test_engine_module_debug_id_synthesized()
 		},
 		backtrace = { { address = 0x4abc } },
 	})
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:capture_previous(module))
 	assert_equal(#requests, 1)
 	local body = requests[1].body
@@ -1549,7 +1549,7 @@ local function test_engine_module_debug_id_prefers_dump_engine_hash()
 		modules = { { name = "dmengine", address = 0x4000 } },
 		backtrace = { { address = 0x4abc } },
 	})
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:capture_previous(module))
 	assert_equal(#requests, 1)
 	assert_contains(requests[1].body, '"debug_id":"dmengine-0ldc0ffee0ldc0ffee0ldc0ffee0ldc0ffee0ld"')
@@ -1570,7 +1570,7 @@ local function test_engine_module_debug_id_matches_platform_name_shapes()
 		},
 		backtrace = { { address = 0x4abc } },
 	})
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:capture_previous(module))
 	assert_equal(#requests, 1)
 	local body = requests[1].body
@@ -1590,7 +1590,7 @@ local function test_engine_module_debug_id_falls_back_without_engine_info()
 		modules = { { name = "dmengine", address = 0x4000 } },
 		backtrace = { { address = 0x4abc } },
 	})
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:capture_previous(module))
 	assert_equal(#requests, 1)
 	assert_contains(requests[1].body, '"debug_id":"dmengine"')
@@ -1609,7 +1609,7 @@ local function test_init_auto_captures_previous_dump_on_boot()
 	rawset(_G, "crash", module)
 	-- crash.init (the boot entry) forwards the previous-session dump itself —
 	-- no manual capture_previous() call anywhere in this test.
-	assert_true(crash.init(config({ sample_every = 1 })))
+	assert_true(crash.init(config({ crash_sample_every = 1 })))
 	rawset(_G, "crash", nil)
 	assert_equal(opts.load_calls, 1, "boot auto-capture must read the one-shot dump")
 	assert_equal(#requests, 1)
@@ -1626,7 +1626,7 @@ local function test_init_auto_capture_disabled_by_flag()
 	}
 	local module = fake_crash_module(opts)
 	rawset(_G, "crash", module)
-	assert_true(crash.init(config({ sample_every = 1, capture_previous_on_boot = false })))
+	assert_true(crash.init(config({ crash_sample_every = 1, previous_crash_capture_enabled = false })))
 	rawset(_G, "crash", nil)
 	assert_equal(opts.load_calls, nil, "the flag must keep the dump untouched for a manual flow")
 	assert_equal(#requests, 0)
@@ -1636,7 +1636,7 @@ end
 local function test_init_auto_capture_respects_persisted_opt_out()
 	reset()
 	-- Persist the opt-out first (a previous session's set_enabled(false)).
-	local prior = assert(crash.new(config({ sample_every = 1 })))
+	local prior = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(prior:set_enabled(false))
 	local opts = {
 		handle = 7,
@@ -1645,7 +1645,7 @@ local function test_init_auto_capture_respects_persisted_opt_out()
 	}
 	local module = fake_crash_module(opts)
 	rawset(_G, "crash", module)
-	assert_true(crash.init(config({ sample_every = 1 })))
+	assert_true(crash.init(config({ crash_sample_every = 1 })))
 	rawset(_G, "crash", nil)
 	-- Disabled ⇒ the one-shot dump stays UNREAD (a later re-enable can still
 	-- forward it) and nothing is sent.
@@ -1656,14 +1656,14 @@ end
 
 local function test_script_error_capture_dark_by_default()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_equal(sys.error_handler, nil, "the dark default must never touch sys.set_error_handler")
 	assert_true(client ~= nil)
 end
 
 local function test_script_error_capture_reports_fatal()
 	reset()
-	assert(crash.new(config({ sample_every = 1000, script_error_capture_enabled = true })))
+	assert(crash.new(config({ crash_sample_every = 1000, crash_hooks_enabled = true })))
 	assert_true(type(sys.error_handler) == "function", "opt-in must install the handler")
 	sys.error_handler("lua", "main/game.script:12: attempt to index nil", "stack traceback:\n  main/game.script:12: in function update")
 	-- Fatal: the 1-in-1000 sampler must not suppress it.
@@ -1677,7 +1677,7 @@ end
 
 local function test_script_error_capture_caps_per_session()
 	reset()
-	assert(crash.new(config({ sample_every = 1, script_error_capture_enabled = true })))
+	assert(crash.new(config({ crash_sample_every = 1, crash_hooks_enabled = true })))
 	for i = 1, 14 do
 		sys.error_handler("lua", "boom " .. i, "stack traceback: loop")
 	end
@@ -1690,9 +1690,9 @@ local function test_script_error_capture_defers_install_while_opted_out()
 	reset()
 	-- Persist the opt-out, then boot with the flag on: the game's handler
 	-- slot must stay untouched (Defold has ONE process-wide slot).
-	local prior = assert(crash.new(config({ sample_every = 1 })))
+	local prior = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(prior:set_enabled(false))
-	local client = assert(crash.new(config({ sample_every = 1, script_error_capture_enabled = true })))
+	local client = assert(crash.new(config({ crash_sample_every = 1, crash_hooks_enabled = true })))
 	assert_equal(sys.error_handler, nil, "an opted-out boot must not install the handler")
 	-- Re-enabling is the first enabled instant: the handler installs then.
 	assert_true(client:set_enabled(true))
@@ -1703,7 +1703,7 @@ end
 
 local function test_script_error_capture_reports_without_traceback()
 	reset()
-	assert(crash.new(config({ sample_every = 1, script_error_capture_enabled = true })))
+	assert(crash.new(config({ crash_sample_every = 1, crash_hooks_enabled = true })))
 	-- Some runtime callbacks pass no traceback: the message doubles as
 	-- raw_text so the report still ships (frames_or_raw_text_required).
 	sys.error_handler("lua", "main/game.script:7: boom", nil)
@@ -1717,7 +1717,7 @@ end
 
 local function test_script_error_capture_respects_opt_out()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1, script_error_capture_enabled = true })))
+	local client = assert(crash.new(config({ crash_sample_every = 1, crash_hooks_enabled = true })))
 	assert_true(client:set_enabled(false))
 	local ok = client:on_script_error("lua", "boom", "stack traceback: x")
 	assert_equal(ok, true, "the handler must swallow, never throw into the engine")
@@ -1734,7 +1734,7 @@ local function test_capture_previous_drops_dump_without_modules()
 		backtrace = { { address = 0x1abc } },
 		modules = {},
 	})
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok, sent = client:capture_previous(module)
 	assert_equal(ok, true)
 	assert_equal(sent, false, "a dump with no module map is dropped")
@@ -1767,7 +1767,7 @@ local function test_singleton_guard_and_flow()
 	assert_equal(ok, false)
 	assert_equal(err, "not_initialized")
 
-	assert_true(crash.init(config({ sample_every = 1, crash_source = "game-client" })))
+	assert_true(crash.init(config({ crash_sample_every = 1, crash_component = "game-client" })))
 	assert_true(crash.record_breadcrumb("menu.open"))
 	assert_true(crash.emit_fatal(presymbolicated_event()))
 	assert_equal(#requests, 1)
@@ -1781,7 +1781,7 @@ end
 
 local function test_caller_event_not_mutated()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1, crash_source = "main-server" })))
+	local client = assert(crash.new(config({ crash_sample_every = 1, crash_component = "main-server" })))
 	local event = presymbolicated_event()
 	assert_true(client:emit(event))
 	-- prepare() clones; the caller's table must be untouched (no defaulted source
@@ -1796,7 +1796,7 @@ end
 
 local function test_crash_id_pii_replaced_with_uuid()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A caller crash_id carrying a raw-identifier prefix must NOT reach the wire;
 	-- it is replaced with a generated UUIDv7, never dropped.
 	assert_true(client:emit(presymbolicated_event({ crash_id = "player_123" })))
@@ -1833,7 +1833,7 @@ end
 
 local function test_context_identity_keys_stripped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- Clean (non-PII-prefixed) identity values would pass the value scrub; the KEY
 	-- itself must be stripped so a raw actor identifier never reaches the wire.
 	assert_true(client:emit(presymbolicated_event({
@@ -1860,7 +1860,7 @@ end
 
 local function test_occurred_at_malformed_defaults_to_now()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A malformed occurred_at must NOT be shipped verbatim; default to now.
 	assert_true(client:emit(presymbolicated_event({ occurred_at = "not a date" })))
 	assert_equal(#requests, 1)
@@ -1885,7 +1885,7 @@ end
 
 local function test_breadcrumb_timestamp_scrubbed()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A caller breadcrumb with a malformed/PII timestamp must not ship it verbatim;
 	-- it falls back to the event time. A clean ISO timestamp is preserved.
 	assert_true(client:emit(presymbolicated_event({
@@ -1908,7 +1908,7 @@ end
 
 local function test_base_address_without_load_address_accepted()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A module with base_address but NO load_address must satisfy the
 	-- load/base-address requirement (the nil first arg must not stop the fallback).
 	assert_true(client:emit({
@@ -1932,7 +1932,7 @@ end
 
 local function test_malformed_nested_entry_rejected()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A non-table module entry must be rejected via the normal error path, never
 	-- raise a Lua error.
 	local ok, err = client:emit(presymbolicated_event({ modules = { 42 } }))
@@ -1960,7 +1960,7 @@ end
 
 local function test_non_hex_frame_address_rejected()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A non-empty but non-hex address is cleared, never dispatched as a resolvable
 	-- address. Here it is the frame's only identity, so the frame is dropped and the
 	-- report falls back to the frame-less rule — still rejected, nothing non-hex sent.
@@ -2024,7 +2024,7 @@ local function test_shutdown_waits_for_in_flight_send()
 		end
 	end
 
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event()))
 	assert_equal(#requests, 1)
 
@@ -2053,7 +2053,7 @@ local function test_capture_previous_does_not_attach_current_breadcrumbs()
 		modules = { { name = "libgame.so", address = 0x1000 } },
 		backtrace = { { address = 0x1abc } },
 	})
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- The current (live) session recorded a breadcrumb; it must NOT be attached to
 	-- the previous-session dump, whose own breadcrumbs are unavailable.
 	assert_true(client:record_breadcrumb("live-session-breadcrumb"))
@@ -2070,7 +2070,7 @@ end
 
 local function test_metadata_identity_keys_stripped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- Clean (non-PII-prefixed) identity VALUES pass the value scrub; the KEY itself
 	-- must be stripped from metadata exactly as it is from context, so a raw actor
 	-- identifier never reaches the wire.
@@ -2098,7 +2098,7 @@ end
 
 local function test_absent_module_fields_omitted()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A module with only the required fields (name + debug_id + load_address) must
 	-- not encode present-but-empty optional fields.
 	assert_true(client:emit({
@@ -2128,7 +2128,7 @@ end
 
 local function test_absent_breadcrumb_fields_omitted()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A breadcrumb supplied with only a name must not encode present-but-empty
 	-- type/category/level/message.
 	assert_true(client:emit(presymbolicated_event({
@@ -2174,7 +2174,7 @@ local function test_iso_instant_fraction_strict()
 
 	-- End-to-end: a malformed-fraction occurred_at is defaulted, never shipped.
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event({ occurred_at = "2026-06-21T10:11:12..Z" })))
 	assert_equal(#requests, 1)
 	local body = requests[1].body
@@ -2188,7 +2188,7 @@ end
 
 local function test_non_hex_module_address_rejected()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A module whose load_address is non-hex is an unusable entry: it is dropped
 	-- rather than rejecting the whole report. Here the lone address frame
 	-- (0xdeadbeef) has no module map left to resolve against and no function symbol,
@@ -2243,7 +2243,7 @@ end
 
 local function test_embedded_raw_id_scrubbed_from_wire()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit({
 		-- an embedded raw id inside an exception reason must be blanked
 		exception = { type = "lua_error", reason = "save failed for user_4242" },
@@ -2277,7 +2277,7 @@ end
 local function test_dotted_app_version_preserved_on_wire()
 	reset()
 	-- a 4-part version comes from the trusted config and must survive to the wire
-	local client = assert(crash.new(config({ app_version = "1.2.3.4", app_build = "2024.6", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_version = "1.2.3.4", app_build = "2024.6", crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event()))
 	assert_equal(#requests, 1)
 	local body = requests[1].body
@@ -2286,7 +2286,7 @@ local function test_dotted_app_version_preserved_on_wire()
 
 	-- but an email/raw-id in the version field is still rejected (blanked + omitted)
 	reset()
-	local poisoned = assert(crash.new(config({ app_version = "build@example.com", sample_every = 1 })))
+	local poisoned = assert(crash.new(config({ app_version = "build@example.com", crash_sample_every = 1 })))
 	assert_true(poisoned:emit(presymbolicated_event()))
 	assert_equal(#requests, 1)
 	assert_not_contains(requests[1].body, "build@example.com")
@@ -2296,7 +2296,7 @@ end
 
 local function test_raw_text_only_fatal_not_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A fatal crash reported as raw traceback text (no structured frames). The
 	-- traceback line "main.script:42:" must NOT be mistaken for an IPv6 literal and
 	-- blanked, which would otherwise leave the report with no frames AND no
@@ -2426,7 +2426,7 @@ end
 -- the same text IS still blanked.
 local function test_timestamp_raw_text_fatal_not_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal({
 		exception = { type = "lua_error", reason = "crash at 12:34:56" },
 		raw_text = "12:34:56 main.script:42: attempt to index nil\n\tin function 'update'",
@@ -2464,7 +2464,7 @@ end
 -- the symbol while still stripping an embedded email/IP.
 local function test_manual_frame_symbol_fatal_not_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A function-only frame (no address), so the frame's ONLY identity is the
 	-- symbol: if it is blanked the frame is unidentified and the fatal is dropped.
 	local ok = client:emit_fatal({
@@ -2536,7 +2536,7 @@ end
 -- frame ships, the crash reaches the wire, and the PII is absent.
 local function test_pii_only_frame_dropped_clean_frame_ships()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal({
 		exception = { type = "lua_error", reason = "boom" },
 		threads = {
@@ -2593,7 +2593,7 @@ end
 -- init-validated config platform must be reapplied so the fatal reaches the wire.
 local function test_bad_per_event_platform_falls_back_to_config()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1, platform = "html5" })))
+	local client = assert(crash.new(config({ crash_sample_every = 1, platform = "html5" })))
 	local ok = client:emit_fatal({
 		exception = { type = "lua_error", reason = "boom" },
 		platform = "user_4242",
@@ -2630,7 +2630,7 @@ end
 -- reaches the wire under an aliased key.
 local function test_identity_key_aliases_stripped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event({
 		context = {
 			userId = "alice",
@@ -2661,7 +2661,7 @@ end
 -- survives.
 local function test_device_identity_keys_stripped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event({
 		device = {
 			device_id = "dev-clean-123",
@@ -2694,7 +2694,7 @@ end
 -- (trimmed) with its value.
 local function test_padded_identity_key_stripped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event({
 		context = {
 			[" user_id "] = "alice",
@@ -2722,7 +2722,7 @@ end
 -- component is still removed.
 local function test_symbol_fingerprint_component_survives_on_wire()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event({
 		fingerprint_components = {
 			"java.lang.RuntimeException",
@@ -2744,7 +2744,7 @@ end
 
 local function test_home_path_username_redacted_on_wire()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit({
 		exception = { type = "lua_error", reason = "asset load failed: /Users/alice/game/level.lua" },
 		raw_text = "stack:\n\t/home/bob/projects/app/src/main.lua:10",
@@ -2774,7 +2774,7 @@ end
 -- rest of the file location useful.
 local function test_frame_file_path_username_redacted_on_wire()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit({
 		exception = { type = "lua_error", reason = "boom" },
 		threads = {
@@ -2805,7 +2805,7 @@ end
 -- genuine email address in free text IS still blanked.
 local function test_at_sign_raw_text_fatal_not_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- The traceback carries two non-email "@" tokens: an HTML5/file URL and an
 	-- offset-into-module address. Neither is an email address shape (no dotted
 	-- letters-only TLD after the "@"), so the raw text must survive verbatim.
@@ -2845,7 +2845,7 @@ end
 -- the wire.
 local function test_overlong_backtrace_truncated_fatal_not_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- Build a single thread with far more than the 256-frame budget. Each frame is a
 	-- distinct, recognizable symbol so we can assert which end survived.
 	local frames = {}
@@ -2876,7 +2876,7 @@ end
 -- resolvable; the bare alias key is dropped.
 local function test_frame_address_alias_normalized()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit({
 		exception = { type = "SIGSEGV" },
 		modules = { { name = "libgame.so", debug_id = "ABC", load_address = "0x1000" } },
@@ -2914,7 +2914,7 @@ end
 -- leave the report with no actionable stack.
 local function test_crashed_thread_frames_prioritized()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- Thread order puts a huge NON-crashed thread first, the crashed thread second.
 	local bg_frames = {}
 	for i = 1, 400 do
@@ -2954,7 +2954,7 @@ end
 -- value that carries real PII is rejected up front, never reaching emit).
 local function test_app_id_actor_prefix_scope_survives()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1, app_id = "user_app" })))
+	local client = assert(crash.new(config({ crash_sample_every = 1, app_id = "user_app" })))
 	-- a FATAL crash must reach the wire with the scope intact, not be dropped over it
 	local ok = client:emit_fatal(presymbolicated_event())
 	assert_equal(ok, true, "a fatal crash must not be dropped over an actor-prefixed app_id scope")
@@ -2964,7 +2964,7 @@ local function test_app_id_actor_prefix_scope_survives()
 
 	-- a second actor-style scope (customer_portal) survives identically
 	reset()
-	local client2 = assert(crash.new(config({ sample_every = 1, app_id = "customer_portal" })))
+	local client2 = assert(crash.new(config({ crash_sample_every = 1, app_id = "customer_portal" })))
 	assert_true(client2:emit_fatal(presymbolicated_event()))
 	assert_contains(requests[1].body, '"id":"customer_portal"')
 end
@@ -2975,7 +2975,7 @@ end
 -- id would send under the wrong scope or be rejected.
 local function test_caller_app_id_overridden_by_config()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1, app_id = "app-example" })))
+	local client = assert(crash.new(config({ crash_sample_every = 1, app_id = "app-example" })))
 	-- the caller tries to set a DIFFERENT app id on the event
 	local ok = client:emit_fatal(presymbolicated_event({ app = { id = "some-other-app" } }))
 	assert_equal(ok, true)
@@ -2998,7 +2998,7 @@ end
 -- treated as missing and replaced with the positional index.
 local function test_non_number_frame_index_normalized()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal(presymbolicated_event({
 		threads = {
 			{
@@ -3023,7 +3023,7 @@ end
 -- shipped verbatim and not allowed to drop the fatal.
 local function test_invalid_numeric_frame_index_normalized()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal(presymbolicated_event({
 		threads = {
 			{
@@ -3052,7 +3052,7 @@ end
 -- A fatal is never dropped over a bad line.
 local function test_fractional_frame_line_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal(presymbolicated_event({
 		threads = {
 			{
@@ -3080,7 +3080,7 @@ end
 -- reject the whole fatal — it is only an optional grouping hint.
 local function test_oversized_fingerprint_components_capped_fatal_not_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local components = {}
 	for i = 1, 40 do
 		components[i] = "group.part" .. i
@@ -3103,7 +3103,7 @@ end
 -- reject the whole crash.
 local function test_invalid_device_class_dropped_fatal_not_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal(presymbolicated_event({
 		device = { class = "handheld", model = "pixel" },
 	}))
@@ -3124,7 +3124,7 @@ end
 -- crashed thread, never reject the fatal with a thread overflow.
 local function test_oversized_thread_list_capped_keeps_crashed_fatal_not_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local threads = {}
 	-- 80 non-crashed background threads first (past the 64 budget), then the crashed
 	-- thread last so a naive head-truncation would drop it.
@@ -3157,7 +3157,7 @@ end
 -- the stack is pre-symbolicated and needs no module map).
 local function test_invalid_module_entry_dropped_fatal_not_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal(presymbolicated_event({
 		modules = {
 			-- a clean module the stack does not need
@@ -3179,7 +3179,7 @@ end
 -- clean symbolic frame in the same stack still ships — the fatal is not lost.
 local function test_dropped_referenced_module_drops_frame_address_keeps_clean_frame()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal({
 		exception = { type = "SIGSEGV", reason = "boom" },
 		modules = {
@@ -3214,7 +3214,7 @@ end
 -- so the fatal is NOT lost over the unresolvable optional address.
 local function test_unresolvable_address_frame_dropped_clean_sibling_keeps_fatal()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal({
 		exception = { type = "SIGSEGV", reason = "boom" },
 		threads = {
@@ -3248,7 +3248,7 @@ end
 -- symbolic tail frames must survive.
 local function test_address_frames_for_filtered_module_dropped_before_budget()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local frames = {}
 	-- 256 (== the frame budget) address-only frames into a module that is dropped as
 	-- invalid (no debug_id/build_id), so each frame's address path is cleared and the
@@ -3345,7 +3345,7 @@ end
 -- SENDS (a fatal crash is never dropped over a bad source).
 local function test_per_report_invalid_scrubbed_source()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 
 	-- non-fatal: a source carrying a raw identifier is rejected
 	local ok, err = client:emit(presymbolicated_event({ source = "user_123" }))
@@ -3387,7 +3387,7 @@ local function test_long_valid_slug_source_preserved()
 
 	-- per-report, non-fatal: the long valid slug is NOT rejected and reaches the wire
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok, err = client:emit(presymbolicated_event({ source = long_slug }))
 	assert_equal(ok, true, "a valid long slug source must not be rejected: " .. tostring(err))
 	assert_equal(#requests, 1)
@@ -3403,7 +3403,7 @@ local function test_long_valid_slug_source_preserved()
 
 	-- config-default: the same long slug stamped from config survives on every report
 	reset()
-	local client2 = assert(crash.new(config({ crash_source = long_slug, sample_every = 1 })))
+	local client2 = assert(crash.new(config({ crash_component = long_slug, crash_sample_every = 1 })))
 	assert_true(client2:emit(presymbolicated_event()))
 	assert_equal(#requests, 1)
 	assert_contains(requests[1].body, '"component":"' .. long_slug .. '"')
@@ -3466,7 +3466,7 @@ local function test_dump_persisted_before_dispatch()
 		end
 	end
 
-	local client = assert(crash.new(config({ app_id = "inflight-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "inflight-app", crash_sample_every = 1 })))
 	local ok, sent = client:capture_previous(fake_crash_module({
 		handle = 9,
 		signum = 11,
@@ -3516,7 +3516,7 @@ local function test_dump_retryable_failure_persists_and_resends()
 	-- LAUNCH 1: the server is unreachable (status 0 == retryable). The dump is
 	-- consumed on read, so the prepared report MUST be persisted, not dropped.
 	next_status = 0
-	local client = assert(crash.new(config({ app_id = "persist-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "persist-app", crash_sample_every = 1 })))
 	local ok, sent = client:capture_previous(fresh_dump_module())
 	assert_equal(ok, true)
 	assert_equal(sent, true, "the dump was dispatched")
@@ -3530,7 +3530,7 @@ local function test_dump_retryable_failure_persists_and_resends()
 	-- pending list is cleared.
 	reset()
 	next_status = 202
-	local client2 = assert(crash.new(config({ app_id = "persist-app", sample_every = 1 })))
+	local client2 = assert(crash.new(config({ app_id = "persist-app", crash_sample_every = 1 })))
 	-- no new native dump this launch
 	local ok2, sent2 = client2:capture_previous(fake_crash_module({ handle = nil }))
 	assert_equal(ok2, true)
@@ -3560,7 +3560,7 @@ local function test_dump_non_retryable_reject_not_persisted()
 	local restore = install_fake_sys_storage()
 
 	next_status = 400
-	local client = assert(crash.new(config({ app_id = "terminal-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "terminal-app", crash_sample_every = 1 })))
 	local ok, sent = client:capture_previous(fake_crash_module({
 		handle = 5,
 		signum = 6,
@@ -3758,7 +3758,7 @@ local function test_pending_persistence_safe_without_sys_api()
 	storage.reset()
 	-- no fake sys storage installed: sys.save/load/get_save_file are absent here
 	next_status = 0
-	local client = assert(crash.new(config({ app_id = "no-disk-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "no-disk-app", crash_sample_every = 1 })))
 	local ok = client:capture_previous(fake_crash_module({
 		handle = 3,
 		signum = 11,
@@ -3891,7 +3891,7 @@ end
 -- like "build.channel" is NOT an identity name after collapsing and must survive.
 local function test_dotted_identity_key_aliases_stripped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event({
 		context = {
 			["user.id"] = "alice",
@@ -3926,7 +3926,7 @@ end
 -- the crashed field.
 local function test_non_boolean_thread_crashed_normalized()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- Thread 0 carries crashed="false" (a truthy string); thread 1 is the real
 	-- boolean-crashed thread. The string must not win the crashed selection and must
 	-- not reach the wire.
@@ -3968,7 +3968,7 @@ end
 -- reassigned AND the crashed-thread pointer repointed to it.
 local function test_thread_id_pii_redefaulted_fatal_not_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal({
 		exception = { type = "lua_error", reason = "boom", crashed_thread_id = "user_123" },
 		threads = {
@@ -3997,7 +3997,7 @@ end
 -- spent on the frames that actually ship.
 local function test_pii_frames_dropped_before_frame_budget()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- Build a stack that exceeds the 256-frame budget: the first 256 frames are
 	-- PII-only (an embedded email, so they scrub empty and are dropped), followed by
 	-- clean frames that must survive.
@@ -4030,7 +4030,7 @@ end
 -- instead, keeping modules the surviving frames reference.
 local function test_oversized_module_map_truncated_fatal_not_dropped()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- The crashed frame references a module deep in the list (past the budget); the
 	-- referenced module must be kept so the frame still resolves.
 	local referenced_name = "lib_referenced.so"
@@ -4075,7 +4075,7 @@ end
 -- frame's PC must be kept even when no frame names it.
 local function test_oversized_module_map_keeps_address_covering_module()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A wide map of early modules at low addresses, plus a late-loaded module whose
 	-- address range contains the crashing PC. No frame names any module.
 	local modules = {}
@@ -4215,7 +4215,7 @@ local function test_dump_persist_failure_falls_back_to_in_memory_pending()
 	-- on read, so the prepared report MUST survive the failed persist via the
 	-- in-memory fallback, not be dropped.
 	next_status = 0
-	local client = assert(crash.new(config({ app_id = "mem-fallback-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "mem-fallback-app", crash_sample_every = 1 })))
 	local ok, sent = client:capture_previous(fake_crash_module({
 		handle = 9,
 		signum = 11,
@@ -4283,7 +4283,7 @@ local function test_in_memory_pending_terminal_reject_cleared()
 	end
 
 	next_status = 400
-	local client = assert(crash.new(config({ app_id = "mem-terminal-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "mem-terminal-app", crash_sample_every = 1 })))
 	local ok = client:capture_previous(fake_crash_module({
 		handle = 5,
 		signum = 6,
@@ -4312,7 +4312,7 @@ end
 -- than be dropped as a whole.
 local function test_bare_raw_id_frame_blanked_fatal_ships_via_sibling()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- Two frames: the crashing frame's only identity is a bare raw id ("user_alice"),
 	-- which blanks to empty and is dropped; the sibling frame carries a clean
 	-- qualified symbol and keeps the fatal alive.
@@ -4359,7 +4359,7 @@ end
 -- budget and no frame names it.
 local function test_oversized_address_only_module_map_keeps_nearest_preceding()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	-- A wide map of early ADDRESS-ONLY modules (load_address only, no end_address).
 	local modules = {}
 	for i = 1, 300 do
@@ -4414,7 +4414,7 @@ end
 -- thread), so the crashed stack is always addressable.
 local function test_stale_crashed_thread_id_repointed_to_crashed_thread()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal({
 		exception = { type = "lua_error", reason = "boom", crashed_thread_id = "no-such-thread" },
 		threads = {
@@ -4435,7 +4435,7 @@ end
 -- crashed stack rather than a dangling pointer to a non-existent thread.
 local function test_stale_crashed_thread_id_no_flag_falls_back_to_first()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok = client:emit_fatal({
 		exception = { type = "lua_error", reason = "boom", crashed_thread_id = "ghost" },
 		threads = {
@@ -4488,7 +4488,7 @@ local function test_live_fatal_emit_persisted_before_dispatch()
 		end
 	end
 
-	local client = assert(crash.new(config({ app_id = "live-writeahead-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "live-writeahead-app", crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event()))
 	assert_equal(#requests, 1, "the live send was dispatched")
 
@@ -4522,7 +4522,7 @@ local function test_sampling_gates_write_ahead_persist()
 	local restore = install_fake_sys_storage()
 	next_status = 500
 
-	local client = assert(crash.new(config({ app_id = "sampling-app", sample_every = 2 })))
+	local client = assert(crash.new(config({ app_id = "sampling-app", crash_sample_every = 2 })))
 	assert_true(client:emit(presymbolicated_event()))
 	assert_equal(client:snapshot().sampled_out, 1, "the first non-fatal is sampled out (1-in-2)")
 	assert_equal(#storage.load_pending_crashes({ app_id = "sampling-app" }), 0,
@@ -4547,7 +4547,7 @@ local function test_resend_sequential_429_stops_pass_and_defers()
 
 	-- Seed three pending fatals (oldest first: S1, S2, S3), all failing 500.
 	next_status = 500
-	local seeder = assert(crash.new(config({ app_id = "seq-app", sample_every = 1 })))
+	local seeder = assert(crash.new(config({ app_id = "seq-app", crash_sample_every = 1 })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "S1" } })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "S2" } })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "S3" } })))
@@ -4560,7 +4560,7 @@ local function test_resend_sequential_429_stops_pass_and_defers()
 		{ status = 202 },
 		{ status = 429, headers = { ["retry-after"] = "7200" } },
 	})
-	local client = assert(crash.new(config({ app_id = "seq-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "seq-app", crash_sample_every = 1 })))
 	client:resend_pending()
 	assert_equal(#requests, 2, "the 429 stops the pass: strictly one request at a time, S3 never raced out")
 	assert_contains(requests[1].body, '"S1"')
@@ -4576,7 +4576,7 @@ local function test_resend_sequential_429_stops_pass_and_defers()
 	-- While the stored window holds, another pass DEFERS (nothing is sent).
 	reset()
 	next_status = 202
-	local deferred = assert(crash.new(config({ app_id = "seq-app", sample_every = 1 })))
+	local deferred = assert(crash.new(config({ app_id = "seq-app", crash_sample_every = 1 })))
 	deferred:resend_pending()
 	assert_equal(#requests, 0, "the persisted backpressure window defers the whole pass")
 	assert_true(type(deferred:snapshot().resend_deferred_until_ms) == "number",
@@ -4587,7 +4587,7 @@ local function test_resend_sequential_429_stops_pass_and_defers()
 	assert_true(storage.set_pending_crash_retry_after(scope, nil))
 	reset()
 	next_status = 202
-	local resumed = assert(crash.new(config({ app_id = "seq-app", sample_every = 1 })))
+	local resumed = assert(crash.new(config({ app_id = "seq-app", crash_sample_every = 1 })))
 	resumed:resend_pending()
 	assert_equal(#requests, 2, "the resumed pass delivers the remainder")
 	assert_contains(requests[1].body, '"S2"')
@@ -4611,7 +4611,7 @@ local function test_retry_after_window_cleared_on_accept_and_absurd_dropped()
 	local _, armed = storage.load_pending_entries(scope)
 	assert_true(type(armed) == "number", "the window is stored")
 	next_status = 202
-	local client = assert(crash.new(config({ app_id = "window-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "window-app", crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event()))
 	local _, after_accept = storage.load_pending_entries(scope)
 	assert_equal(after_accept, nil, "an accepted send clears the stored backpressure window")
@@ -4727,7 +4727,7 @@ local function test_legacy_report_table_entry_resent_and_settled()
 	-- carry the encoded body under the same token.
 	reset()
 	next_status = 500
-	local client = assert(crash.new(config({ app_id = "legacy-entry-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "legacy-entry-app", crash_sample_every = 1 })))
 	client:resend_pending()
 	assert_equal(#requests, 1, "the legacy entry was attempted")
 	local first_body = requests[1].body
@@ -4740,7 +4740,7 @@ local function test_legacy_report_table_entry_resent_and_settled()
 	-- The next pass re-sends those SAME bytes and settles.
 	reset()
 	next_status = 202
-	local client2 = assert(crash.new(config({ app_id = "legacy-entry-app", sample_every = 1 })))
+	local client2 = assert(crash.new(config({ app_id = "legacy-entry-app", crash_sample_every = 1 })))
 	client2:resend_pending()
 	assert_equal(#requests, 1, "the adopted entry is resent")
 	assert_equal(requests[1].body, first_body, "byte-identical to the first attempt")
@@ -4761,7 +4761,7 @@ local function test_dump_forward_queues_behind_pending_pass()
 
 	-- Seed one older pending report (S1).
 	next_status = 500
-	local seeder = assert(crash.new(config({ app_id = "order-app", sample_every = 1 })))
+	local seeder = assert(crash.new(config({ app_id = "order-app", crash_sample_every = 1 })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "S1" } })))
 	assert_equal(#storage.load_pending_crashes(scope), 1)
 
@@ -4774,7 +4774,7 @@ local function test_dump_forward_queues_behind_pending_pass()
 		held[#held + 1] = callback
 	end
 
-	local client = assert(crash.new(config({ app_id = "order-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "order-app", crash_sample_every = 1 })))
 	local ok, sent = client:capture_previous(fake_crash_module({
 		handle = 9,
 		signum = 11,
@@ -4833,7 +4833,7 @@ local function test_memory_fallback_bounded_and_fatal_shielded()
 	storage.reset()
 	-- No sys storage: every persist fails over to the memory fallback.
 	next_status = 500
-	local client = assert(crash.new(config({ app_id = "mem-bound-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "mem-bound-app", crash_sample_every = 1 })))
 	for i = 1, 12 do
 		assert_true(client:emit(presymbolicated_event({ exception = { type = "lua_error", reason = "NF" .. i } })))
 	end
@@ -4866,7 +4866,7 @@ local function test_memory_fallback_honors_byte_caps()
 	reset()
 	storage.reset()
 	next_status = 500
-	local client = assert(crash.new(config({ app_id = "mem-bytes-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "mem-bytes-app", crash_sample_every = 1 })))
 
 	local oversized = { body = string.rep("x", 65 * 1024), crash_id = "big", fatal = true }
 	assert_equal(client:retain_in_memory_pending(oversized), nil,
@@ -4893,7 +4893,7 @@ local function test_memory_fallback_resends_oldest_first()
 	storage.reset()
 	-- No sys storage: every persist fails over to the memory fallback.
 	next_status = 500
-	local client = assert(crash.new(config({ app_id = "mem-order-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "mem-order-app", crash_sample_every = 1 })))
 	for i = 1, 12 do
 		assert_true(client:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "NF" .. i .. "x" } })))
 	end
@@ -4917,7 +4917,7 @@ local function test_tokenless_accept_clears_retry_after_window()
 	-- with fatal entries so a non-fatal emit retains NOTHING (token nil).
 	local scope = { app_id = "tokenless-app" }
 	next_status = 202
-	local client = assert(crash.new(config({ app_id = "tokenless-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "tokenless-app", crash_sample_every = 1 })))
 	for i = 1, 8 do
 		assert_true(client:retain_in_memory_pending(
 			{ body = '{"crash_id":"f' .. i .. '"}', crash_id = "f" .. i, fatal = true }) ~= nil)
@@ -5000,7 +5000,7 @@ local function test_resend_merges_memory_and_disk_by_age()
 	local restore = install_fake_sys_storage()
 
 	next_status = 500
-	local client = assert(crash.new(config({ app_id = "age-merge-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "age-merge-app", crash_sample_every = 1 })))
 	-- OLDER report: force its durable save to fail (memory retention).
 	local saved_save = sys.save
 	sys.save = function()
@@ -5034,7 +5034,7 @@ local function test_live_non_fatal_defers_into_stored_window()
 
 	assert_true(storage.set_pending_crash_retry_after(scope, 3600))
 	next_status = 202
-	local client = assert(crash.new(config({ app_id = "window-defer-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "window-defer-app", crash_sample_every = 1 })))
 
 	assert_true(client:emit(presymbolicated_event({ exception = { type = "lua_error", reason = "HELDx" } })))
 	assert_equal(#requests, 0, "a non-fatal live report defers into the stored window")
@@ -5059,7 +5059,7 @@ local function test_live_non_fatal_queues_behind_active_pass()
 
 	-- Seed one older pending report.
 	next_status = 500
-	local seeder = assert(crash.new(config({ app_id = "pass-queue-app", sample_every = 1 })))
+	local seeder = assert(crash.new(config({ app_id = "pass-queue-app", crash_sample_every = 1 })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "OLDpass" } })))
 	assert_equal(#storage.load_pending_crashes(scope), 1)
 
@@ -5072,7 +5072,7 @@ local function test_live_non_fatal_queues_behind_active_pass()
 		held[#held + 1] = callback
 	end
 
-	local client = assert(crash.new(config({ app_id = "pass-queue-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "pass-queue-app", crash_sample_every = 1 })))
 	client:resend_pending()
 	assert_equal(#requests, 1, "the pass has the older report in flight")
 
@@ -5103,7 +5103,7 @@ local function test_deferral_stat_clears_with_window()
 
 	assert_true(storage.set_pending_crash_retry_after(scope, 3600))
 	next_status = 202
-	local client = assert(crash.new(config({ app_id = "stat-clear-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "stat-clear-app", crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event()), "the non-fatal defers into the window")
 	assert_true(type(client:snapshot().resend_deferred_until_ms) == "number", "the deferral is surfaced")
 
@@ -5129,7 +5129,7 @@ local function test_resend_skips_tokens_in_flight()
 		held[#held + 1] = callback
 	end
 
-	local client = assert(crash.new(config({ app_id = "inflight-skip-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "inflight-skip-app", crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "INFLIGHTx" } })))
 	assert_equal(#requests, 1, "the live send is on the wire")
 	assert_equal(#storage.load_pending_crashes(scope), 1, "its write-ahead copy is pending")
@@ -5155,7 +5155,7 @@ local function test_pass_stops_on_concurrent_fatal_throttle()
 
 	-- Seed two pending reports.
 	next_status = 500
-	local seeder = assert(crash.new(config({ app_id = "concurrent-throttle-app", sample_every = 1 })))
+	local seeder = assert(crash.new(config({ app_id = "concurrent-throttle-app", crash_sample_every = 1 })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "R1x" } })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "R2x" } })))
 	assert_equal(#storage.load_pending_crashes(scope), 2)
@@ -5168,7 +5168,7 @@ local function test_pass_stops_on_concurrent_fatal_throttle()
 		held[#held + 1] = callback
 	end
 
-	local client = assert(crash.new(config({ app_id = "concurrent-throttle-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "concurrent-throttle-app", crash_sample_every = 1 })))
 	client:resend_pending()
 	assert_equal(#requests, 1, "the pass has R1 in flight")
 
@@ -5203,7 +5203,7 @@ local function test_mid_pass_disable_stops_pass_before_next_dispatch()
 
 	-- Seed three pending reports.
 	next_status = 500
-	local seeder = assert(crash.new(config({ app_id = "midpass-disable-app", sample_every = 1 })))
+	local seeder = assert(crash.new(config({ app_id = "midpass-disable-app", crash_sample_every = 1 })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "D1x" } })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "D2x" } })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "D3x" } })))
@@ -5217,7 +5217,7 @@ local function test_mid_pass_disable_stops_pass_before_next_dispatch()
 		held[#held + 1] = callback
 	end
 
-	local client = assert(crash.new(config({ app_id = "midpass-disable-app", sample_every = 1 })))
+	local client = assert(crash.new(config({ app_id = "midpass-disable-app", crash_sample_every = 1 })))
 	client:resend_pending()
 	assert_equal(#requests, 1, "the pass has D1 in flight")
 	assert_contains(requests[1].body, '"D1x"')
@@ -5265,7 +5265,7 @@ local function test_crash_enabled_by_default_and_opt_out_blocks_collection()
 	reset()
 	local restore = install_fake_sys_storage()
 
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local enabled, reason = client:is_enabled()
 	assert_equal(enabled, true, "crash reporting must default ON")
 	assert_equal(reason, nil)
@@ -5341,7 +5341,7 @@ local function test_crash_settings_absent_record_defaults_on()
 	sys.load = function()
 		return {}
 	end
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_equal(client:is_enabled(), true, "an absent record must apply the default, not fail closed")
 	assert_true(client:emit_fatal(presymbolicated_event()))
 	assert_equal(#requests, 1)
@@ -5368,7 +5368,7 @@ local function test_crash_settings_read_error_fails_closed()
 		error("disk corruption")
 	end
 
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local enabled, reason = client:is_enabled()
 	assert_equal(enabled, false, "an unreadable opt-out state must fail closed")
 	assert_equal(reason, "settings_read_failed")
@@ -5396,10 +5396,10 @@ end
 local function test_crash_opt_out_persists_across_reinit()
 	reset()
 	local restore = install_fake_sys_storage()
-	local first = assert(crash.new(config({ sample_every = 1 })))
+	local first = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(first:set_enabled(false))
 
-	local second = assert(crash.new(config({ sample_every = 1 })))
+	local second = assert(crash.new(config({ crash_sample_every = 1 })))
 	local enabled, reason = second:is_enabled()
 	assert_equal(enabled, false, "the persisted opt-out must survive re-init")
 	assert_equal(reason, "opt_out")
@@ -5409,7 +5409,7 @@ local function test_crash_opt_out_persists_across_reinit()
 	assert_equal(#requests, 0)
 
 	assert_true(second:set_enabled(true))
-	local third = assert(crash.new(config({ sample_every = 1 })))
+	local third = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_equal(third:is_enabled(), true)
 	assert_true(third:emit_fatal(presymbolicated_event()))
 	assert_equal(#requests, 1)
@@ -5430,7 +5430,7 @@ local function test_set_enabled_persist_failure_reported()
 	sys.load = function()
 		return nil
 	end
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local ok, err = client:set_enabled(false)
 	assert_equal(ok, false)
 	assert_equal(err, "crash_persist_failed")
@@ -5447,7 +5447,7 @@ end
 -- carry opt-out-period (or pre-opt-out) activity.
 local function test_opt_out_clears_and_refuses_breadcrumbs()
 	reset()
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_true(client:record_breadcrumb("pre.optout.crumb"))
 	assert_true(client:set_enabled(false))
 
@@ -5483,14 +5483,14 @@ local function test_failed_enable_persist_does_not_seed_shadow()
 		error("disk corruption")
 	end
 
-	local first = assert(crash.new(config({ sample_every = 1 })))
+	local first = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_equal(first:is_enabled(), false, "the unreadable record must fail closed")
 	local ok, err = first:set_enabled(true)
 	assert_equal(ok, false)
 	assert_equal(err, "crash_persist_failed")
 	assert_equal(first:is_enabled(), true, "the in-memory decision applies for this session")
 
-	local second = assert(crash.new(config({ sample_every = 1 })))
+	local second = assert(crash.new(config({ crash_sample_every = 1 })))
 	local enabled, reason = second:is_enabled()
 	assert_equal(enabled, false,
 		"a re-init with the durable read still failing must stay fail-closed")
@@ -5520,7 +5520,7 @@ local function test_malformed_crash_settings_fail_closed()
 		end
 		return nil
 	end
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	local enabled, reason = client:is_enabled()
 	assert_equal(enabled, false, "a malformed decision must not reopen collection on the default")
 	assert_equal(reason, "settings_read_failed")
@@ -5550,7 +5550,7 @@ local function test_disabled_client_prunes_expired_pending_on_init()
 		nil, now_ms) ~= nil)
 	assert_true(storage.save_crash_settings(scope, { crash_enabled = false }))
 
-	local client = assert(crash.new(config({ sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_sample_every = 1 })))
 	assert_equal(client:is_enabled(), false)
 	assert_equal(#requests, 0, "the maintenance read must not dispatch anything")
 
@@ -5574,7 +5574,7 @@ local function test_singleton_set_enabled_flow()
 	local off, off_reason = crash.is_enabled()
 	assert_equal(off, false)
 	assert_equal(off_reason, "not_initialized")
-	assert_true(crash.init(config({ sample_every = 1 })))
+	assert_true(crash.init(config({ crash_sample_every = 1 })))
 	assert_equal(crash.is_enabled(), true)
 	assert_true(crash.set_enabled(false))
 	local enabled, reason = crash.is_enabled()
@@ -5607,14 +5607,14 @@ local function test_component_replay_structural_keys()
 end
 
 local function test_component_option_precedence()
-	for _, row in ipairs({ { "game-client", "main-server", "game-client" }, { "", "main-server", "main-server" }, { "  ", "main-server", "main-server" }, { " game-client ", "main-server", "game-client" } }) do
+	for _, row in ipairs({ { "game-client", "game-client" }, { "", nil }, { "  ", nil }, { " game-client ", "game-client" } }) do
 		reset()
-		local client = assert(crash.new(config({ crash_component = row[1], crash_source = row[2] })))
-		assert_equal(client.config.crash_component, row[3])
+		local client = assert(crash.new(config({ crash_component = row[1] })))
+		assert_equal(client.config.crash_component, row[2])
 	end
-	local client, err = crash.new(config({ crash_component = "Bad_Slug", crash_source = "main-server" }))
+	local client, err = crash.new(config({ crash_component = "Bad_Slug" }))
 	assert_equal(client, nil)
-	assert_equal(err, "invalid_crash_source")
+	assert_equal(err, "invalid_crash_component")
 end
 
 local function test_legacy_component_replay_and_ambiguity()
@@ -5622,7 +5622,7 @@ local function test_legacy_component_replay_and_ambiguity()
 		reset()
 		storage.reset()
 		local restore = install_fake_sys_storage()
-		local producer = assert(crash.new(config({ crash_component = "game-client", sample_every = 1 })))
+		local producer = assert(crash.new(config({ crash_component = "game-client", crash_sample_every = 1 })))
 		assert_true(producer:emit_fatal(presymbolicated_event({ metadata = { source = "nested-preserved" } })))
 		local fresh = requests[1].body
 		local legacy = fresh:gsub('"component":"game%-client"', '"source":"game-client"', 1)
@@ -5644,7 +5644,7 @@ local function test_legacy_component_replay_and_ambiguity()
 		end
 		storage.reset()
 		requests = {}
-		local consumer = assert(crash.new(config({ sample_every = 1 })))
+		local consumer = assert(crash.new(config({ crash_sample_every = 1 })))
 		assert_true(consumer:resend_pending())
 		if shape == "both" then
 			assert_equal(#requests, 0, "ambiguous record never dispatched")
@@ -5664,7 +5664,7 @@ end
 
 local function test_component_wire_rejects_retired_key()
 	reset()
-	local client = assert(crash.new(config({ crash_source = "game-client", sample_every = 1 })))
+	local client = assert(crash.new(config({ crash_component = "game-client", crash_sample_every = 1 })))
 	local prepared = assert(event_mod.prepare(client, presymbolicated_event(), true, {}))
 	assert_equal(prepared.source, nil, "prepared crash has no retired root key")
 	assert_equal(prepared.component, "game-client", "prepared crash carries component")
@@ -5873,7 +5873,7 @@ print("shardpilot defold crash tests passed")
 		local real_request = http.request
 		local ok, err = pcall(function()
 			local client, sampler_calls = nil, 0
-			local options = config({ sample_every = scene.every })
+			local options = config({ crash_sample_every = scene.every })
 			if scene.custom then
 				options.sampler = function(view)
 					sampler_calls = sampler_calls + 1
@@ -5882,7 +5882,7 @@ print("shardpilot defold crash tests passed")
 					if scene.custom == "throws" then error("synthetic sampler failure") end
 					if scene.custom == "changes" then
 						client.config.sampler = nil
-						client.config.sample_every = 1
+						client.config.crash_sample_every = 1
 					end
 					return scene.custom ~= "reject"
 				end
@@ -5896,7 +5896,7 @@ print("shardpilot defold crash tests passed")
 				assert_true(storage.save_pending_crash(client:pending_scope(),
 					{ body = body, crash_id = prepared.crash_id, fatal = true }) ~= nil)
 				storage.reset()
-				local replay = assert(crash.new(config({ sample_every = 1 })))
+				local replay = assert(crash.new(config({ crash_sample_every = 1 })))
 				assert_true(replay:resend_pending())
 				assert_equal(#requests, 1)
 				assert_equal(requests[1].body, body, "old body remains byte-identical and unknown")
@@ -5931,7 +5931,7 @@ print("shardpilot defold crash tests passed")
 			assert_equal(caller.non_fatal_sample_one_in, 99, "caller data was not mutated")
 			-- Relaunch under another rate: serialization at capture owns the rate.
 			reset()
-			local replay = assert(crash.new(config({ sample_every = 1 })))
+			local replay = assert(crash.new(config({ crash_sample_every = 1 })))
 			assert_true(replay:resend_pending())
 			assert_equal(#requests, 1)
 			assert_equal(requests[1].body, body, "replay does not restamp under new policy")

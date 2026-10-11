@@ -60,7 +60,7 @@ local function enc(v)
 end
 json = { encode = function(v) encode_calls = encode_calls + 1; return enc(v) end }
 
-local sdk = require("shardpilot.sdk")
+local sdk = require("test.inspect_client").wrap(require("shardpilot.sdk"))
 local storage = require("shardpilot.storage")
 
 -- Consent must be GRANTED on disk before the client will spool anything:
@@ -81,7 +81,7 @@ local client = assert(sdk.new({
 	app_build = "100",
 	token_provider = function(callback) callback("client-token-placeholder", nil, nil) end,
 	flush_interval_seconds = 1,
-	publish_timeout_seconds = 2,
+	http_timeout_seconds = 2,
 }))
 
 local function make_envelope(i)

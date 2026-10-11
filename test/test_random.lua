@@ -13,8 +13,8 @@ socket = { gettime = function() return 1700000000.125 end }
 
 local id = require "shardpilot.id"
 local storage = require "shardpilot.storage"
-local Client = require("shardpilot.client").Client
-local Experiments = require("shardpilot.experiments").Experiments
+local Client = require("test.inspect_client").class(require("shardpilot.client").new)
+local Experiments = require("test.inspect_client").class(require("shardpilot.experiments").new, "Experiments")
 local client = setmetatable({publish_backoff_attempt=2, consent_backoff_attempt=2}, {__index=Client})
 local experiments = setmetatable({backoff_attempt=2}, {__index=Experiments})
 local scope = { app_id="random-tests" }

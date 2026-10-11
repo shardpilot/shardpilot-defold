@@ -527,7 +527,7 @@ end
 
 local config_keys = {
 	anonymous_id = true,
-	api_key = true,
+	publishable_key = true,
 	app_build = true,
 	app_id = true,
 	app_version = true,
@@ -540,10 +540,11 @@ local config_keys = {
 	flush_interval_seconds = true,
 	ingest_url = true,
 	platform = true,
-	publish_timeout_seconds = true,
+	http_timeout_seconds = true,
 	rejection_capacity = true,
 	remote_config_attributes_enabled = true,
-	remote_config_url = true,
+	app_url = true,
+	remote_config_enabled = true,
 	request_compression_enabled = true,
 	session_timeout_seconds = true,
 	source = true,
@@ -551,7 +552,7 @@ local config_keys = {
 	spool_max_bytes = true,
 	spool_max_events = true,
 	token_provider = true,
-	token_refresh_lead_ms = true,
+	token_refresh_lead_seconds = true,
 	transport = true,
 	user_id = true,
 	workspace_id = true,
@@ -587,26 +588,33 @@ local function validate_config(config, diagnostics)
 	if not valid_ingest_url(config.ingest_url) then
 		return nil, "invalid_ingest_url"
 	end
-	-- Optional remote config: `remote_config_url` is the base URL of the
+	-- Optional remote config: `app_url` is the base URL of the
 	-- remote-config endpoint (a separate service from the ingest endpoint),
-	-- validated with the same URL shape rules. Omit the field to disable
-	-- remote config; a configured value must be a valid base URL.
-	if config.remote_config_url ~= nil and not valid_ingest_url(config.remote_config_url) then
-		return nil, "invalid_remote_config_url"
+	-- validated with the same URL shape rules. A configured address must be
+	-- valid; remote_config_enabled controls construction of that consumer.
+	if config.app_url ~= nil and not valid_ingest_url(config.app_url) then
+		return nil, "invalid_app_url"
 	end
-	local has_remote_config = config.remote_config_url ~= nil
+	local has_app_url = config.app_url ~= nil
+	if config.remote_config_enabled ~= nil and type(config.remote_config_enabled) ~= "boolean" then
+		return nil, "invalid_remote_config_enabled"
+	end
+	local remote_config_enabled = config.remote_config_enabled == true
+	if remote_config_enabled and not has_app_url then
+		return nil, "remote_config_requires_app_url"
+	end
 	-- Experiments (dark by default): `experiments_enabled = true` opts into
 	-- the assignment consumer. The assignment endpoint lives on the same
 	-- host as the remote-config fetch and authenticates with
-	-- the same publishable api_key, so the flag requires `remote_config_url`
-	-- (which in turn requires the api_key). Default false — and while false,
+	-- the same publishable_key, so the flag requires `app_url`
+	-- (which in turn requires the publishable_key). Default false — and while false,
 	-- zero experiment code paths execute.
 	if config.experiments_enabled ~= nil and type(config.experiments_enabled) ~= "boolean" then
 		return nil, "invalid_experiments_enabled"
 	end
 	local experiments_enabled = config.experiments_enabled == true
-	if experiments_enabled and not has_remote_config then
-		return nil, "experiments_requires_remote_config_url"
+	if experiments_enabled and not has_app_url then
+		return nil, "experiments_requires_app_url"
 	end
 	-- Remote-config targeting attributes (dark by default):
 	-- `remote_config_attributes_enabled = true` opts fetches into carrying
@@ -619,41 +627,41 @@ local function validate_config(config, diagnostics)
 		return nil, "invalid_remote_config_attributes_enabled"
 	end
 	local remote_config_attributes_enabled = config.remote_config_attributes_enabled == true
-	if remote_config_attributes_enabled and not has_remote_config then
-		return nil, "remote_config_attributes_requires_remote_config_url"
+	if remote_config_attributes_enabled and not has_app_url then
+		return nil, "remote_config_attributes_requires_app_url"
 	end
 	-- Dual-mode auth. EITHER a Mode B async `token_provider` (a
-	-- per-tenant ingest JWT minted by the host) OR a Mode A `api_key` (the
+	-- per-tenant ingest JWT minted by the host) OR a Mode A `publishable_key` (the
 	-- non-secret publishable `sp_ingest_...` key, safe to embed client-side)
 	-- satisfies the config. Mode is selected by presence: a configured
 	-- `token_provider` yields the ingest Bearer (Mode B); otherwise the
-	-- `api_key` is the ingest Bearer (Mode A).
+	-- `publishable_key` is the ingest Bearer (Mode A).
 	--
 	-- Remote config is the one exception to "configure exactly one". The
-	-- remote-config endpoint authenticates with the publishable api_key
+	-- remote-config endpoint authenticates with the publishable_key
 	-- only — a Mode B ingest token is scoped to event ingest and the
-	-- remote-config endpoint rejects it. So with remote_config_url set, an
-	-- api_key is required even in Mode B, and configuring both credentials
+	-- remote-config endpoint rejects it. So with app_url set, a
+	-- publishable_key is required even in Mode B, and configuring both credentials
 	-- becomes valid: the token_provider keeps the ingest Bearer, the
-	-- api_key authenticates only the remote-config fetch. Without remote
+	-- publishable_key authenticates only the remote-config fetch. Without remote
 	-- config, configuring both stays rejected so the ingest auth source is
 	-- never ambiguous.
 	if config.token_provider ~= nil and type(config.token_provider) ~= "function" then
 		return nil, "invalid_token_provider"
 	end
-	if config.api_key ~= nil and type(config.api_key) ~= "string" then
-		return nil, "invalid_api_key"
+	if config.publishable_key ~= nil and type(config.publishable_key) ~= "string" then
+		return nil, "invalid_publishable_key"
 	end
 	local has_token_provider = type(config.token_provider) == "function"
-	local has_api_key = type(config.api_key) == "string" and config.api_key ~= ""
-	if has_token_provider and has_api_key and not has_remote_config then
+	local has_publishable_key = type(config.publishable_key) == "string" and config.publishable_key ~= ""
+	if has_token_provider and has_publishable_key and not has_app_url then
 		return nil, "auth_mode_conflict"
 	end
-	if not has_token_provider and not has_api_key then
+	if not has_token_provider and not has_publishable_key then
 		return nil, "auth_required"
 	end
-	if has_remote_config and not has_api_key then
-		return nil, "remote_config_api_key_required"
+	if has_app_url and not has_publishable_key then
+		return nil, "remote_config_publishable_key_required"
 	end
 	local source = config.source or "client"
 	if source ~= "client" and source ~= "server" and source ~= "backend" then
@@ -688,14 +696,14 @@ local function validate_config(config, diagnostics)
 	if session_timeout_seconds ~= session_timeout_seconds or session_timeout_seconds == math.huge then
 		return nil, "invalid_session_timeout_seconds"
 	end
-	local publish_timeout_seconds, publish_timeout_err =
-		normalize_positive_number(config.publish_timeout_seconds, 2, "invalid_publish_timeout_seconds")
-	if not publish_timeout_seconds then
+	local http_timeout_seconds, publish_timeout_err =
+		normalize_positive_number(config.http_timeout_seconds, 2, "invalid_http_timeout_seconds")
+	if not http_timeout_seconds then
 		return nil, publish_timeout_err
 	end
-	local token_refresh_lead_ms, token_refresh_lead_err =
-		normalize_non_negative_number(config.token_refresh_lead_ms, 60000, "invalid_token_refresh_lead_ms")
-	if token_refresh_lead_ms == nil then
+	local token_refresh_lead_seconds, token_refresh_lead_err =
+		normalize_non_negative_number(config.token_refresh_lead_seconds, 60, "invalid_token_refresh_lead_seconds")
+	if token_refresh_lead_seconds == nil then
 		return nil, token_refresh_lead_err
 	end
 	local rejection_capacity =
@@ -741,7 +749,8 @@ local function validate_config(config, diagnostics)
 	end
 	local out = {
 		ingest_url = trim_slash(config.ingest_url),
-		remote_config_url = has_remote_config and trim_slash(config.remote_config_url) or nil,
+		app_url = has_app_url and trim_slash(config.app_url) or nil,
+		remote_config_enabled = remote_config_enabled,
 		workspace_id = config.workspace_id,
 		app_id = config.app_id,
 		environment_id = config.environment_id,
@@ -753,7 +762,7 @@ local function validate_config(config, diagnostics)
 		platform = resolve_envelope_platform(config, diagnostics),
 		transport = config.transport,
 		token_provider = config.token_provider,
-		api_key = has_api_key and config.api_key or nil,
+		publishable_key = has_publishable_key and config.publishable_key or nil,
 		experiments_enabled = experiments_enabled,
 		remote_config_attributes_enabled = remote_config_attributes_enabled,
 		diagnostics = diagnostics,
@@ -762,8 +771,8 @@ local function validate_config(config, diagnostics)
 		buffer_size = buffer_size,
 		flush_interval_seconds = flush_interval_seconds,
 		session_timeout_seconds = session_timeout_seconds,
-		publish_timeout_seconds = publish_timeout_seconds,
-		token_refresh_lead_ms = token_refresh_lead_ms,
+		http_timeout_seconds = http_timeout_seconds,
+		token_refresh_lead_seconds = token_refresh_lead_seconds,
 		spool_enabled = config.spool_enabled ~= false,
 		spool_max_events = spool_max_events,
 		spool_max_bytes = spool_max_bytes,
@@ -1367,7 +1376,7 @@ function M.new(config, defer_init_diagnostics)
 	-- Remote config selects the anonymous ID only with granted consent; other
 	-- states select an empty client scope. Live accessors keep dispatch and
 	-- startup cache selection aligned with the client's current decision.
-	if normalized.remote_config_url then
+	if normalized.remote_config_enabled then
 		client.remote_config = remote_config_mod.new(normalized, function()
 			return client.anonymous_id
 		end, function()
@@ -1375,7 +1384,7 @@ function M.new(config, defer_init_diagnostics)
 			return client.consent_state
 		end)
 	end
-	if normalized.token_provider and not normalized.api_key
+	if normalized.token_provider and not normalized.publishable_key
 		and #client.consent_outbox > 0 then
 		-- The narrow could-never-send anti-wedge drop, scoped to the ONE
 		-- configuration where it is true: Mode B with no publishable key.
@@ -1396,8 +1405,8 @@ function M.new(config, defer_init_diagnostics)
 		-- be terminally rejected on the actor/subject mismatch or land the
 		-- decision under the wrong actor, and retained it would hold
 		-- set_anonymous_id's rotation guard in events_pending for as long
-		-- as it sat anon-keyed in the outbox. With a publishable api_key
-		-- configured (Mode A, or Mode B + api_key), anon-keyed receipts
+		-- as it sat anon-keyed in the outbox. With a publishable_key
+		-- configured (Mode A, or Mode B + publishable_key), anon-keyed receipts
 		-- dispatch under the key instead — the historic actor is the
 		-- correct subject of those decisions — so nothing is dropped there.
 		-- And a user_verified-keyed receipt is NEVER dropped for a
@@ -2519,7 +2528,7 @@ end
 -- ── remote config ─────────────────────────────────────────────────────────────
 --
 -- Thin delegates over the remote-config client (shardpilot/remote_config.lua),
--- present only when `remote_config_url` is configured. The fetch is always an
+-- present only when `remote_config_enabled` is true. The fetch is always an
 -- explicit game-triggered call — the SDK never fetches configuration on its
 -- own. Every consent state can fetch, but only granted consent permits the
 -- anonymous ID in the URL. Other states omit identity and attributes.
@@ -4087,15 +4096,15 @@ end
 
 function Client:refresh_token()
 	-- Mode A: no async token_provider is configured, so the standing
-	-- Bearer is the non-secret publishable `api_key`. It never expires and is
+	-- Bearer is the non-secret publishable `publishable_key`. It never expires and is
 	-- restored synchronously here (including after a 401 clears self.token), so
-	-- the publish/consent paths treat the api_key exactly like a yielded JWT.
+	-- the publish/consent paths treat the publishable_key exactly like a yielded JWT.
 	-- The token_provider check keeps the precedence explicit for the one
 	-- configuration where both credentials are present (remote config in
-	-- Mode B): the ingest Bearer stays the minted token, never the api_key —
-	-- the api_key authenticates only the remote-config fetch there.
-	if self.config.api_key and not self.config.token_provider then
-		self.token = self.config.api_key
+	-- Mode B): the ingest Bearer stays the minted token, never the publishable_key —
+	-- the publishable_key authenticates only the remote-config fetch there.
+	if self.config.publishable_key and not self.config.token_provider then
+		self.token = self.config.publishable_key
 		self.token_expires_at_ms = nil
 		return true
 	end
@@ -4194,7 +4203,7 @@ function Client:expiry_already_stale(expires_at_ms)
 	if expires_at_ms == nil then
 		return false
 	end
-	return clock.unix_ms() >= expires_at_ms - self.config.token_refresh_lead_ms
+	return clock.unix_ms() >= expires_at_ms - self.config.token_refresh_lead_seconds * 1000
 end
 
 function Client:can_publish()
@@ -4525,7 +4534,7 @@ function Client:receipt_dispatch_needs_token(receipt)
 	local vouched_by_token = self.config.token_provider ~= nil
 		and (receipt.kind == "user_verified"
 			or receipt.actor_identifier == self.anonymous_id)
-	local used_publishable_key = not vouched_by_token and self.config.api_key ~= nil
+	local used_publishable_key = not vouched_by_token and self.config.publishable_key ~= nil
 	return not used_publishable_key
 end
 
@@ -4769,7 +4778,7 @@ end
 -- selects the dispatch credential PER RECEIPT, most-vouching first — the
 -- minted Mode B token whenever it vouches for the receipt's actor (current
 -- verified user, or current-anon subject in the dual configuration; grants
--- stay deliverable there), the publishable api_key only for receipts the
+-- stay deliverable there), the publishable_key only for receipts the
 -- token cannot vouch for (historic-anon) and in pure Mode A.
 -- user_verified-keyed receipts dispatch only under a Mode B minted token,
 -- never a publishable fallback: the route binds the actor to the token
@@ -4920,7 +4929,7 @@ end
 -- True when some configured credential can lawfully carry this receipt's
 -- actor: the minted Mode B token (it vouches for the current verified user
 -- and for the CURRENT anon it binds as its subject) or the publishable
--- api_key (anon-keyed receipts, historic actors included). The Mode-B-only
+-- publishable_key (anon-keyed receipts, historic actors included). The Mode-B-only
 -- load drop already removes anon receipts with a never-vouchable actor, so
 -- this is the dispatch-side BELT for the same rule: a receipt nothing
 -- vouches for is SKIPPED by selection — never handed to the token as a
@@ -4931,7 +4940,7 @@ function Client:receipt_credential_available(receipt)
 	if receipt.kind == "user_verified" then
 		return true
 	end
-	return self.config.api_key ~= nil
+	return self.config.publishable_key ~= nil
 		or (self.config.token_provider ~= nil
 			and receipt.actor_identifier == self.anonymous_id)
 end
@@ -5234,7 +5243,7 @@ end
 -- Mode B token whenever it vouches for the receipt's actor (the current
 -- verified user, or the current anon the mint binds as its subject — so
 -- current-anon grants stay deliverable in the dual configuration), the
--- publishable api_key only for receipts the token cannot vouch for
+-- publishable_key only for receipts the token cannot vouch for
 -- (historic-anon actors) and in pure Mode A. Failure handling mirrors
 -- the publish path: retryable outcomes keep the receipt for the next
 -- dispatch point (a Retry-After or backoff paces the retry; a 401 under a
@@ -5276,7 +5285,7 @@ function Client:try_send_consent_outbox()
 	-- the current verified user (a dispatchable user_verified receipt has
 	-- already passed the vouching predicate), or the CURRENT anonymous id,
 	-- which the mint binds as the token's subject — so in the dual
-	-- token_provider + api_key configuration a current-anon receipt may
+	-- token_provider + publishable_key configuration a current-anon receipt may
 	-- carry a GRANT the publishable key terminally could not (the route
 	-- accepts grants only from a credential bound to the actor). Only a
 	-- receipt the token cannot vouch for falls back to the publishable key
@@ -5289,9 +5298,9 @@ function Client:try_send_consent_outbox()
 	local vouched_by_token = self.config.token_provider ~= nil
 		and (payload.kind == "user_verified"
 			or payload.actor_identifier == self.anonymous_id)
-	local used_publishable_key = not vouched_by_token and self.config.api_key ~= nil
+	local used_publishable_key = not vouched_by_token and self.config.publishable_key ~= nil
 	if used_publishable_key then
-		credential = self.config.api_key
+		credential = self.config.publishable_key
 	else
 		if not self:can_publish() then
 			return false
@@ -7253,6 +7262,6 @@ function Client:snapshot()
 	return out
 end
 
-M.Client = Client
+
 
 return M

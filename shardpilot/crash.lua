@@ -3,17 +3,33 @@
 -- for hosts that want to hold the client themselves.
 --
 -- Crash reports go to a DEDICATED crash ingest endpoint
--- (POST {crash_ingest_url}/api/v1/crashes/ingest) with a `crash:write` API key
+-- (POST {crash_url}/api/v1/crashes/ingest) with a `crash:write` API key
 -- and the crash report JSON body — they are NEVER wrapped as a `mobile_crash`
 -- analytics event. A fatal report is ALWAYS sent (never sampled).
+local facade = require "shardpilot.internal.facade"
 local client_mod = require "shardpilot.crash.client"
 
 local M = {}
 local default_client = nil
 
+local instance_methods = {
+	record_breadcrumb = 1,
+	set_enabled = 1,
+	is_enabled = 0,
+	emit = 1,
+	emit_fatal = 1,
+	capture_previous = 1,
+	resend_pending = 0,
+	snapshot = 0,
+	shutdown = 0,
+}
+
 function M.new(config)
-	return client_mod.new(config)
+	local client, err = client_mod.new(config)
+	if not client then return nil, err end
+	return facade.new(client, instance_methods)
 end
+
 
 function M.init(config)
 	local client, err = client_mod.new(config)
@@ -22,7 +38,7 @@ function M.init(config)
 	end
 	default_client = client
 	-- boot auto-capture (ON by default; disable with
-	-- `capture_previous_on_boot = false`): forward the previous session's
+	-- `previous_crash_capture_enabled = false`): forward the previous session's
 	-- native crash dump — and run the serial resend pass over any pending
 	-- backlog — as part of init, so integrators no longer wire the manual
 	-- capture_previous() call. Best-effort and never a reason for init to
@@ -30,7 +46,7 @@ function M.init(config)
 	-- (disabled ⇒ the one-shot dump stays UNREAD for a later re-enable).
 	-- Hosts constructing via crash.new manage their own boot and keep the
 	-- manual call.
-	if client.config.capture_previous_on_boot then
+	if client.config.previous_crash_capture_enabled then
 		pcall(client.capture_previous, client)
 	end
 	return true

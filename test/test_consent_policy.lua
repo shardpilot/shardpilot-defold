@@ -247,7 +247,7 @@ end
 
 local function context(overrides)
 	local ctx = {
-		endpoint = "https://policy.example",
+		app_url = "https://policy.example",
 		workspace_key = "ws-synthetic",
 		app_key = "app-synthetic",
 		environment_key = "env-synthetic",
@@ -866,19 +866,19 @@ end
 -- nothing to fail closed on.
 local function test_an_invalid_endpoint_is_an_invalid_request()
 	for _, override in ipairs({
-		{ endpoint = "__nil__" }, { endpoint = 8080 }, { endpoint = "policy.example" },
-		{ endpoint = "https://" .. string.rep("h", 300) },
+		{ app_url = "__nil__" }, { app_url = 8080 }, { app_url = "policy.example" },
+		{ app_url = "https://" .. string.rep("h", 300) },
 		-- ⚠ PLAIN http OFF LOOPBACK. The request carries this app's scope and
 		-- this player's locale and age band; in the clear to a remote host is
 		-- not a development convenience.
-		{ endpoint = "http://policy.example" },
-		{ endpoint = "http://198.51.100.7:8082" },
+		{ app_url = "http://policy.example" },
+		{ app_url = "http://198.51.100.7:8082" },
 		-- The rest of the SDK's URL rule, which the copied predicate brings
 		-- with it: no userinfo, no query, no fragment, no path.
-		{ endpoint = "https://user@policy.example" },
-		{ endpoint = "https://policy.example?a=1" },
-		{ endpoint = "https://policy.example#f" },
-		{ endpoint = "https://policy.example/v2" },
+		{ app_url = "https://user@policy.example" },
+		{ app_url = "https://policy.example?a=1" },
+		{ app_url = "https://policy.example#f" },
+		{ app_url = "https://policy.example/v2" },
 	}) do
 		reset()
 		next_response_body = plan()
@@ -892,7 +892,7 @@ local function test_an_invalid_endpoint_is_an_invalid_request()
 
 	-- The controls: https anywhere, http on loopback, and a single trailing
 	-- slash accepted and trimmed rather than refused — the SAME verdicts the
-	-- SDK gives ingest_url and crash_ingest_url, which is the point of copying
+	-- SDK gives ingest_url and crash_url, which is the point of copying
 	-- its predicate instead of writing a second opinion.
 	for _, endpoint in ipairs({
 		"https://policy.example", "https://policy.example/", "https://policy.example:8443",
@@ -900,7 +900,7 @@ local function test_an_invalid_endpoint_is_an_invalid_request()
 	}) do
 		reset()
 		next_response_body = plan()
-		local decision = prepare(context({ endpoint = endpoint }))
+		local decision = prepare(context({ app_url = endpoint }))
 		assert_unsigned(decision, endpoint .. " must be accepted: " .. tostring(decision.reason))
 		assert_equal(#requests, 1, endpoint .. " must reach the wire")
 		assert_true(requests[1].url:find("//api/cp", 1, true) == nil,

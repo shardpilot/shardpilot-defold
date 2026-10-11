@@ -17,7 +17,7 @@ return function(c)
 		workspace_id = c.workspace_id, app_id = c.app_id,
 		environment_id = c.environment_id, platform = "linux", source = "client",
 		batch_size = 100, spool_enabled = false,
-		request_compression_enabled = false, publish_timeout_seconds = 15,
+		request_compression_enabled = false, http_timeout_seconds = 15,
 		-- The caller's documented view of a per-event rejection: the
 		-- diagnostics hook receives every non-accepted row and
 		-- get_rejections() keeps the same rows retrievable (docs/configuration.md).
@@ -28,11 +28,11 @@ return function(c)
 	}))
 	assert(client:identify(c.user_id))
 	local crashes = assert(crash.new({
-		crash_ingest_url = c.crash_url, crash_api_key = c.crash_key,
+		crash_url = c.crash_url, crash_key = c.crash_key,
 		app_id = c.crash_app_id, platform = "linux",
 		app_version = "synthetic-sender", app_build = "synthetic-build",
-		crash_source = "sdk-evidence-sender", sample_every = 1,
-		capture_previous_on_boot = false, publish_timeout_seconds = 15,
+		crash_component = "sdk-evidence-sender", crash_sample_every = 1,
+		previous_crash_capture_enabled = false, crash_http_timeout_seconds = 15,
 	}))
 	stage("consent")
 	assert(client:set_consent(true))

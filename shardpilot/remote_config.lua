@@ -5,7 +5,7 @@
 -- configuration. Deliberately separate from the analytics transport
 -- (shardpilot/transport.lua): configuration is FETCHED (a GET of one
 -- resource, ETag-revalidated), never batched, and authenticates with the
--- publishable api_key only — a Mode B ingest token cannot authenticate the
+-- publishable publishable_key only — a Mode B ingest token cannot authenticate the
 -- remote-config endpoint (see client.lua's auth validation).
 --
 -- Fetch semantics (one fetch = one HTTP GET, decided by M.apply):
@@ -402,8 +402,8 @@ end
 local RemoteConfig = {}
 RemoteConfig.__index = RemoteConfig
 
--- `config` is the client's normalized configuration (remote_config_url,
--- api_key, workspace_id, environment_id, publish_timeout_seconds,
+-- `config` is the client's normalized configuration (app_url,
+-- publishable_key, workspace_id, environment_id, http_timeout_seconds,
 -- diagnostics). `identity` is a function returning the CURRENT anonymous id:
 -- it is read at every fetch (and cache read) rather than captured once, so a
 -- later set_anonymous_id naturally invalidates the cache through the scope
@@ -485,7 +485,7 @@ function RemoteConfig:scope_for(client_id)
 		self.config.workspace_id,
 		self.config.environment_id,
 		client_id,
-		self.config.remote_config_url)
+		self.config.app_url)
 end
 
 -- The usable durable record for the given scope, or nil. A record without
@@ -761,19 +761,19 @@ function RemoteConfig:fetch(callback)
 	end
 
 	local headers = {
-		["Authorization"] = "Bearer " .. self.config.api_key,
+		["Authorization"] = "Bearer " .. self.config.publishable_key,
 	}
 	if cache and cache.etag ~= "" then
 		headers["If-None-Match"] = cache.etag
 	end
 	local url = M.build_url(
-		self.config.remote_config_url,
+		self.config.app_url,
 		self.config.workspace_id,
 		self.config.environment_id,
 		client_id,
 		attribute_pairs_for(self))
 	local options = {
-		timeout = self.config.publish_timeout_seconds,
+		timeout = self.config.http_timeout_seconds,
 	}
 
 	http.request(url, "GET", function(_, _, response)
@@ -850,7 +850,5 @@ end
 function RemoteConfig:get_version()
 	return self.version
 end
-
-M.RemoteConfig = RemoteConfig
 
 return M

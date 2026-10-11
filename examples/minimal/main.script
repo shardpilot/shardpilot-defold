@@ -68,7 +68,7 @@ local spawn_rate = 1.0
 -- and several copies is how they drift apart.
 local function policy_context()
 	return {
-		endpoint = "http://localhost:8082",
+		app_url = "http://localhost:8082",
 		workspace_key = "workspace-example",
 		app_key = "app-example",
 		environment_key = "develop",
@@ -171,10 +171,11 @@ local function start_analytics(granted, decision, newly_answered, notice)
 			callback("client-token-placeholder", nil, nil)
 		end,
 		-- Remote config (optional). A separate endpoint from ingest_url; it
-		-- authenticates with the publishable api_key, so enabling it under
-		-- Mode B requires the api_key too. See docs/configuration.md.
-		remote_config_url = "http://localhost:8081",
-		api_key = "sp_ingest_publishable_placeholder",
+		-- authenticates with the publishable_key, so enabling it under
+		-- Mode B requires the publishable_key too. See docs/configuration.md.
+		app_url = "http://localhost:8081",
+		remote_config_enabled = true,
+		publishable_key = "sp_ingest_publishable_placeholder",
 	})
 	if not started_ok then
 		print("shardpilot init failed: " .. tostring(start_err))
@@ -259,15 +260,15 @@ end
 local function start_crash()
 	-- A separate module, endpoint, and crash:write key — see docs/crash.md.
 	-- init auto-forwards a previous-session native crash dump (set
-	-- capture_previous_on_boot = false for the manual flow). ⚠ THE FLAG COMES
+	-- previous_crash_capture_enabled = false for the manual flow). ⚠ THE FLAG COMES
 	-- FROM THE RESULT: a crash_running that lies makes final() shut down a
 	-- reporter that was never created.
 	local ok, err = crash.init({
-		crash_ingest_url = "http://localhost:8080",
-		crash_api_key = "sp_crash_write_placeholder",
+		crash_url = "http://localhost:8080",
+		crash_key = "sp_crash_write_placeholder",
 		app_id = "app-example",
 		crash_component = "game-client",
-		-- script_error_capture_enabled = true, -- opt-in Lua error auto-capture
+		-- crash_hooks_enabled = true, -- opt-in Lua error auto-capture
 	})
 	crash_running = ok and true or false
 	if not ok then

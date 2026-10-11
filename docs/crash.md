@@ -5,7 +5,7 @@ endpoint**, separate from analytics events. A crash report is **never** wrapped
 as a `mobile_crash` analytics event — it is a crash report JSON body, sent to:
 
 ```
-POST {crash_ingest_url}/api/v1/crashes/ingest
+POST {crash_url}/api/v1/crashes/ingest
 Authorization: Bearer <crash:write API key>
 Content-Type: application/json
 ```
@@ -19,8 +19,7 @@ independent of the analytics client.
 Unknown keys, including misspelled options or analytics-only options, are refused
 with `unknown_config_key` before any storage or HTTP work. `crash.new()` returns
 `nil, code`; `crash.init()` returns `false, code` and keeps its previous client.
-Both the preferred `crash_component` and the deprecated `crash_source` option
-remain supported.
+`crash_component` is the only component setting.
 
 Constructors capture the table's raw entries once before validation or host
 hooks. Metatable-provided fields are absent; use explicit table entries for
@@ -31,38 +30,37 @@ configuration. Function options retain their normal callback behavior.
 local crash = require "shardpilot.crash"
 
 crash.init({
-  crash_ingest_url = "https://crashes.example.com", -- crash ingest base URL
-  crash_api_key    = "sp_crash_...",                -- a crash:write API key
+  crash_url = "https://crashes.example.com", -- crash ingest base URL
+  crash_key    = "sp_crash_...",                -- a crash:write API key
   app_id           = "app-example",                  -- must match the key's app scope
   app_version      = "1.4.2",
   app_build        = "4201",
   crash_component  = "game-client",                  -- component slug (optional)
-  -- sample_every      = 10,  -- every-Nth NON-fatal is sent (deterministic counter; fatal always sent)
-  -- publish_timeout_seconds = 30,
+  -- crash_sample_every      = 10,  -- every-Nth NON-fatal is sent (deterministic counter; fatal always sent)
+  -- crash_http_timeout_seconds = 30,
   -- sampler = function(event) return true end,       -- custom NON-fatal sampler
   -- diagnostics = function(issue) ... end,            -- per-report failure hook
-  -- capture_previous_on_boot = false,   -- keep the manual capture_previous() flow
-  -- script_error_capture_enabled = true, -- opt-in Lua script-error auto-capture (dark by default)
+  -- previous_crash_capture_enabled = false,   -- keep the manual capture_previous() flow
+  -- crash_hooks_enabled = true, -- opt-in Lua script-error auto-capture (dark by default)
 })
 ```
 
 | Key | Required | Meaning |
 | --- | --- | --- |
-| `crash_ingest_url` | yes | The crash ingest **base** URL (no path/query/fragment). `https` is required outside loopback. The `/api/v1/crashes/ingest` route is appended by the SDK. |
-| `crash_api_key` | yes | A `crash:write` API key, used directly as the `Bearer` credential. |
+| `crash_url` | yes | The crash ingest **base** URL (no path/query/fragment). `https` is required outside loopback. The `/api/v1/crashes/ingest` route is appended by the SDK. |
+| `crash_key` | yes | A `crash:write` API key, used directly as the `Bearer` credential. |
 | `app_id` | yes | App/project scope; must match the API key's app scope. A product slug such as `user_app` or `customer_portal` is fine; a value carrying real PII (an email, an IP, a token, a digit-bearing raw actor id) fails `crash.init` with `invalid_app_id`. |
 | `app_version`, `app_build` | no | Defaulted onto every report. |
 | `platform` | no | Auto-detected from `sys.get_sys_info` (`ios`/`android`/`windows`/`macos`/`linux`/`web`). Set it explicitly when running outside Defold or on an unrecognized system; if it is neither configured nor auto-detectable, `crash.init` fails with `platform_required` rather than returning a client that can never send a report. |
-| `crash_component` | no | Preferred component slug (see below). |
-| `crash_source` | no | Deprecated fallback when `crash_component` is blank. |
-| `sample_every` | no | Every-Nth sampling for **non-fatal** reports (default 10): a deterministic per-process counter transmits calls N, 2N, 3N, … — the first N−1 non-fatals of a process are always dropped, so a process emitting fewer than N non-fatals in its lifetime reports none (set `1` to send every one). Fatal reports are **never** sampled. |
-| `publish_timeout_seconds` | no | Per-request timeout (default 30). |
-| `sampler` | no | A custom `function(event) -> boolean` for non-fatal reports. A fatal report bypasses it. |
+| `crash_component` | no | Component slug (see below); no fallback configuration alias. |
+| `crash_sample_every` | no | Every-Nth sampling for **non-fatal** reports (default 10): a deterministic per-process counter transmits calls N, 2N, 3N, … — the first N−1 non-fatals of a process are always dropped, so a process emitting fewer than N non-fatals in its lifetime reports none (set `1` to send every one). Set `0` to disable non-fatal reports, including the custom sampler. Fatal reports are **never** sampled. |
+| `crash_http_timeout_seconds` | no | Per-request timeout (default 30). |
+| `sampler` | no | A custom `function(event) -> boolean` for non-fatal reports when `crash_sample_every` is positive. Zero disables non-fatals before this callback; fatal reports bypass it. |
 | `diagnostics` | no | A hook invoked with `{ scope, status, code, retryable, response }` when a report is rejected or unauthorized. |
 | `anonymous_id` | no | The pseudonymous actor key a report is attributed to — a `function` resolved per report (pass `shardpilot.get_anonymous_id` to track the analytics id, including later rotations) or a fixed string. Absent means reports carry no actor key, as before. See [Attributing crashes to a player](#attributing-crashes-to-a-player). |
 | `session_id` | no | The session a crash happened in; same `function`-or-string shape. `shardpilot.get_session_id` returns `nil` until a session opens, which is handled. |
-| `capture_previous_on_boot` | no | **Default `true`**: `crash.init` itself forwards the previous-session native dump and runs one resend pass — no manual `capture_previous()` call needed. Set `false` to keep the manual flow (e.g. to defer the network work past your loading screen). Instance clients built with `crash.new` are unaffected either way — they always use the manual call. |
-| `script_error_capture_enabled` | no | **Default `false` (dark)** — opt-in Lua script-error auto-capture. When `true`, the SDK installs a [`sys.set_error_handler`](https://defold.com/ref/stable/sys/#sys.set_error_handler) handler — at construction while crash reporting is enabled, or at the `set_enabled(true)` that re-enables it (an opted-out or fail-closed boot leaves the game's handler slot untouched; a runtime opt-out after install leaves the SDK's handler in place as a guaranteed no-op, since the sys API cannot restore a previous handler) — that forwards each unhandled script error as a **fatal** `lua_error` report (message → `exception.reason`, traceback → `raw_text`, source → context), capped at **10 reports per session** so a per-frame error loop cannot flood the ingest door. Defold has a **single** process-wide error-handler slot: opting in replaces any handler the game installed (and a later `sys.set_error_handler` by game code replaces the SDK's). Keep this off and call `emit_fatal` from your own handler if you need both. |
+| `previous_crash_capture_enabled` | no | **Default `true`**: `crash.init` itself forwards the previous-session native dump and runs one resend pass — no manual `capture_previous()` call needed. Set `false` to keep the manual flow (e.g. to defer the network work past your loading screen). Instance clients built with `crash.new` are unaffected either way — they always use the manual call. |
+| `crash_hooks_enabled` | no | **Default `false` (dark)** — opt-in Lua script-error auto-capture. When `true`, the SDK installs a [`sys.set_error_handler`](https://defold.com/ref/stable/sys/#sys.set_error_handler) handler — at construction while crash reporting is enabled, or at the `set_enabled(true)` that re-enables it (an opted-out or fail-closed boot leaves the game's handler slot untouched; a runtime opt-out after install leaves the SDK's handler in place as a guaranteed no-op, since the sys API cannot restore a previous handler) — that forwards each unhandled script error as a **fatal** `lua_error` report (message → `exception.reason`, traceback → `raw_text`, source → context), capped at **10 reports per session** so a per-frame error loop cannot flood the ingest door. Defold has a **single** process-wide error-handler slot: opting in replaces any handler the game installed (and a later `sys.set_error_handler` by game code replaces the SDK's). Keep this off and call `emit_fatal` from your own handler if you need both. |
 
 ### The `component` slug
 
@@ -83,9 +81,9 @@ chars — **not** the analytics `client` / `server` / `backend` enum.
 - The slug is validated **before** it reaches the wire; an invalid value is
   rejected.
 
-The preferred option wins over `crash_source`. A blank preferred option uses the
-legacy fallback; an invalid nonblank preferred value is rejected. The event-table
-`source` override remains supported, but its wire key is `component`.
+Whitespace around `crash_component` is trimmed. An invalid nonblank value is
+rejected; an empty value omits the component. The event-table `source` override
+remains supported, but its wire key is `component`.
 
 Durable reports written by older versions rename only their root `source` key on
 replay. Values, nested keys and crash IDs are preserved. Records containing both
@@ -135,14 +133,15 @@ dropped.
 
 ## Fatal reports are never sampled
 
-A fatal crash is reported **every time**, regardless of `sample_every` or a
+A fatal crash is reported **every time**, regardless of `crash_sample_every` or a
 custom `sampler` — `emit_fatal` (and the dump-forward path) bypass the sampler
 entirely. Only `emit` (non-fatal) is sampled, and the default sampler is
 **deterministic, not probabilistic**: a per-process counter transmits every
 Nth call (10th, 20th, … at the default), so the first N−1 non-fatals of any
 process are always dropped. A sampled-out `emit` looks exactly like a sent
-one at the call site; supply a custom `sampler` (e.g. `function() return
-true end`) to transmit every non-fatal.
+one at the call site. `crash_sample_every = 0` disables every non-fatal report
+before the custom `sampler` runs. At a positive rate, a custom `sampler`
+(e.g. `function() return true end`) can admit every non-fatal.
 
 **New in `v0.11.0`:** newly captured reports carry SDK-stamped `fatal` on the wire.
 An admitted non-fatal report also carries `non_fatal_sample_one_in` when the
@@ -216,7 +215,7 @@ function init(self)
 end
 ```
 
-Set `capture_previous_on_boot = false` to keep the manual flow instead —
+Set `previous_crash_capture_enabled = false` to keep the manual flow instead —
 `crash.capture_previous()` then works exactly as before (and is what
 `crash.new` instance clients always use). The boot auto-capture is
 best-effort (it can never fail `init`) and honors the persisted opt-out: on a
@@ -277,7 +276,7 @@ failure.
 
 ## Opt-in script-error auto-capture
 
-`script_error_capture_enabled = true` (default **false** — dark) installs a
+`crash_hooks_enabled = true` (default **false** — dark) installs a
 [`sys.set_error_handler`](https://defold.com/ref/stable/sys/#sys.set_error_handler)
 handler at client construction while crash reporting is ENABLED (an opted-out
 boot defers the install to the `set_enabled(true)` that re-enables reporting,
@@ -369,8 +368,8 @@ local shardpilot = require "shardpilot.sdk"
 local crash = require "shardpilot.crash"
 
 crash.init({
-    crash_ingest_url = "https://crash.example.com",
-    crash_api_key = "<crash:write key>",
+    crash_url = "https://crash.example.com",
+    crash_key = "<crash:write key>",
     app_id = "your-app-id",
     anonymous_id = shardpilot.get_anonymous_id,  -- resolved per report
     session_id = shardpilot.get_session_id,      -- optional; nil until a session opens

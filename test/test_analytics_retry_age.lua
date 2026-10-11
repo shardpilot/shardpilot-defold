@@ -58,7 +58,7 @@ local function eq(actual, expected, message)
 	assert(actual == expected, message .. ": expected " .. tostring(expected) .. ", got " .. tostring(actual))
 end
 local config = {
-	api_key = "sp_test_retry_age", ingest_url = "https://ingest.example.invalid",
+	publishable_key = "sp_test_retry_age", ingest_url = "https://ingest.example.invalid",
 	workspace_id = "workspace-test", app_id = "app-test", environment_id = "test",
 	source = "backend", batch_size = 25, flush_interval_seconds = 3600,
 	diagnostics = function(issue) issues[#issues + 1] = issue end,
@@ -163,7 +163,7 @@ local function malformed_clock(field, value)
 end
 local function settle_after_consent(regrant, accepted, purge)
 	local client = fresh(purge and {
-		experiments_enabled = true, remote_config_url = "https://config.example.invalid",
+		experiments_enabled = true, app_url = "https://config.example.invalid",
 	} or nil)
 	local ids = {}
 	for i = 1, 5 do
@@ -296,7 +296,7 @@ local cases = {
 	end },
 	{ "stale_401_keeps_new_identity_credential", function()
 		local minted = 0
-		local client = fresh({ remote_config_url = "https://config.example.invalid",
+		local client = fresh({ app_url = "https://config.example.invalid",
 			token_provider = function(callback)
 				minted = minted + 1; callback("synthetic-credential-" .. minted, nil, nil)
 			end,

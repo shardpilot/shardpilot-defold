@@ -148,7 +148,7 @@ local function base_config(overrides)
 		environment_id = "develop",
 		source = "client",
 		app_version = "1.0.0",
-		api_key = "sp_ingest_publishable_key",
+		publishable_key = "sp_ingest_publishable_key",
 	}
 	for key, value in pairs(overrides or {}) do
 		config[key] = value
@@ -199,8 +199,8 @@ end
 do
 	local shared = base_config({
 		platform = "Win64_Shipping",
-		crash_ingest_url = "https://crash.example.com",
-		crash_api_key = "sp_crash_write_key",
+		crash_url = "https://crash.example.com",
+		crash_key = "sp_crash_write_key",
 	})
 	local invalid, err = client_mod.new(shared)
 	check(invalid == nil and err == "unknown_config_key", "analytics accepted crash-only keys")
@@ -208,7 +208,7 @@ do
 	check(invalid == nil and err == "unknown_config_key", "crash accepted analytics-only keys")
 	local analytics_options = base_config({ platform = shared.platform })
 	local crash_options = { platform = shared.platform, app_id = shared.app_id,
-		crash_ingest_url = shared.crash_ingest_url, crash_api_key = shared.crash_api_key }
+		crash_url = shared.crash_url, crash_key = shared.crash_key }
 	local analytics = assert(client_mod.new(analytics_options))
 	local crash = assert(crash_client.new(crash_options))
 	check(analytics_options.platform == shared.platform, "analytics config platform was mutated")

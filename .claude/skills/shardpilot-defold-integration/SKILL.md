@@ -30,7 +30,7 @@ the deeper reference.
   and targeting attributes and uses a separate cache scope.
 - **Experiments (off by default)**: a server-evaluated variant assignment
   consumer behind `experiments_enabled = true`, which also requires
-  `remote_config_url` AND `api_key`. It requires analytics consent `granted`,
+  `app_url` AND `publishable_key`. It requires analytics consent `granted`,
   and fails closed (no variant served, getters `nil`) until experiments are
   enabled server-side for the app — so a build with the flag on simply runs
   the control experience. See the README's "Experiments" section and
@@ -41,7 +41,7 @@ the deeper reference.
 - **Not provided today**: no automatic remote-config refresh, no packaged
   release ZIP assets (source archives
   only). (Live Lua script-error capture IS available as the opt-in
-  `script_error_capture_enabled` crash flag, default off — see the crash
+  `crash_hooks_enabled` crash flag, default off — see the crash
   section.)
 - **Deployment availability is not verified by this SDK source.** Use an
   endpoint supplied for your environment. The SDK is v0 alpha and the API
@@ -93,7 +93,7 @@ local crash = require "shardpilot.crash" -- only if you use crash reporting
 
 Two analytics auth modes; configure **exactly one** (plus one exception below):
 
-- **Mode A — `api_key`**: the publishable `sp_ingest_…` ingest key. It is
+- **Mode A — `publishable_key`**: the publishable `sp_ingest_…` ingest key. It is
   **non-secret by design** — safe to embed client-side, used directly as the
   `Bearer`, never expires. This is the normal choice for a shipped game
   client. One platform-side limit matters for consent: a publishable key can
@@ -107,12 +107,12 @@ Two analytics auth modes; configure **exactly one** (plus one exception below):
 
 Rules enforced at `init`: both configured → `auth_mode_conflict`; neither →
 `auth_required`. **Exception**: remote config authenticates with the
-publishable `api_key` only (a Mode B ingest JWT is scoped to event ingest and
-is rejected there), so with `remote_config_url` set you must supply `api_key`
-even in Mode B (`remote_config_api_key_required` otherwise) — the one valid
+publishable `publishable_key` only (a Mode B ingest JWT is scoped to event ingest and
+is rejected there), so with `app_url` set you must supply `publishable_key`
+even in Mode B (`remote_config_publishable_key_required` otherwise) — the one valid
 both-credentials configuration.
 
-Crash reporting uses a separate **`crash:write` API key** (`crash_api_key`),
+Crash reporting uses a separate **`crash:write` API key** (`crash_key`),
 used directly as the `Bearer` on the crash endpoint.
 
 **Never hardcode secrets** in game code or the game repo. The publishable
@@ -221,7 +221,7 @@ One context, resolved on every trigger:
 -- and several copies is how they drift apart.
 local function policy_context()
 	return {
-		endpoint = "http://localhost:8082",
+		app_url = "http://localhost:8082",
 		workspace_key = "workspace-example",
 		app_key = "app-example",
 		environment_key = "develop",
@@ -343,10 +343,11 @@ local function start_analytics(granted, decision, newly_answered, notice)
 			callback("client-token-placeholder", nil, nil)
 		end,
 		-- Remote config (optional). A separate endpoint from ingest_url; it
-		-- authenticates with the publishable api_key, so enabling it under
-		-- Mode B requires the api_key too. See docs/configuration.md.
-		remote_config_url = "http://localhost:8081",
-		api_key = "sp_ingest_publishable_placeholder",
+		-- authenticates with the publishable_key, so enabling it under
+		-- Mode B requires the publishable_key too. See docs/configuration.md.
+		app_url = "http://localhost:8081",
+		remote_config_enabled = true,
+		publishable_key = "sp_ingest_publishable_placeholder",
 	})
 	if not started_ok then
 		print("shardpilot init failed: " .. tostring(start_err))
@@ -436,15 +437,15 @@ reporter that was never created:
 local function start_crash()
 	-- A separate module, endpoint, and crash:write key — see docs/crash.md.
 	-- init auto-forwards a previous-session native crash dump (set
-	-- capture_previous_on_boot = false for the manual flow). ⚠ THE FLAG COMES
+	-- previous_crash_capture_enabled = false for the manual flow). ⚠ THE FLAG COMES
 	-- FROM THE RESULT: a crash_running that lies makes final() shut down a
 	-- reporter that was never created.
 	local ok, err = crash.init({
-		crash_ingest_url = "http://localhost:8080",
-		crash_api_key = "sp_crash_write_placeholder",
+		crash_url = "http://localhost:8080",
+		crash_key = "sp_crash_write_placeholder",
 		app_id = "app-example",
 		crash_component = "game-client",
-		-- script_error_capture_enabled = true, -- opt-in Lua error auto-capture
+		-- crash_hooks_enabled = true, -- opt-in Lua error auto-capture
 	})
 	crash_running = ok and true or false
 	if not ok then
@@ -781,8 +782,9 @@ local ok, err = shardpilot.init({
   workspace_id   = "<YOUR-WORKSPACE-ID>",
   app_id         = "<YOUR-APP-ID>",
   environment_id = "develop",
-  api_key        = "<YOUR-PUBLISHABLE-INGEST-KEY>", -- Mode A (or token_provider for Mode B)
-  -- remote_config_url = "<YOUR-REMOTE-CONFIG-BASE-URL>", -- optional; requires api_key
+  publishable_key        = "<YOUR-PUBLISHABLE-INGEST-KEY>", -- Mode A (or token_provider for Mode B)
+  -- app_url = "<YOUR-APPLICATION-ORIGIN>", -- optional; requires publishable_key
+  -- remote_config_enabled = true, -- explicit opt-in
   -- app_version = "1.2.3", app_build = "456",
   -- diagnostics = function(issue) print(issue.scope, issue.status, issue.code) end,
 })
@@ -791,11 +793,11 @@ local ok, err = shardpilot.init({
 Required: `ingest_url`, `workspace_id`, `app_id`, `environment_id`, and one
 auth credential. `init` returns `true`, or `false, err` with a specific code
 (`ingest_url_required`, `invalid_ingest_url`, `auth_required`,
-`auth_mode_conflict`, `remote_config_api_key_required`, …). Useful defaults:
+`auth_mode_conflict`, `remote_config_publishable_key_required`, …). Useful defaults:
 `batch_size = 25` (1–100), `buffer_size = 1000`,
 `flush_interval_seconds = 15` (partial batches wait; empty queues send nothing),
 full batches publish immediately, `flush()` runs on demand, and retries use their own clock,
-`publish_timeout_seconds = 2`, `spool_enabled = true`,
+`http_timeout_seconds = 2`, `spool_enabled = true`,
 `spool_max_events = 500`, `spool_max_bytes = 262144` (max 393216),
 `request_compression_enabled = true`.
 
@@ -992,13 +994,15 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
 
 ## Remote config
 
+Set `app_url` and `remote_config_enabled = true` to construct this consumer;
+the switch defaults to false. Experiments can use `app_url` independently.
 Explicit fetch only — the SDK never fetches on its own; there is no automatic
 or interval refresh. With granted consent the fetch is
-`GET {remote_config_url}/config/v1/{workspace_id}/{environment_id}/{client_id}`,
+`GET {app_url}/config/v1/{workspace_id}/{environment_id}/{client_id}`,
 where `client_id` is the persisted anonymous ID. Unknown and both denied states
 omit that final segment and all targeting attributes. The host user ID is never
 sent and there is no request body. Both routes authenticate with the publishable
-`api_key`. Identifier-free requests use an empty client cache component and
+`publishable_key`. Identifier-free requests use an empty client cache component and
 never reuse identified values or ETags, including on restart. Responses retain
 the scope selected at dispatch, even when consent changes before they arrive.
 Getters keep their last served snapshot until another response replaces it.
@@ -1024,7 +1028,8 @@ launches. `remote_config_version()` reads the response wrapper's `version`
 metadata.
 
 Targeting attributes are a dark opt-in and — unlike the fetch —
-granted-consent-only: `remote_config_attributes_enabled = true` plus
+granted-consent-only. They do not enable remote config: the consumer needs
+`remote_config_enabled = true` first. Then `remote_config_attributes_enabled = true` plus
 `shardpilot.set_remote_config_attributes({ geo = "US", … })` makes fetches
 carry the experiment attribute vocabulary (`geo`, `app_version`,
 `device_type`, `install_date`, `user_segment`, `custom_attribute_<name>`;
@@ -1033,8 +1038,8 @@ never sent) as query parameters for server-side delivery rules. Attributes
 ride ONLY while consent is granted — unknown or denied consent (forced-minor
 included) fetches without identity or attributes. Default
 `false`: the fetch URL stays byte-identical to the attribute-less path and
-the setter is inert. The flag requires `remote_config_url`
-(`remote_config_attributes_requires_remote_config_url` otherwise).
+the setter is inert. The flag requires `app_url`
+(`remote_config_attributes_requires_app_url` otherwise).
 
 ## Crash reporting
 
@@ -1046,20 +1051,20 @@ gate them.
 ```lua
 local crash = require "shardpilot.crash"
 crash.init({
-  crash_ingest_url = "<YOUR-CRASH-INGEST-BASE-URL>", -- base URL only; route appended by the SDK
-  crash_api_key    = "<YOUR-CRASH-WRITE-KEY>",       -- crash:write scope
+  crash_url = "<YOUR-CRASH-INGEST-BASE-URL>", -- base URL only; route appended by the SDK
+  crash_key    = "<YOUR-CRASH-WRITE-KEY>",       -- crash:write scope
   app_id           = "<YOUR-APP-ID>",
   app_version      = "1.2.3",
   -- platform = "windows", -- auto-detected in-engine; REQUIRED explicitly
   --                       -- outside Defold, or init fails platform_required
-  -- script_error_capture_enabled = true, -- opt-in Lua script-error auto-capture (dark by default)
+  -- crash_hooks_enabled = true, -- opt-in Lua script-error auto-capture (dark by default)
 })
 -- crash.init auto-forwards last session's native dump;
--- set capture_previous_on_boot = false to call crash.capture_previous() manually instead.
+-- set previous_crash_capture_enabled = false to call crash.capture_previous() manually instead.
 crash.record_breadcrumb("menu.open")
 ```
 
-- Reports go to `POST {crash_ingest_url}/api/v1/crashes/ingest` as a crash
+- Reports go to `POST {crash_url}/api/v1/crashes/ingest` as a crash
   report JSON body (`crash_id` UUIDv7, `occurred_at`, `exception`,
   `threads[]`/`frames[]`, `breadcrumbs[]`, …). Lua-level errors use
   pre-symbolicated frames (`function`/`file`/`line`); native dump frames are
@@ -1075,8 +1080,10 @@ crash.record_breadcrumb("menu.open")
   `crash.is_enabled()` returns `enabled, reason`
   (`"opt_out" | "settings_read_failed" | "not_initialized"`).
 - **Fatal is never sampled**; non-fatal `emit` is sampled deterministically
-  1-in-N (`sample_every`, default 10 — the first N−1 non-fatals of a process
-  are dropped; set `1` or a custom `sampler` to send every one).
+  1-in-N (`crash_sample_every`, default 10 — the first N−1 non-fatals of a process
+  are dropped; set `1` to send every one). `crash_sample_every = 0` disables
+  all non-fatal reports, including a custom `sampler`; at a positive rate,
+  a custom sampler returning `true` admits every non-fatal.
 - **Write-ahead durability (best-effort)**: before its send attempt, every
   dispatched report is persisted to a bounded per-app pending sidecar
   (8 records / 64 KB each / 384 KB total, ~7-day TTL) and re-sent
@@ -1088,7 +1095,7 @@ crash.record_breadcrumb("menu.open")
   `crash.snapshot().persist_failed` counts these.
   `crash.capture_previous()` runs a resend pass; `crash.resend_pending()`
   retries later in-session.
-- **Opt-in Lua script-error auto-capture** (`script_error_capture_enabled =
+- **Opt-in Lua script-error auto-capture** (`crash_hooks_enabled =
   true`, default **off**): the SDK installs a `sys.set_error_handler` handler
   forwarding each unhandled script error as a fatal `lua_error` report
   (message → reason, traceback → `raw_text`), capped at 10 per session and
@@ -1213,7 +1220,7 @@ this is not a verification of a deployed service.
   and its `bob-build` job resolves and builds a real Defold library harness.
   Validate gameplay and lifecycle behavior in your own engine integration.
 - **Lua script-error auto-capture is OPT-IN and replaces the handler slot**:
-  live Lua errors report only when `script_error_capture_enabled = true`
+  live Lua errors report only when `crash_hooks_enabled = true`
   (default off), and opting in installs the SDK's `sys.set_error_handler`
   handler into Defold's single process-wide slot — keep the flag off and
   call `crash.emit_fatal` from your own handler if you need both.

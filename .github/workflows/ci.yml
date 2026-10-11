@@ -135,6 +135,7 @@ jobs:
         run: |
           ./scripts/check_library.sh
           python3 scripts/test_library_files.py
+          python3 scripts/test_library_wire.py
 
       - name: Headless SDK sender contract fixtures (loopback only)
         run: |

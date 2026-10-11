@@ -192,7 +192,7 @@ json = {
 	decode = json_decode,
 }
 
-local sdk = require "shardpilot.sdk"
+local sdk = require("test.inspect_client").wrap(require "shardpilot.sdk")
 local sampling = require "shardpilot.sampling"
 local platform = require "shardpilot.platform"
 local storage = require "shardpilot.storage"
@@ -253,7 +253,7 @@ local function config(overrides)
 			callback("client-token-placeholder", nil, nil)
 		end,
 		flush_interval_seconds = 1,
-		publish_timeout_seconds = 2,
+		http_timeout_seconds = 2,
 	}
 	for key, value in pairs(overrides or {}) do
 		out[key] = value
@@ -261,12 +261,12 @@ local function config(overrides)
 	return out
 end
 
--- A Mode A (publishable-key) config: no token_provider, an sp_ingest_ api_key
+-- A Mode A (publishable-key) config: no token_provider, an sp_ingest_ publishable_key
 -- used directly as the Bearer. Starts from config() and strips token_provider.
 local function config_mode_a(overrides)
 	local out = config(overrides)
 	out.token_provider = nil
-	out.api_key = (overrides and overrides.api_key) or "sp_ingest_publishable_key"
+	out.publishable_key = (overrides and overrides.publishable_key) or "sp_ingest_publishable_key"
 	return out
 end
 
@@ -345,8 +345,8 @@ local function test_config_validation()
 		{ { session_timeout_seconds = 0 }, "invalid_session_timeout_seconds" },
 		{ { session_timeout_seconds = 0 / 0 }, "invalid_session_timeout_seconds" },
 		{ { session_timeout_seconds = math.huge }, "invalid_session_timeout_seconds" },
-		{ { publish_timeout_seconds = -1 }, "invalid_publish_timeout_seconds" },
-		{ { token_refresh_lead_ms = -1 }, "invalid_token_refresh_lead_ms" },
+		{ { http_timeout_seconds = -1 }, "invalid_http_timeout_seconds" },
+		{ { token_refresh_lead_seconds = -1 }, "invalid_token_refresh_lead_seconds" },
 		{ { spool_enabled = "yes" }, "invalid_spool_enabled" },
 		{ { spool_max_events = 0 }, "invalid_spool_max_events" },
 		{ { spool_max_events = 1.5 }, "invalid_spool_max_events" },
@@ -382,14 +382,14 @@ local function test_config_validation()
 	-- 1000 is the cross-SDK canonical buffer default.
 	assert_equal(client.config.buffer_size, 1000)
 	assert_equal(client.config.platform, "linux")
-	assert_equal(client.config.token_refresh_lead_ms, 60000)
+	assert_equal(client.config.token_refresh_lead_seconds, 60)
 	assert_equal(client.config.spool_enabled, true)
 	assert_equal(client.config.spool_max_events, 500)
 	assert_equal(client.config.spool_max_bytes, 262144)
 	-- Default: consent receipts carry their actor kind on the wire.
 	assert_equal(client.config.consent_kind_emission_enabled, true)
 
-	-- Dual-mode auth: exactly one of token_provider / api_key.
+	-- Dual-mode auth: exactly one of token_provider / publishable_key.
 	-- Neither configured -> auth_required.
 	local no_auth = config()
 	no_auth.token_provider = nil
@@ -398,35 +398,35 @@ local function test_config_validation()
 	assert_equal(err, "auth_required")
 
 	-- Both configured -> auth_mode_conflict (the Bearer source is ambiguous).
-	client, err = sdk.new(config({ api_key = "sp_ingest_publishable_key" }))
+	client, err = sdk.new(config({ publishable_key = "sp_ingest_publishable_key" }))
 	assert_equal(client, nil)
 	assert_equal(err, "auth_mode_conflict")
 
-	-- An empty-string api_key with no token_provider is not a usable Bearer.
+	-- An empty-string publishable_key with no token_provider is not a usable Bearer.
 	local empty_key = config()
 	empty_key.token_provider = nil
-	empty_key.api_key = ""
+	empty_key.publishable_key = ""
 	client, err = sdk.new(empty_key)
 	assert_equal(client, nil)
 	assert_equal(err, "auth_required")
 
-	-- A non-string api_key is rejected before mode selection.
+	-- A non-string publishable_key is rejected before mode selection.
 	local bad_key = config()
 	bad_key.token_provider = nil
-	bad_key.api_key = 42
+	bad_key.publishable_key = 42
 	client, err = sdk.new(bad_key)
 	assert_equal(client, nil)
-	assert_equal(err, "invalid_api_key")
+	assert_equal(err, "invalid_publishable_key")
 
 	-- A non-function token_provider is rejected.
 	client, err = sdk.new(config({ token_provider = "not-a-function" }))
 	assert_equal(client, nil)
 	assert_equal(err, "invalid_token_provider")
 
-	-- Mode A (api_key, no token_provider) is a VALID config.
+	-- Mode A (publishable_key, no token_provider) is a VALID config.
 	client, err = sdk.new(config_mode_a())
 	assert_true(client, err)
-	assert_equal(client.config.api_key, "sp_ingest_publishable_key")
+	assert_equal(client.config.publishable_key, "sp_ingest_publishable_key")
 	assert_equal(client.config.token_provider, nil)
 end
 
@@ -3156,13 +3156,13 @@ local function test_invalid_diagnostics_rejected()
 	assert_equal(err, "invalid_diagnostics")
 end
 
--- Mode A: a publishable api_key (no token_provider) publishes events
--- with the api_key as the Bearer, with no token round-trip.
-local function test_mode_a_api_key_is_bearer()
+-- Mode A: a publishable publishable_key (no token_provider) publishes events
+-- with the publishable_key as the Bearer, with no token round-trip.
+local function test_mode_a_publishable_key_is_bearer()
 	reset()
 	storage.reset()
 	seed_granted_consent()
-	local client = assert(sdk.new(config_mode_a({ api_key = "sp_ingest_abc123" })))
+	local client = assert(sdk.new(config_mode_a({ publishable_key = "sp_ingest_abc123" })))
 	assert_true(client:identify("user-example"))
 	assert_true(client:track("mode_a_event"))
 	assert_true(client:flush())
@@ -3173,11 +3173,11 @@ local function test_mode_a_api_key_is_bearer()
 	storage.reset()
 end
 
--- Mode A: the consent decision also rides the publishable api_key.
-local function test_mode_a_consent_uses_api_key_bearer()
+-- Mode A: the consent decision also rides the publishable publishable_key.
+local function test_mode_a_consent_uses_publishable_key_bearer()
 	reset()
 	storage.reset()
-	local client = assert(sdk.new(config_mode_a({ api_key = "sp_ingest_consent" })))
+	local client = assert(sdk.new(config_mode_a({ publishable_key = "sp_ingest_consent" })))
 	assert_true(client:identify("user-example"))
 	assert_true(client:set_consent(true))
 	assert_equal(#requests, 1)
@@ -3204,7 +3204,7 @@ local function test_client_source_keeps_anonymous_id_both_modes()
 	assert_contains(requests[1].body, '"anonymous_id":"anon-mode-b"')
 	assert_contains(requests[1].body, '"event_name":"client_event_b"')
 
-	-- Mode A (publishable api_key).
+	-- Mode A (publishable publishable_key).
 	reset()
 	storage.reset()
 	seed_granted_consent()
@@ -6333,7 +6333,7 @@ end
 -- binds the CURRENT anon, so replaying them would wedge the trail behind a
 -- guaranteed rejection; diagnosed as identity_changed, like the event
 -- spool). Everything else keeps delivering: Mode A re-sends the historic
--- actor unchanged, a Mode B + api_key configuration dispatches
+-- actor unchanged, a Mode B + publishable_key configuration dispatches
 -- HISTORIC-anon receipts under the publishable key (the historic actor is
 -- the correct subject of those decisions, and the key is the one
 -- credential that can still carry it — a current-anon receipt rides the
@@ -6407,7 +6407,7 @@ local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 	assert_contains(requests[1].body, '"kind":"user_verified"')
 	assert_equal(verified_second:snapshot().consent_recorded, 1)
 
-	-- Mode B + api_key (the remote-config dual-credential configuration): an
+	-- Mode B + publishable_key (the remote-config dual-credential configuration): an
 	-- anon-keyed receipt with a rotated anon KEEPS delivering — a HISTORIC
 	-- anon actor is one the minted token cannot vouch for, so it goes under
 	-- the publishable key, which has no token binding. (The explicit anon
@@ -6419,8 +6419,8 @@ local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 	storage.reset()
 	next_status = 500
 	local dual_config = {
-		remote_config_url = "http://localhost:9090",
-		api_key = "sp_ingest_publishable_key",
+		app_url = "http://localhost:9090", remote_config_enabled = true,
+		publishable_key = "sp_ingest_publishable_key",
 		anonymous_id = "anon-dual-historic",
 	}
 	local dual_first = assert(sdk.new(config(dual_config)))
@@ -6431,11 +6431,11 @@ local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 	reset()
 	next_status = 202
 	local dual_second = assert(sdk.new(config({
-		remote_config_url = "http://localhost:9090",
-		api_key = "sp_ingest_publishable_key",
+		app_url = "http://localhost:9090", remote_config_enabled = true,
+		publishable_key = "sp_ingest_publishable_key",
 		anonymous_id = "anon-override",
 	})))
-	assert_equal(#requests, 1, "Mode B + api_key must re-send the historic anon receipt")
+	assert_equal(#requests, 1, "Mode B + publishable_key must re-send the historic anon receipt")
 	assert_equal(requests[1].headers["Authorization"], "Bearer sp_ingest_publishable_key")
 	assert_contains(requests[1].body, '"actor_identifier":"' .. dual_historic_anon .. '"')
 	assert_equal(dual_second:snapshot().consent_recorded, 1)
@@ -7060,7 +7060,7 @@ local function test_gate_and_in_flight_release_key_to_dispatch_head_not_front()
 end
 
 -- Most-vouching dispatch-credential selection in the dual-credential
--- configuration (token_provider + api_key via remote_config_url): a receipt
+-- configuration (token_provider + publishable_key via app_url): a receipt
 -- rides the minted Mode B token whenever it vouches for the receipt's
 -- actor — the current verified user, or the CURRENT anon the mint binds as
 -- its subject — so a current-anon GRANT stays deliverable (the publishable
@@ -7078,8 +7078,8 @@ local function test_most_vouching_credential_and_401_follows_credential_used()
 	local token_calls = 0
 	local dual = function()
 		return config({
-			remote_config_url = "http://localhost:9090",
-			api_key = "sp_ingest_publishable_key",
+			app_url = "http://localhost:9090", remote_config_enabled = true,
+			publishable_key = "sp_ingest_publishable_key",
 			token_provider = function(callback)
 				token_calls = token_calls + 1
 				callback("token-" .. tostring(token_calls), nil, nil)
@@ -7247,7 +7247,7 @@ end
 -- narrow identity_changed rule (counted, diagnosed, persisted), dispatch
 -- selection skips it as a belt (never falling through to a non-vouching
 -- credential, never head-blocking the trail), and in the dual
--- token_provider + api_key configuration the SAME receipt is retained and
+-- token_provider + publishable_key configuration the SAME receipt is retained and
 -- delivered under the publishable key as today.
 local function test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual()
 	reset()
@@ -7325,7 +7325,7 @@ local function test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual()
 	assert_contains(requests[#requests].body, '"actor_identifier":"anon-current"')
 	assert_not_contains(requests[#requests].body, "user-legacy-example")
 
-	-- Dual (token_provider + api_key): the SAME legacy receipt is retained
+	-- Dual (token_provider + publishable_key): the SAME legacy receipt is retained
 	-- at load and delivers under the publishable key — the historic-actor
 	-- path, unchanged.
 	reset()
@@ -7336,8 +7336,8 @@ local function test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual()
 	local dual_issues = {}
 	local dual = assert(sdk.new(config({
 		anonymous_id = "anon-current",
-		remote_config_url = "http://localhost:9090",
-		api_key = "sp_ingest_publishable_key",
+		app_url = "http://localhost:9090", remote_config_enabled = true,
+		publishable_key = "sp_ingest_publishable_key",
 		diagnostics = function(issue)
 			dual_issues[#dual_issues + 1] = issue
 		end,
@@ -8047,8 +8047,8 @@ local tests = {
 	test_error_envelope_is_surfaced,
 	test_diagnostics_hook_errors_are_swallowed,
 	test_invalid_diagnostics_rejected,
-	test_mode_a_api_key_is_bearer,
-	test_mode_a_consent_uses_api_key_bearer,
+	test_mode_a_publishable_key_is_bearer,
+	test_mode_a_consent_uses_publishable_key_bearer,
 	test_client_source_keeps_anonymous_id_both_modes,
 	test_get_anonymous_id_matches_wire,
 	test_track_before_session_start_lazily_opens_session,
@@ -11474,7 +11474,7 @@ end)()
 
 	-- ── A token that is stale the moment it arrives ────────────────────────
 	--
-	-- A numerically valid expires_at already inside token_refresh_lead_ms
+	-- A numerically valid expires_at already inside token_refresh_lead_seconds
 	-- passes the type check, installs, and is then declared stale by the very
 	-- next can_publish(). Arming the settlement wake for it makes the next
 	-- update() mint again, settle, wake, mint — the HOST's provider called
@@ -11550,8 +11550,8 @@ end)()
 	storage.reset()
 	local dual = assert(sdk.new(config({
 		flush_interval_seconds = 9999,
-		remote_config_url = "http://localhost:9090",
-		api_key = "sp_ingest_publishable_key",
+		app_url = "http://localhost:9090", remote_config_enabled = true,
+		publishable_key = "sp_ingest_publishable_key",
 		token_provider = function(callback) callback("token-dual", nil, nil) end,
 	})))
 	local function receipt(key, actor)
@@ -14118,7 +14118,7 @@ end)()
 		local stores, clients, paths = {}, {}, {}
 		local core = require "shardpilot.client"
 		local real_new = core.new
-		local facade = dofile("shardpilot/sdk.lua")
+		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local function cfg(app, hook)
 			return config({ app_id = app, anonymous_id = app .. "-actor", diagnostics = hook })
 		end
@@ -14545,7 +14545,7 @@ end)()
 	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
 	local function fresh(run)
 		reset(); storage.reset()
-		local facade = dofile("shardpilot/sdk.lua")
+		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local core = require "shardpilot.client"
 		local real_new, real_load, calls = core.new, storage.load, 0
 		core.new = function(...)
@@ -14674,7 +14674,7 @@ end)()
 	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
 	local function fresh(run)
 		reset(); storage.reset()
-		local facade = dofile("shardpilot/sdk.lua")
+		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local options = config({ app_id = "synthetic-consent-getter", anonymous_id = "synthetic-reader" })
 		local ok, err = pcall(run, facade, options)
 		storage.reset()
@@ -14746,9 +14746,9 @@ end)()
 			local ok, code, warning = client:set_consent(false)
 			storage.clear_spool = real_clear
 			assert_equal(ok, true); assert_equal(code, nil); assert_equal(warning, "spool_purge_failed")
-			assert_true(client.spool_purge_pending, "real denial retains purge debt")
+			assert_true(require("test.inspect_client").state(client).spool_purge_pending, "real denial retains purge debt")
 			read_only(function() return client:get_consent_state() end, "denied")
-			assert_true(client.spool_purge_pending, "getter does not settle purge debt")
+			assert_true(require("test.inspect_client").state(client).spool_purge_pending, "getter does not settle purge debt")
 		end)
 	end)
 	scene("retryable shutdown retains the current facade state", function()
@@ -14786,9 +14786,9 @@ end)()
 		for _, key in ipairs({ "save", "clear_spool", "save_consent_outbox", "save_consent_denial_marker" }) do
 			saved[key] = storage[key]
 		end
-		local facade = dofile("shardpilot/sdk.lua")
+		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local options = config({ app_id = "synthetic-consent-results", anonymous_id = "synthetic-actor" })
-		if mode == "publishable" then options.token_provider = nil; options.api_key = "sp_ingest_synthetic" end
+		if mode == "publishable" then options.token_provider = nil; options.publishable_key = "sp_ingest_synthetic" end
 		local ok, err = pcall(function()
 			local client
 			if api == "instance" then client = assert(facade.new(options))
@@ -15088,7 +15088,7 @@ end)()
 				counts.tokens = counts.tokens + 1; cb("synthetic-fixture", nil, nil)
 			end })
 		end
-		return { crash_ingest_url = "http://localhost:8080", app_id = "synthetic-config-crash", crash_api_key = "synthetic-fixture", capture_previous_on_boot = false }
+		return { crash_url = "http://localhost:8080", app_id = "synthetic-config-crash", crash_key = "synthetic-fixture", previous_crash_capture_enabled = false }
 	end
 	local function facade(kind) return dofile(kind == "analytics" and "shardpilot/sdk.lua" or "shardpilot/crash.lua") end
 	local function refused(module, api, opts, code, counts)
@@ -15102,7 +15102,7 @@ end)()
 	end
 	for _, kind in ipairs({ "analytics", "crash" }) do
 		for _, api in ipairs({ "new", "init" }) do
-			for _, entry in ipairs({ { "arbitrary", "synthetic_unknown_option" }, { "typo", "diagnositcs" }, { "empty", "" }, { "numeric", 1 }, { "boolean", false }, { "table", {} }, { "other-plane", kind == "analytics" and "crash_ingest_url" or "workspace_id" } }) do
+			for _, entry in ipairs({ { "arbitrary", "synthetic_unknown_option" }, { "typo", "diagnositcs" }, { "empty", "" }, { "numeric", 1 }, { "boolean", false }, { "table", {} }, { "other-plane", kind == "analytics" and "crash_url" or "workspace_id" } }) do
 				scene(kind .. " " .. api .. " unknown " .. entry[1], function()
 					fresh(function(counts)
 						local opts = options(kind, counts); opts[entry[2]] = true
@@ -15123,8 +15123,8 @@ end)()
 					local extra
 					if kind == "analytics" then
 						extra = {
-							api_key = "sp_ingest_synthetic",
-							remote_config_url = "http://localhost:8081",
+							publishable_key = "sp_ingest_synthetic",
+							app_url = "http://localhost:8081", remote_config_enabled = true,
 							user_id = "synthetic-user",
 							app_version = "1.0",
 							app_build = "1",
@@ -15141,8 +15141,8 @@ end)()
 							buffer_size = 20,
 							flush_interval_seconds = 5,
 							session_timeout_seconds = 30,
-							publish_timeout_seconds = 2,
-							token_refresh_lead_ms = 100,
+							http_timeout_seconds = 2,
+							token_refresh_lead_seconds = 0.1,
 							spool_enabled = false,
 							spool_max_events = 50,
 							spool_max_bytes = 4096,
@@ -15152,27 +15152,26 @@ end)()
 							app_version = "1.0",
 							app_build = "1",
 							crash_component = "synthetic-component",
-							crash_source = "synthetic-legacy-component",
 							platform = "Linux",
-							sample_every = 1,
-							publish_timeout_seconds = 2,
+							crash_sample_every = 1,
+							crash_http_timeout_seconds = 2,
 							diagnostics = function() end,
 							sampler = function() return true end,
 							anonymous_id = function() return "synthetic-actor" end,
 							session_id = function() return "synthetic-session" end,
-							script_error_capture_enabled = false,
+							crash_hooks_enabled = false,
 						}
 					end
 					for key, value in pairs(extra) do opts[key] = value end
 					local count = 0; for _ in pairs(opts) do count = count + 1 end
-					assert_equal(count, kind == "analytics" and 29 or 16, "all supported caller keys are exercised")
+					assert_equal(count, kind == "analytics" and 30 or 15, "all supported caller keys are exercised")
 					local ok, err = facade(kind)[api](opts); assert_true(ok, err)
 					assert_true(counts.reads > 0, "real accepted constructor reached storage")
 				end)
 			end)
 			scene(kind .. " " .. api .. " invalid known field control", function()
 				fresh(function(counts)
-					local opts = options(kind, counts); local key = kind == "analytics" and "ingest_url" or "crash_ingest_url"; opts[key] = 12
+					local opts = options(kind, counts); local key = kind == "analytics" and "ingest_url" or "crash_url"; opts[key] = 12
 					refused(facade(kind), api, opts, "invalid_" .. key, counts)
 				end)
 			end)
@@ -15231,7 +15230,7 @@ end)()
 						if reads > 1 then return {} end
 						return inherited[key]
 					end })
-					refused(facade(kind), api, opts, kind == "analytics" and "ingest_url_required" or "crash_ingest_url_required", counts)
+					refused(facade(kind), api, opts, kind == "analytics" and "ingest_url_required" or "crash_url_required", counts)
 					assert_equal(reads, 0, "required fields cannot invoke __index")
 				end)
 			end)
@@ -15309,7 +15308,7 @@ end)()
 		local _, restore = install_stub_sys_storage()
 		next_status = 200; next_response_body = '{"recorded":true,"replayed":false}'
 		local opts = config({ app_id = "synthetic-notice", anonymous_id = "synthetic-actor" })
-		if mode == "publishable" then opts.token_provider = nil; opts.api_key = "sp_ingest_synthetic" end
+		if mode == "publishable" then opts.token_provider = nil; opts.publishable_key = "sp_ingest_synthetic" end
 		local mod = dofile("shardpilot/sdk.lua")
 		local client = assert(mod[api](opts))
 		local function call(name, ...)
@@ -15473,7 +15472,7 @@ end)()
 			storage.reset(); requests = {}
 			local restored = assert(dofile("shardpilot/sdk.lua").new(opts))
 			assert_equal(#requests, 0, "corrupted tuple must not be resent without provenance")
-			assert_true(restored.consent_outbox_unreadable, "existing malformed-receipt hold applies")
+			assert_true(require("test.inspect_client").state(restored).consent_outbox_unreadable, "existing malformed-receipt hold applies")
 		end)
 	end)
 	scene("accepted server golden request and response bytes", function()
@@ -15493,7 +15492,7 @@ end)()
 				next_status = 200; next_response_body = read("test/golden/consent-notice-response.json")
 				assert_true(client:set_consent(false, notice()))
 				local _, body = receipt(); assert_equal(body, expected, "wire must match the accepted server bytes")
-				assert_equal(#client.consent_outbox, 0, "accepted response acknowledged the real receipt")
+				assert_equal(#require("test.inspect_client").state(client).consent_outbox, 0, "accepted response acknowledged the real receipt")
 			end)
 			clock.iso_utc, id.uuid_v7 = old_time, old_id
 			assert_true(ok, err)
@@ -15625,7 +15624,7 @@ end)()
 	local function fresh(api, options, run, consent)
 		reset(); storage.reset()
 		local _, restore = install_stub_sys_storage()
-		local facade = dofile("shardpilot/sdk.lua")
+		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local client = assert(facade[api](config(options)))
 		local function call(name, ...)
 			if api == "new" then return client[name](client, ...) end
@@ -15793,7 +15792,7 @@ end)()
 	local function fresh(api, run, consent)
 		reset(); storage.reset()
 		local _, restore = install_stub_sys_storage()
-		local facade = dofile("shardpilot/sdk.lua")
+		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local client = assert(facade[api](config()))
 		local function call(name, ...)
 			if api == "new" then return client[name](client, ...) end
@@ -15900,6 +15899,147 @@ end)()
 	assert_equal(failed, 0, "event name admission failures")
 end)()
 
+-- Host configuration uses one vocabulary and explicit consumer switches.
+;(function()
+	local public_sdk = require "shardpilot.sdk"
+	local public_crash = require "shardpilot.crash"
+	local scenes = {}
+	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
+	local function options(kind)
+		if kind == "crash" then return {
+			crash_url = "http://localhost:8086", crash_key = "synthetic-crash-key",
+			app_id = "synthetic-app", previous_crash_capture_enabled = false,
+		} end
+		return { ingest_url = "http://localhost:8080", workspace_id = "synthetic-ws",
+			app_id = "synthetic-app", environment_id = "develop", publishable_key = "sp_ingest_synthetic" }
+	end
+	local function fresh(kind, api, opts, run)
+		local mod = kind == "crash" and public_crash or public_sdk
+		mod.shutdown(); reset(); storage.reset()
+		local client, err = mod[api](opts); assert_true(client, err)
+		local function call(name, ...)
+			if api == "init" then return mod[name](...) end
+			return client[name](client, ...)
+		end
+		local ok, failure = pcall(run, call, client)
+		if api == "init" then mod.shutdown() else client:shutdown() end
+		assert_true(ok, failure)
+	end
+	local removed = {
+		analytics = { api_key = "sp_ingest_synthetic", remote_config_url = "http://localhost:8081",
+			publish_timeout_seconds = 2, token_refresh_lead_ms = 50 },
+		crash = { crash_api_key = "synthetic-key", crash_ingest_url = "http://localhost:8086",
+			crash_source = "synthetic-component", publish_timeout_seconds = 2, sample_every = 10,
+			script_error_capture_enabled = false, capture_previous_on_boot = false },
+	}
+	for _, kind in ipairs({ "analytics", "crash" }) do
+		for _, api in ipairs({ "new", "init" }) do
+			for key, value in pairs(removed[kind]) do
+				scene(kind .. " " .. api .. " rejects " .. key, function()
+					local mod = kind == "crash" and public_crash or public_sdk
+					mod.shutdown(); reset(); storage.reset()
+					local opts = options(kind); opts[key] = value
+					local result, err = mod[api](opts)
+					assert_true(not result, "removed configuration must not construct a client")
+					assert_equal(err, "unknown_config_key"); assert_equal(#requests, 0)
+				end)
+			end
+			scene(kind .. " " .. api .. " canonical configuration dispatch", function()
+				local opts = options(kind)
+				if kind == "analytics" then opts.http_timeout_seconds = 1.25; opts.token_refresh_lead_seconds = 0.05
+				else opts.crash_http_timeout_seconds = 1.25; opts.crash_sample_every = 1; opts.crash_component = "synthetic-component"; opts.crash_hooks_enabled = false end
+				fresh(kind, api, opts, function(call)
+					if kind == "analytics" then
+						assert_true(call("set_consent", true)); requests = {}
+						assert_true(call("track", "synthetic_event")); call("flush")
+					else
+						assert_true(call("emit_fatal", { exception = { type = "synthetic_error", reason = "synthetic failure" }, threads = { { id = "main", crashed = true, frames = { { ["function"] = "synthetic.update" } } } } }))
+					end
+					assert_equal(#requests, 1, "the real transport must run")
+					assert_contains(requests[1].url, kind == "analytics" and "http://localhost:8080/" or "http://localhost:8086/")
+					assert_equal(requests[1].options.timeout, 1.25)
+					assert_equal(requests[1].headers.Authorization, "Bearer " .. (kind == "analytics" and "sp_ingest_synthetic" or "synthetic-crash-key"))
+				end)
+			end)
+		end
+	end
+
+	for _, enabled in ipairs({ false, true }) do
+		scene("app origin does not imply remote config " .. tostring(enabled), function()
+			local opts = options("analytics"); opts.app_url = "http://localhost:8081"; opts.remote_config_enabled = enabled
+			fresh("analytics", "new", opts, function(call)
+				next_status = 200; next_response_body = '{"version":"synthetic","values":{}}'
+				local ok, err = call("fetch_remote_config", function() end)
+				if enabled then assert_equal(#requests, 1); assert_contains(requests[1].url, "http://localhost:8081/config/v1/")
+				else assert_equal(ok, false); assert_equal(err, "remote_config_not_configured"); assert_equal(#requests, 0) end
+			end)
+		end)
+	end
+	for _, custom in ipairs({ false, true }) do
+		scene("zero crash sampling, custom=" .. tostring(custom), function()
+			local opts = options("crash"); opts.crash_sample_every = 0
+			local sampled = 0
+			if custom then opts.sampler = function() sampled = sampled + 1; return true end end
+			fresh("crash", "new", opts, function(call)
+				local event = { exception = { type = "synthetic_error" }, threads = { { id = "main", crashed = true, frames = { { ["function"] = "synthetic.update" } } } } }
+				call("emit", event); assert_equal(#requests, 0, "zero sends no non-fatal reports")
+				assert_equal(sampled, 0, "zero does not call a custom sampler")
+				assert_true(call("emit_fatal", event)); assert_equal(#requests, 1, "fatal bypasses zero sampling")
+			end)
+		end)
+	end
+	scene("refresh lead is seconds", function()
+		local opts = options("analytics"); opts.publishable_key = nil; opts.token_refresh_lead_seconds = 60
+		local calls, expiry = 0, 0
+		opts.token_provider = function(done)
+			calls = calls + 1; expiry = socket.now * 1000 + 120000; done("synthetic-token", expiry)
+		end
+		fresh("analytics", "new", opts, function(call)
+			assert_true(call("set_consent", true)); assert_equal(calls, 1)
+			assert_true(call("track", "control")); call("flush"); assert_equal(calls, 1, "fresh token control")
+			socket.now = (expiry - 30000) / 1000
+			assert_true(call("track", "refresh")); call("flush")
+			assert_equal(calls, 2, "60 seconds refreshes 30 seconds before expiry")
+		end)
+	end)
+	scene("remote-config enablement requires an address", function()
+		local opts = options("analytics"); opts.remote_config_enabled = true
+		local client, err = public_sdk.new(opts); assert_equal(client, nil); assert_equal(err, "remote_config_requires_app_url")
+	end)
+	scene("remote-config switch is boolean", function()
+		local opts = options("analytics"); opts.remote_config_enabled = 1
+		local client, err = public_sdk.new(opts); assert_equal(client, nil); assert_equal(err, "invalid_remote_config_enabled")
+	end)
+	scene("experiments do not require remote config enabled", function()
+		local opts = options("analytics"); opts.app_url = "http://localhost:8081"; opts.experiments_enabled = true
+		fresh("analytics", "new", opts, function(call)
+			assert_true(call("set_consent", true)); requests = {}
+			call("fetch_remote_config", function() end); assert_equal(#requests, 0, "remote config defaults off")
+			call("fetch_experiment_assignment", "synthetic-experiment", {}, function() end)
+			assert_equal(#requests, 1); assert_contains(requests[1].url, "http://localhost:8081/")
+		end)
+	end)
+	scene("consent-policy origin uses the application name", function()
+		local policy = require "shardpilot.consent_policy"
+		local ctx = { app_url = "https://policy.example", workspace_key = "synthetic-ws", app_key = "synthetic-app",
+			environment_key = "develop", app_version = "1", locale = "en", platform = "windows" }
+		local ok, err = policy.validate_context(ctx); assert_true(ok, err)
+		ctx.endpoint = "https://policy.example"
+		assert_equal(policy.validate_context(ctx), false, "old context key must be refused")
+	end)
+	for _, key in ipairs({ "consent_receipt_outbox", "consent_state_denied_forced_minor", "experiments_assignment", "experiments_age_band" }) do
+		scene("capability control " .. key, function() assert_equal(public_sdk.supports(key), true) end)
+	end
+	local passed, failed = 0, 0
+	for _, entry in ipairs(scenes) do
+		local ok, err = pcall(entry.run)
+		if ok then passed = passed + 1 else failed = failed + 1 end
+		print("host surface " .. entry.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	print(string.format("Host surface: %d passed, %d failed", passed, failed))
+	assert_equal(failed, 0, "host surface failures")
+end)()
+
 -- Public schema surface: exercise the real constructors and HTTP dispatch.
 ;(function()
 	local scenes = {}
@@ -15999,4 +16139,70 @@ end)()
 	end
 	print(string.format("Schema surface: %d passed, %d failed", passed, failed))
 	assert_equal(failed, 0, "schema surface failures")
+end)()
+
+
+-- Public instance handles expose only the documented operations.
+;(function()
+ local passed, failed = 0, 0
+ local function scene(name, run)
+  reset(); storage.reset()
+  local original_sys = sys
+  local ok, err = pcall(run)
+  sys = original_sys; storage.reset()
+  if ok then passed=passed+1 else failed=failed+1 end
+  print("client-boundary "..name..": "..(ok and "PASS" or "FAIL "..tostring(err)))
+ end
+ for _, kind in ipairs({"analytics", "crash"}) do
+  scene(kind.." public handle", function()
+   local public = require(kind=="analytics" and "shardpilot.sdk" or "shardpilot.crash")
+   local cfg = kind=="analytics" and config() or {
+    crash_url="http://localhost:8086", crash_key="synthetic-crash-key", app_id="synthetic"}
+   local client=assert(public.new(cfg))
+   assert_true(client.config==nil and client.stats==nil and client.remote_config==nil and client.experiments==nil,
+    "implementation state must not escape")
+   assert_true(getmetatable(client)==nil, "no implementation metatable")
+   local count=0
+   for name in pairs(client) do
+    assert_true(type(client[name])=="function" and type(public[name])=="function", "supported operations only: "..name)
+    assert_true(name~="new" and name~="init" and name~="supports", "instance operations only")
+    count=count+1
+   end
+   local expected=0
+   for name,value in pairs(public) do
+    if type(value)=="function" and name~="new" and name~="init" and name~="supports" then
+     assert_equal(type(client[name]),"function","missing public operation: "..name);expected=expected+1
+    end
+   end
+   assert_equal(count,expected,"complete public operation census")
+   local snapshot=client:snapshot();snapshot.last_error="synthetic mutation"
+   assert_not_equal(client:snapshot().last_error,"synthetic mutation","snapshot is a value")
+   assert_true(client:shutdown())
+  end)
+ end
+ for _, module in ipairs({{"shardpilot.client","Client"},{"shardpilot.crash.client","Client"},
+  {"shardpilot.experiments","Experiments"},{"shardpilot.remote_config","RemoteConfig"}}) do
+  scene(module[1].." class private",function() assert_equal(require(module[1])[module[2]],nil,"implementation class not exported") end)
+ end
+ scene("public flush ignores implementation options",function()
+  seed_granted_consent()
+  local client=assert(require("shardpilot.sdk").new(config()))
+  assert_true(client:session_start());client:observe_ping_ms(25)
+  assert_true(client:flush({include_summaries=false}))
+  local found=false
+  for _, request in ipairs(requests) do if request.body and request.body:find('"network_summary"',1,true) then found=true end end
+  assert_true(found,"public flush includes summaries regardless of private options")
+  assert_true(client:shutdown())
+ end)
+ for _, kind in ipairs({"analytics", "crash"}) do
+  scene(kind.." unknown-key control", function()
+   local module=require(kind=="analytics" and "shardpilot.sdk" or "shardpilot.crash")
+   local cfg=kind=="analytics" and config() or {crash_url="http://localhost:8086",crash_key="synthetic-crash-key",app_id="synthetic"}
+   cfg.synthetic_unknown=true
+   local client,err=module.new(cfg);assert_equal(client,nil);assert_equal(err,"unknown_config_key")
+  end)
+ end
+ scene("capability control",function() assert_equal(require("shardpilot.sdk").supports("schema_revision_declaration"),false) end)
+ print(string.format("Public handles: %d pass, %d fail",passed,failed))
+ assert_equal(failed,0,"public handle scenes")
 end)()

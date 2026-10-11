@@ -250,7 +250,7 @@ local function config()
 			callback("client-token-placeholder", nil, nil)
 		end,
 		flush_interval_seconds = 3600, -- never inside the measured window
-		publish_timeout_seconds = 2,
+		http_timeout_seconds = 2,
 		spool_enabled = false, -- disk I/O is the spool benchmark's measurement, not this one
 		-- A queue big enough that nothing DROPS. THIS is the defect that
 		-- produced this file's first, nonsensical table — confirmed by

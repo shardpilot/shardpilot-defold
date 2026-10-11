@@ -2,6 +2,40 @@
 
 ### Unreleased
 
+- Analytics and crash instances expose only documented operations. Implementation
+  state and class tables stay private; `flush()` has no private options.
+
+- Host configuration uses explicit credential, origin and duration names with
+  no aliases. Unknown old keys are refused before callbacks or storage work.
+  `remote_config_enabled` defaults to `false`: an application origin alone no
+  longer enables fetches. Experiments retain their independent switch.
+
+  | Removed name | Replacement |
+  |---|---|
+  | `api_key` | `publishable_key` |
+  | `remote_config_url` | `app_url` plus `remote_config_enabled` for remote config |
+  | consent-policy `endpoint` | `app_url` |
+  | `publish_timeout_seconds` | `http_timeout_seconds` |
+  | `token_refresh_lead_ms` | `token_refresh_lead_seconds` (divide the number by 1000; default 60) |
+  | `crash_ingest_url` | `crash_url` |
+  | `crash_api_key` | `crash_key` |
+  | `crash_source` | `crash_component` (no fallback alias) |
+  | crash `publish_timeout_seconds` | `crash_http_timeout_seconds` |
+  | `sample_every` | `crash_sample_every` |
+  | `script_error_capture_enabled` | `crash_hooks_enabled` |
+  | `capture_previous_on_boot` | `previous_crash_capture_enabled` |
+
+  `crash_sample_every = 0` disables non-fatal reports, including custom sampling;
+  fatal reports still bypass sampling.
+
+  Validation errors use the new names, including `invalid_publishable_key`,
+  `remote_config_publishable_key_required`, `experiments_requires_app_url`,
+  `remote_config_attributes_requires_app_url`, `invalid_http_timeout_seconds`,
+  `invalid_token_refresh_lead_seconds`, `crash_key_required`,
+  `invalid_crash_component`, `invalid_crash_sample_every`,
+  `invalid_crash_http_timeout_seconds`, `invalid_crash_hooks_enabled`, and
+  `invalid_previous_crash_capture_enabled`. Defaults otherwise remain unchanged.
+
 - Removed schema-set revision declaration from engine requests. There is no
   `schema_revision` configuration key or exported default revision module;
   the `schema_revision_declaration` capability now answers `false`.
@@ -74,8 +108,8 @@
   anonymous-ID replacement clears the prior actor's exclusion and starts the
   replacement at `unknown`; same-ID and refused replacements retain it.
 
-- Crash reports emit the root `component` key. `crash_component` is the preferred
-  configuration option; `crash_source` remains a deprecated fallback when blank.
+- Crash reports emit the root `component` key. `crash_component` is the only
+  configuration option for it; there is no deprecated fallback alias.
   Durable replay renames old root `source` keys without changing value bytes,
   nested fields or crash IDs. Older prepared-table records are encoded once and
   receive the same rename. Both-key records remain queued without dispatch.
