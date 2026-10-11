@@ -76,9 +76,10 @@ not the platform boundary.
   [Privacy & consent](#privacy--consent).
 - **Capability discovery.** `shardpilot.supports(capability)` feature-detects
   SDK abilities before `init()` — `"consent_receipt_outbox"`,
-  `"consent_state_denied_forced_minor"`, `"schema_revision_declaration"`,
+  `"consent_state_denied_forced_minor"`,
   `"experiments_assignment"`, and `"experiments_age_band"` (New in `v0.11.0`); unknown names return `false` on older and
   newer SDKs alike, so integrations can gate new call shapes safely.
+  `"schema_revision_declaration"` returns `false`.
 - Samples basic runtime signals via `update(dt)`, `observe_ping_ms(ms)`, and
   `observe_disconnect(reason)`.
 - Reports **crashes** through a separate `require "shardpilot.crash"`
@@ -624,7 +625,6 @@ initialization attempt. `new(config)` creates an independent client instance.
 | `spool_enabled` | `true` | Durable offline event spool ([details](#offline-durability-event-spool)); `false` also clears a previously persisted record at init |
 | `spool_max_events` | `500` | Max spooled entries (≥1); oldest evicted first |
 | `spool_max_bytes` | `262144` | Approx. spool size budget (1024–393216); oldest evicted first |
-| `schema_revision` | built-in revision | Schema-set revision declared on batch ingest (`X-ShardPilot-Schema-Revision` request header); a string overrides the value, `false`/`""` stops declaring ([details](docs/configuration.md#schema-revision-declaration)) |
 
 **One client per app.** Keep one live client per configured app
 (`workspace_id` and `app_id`) in a process. The identity and consent record,
@@ -705,13 +705,10 @@ Legacy public-SDK fields are **never** emitted: `project_id`, `game_id`, `env`,
 [`scripts/check_library.sh`](scripts/check_library.sh). See
 [`docs/events.md`](docs/events.md).
 
-Each batch request also declares the SDK's schema-set revision in the
-`X-ShardPilot-Schema-Revision` **request header** (never a body field; only
-this route — consent, crash, and remote-config requests never carry it). A
-`schema_revision_mismatch` `409` from an ingest service with the handshake
-armed is terminal for the batch: dropped, never retried. See
-[`docs/configuration.md`](docs/configuration.md#schema-revision-declaration);
-`schema_revision = false` stops declaring.
+The SDK sends no `X-ShardPilot-Schema-Revision` header. There is no schema-set
+revision setting or exported default digest;
+`shardpilot.supports("schema_revision_declaration")` returns `false`.
+Individual event envelopes keep their existing `schema_version`.
 
 ## Offline durability (event spool)
 

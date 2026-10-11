@@ -33,6 +33,12 @@
   `invalid_crash_http_timeout_seconds`, `invalid_crash_hooks_enabled`, and
   `invalid_previous_crash_capture_enabled`. Defaults otherwise remain unchanged.
 
+- Removed schema-set revision declaration from engine requests. There is no
+  `schema_revision` configuration key or exported default revision module;
+  the `schema_revision_declaration` capability now answers `false`.
+  Per-event `schema_version` is unchanged. Remove the setting from host
+  configuration; `false`, empty strings and overrides are all unknown keys.
+
 - Bound analytics replay to seven days from local intake and fifteen minutes
   from the first potentially delivered HTTP attempt. Persist local clocks
   outside envelopes, retain original payloads, and diagnose expired members as
