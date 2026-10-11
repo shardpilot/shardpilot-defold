@@ -2023,31 +2023,14 @@ function M.new(config, defer_init_diagnostics)
 			-- the CURRENT caps — a configuration that lowered the budgets
 			-- trims an over-budget old record at load, oldest first (counted
 			-- in spool_evicted) — and re-stamps or drops the stored deadline.
-			-- Should this write fail, the raw list is used for this process
-			-- and the caps apply on the next successful write.
+			-- A failed rewrite remains owed even when filtering left no
+			-- surviving event whose later acknowledgement could retry it.
 			if client:write_spool_record(spooled) then
 				spooled = client.spool_record
-			elseif condemned > 0 then
-				-- The CONDEMNATION could not land durably: the stale file
-				-- still carries the withdrawn facts, and with everything
-				-- condemned there may be nothing left to resend/ack that
-				-- would ever rewrite it. This is durable work — record the
-				-- debt so the rewrite retries at every dispatch point, and
-				-- so the condemnation marker stays alive (the retire check
-				-- consults it) until the file is actually clean; a retired
-				-- marker over a stale file would replay the withdrawn keys
-				-- at the launch after next.
+			else
 				client.spool_rewrite_pending = true
-				client.condemned_spool_pending = true
-			elseif (spool_migrated or 0) > 0 then
-				-- The MIGRATION could not land durably, and it is owed for the
-				-- same reason a condemnation is: the stale file still carries
-				-- legacy names. When migration dropped everything there is no
-				-- surviving event to resend and no acknowledgement that would
-				-- ever force another write, so without this the file stays as
-				-- it is for every future launch — and a rollback to a release
-				-- without the migration replays those names onto the wire.
-				client.spool_rewrite_pending = true
+				-- Keep a condemnation marker alive until the file is clean.
+				if condemned > 0 then client.condemned_spool_pending = true end
 			end
 			if withdrawn > 0 and client.withdrawn_fact_debt ~= nil then
 				-- The rewrite that drops the withdrawn copies failed again:

@@ -2,7 +2,7 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local now, disk, requests, response_status = 1700000000000, {}, {}, 202
 local save_hook, encode_hook, request_hook, pending_response, issues
-local response_body, response_documents
+local response_body, response_documents, response_headers
 local function copy(value)
 	if type(value) ~= "table" then return value end
 	local out = {}
@@ -44,7 +44,7 @@ http = { request = function(url, method, callback, headers, body)
 	if url:find("/v1/events:batch", 1, true) then
 		requests[#requests + 1] = body
 		if request_hook then request_hook(body) end
-		local complete = function() callback(nil, nil, { status = response_status, response = response_body or '{"accepted":1}' }) end
+		local complete = function() callback(nil, nil, { status = response_status, response = response_body or '{"accepted":1}', headers = response_headers }) end
 		if pending_response then pending_response = complete else complete() end
 	elseif url:find("/runtime/experiments/assignment", 1, true) then
 		local body = encode({ error = "experiment real-subject assignment is disabled" })
@@ -67,7 +67,7 @@ local function fresh(overrides)
 	now, disk, requests, response_status = 1700000000000, {}, {}, 202
 	save_hook, encode_hook, request_hook, pending_response, issues = nil, nil, nil, nil, {}
 	storage.reset()
-	response_body, response_documents = nil, {}
+	response_body, response_documents, response_headers = nil, {}, nil
 	local options = copy(config)
 	for k, v in pairs(overrides or {}) do options[k] = v end
 	local client = assert(clients.new(options))
@@ -235,7 +235,49 @@ local function preflight_expiry_drain(stage, shutdown)
 	eq(err, nil, "a completed local drain has no error")
 	if shutdown then eq(client.initialized, false, "shutdown completes after the local drain") end
 end
+local function startup_expiry_rewrite(ambiguous, survivor)
+	local client, id = durable_subject()
+	if ambiguous then response_status = 0; client:flush(); now = now + 14 * 60000
+	else now = now + 7 * 86400000 - 60000 end
+	local survivor_bytes
+	if survivor then
+		assert(client:track("eligible_survivor")); assert(client:persist())
+		survivor_bytes = encode(spool_record().events[2])
+	end
+	-- A real Retry-After prevents delivery from masking the cleanup retry.
+	response_status, response_headers = 429, { ["Retry-After"] = "300" }; client:flush()
+	now = now + 2 * 60000; requests, response_headers = {}, nil
+	local writes = 0
+	save_hook = function(name)
+		if name:sub(-6) == "/spool" then writes = writes + 1; return false end
+	end
+	local loaded = restart(); local startup_writes = writes
+	assert(startup_writes > 0, "startup reached the failed cleanup write")
+	assert(encode(spool_record().events):find(id, 1, true), "the failed cleanup leaves the expired bytes on disk")
+	loaded:update(loaded.config.flush_interval_seconds); local retry_writes = writes
+	save_hook = nil; loaded:update(loaded.config.flush_interval_seconds)
+	local persisted = spool_record().events
+	eq(#persisted, survivor and 1 or 0, "storage recovery removes expired members without another event")
+	assert(not encode(persisted):find(id, 1, true), "the original expired ID is durably removed")
+	if survivor then eq(encode(persisted[1]), survivor_bytes, "cleanup preserves the eligible envelope exactly") end
+	assert(retry_writes > startup_writes, "cleanup remained owed across another failed cadence")
+	eq(#requests, 0, "no HTTP response or new capture masked the cleanup retry")
+	eq(loaded.spool_rewrite_pending, false, "successful cleanup clears the pending rewrite")
+	eq(loaded:snapshot().spool_expired, 1, "retried cleanup does not recount expiry")
+end
 local cases = {
+	{ "startup_intake_expiry_rewrite_empty", function() startup_expiry_rewrite(false, false) end },
+	{ "startup_intake_expiry_rewrite_survivor", function() startup_expiry_rewrite(false, true) end },
+	{ "startup_ambiguity_expiry_rewrite_empty", function() startup_expiry_rewrite(true, false) end },
+	{ "startup_ambiguity_expiry_rewrite_survivor", function() startup_expiry_rewrite(true, true) end },
+	{ "live_expiry_rewrite_already_retries", function()
+		local client = durable_subject(); now = now + 8 * 86400000
+		save_hook = function(name) if name:sub(-6) == "/spool" then return false end end
+		client:flush(); eq(#spool_record().events, 1, "failed live cleanup leaves durable bytes")
+		save_hook = nil; client:update(client.config.flush_interval_seconds)
+		eq(#spool_record().events, 0, "live expiry cleanup already retries after recovery")
+		eq(#requests, 0, "live cleanup does not send an expired member")
+	end },
 	{ "serialization_intake_expiry_flush", function() preflight_expiry_drain("serialize", false) end },
 	{ "serialization_intake_expiry_shutdown", function() preflight_expiry_drain("serialize", true) end },
 	{ "serialization_ambiguity_expiry_flush", function() preflight_expiry_drain("ambiguity", false) end },
