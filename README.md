@@ -1381,7 +1381,9 @@ game has to handle specially.
 
   **Treat exposure delivery as best-effort, and the `diagnostics` hook as the
   place you learn otherwise.** Facts carry a deterministic `event_id`, so the
-  server counts retries of the same fact once. **New in `v0.11.0`:** a consent denial
+  server counts retries of the same fact once. Newly derived exposure IDs set
+  UUID version 5 and RFC variant bits in the existing deterministic tuple hash.
+  Queued and spooled facts retain their stamped IDs on retry. **New in `v0.11.0`:** a consent denial
   closes the session; after re-grant, retained assignments re-arm into the
   fresh session and use its distinct exposure ID. Those are separate facts,
   not duplicate sends of the pre-denial exposure. Under sustained queue

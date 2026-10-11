@@ -939,7 +939,8 @@ end
 -- re-arm bumps the counter (so does a readmission after an age withdrawal),
 -- and a rotated session marker or re-minted subject derives a distinct id.
 -- Retries of one emitted fact are idempotent regardless — the id is stamped
--- once at enqueue and the spool re-sends it verbatim.
+-- once at enqueue and the spool re-sends it verbatim. New IDs set the UUID
+-- version 5 and RFC variant bits; the existing tuple hash remains unchanged.
 function M.exposure_event_id(session_marker, subject_key, experiment_key, version, arm)
 	local text = table.concat({
 		"exposure",
@@ -952,8 +953,8 @@ function M.exposure_event_id(session_marker, subject_key, experiment_key, versio
 	return string.format("%08x-%04x-%04x-%04x-%08x%04x",
 		hash32(text, 2166136261, 131),
 		hash32(text, 5381, 33) % 65536,
-		hash32(text, 0, 65599) % 65536,
-		hash32(text, 40503, 257) % 65536,
+		hash32(text, 0, 65599) % 4096 + 20480,
+		hash32(text, 40503, 257) % 16384 + 32768,
 		hash32(text, 8675309, 131),
 		hash32(text, 1013904223, 33) % 65536)
 end

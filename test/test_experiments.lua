@@ -11388,7 +11388,74 @@ function extra_tests.test_retired_arm_of_an_owed_readmission_survives_a_renewal(
 	storage.reset()
 end
 
+function extra_tests.test_exposure_uuid_version_bits()
+	for arm = 0, 63 do
+		local value = experiments.exposure_event_id("marker", "spcid_" .. string.rep("f", 32), "exp", 3, arm)
+		assert_equal(value:sub(15, 15), "5", "exposure UUID version bits")
+	end
+end
+
+function extra_tests.test_exposure_uuid_variant_bits()
+	for arm = 0, 63 do
+		local value = experiments.exposure_event_id("marker", "spcid_" .. string.rep("f", 32), "exp", 3, arm)
+		assert_match(value:sub(20, 20), "^[89ab]$", "exposure UUID RFC variant bits")
+	end
+end
+
+function extra_tests.test_exposure_uuid_golden_vectors()
+	local expected = {
+		[0] = "25facac3-65ff-57ee-bdb1-6be885abb5d9",
+		[1] = "25facac4-6600-57ef-bdb2-6be885acb5da",
+		[2] = "25facac5-6601-57f0-bdb3-6be885adb5db",
+		[17] = "6f55c283-2637-5408-afe9-37fc673b7151",
+	}
+	for arm, value in pairs(expected) do
+		assert_equal(experiments.exposure_event_id("marker", "spcid_" .. string.rep("f", 32), "exp", 3, arm),
+			value, "deterministic exposure UUID vector")
+	end
+end
+
+function extra_tests.test_exposure_uuid_wire_and_retry()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	assert_true(fetch(client, "exp-checkout").ok)
+	assert_true(client:track_exposure("exp-checkout"))
+	local attempts = {}
+	responder = function(url, method, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			attempts[#attempts + 1] = requests[#requests].body
+			callback(nil, nil, { status = #attempts == 1 and 503 or 202,
+				response = #attempts == 1 and "{}" or '{"accepted":2}' })
+			return true
+		end
+	end
+	assert_true(not client:flush({ include_summaries = false }), "first publish must reach the failing responder")
+	assert_true(client:flush({ include_summaries = false }), "retry must reach the accepting responder")
+	assert_equal(#attempts, 2, "one failed publish and one retry")
+	assert_equal(attempts[1], attempts[2], "exposure retry keeps the original bytes")
+	local seen = {}
+	local count = 0
+	for _, event in ipairs(json.decode(attempts[2]).events) do
+		if event.event_name == "experiment_exposure" then
+			local value = event.event_id
+			assert_equal(#value, 36, "wire UUID length")
+			assert_equal(value:lower(), value, "wire UUID lowercase")
+			assert_match(value, "^%x+%-%x+%-5%x%x%x%-[89ab]%x%x%x%-%x+$", "wire UUID version and variant")
+			assert_true(not seen[value], "automatic and rearmed facts have distinct IDs")
+			seen[value] = true
+			count = count + 1
+		end
+	end
+	assert_equal(count, 2, "automatic and explicit exposure reached the wire")
+end
+
 local tests = {
+	extra_tests.test_exposure_uuid_version_bits,
+	extra_tests.test_exposure_uuid_variant_bits,
+	extra_tests.test_exposure_uuid_golden_vectors,
+	extra_tests.test_exposure_uuid_wire_and_retry,
+
 	extra_tests.test_age_remote_config_keeps_targeting_rules,
 	extra_tests.test_age_api_lifecycle_precedes_arguments,
 	extra_tests.test_age_capability_is_distinct,
