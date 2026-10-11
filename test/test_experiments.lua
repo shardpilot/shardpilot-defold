@@ -11403,16 +11403,39 @@ function extra_tests.test_exposure_uuid_variant_bits()
 end
 
 function extra_tests.test_exposure_uuid_golden_vectors()
-	local expected = {
-		[0] = "25facac3-65ff-57ee-bdb1-6be885abb5d9",
-		[1] = "25facac4-6600-57ef-bdb2-6be885acb5da",
-		[2] = "25facac5-6601-57f0-bdb3-6be885adb5db",
-		[17] = "6f55c283-2637-5408-afe9-37fc673b7151",
-	}
-	for arm, value in pairs(expected) do
-		assert_equal(experiments.exposure_event_id("marker", "spcid_" .. string.rep("f", 32), "exp", 3, arm),
-			value, "deterministic exposure UUID vector")
+	for index, row in ipairs(require "test.fixtures.exposure_uuid5") do
+		assert_equal(experiments.exposure_event_id(row[1], row[2], row[3], row[4], row[5]),
+			row[6], "Python uuid.uuid5 known answer " .. index)
 	end
+end
+
+function extra_tests.test_exposure_sha1_known_answers()
+	-- Independent hashlib.sha1 digests include both sides of the padding boundary.
+	local sha1 = require "shardpilot.sha1"
+	local vectors = {
+		{ "", "da39a3ee5e6b4b0d3255bfef95601890afd80709" },
+		{ "abc", "a9993e364706816aba3e25717850c26c9cd0d89d" },
+		{ "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", "84983e441c3bd26ebaae4aa1f95129e5e54670f1" },
+		{ string.rep("a", 55), "c1c8bbdc22796e28c0e15163d20899b65621d65a" },
+		{ string.rep("a", 56), "c2db330f6083854c99d4b5bfb6e8f29f201be699" },
+		{ string.rep("a", 63), "03f09f5b158a7a8cdad920bddc29b81c18a551f5" },
+		{ string.rep("a", 64), "0098ba824b5c16427bd7a1122a5a442a25ec644d" },
+		{ string.rep("a", 65), "11655326c708d70319be2610e8a57d9a5b959d3b" },
+		{ string.rep("a", 1000), "291e9a6c66994949b57ba5e650361e98fc36b1ba" },
+	}
+	for index, row in ipairs(vectors) do
+		assert_equal(sha1.hex(row[1]), row[2], "SHA-1 known answer " .. index)
+	end
+end
+
+function extra_tests.test_exposure_uuid_reload_is_stable()
+	local before = experiments.exposure_event_id("marker", "subject", "experiment", 1, 7)
+	local loaded = package.loaded["shardpilot.experiments"]
+	package.loaded["shardpilot.experiments"] = nil
+	local reloaded = require "shardpilot.experiments"
+	package.loaded["shardpilot.experiments"] = loaded
+	assert_equal(reloaded.exposure_event_id("marker", "subject", "experiment", 1, 7),
+		before, "namespace and canonical tuple are stable across module reloads")
 end
 
 function extra_tests.test_exposure_uuid_wire_and_retry()
@@ -11451,6 +11474,8 @@ function extra_tests.test_exposure_uuid_wire_and_retry()
 end
 
 local tests = {
+	extra_tests.test_exposure_sha1_known_answers,
+	extra_tests.test_exposure_uuid_reload_is_stable,
 	extra_tests.test_exposure_uuid_version_bits,
 	extra_tests.test_exposure_uuid_variant_bits,
 	extra_tests.test_exposure_uuid_golden_vectors,

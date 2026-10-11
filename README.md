@@ -1381,8 +1381,13 @@ game has to handle specially.
 
   **Treat exposure delivery as best-effort, and the `diagnostics` hook as the
   place you learn otherwise.** Facts carry a deterministic `event_id`, so the
-  server counts retries of the same fact once. Newly derived exposure IDs set
-  UUID version 5 and RFC variant bits in the existing deterministic tuple hash.
+  server counts retries of the same fact once. Newly derived exposure IDs use
+  RFC 9562 UUIDv5: SHA-1 of the SDK namespace UUID
+  `01e2e885-f600-4118-80b6-f8470ece21bb` in network byte order followed by
+  `exposure`, session marker, subject key, experiment key, decimal version and
+  decimal arm counter joined by byte `0x1f`. The first 128 digest bits receive
+  UUID version 5 and RFC variant bits. The pure-Lua derivation is identical
+  on every supported runtime.
   Queued and spooled facts retain their stamped IDs on retry. **New in `v0.11.0`:** a consent denial
   closes the session; after re-grant, retained assignments re-arm into the
   fresh session and use its distinct exposure ID. Those are separate facts,
