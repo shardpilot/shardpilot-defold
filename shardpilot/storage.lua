@@ -15,6 +15,7 @@
 local clock = require "shardpilot.clock"
 local consent_notice = require "shardpilot.consent_notice"
 local random = require "shardpilot.random"
+local experiment_facts = require "shardpilot.experiment_facts"
 
 local M = {}
 
@@ -2226,6 +2227,12 @@ local function sanitize_experiment_entries(entries)
 			and type(entry.assignment_key) == "string" and entry.assignment_key ~= ""
 			and type(entry.variant_key) == "string" and entry.variant_key ~= ""
 			and valid_wire_version(entry.version)
+			and ((entry.served_revision_wire == nil and entry.served_kill_gate == nil and entry.served_at == nil)
+				or (experiment_facts.integer(entry.version_wire, 1)
+					and tonumber(entry.version_wire) == entry.version
+					and experiment_facts.integer(entry.served_revision_wire, 0)
+					and type(entry.served_kill_gate) == "boolean"
+					and type(entry.served_at) == "string" and entry.served_at ~= ""))
 			and type(entry.assignment_unit) == "string" and entry.assignment_unit ~= ""
 			and (entry.assignment_unit ~= "client_id"
 				or valid_subject_fact_key(entry.subject_fact_key))
@@ -2236,6 +2243,10 @@ local function sanitize_experiment_entries(entries)
 				variant_key = entry.variant_key,
 				variant_payload = copy_experiment_payload(entry.variant_payload, 0),
 				version = entry.version,
+				version_wire = entry.version_wire,
+				served_revision_wire = entry.served_revision_wire,
+				served_kill_gate = entry.served_kill_gate,
+				served_at = entry.served_at,
 				assignment_unit = entry.assignment_unit,
 				subject_fact_key = valid_subject_fact_key(entry.subject_fact_key)
 					and entry.subject_fact_key or nil,

@@ -14,6 +14,7 @@ sys = {
 	end,
 }
 
+local extra_tests = {}
 local requests = {}
 -- Scripted answer for ASSIGNMENT requests; the consent and events:batch
 -- routes answer their happy-path defaults so consent receipts and fact
@@ -33,11 +34,30 @@ http = {
 			body = body,
 			options = options,
 		}
+		if url:find("/runtime/experiments/assignment", 1, true) then
+			local done = callback
+			callback = function(first, second, response)
+				local ok, assignment = pcall(json.decode, response and response.response or "")
+				if ok and assignment and assignment.assigned then
+					extra_tests.fixture_fact_keys = extra_tests.fixture_fact_keys or {}
+					local key = assignment.experiment_key or url:match("[?&]experiment_key=([^&]+)")
+					local subject = url:match("[?&]subject_key=([^&]+)") or ""
+					if key and type(assignment.version) == "number" then
+						extra_tests.fixture_fact_keys[key .. ":" .. string.format("%.0f", assignment.version) .. ":" .. subject] = assignment.subject_fact_key
+					end
+				end
+				done(first, second, response)
+			end
+		end
 		if responder then
 			local handled = responder(url, method, callback)
 			if handled then
 				return
 			end
+		end
+		if url:find("/experiments/exposures", 1, true) or url:find("/experiments/outcomes", 1, true) then
+			callback(nil, nil, { status = 200, response = extra_tests.sealed_answer(body) })
+			return
 		end
 		if url:find("/v1/consent", 1, true) then
 			callback(nil, nil, { status = 200, response = "{}" })
@@ -253,6 +273,7 @@ local function assert_match(value, pattern, message)
 end
 
 local function reset()
+	extra_tests.fixture_fact_keys = {}
 	requests = {}
 	next_status = 200
 	next_response_body = nil
@@ -349,6 +370,7 @@ local function assignment_body(overrides)
 		environment_key = "develop",
 		experiment_key = "exp-checkout",
 		version = 3,
+		served_revision = 7, served_kill_gate = false, served_at = "1970-01-01T00:16:40Z",
 		assigned = true,
 		assignment_key = fixture_assignment_key,
 		variant_key = "treatment",
@@ -377,7 +399,7 @@ local function not_assigned_body(reason)
 end
 
 local function is_assignment_request(request)
-	return request.url:find("/api/v1/runtime/experiments/assignment", 1, true) ~= nil
+	return request.url:find("/api/cp/v1/runtime/experiments/assignment", 1, true) ~= nil
 end
 
 local function assignment_requests()
@@ -423,6 +445,24 @@ local function fetch(client, experiment_key, attributes)
 	end)
 	assert_true(result ~= nil, "the fetch callback must have been invoked")
 	return result
+end
+
+function extra_tests.apply(client, key)
+	local variant, err = client:apply_experiment_variant(key)
+	if client.experiments then client.experiments:sweep_owed(true) end
+	return variant, err
+end
+
+function extra_tests.fetch_apply(client, key, attributes)
+	local result = fetch(client, key, attributes)
+	if result.ok and result.assigned then extra_tests.apply(client, key) end
+	return result
+end
+
+function extra_tests.outcome(client, key, name, value)
+	local ok, err = client:track_outcome(key, name, value)
+	if client.experiments then client.experiments:sweep_owed(true) end
+	return ok, err
 end
 
 local function queued_events(client, event_name)
@@ -487,7 +527,7 @@ local function test_flag_off_zero_paths()
 	assert_nil(client:experiment_payload("exp-checkout"))
 	ok, err = client:track_exposure("exp-checkout")
 	assert_equal(err, "experiments_not_configured")
-	ok, err = client:track_outcome("exp-checkout", "score", 1)
+	ok, err = extra_tests.outcome(client, "exp-checkout", "score", 1)
 	assert_equal(err, "experiments_not_configured")
 	client:update(0.016)
 	client:update(0.016)
@@ -525,7 +565,7 @@ local function test_fetch_happy_path_and_boundary_passthrough()
 	local request = last_assignment_request()
 	assert_equal(request.method, "GET")
 	assert_match(request.url,
-		"^http://localhost:18081/api/v1/runtime/experiments/assignment%?")
+		"^http://localhost:18081/api/cp/v1/runtime/experiments/assignment%?")
 	assert_equal(request.headers["Authorization"], "Bearer sp_ingest_publishable_key",
 		"the assignment fetch authenticates with the publishable key")
 	assert_nil(request.headers["X-ShardPilot-Schema-Revision"],
@@ -742,12 +782,12 @@ local function test_kill_switch_drops_durably_and_never_exposes()
 	local restore = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1,
 		"the applied assignment emits one exposure")
 
 	next_response_body = not_assigned_body("kill_switch")
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_nil(client:experiment_variant("exp-checkout"))
 	assert_equal(#queued_events(client, "experiment_exposure"), 1,
 		"a kill must emit no further exposure")
@@ -1088,12 +1128,12 @@ end
 
 -- ── exposure lane ─────────────────────────────────────────────────────────────
 
-local function test_exposure_auto_emit_once_with_deterministic_id()
+local function test_explicit_application_once_with_signed_id()
 	reset()
 	local client = granted_client()
 	client:identify("user-with-account")
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 
 	local exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 1, "the first application emits exactly one exposure")
@@ -1107,53 +1147,32 @@ local function test_exposure_auto_emit_once_with_deterministic_id()
 	assert_nil(fact.user_id, "experiment facts omit user_id even when identified")
 	assert_equal(fact.anonymous_id, "anon-client",
 		"the envelope identity stays the standard anonymous id")
-	local subject = client.experiments_client_id
-	assert_equal(fact.event_id, experiments.exposure_event_id(
-		client.experiments.session_marker, subject, "exp-checkout", 3, 0),
-		"the exposure event id is the deterministic derivation")
+	assert_equal(fact.event_id, fact.sealed_fact.event_id, "the exposure keeps the signed ID")
 
 	-- Re-fetching the same assignment does not re-emit.
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	client:update(0.016)
 	assert_equal(#queued_events(client, "experiment_exposure"), 1,
 		"one exposure per (experiment, version, subject) per session")
 
-	-- The explicit re-arm emits again with a distinct deterministic id.
 	assert_true(client:track_exposure("exp-checkout"))
+	client.experiments:tick(0)
 	local rearmed = queued_events(client, "experiment_exposure")
 	assert_equal(#rearmed, 2)
 	assert_true(rearmed[2].event_id ~= rearmed[1].event_id,
 		"a re-arm derives a distinct id")
-	assert_equal(rearmed[2].event_id, experiments.exposure_event_id(
-		client.experiments.session_marker, subject, "exp-checkout", 3, 1))
-end
-
-local function test_exposure_event_id_derivation_is_stable()
-	local subject = "spcid_" .. string.rep("f", 32)
-	local a = experiments.exposure_event_id("marker", subject, "exp", 3, 0)
-	local b = experiments.exposure_event_id("marker", subject, "exp", 3, 0)
-	assert_equal(a, b, "the same tuple derives the same id")
-	assert_match(a, "^%x+%-%x+%-%x+%-%x+%-%x+$")
-	assert_true(a ~= experiments.exposure_event_id("marker", subject, "exp", 3, 1),
-		"the arm counter varies the id")
-	assert_true(a ~= experiments.exposure_event_id("marker", subject, "exp", 4, 0),
-		"the version varies the id")
-	assert_true(a ~= experiments.exposure_event_id("other", subject, "exp", 3, 0),
-		"the session marker varies the id")
-	assert_true(a ~= experiments.exposure_event_id("marker", "spcid_" .. string.rep("0", 32),
-		"exp", 3, 0),
-		"the subject varies the id")
+	assert_equal(rearmed[2].event_id, rearmed[2].sealed_fact.event_id)
 end
 
 local function test_exposure_version_change_rearms()
 	reset()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 	-- A republished version is a new tuple: one more exposure.
 	next_response_body = assignment_body({ version = 4 })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 2,
 		"a version change re-arms the exposure")
 end
@@ -1163,7 +1182,7 @@ local function test_restart_restores_cache_serves_offline_and_exposes_once()
 	local restore = install_fake_sys_storage()
 	local first = granted_client()
 	next_response_body = assignment_body()
-	fetch(first, "exp-checkout", { age_band = "adult" })
+	extra_tests.fetch_apply(first, "exp-checkout", { age_band = "adult" })
 	local first_exposure = queued_events(first, "experiment_exposure")[1]
 
 	-- A relaunch serves the persisted assignment before (and without) any
@@ -1178,12 +1197,6 @@ local function test_restart_restores_cache_serves_offline_and_exposes_once()
 	assert_equal(result.from_cache, true)
 	assert_equal(result.variant_key, "treatment")
 
-	-- The restored application emits one exposure for the NEW session, with
-	-- a distinct deterministic id — once that session EXISTS. The
-	-- background tick must not lazily open a session to drain it (a
-	-- phantom session would demote the host's first session_start to a
-	-- renewal and double-arm); the snapshot waits for the first-session
-	-- migration.
 	second:update(0.016)
 	second:update(0.016)
 	assert_equal(#queued_events(second, "experiment_exposure"), 0,
@@ -1191,6 +1204,7 @@ local function test_restart_restores_cache_serves_offline_and_exposes_once()
 	assert_nil(second.session_id,
 		"and the tick opened no phantom analytics session")
 	assert_true(second:session_start())
+	extra_tests.apply(second, "exp-checkout")
 	second:update(0.016)
 	local exposures = queued_events(second, "experiment_exposure")
 	assert_equal(#exposures, 1, "a restored assignment exposes once per session")
@@ -1299,7 +1313,7 @@ local function test_forced_minor_zero_traffic_on_both_planes()
 	ok, err = client:track_exposure("exp-checkout")
 	assert_equal(ok, false)
 	assert_equal(err, "consent_denied")
-	ok, err = client:track_outcome("exp-checkout", "score", 1)
+	ok, err = extra_tests.outcome(client, "exp-checkout", "score", 1)
 	assert_equal(ok, false)
 	assert_equal(err, "consent_denied")
 	assert_equal(#queued_events(client), 0)
@@ -1315,9 +1329,9 @@ local function test_track_outcome_stamps_cached_assignment()
 	local client = granted_client()
 	client:identify("user-with-account")
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 
-	assert_true(client:track_outcome("exp-checkout", "score", 12.5))
+	assert_true(extra_tests.outcome(client, "exp-checkout", "score", 12))
 	local outcomes = queued_events(client, "experiment_outcome")
 	assert_equal(#outcomes, 1)
 	local fact = outcomes[1]
@@ -1327,21 +1341,21 @@ local function test_track_outcome_stamps_cached_assignment()
 	assert_equal(fact.props.variant_key, "treatment")
 	assert_equal(fact.props.assignment_unit, "client_id")
 	assert_equal(fact.props.outcome_key, "score")
-	assert_equal(fact.props.outcome_value, 12.5)
+	assert_equal(fact.props.outcome_value, 12)
 	assert_nil(fact.user_id, "outcome facts omit user_id")
 
 	-- Each call is a distinct fact.
-	assert_true(client:track_outcome("exp-checkout", "score", 13))
+	assert_true(extra_tests.outcome(client, "exp-checkout", "score", 13))
 	local again = queued_events(client, "experiment_outcome")
 	assert_equal(#again, 2)
 	assert_true(again[2].event_id ~= again[1].event_id)
 
-	local ok, err = client:track_outcome("exp-unknown", "score", 1)
+	local ok, err = extra_tests.outcome(client, "exp-unknown", "score", 1)
 	assert_equal(ok, false)
 	assert_equal(err, "no_assignment")
-	ok, err = client:track_outcome("exp-checkout", "", 1)
+	ok, err = extra_tests.outcome(client, "exp-checkout", "", 1)
 	assert_equal(err, "invalid_outcome_key")
-	ok, err = client:track_outcome("exp-checkout", "score", "twelve")
+	ok, err = extra_tests.outcome(client, "exp-checkout", "score", "twelve")
 	assert_equal(err, "invalid_outcome_value")
 
 	-- Non-finite numbers are rejected BEFORE enqueue. They are Lua numbers
@@ -1349,8 +1363,8 @@ local function test_track_outcome_stamps_cached_assignment()
 	-- whole batch it lands in (a terminal encode failure drops the batch,
 	-- unrelated events included, and permanent failures are never spooled).
 	local before = #queued_events(client, "experiment_outcome")
-	for _, bad in ipairs({ 0 / 0, math.huge, -math.huge }) do
-		ok, err = client:track_outcome("exp-checkout", "score", bad)
+	for _, bad in ipairs({ 0 / 0, math.huge, -math.huge, 12.5, 9007199254740994 }) do
+		ok, err = extra_tests.outcome(client, "exp-checkout", "score", bad)
 		assert_equal(ok, false)
 		assert_equal(err, "invalid_outcome_value")
 	end
@@ -1590,7 +1604,7 @@ local function test_remint_rearms_exposure_for_new_subject()
 	reset()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 	local first_subject = query_params(last_assignment_request().url).subject_key
 
@@ -1614,7 +1628,7 @@ local function test_remint_rearms_exposure_for_new_subject()
 		end
 		return true
 	end
-	local result = fetch(client, "exp-checkout")
+	local result = extra_tests.fetch_apply(client, "exp-checkout")
 	responder = nil
 	assert_true(result.ok and result.assigned)
 	local second_subject = query_params(last_assignment_request().url).subject_key
@@ -1696,7 +1710,7 @@ local function test_queue_full_exposure_retried_by_tick()
 	-- The fresh assignment applies while the queue is full: the exposure
 	-- emit fails locally and must stay armed instead of being lost.
 	next_response_body = assignment_body()
-	local result = fetch(client, "exp-checkout")
+	local result = extra_tests.fetch_apply(client, "exp-checkout")
 	assert_true(result.ok and result.assigned)
 	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0,
@@ -1719,7 +1733,7 @@ local function test_session_renewal_rearms_exposure()
 	reset()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	local first = queued_events(client, "experiment_exposure")
 	assert_equal(#first, 1)
 	client:update(0.016)
@@ -1728,12 +1742,14 @@ local function test_session_renewal_rearms_exposure()
 
 	-- An explicit session renewal re-arms the once-per-SESSION contract.
 	assert_true(client:session_start())
+	assert_equal(#queued_events(client, "experiment_exposure"), 1, "renewal did not apply a variant")
+	extra_tests.apply(client, "exp-checkout")
 	client:update(0.016)
 	local exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 2,
 		"a renewed session emits its own exposure for the applied assignment")
 	assert_true(exposures[2].event_id ~= exposures[1].event_id,
-		"each session derives its own deterministic id")
+		"each session derives its own signed ID")
 	assert_equal(exposures[2].session_id, client.session_id,
 		"the renewed session's exposure rides the new session")
 
@@ -1748,7 +1764,7 @@ local function test_regenerated_assignment_key_does_not_reexpose()
 	reset()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 
 	-- The same (experiment, version, subject) tuple answering with a
@@ -1757,7 +1773,7 @@ local function test_regenerated_assignment_key_does_not_reexpose()
 	next_response_body = assignment_body({
 		assignment_key = "asgn_" .. string.rep("f", 32),
 	})
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	client:update(0.016)
 	assert_equal(#queued_events(client, "experiment_exposure"), 1,
 		"a regenerated assignment key must not re-expose the same tuple")
@@ -1792,9 +1808,9 @@ local function test_missing_fact_key_skips_facts_and_subject_never_egresses()
 	local ok, err = client:track_exposure("exp-checkout")
 	assert_equal(ok, false)
 	assert_equal(err, "exposure_no_subject_fact_key")
-	ok, err = client:track_outcome("exp-checkout", "score", 1)
+	ok, err = extra_tests.outcome(client, "exp-checkout", "score", 1)
 	assert_equal(ok, false)
-	assert_equal(err, "exposure_no_subject_fact_key")
+	assert_equal(err, "no_assignment")
 
 	-- The egress rule itself: the SDK-minted subject id appears in NO
 	-- queued analytics event, in any field.
@@ -2051,11 +2067,11 @@ local function test_drop_preserves_owed_exposure()
 	-- OWED. A kill then stops serving — but the application already
 	-- happened, and its fact must still be emitted.
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0,
 		"the full queue kept the exposure owed")
 	next_response_body = not_assigned_body("kill_switch")
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_nil(client:experiment_variant("exp-checkout"),
 		"the kill stops serving")
 
@@ -2206,7 +2222,7 @@ local function test_consent_purge_rearms_unpublished_exposures()
 	reset()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	local exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 1)
 	local original_event_id = exposures[1].event_id
@@ -2220,12 +2236,13 @@ local function test_consent_purge_rearms_unpublished_exposures()
 	assert_equal(#queued_events(client, "experiment_exposure"), 0,
 		"a background sweep cannot reopen the denied session")
 	assert_true(client:track("after_regrant"))
+	extra_tests.apply(client, "exp-checkout")
 	client:update(0.016)
 	exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 1,
 		"the purged exposure must re-emit after a re-grant")
 	assert_true(exposures[1].event_id ~= original_event_id,
-		"the fresh session gets its own deterministic exposure id")
+		"the fresh session gets its own signed exposure ID")
 
 	-- Still once per session: no growth on further ticks.
 	client:update(0.016)
@@ -2290,9 +2307,9 @@ local function test_owed_exposures_queue_across_replacements()
 	-- are owed, in order — the second application must not cost the first
 	-- its exposure.
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	next_response_body = assignment_body({ version = 4, variant_key = "control" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
 	assert_true(client:flush({ include_summaries = false }))
@@ -2473,12 +2490,9 @@ local function test_rearm_while_auto_exposure_owed_emits_both()
 	-- The assignment applies while the queue is full: the automatic
 	-- exposure stays OWED.
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
-	-- The queue drains and the host explicitly re-arms BEFORE the tick
-	-- sweeps the owed automatic fact: the re-arm buys an EXTRA fact — it
-	-- must not consume the owed automatic slot.
 	assert_true(client:flush({ include_summaries = false }))
 	assert_true(client:track_exposure("exp-checkout"))
 	client:update(0.016)
@@ -2486,9 +2500,8 @@ local function test_rearm_while_auto_exposure_owed_emits_both()
 	assert_equal(#exposures, 2,
 		"the explicit re-arm AND the owed automatic exposure both emit")
 	assert_true(exposures[1].event_id ~= exposures[2].event_id,
-		"distinct arms derive distinct deterministic ids")
+		"distinct arms derive distinct occurrence IDs")
 
-	-- And exactly those two: the automatic slot emitted once.
 	client:update(0.016)
 	assert_equal(#queued_events(client, "experiment_exposure"), 2)
 end
@@ -2501,12 +2514,12 @@ local function test_shutdown_sweeps_owed_exposure_after_flush()
 	-- reasons this test is not about. The filler goes FIRST: an event after
 	-- an end opens the next session, which shutdown would then have to end.
 	assert_true(client:track("filler"))
-	assert_true(client:session_end("pre-shutdown"))
+	assert_true(client:track("filler-two"))
 
 	-- The assignment applies under a FULL queue: the exposure is owed, and
 	-- no update() runs again before exit.
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
 	-- Shutdown's final flush frees the room: the owed fact must be swept
@@ -2706,7 +2719,7 @@ local function test_owed_exposures_stay_session_scoped()
 	local restore = install_fake_sys_storage()
 	local seed = granted_client()
 	next_response_body = assignment_body()
-	fetch(seed, "exp-checkout", { age_band = "adult" })
+	extra_tests.fetch_apply(seed, "exp-checkout", { age_band = "adult" })
 	next_status = 202
 	next_response_body = nil
 	assert_true(seed:shutdown())
@@ -2720,13 +2733,15 @@ local function test_owed_exposures_stay_session_scoped()
 	next_status = 200
 	local client = assert(sdk.new(config()))
 	assert_true(client:track("warmup"))
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
 	assert_true(client:session_start())
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
 	client:update(0.016)
 	local exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 2,
 		"both sessions' treatments get their own exposure fact")
 	assert_true(exposures[1].event_id ~= exposures[2].event_id,
-		"each session derives its own deterministic id")
+		"each session derives its own signed ID")
 
 	-- And exactly those two.
 	client:update(0.016)
@@ -2740,7 +2755,7 @@ local function test_ordinary_latch_preserves_owed_exposure()
 	assert_true(client:track("filler-a"))
 	assert_true(client:track("filler-b"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
 	-- An ORDINARY 401 latches: serving stops, but the treatment already
@@ -2748,7 +2763,7 @@ local function test_ordinary_latch_preserves_owed_exposure()
 	-- draining once the queue has room.
 	next_status = 401
 	next_response_body = json.encode({ error = "invalid runtime token" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_nil(client:experiment_variant("exp-checkout"))
 
 	next_status = 200
@@ -2769,7 +2784,7 @@ local function test_remint_preserves_owed_exposure_of_past_treatment()
 	assert_true(client:track("filler-a"))
 	assert_true(client:track("filler-b"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
 	-- A grammar re-mint rotates the subject: the OLD subject's applied
@@ -2797,7 +2812,7 @@ local function test_remint_preserves_owed_exposure_of_past_treatment()
 		end
 		return true
 	end
-	fetch(client, "exp-other")
+	extra_tests.fetch_apply(client, "exp-other")
 	responder = nil
 
 	assert_true(client:flush({ include_summaries = false }))
@@ -2818,7 +2833,7 @@ local function test_sentinel_discards_owed_exposures()
 	assert_true(client:track("filler-a"))
 	assert_true(client:track("filler-b"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
 	-- The real-subjects sentinel withdraws the assignments AND their
@@ -2827,7 +2842,7 @@ local function test_sentinel_discards_owed_exposures()
 	-- the platform flipped real subjects off.
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 
 	next_status = 200
 	next_response_body = nil
@@ -2950,15 +2965,10 @@ local function test_restored_exposure_migrates_to_first_session()
 	next_response_body = nil
 	assert_true(seed:shutdown())
 
-	-- The common init-then-start-session launch flow: the restored
-	-- assignment's owed exposure is armed under the PRE-session
-	-- constructor marker, and the host explicitly starts the FIRST session
-	-- before any update(). No session existed for the restoration to have
-	-- run in — the owed snapshot must MIGRATE to the first real session,
-	-- never duplicate into two facts.
 	next_status = 200
 	local client = assert(sdk.new(config()))
 	assert_true(client:session_start())
+	extra_tests.apply(client, "exp-checkout")
 	client:update(0.016)
 	local exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 1,
@@ -3019,7 +3029,7 @@ local function test_shutdown_captures_deferred_session_end_when_flush_cannot_sen
 	assert_true(client:track("filler-a"))
 	assert_true(client:track("filler-b"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
 	-- The queue is FULL and undeliverable; the spool durably captures it.
@@ -3060,7 +3070,7 @@ local function test_shutdown_completes_with_active_session_and_full_queue()
 	assert_true(client:track("filler-a"))
 	assert_true(client:track("filler-b"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
 	-- Active session + FULL queue — the exact scenario that owes an
@@ -3561,7 +3571,7 @@ local function test_shutdown_fails_when_housekeeping_events_cannot_persist()
 	assert_true(client:track("filler-a"))
 	assert_true(client:track("filler-b"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
 	-- The FIRST shutdown flush drains fine; the HOUSEKEEPING flush (the
@@ -3650,7 +3660,7 @@ local function test_consent_purge_discards_dead_owed_exposures()
 	assert_true(client:track("filler-a"))
 	assert_true(client:track("filler-b"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
 	-- The assignment is KILLED (its owed snapshot survives the drop — the
@@ -3658,7 +3668,7 @@ local function test_consent_purge_discards_dead_owed_exposures()
 	-- discards the unpublished fact. A re-grant must never publish a
 	-- treatment the server already killed.
 	next_response_body = not_assigned_body("kill_switch")
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_true(client:set_consent(false))
 	assert_true(client:set_consent(true))
 	client:update(0.016)
@@ -3676,7 +3686,7 @@ local function test_owed_exposure_keeps_original_session_identity()
 	local first_session = client.session_id
 	assert_true(first_session ~= nil)
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
 	-- The queue drains and the host RENEWS the session before the owed
@@ -3684,6 +3694,7 @@ local function test_owed_exposure_keeps_original_session_identity()
 	-- in; the renewal's own exposure rides the new session.
 	assert_true(client:flush({ include_summaries = false }))
 	assert_true(client:session_start())
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
 	client:update(0.016)
 	local exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 2)
@@ -3703,7 +3714,7 @@ local function test_shutdown_buffer_one_drains_owed_exposure_after_session_end()
 	assert_true(client:session_start())
 	assert_equal(#client.queue.items, 1, "session_started fills the whole queue")
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0,
 		"the full queue leaves the exposure owed")
 	-- The assignment is then DROPPED (404): the owed fact survives, but a
@@ -3711,7 +3722,7 @@ local function test_shutdown_buffer_one_drains_owed_exposure_after_session_end()
 	-- only exit. Exactly the fatal flavor of the loop-less housekeeping.
 	next_status = 404
 	next_response_body = nil
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	next_status = 200
 
 	assert_true(client:shutdown(), "shutdown completes by looping the housekeeping")
@@ -3758,7 +3769,7 @@ local function test_owed_exposure_keeps_original_anonymous_id_and_timestamp()
 	assert_true(client:track("filler-d"))
 	local ts_before_arm = clock_mod.iso_utc()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	local ts_after_arm = clock_mod.iso_utc()
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
@@ -3791,7 +3802,7 @@ local function test_persist_spools_owed_exposure_fact()
 	assert_true(client:track("filler-c"))
 	assert_true(client:track("filler-d"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
 	-- The queue drains; the host's focus-loss listener fires persist()
@@ -3823,7 +3834,7 @@ local function test_persist_reports_uncaptured_experiment_state()
 	assert_true(client:track("filler-c"))
 	assert_true(client:track("filler-d"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 
 	-- The queue is STILL full: the sweep cannot capture the owed fact, so
 	-- persist must not claim the app-may-die snapshot is safe.
@@ -3839,7 +3850,7 @@ local function test_persist_reports_uncaptured_experiment_state()
 	assert_true(client:persist(), "a captured snapshot reports success")
 	state.fail_save = fail_experiment_saves
 	next_response_body = not_assigned_body("kill_switch")
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	local drop_ok, drop_err = client:persist()
 	assert_equal(drop_ok, false)
 	assert_equal(drop_err, "experiments_pending")
@@ -4121,15 +4132,11 @@ local function test_migrated_snapshot_keeps_apply_identity_through_session_start
 	next_response_body = assignment_body()
 	fetch(seed_client, "exp-checkout", { age_band = "adult" })
 
-	-- Restart: the restored assignment arms its pre-session snapshot at
-	-- construction. Time passes and the anonymous id rotates BEFORE the
-	-- first session starts: the migration must carry the snapshot into
-	-- the first real session with its RESTORE-moment identity — the
-	-- unconditional re-arm must not replace it with a session-start-
-	-- stamped one.
 	local clock_mod = require "shardpilot.clock"
 	local ts_low = clock_mod.iso_utc()
 	local client = assert(sdk.new(config()))
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
+	local applied_session = client.session_id
 	local ts_high = clock_mod.iso_utc()
 	advance_seconds(120)
 	assert_true(client:set_anonymous_id("anon-rotated"))
@@ -4138,11 +4145,11 @@ local function test_migrated_snapshot_keeps_apply_identity_through_session_start
 	local exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 1)
 	assert_equal(exposures[1].anonymous_id, "anon-client",
-		"the migrated snapshot keeps the restore-moment anonymous id")
+		"the migrated snapshot keeps the application-moment anonymous id")
 	assert_true(ts_low <= exposures[1].event_ts
 		and exposures[1].event_ts <= ts_high,
-		"the migrated snapshot keeps the restore-moment timestamp")
-	assert_equal(exposures[1].session_id, client.session_id,
+		"the migrated snapshot keeps the application-moment timestamp")
+	assert_equal(exposures[1].session_id, applied_session,
 		"and belongs to the first real session")
 	restore()
 	storage.reset()
@@ -4167,7 +4174,7 @@ local function test_mode_b_rotation_blocked_while_exposure_owed()
 	assert_true(client:track("filler-c"))
 	assert_true(client:track("filler-d"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_true(client:flush({ include_summaries = false }))
 	assert_equal(#client.queue.items, 0, "the queue itself is drained")
 	local ok, err = client:set_anonymous_id("anon-rotated")
@@ -4180,31 +4187,22 @@ local function test_mode_b_rotation_blocked_while_exposure_owed()
 		"rotation proceeds once the owed fact drained")
 end
 
-local function test_purge_rearm_materializes_at_grant_identity()
+local function test_application_after_grant_pins_identity()
 	reset()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	client:update(0.016)
 	assert_true(client:flush({ include_summaries = false }))
 
-	-- Consent is revoked (the purge re-arms the retained assignment as
-	-- INTENT), time passes and the anonymous id rotates during denial,
-	-- then consent returns: the re-emitted exposure must carry the
-	-- identity of the moment serving RESUMED — never a denied-period
-	-- snapshot for a treatment that was not being served.
 	local clock_mod = require "shardpilot.clock"
 	assert_true(client:set_consent(false))
 	advance_seconds(120)
 	assert_true(client:set_anonymous_id("anon-rotated"))
-	-- The re-arm intent materializes INSIDE the grant call — serving
-	-- resumes at that exact moment, so the snapshot captures the grant
-	-- moment's identity; the window brackets set_consent(true) itself.
-	-- The clock then moves well past the window before the sweep runs, so
-	-- a lazily-at-first-sweep materialization (the pre-fix posture) would
-	-- stamp a visibly LATER timestamp and fail the bracket.
 	local ts_low = clock_mod.iso_utc()
 	assert_true(client:set_consent(true))
+	assert_true(not client.experiments:has_owed_exposures(), "grant is not application")
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
 	local ts_high = clock_mod.iso_utc()
 	advance_seconds(5)
 	assert_true(client:track("after_regrant"))
@@ -4266,18 +4264,15 @@ local function test_denied_restore_arms_intent_and_exposes_at_grant_identity()
 	local client = assert(sdk.new(config()))
 	advance_seconds(120)
 	assert_true(client:set_anonymous_id("anon-rotated"))
-	-- The intent materializes INSIDE the grant call (the moment serving
-	-- resumes stamps the snapshot's identity), so the timestamp window
-	-- brackets set_consent(true) itself; the fact then enqueues once a
-	-- session exists to attribute it to — the first session_start migrates
-	-- it, and the background tick opens no phantom session for it.
 	local ts_low = clock_mod.iso_utc()
 	assert_true(client:set_consent(true))
-	local ts_high = clock_mod.iso_utc()
+
 	client:update(0.016)
 	assert_equal(#queued_events(client, "experiment_exposure"), 0,
 		"the grant-moment snapshot waits for the first real session")
 	assert_true(client:session_start())
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
+	local ts_high = clock_mod.iso_utc()
 	client:update(0.016)
 	local exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 1)
@@ -4300,7 +4295,7 @@ local function test_retryable_sweep_attempts_do_not_count_as_drops()
 	assert_true(client:track("filler-c"))
 	assert_true(client:track("filler-d"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 
 	-- The owed exposure meets the full queue at the install sweep and at
 	-- every tick until room exists: each refusal is RETRYABLE (the
@@ -4505,13 +4500,9 @@ local function test_rearm_during_regrant_window_keeps_auto_exposure()
 	client:update(0.016)
 	assert_true(client:flush({ include_summaries = false }))
 
-	-- Consent cycles; in the window between the re-grant and the first
-	-- sweep the automatic exposure exists only as a pending re-arm
-	-- INTENT. An explicit track_exposure() there buys the EXTRA fact
-	-- (arm 1) — it must not consume the automatic slot: the intent still
-	-- materializes arm 0 and both facts emit with distinct ids.
 	assert_true(client:set_consent(false))
 	assert_true(client:set_consent(true))
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
 	assert_true(client:track_exposure("exp-checkout"))
 	client:update(0.016)
 	local exposures = queued_events(client, "experiment_exposure")
@@ -4747,15 +4738,9 @@ local function test_regrant_window_blocks_rotation_until_materialized()
 	fetch(client, "exp-checkout")
 	assert_true(client:flush({ include_summaries = false }))
 
-	-- Deny (the purge re-arms the retained assignment as INTENT), then
-	-- re-grant: the intent must materialize AT THE GRANT — the treatment
-	-- resumes serving that instant under the OLD anon — so the Mode B
-	-- rotation gate sees the owed automatic fact immediately. The lazy
-	-- first-sweep posture left a window in which has_owed_exposures()
-	-- reported none and a rotation could slip through, stamping the fact
-	-- with the NEW anon's identity.
 	assert_true(client:set_consent(false))
 	assert_true(client:set_consent(true))
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
 	assert_true(client:flush({ include_summaries = false }),
 		"the consent receipts drain")
 	local ok, err = client:set_anonymous_id("anon-rotated")
@@ -4775,7 +4760,7 @@ local function test_sentinel_purges_queue_resident_exposure_facts()
 	assert_true(client:session_start())
 	assert_true(client:track("filler-host-event"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1,
 		"the accepted exposure fact sits in the queue below batch size")
 
@@ -4785,7 +4770,7 @@ local function test_sentinel_purges_queue_resident_exposure_facts()
 	-- egress, not just future serving.
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0,
 		"queue-resident exposure facts are purged with the sentinel")
 	assert_equal(#queued_events(client, "filler-host-event"), 1,
@@ -4808,7 +4793,7 @@ local function test_sentinel_purges_retained_backoff_batch()
 	assert_true(client:session_start())
 	assert_true(client:track("filler-host-event"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 
 	-- The batch (host event + exposure fact) fails transiently and is
@@ -4830,7 +4815,7 @@ local function test_sentinel_purges_retained_backoff_batch()
 	responder = nil
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 
 	responder = function(url, _, callback)
 		if url:find("/v1/events:batch", 1, true) then
@@ -4860,7 +4845,7 @@ local function test_sentinel_purges_spooled_facts_from_prior_launch()
 	assert_true(first:session_start())
 	assert_true(first:track("filler-host-event"))
 	next_response_body = assignment_body()
-	fetch(first, "exp-checkout")
+	extra_tests.fetch_apply(first, "exp-checkout")
 	assert_equal(#queued_events(first, "experiment_exposure"), 1)
 	-- A transiently failing publish durably SPOOLS the batch (exposure
 	-- fact included); the process then dies without a clean shutdown.
@@ -4882,7 +4867,7 @@ local function test_sentinel_purges_spooled_facts_from_prior_launch()
 	assert_true(second:spool_pending(), "the spooled envelopes await re-send")
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(second, "exp-checkout")
+	extra_tests.fetch_apply(second, "exp-checkout")
 
 	next_status = 200
 	next_response_body = nil
@@ -4910,18 +4895,13 @@ local function test_presession_exposure_attributes_to_lazy_first_session()
 	next_response_body = assignment_body()
 	fetch(seed_client, "exp-checkout", { age_band = "adult" })
 
-	-- Relaunch: the restored snapshot is pre-session. Host activity lazily
-	-- opens the first real session (a pre-start track), the snapshot stays
-	-- held (no tick runs), and the explicit session_start is a RENEWAL of
-	-- that lazy session: the still-unattributed snapshot takes the LAZY
-	-- session's id — the session it lived through — while the renewal
-	-- re-arms the entry for the new session. Each real session gets
-	-- exactly one fact, correctly attributed.
 	local second = assert(sdk.new(config()))
 	assert_true(second:track("boot-event"))
+	assert_equal(second:apply_experiment_variant("exp-checkout"), "treatment")
 	local lazy_session = second.session_id
 	assert_true(lazy_session ~= nil, "host activity opened the lazy first session")
 	assert_true(second:session_start())
+	assert_equal(second:apply_experiment_variant("exp-checkout"), "treatment")
 	local started_session = second.session_id
 	assert_true(started_session ~= lazy_session)
 	second:update(0.016)
@@ -4941,31 +4921,25 @@ local function test_sentinel_purged_tuple_reexposes_on_refetch()
 	local client = granted_client()
 	assert_true(client:session_start())
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	local exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 1)
 	local original_id = exposures[1].event_id
 
-	-- The sentinel purges the queued fact — it never egressed — and the
-	-- platform then flips real subjects back ON in the same session: the
-	-- refetched tuple must expose again (a retained dedupe mark would
-	-- under-count the re-served treatment), and it derives the SAME
-	-- deterministic id, so a fact that had somehow already published
-	-- collapses server-side instead of double-counting.
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
 	next_status = 200
 	next_response_body = assignment_body()
-	local refetched = fetch(client, "exp-checkout")
+	local refetched = extra_tests.fetch_apply(client, "exp-checkout")
 	assert_true(refetched.ok, "the flag flipped back on — the plane recovers")
 	exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 1,
 		"the purged tuple re-exposes on the same-session refetch")
-	assert_equal(exposures[1].event_id, original_id,
-		"with the same deterministic id — server-side dedupe stays the guard")
+	assert_true(exposures[1].event_id ~= original_id,
+		"a new explicit application has a new occurrence ID")
 end
 
 local function test_condemned_relaunch_filters_spooled_facts()
@@ -4975,7 +4949,7 @@ local function test_condemned_relaunch_filters_spooled_facts()
 	assert_true(client:session_start())
 	assert_true(client:track("filler-host-event"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 	-- The batch (filler + fact) spools durably on a transient failure.
 	responder = function(url, _, callback)
@@ -5001,7 +4975,7 @@ local function test_condemned_relaunch_filters_spooled_facts()
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	state.fail_save = nil
 	storage.reset()
 
@@ -5033,7 +5007,7 @@ local function test_dropped_entry_owed_exposure_replays_after_kill()
 	-- The queue is FULL (buffer_size 1 holds the session start), so the
 	-- applied assignment's exposure stays OWED in memory.
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0,
 		"the exposure is owed, not queued")
 
@@ -5043,7 +5017,7 @@ local function test_dropped_entry_owed_exposure_replays_after_kill()
 	-- a process kill before the next sweep would otherwise lose the
 	-- treatment's record entirely.
 	next_response_body = not_assigned_body("kill_switch")
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 
 	-- SIMULATED PROCESS DEATH: no shutdown, no persist — module memory
 	-- dies, the fake disk survives.
@@ -5153,16 +5127,12 @@ local function test_shutdown_closes_session_opened_by_final_drain()
 	next_response_body = assignment_body()
 	fetch(seed_client, "exp-checkout", { age_band = "adult" })
 
-	-- Relaunch with a restored pre-session owed exposure and NO session:
-	-- the shutdown's final drain lazily opens the exit-time session for
-	-- the fact — that session must CLOSE in the same housekeeping loop,
-	-- with its session_end delivered, instead of teardown leaving an open
-	-- session with no end on the wire.
 	storage.reset()
 	local second = assert(sdk.new(config()))
 	assert_nil(second.session_id)
 	next_status = 200
 	next_response_body = nil
+	assert_equal(second:apply_experiment_variant("exp-checkout"), "treatment")
 	local requests_before = #requests
 	assert_true(second:shutdown("app_final"))
 	local saw_exposure_session = nil
@@ -5200,13 +5170,13 @@ local function test_stale_marker_does_not_condemn_new_scope_spool()
 	local restore, stores, state = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	-- Sentinel with the record store down: the sidecar marker persists,
 	-- stamped with THIS (develop) scope.
 	state.fail_save = fail_experiment_saves
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 
 	-- New launch under a DIFFERENT scope (environment rotated). The stale
 	-- develop-scope marker cannot retire (sidecar store failing) while
@@ -5221,7 +5191,7 @@ local function test_stale_marker_does_not_condemn_new_scope_spool()
 	assert_true(second:track("filler-host-event"))
 	next_status = 200
 	next_response_body = assignment_body({ environment_key = "prod" })
-	fetch(second, "exp-checkout")
+	extra_tests.fetch_apply(second, "exp-checkout")
 	assert_equal(#queued_events(second, "experiment_exposure"), 1)
 	responder = function(url, _, callback)
 		if url:find("/v1/events:batch", 1, true) then
@@ -5336,13 +5306,13 @@ local function test_stale_transient_does_not_pace_settled_key()
 		"a fenced-out stale transient must not pace the settled key's plane")
 end
 
-local function test_replacement_fact_capture_survives_settled_purge()
+local function test_new_application_capture_survives_settled_purge()
 	reset()
 	local restore, stores, state = install_fake_sys_storage()
 	local client = granted_client()
 	assert_true(client:session_start())
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 	-- The batch spools durably on a transient failure.
 	responder = function(url, _, callback)
@@ -5363,22 +5333,21 @@ local function test_replacement_fact_capture_survives_settled_purge()
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 
-	-- The flag flips back on: the refetched tuple re-exposes with the
-	-- SAME deterministic id. The capture re-legitimizes the id and
-	-- REWRITES the stored copy with the replacement's post-sentinel
-	-- identity — and with the spool store still down that write cannot
-	-- land, so persist reports the truth: not yet durable (the mirror
-	-- holds the replacement and the deferred rewrite converges it).
+	-- The flag flips back on and the host applies again: this is a new
+	-- occurrence. A failed persist does not promise durability; retrying
+	-- it after storage recovers must capture the new fact alongside the
+	-- removal of the withdrawn one.
 	next_status = 200
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1,
 		"the re-served treatment re-exposes")
 	assert_true(not client:persist(),
 		"persist reports the replacement not yet durable while the store is down")
 	state.fail_save = nil
+	assert_true(client:persist(), "the fresh occurrence becomes durable after the store recovers")
 
 	-- The store recovers and the deferred removal rewrite lands (flush
 	-- runs it first; the publish stays failing so nothing delivers live).
@@ -5400,6 +5369,8 @@ local function test_replacement_fact_capture_survives_settled_purge()
 	local relaunch = assert(sdk.new(config()))
 	next_status = 200
 	next_response_body = nil
+	assert_true(#relaunch.spool_batches > 0, "the new occurrence is durable before replay")
+	advance_seconds(60)
 	local requests_before = #requests
 	assert_true(relaunch:flush({ include_summaries = false }))
 	local resent_exposure = false
@@ -5422,7 +5393,7 @@ local function test_reissued_fact_key_replaces_settled_spool_copy()
 	local client = granted_client()
 	assert_true(client:session_start())
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	responder = function(url, _, callback)
 		if url:find("/v1/events:batch", 1, true) then
 			callback(nil, nil, { status = 503, response = "{}" })
@@ -5440,16 +5411,11 @@ local function test_reissued_fact_key_replaces_settled_spool_copy()
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 
-	-- The platform re-enables and REISSUES the same tuple/version with a
-	-- DIFFERENT subject-fact key: the re-exposed fact derives the SAME
-	-- deterministic id but different assignment_key bytes. The stale
-	-- settled copy on disk carries the WITHDRAWN key — the capture must
-	-- REPLACE it, never let it stand as the replacement's durable form.
 	next_status = 200
 	next_response_body = assignment_body({ subject_fact_key = new_fact_key })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 	state.fail_save = nil
 	assert_true(client:persist(), "the replacement capture lands durably")
@@ -5484,7 +5450,7 @@ local function test_condemned_marker_holds_without_subject()
 	assert_true(client:session_start())
 	assert_true(client:track("filler-host-event"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 	responder = function(url, _, callback)
 		if url:find("/v1/events:batch", 1, true) then
@@ -5505,7 +5471,7 @@ local function test_condemned_marker_holds_without_subject()
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	state.fail_save = nil
 
 	-- Process death, and the identity record loses its SUBJECT field
@@ -5548,7 +5514,7 @@ local function test_condemnation_survives_failed_spool_clear()
 	local restore, stores, state = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 	responder = function(url, _, callback)
 		if url:find("/v1/events:batch", 1, true) then
@@ -5568,7 +5534,7 @@ local function test_condemnation_survives_failed_spool_clear()
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 
 	-- SECOND launch with the spool store still down: the condemnation
 	-- filter drops the fact (nothing survives → nothing will ever resend
@@ -5619,7 +5585,7 @@ local function test_evicted_replacement_reports_capture_failure()
 	local new_fact_key = "sfk1_" .. string.rep("d", 64)
 	local client = granted_client({ spool_max_events = 1 })
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	responder = function(url, _, callback)
 		if url:find("/v1/events:batch", 1, true) then
 			callback(nil, nil, { status = 503, response = "{}" })
@@ -5634,10 +5600,10 @@ local function test_evicted_replacement_reports_capture_failure()
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	next_status = 200
 	next_response_body = assignment_body({ subject_fact_key = new_fact_key })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_true(client:track("late-host-event"))
 	state.fail_save = nil
 
@@ -5658,14 +5624,14 @@ local function test_settled_marker_spares_fresh_facts()
 	local client = granted_client()
 	assert_true(client:session_start())
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	client:update(0.016)
 	assert_true(client:flush({ include_summaries = false }))
 	-- Sentinel with the record store down mints the marker...
 	state.fail_save = fail_experiment_saves
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	-- ...the record store heals but the SIDECAR delete fails: the clear
 	-- fully settles on the first tick while the stale marker file stays.
 	state.fail_save = function(path)
@@ -5680,7 +5646,7 @@ local function test_settled_marker_spares_fresh_facts()
 	advance_seconds(5)
 	next_status = 200
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 	responder = function(url, _, callback)
 		if url:find("/v1/events:batch", 1, true) then
@@ -5724,7 +5690,7 @@ local function test_backend_owed_fact_capture_without_session()
 	-- Backend sources never open sessions — the queue is full, so the
 	-- applied assignment's exposure stays OWED and sessionless.
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0,
 		"the exposure is owed behind the full queue")
 
@@ -5733,7 +5699,7 @@ local function test_backend_owed_fact_capture_without_session()
 	-- legitimately sessionless on the normal enqueue path too, and a
 	-- process kill would otherwise lose the fact with its entry.
 	next_response_body = not_assigned_body("kill_switch")
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 
 	storage.reset()
 	local relaunch = assert(sdk.new(config({ source = "backend", buffer_size = 1 })))
@@ -5760,7 +5726,7 @@ local function test_spool_only_debt_persists_marker()
 	local restore, stores, state = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	responder = function(url, _, callback)
 		if url:find("/v1/events:batch", 1, true) then
 			callback(nil, nil, { status = 503, response = "{}" })
@@ -5783,7 +5749,7 @@ local function test_spool_only_debt_persists_marker()
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	local marker_path = nil
 	for key in pairs(stores) do
 		if key:match("/experiments%-clear$") then
@@ -5817,7 +5783,7 @@ local function test_same_key_replacement_carries_post_sentinel_identity()
 	local client = granted_client()
 	assert_true(client:session_start())
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	responder = function(url, _, callback)
 		if url:find("/v1/events:batch", 1, true) then
 			callback(nil, nil, { status = 503, response = "{}" })
@@ -5835,18 +5801,13 @@ local function test_same_key_replacement_carries_post_sentinel_identity()
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 
-	-- The flag flips back with the SAME subject-fact key: identical props,
-	-- same deterministic id — but the replacement's event_ts is
-	-- POST-sentinel, and that identity must become the durable copy: the
-	-- relaunch's stamp partition would drop a pre-sentinel timestamp as
-	-- withdrawn while the capture had reported the fact durable.
 	advance_seconds(2)
 	state.fail_save = fail_experiment_saves
 	next_status = 200
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 	-- persist() reports false here — the refetched entry's cache write is
 	-- owed against the still-failing record store — but its SPOOL capture
@@ -5880,7 +5841,7 @@ local function test_same_second_fresh_fact_survives_partition()
 	local client = granted_client()
 	assert_true(client:session_start())
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	client:update(0.016)
 	assert_true(client:flush({ include_summaries = false }))
 
@@ -5892,7 +5853,7 @@ local function test_same_second_fresh_fact_survives_partition()
 	state.fail_save = fail_experiment_saves
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	state.fail_save = function(path)
 		return path:match("/experiments%-clear$") ~= nil
 	end
@@ -5908,7 +5869,7 @@ local function test_same_second_fresh_fact_survives_partition()
 	socket.now = anchor_second + 0.5
 	next_status = 200
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	local exposures = queued_events(client, "experiment_exposure")
 	assert_equal(#exposures, 1)
 	responder = function(url, _, callback)
@@ -5948,7 +5909,7 @@ local function test_presettle_persist_excludes_wire_batch_facts()
 	assert_true(client:session_start())
 	assert_true(client:track("filler-host-event"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 
 	-- The batch goes ON THE WIRE and stays unsettled (held callback).
@@ -5970,7 +5931,7 @@ local function test_presettle_persist_excludes_wire_batch_facts()
 	-- durable spool: a crash pre-settle would replay them.
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	client:persist()
 
 	-- CRASH before the publish ever settles.
@@ -6113,16 +6074,10 @@ local function test_backend_restored_exposure_drains_in_background()
 	next_response_body = assignment_body()
 	fetch(seed_client, "exp-checkout", { age_band = "adult" })
 
-	-- A backend relaunch restores the assignment with a sessionless owed
-	-- snapshot. Backend envelopes are legitimately sessionless on the
-	-- normal enqueue path, so the background sweep must DRAIN it — the
-	-- pre-session hold exists to prevent phantom sessions and renewal
-	-- double-arms, neither of which exists for a source that never opens
-	-- sessions; holding would park the fact forever in a long-lived
-	-- backend process.
 	storage.reset()
 	local second = assert(sdk.new(config({ source = "backend" })))
 	assert_equal(second:experiment_variant("exp-checkout"), "treatment")
+	assert_equal(second:apply_experiment_variant("exp-checkout"), "treatment")
 	second:update(0.016)
 	local exposures = queued_events(second, "experiment_exposure")
 	assert_equal(#exposures, 1,
@@ -6171,7 +6126,6 @@ end
 -- Lua 5.4 caps a chunk at 200 locals; the suite crossed it at 160 test
 -- functions. New tests from here on are FIELDS of this one registry
 -- table, never new locals.
-local extra_tests = {}
 
 function extra_tests.test_subject_echo_never_installs_as_fact_key()
 	reset()
@@ -6314,7 +6268,7 @@ function extra_tests.test_disabled_relaunch_filters_condemned_spool()
 	assert_true(client:session_start())
 	assert_true(client:track("filler-host-event"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 	-- The batch (filler + fact) spools durably on a transient failure.
 	responder = function(url, _, callback)
@@ -6336,7 +6290,7 @@ function extra_tests.test_disabled_relaunch_filters_condemned_spool()
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	state.fail_save = nil
 	storage.reset()
 
@@ -6485,7 +6439,7 @@ local function stage_condemned_spool_launch(state)
 	assert_true(client:session_start())
 	assert_true(client:track("filler-host-event"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 	responder = function(url, _, callback)
 		if url:find("/v1/events:batch", 1, true) then
@@ -6502,7 +6456,7 @@ local function stage_condemned_spool_launch(state)
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	state.fail_save = nil
 	next_status = 200
 	next_response_body = nil
@@ -6923,14 +6877,14 @@ function extra_tests.test_spool_shadow_never_masks_unreadable()
 	assert_true(not client:flush({ include_summaries = false }))
 	responder = nil
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	-- The sentinel lands with the RECORD store down: marker armed; no
 	-- experiment facts are spooled, so the spool keeps its (clean) state.
 	advance_seconds(2)
 	state.fail_save = fail_experiment_saves
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	state.fail_save = nil
 	next_status = 200
 	next_response_body = nil
@@ -7397,7 +7351,7 @@ function extra_tests.test_spool_purge_clears_condemnation_debt()
 	local restore, stores, state = install_fake_sys_storage()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	responder = function(url, _, callback)
 		if url:find("/v1/events:batch", 1, true) then
 			callback(nil, nil, { status = 503, response = "{}" })
@@ -7417,7 +7371,7 @@ function extra_tests.test_spool_purge_clears_condemnation_debt()
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	next_status = 200
 	next_response_body = nil
 	local marker_path = nil
@@ -7449,17 +7403,7 @@ function extra_tests.test_spool_purge_clears_condemnation_debt()
 	storage.reset()
 end
 
--- the consumer used to be constructed BEFORE the
--- boot belt, so a stale granted record armed a LIVE pending_exposure from
--- the cached assignment — and when the belt then flipped the boot state to
--- denied, that denied-boot snapshot was never reconciled: it could emit
--- after a later re-grant with the denied-boot identity, or hold Mode B
--- rotation as phantom pending work. Construction now runs after the belt
--- and reads the FINAL boot consent state: the restored assignment arms as
--- re-arm INTENT instead, exactly like any non-granted restore.
--- Global on purpose: the main chunk sits at lua5.4's 200-local limit, and
--- one more `local function` fails to compile there.
-function test_belt_denial_flip_arms_intent_not_exposure()
+function test_belt_denial_restore_records_no_application()
 	reset()
 	storage.reset()
 	local client = granted_client()
@@ -7492,29 +7436,22 @@ function test_belt_denial_flip_arms_intent_not_exposure()
 	end
 	assert_equal(armed, 0,
 		"no live exposure snapshot arms under the belt-flipped denied boot")
-	assert_true(relaunch.experiments.pending_rearm["exp-checkout"] == true,
-		"the restored assignment arms as re-arm INTENT for a later grant")
+	assert_nil(relaunch.experiments.applications["exp-checkout"],
+		"restoration during denial does not apply the variant")
 	assert_true(relaunch:shutdown())
 	storage.reset()
 end
 
--- AFTER AN END, A BACKGROUND TICK OPENS NO SESSION. The next session is the
--- host's to open: its next event starts it. A pre-session snapshot still owed
--- when the session ends is held by the tick, as it is before the first
--- session. Without that hold, the owed start would be discharged by an SDK
--- tick: a session no host activity created.
 function extra_tests.test_ended_session_background_tick_opens_no_session()
 	reset()
 	local restore = install_fake_sys_storage()
 	local first = granted_client()
 	next_response_body = assignment_body()
-	fetch(first, "exp-checkout")
+	fetch(first, "exp-checkout", { age_band = "adult" })
 
-	-- Relaunch: the restored assignment arms a PRE-SESSION snapshot. The
-	-- host's first event lazily opens the first session, and the session
-	-- ends before any tick has drained the snapshot.
 	local second = assert(sdk.new(config()))
 	assert_true(second:track("host_event"))
+	assert_equal(second:apply_experiment_variant("exp-checkout"), "treatment")
 	local ended = second.session_id
 	assert_true(second:session_end("complete"))
 	local starts = #queued_events(second, "app.session_started")
@@ -7546,7 +7483,7 @@ function extra_tests.test_assignment_after_end_is_exposed_once_in_the_new_sessio
 	local ended = client.session_id
 	assert_true(client:session_end("complete"))
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	for _ = 1, 5 do
 		advance_seconds(1)
 		client:update(1)
@@ -7578,6 +7515,7 @@ function extra_tests.test_assignment_after_end_under_a_full_queue_is_exposed_onc
 	client.queue.items = {}
 	client.queue.limit = 20
 	assert_true(client:track("host_next"))
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
 	for _ = 1, 5 do
 		advance_seconds(1)
 		client:update(1)
@@ -7596,7 +7534,7 @@ function extra_tests.test_regrant_after_end_is_exposed_once_in_the_new_session()
 	local client = granted_client()
 	assert_true(client:session_start())
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1, "exposed in the first session")
 	local ended = client.session_id
 	assert_true(client:session_end("complete"))
@@ -7604,6 +7542,7 @@ function extra_tests.test_regrant_after_end_is_exposed_once_in_the_new_session()
 	client:set_consent(true)
 	client.queue.items = {}
 	assert_true(client:track("host_next"))
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
 	for _ = 1, 5 do
 		advance_seconds(1)
 		client:update(1)
@@ -7614,10 +7553,6 @@ function extra_tests.test_regrant_after_end_is_exposed_once_in_the_new_session()
 	assert_equal(exposures[1].session_id, client.session_id, "in the session that opened after it")
 end
 
--- WHAT LIVED THROUGH AN ENDED SESSION IS EXPOSED IN IT. A cache-restored
--- (pre-session) snapshot lives through the lazily opened first session; when
--- that session ends before any tick drained it, it is attributed to that
--- session at the end, and the tick exposes it there without opening a session.
 function extra_tests.test_snapshot_that_lived_through_an_ended_session_is_exposed_in_it()
 	reset()
 	local restore = install_fake_sys_storage()
@@ -7627,6 +7562,7 @@ function extra_tests.test_snapshot_that_lived_through_an_ended_session_is_expose
 
 	local second = assert(sdk.new(config()))
 	assert_true(second:track("host_event"))
+	assert_equal(second:apply_experiment_variant("exp-checkout"), "treatment")
 	local lived = second.session_id
 	assert_true(second:session_end("complete"))
 	local starts = #queued_events(second, "app.session_started")
@@ -7654,6 +7590,7 @@ function extra_tests.test_ended_and_next_session_snapshots_stay_apart()
 
 	local second = assert(sdk.new(config({ buffer_size = 3 })))
 	assert_true(second:track("host_event"))
+	assert_equal(second:apply_experiment_variant("exp-checkout"), "treatment")
 	local lived = second.session_id
 	assert_true(second:track("filler"))
 	assert_true(second:session_end("complete"))   -- the queue is full now
@@ -7666,6 +7603,7 @@ function extra_tests.test_ended_and_next_session_snapshots_stay_apart()
 	second.queue.items = {}
 	second.queue.limit = 20
 	assert_true(second:track("host_next"))
+	assert_equal(second:apply_experiment_variant("exp-checkout"), "treatment")
 	local next_session = second.session_id
 	for _ = 1, 5 do
 		advance_seconds(1)
@@ -7694,39 +7632,36 @@ function extra_tests.test_backend_background_sweep_opens_no_session()
 	client:set_consent(false)
 	client:set_consent(true)
 	client.queue.items = {}
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
 	for _ = 1, 5 do
 		advance_seconds(1)
 		client:update(1)
 	end
 	assert_equal(#queued_events(client, "app.session_started"), 0,
 		"no SDK tick opened a session for a backend client")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 	for _, exposure in ipairs(queued_events(client, "experiment_exposure")) do
 		assert_nil(exposure.session_id, "a backend exposure drains sessionless")
 	end
 end
 
--- AN EXPLICIT EXPOSURE AFTER AN END IS AN EXTRA ONE, IN THE NEXT SESSION. The
--- explicit path chose the post-end marker and its arm state before the owed
--- start ran inside its own enqueue; the start re-armed the automatic exposure
--- for the new session, and the explicit emission then wrote its stale state
--- over it, so the sweep discarded the automatic fact as already emitted: one
--- exposure where the call documents the automatic one plus an extra.
-function extra_tests.test_explicit_exposure_after_end_adds_to_the_automatic_one()
+function extra_tests.test_extra_application_after_end_has_distinct_occurrence()
 	reset()
 	local client = granted_client()
 	assert_true(client:session_start())
 	next_response_body = assignment_body()
-	fetch(client, "exp-checkout")
+	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 1, "exposed in the first session")
 	assert_true(client:session_end("complete"))
 	client.queue.items = {}
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
 	assert_true(client:track_exposure("exp-checkout"))
 	for _ = 1, 5 do
 		advance_seconds(1)
 		client:update(1)
 	end
 	local exposures = queued_events(client, "experiment_exposure")
-	assert_equal(#exposures, 2, "the automatic exposure and the explicit extra one")
+	assert_equal(#exposures, 2, "the application and the explicit extra one")
 	assert_true(exposures[1].event_id ~= exposures[2].event_id, "with distinct ids")
 	for _, exposure in ipairs(exposures) do
 		assert_equal(exposure.session_id, client.session_id, "both in the new session")
@@ -7745,6 +7680,8 @@ function extra_tests.test_backend_explicit_exposure_after_end_opens_no_session()
 	assert_true(client:session_end("complete"))
 	client.queue.items = {}
 	assert_true(client:track_exposure("exp-checkout"))
+	client.experiments:tick(0)
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
 	assert_equal(#queued_events(client, "app.session_started"), 0,
 		"the explicit exposure opened no session")
 	for _, exposure in ipairs(queued_events(client, "experiment_exposure")) do
@@ -7769,11 +7706,17 @@ end
 
 function extra_tests.test_age_golden_adult_control()
 	local result, outcome = experiments.apply(nil,
-		{ status = 200, response = extra_tests.age_golden("adult") }, 1000,
+		{ status = 200, response = extra_tests.served_age_golden() }, 1000,
 		"exposure-banner", "exposure-app", "develop", {})
 	assert_true(result.ok and result.assigned)
 	assert_equal(result.variant_key, "control")
 	assert_true(outcome.authoritative)
+end
+
+function extra_tests.served_age_golden()
+	local body = json.decode(extra_tests.age_golden("adult"))
+	body.served_revision, body.served_kill_gate, body.served_at = 7, false, "1970-01-01T00:16:40Z"
+	return json.encode(body)
 end
 
 function extra_tests.age_refusal(band)
@@ -7781,7 +7724,7 @@ function extra_tests.age_refusal(band)
 	local restore = install_fake_sys_storage()
 	local client = granted_client({ app_id = "exposure-app" })
 	client:set_consent(true)
-	next_response_body = extra_tests.age_golden("adult")
+	next_response_body = extra_tests.served_age_golden()
 	client:fetch_experiment_assignment("exposure-banner", { age_band = "adult" })
 	assert_equal(client:experiment_variant("exposure-banner"), "control", "adult prefill ran")
 	next_response_body = extra_tests.age_golden(band)
@@ -7821,7 +7764,7 @@ function extra_tests.test_age_future_reason_stays_malformed()
 	reset()
 	local client = granted_client({ app_id = "exposure-app" })
 	client:set_consent(true)
-	next_response_body = extra_tests.age_golden("adult")
+	next_response_body = extra_tests.served_age_golden()
 	client:fetch_experiment_assignment("exposure-banner", {})
 	-- Explicitly derived negative control, not a server-captured verdict.
 	next_response_body = extra_tests.age_golden("unknown"):gsub('"age_ineligible"', '"future_age_reason"')
@@ -7898,7 +7841,7 @@ function extra_tests.test_age_restart_keeps_declarations()
 	local restore = install_fake_sys_storage()
 	local client = granted_client({ app_id = "exposure-app" })
 	client:set_consent(true)
-	next_response_body = extra_tests.age_golden("adult")
+	next_response_body = extra_tests.served_age_golden()
 	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", { geo = "DE" })
 	client:shutdown()
 	storage.reset()
@@ -7921,7 +7864,7 @@ function extra_tests.test_age_restored_refusal_never_promoted()
 		local restore = install_fake_sys_storage()
 		local client = granted_client({ app_id = "exposure-app" })
 		client:set_consent(true)
-		next_response_body = extra_tests.age_golden("adult")
+		next_response_body = extra_tests.served_age_golden()
 		client:fetch_experiment_assignment("exposure-banner", { custom_attribute_age_band = "adult" })
 		client:shutdown()
 		local record = storage.load_experiments(client.config)
@@ -7984,7 +7927,7 @@ function extra_tests.test_restored_undeclared_client_id_assignment_is_not_served
 	for _ in pairs(relaunch.experiments.pending_exposure) do
 		armed = armed + 1
 	end
-	assert_equal(armed, 2, "only the two restored assignments arm an exposure")
+	assert_equal(armed, 0, "restoring assignments does not apply them")
 	assert_equal(#assignment_requests(), before, "the restore makes no request")
 
 	next_response_body = assignment_body({
@@ -8015,7 +7958,7 @@ function extra_tests.test_age_module_facade()
 	local cfg = config({ app_id = "exposure-app" })
 	assert(sdk.init(cfg))
 	sdk.set_consent(true)
-	next_response_body = extra_tests.age_golden("adult")
+	next_response_body = extra_tests.served_age_golden()
 	local result
 	assert(sdk.fetch_experiment_assignment_with_age_band("exposure-banner", "adult",
 		function(value) result = value end))
@@ -8104,7 +8047,7 @@ end
 
 -- The refused subject's server-minted fact key, as the golden fixtures carry it.
 function extra_tests.age_fact_key()
-	return json.decode(extra_tests.age_golden("adult")).subject_fact_key
+	return json.decode(extra_tests.served_age_golden()).subject_fact_key
 end
 
 -- The captured refusal for the admitted subject; another reason is swapped in
@@ -8205,7 +8148,7 @@ end
 function extra_tests.admit(client, experiment_key)
 	experiment_key = experiment_key or "exposure-banner"
 	if experiment_key == "exposure-banner" then
-		next_response_body = extra_tests.age_golden("adult")
+		next_response_body = extra_tests.served_age_golden()
 	else
 		next_response_body = assignment_body({
 			app_key = "exposure-app",
@@ -8213,10 +8156,14 @@ function extra_tests.admit(client, experiment_key)
 			subject_fact_key = extra_tests.age_fact_key(),
 		})
 	end
+	local served = json.decode(next_response_body)
+	served.served_revision, served.served_kill_gate, served.served_at = 7, false, "1970-01-01T00:16:40Z"
+	next_response_body = json.encode(served)
 	local result
 	client:fetch_experiment_assignment_with_age_band(experiment_key, "adult", nil,
 		function(value) result = value end)
 	assert_true(result and result.ok and result.assigned, "adult admission control: " .. experiment_key)
+	extra_tests.apply(client, experiment_key)
 end
 
 function extra_tests.refuse(client, reason)
@@ -8233,12 +8180,12 @@ end
 -- lands by explicit fetch or by the automatic revalidation.
 function extra_tests.owed_scene(reason, via_revalidation)
 	local client, restore = extra_tests.age_client({ buffer_size = 1 })
-	assert_true(client:track("filler-host-event"))
-	extra_tests.admit(client)
-	assert_nil(queued_events(client, "experiment_exposure")[1], "the full queue keeps the exposure owed")
-	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "one owed exposure")
+		extra_tests.admit(client)
 	assert_true(client:flush({ include_summaries = false }))
-	assert_true(client:track_outcome("exposure-banner", "score", 1), "an accepted outcome")
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1), "an accepted outcome")
+	assert_true(client:track_exposure("exposure-banner"))
+	client.experiments:sweep_owed(true)
+	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "the full queue keeps the extra exposure owed")
 	if via_revalidation then
 		client:update(0) -- arms the cadence
 		next_response_body = extra_tests.refusal_body(reason)
@@ -8259,14 +8206,14 @@ function extra_tests.assert_owed_withdrawn(via_revalidation)
 	local client, restore = extra_tests.owed_scene("age_ineligible", via_revalidation)
 	assert_nil(client:experiment_variant("exposure-banner"), path .. "nothing is served")
 	assert_nil(client.experiments.pending_exposure["exposure-banner"], path .. "no owed exposure")
-	assert_nil(client.experiments.pending_rearm["exposure-banner"], path .. "no re-arm intent")
+	assert_nil(client.experiments.applications["exposure-banner"], path .. "no re-arm intent")
 	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
 	assert_equal(exposures + outcomes, 0, path .. "no accepted fact stays queued")
 	exposures, outcomes = extra_tests.count_facts(client.spool_record, "exposure-banner")
 	assert_equal(exposures + outcomes, 0, path .. "the refusal spooled no copy")
 	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
 	assert_equal(exposures + outcomes, 0, path .. "the refusal wrote no durable copy")
-	local ok, err = client:track_outcome("exposure-banner", "score", 2)
+	local ok, err = extra_tests.outcome(client, "exposure-banner", "score", 2)
 	assert_equal(ok, false, path .. "a new outcome is refused")
 	assert_equal(err, "no_assignment", path .. "refused locally")
 
@@ -8323,8 +8270,9 @@ function extra_tests.test_age_refusal_leaves_nothing_to_replay()
 	-- persist() BEFORE the refusal: its durable copies must not replay.
 	client, restore = extra_tests.age_client()
 	extra_tests.admit(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
-	assert_true(client:session_start(), "a renewal owes the exposure again")
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
+	assert_true(client:session_start(), "a new session")
+	extra_tests.apply(client, "exposure-banner")
 	assert_true(client:track("host-before-persist"))
 	assert_true(client:persist())
 	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
@@ -8384,19 +8332,21 @@ function extra_tests.test_age_refusal_spares_other_experiment()
 	assert_true(client:session_start())
 	extra_tests.admit(client)
 	extra_tests.admit(client, "exposure-other")
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
-	assert_true(client:track_outcome("exposure-other", "score", 1))
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(client, "exposure-other", "score", 1))
 	assert_true(client:persist())
 	-- A renewal owes both exposures again, in memory.
 	assert_true(client:session_start())
+	assert_equal(client:apply_experiment_variant("exposure-banner"), "control")
+	assert_equal(client:apply_experiment_variant("exposure-other"), "treatment")
 	-- ANOTHER subject's exposure-banner application, as a subject re-mint
 	-- leaves it behind (an owed exposure and an accepted outcome under its own
 	-- fact key): not the refused subject's to withdraw.
-	client.experiments:arm_exposure("exposure-banner", {
-		version = 1, subject_key = "spcid_" .. string.rep("c", 32),
+	client.experiments:queue_application("exposure-banner", client.experiments:exposure_snapshot({
+		version = 1, version_wire = "1", served_revision_wire = "7", served_kill_gate = false, served_at = "1970-01-01T00:16:40Z", subject_key = "spcid_" .. string.rep("c", 32),
 		subject_fact_key = fixture_subject_fact_key, variant_key = "control",
 		assignment_unit = "client_id",
-	})
+	}))
 	assert_true(client:enqueue_event("experiment_outcome", {
 		experiment_key = "exposure-banner", experiment_version = 1,
 		assignment_key = fixture_subject_fact_key, variant_key = "control",
@@ -8441,7 +8391,7 @@ function extra_tests.test_age_refusal_filters_retained_batch()
 	assert_true(client:session_start())
 	extra_tests.admit(client)
 	extra_tests.admit(client, "exposure-other")
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
 	assert_true(client:track("filler-host-event"))
 	responder = extra_tests.batch_answer(503)
 	assert_true(not client:flush({ include_summaries = false }), "the 503 retains the batch")
@@ -8477,7 +8427,7 @@ function extra_tests.test_age_refusal_filters_restored_spool_chunks()
 	local first, restore = extra_tests.age_client()
 	assert_true(first:session_start())
 	extra_tests.admit(first)
-	assert_true(first:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(first, "exposure-banner", "score", 1))
 	assert_true(first:track("filler-host-event"))
 	responder = extra_tests.batch_answer(503)
 	assert_true(not first:flush({ include_summaries = false }))
@@ -8509,7 +8459,7 @@ function extra_tests.test_age_refusal_leaves_wire_batch_unrecalled()
 	local client, restore = extra_tests.age_client()
 	assert_true(client:session_start())
 	extra_tests.admit(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
 	assert_true(client:track("filler-host-event"))
 	local held = nil
 	responder = function(url, _, callback)
@@ -8574,8 +8524,8 @@ function extra_tests.test_age_refusal_withdraws_across_consent_transition()
 	assert_equal(#held, 1)
 	assert_true(client:set_consent(false))
 	assert_true(client:set_consent(true))
-	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1,
-		"the re-grant re-armed the live assignment's exposure")
+	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 0,
+		"the grant does not apply a variant while the declaration is pending")
 
 	-- The refusal answers across the transition: constructive half
 	-- suppressed, the withdrawal still lands.
@@ -8605,9 +8555,11 @@ function extra_tests.test_age_refusal_withdraws_on_stale_epoch()
 	assert_true(client:session_start())
 	extra_tests.admit(client)
 	extra_tests.admit(client, "exposure-other")
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
-	-- A renewal owes both exposures in memory; an ordinary latch keeps them.
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
+	-- Apply both variants again in the renewed session; an ordinary latch keeps their records.
 	assert_true(client:session_start())
+	assert_equal(client:apply_experiment_variant("exposure-banner"), "control")
+	assert_equal(client:apply_experiment_variant("exposure-other"), "treatment")
 	local held = {}
 	responder = function(url, _, callback)
 		if not url:find("experiment_key=exposure-banner", 1, true) then
@@ -8637,6 +8589,7 @@ function extra_tests.test_age_refusal_withdraws_on_stale_epoch()
 	assert_nil(record.entries["exposure-banner"], "the refused entry is dropped durably")
 	assert_true(record.entries["exposure-other"] ~= nil, "the latch retained the other record")
 
+	extra_tests.admit(client, "exposure-other") -- a new authorized fetch releases its apply latch
 	local from = #requests
 	client:update(0.016)
 	assert_true(client:flush({ include_summaries = false }))
@@ -8676,7 +8629,7 @@ function extra_tests.test_age_refusal_without_known_key_spares_other_subject()
 	-- leaves them behind: an accepted exposure and outcome, persisted, and an
 	-- owed exposure, all under that subject's own fact key.
 	local other = {
-		version = 1, subject_key = "spcid_" .. string.rep("c", 32),
+		version = 1, version_wire = "1", served_revision_wire = "7", served_kill_gate = false, served_at = "1970-01-01T00:16:40Z", subject_key = "spcid_" .. string.rep("c", 32),
 		subject_fact_key = fixture_subject_fact_key, variant_key = "control",
 		assignment_unit = "client_id",
 	}
@@ -8689,7 +8642,7 @@ function extra_tests.test_age_refusal_without_known_key_spares_other_subject()
 	props.outcome_key, props.outcome_value = "score", 7
 	assert_true(client:enqueue_event("experiment_outcome", props, nil, { omit_user_id = true }))
 	assert_true(client:persist())
-	client.experiments:arm_exposure("exposure-banner", other)
+	client.experiments:queue_application("exposure-banner", client.experiments:exposure_snapshot(other))
 	-- The refused subject holds no assignment of the experiment and owes
 	-- nothing for it, and the refusal names no fact key: none is known.
 	assert_nil(client.experiments.entries["exposure-banner"], "no local assignment supplies a key")
@@ -8804,9 +8757,7 @@ function extra_tests.test_age_readmission_kill_capture_keeps_fresh_id()
 		end
 	end
 	assert_equal(#captured, 1, "the old batch's acknowledgment left the drop-time capture")
-	local subject = client.experiments:current_subject_id()
-	assert_equal(captured[1], experiments.exposure_event_id(client.experiments.session_marker,
-		subject, "exposure-banner", 1, 1), "the capture carries the readmission's fresh id")
+	assert_true(captured[1] ~= withdrawn.event_id, "the capture keeps the readmission's fresh ID")
 
 	storage.reset() -- SIMULATED PROCESS DEATH
 	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
@@ -8838,9 +8789,10 @@ function extra_tests.test_age_refusal_withdraws_restored_entry_without_subject_k
 	assert_true(storage.save_experiments(first.config, record))
 	storage.reset() -- SIMULATED PROCESS DEATH
 	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	assert_equal(second:apply_experiment_variant("exposure-banner"), "control")
 	local owed = second.experiments.pending_exposure["exposure-banner"]
 	assert_true(owed ~= nil and #owed == 1, "the restore owes the exposure")
-	assert_nil(owed[1].entry.subject_key, "under an entry without a subject key")
+	assert_equal(owed[1].entry.subject_key, second.experiments:current_subject_id(), "restore fills the scoped subject before application")
 
 	extra_tests.refuse(second, "age_ineligible")
 	assert_nil(second.experiments.pending_exposure["exposure-banner"], "the refusal withdrew the restored exposure")
@@ -8867,7 +8819,9 @@ function extra_tests.test_age_refusal_withdraws_restored_entry_without_subject_k
 	storage.reset() -- SIMULATED PROCESS DEATH
 	second = assert(sdk.new(config({ app_id = "exposure-app", buffer_size = 1 })))
 	assert_true(second:track("filler-host-event"))
+	assert_equal(second:apply_experiment_variant("exposure-banner"), "control")
 	extra_tests.admit(second)
+	assert_true(second:track_exposure("exposure-banner"))
 	owed = second.experiments.pending_exposure["exposure-banner"]
 	assert_true(owed ~= nil and #owed == 2 and owed[1].entry.subject_key == nil, "both applications are owed")
 	extra_tests.refuse(second, "age_ineligible")
@@ -8892,14 +8846,16 @@ extra_tests.republished_fact_key = "sfk1_" .. string.rep("d", 64)
 -- The subject is admitted to version 2 of exposure-banner: the server
 -- republished the experiment and rotated the subject's fact key.
 function extra_tests.admit_republished(client)
-	next_response_body = extra_tests.age_golden("adult")
-		:gsub('"version":1,', '"version":2,', 1)
-		:gsub(extra_tests.age_fact_key(), extra_tests.republished_fact_key, 1)
+	local served = json.decode(extra_tests.served_age_golden())
+	served.version, served.subject_fact_key = 2, extra_tests.republished_fact_key
+	served.served_revision, served.served_kill_gate, served.served_at = 8, false, "1970-01-01T00:16:40Z"
+	next_response_body = json.encode(served)
 	local result
 	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
 		function(value) result = value end)
 	assert_true(result and result.ok and result.assigned and result.version == 2,
 		"republished admission control")
+	extra_tests.apply(client, "exposure-banner")
 end
 
 -- The age refusal of `version`, echoing `fact_key`, or no fact key at all
@@ -8967,12 +8923,12 @@ function extra_tests.test_age_refusal_withdraws_republished_facts_in_process()
 	local client, restore = extra_tests.age_client()
 	assert_true(client:session_start())
 	extra_tests.admit(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
 	assert_true(client:persist())
 	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner", key_a)
 	assert_true(exposures == 1 and outcomes == 1, "version 1's facts are spooled under A")
 	extra_tests.admit_republished(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 2))
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 2))
 	exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", key_b)
 	assert_true(exposures == 1 and outcomes == 1, "version 2's facts are queued under B")
 
@@ -8998,7 +8954,7 @@ function extra_tests.test_age_refusal_withdraws_republished_facts_after_relaunch
 	local first, restore = extra_tests.age_client()
 	assert_true(first:session_start())
 	extra_tests.admit(first)
-	assert_true(first:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(first, "exposure-banner", "score", 1))
 	assert_true(first:persist())
 	storage.reset() -- SIMULATED PROCESS DEATH: version 1's facts are spooled under A
 
@@ -9008,7 +8964,7 @@ function extra_tests.test_age_refusal_withdraws_republished_facts_after_relaunch
 	assert_equal(second:experiment_variant("exposure-banner"), "control", "version 1's entry restored")
 	assert_true(second:session_start())
 	extra_tests.admit_republished(second)
-	assert_true(second:track_outcome("exposure-banner", "score", 2))
+	assert_true(extra_tests.outcome(second, "exposure-banner", "score", 2))
 	second:persist()
 	storage.reset() -- SIMULATED PROCESS DEATH: A's and B's facts are spooled
 
@@ -9036,7 +8992,7 @@ function extra_tests.test_fact_key_history_prunes_after_the_last_fact()
 		local client, restore = extra_tests.age_client()
 		assert_true(client:session_start())
 		extra_tests.admit(client)
-		assert_true(client:track_outcome("exposure-banner", "score", 1))
+		assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
 		assert_true(client:persist())
 		extra_tests.admit_republished(client)
 		assert_equal(extra_tests.memory_history(client, "exposure-banner"), key_a,
@@ -9079,7 +9035,7 @@ function extra_tests.test_fact_key_history_keeps_a_spooled_key_across_relaunch()
 	local client, restore = extra_tests.age_client()
 	assert_true(client:session_start())
 	extra_tests.admit(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
 	responder = extra_tests.batch_answer(503)
 	assert_true(not client:flush({ include_summaries = false }), "the 503 retains the batch")
 	responder = nil
@@ -9170,7 +9126,7 @@ function extra_tests.test_record_without_fact_key_history_loads()
 	local client = assert(sdk.new(config()))
 	assert_equal(client:experiment_variant("exp-checkout"), "treatment", "the old record serves as before")
 	assert_equal(client:experiment_payload("exp-checkout").color, "blue", "with its payload")
-	assert_equal(extra_tests.owed_count(client, "exp-checkout"), 1, "and re-arms its exposure")
+	assert_equal(extra_tests.owed_count(client, "exp-checkout"), 0, "restoration does not apply the variant")
 	local record = storage.load_experiments(client.config)
 	local loaded = record and record.fact_key_history
 	print(("fact-key history old-record scene: variant=%s history=%s"):format(
@@ -9235,11 +9191,11 @@ end
 -- failed batch frees the room. From here on nothing but the fact-key
 -- history remembers the subject's key.
 function extra_tests.kill_and_emit_owed(client)
-	assert_true(client:track("filler-host-event"))
-	extra_tests.admit(client)
-	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "the full queue keeps the exposure owed")
+		extra_tests.admit(client)
 	assert_true(client:flush({ include_summaries = false }))
-	assert_true(client:track_outcome("exposure-banner", "score", 1), "an accepted outcome")
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1), "an accepted outcome")
+	assert_true(client:track_exposure("exposure-banner"))
+	client.experiments:sweep_owed(true)
 	extra_tests.refuse(client, "kill_switch")
 	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "the owed exposure survives the kill")
 	assert_equal((extra_tests.disk_facts(client, "exposure-banner")), 1, "the kill captured it durably")
@@ -9311,7 +9267,7 @@ function extra_tests.test_fact_key_retired_when_its_entry_never_reached_disk()
 	-- Version 1's entry write fails: the disk never holds A.
 	state.fail_save = fail_experiment_saves
 	extra_tests.admit(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
 	client:persist()
 	state.fail_save = nil
 	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner", key_a)
@@ -9344,7 +9300,7 @@ function extra_tests.test_fact_key_retired_by_dropping_an_unwritten_entry_surviv
 	assert_true(client:session_start())
 	state.fail_save = fail_experiment_saves
 	extra_tests.admit(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
 	client:persist()
 	state.fail_save = nil
 	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner", key_a)
@@ -9379,7 +9335,7 @@ function extra_tests.test_restored_key_retires_when_the_disk_no_longer_shows_it(
 	local first, restore = extra_tests.age_client()
 	assert_true(first:session_start())
 	extra_tests.admit(first)
-	assert_true(first:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(first, "exposure-banner", "score", 1))
 	assert_true(first:persist())
 	storage.reset() -- SIMULATED PROCESS DEATH: version 1's facts are spooled under A
 
@@ -9426,7 +9382,7 @@ function extra_tests.test_cap_evicted_entry_key_survives_relaunch()
 	local client, restore = extra_tests.age_client()
 	assert_true(client:session_start())
 	extra_tests.admit(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
 	assert_true(client:persist())
 	local blob = {}
 	for i = 1, 26000 do
@@ -9496,7 +9452,7 @@ function extra_tests.applied_scene(overrides)
 	local client, restore = extra_tests.age_client(overrides)
 	assert_true(client:session_start())
 	extra_tests.admit(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1), "setup: an accepted outcome")
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1), "setup: an accepted outcome")
 	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
 	assert_true(exposures == 1 and outcomes == 1, "setup: the exposure and the outcome are owed")
 	return client, restore
@@ -9566,7 +9522,7 @@ function extra_tests.assert_declaration_withdrew(client, check, dropped, withdra
 	local ok, err = client:track_exposure(key)
 	check(not ok and err == "no_assignment",
 		"stop serving: track_exposure answered " .. tostring(ok) .. "/" .. tostring(err) .. ", want no_assignment")
-	ok, err = client:track_outcome(key, "score", 2)
+	ok, err = extra_tests.outcome(client, key, "score", 2)
 	check(not ok and err == "no_assignment",
 		"stop serving: a new outcome answered " .. tostring(ok) .. "/" .. tostring(err) .. ", want no_assignment")
 	check(#client.queue.items == queued,
@@ -9685,7 +9641,7 @@ end
 function extra_tests.test_age_unconfirmed_declaration_spares_other_experiment()
 	local client, restore = extra_tests.applied_scene()
 	extra_tests.admit(client, "exposure-other")
-	assert_true(client:track_outcome("exposure-other", "score", 1), "setup: the other experiment's outcome")
+	assert_true(extra_tests.outcome(client, "exposure-other", "score", 1), "setup: the other experiment's outcome")
 	extra_tests.declare_unconfirmed(client)
 	next_status = 200
 	local check, verify = extra_tests.checklist()
@@ -9755,7 +9711,8 @@ function extra_tests.test_age_declaration_in_flight_stops_serving_until_answered
 			check_all(ok, reason .. ": " .. message)
 		end
 		local client, restore = extra_tests.applied_scene()
-		assert_true(client:session_start(), "setup: a renewal owes the exposure again")
+		assert_true(client:session_start(), "setup: a new session")
+		assert_equal(client:apply_experiment_variant("exposure-banner"), "control")
 		assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "setup: the renewal's exposure is owed")
 		local dropped = client.stats.dropped
 		local held = {}
@@ -9778,7 +9735,7 @@ function extra_tests.test_age_declaration_in_flight_stops_serving_until_answered
 		local ok, err = client:track_exposure("exposure-banner")
 		check(not ok and err == "no_assignment", "stop serving: track_exposure answered "
 			.. tostring(ok) .. "/" .. tostring(err) .. " while in flight")
-		ok, err = client:track_outcome("exposure-banner", "score", 3)
+		ok, err = extra_tests.outcome(client, "exposure-banner", "score", 3)
 		check(not ok and err == "no_assignment", "stop serving: an outcome answered "
 			.. tostring(ok) .. "/" .. tostring(err) .. " while in flight")
 		check(#client.queue.items == queued, "stop serving: " .. (#client.queue.items - queued)
@@ -9845,7 +9802,7 @@ function extra_tests.test_age_declaration_in_flight_at_shutdown_withdraws()
 	check(exposures + outcomes == 0, (exposures + outcomes) .. " fact(s) of the declared experiment left on disk")
 	check(extra_tests.durable_entry(client, "exposure-banner") == nil,
 		"the adult assignment is still in the durable record")
-	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	held[1](nil, nil, { status = 200, response = extra_tests.served_age_golden() })
 	storage.reset() -- relaunch
 	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
 	check(relaunch:experiment_variant("exposure-banner") == nil, "the relaunch serves the declared experiment")
@@ -9877,7 +9834,7 @@ function extra_tests.test_age_declaration_in_flight_is_not_revalidated()
 	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
 	assert_equal(#held, 1, "setup: the declaration is in flight")
 	local from = #assignment_requests()
-	next_response_body = extra_tests.age_golden("adult")
+	next_response_body = extra_tests.served_age_golden()
 	advance_seconds(1000)
 	client:update(0.016)
 	responder = nil
@@ -9946,7 +9903,7 @@ function extra_tests.test_age_adult_revalidation_in_flight_loses_to_unconfirmed_
 	extra_tests.declare_unconfirmed(client)
 	responder = nil
 	local from = #assignment_requests()
-	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	held[1](nil, nil, { status = 200, response = extra_tests.served_age_golden() })
 	local check, verify = extra_tests.checklist()
 	check(client:experiment_variant("exposure-banner") == nil, "no stale re-send: the in-flight adult revalidation reinstalled "
 		.. tostring(client:experiment_variant("exposure-banner")))
@@ -9985,10 +9942,10 @@ function extra_tests.test_age_adult_answer_lands_while_declaration_pending()
 	local from = #assignment_requests()
 	local dropped = client.stats.dropped
 	local check, verify = extra_tests.checklist()
-	held[2](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	held[2](nil, nil, { status = 200, response = extra_tests.served_age_golden() })
 	check(newer ~= nil and not newer.ok and not newer.assigned, "the adult caller answered while the declaration "
 		.. "is pending received " .. tostring(newer and newer.variant_key))
-	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	held[1](nil, nil, { status = 200, response = extra_tests.served_age_golden() })
 	check(older ~= nil and not older.ok and not older.assigned, "the superseded adult caller received "
 		.. tostring(older and older.variant_key))
 	check(client:experiment_variant("exposure-banner") == nil, "stop serving: "
@@ -10008,14 +9965,15 @@ end
 function extra_tests.test_age_declaration_own_cache_serve_is_withdrawn()
 	local client, restore = extra_tests.age_client()
 	assert_true(client:session_start())
-	next_response_body = extra_tests.age_golden("adult")
+	next_response_body = extra_tests.served_age_golden()
 	local result
 	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
 		function(value) result = value end)
 	assert_true(result ~= nil and result.assigned and not result.from_cache,
 		"setup: the stub assigned the under_threshold request")
+	extra_tests.apply(client, "exposure-banner")
 	client:update(0.016)
-	assert_true(client:track_outcome("exposure-banner", "score", 1), "setup: an accepted outcome")
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1), "setup: an accepted outcome")
 	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
 	assert_true(exposures == 1 and outcomes == 1, "setup: the exposure and the outcome are owed")
 	local dropped = client.stats.dropped
@@ -10038,7 +9996,7 @@ end
 function extra_tests.test_age_declaration_leaves_synthetic_assignment()
 	local client, restore = extra_tests.age_client()
 	assert_true(client:session_start())
-	local synthetic = extra_tests.age_golden("adult"):gsub('"assignment_unit":"client_id"',
+	local synthetic = extra_tests.served_age_golden():gsub('"assignment_unit":"client_id"',
 		'"assignment_unit":"synthetic_subject_key"', 1)
 	assert_true(synthetic:find('"assignment_unit":"synthetic_subject_key"', 1, true) ~= nil,
 		"setup: a synthetic-subject body")
@@ -10136,14 +10094,14 @@ function extra_tests.test_age_declaration_blocks_stale_grammar_retry()
 		.. " declaring adult while the declaration was pending")
 	held[2](nil, nil, { status = 503, response = extra_tests.unavailable_body })
 	for i = 3, #held do
-		held[i](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+		held[i](nil, nil, { status = 200, response = extra_tests.served_age_golden() })
 	end
 	responder = nil
 	check(client:experiment_variant("exposure-banner") == nil, "stop serving: "
 		.. tostring(client:experiment_variant("exposure-banner")) .. " served after the declaration failed")
-	local ok, err = client:track_outcome("exposure-banner", "score", 2)
+	local ok, err = extra_tests.outcome(client, "exposure-banner", "score", 2)
 	check(not ok and err == "no_assignment", "a new outcome answered " .. tostring(ok) .. "/" .. tostring(err))
-	next_response_body = extra_tests.age_golden("adult")
+	next_response_body = extra_tests.served_age_golden()
 	for _ = 1, 2 do
 		advance_seconds(1000)
 		client:update(0.016)
@@ -10170,15 +10128,11 @@ end
 -- drops its subject-fact key (the usual synthetic shape), `version` replaces
 -- its experiment version.
 function extra_tests.synthetic_body(fact_key, version)
-	local body = extra_tests.age_golden("adult"):gsub('"assignment_unit":"client_id"',
-		'"assignment_unit":"synthetic_subject_key"', 1)
-	if fact_key == false then
-		body = body:gsub('"subject_fact_key":"[^"]*",', "", 1)
-	end
-	if version then
-		body = body:gsub('"version":1,', '"version":' .. version .. ",", 1)
-	end
-	return body
+	local body = json.decode(extra_tests.served_age_golden())
+	body.boundary.assignment_unit = "synthetic_subject_key"
+	if fact_key == false then body.subject_fact_key = nil end
+	if version then body.version = version end
+	return json.encode(body)
 end
 
 -- A synthetic-subject assignment kept by an unanswered declaration does not
@@ -10204,7 +10158,7 @@ function extra_tests.test_age_unanswered_declaration_keeping_synthetic_still_fen
 	responder = nil
 	assert_equal(#held, 2, "setup: the adult fetch and the declaration are in flight")
 	held[2](nil, nil, { status = 503, response = extra_tests.unavailable_body })
-	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("adult")
+	held[1](nil, nil, { status = 200, response = extra_tests.served_age_golden()
 		:gsub('"variant_key":"control"', '"variant_key":"client-id-variant"', 1) })
 	local check, verify = extra_tests.checklist()
 	check(client:experiment_variant("exposure-banner") ~= "client-id-variant",
@@ -10228,7 +10182,7 @@ function extra_tests.test_age_unanswered_declaration_withdraws_client_id_beneath
 	extra_tests.admit(client)
 	assert_equal(extra_tests.owed_count(client, "exposure-banner"), 1, "setup: the client-id exposure is owed")
 	assert_true(client:flush({ include_summaries = false }))
-	assert_true(client:track_outcome("exposure-banner", "score", 1), "setup: an accepted client-id outcome")
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1), "setup: an accepted client-id outcome")
 	-- A republished version, so its application is not the owed client-id one.
 	next_response_body = extra_tests.synthetic_body(false, 2)
 	local result
@@ -10254,7 +10208,7 @@ function extra_tests.test_age_unanswered_declaration_withdraws_client_id_beneath
 	responder = nil
 	assert_equal(#held, 1, "setup: the declaration is in flight")
 	local check, verify = extra_tests.checklist()
-	local ok, err = client:track_outcome("exposure-banner", "score", 3)
+	local ok, err = extra_tests.outcome(client, "exposure-banner", "score", 3)
 	check(not ok, "an outcome was recorded while the declaration was pending (" .. tostring(err) .. ")")
 	held[1](nil, nil, { status = 503, response = extra_tests.unavailable_body })
 	local fact_key = extra_tests.age_fact_key()
@@ -10273,7 +10227,7 @@ function extra_tests.test_age_unanswered_declaration_withdraws_client_id_beneath
 			own = own + 1
 		end
 	end
-	check(own == 1, "the kept synthetic assignment's own owed application was withdrawn (" .. own .. " left)")
+	check(own == 0, "fetching the synthetic assignment must not record an application")
 	local from = #requests
 	for _ = 1, 2 do
 		client:update(0.016)
@@ -10298,7 +10252,7 @@ function extra_tests.test_age_unanswered_declaration_keeping_synthetic_withdraws
 	local client, restore = extra_tests.age_client()
 	assert_true(client:session_start())
 	extra_tests.admit(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1), "setup: an accepted client-id outcome")
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1), "setup: an accepted client-id outcome")
 	local fact_key = extra_tests.age_fact_key()
 	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", fact_key)
 	assert_true(exposures == 1 and outcomes == 1, "setup: the client-id exposure and outcome are queued, got "
@@ -10347,10 +10301,11 @@ function extra_tests.test_age_unanswered_declaration_keeping_synthetic_reopens_c
 	extra_tests.declare_unconfirmed(client)
 	assert_equal(client:experiment_variant("exposure-banner"), "control", "setup: the synthetic assignment is kept")
 	next_status = 200
-	next_response_body = extra_tests.age_golden("adult")
+	next_response_body = extra_tests.served_age_golden()
 	result = nil
 	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
 		function(value) result = value end)
+	extra_tests.apply(client, "exposure-banner")
 	local check, verify = extra_tests.checklist()
 	check(result ~= nil and result.assigned and not result.from_cache, "the adult re-admission must install")
 	local fresh = 0
@@ -10381,6 +10336,7 @@ function extra_tests.test_age_declaration_pending_refuses_synthetic_keyed_outcom
 	assert_true(result ~= nil and result.assigned, "setup: the synthetic assignment is assigned")
 	assert_equal(client.experiments.entries["exposure-banner"].subject_fact_key, extra_tests.age_fact_key(),
 		"setup: the synthetic entry carries the server fact key")
+	extra_tests.apply(client, "exposure-banner")
 	local held = {}
 	responder = function(url, _, callback)
 		if url:find("/runtime/experiments/assignment", 1, true) then
@@ -10394,14 +10350,14 @@ function extra_tests.test_age_declaration_pending_refuses_synthetic_keyed_outcom
 	assert_equal(#held, 1, "setup: the declaration is in flight")
 	local check, verify = extra_tests.checklist()
 	local queued = #client.queue.items
-	local ok, err = client:track_outcome("exposure-banner", "score", 3)
+	local ok, err = extra_tests.outcome(client, "exposure-banner", "score", 3)
 	check(not ok and err == "no_assignment", "an outcome was recorded under the synthetic fact key while the "
 		.. "declaration was pending (" .. tostring(ok) .. "/" .. tostring(err) .. ")")
 	check(#client.queue.items == queued, (#client.queue.items - queued) .. " fact(s) recorded while pending")
 	check(client:experiment_variant("exposure-banner") == "control", "the synthetic assignment must keep serving")
 	held[1](nil, nil, { status = 503, response = extra_tests.unavailable_body })
 	check(client:experiment_variant("exposure-banner") == "control", "the synthetic assignment must be kept")
-	ok = client:track_outcome("exposure-banner", "score", 4)
+	ok = extra_tests.outcome(client, "exposure-banner", "score", 4)
 	check(ok == true, "the kept synthetic assignment must record outcomes again")
 	verify("synthetic keyed outcome")
 	client:shutdown()
@@ -10425,7 +10381,7 @@ function extra_tests.test_age_declaration_answered_by_its_grammar_retry()
 				error = "experiment metadata must use synthetic local-safe identifiers only",
 			}) })
 		else
-			callback(nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+			callback(nil, nil, { status = 200, response = extra_tests.served_age_golden() })
 		end
 		return true
 	end
@@ -10455,11 +10411,12 @@ function extra_tests.test_age_adult_declaration_after_unconfirmed_one_is_new_app
 	assert_true(withdrawn ~= nil, "setup: the first application's exposure is queued")
 	extra_tests.declare_unconfirmed(client)
 	next_status = 200
-	next_response_body = extra_tests.age_golden("adult")
+	next_response_body = extra_tests.served_age_golden()
 	local before = #assignment_requests()
 	local result
 	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
 		function(value) result = value end)
+	extra_tests.apply(client, "exposure-banner")
 	local check, verify = extra_tests.checklist()
 	check(result ~= nil and result.assigned and not result.from_cache,
 		"the adult re-declaration must be decided by a new fetch")
@@ -10496,7 +10453,7 @@ function extra_tests.test_age_declaration_under_refused_consent_withdraws()
 	assert_true(ok == false and err == "consent_denied", "setup: the declaration is refused before the wire")
 	assert_true(client:set_consent(true))
 	local check, verify = extra_tests.checklist()
-	check(client.experiments.pending_rearm["exposure-banner"] == nil, "withdraw: the re-grant re-arms the exposure")
+	check(client.experiments.applications["exposure-banner"] == nil, "withdraw: the re-grant re-arms the exposure")
 	extra_tests.assert_declaration_withdrew(client, check, nil, nil, 1)
 	verify("refused consent")
 	client:shutdown()
@@ -10533,7 +10490,7 @@ function extra_tests.test_age_forced_minor_floor_closed_for_adult_declaration()
 	assert_nil(client:experiment_variant("exposure-banner"), "cached: the forced-minor floor served")
 	ok, err = client:track_exposure("exposure-banner")
 	assert_true(ok == false and err == "consent_denied", "cached: the forced-minor floor applied")
-	ok, err = client:track_outcome("exposure-banner", "score", 1)
+	ok, err = extra_tests.outcome(client, "exposure-banner", "score", 1)
 	assert_true(ok == false and err == "consent_denied", "cached: the forced-minor floor recorded an outcome")
 	local from = #requests
 	advance_seconds(1000)
@@ -10572,7 +10529,7 @@ function extra_tests.test_age_adult_answer_in_flight_loses_to_later_refusal()
 		function(value) refused = value end)
 	responder = nil
 	assert_equal(refused and refused.reason, "age_ineligible", "setup: the refusal lands")
-	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	held[1](nil, nil, { status = 200, response = extra_tests.served_age_golden() })
 	assert_true(late ~= nil and not late.assigned, "the superseded adult caller received a variant")
 	assert_nil(client:experiment_variant("exposure-banner"), "the late adult response reinstalled the assignment")
 	assert_nil(extra_tests.durable_entry(client, "exposure-banner"), "the late adult response persisted the assignment")
@@ -10609,7 +10566,7 @@ function extra_tests.test_age_revalidation_in_flight_loses_to_later_refusal()
 		function(value) refused = value end)
 	responder = nil
 	assert_equal(refused and refused.reason, "age_ineligible", "setup: the refusal lands")
-	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("adult") })
+	held[1](nil, nil, { status = 200, response = extra_tests.served_age_golden() })
 	assert_nil(client:experiment_variant("exposure-banner"), "the in-flight revalidation reinstalled the assignment")
 	assert_nil(extra_tests.durable_entry(client, "exposure-banner"), "the in-flight revalidation persisted the assignment")
 	client:shutdown()
@@ -10656,7 +10613,7 @@ function extra_tests.spooled_debt_scene()
 	client:set_consent(true)
 	assert_true(client:session_start())
 	extra_tests.admit(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1), "setup: an accepted outcome")
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1), "setup: an accepted outcome")
 	responder = extra_tests.batch_answer(503)
 	assert_true(not client:flush({ include_summaries = false }), "setup: the 503 spools the batch")
 	responder = nil
@@ -10966,7 +10923,7 @@ function extra_tests.test_failed_history_save_of_a_dropped_unwritten_entry_is_ow
 	assert_true(client:session_start())
 	state.fail_save = fail_experiment_saves
 	extra_tests.admit(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
 	client:persist()
 	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner", key_a)
 	assert_true(exposures == 1 and outcomes == 1, "setup: A's facts are spooled")
@@ -11003,7 +10960,7 @@ function extra_tests.test_declaration_end_after_auth_latch_withdraws_by_captured
 	assert_true(client:session_start())
 	state.fail_save = fail_experiment_saves
 	extra_tests.admit(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
 	state.fail_save = nil
 	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
 	assert_true(exposures == 1 and outcomes == 1, "setup: the facts are queued")
@@ -11039,7 +10996,7 @@ function extra_tests.test_declaration_end_after_auth_latch_withdraws_under_an_ol
 	assert_true(client:flush({ include_summaries = false }), "setup: A's exposure delivers")
 	state.fail_save = fail_experiment_saves
 	extra_tests.admit_republished(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
 	state.fail_save = nil
 	local stored = extra_tests.durable_entry(client, "exposure-banner")
 	assert_true(stored and stored.subject_fact_key == key_a, "setup: the record holds A's entry")
@@ -11068,7 +11025,7 @@ function extra_tests.test_declaration_end_after_remint_keeps_the_retired_subject
 	local client, restore = extra_tests.age_client()
 	assert_true(client:session_start())
 	extra_tests.admit(client)
-	assert_true(client:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
 	local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner")
 	assert_true(exposures == 1 and outcomes == 1, "setup: the facts are queued")
 	local answers = 0
@@ -11117,7 +11074,7 @@ function extra_tests.spool_with_deadline(with_host, spool_max_events)
 	local first, restore = extra_tests.age_client()
 	assert_true(first:session_start())
 	extra_tests.admit(first)
-	assert_true(first:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(first, "exposure-banner", "score", 1))
 	assert_true(first:track("filler-host-event"))
 	responder = extra_tests.batch_answer(503)
 	assert_true(not first:flush({ include_summaries = false }))
@@ -11202,7 +11159,7 @@ function extra_tests.test_age_refusal_keeps_a_retained_batchs_deadline()
 	assert_true(first:flush({ include_summaries = false }))
 	assert_true(first:track("filler-host-event"))
 	extra_tests.admit(first)
-	assert_true(first:track_outcome("exposure-banner", "score", 1))
+	assert_true(extra_tests.outcome(first, "exposure-banner", "score", 1))
 	responder = extra_tests.batch_answer(503)
 	assert_true(not first:flush({ include_summaries = false }))
 	responder = nil
@@ -11296,53 +11253,33 @@ function extra_tests.test_sentinel_clears_the_deadline_of_a_record_without_resto
 	end)
 end
 
--- ── retired exposure arms (#124) ─────────────────────────────────────────────
---
--- An age withdrawal retires the withdrawn tuple's arms under the session
--- marker, so a re-admission is exposed under a fresh id. Once the marker has
--- rotated and no owed snapshot carries it, nothing reads the entry.
-
-function extra_tests.retired_arm_count(client)
-	local count = 0
-	for _ in pairs(client.experiments.retired_arms) do
-		count = count + 1
-	end
-	return count
-end
-
-function extra_tests.test_retired_arms_stay_bounded_across_renewals()
+-- Session changes release the last application and deduplication state.
+function extra_tests.test_application_state_stays_bounded_across_renewals()
 	local client, restore = extra_tests.age_client()
 	for _ = 1, 5 do
 		assert_true(client:session_start())
 		extra_tests.admit(client)
-		assert_equal(#queued_events(client, "experiment_exposure"), 1, "setup: the session's exposure is queued")
+		assert_true(next(client.experiments.applications) ~= nil)
 		extra_tests.refuse(client, "age_ineligible")
-		assert_equal(#queued_events(client, "experiment_exposure"), 0, "setup: the refusal withdrew it")
+		assert_nil(next(client.experiments.applications))
 	end
 	assert_true(client:session_start())
-	local observed = "retired arms after 5 renewed sessions=" .. extra_tests.retired_arm_count(client)
-	print("  retired-arms scene, renewals: " .. observed)
-	assert_equal(observed, "retired arms after 5 renewed sessions=0", "retired arms of rotated markers")
+	assert_nil(next(client.experiments.exposed))
 	client:shutdown()
 	restore()
 	storage.reset()
 end
 
-function extra_tests.test_retired_arms_leave_with_an_ended_session()
+function extra_tests.test_application_state_leaves_with_an_ended_session()
 	local client, restore = extra_tests.age_client()
-	local counts = {}
 	for _ = 1, 3 do
 		assert_true(client:session_start())
-		local before = extra_tests.retired_arm_count(client)
 		extra_tests.admit(client)
-		extra_tests.refuse(client, "age_ineligible")
-		assert_equal(extra_tests.retired_arm_count(client), before + 1, "setup: the withdrawal retired the tuple's arm")
+		assert_true(next(client.experiments.applications) ~= nil)
 		assert_true(client:session_end())
-		counts[#counts + 1] = tostring(extra_tests.retired_arm_count(client))
+		assert_nil(next(client.experiments.applications))
+		assert_nil(next(client.experiments.exposed))
 	end
-	local observed = "retired arms after each end=" .. table.concat(counts, ",")
-	print("  retired-arms scene, ended sessions: " .. observed)
-	assert_equal(observed, "retired arms after each end=0,0,0", "retired arms of ended sessions")
 	client:shutdown()
 	restore()
 	storage.reset()
@@ -11350,7 +11287,7 @@ end
 
 -- Control: a re-admission's exposure still owed across a renewal keeps the
 -- fresh arm its marker's entry gives it, so its id is not the withdrawn one.
-function extra_tests.test_retired_arm_of_an_owed_readmission_survives_a_renewal()
+function extra_tests.test_owed_readmission_keeps_its_id_across_renewal()
 	-- A replacement now needs room for both its end and start. Fill both
 	-- slots so the exposure remains owed across the same renewal as before.
 	local client, restore = extra_tests.age_client({ buffer_size = 2 })
@@ -11388,62 +11325,13 @@ function extra_tests.test_retired_arm_of_an_owed_readmission_survives_a_renewal(
 	storage.reset()
 end
 
-function extra_tests.test_exposure_uuid_version_bits()
-	for arm = 0, 63 do
-		local value = experiments.exposure_event_id("marker", "spcid_" .. string.rep("f", 32), "exp", 3, arm)
-		assert_equal(value:sub(15, 15), "5", "exposure UUID version bits")
-	end
-end
-
-function extra_tests.test_exposure_uuid_variant_bits()
-	for arm = 0, 63 do
-		local value = experiments.exposure_event_id("marker", "spcid_" .. string.rep("f", 32), "exp", 3, arm)
-		assert_match(value:sub(20, 20), "^[89ab]$", "exposure UUID RFC variant bits")
-	end
-end
-
-function extra_tests.test_exposure_uuid_golden_vectors()
-	for index, row in ipairs(require "test.fixtures.exposure_uuid5") do
-		assert_equal(experiments.exposure_event_id(row[1], row[2], row[3], row[4], row[5]),
-			row[6], "Python uuid.uuid5 known answer " .. index)
-	end
-end
-
-function extra_tests.test_exposure_sha1_known_answers()
-	-- Independent hashlib.sha1 digests include both sides of the padding boundary.
-	local sha1 = require "shardpilot.sha1"
-	local vectors = {
-		{ "", "da39a3ee5e6b4b0d3255bfef95601890afd80709" },
-		{ "abc", "a9993e364706816aba3e25717850c26c9cd0d89d" },
-		{ "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", "84983e441c3bd26ebaae4aa1f95129e5e54670f1" },
-		{ string.rep("a", 55), "c1c8bbdc22796e28c0e15163d20899b65621d65a" },
-		{ string.rep("a", 56), "c2db330f6083854c99d4b5bfb6e8f29f201be699" },
-		{ string.rep("a", 63), "03f09f5b158a7a8cdad920bddc29b81c18a551f5" },
-		{ string.rep("a", 64), "0098ba824b5c16427bd7a1122a5a442a25ec644d" },
-		{ string.rep("a", 65), "11655326c708d70319be2610e8a57d9a5b959d3b" },
-		{ string.rep("a", 1000), "291e9a6c66994949b57ba5e650361e98fc36b1ba" },
-	}
-	for index, row in ipairs(vectors) do
-		assert_equal(sha1.hex(row[1]), row[2], "SHA-1 known answer " .. index)
-	end
-end
-
-function extra_tests.test_exposure_uuid_reload_is_stable()
-	local before = experiments.exposure_event_id("marker", "subject", "experiment", 1, 7)
-	local loaded = package.loaded["shardpilot.experiments"]
-	package.loaded["shardpilot.experiments"] = nil
-	local reloaded = require "shardpilot.experiments"
-	package.loaded["shardpilot.experiments"] = loaded
-	assert_equal(reloaded.exposure_event_id("marker", "subject", "experiment", 1, 7),
-		before, "namespace and canonical tuple are stable across module reloads")
-end
-
-function extra_tests.test_exposure_uuid_wire_and_retry()
+function extra_tests.test_signed_exposure_wire_and_retry()
 	reset()
 	local client = granted_client()
 	next_response_body = assignment_body()
-	assert_true(fetch(client, "exp-checkout").ok)
+	assert_true(extra_tests.fetch_apply(client, "exp-checkout").ok)
 	assert_true(client:track_exposure("exp-checkout"))
+	client.experiments:tick(0)
 	local attempts = {}
 	responder = function(url, method, callback)
 		if url:find("/v1/events:batch", 1, true) then
@@ -11462,24 +11350,559 @@ function extra_tests.test_exposure_uuid_wire_and_retry()
 	for _, event in ipairs(json.decode(attempts[2]).events) do
 		if event.event_name == "experiment_exposure" then
 			local value = event.event_id
-			assert_equal(#value, 36, "wire UUID length")
-			assert_equal(value:lower(), value, "wire UUID lowercase")
-			assert_match(value, "^%x+%-%x+%-5%x%x%x%-[89ab]%x%x%x%-%x+$", "wire UUID version and variant")
-			assert_true(not seen[value], "automatic and rearmed facts have distinct IDs")
+			assert_equal(#value, 69, "signed fact ID length")
+			assert_equal(value:lower(), value, "signed ID lowercase")
+			assert_match(value, "^cpx1_[0-9a-f]+$", "signed fact namespace")
+			assert_true(not seen[value], "separate applications have distinct IDs")
 			seen[value] = true
 			count = count + 1
 		end
 	end
-	assert_equal(count, 2, "automatic and explicit exposure reached the wire")
+	assert_equal(count, 2, "both applications reached the wire")
+end
+
+-- Signed JSON remains byte-preserved even when Lua numbers cannot represent
+-- an integer exactly. Exercise the production envelope and transport, not a
+-- reimplementation of the serializer in the scene.
+function extra_tests.test_sealed_fact_v2_lossless_forwarding()
+	reset()
+	local restore = install_fake_sys_storage()
+	local facts = require "shardpilot.experiment_facts"
+	local file = assert(io.open("test/golden/experiment-fact-v2.json", "rb"))
+	local raw = file:read("*a"):gsub("%s+$", "")
+	file:close()
+	local seal = "sps1.synthetic." .. string.rep("x", 86)
+	for _, version in ipairs({ "3", "9007199254740993" }) do
+		local exact = raw:gsub('"experiment_version":3', '"experiment_version":' .. version)
+		local fact, err = facts.decode('{"fact":' .. exact .. ',"seal":' .. json.encode(seal) .. '}', {
+			workspace_key = "golden-workspace", app_key = "golden-app", environment_key = "production",
+			event_name = "experiment_exposure", experiment_key = "checkout-copy",
+			version_wire = version, variant_key = "treatment",
+		})
+		assert_true(fact ~= nil, err)
+		local env = require("shardpilot.envelope").build(config(), {}, {
+			event_id = fact.event_id, event_name = fact.event_name, props = fact.props,
+			sealed_fact = fact, user_id = "must-be-omitted", anonymous_id = "analytics-anon",
+			session_id = "analytics-session", session_sequence = 1,
+		})
+		local client = granted_client()
+		assert_true(storage.save_spool(client.config, { env }, 10, 100000) ~= false)
+		storage.reset()
+		local saved = storage.load_spool(client.config)
+		assert_true(saved and saved[1] ~= nil, "signed spool control")
+		local sent = false
+		require("shardpilot.transport").publish(config(), "fixture", { events = saved }, function(ok)
+			sent = ok
+		end)
+		assert_true(sent)
+		local body = requests[#requests].body
+		assert_true(body:find(exact:sub(1, -2), 1, true) ~= nil, "signed fact bytes changed")
+		assert_true(body:find('"experiment_version":' .. version, 1, true) ~= nil, "integer rounded")
+		local sent_event = json.decode(body).events[1]
+		assert_equal(sent_event.schema_version, 2)
+		assert_equal(sent_event.source, "client")
+		assert_equal(sent_event.attestation_seal, seal)
+		assert_equal(sent_event.anonymous_id, "analytics-anon")
+		assert_equal(sent_event.workspace_key, "golden-workspace")
+		assert_nil(sent_event.workspace_id)
+		assert_nil(sent_event.app_id)
+		assert_nil(sent_event.environment_id)
+		assert_nil(sent_event.user_id)
+		assert_nil(sent_event.sealed_fact)
+	end
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_fetch_getter_and_restore_never_apply()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body({ served_revision = 7, served_kill_gate = true,
+		served_at = "1970-01-01T00:16:40Z" })
+	assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).ok)
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+	assert_equal(client:experiment_payload("exp-checkout").color, "blue")
+	client:update(0)
+	assert_equal(#queued_events(client, "experiment_exposure"), 0, "fetch/getter emitted exposure")
+	assert_true(not client.experiments:has_owed_exposures(), "fetch armed application")
+	local restored = assert(sdk.new(config()))
+	assert_equal(restored:experiment_variant("exp-checkout"), "treatment")
+	assert_true(not restored.experiments:has_owed_exposures(), "restore armed application")
+	assert_equal(#requests, 1, "read-only operations added an HTTP hop")
+end
+
+function extra_tests.test_explicit_application_pins_served_state()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body({ served_revision = 7, served_kill_gate = false,
+		served_at = "1970-01-01T00:16:40Z" })
+	assert_true(fetch(client, "exp-checkout", { age_band = "adult", country = "US" }).ok)
+	local variant, err = client:apply_experiment_variant("exp-checkout")
+	assert_equal(variant, "treatment", err)
+	assert_equal(#requests, 1, "apply must queue, not call the network in host code")
+	local record = client.experiments.pending_exposure["exp-checkout"][1]
+	assert_equal(record.entry.served_revision_wire, "7")
+	assert_true(type(record.session_id) == "string" and record.session_id ~= "", "application pins its first session")
+	assert_equal(record.entry.served_kill_gate, false)
+	assert_equal(record.entry.served_at, "1970-01-01T00:16:40Z")
+	assert_true(record.application_id ~= record.session_id)
+	assert_true(record.application_id ~= record.entry.subject_key)
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
+	assert_equal(#client.experiments.pending_exposure["exp-checkout"], 1, "same application counted twice")
+	assert_true(client:track_outcome("exp-checkout", "purchase", 1))
+	assert_equal(#client.experiments.pending_exposure["exp-checkout"], 2)
+	assert_equal(client.experiments.pending_exposure["exp-checkout"][2].applied_at, record.applied_at)
+end
+
+-- A deterministic stand-in for the server's signed-response contract. The independently
+-- pinned golden above checks bytes; these responses let queue scenes identify
+-- which application reached each hop without involving production keys.
+function extra_tests.sealed_answer(request_body)
+	local request, fields = require("shardpilot.experiment_facts").object(request_body)
+	local occurrence = request.exposure_id or request.outcome_id
+	local props = {
+		assignment_key = (extra_tests.fixture_fact_keys or {})[request.experiment_key .. ":" .. fields.experiment_version.raw .. ":" .. request.subject_key] or fixture_subject_fact_key, assignment_unit = "client_id",
+		attestation = "client_attested", experiment_key = request.experiment_key,
+		experiment_version = request.experiment_version, variant_key = request.variant_key,
+		outcome_key = request.outcome_key, outcome_value = request.outcome_value,
+	}
+	local fact = {
+		workspace_key = "workspace-test", app_key = request.app_key,
+		environment_key = request.environment_key,
+		event_id = "cpx1_" .. occurrence .. occurrence,
+		event_name = request.outcome_id and "experiment_outcome" or "experiment_exposure",
+		event_ts = request.occurred_at or request.applied_at, props = props,
+	}
+	local raw = json.encode(fact):gsub('"experiment_version":[^,}]+',
+		'"experiment_version":' .. fields.experiment_version.raw)
+	if fields.outcome_value then
+		raw = raw:gsub('"outcome_value":[^,}]+', '"outcome_value":' .. fields.outcome_value.raw)
+	end
+	return '{"fact":' .. raw .. ',"seal":"sps1.' .. string.rep("a", 16) .. '.' .. string.rep("b", 86) .. '"}'
+end
+
+function extra_tests.application_client()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body({ served_revision = 7, served_kill_gate = false,
+		served_at = "1970-01-01T00:16:40Z" })
+	assert_true(fetch(client, "exp-checkout", { age_band = "adult", geo = "US" }).ok)
+	return client
+end
+
+function extra_tests.test_signed_apply_two_hops_pinned_inputs()
+	local client = extra_tests.application_client()
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
+	local original = client.experiments.pending_exposure["exp-checkout"][1]
+	local applied_at, application_id = original.applied_at, original.application_id
+	next_response_body = assignment_body({ version = 4, served_revision = 9, served_kill_gate = true,
+		served_at = "1970-01-01T00:16:45Z", variant_key = "control" })
+	assert_true(fetch(client, "exp-checkout", { age_band = "adult", geo = "GB" }).ok)
+	assert_true(client:track_outcome("exp-checkout", "purchase", -9007199254740992))
+	assert_equal(#requests, 2, "host calls did network work")
+	local captured = {}
+	responder = function(url, method, callback)
+		if url:find("/experiments/exposures", 1, true) or url:find("/experiments/outcomes", 1, true) then
+			local wire = requests[#requests]
+			local request = json.decode(wire.body)
+			request._method, request._url = method, url
+			captured[#captured + 1] = request
+			callback(nil, nil, { status = 200, response = extra_tests.sealed_answer(wire.body) })
+			return true
+		end
+	end
+	client.experiments:tick(0)
+	assert_equal(#captured, 2)
+	for _, request in ipairs(captured) do
+		assert_equal(request._method, "POST")
+		assert_true(request._url:find("/api/cp/v1/runtime/experiments/", 1, true) ~= nil)
+		assert_equal(request.experiment_version, 3)
+		assert_equal(request.served_revision, 7)
+		assert_equal(request.served_kill_gate, false)
+		assert_equal(request.variant_key, "treatment")
+		assert_equal(request.attributes.geo, "US")
+		assert_equal(request.applied_at, applied_at)
+		assert_nil(request.anonymous_id)
+		assert_nil(request.session_id)
+		assert_nil(request.user_id)
+	end
+	assert_equal(captured[1].exposure_id, application_id)
+	assert_nil(captured[2].exposure_id)
+	assert_true(captured[2].outcome_id ~= application_id)
+	assert_equal(captured[2].outcome_value, -9007199254740992)
+	assert_nil(original.entry.subject_key, "sealed queue record retains the raw subject")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	assert_equal(#queued_events(client, "experiment_outcome"), 1)
+	assert_true(client:flush({ include_summaries = false }))
+	local batch = requests[#requests].body
+	assert_true(not batch:find(client.experiments:current_subject_id(), 1, true), "subject reached analytics")
+	local sent = json.decode(batch).events
+	for _, event in ipairs(sent) do
+		if event.event_name:find("experiment_", 1, true) == 1 then
+			assert_equal(event.schema_version, 2)
+			assert_equal(event.app_key, "app-test")
+			assert_nil(event.app_id)
+			assert_true(event.attestation_seal ~= nil)
+		end
+	end
+end
+
+function extra_tests.test_signed_apply_apply_dispositions()
+	for _, status in ipairs({ 0, 200, 301, 302, 307, 308, 400, 401, 403, 404, 408, 409, 418, 429, 500, 503 }) do
+		local client = extra_tests.application_client()
+		client:apply_experiment_variant("exp-checkout")
+		local record = client.experiments.pending_exposure["exp-checkout"][1]
+		local before = #requests
+		responder = function(url, _, callback)
+			if url:find("/experiments/exposures", 1, true) then
+				callback(nil, nil, { status = status, response = "{}", headers = { ["Retry-After"] = "30" } })
+				return true
+			end
+		end
+		client.experiments:tick(0)
+		assert_equal(#requests, before + 1, "one apply attempt for " .. status)
+		assert_equal(#queued_events(client, "experiment_exposure"), 0)
+		local terminal = status >= 400 and status < 500 and status ~= 401 and status ~= 403 and status ~= 408 and status ~= 429
+		assert_equal(client.experiments:has_owed_exposures(), not terminal, "disposition " .. status)
+		if status == 401 or status == 403 then
+			assert_true(client.experiments.auth_blocked)
+			assert_nil(client:experiment_variant("exp-checkout"))
+		elseif not terminal then
+			assert_true(client.experiments.retry_after_ms ~= nil, "retry paced for " .. status)
+		end
+		client.experiments:tick(0)
+		assert_equal(#requests, before + 1, "retry storm for " .. status)
+		if not terminal then assert_equal(client.experiments.pending_exposure["exp-checkout"][1], record) end
+	end
+end
+
+function extra_tests.test_signed_apply_apply_retry_keeps_occurrence()
+	local client = extra_tests.application_client()
+	client:apply_experiment_variant("exp-checkout")
+	local bodies = {}
+	responder = function(url, _, callback)
+		if url:find("/experiments/exposures", 1, true) then
+			bodies[#bodies + 1] = requests[#requests].body
+			callback(nil, nil, { status = #bodies == 1 and 503 or 200,
+				response = #bodies == 1 and "{}" or extra_tests.sealed_answer(bodies[#bodies]),
+				headers = { ["Retry-After"] = "3" } })
+			return true
+		end
+	end
+	client.experiments:tick(0)
+	socket.now = socket.now + 4
+	client.experiments:tick(0)
+	assert_equal(#bodies, 2)
+	assert_equal(bodies[1], bodies[2], "retry rewrote the application")
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	assert_true(not client.experiments:has_owed_exposures())
+end
+
+function extra_tests.test_signed_apply_late_seal_cannot_restore_withdrawn_record()
+	for _, reason in ipairs({ "consent", "age", "sentinel", "overflow", "teardown" }) do
+		local client = extra_tests.application_client()
+		client:apply_experiment_variant("exp-checkout")
+		local callback, body
+		responder = function(url, _, done)
+			if url:find("/experiments/exposures", 1, true) then
+				callback, body = done, requests[#requests].body
+				return true
+			end
+		end
+		client.experiments:tick(0)
+		assert_true(callback ~= nil)
+		if reason == "consent" then client:set_consent("analytics", "denied")
+		elseif reason == "age" then
+			client.experiments:apply_age_withdrawal(client.experiments:scope_for(client.experiments:current_subject_id()), "exp-checkout", 1000000, fixture_subject_fact_key)
+		elseif reason == "sentinel" then
+			client.experiments:apply_sentinel_withdrawal(client.experiments:scope_for(client.experiments:current_subject_id()), 1000000, 1000000)
+		elseif reason == "overflow" then
+			for _ = 1, 8 do assert_true(client:track_exposure("exp-checkout")) end
+		else client.experiments:teardown() end
+		callback(nil, nil, { status = 200, response = extra_tests.sealed_answer(body) })
+		assert_equal(#queued_events(client, "experiment_exposure"), 0, "late seal after " .. reason)
+	end
+end
+
+function extra_tests.test_signed_apply_legacy_and_corrupt_serving_pins()
+	local client = extra_tests.application_client()
+	local entry = client.experiments.entries["exp-checkout"]
+	entry.served_revision_wire, entry.served_kill_gate, entry.served_at = nil, nil, nil
+	local variant, err = client:apply_experiment_variant("exp-checkout")
+	assert_equal(variant, "treatment")
+	assert_equal(err, "serving_pins_missing")
+	assert_true(not client.experiments:has_owed_exposures())
+	assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).ok)
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
+	assert_true(client.experiments:has_owed_exposures())
+	for _, change in ipairs({
+		{ "served_revision_wire", "-1" }, { "served_revision_wire", "1e2" },
+		{ "version_wire", "4" }, { "served_kill_gate", "false" }, { "served_at", "" },
+	}) do
+		local record = storage.load_experiments(client.config)
+		assert_true(record ~= nil)
+		record.entries["exp-checkout"][change[1]] = change[2]
+		assert_true(storage.save_experiments(client.config, record))
+		assert_nil(storage.load_experiments(client.config).entries["exp-checkout"], "corrupt pins restored")
+		assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).ok)
+	end
+end
+
+function extra_tests.test_signed_apply_int64_pins_survive_both_hops()
+	local client = extra_tests.application_client()
+	next_response_body = assignment_body():gsub('"version":3', '"version":9007199254740993')
+		:gsub('"served_revision":7', '"served_revision":9223372036854775807')
+	assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).ok)
+	client:apply_experiment_variant("exp-checkout")
+	client.experiments:tick(0)
+	local wire = requests[#requests].body
+	assert_true(wire:find('"experiment_version":9007199254740993', 1, true) ~= nil)
+	assert_true(wire:find('"served_revision":9223372036854775807', 1, true) ~= nil)
+	assert_true(client:flush({ include_summaries = false }))
+	assert_true(requests[#requests].body:find('"experiment_version":9007199254740993', 1, true) ~= nil)
+end
+
+function extra_tests.test_signed_apply_persist_never_starts_apply()
+	local restore = install_fake_sys_storage()
+	local client = extra_tests.application_client()
+	client:apply_experiment_variant("exp-checkout")
+	local count = #requests
+	local ok = client:persist()
+	assert_equal(ok, false, "an unsealed application is not captured as an analytics event")
+	assert_equal(#requests, count, "persist started an apply request")
+	client.experiments:tick(0)
+	assert_true(client:persist(), "sealed fact is captured by the existing spool")
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_signed_apply_apply_auth_latch_resumes_on_new_fetch()
+	local client = extra_tests.application_client()
+	client:apply_experiment_variant("exp-checkout")
+	local record = client.experiments.pending_exposure["exp-checkout"][1]
+	responder = function(url, _, callback)
+		if url:find("/experiments/exposures", 1, true) then
+			callback(nil, nil, { status = 401, response = "{}" }); return true
+		end
+	end
+	client.experiments:tick(0)
+	assert_true(client.experiments.auth_blocked)
+	local count = #requests
+	client.experiments:tick(0)
+	assert_equal(#requests, count)
+	responder = nil
+	assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).ok)
+	client.experiments:tick(0)
+	assert_true(not client.experiments.auth_blocked)
+	assert_true(not client.experiments:has_owed_exposures())
+	assert_equal(queued_events(client, "experiment_exposure")[1].event_id, "cpx1_" .. record.application_id .. record.application_id)
+end
+
+function extra_tests.test_signed_apply_browser_transport_lifecycle()
+	reset()
+	local previous_info, previous_html5 = sys.get_sys_info, html5
+	sys.get_sys_info = function() return { system_name = "HTML5" } end
+	local script, answer = nil, "started"
+	html5 = { run = function(code) script = code; return answer end }
+	local transport = require("shardpilot.experiment_http").new()
+	assert_true(transport:available())
+	local response
+	transport:request("http://localhost:42008/apply", "POST", function(_, _, value) response = value end,
+		{ Authorization = "Bearer synthetic" }, "{}", { timeout = 2 })
+	assert_true(script:find('redirect: "error"', 1, true) ~= nil)
+	assert_true(script:find('credentials: "omit"', 1, true) ~= nil)
+	assert_true(script:find('"timeout":2000', 1, true) ~= nil)
+	answer = ""
+	transport:tick()
+	assert_nil(response, "pending browser job completed")
+	answer = '{"status":429,"response":"{}","headers":{"retry-after":"30"}}'
+	transport:tick()
+	assert_equal(response.status, 429)
+	assert_equal(response.headers["retry-after"], "30")
+	assert_true(next(transport.jobs) == nil)
+	answer = "started"
+	transport:request("http://localhost:42008/apply", "POST", function() error("after teardown") end, {}, "{}", { timeout = 2 })
+	transport:teardown()
+	assert_true(script:find("controller.abort()", 1, true) ~= nil)
+	assert_true(next(transport.jobs) == nil)
+	sys.get_sys_info, html5 = previous_info, previous_html5
+end
+
+function extra_tests.test_apply_returned_key_is_durable_before_forwarding()
+	local restore, _, state = install_fake_sys_storage()
+	local client = extra_tests.application_client()
+	client:apply_experiment_variant("exp-checkout")
+	local rotated = "sfk1_" .. string.rep("d", 64)
+	local attempts = {}
+	responder = function(url, _, callback)
+		if url:find("/experiments/exposures", 1, true) then
+			attempts[#attempts + 1] = requests[#requests].body
+			local body = extra_tests.sealed_answer(requests[#requests].body):gsub(fixture_subject_fact_key, rotated)
+			callback(nil, nil, { status = 200, response = body })
+			return true
+		end
+	end
+	state.fail_save = fail_experiment_saves
+	client.experiments:tick(0)
+	assert_equal(#queued_events(client, "experiment_exposure"), 0, "unsaved key reached analytics")
+	assert_true(client.experiments:has_owed_exposures())
+	state.fail_save = nil
+	advance_seconds(60)
+	client.experiments:tick(0)
+	assert_equal(#attempts, 2)
+	assert_equal(attempts[1], attempts[2])
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+	assert_true(client:persist())
+	storage.reset()
+	local second = assert(sdk.new(config()))
+	next_status = 200
+	next_response_body = json.encode({ assigned = false, version = 3, reason = "age_ineligible",
+		subject_fact_key = fixture_subject_fact_key, boundary = { assignment_unit = "client_id" } })
+	assert_true(fetch(second, "exp-checkout", { age_band = "under_threshold" }).ok)
+	local from = #requests
+	advance_seconds(60)
+	assert_true(second:flush({ include_summaries = false }))
+	for j = from + 1, #requests do
+		assert_true(not requests[j].body:find(rotated, 1, true), "rotated key replayed after refusal")
+	end
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_seal_survives_queue_pressure_without_second_apply()
+	reset()
+	local client = granted_client({ buffer_size = 1 })
+	next_response_body = assignment_body()
+	assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).ok)
+	assert_true(client:track("filler"))
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
+	client.experiments:tick(0)
+	local record = client.experiments.pending_exposure["exp-checkout"][1]
+	assert_true(record.sealed_fact ~= nil)
+	assert_nil(record.entry.subject_key)
+	local requests_after_seal = #requests
+	client.experiments:tick(0)
+	assert_equal(#requests, requests_after_seal, "full queue repeated sealing")
+	assert_true(client:flush({ include_summaries = false }))
+	client.experiments:tick(0)
+	assert_equal(#requests, requests_after_seal + 1, "draining repeated sealing")
+	assert_true(not client.experiments:has_owed_exposures())
+	assert_equal(queued_events(client, "experiment_exposure")[1].event_id, record.sealed_fact.event_id)
+end
+
+function extra_tests.test_apply_timeout_ignores_old_callback()
+	local client = extra_tests.application_client()
+	client:apply_experiment_variant("exp-checkout")
+	local held, bodies = {}, {}
+	responder = function(url, _, callback)
+		if url:find("/experiments/exposures", 1, true) then
+			held[#held + 1], bodies[#bodies + 1] = callback, requests[#requests].body
+			return true
+		end
+	end
+	client.experiments:tick(0)
+	advance_seconds(client.config.publish_timeout_seconds + 1)
+	client.experiments:tick(0)
+	assert_true(client.experiments.retry_after_ms ~= nil)
+	advance_seconds(60)
+	client.experiments:tick(0)
+	assert_equal(#held, 2)
+	assert_equal(bodies[1], bodies[2])
+	held[1](nil, nil, { status = 200, response = extra_tests.sealed_answer(bodies[1]) })
+	assert_nil(client.experiments.pending_exposure["exp-checkout"][1].sealed_fact, "timed-out callback won")
+	held[2](nil, nil, { status = 200, response = extra_tests.sealed_answer(bodies[2]) })
+	client.experiments:tick(0)
+	assert_equal(#queued_events(client, "experiment_exposure"), 1)
+end
+
+function extra_tests.test_sealed_response_rejects_ambiguous_or_mismatched_values()
+	local client = extra_tests.application_client()
+	client:apply_experiment_variant("exp-checkout")
+	client.experiments:tick(0)
+	local body = extra_tests.sealed_answer(requests[#requests].body)
+	local expected = { workspace_key = "workspace-test", app_key = "app-test", environment_key = "develop",
+		event_name = "experiment_exposure", experiment_key = "exp-checkout", version_wire = "3", variant_key = "treatment" }
+	local facts = require "shardpilot.experiment_facts"
+	assert_true(facts.decode(body, expected) ~= nil, "valid response control")
+	for _, bad in ipairs({
+		body:gsub('"app_key":"app%-test"', '"app_key":"other-app"'),
+		body:gsub('"app_key":', '"app_key":"app-test","app_key":'),
+		body:gsub('"app_key":', '"app_\\u006bey":"app-test","app_key":'),
+		body:gsub('"experiment_version":3', '"experiment_version":3.0'),
+		body:gsub('"experiment_version":3', '"experiment_version":4'),
+		body:gsub('"experiment_key":', '"subject_key":"forbidden","experiment_key":'),
+		body:gsub('"event_name":"experiment_exposure"', '"event_name":"experiment_outcome"'),
+		body:gsub('"props":{', '"props":{"outcome_value":1,'),
+		body .. "x",
+	}) do
+		assert_nil(facts.decode(bad, expected), "invalid sealed response accepted")
+	end
+end
+
+function extra_tests.test_apply_refusals_withdraw_their_fact_population()
+	for _, sentinel in ipairs({ false, true }) do
+		local restore = install_fake_sys_storage()
+		local client = extra_tests.application_client()
+		extra_tests.apply(client, "exp-checkout")
+		assert_true(extra_tests.outcome(client, "exp-checkout", "score", 1))
+		next_response_body = assignment_body({ experiment_key = "other" })
+		assert_true(extra_tests.fetch_apply(client, "other", { age_band = "adult" }).ok)
+		assert_true(client:persist())
+		assert_true(client:track_exposure("exp-checkout"))
+		responder = function(url, _, callback)
+			if url:find("/experiments/exposures", 1, true) then
+				callback(nil, nil, { status = sentinel and 403 or 409,
+					response = sentinel and json.encode({ error = "experiment real-subject assignment is disabled" })
+						or json.encode({ error = "not_assigned", reason = "age_ineligible" }) })
+				return true
+			end
+		end
+		client.experiments:tick(0)
+		assert_nil(client:experiment_variant("exp-checkout"))
+		assert_nil(client.experiments.pending_exposure["exp-checkout"])
+		for _, event in ipairs(client.queue.items) do
+			assert_true(event.props == nil or event.props.experiment_key ~= "exp-checkout")
+		end
+		if sentinel then
+			assert_nil(client:experiment_variant("other"))
+			assert_equal(#queued_events(client, "experiment_exposure"), 0)
+		else
+			assert_equal(client:experiment_variant("other"), "treatment")
+			assert_equal(#queued_events(client, "experiment_exposure"), 1)
+		end
+		storage.reset()
+		local second = assert(sdk.new(config()))
+		assert_nil(second:experiment_variant("exp-checkout"))
+		local before = #requests
+		advance_seconds(60)
+		second:flush({ include_summaries = false })
+		for j = before + 1, #requests do
+			assert_true(not requests[j].body:find('"experiment_key":"exp-checkout"', 1, true), "refused fact replayed")
+		end
+		restore()
+		storage.reset()
+	end
 end
 
 local tests = {
-	extra_tests.test_exposure_sha1_known_answers,
-	extra_tests.test_exposure_uuid_reload_is_stable,
-	extra_tests.test_exposure_uuid_version_bits,
-	extra_tests.test_exposure_uuid_variant_bits,
-	extra_tests.test_exposure_uuid_golden_vectors,
-	extra_tests.test_exposure_uuid_wire_and_retry,
+	extra_tests.test_apply_refusals_withdraw_their_fact_population,
+	extra_tests.test_apply_returned_key_is_durable_before_forwarding,
+	extra_tests.test_seal_survives_queue_pressure_without_second_apply,
+	extra_tests.test_apply_timeout_ignores_old_callback,
+	extra_tests.test_sealed_response_rejects_ambiguous_or_mismatched_values,
+	extra_tests.test_signed_apply_legacy_and_corrupt_serving_pins,
+	extra_tests.test_signed_apply_int64_pins_survive_both_hops,
+	extra_tests.test_signed_apply_persist_never_starts_apply,
+	extra_tests.test_signed_apply_apply_auth_latch_resumes_on_new_fetch,
+	extra_tests.test_signed_apply_browser_transport_lifecycle,
+	extra_tests.test_signed_apply_two_hops_pinned_inputs,
+	extra_tests.test_signed_apply_apply_dispositions,
+	extra_tests.test_signed_apply_apply_retry_keeps_occurrence,
+	extra_tests.test_signed_apply_late_seal_cannot_restore_withdrawn_record,
+	extra_tests.test_fetch_getter_and_restore_never_apply,
+	extra_tests.test_explicit_application_pins_served_state,
+	extra_tests.test_sealed_fact_v2_lossless_forwarding,
+	extra_tests.test_signed_exposure_wire_and_retry,
 
 	extra_tests.test_age_remote_config_keeps_targeting_rules,
 	extra_tests.test_age_api_lifecycle_precedes_arguments,
@@ -11551,8 +11974,7 @@ local tests = {
 	test_revalidation_kill_drops_mid_session,
 	test_variant_change_applies_at_resolution,
 	test_no_revalidation_without_consumer_state,
-	test_exposure_auto_emit_once_with_deterministic_id,
-	test_exposure_event_id_derivation_is_stable,
+	test_explicit_application_once_with_signed_id,
 	test_exposure_version_change_rearms,
 	test_restart_restores_cache_serves_offline_and_exposes_once,
 	test_corrupt_cache_record_is_a_miss,
@@ -11637,7 +12059,7 @@ local tests = {
 	test_sibling_adopts_after_corrupt_subject_heals,
 	test_migrated_snapshot_keeps_apply_identity_through_session_start,
 	test_mode_b_rotation_blocked_while_exposure_owed,
-	test_purge_rearm_materializes_at_grant_identity,
+	test_application_after_grant_pins_identity,
 	test_transient_pacing_shortens_next_revalidation,
 	test_denied_restore_arms_intent_and_exposes_at_grant_identity,
 	test_retryable_sweep_attempts_do_not_count_as_drops,
@@ -11665,7 +12087,7 @@ local tests = {
 	test_stale_marker_does_not_condemn_new_scope_spool,
 	test_numeric_payload_counts_toward_record_cap,
 	test_stale_transient_does_not_pace_settled_key,
-	test_replacement_fact_capture_survives_settled_purge,
+	test_new_application_capture_survives_settled_purge,
 	test_reissued_fact_key_replaces_settled_spool_copy,
 	test_condemned_marker_holds_without_subject,
 	test_condemnation_survives_failed_spool_clear,
@@ -11681,7 +12103,7 @@ local tests = {
 	test_present_null_reason_is_malformed,
 	test_backend_restored_exposure_drains_in_background,
 	test_sync_latch_halts_remaining_cadence_dispatches,
-	test_belt_denial_flip_arms_intent_not_exposure,
+	test_belt_denial_restore_records_no_application,
 	extra_tests.test_subject_echo_never_installs_as_fact_key,
 	extra_tests.test_sync_remint_stops_stale_cadence_keys,
 	extra_tests.test_restored_client_id_entry_requires_fact_key,
@@ -11714,7 +12136,7 @@ local tests = {
 	extra_tests.test_snapshot_that_lived_through_an_ended_session_is_exposed_in_it,
 	extra_tests.test_ended_and_next_session_snapshots_stay_apart,
 	extra_tests.test_backend_background_sweep_opens_no_session,
-	extra_tests.test_explicit_exposure_after_end_adds_to_the_automatic_one,
+	extra_tests.test_extra_application_after_end_has_distinct_occurrence,
 	extra_tests.test_backend_explicit_exposure_after_end_opens_no_session,
 	extra_tests.test_age_unconfirmed_declaration_withdraws_experiment,
 	extra_tests.test_age_unconfirmed_declaration_withdraws_spooled_facts,
@@ -11761,9 +12183,9 @@ local tests = {
 	extra_tests.test_age_refusal_keeps_a_retained_batchs_deadline,
 	extra_tests.test_age_refusal_clears_the_deadline_of_a_record_without_restored_facts,
 	extra_tests.test_sentinel_clears_the_deadline_of_a_record_without_restored_facts,
-	extra_tests.test_retired_arms_stay_bounded_across_renewals,
-	extra_tests.test_retired_arms_leave_with_an_ended_session,
-	extra_tests.test_retired_arm_of_an_owed_readmission_survives_a_renewal,
+	extra_tests.test_application_state_stays_bounded_across_renewals,
+	extra_tests.test_application_state_leaves_with_an_ended_session,
+	extra_tests.test_owed_readmission_keeps_its_id_across_renewal,
 }
 
 for _, test in ipairs(tests) do

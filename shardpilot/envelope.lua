@@ -23,7 +23,7 @@ function M.build(config, state, event)
 	end
 	local context = copy_table(event.context)
 
-	return {
+	local out = {
 		event_id = event.event_id or id.uuid(),
 		schema_version = 1,
 		event_name = event.event_name,
@@ -42,6 +42,15 @@ function M.build(config, state, event)
 		props = props,
 		context = context,
 	}
+	if event.sealed_fact then
+		local fact = event.sealed_fact
+		out.schema_version, out.source, out.user_id = 2, "client", nil
+		out.workspace_id, out.app_id, out.environment_id = nil, nil, nil
+		out.workspace_key, out.app_key, out.environment_key = fact.workspace_key, fact.app_key, fact.environment_key
+		out.event_id, out.event_name, out.event_ts, out.props = fact.event_id, fact.event_name, fact.event_ts, fact.props
+		out.attestation_seal, out.sealed_fact = fact.seal, fact
+	end
+	return out
 end
 
 return M

@@ -1627,14 +1627,8 @@ function M.new(config, defer_init_diagnostics)
 		end
 	end
 	-- Experiment-assignment consumer (dark unless `experiments_enabled`).
-	-- Constructed AFTER the consent-outbox load and the boot BELT above
-	--: the construction-time cache restore decides
-	-- between arming a LIVE exposure snapshot and a re-arm INTENT by
-	-- reading deps.consent(), so it must see the FINAL belt-settled boot
-	-- state - constructed before the belt, a stale granted restore armed
-	-- an exposure the belt's denied flip never reconciled (a denied-boot
-	-- identity that could emit after a later re-grant, or hold Mode B
-	-- rotation as phantom pending work).
+	-- Constructed after consent restoration so cached serving observes the
+	-- final boot consent state. Restoration itself records no application.
 	-- Constructed only when the flag is on — while off there is no subject-id
 	-- mint, no fetch, no revalidation, no exposure and no new persistence
 	-- keys. The subject id is SDK-managed: it is loaded from the identity
@@ -1694,7 +1688,7 @@ function M.new(config, defer_init_diagnostics)
 				-- The fact shape emit() below gives an immediate exposure:
 				-- the same predicate, so the session opens exactly when that
 				-- enqueue would have opened it — only earlier.
-				return client:open_owed_session({ omit_user_id = true })
+				return client:open_experiment_application_session()
 			end,
 			emit = function(event_name, props, event_id, overrides)
 				-- `overrides` is the ARM-TIME identity of an owed fact
@@ -1710,6 +1704,7 @@ function M.new(config, defer_init_diagnostics)
 					anonymous_id = overrides.anonymous_id,
 					event_ts = overrides.event_ts,
 					retryable = overrides.retryable,
+					sealed_fact = overrides.sealed_fact,
 				})
 			end,
 			purge_facts = function()
@@ -2712,6 +2707,12 @@ function Client:experiment_payload(experiment_key)
 	return self.experiments:payload(experiment_key)
 end
 
+function Client:apply_experiment_variant(experiment_key)
+	if not self.initialized then return nil, "shutdown" end
+	if not self.experiments then return nil, "experiments_not_configured" end
+	return self.experiments:apply_variant(experiment_key)
+end
+
 function Client:track_exposure(experiment_key)
 	if not self.initialized then
 		return false, "shutdown"
@@ -2800,14 +2801,6 @@ function Client:set_consent(decision, notice)
 		-- repeated same-state call is not a transition and fences nothing.
 		self.experiments.consent_epoch = self.experiments.consent_epoch + 1
 	end
-	if granted and self.experiments then
-		-- Purge/denied-restore re-arm intents materialize AT THE GRANT:
-		-- serving resumes this instant, so the replacement snapshots
-		-- capture this exact moment's identity — and has_owed_exposures()
-		-- reflects the owed automatic facts immediately, before any Mode B
-		-- rotation can be requested in the regrant window.
-		self.experiments:on_consent_granted()
-	end
 	local purged = true
 	if not granted then
 		-- Denial ends attribution locally, without an end event. Discard the
@@ -2887,10 +2880,8 @@ function Client:set_consent(decision, notice)
 		end
 		self.owed_summaries = {}
 		if self.experiments then
-			-- The purge above discarded any queued-but-unpublished
-			-- experiment exposure facts: re-arm the assignment's emissions so
-			-- a later re-grant of a retained assignment emits its exposure
-			-- in the next session instead of under-counting treatment.
+			-- Withdraw both application stages and last-applied state.
+			-- A later grant records nothing without an explicit application.
 			self.experiments:on_analytics_purge()
 		end
 	end
@@ -3088,7 +3079,6 @@ function Client:start_session(props, fact)
 		commit_event(self, staged_end.event, staged_end.stream, staged_end.now_ms)
 		commit_event(self, staged_start.event, staged_start.stream, staged_start.now_ms)
 	end
-	local previous_session_id = (replaced or self.ended_session or {}).id
 	if first then
 		self:renew_sessionless_samplers()
 	end
@@ -3103,20 +3093,8 @@ function Client:start_session(props, fact)
 		self:finalize_session(replaced)
 	end
 	if self.experiments then
-		-- The exposure contract is once per (experiment, version, subject)
-		-- per SESSION: an explicit session renewal re-arms it, so a
-		-- still-applied assignment emits one exposure into the new session
-		-- (with its own deterministic id) on the next application sweep.
-		-- Whether this start is a genuine RENEWAL (a session — lazy or
-		-- explicit — is OPEN) decides what happens to owed pre-session
-		-- exposure snapshots: the first real session adopts them; a renewal
-		-- preserves them as prior sessions' facts — and stamps any
-		-- still-unattributed pre-session snapshot with the PREVIOUS
-		-- session's id (the lazy first session it lived through), which the
-		-- renewal path needs the id itself for. A start after an END is not a
-		-- renewal: the end already attributed what lived through the ended
-		-- session, and what was armed after it belongs to this one.
-		self.experiments:on_session_renewed(replaced ~= nil, previous_session_id)
+		-- A new session accepts a new explicit application of each tuple.
+		self.experiments:on_session_renewed()
 	end
 	return true
 end
@@ -3640,7 +3618,7 @@ end
 -- The shared enqueue path behind track() and the SDK-internal experiment
 -- facts. `fact` (internal only — never host-supplied) carries the two
 -- deviations an experiment fact needs from an ordinary event: a
--- pre-derived `event_id` (the deterministic exposure id, so at-least-once
+-- server-stamped `event_id` (kept through every retry, so at-least-once
 -- retries and same-session double emissions collapse server-side) and
 -- `omit_user_id` (the facts contract forbids user_id on the envelope; the
 -- identity is the standard anonymous_id alone). `retryable` marks an
@@ -3688,6 +3666,22 @@ function Client:open_owed_session(fact)
 			self.stats.dropped = self.stats.dropped + 1
 		end
 		return false, start_err
+	end
+	return true
+end
+
+-- An explicit application is host activity even before its fact is sealed.
+-- Pin the initial lazy session now; background delivery must not choose it.
+function Client:open_experiment_application_session()
+	local opened, err = self:open_owed_session({ omit_user_id = true })
+	if not opened then return false, err end
+	if self.session == nil and self.ended_session == nil and self.config.source ~= "backend" then
+		local lazy = new_session("session-" .. id.uuid())
+		self:adopt_sessionless_samplers(lazy)
+		self.session = lazy
+		self:mirror_session()
+		self:pause_if_backgrounded(lazy)
+		self:renew_sessionless_samplers()
 	end
 	return true
 end
@@ -3788,7 +3782,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event)
 		end
 		-- An owed experiment fact enqueued LATE carries the identity of
 		-- the moment its treatment applied. The full envelope audit for a
-		-- late-drained fact, field by field: event_id — deterministic,
+		-- late-drained fact, field by field: event_id — server-stamped,
 		-- derived from the arm-time snapshot; event_ts — the arm moment
 		-- (overridden here); user_id — omitted by the facts contract;
 		-- anonymous_id — the arm moment's (overridden here); session_id —
@@ -3825,6 +3819,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event)
 		session_id = session_override or (own and own.id) or (self.session and self.session.id) or nil,
 		session_sequence = stream.sequence + 1,
 		props = props_snapshot,
+		sealed_fact = fact and fact.sealed_fact or nil,
 		context = context_snapshot,
 	}
 	if fact and fact.stage then return true, nil, { event = event, stream = stream, now_ms = now_ms } end
@@ -5938,6 +5933,7 @@ function Client:capture_experiment_fact(event_name, props, event_id, overrides)
 		session_id = session_id,
 		session_sequence = stream.sequence + 1,
 		props = props_snapshot,
+		sealed_fact = overrides.sealed_fact,
 		context = nil,
 	}
 	stream.sequence = event.session_sequence

@@ -236,7 +236,8 @@ the `api_key` authenticates only the remote-config fetch.
   experiment record is written to disk; `fetch_experiment_assignment`,
   `track_exposure`, and `track_outcome` answer
   `false, "experiments_not_configured"` and `experiment_variant` /
-  `experiment_payload` return `nil`. A non-boolean value is rejected with
+  `experiment_payload` return `nil`. `apply_experiment_variant` returns
+  `nil, "experiments_not_configured"`. A non-boolean value is rejected with
   `invalid_experiments_enabled`.
 - **The one disabled-mode exception is rollback safety.** If an *earlier* run
   of the same build had the flag on, turning it back off does not strand what
@@ -273,7 +274,7 @@ alongside `remote_config_url` **and** `api_key`:
 
 In Mode B this is the same documented exception to "configure exactly one"
 that remote config already uses: `token_provider` stays the ingest `Bearer`
-and the `api_key` authenticates the remote-config and assignment fetches.
+and the `api_key` authenticates remote-config, assignment and apply requests.
 Feature-detect the surface before `init()` with
 `shardpilot.supports("experiments_assignment")`.
 
@@ -316,54 +317,53 @@ The public calls, verified against `shardpilot/sdk.lua`:
   or `nil`. Never touches the network, never fails.
 - **`experiment_payload(experiment_key)`** — a copy of the cached variant
   payload, or `nil`. Never touches the network, never fails.
-- **`track_exposure(experiment_key)`** — emits one extra exposure fact for the
-  live assignment (the automatic at-most-once-per-session exposure needs no
-  call). "At most once per session" describes the DEDUPLICATED fact: retries
-  of the same exposure reuse its deterministic event ID. **New in `v0.11.0`:**
-  revoking consent closes the session and re-arms retained assignments for
-  the next grant. When a fresh session opens, its exposure has a distinct
-  deterministic ID; it is separately countable, not a duplicate of the
-  pre-denial exposure.
-  Returns `ok, err`; failure codes `not_initialized`, `shutdown`,
-  `experiments_not_configured`, `experiment_key_required`, `no_assignment`,
-  `consent_unknown`, `consent_denied`, `exposure_no_subject_fact_key`,
-  `queue_full`.
-- **`track_outcome(experiment_key, outcome_key, outcome_value)`** — records a
-  host-defined outcome as its own fact. `outcome_key` must be a non-empty
-  string (`invalid_outcome_key`) and `outcome_value` must be a **finite
-  number** (`invalid_outcome_value`) — `NaN` and `±inf` are Lua numbers but
-  have no JSON representation, so they are refused here rather than being
-  allowed to break the batch they would ride in. The `track_exposure` failure
-  codes apply too.
+- **`apply_experiment_variant(experiment_key)`** — returns the cached variant
+  and records that your game acted on it. Call at the point of application.
+  Fetches, getters, restores, session changes and consent re-grants record
+  nothing. Deduplication is per experiment, version, subject and session.
+  The call pins the served inputs and queues work; it performs no network I/O.
+  Returns `variant, err` or `nil, err`. Missing serving pins or a missing fact
+  key still return the variant, with `serving_pins_missing` or
+  `exposure_no_subject_fact_key`; neither records a fact. Other failures are
+  `not_initialized`, `shutdown`, `experiments_not_configured`,
+  `experiment_key_required`, `no_assignment`, `consent_unknown`,
+  `consent_denied`, or `queue_full` while opening a new session.
+- **`track_exposure(experiment_key)`** — records an additional explicit
+  application, with its own random occurrence ID. Returns `ok, err`, with the
+  application failures above. It also becomes the last application for outcomes.
+- **`track_outcome(experiment_key, outcome_key, outcome_value)`** — records an
+  outcome against the last explicit application's pinned version, variant,
+  attributes and serving times. Without that application it returns
+  `false, "no_assignment"`. Keys are 1–128 ASCII letters, digits, `_`, `.`,
+  `:` or `-`; values are integers with absolute value at most 2^53. Invalid
+  inputs return `invalid_outcome_key` or `invalid_outcome_value`. Lifecycle,
+  configuration and consent failures use the same codes as the other methods.
 
-`queue_full` is the retryable one in that list: the in-memory event queue is
-at `buffer_size`, so flush (or wait for the next batch to drain) and call
-again — the exposure or outcome is otherwise silently lost.
+Use `type(shardpilot.apply_experiment_variant) == "function"` when supporting
+older SDKs. The existing experiment capability does not promise this method.
 
-**`ok` means enqueued locally, NOT accepted by the platform.** Both fact calls
-return success once the event is on the queue. With the documented Mode A
-setup — a game-embedded publishable key — the platform currently **rejects**
-the `experiment_exposure` and experiment-outcome fact names by design, so the
-event is expected to come back as a per-event reject, surfaced through your
-`diagnostics` hook and otherwise tolerated silently. Until that producer lane
-opens, plan for experiments to run with **no accepted exposure or outcome
-data** from a publishable-key build: treat a `true` return as "the SDK did its
-part", not as a recorded measurement, and watch `diagnostics` to see what is
-actually landing.
+**Success means queued locally.** `update()` seals an application via
+`{remote_config_url}/api/cp/v1/runtime/experiments/exposures` or `outcomes`,
+then forwards the exact fact and seal to analytics as a v2 event with literal
+`*_key` scope fields. Raw subject identity goes only to the configured remote-config host; anonymous
+and session identity go only to analytics. `user_id` is omitted. Both stages
+share an eight-record FIFO per experiment; overflow drops the oldest and reports
+`fact_skipped` / `owed_overflow`. A full analytics queue retains a sealed record.
 
-**Automatic exposure is "at most once", not "exactly once".** A fact can only
-be emitted when the assignment carries the server-supplied opaque key it is
-allowed to be attributed by; the SDK-minted subject id must never reach the
-analytics plane. An assignment served without one — a synthetic-unit answer,
-for example — is applied normally but emits **no** exposure at all. Do not
-assume every applied treatment is measured.
+Apply `401`/`403` responses hold the record until an authorized fetch; the
+real-subjects-disabled sentinel withdraws the whole plane. Other `4xx` responses
+are terminal except `408` and `429`. An age-ineligible refusal withdraws the
+subject's facts for that experiment. Offline, timeout, malformed responses,
+redirects, `408`, `429` and `5xx` retry with backoff and delta-seconds
+`Retry-After`. Redirects are never followed. Analytics per-event rejection stays
+terminal and visible through the rejection ring.
 
-Watch the right name for it. The *automatic* skip surfaces **only** through
-your `diagnostics` hook, as `status = "exposure_skipped"` with
-`code = "no_subject_fact_key"`. The similar-looking
-`exposure_no_subject_fact_key` is a different thing: the `err` returned from
-an explicit `track_exposure` / `track_outcome` call. An integration watching
-only the public-call error will not see the automatic gaps at all.
+Unsealed applications are memory-only. `persist()` starts no network request and
+reports incomplete capture while they remain; sealed facts use the existing
+spool. An offline process exit can therefore lose unsealed applications. Consent
+denial purges both stages; re-grant needs a new explicit application. See the
+[README delivery contract](../README.md#consent-targeting-and-facts) for the
+pinned inputs and diagnostics.
 
 Treat `nil` from the getters as the control experience — that is what your
 game sees before the first fetch resolves, when the subject is not assigned,
