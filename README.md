@@ -1750,7 +1750,7 @@ separate prerequisites; the client does not prove the notice was displayed.
   fingerprint of the API key — never the key). See
   [docs/privacy.md](docs/privacy.md) for the full at-rest inventory. The identity
   record is written through
-  `sys.get_save_file("shardpilot.<workspace_id>.<app_id>", "identity")` with
+  `sys.get_save_file("shardpilot.w<workspace-hex>.a<app-hex>", "identity")` with
   `sys.save`/`sys.load`. The per-app namespace prevents two games on one device
   from sharing an anonymous ID or consent state. Outside Defold (e.g. a plain
   Lua test host) it degrades gracefully to in-memory state. `get_anonymous_id()`

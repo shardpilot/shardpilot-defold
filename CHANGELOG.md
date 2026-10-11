@@ -2,6 +2,13 @@
 
 ### Unreleased
 
+- Successful analytics shutdown discards pending token-provider completions,
+  including synchronous provider failures after closure, without changing the
+  closed client's diagnostics or scheduling work. Refused shutdowns stay live.
+- Storage uses one reversible byte-encoded workspace/app namespace for identity,
+  consent, analytics and crash records. Punctuation and case no longer collapse
+  different scopes. Earlier storage namespaces are not imported.
+
 - Analytics and crash instances expose only documented operations. Implementation
   state and class tables stay private; `flush()` has no private options.
 

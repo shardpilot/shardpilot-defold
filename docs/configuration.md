@@ -153,10 +153,10 @@ keeps serving the experiment from memory, and delivers the facts it holds.
   `init` returns `false, "already_initialized"` while that client remains live
   or is being constructed. Successful shutdown releases the default client;
   a later `init` can then create its replacement.
-- Two ids that differ only in characters other than letters, digits, `-` and
-  `_` (for example `com.game` and `com_game`) share the identity and consent
-  record, so they count as one app here
-  ([#148](https://github.com/shardpilot/shardpilot-defold/issues/148)).
+- Raw workspace/app identifiers remain distinct in storage: `com.game` and
+  `com_game`, or `Game` and `game`, have separate identity and consent records.
+  All record categories share the same byte-encoded scope base; see
+  [durable storage](privacy.md).
 
 `new(config)` does not yet refuse a second client of a live app; that guard is
 tracked in [#146](https://github.com/shardpilot/shardpilot-defold/issues/146).
@@ -171,6 +171,10 @@ Configure **exactly one**:
 - **Mode B — `token_provider`** (async per-tenant JWT). A function that yields a
   short-lived ingest JWT minted by your backend. The SDK manages refresh,
   expiry-lead, and 401-retry, and requires a token before publishing.
+  After successful `shutdown()`, a pending token completion is discarded without
+  changing tokens, diagnostics or publish scheduling. This also applies if the
+  provider closes the client and then throws. A refused shutdown leaves the
+  client live, so its pending completion still settles normally.
 
   ```lua
   token_provider = function(callback)
