@@ -8,9 +8,9 @@
 -- degrade gracefully to in-memory state for the process lifetime.
 --
 -- Records are namespaced per configured app identity
--- (`shardpilot.<workspace_id>.<app_id>`, segments sanitized) so two games on
--- the same device never share an anonymous ID or consent decision. The bare
--- `shardpilot` namespace is only used when no scope is configured.
+-- (workspace_id and app_id, reversibly byte-encoded). Identity, consent,
+-- analytics and crash records use the same construction. An app-only crash
+-- scope has an empty workspace segment, not a shared fallback.
 
 local clock = require "shardpilot.clock"
 local analytics_retry = require "shardpilot.analytics_retry"
@@ -33,39 +33,20 @@ local function clone(record)
 	return out
 end
 
-local function sanitize(value)
-	if type(value) ~= "string" or value == "" then
-		return nil
+-- Encode raw bytes without folding punctuation or case. The fixed field
+-- separators are outside the encoded alphabet, so scope tuples stay distinct
+-- on case-insensitive filesystems as well as in the in-process store.
+local function scope_segment(value)
+	if type(value) ~= "string" then
+		return ""
 	end
-	return (value:gsub("[^%w%-_]", "_"))
+	return (value:gsub(".", function(byte) return string.format("%02x", byte:byte()) end))
 end
 
 local function namespace(scope)
-	local workspace = sanitize(type(scope) == "table" and scope.workspace_id or nil)
-	local app = sanitize(type(scope) == "table" and scope.app_id or nil)
-	if workspace and app then
-		return "shardpilot." .. workspace .. "." .. app
-	end
-	return "shardpilot"
-end
-
--- A short, stable 32-bit hash of a string, returned as lowercase hex. Used to
--- disambiguate storage namespaces whose slugs would otherwise collide after the
--- sanitizer collapses disallowed characters to "_": two raw app ids like "com.game"
--- and "com_game" sanitize to the same slug but hash differently, so appending this
--- suffix keeps their per-app sidecars distinct.
---
--- This is a pure-arithmetic polynomial rolling hash (hash = hash * 131 + byte,
--- folded to 32 bits with a modulo) so it uses only features available on the
--- in-game Lua runtime — no bitwise operators. Every intermediate value stays well
--- within double-precision integer range: 2^32 * 131 + 255 < 2^53, so the
--- multiply-add never loses precision before the modulo folds it back to 32 bits.
-local function short_hash(value)
-	local hash = 2166136261
-	for i = 1, #value do
-		hash = (hash * 131 + value:byte(i)) % 4294967296
-	end
-	return string.format("%08x", hash)
+	local workspace = scope_segment(type(scope) == "table" and scope.workspace_id or nil)
+	local app = scope_segment(type(scope) == "table" and scope.app_id or nil)
+	return "shardpilot.w" .. workspace .. ".a" .. app
 end
 
 local function save_path(ns, file_name)
@@ -251,38 +232,8 @@ local function next_pending_token()
 		.. "-" .. suffix
 end
 
--- The per-app base namespace for the crash-plane records (the pending-crash
--- sidecar and the crash-reporting settings), keyed per app so two games on the
--- same device never share a queue or an opt-out decision, even when no
--- workspace scope is configured (the crash client carries only an app id).
--- Fall back to the shared namespace only when no app id is available at all.
-local function crash_scope_base(scope)
-	local app = sanitize(type(scope) == "table" and scope.app_id or nil)
-	local base = namespace(scope)
-	if app and base == "shardpilot" then
-		base = "shardpilot." .. app
-	end
-	-- The sanitized slug above collapses any disallowed character to "_", so two raw
-	-- app ids that differ only in such characters ("com.game" vs "com_game") would map
-	-- to the SAME crash namespace and let one app resend/remove another app's
-	-- report (or flip its opt-out). Append a short hash of the RAW (un-sanitized)
-	-- scope so those two ids get
-	-- distinct namespaces and per-app isolation holds. The hash is omitted only when no
-	-- app id is available at all (the shared fallback has nothing to disambiguate).
-	local raw_app = type(scope) == "table" and scope.app_id or nil
-	if type(raw_app) == "string" and raw_app ~= "" then
-		local raw_workspace = type(scope) == "table" and scope.workspace_id or nil
-		local fingerprint = raw_app
-		if type(raw_workspace) == "string" and raw_workspace ~= "" then
-			fingerprint = raw_workspace .. "\0" .. raw_app
-		end
-		base = base .. "." .. short_hash(fingerprint)
-	end
-	return base
-end
-
 local function pending_namespace(scope)
-	return crash_scope_base(scope) .. ".pending-crashes"
+	return namespace(scope) .. ".pending-crashes"
 end
 
 -- The fixed byte charge for a non-string scalar (number, boolean) and for a
@@ -735,7 +686,7 @@ end
 local crash_settings_memory = {}
 
 local function crash_settings_namespace(scope)
-	return crash_scope_base(scope) .. ".crash-settings"
+	return namespace(scope) .. ".crash-settings"
 end
 
 -- Load the crash-reporting settings record. Returns (record, err):
@@ -853,21 +804,9 @@ local function approx_envelope_bytes(envelope)
 	return total
 end
 
--- The spool is keyed by the same per-app namespace scheme as the identity
--- record, plus the short raw-scope hash (as the pending-crash sidecar does) so
--- two raw app ids that sanitize to the same slug still get distinct spools.
+-- Every record category uses the same raw workspace/app scope.
 local function spool_namespace(scope)
-	local base = namespace(scope)
-	local raw_workspace = type(scope) == "table" and scope.workspace_id or nil
-	local raw_app = type(scope) == "table" and scope.app_id or nil
-	if type(raw_app) == "string" and raw_app ~= "" then
-		local fingerprint = raw_app
-		if type(raw_workspace) == "string" and raw_workspace ~= "" then
-			fingerprint = raw_workspace .. "\0" .. raw_app
-		end
-		base = base .. "." .. short_hash(fingerprint)
-	end
-	return base
+	return namespace(scope)
 end
 
 -- Keep only entries that look like event envelopes (a table carrying a
@@ -1538,7 +1477,7 @@ end
 
 -- Load the retained consent receipts for this app (oldest first, possibly
 -- empty). The outbox shares the identity record's per-app namespace scheme
--- (plus the raw-scope hash, like the spool and the pending-crash sidecar).
+-- (the same byte-encoded raw scope as the spool and pending-crash sidecar).
 -- Never throws into game code.
 --
 -- THREE-VALUED, like load_consent_denial_marker and for the same reason.

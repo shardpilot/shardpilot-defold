@@ -3851,11 +3851,15 @@ local function test_legacy_bare_record_token_persisted()
 	end
 
 	local scope = { app_id = "legacy-app" }
-	-- Seed the on-disk store with a BARE legacy entry: items[1] is the prepared
-	-- report itself, with no { token, report } wrapper. The pending namespace carries
-	-- a short hash of the raw app id so two app ids that sanitize to the same slug
-	-- still get distinct sidecars; "631b4e26" is that hash for "legacy-app".
-	local ns = "shardpilot.legacy-app.631b4e26.pending-crashes"
+	-- Seed a bare record at the actual path chosen by the store. This tests
+	-- entry-shape adoption within the current namespace, not a path migration.
+	local ns
+	sys.get_save_file = function(application_id, file_name)
+		ns = application_id
+		return application_id .. "/" .. file_name
+	end
+	storage.load_pending_entries(scope)
+	assert_true(type(ns) == "string", "real pending path was resolved")
 	stores[ns .. "/identity"] = { items = { { exception = { type = "LEGACY" } } } }
 
 	-- First read adopts a token and writes it back.
@@ -4119,10 +4123,8 @@ end
 
 -- ── two app ids that sanitize to the same slug get distinct pending namespaces ─
 
--- The storage slug collapses any disallowed character to "_", so "com.game" and
--- "com_game" sanitize to the SAME slug. Without a collision-free namespace, one app
--- could resend/remove another app's pending report. A short hash of the RAW app id
--- must keep their per-app sidecars distinct.
+-- Raw app identifiers must remain distinct, including on case-insensitive
+-- filesystems, so one app cannot resend or remove another app's report.
 local function test_pending_namespace_collision_free()
 	reset()
 	storage.reset()
@@ -4163,18 +4165,8 @@ local function test_pending_namespace_collision_free()
 	end
 	assert_equal(#paths, 2, "the two colliding app ids must write to two distinct namespaces")
 
-	-- The two raw app ids sanitize to the SAME slug ("com_game"), so the only thing
-	-- keeping their sidecars apart is the appended hash suffix. Assert each path
-	-- carries an 8-hex suffix and that the two suffixes DIFFER — a hash that collapsed
-	-- "." and "_" to the same value (or any non-disambiguating hash) would fail here.
-	local suffixes = {}
-	for _, path in ipairs(paths) do
-		local suffix = path:match("%.com_game%.(%x%x%x%x%x%x%x%x)%.pending%-crashes/")
-		assert_true(type(suffix) == "string", "each pending namespace carries an 8-hex hash suffix")
-		suffixes[#suffixes + 1] = suffix
-	end
-	assert_not_equal(suffixes[1], suffixes[2],
-		"the two colliding app ids must hash to different namespace suffixes")
+	assert_not_equal(paths[1]:lower(), paths[2]:lower(),
+		"distinct raw scopes remain distinct on case-insensitive filesystems")
 
 	-- Removing app A's report must NOT touch app B's.
 	assert_true(storage.remove_pending_crash(scope_a, token_a))

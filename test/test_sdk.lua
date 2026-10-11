@@ -1802,12 +1802,14 @@ local function test_storage_uses_app_scoped_save_file()
 	end
 
 	local client = assert(sdk.new(config()))
-	local record = stores["shardpilot.workspace-example.app-example/identity"]
+	storage.load(config()) -- observe the selected durable path
+	local record = stores[namespaces[#namespaces] .. "/identity"]
 	assert_equal(type(record), "table", "identity must persist under the app-scoped namespace")
 	assert_equal(record.anonymous_id, client.anonymous_id)
 
 	local other = assert(sdk.new(config({ app_id = "app-other" })))
-	local other_record = stores["shardpilot.workspace-example.app-other/identity"]
+	storage.load(config({ app_id = "app-other" }))
+	local other_record = stores[namespaces[#namespaces] .. "/identity"]
 	assert_equal(type(other_record), "table")
 	assert_equal(other_record.anonymous_id, other.anonymous_id)
 	assert_not_equal(other.anonymous_id, client.anonymous_id)
@@ -1816,9 +1818,10 @@ local function test_storage_uses_app_scoped_save_file()
 	local sibling = assert(sdk.new(config()))
 	assert_equal(sibling.anonymous_id, client.anonymous_id)
 
-	-- scope segments are sanitized before reaching sys.get_save_file
+	-- scope segments are encoded before reaching sys.get_save_file
 	assert(sdk.new(config({ workspace_id = "ws/../evil", app_id = "app one" })))
-	assert_equal(type(stores["shardpilot.ws____evil.app_one/identity"]), "table")
+	storage.load({ workspace_id = "ws/../evil", app_id = "app one" })
+	assert_equal(type(stores[namespaces[#namespaces] .. "/identity"]), "table")
 	for _, application_id in ipairs(namespaces) do
 		assert_equal(application_id:find("/", 1, true), nil, "namespace must not contain path separators")
 		assert_equal(application_id:find("..", 1, true), nil, "namespace must not contain dot-dot")
@@ -16205,4 +16208,140 @@ end)()
  scene("capability control",function() assert_equal(require("shardpilot.sdk").supports("schema_revision_declaration"),false) end)
  print(string.format("Public handles: %d pass, %d fail",passed,failed))
  assert_equal(failed,0,"public handle scenes")
+end)()
+
+-- Token settlement and shared storage scope boundaries.
+;(function()
+ local passed, failed = 0, 0
+ local function scene(name, run)
+  reset(); storage.reset()
+  local original_sys = sys
+  local ok, err = pcall(run)
+  sys = original_sys; storage.reset()
+  if ok then passed=passed+1 else failed=failed+1 end
+  print("client-boundary "..name..": "..(ok and "PASS" or "FAIL "..tostring(err)))
+ end
+ for _, reply in ipairs({{"valid","synthetic-late-token",nil,nil},{"empty","",nil,nil},
+  {"error",nil,nil,"synthetic failure"},{"bad-expiry","synthetic-late-token","bad",nil}}) do
+  scene("closed token "..reply[1],function()
+   local held, calls
+   calls=0
+   local client=assert(require("shardpilot.client").new(config({token_provider=function(callback)calls=calls+1;held=callback end})))
+   client:refresh_token();assert_equal(calls,1,"real provider called");assert_equal(type(held),"function")
+   assert_true(client:shutdown());assert_equal(client.initialized,false)
+   local before=json.encode(client:snapshot());local wakes=0
+   client.wake_pending_publish_work=function()wakes=wakes+1 end
+   held(reply[2],reply[3],reply[4])
+   assert_equal(client.token,nil,"closed client must not install token")
+   assert_equal(client.token_expires_at_ms,nil,"closed client must not install expiry")
+   assert_equal(json.encode(client:snapshot()),before,"closed completion must not change diagnostics")
+   assert_equal(wakes,0,"closed completion must not wake work")
+   assert_equal(client.token_request_in_flight,false,"completion settles the in-flight marker")
+  end)
+ end
+ scene("live token control",function()
+  local held
+  local client=assert(require("shardpilot.client").new(config({token_provider=function(callback)held=callback end})))
+  client:refresh_token();held("synthetic-live-token",nil,nil)
+  assert_equal(client.token,"synthetic-live-token","live completion still installs")
+  assert_true(client:shutdown())
+ end)
+ for _, workspace in ipairs({"synthetic",false}) do
+ for _, durable in ipairs({false,true}) do
+  for _, pair in ipairs({{"com.game","com_game"},{"Game","game"},{"a/b","a_b"},{"a.b","a%2eb"}}) do
+   scene((workspace and "workspace " or "app-only ")..(durable and "durable " or "memory ")..pair[1].." / "..pair[2],function()
+    local records={}
+    sys={get_sys_info=function()return {system_name="Linux"} end}
+    if durable then
+     sys.get_save_file=function(ns,file)return string.lower(ns).."/"..file end
+     sys.save=function(path,record)records[path]=record;return true end
+     sys.load=function(path)return records[path] end
+    end
+    local a={workspace_id=workspace or nil,app_id=pair[1]};local b={workspace_id=workspace or nil,app_id=pair[2]}
+    assert_true(storage.save(a,{anonymous_id="synthetic-first",consent_analytics="granted"}))
+    if durable then storage.reset() end -- read the persisted record after clearing shadows
+    assert_equal(storage.load(b),nil,"distinct raw scopes must not inherit identity/consent")
+    assert_equal(storage.load(a).anonymous_id,"synthetic-first","same scope retains identity")
+   end)
+  end
+ end
+ end
+ for _, scope in ipairs({{workspace_id="synthetic/workspace",app_id="synthetic.game"},{app_id="synthetic.game"}}) do
+  scene("shared namespace "..(scope.workspace_id or "app-only"),function()
+   local current, paths={},{}
+   sys={get_save_file=function(ns,file)current[#current+1]=ns;return ns.."/"..file end,
+    save=function()return true end,load=function()return nil end}
+   for _, read in ipairs({"load","load_consent_denial_marker","load_spool","load_consent_outbox",
+    "load_remote_config","load_experiments","load_experiments_clear","load_withdrawn_facts",
+    "load_pending_crashes","load_crash_settings"}) do
+    current={};storage[read](scope);assert_true(#current>0,"real storage read: "..read)
+    paths[read]=current[1]:gsub("%.pending%-crashes$",""):gsub("%.crash%-settings$","")
+    assert_equal(paths[read],paths.load,"same raw scope for "..read)
+   end
+   assert_not_equal(paths.load,"shardpilot","app-only scope is not global")
+   assert_equal(paths.load:find("/",1,true),nil,"no path separators")
+   assert_equal(paths.load:find("..",1,true),nil,"no traversal")
+  end)
+ end
+
+ scene("failed shutdown token control",function()
+  seed_granted_consent();local held
+  local client=assert(require("shardpilot.client").new(config({spool_enabled=false,token_provider=function(cb)held=cb end})))
+  assert_true(client:session_start());assert_equal(client:shutdown(),false,"undelivered work keeps client live")
+  assert_equal(type(held),"function","real provider in flight")
+  held("synthetic-retry-token",nil,nil)
+  assert_equal(client.token,"synthetic-retry-token","retryable teardown still accepts completion")
+  assert_true(client:shutdown())
+ end)
+
+ for _, pair in ipairs({
+  {{workspace_id="tenant.one",app_id="app"},{workspace_id="tenant_one",app_id="app"}},
+  {{workspace_id="Tenant",app_id="app"},{workspace_id="tenant",app_id="app"}},
+  {{workspace_id="a",app_id="bc"},{workspace_id="ab",app_id="c"}},
+  {{workspace_id="a\0b",app_id="c"},{workspace_id="a",app_id="b\0c"}},
+ }) do
+  scene("scope framing "..pair[1].workspace_id.." / "..pair[2].workspace_id,function()
+   assert_true(storage.save(pair[1],{anonymous_id="synthetic-first",consent_analytics="granted"}))
+   assert_equal(storage.load(pair[2]),nil,"raw workspace/app tuple must remain distinct")
+  end)
+ end
+
+ scene("provider throws after closing client",function()
+  local client,before,wakes
+  wakes=0
+  client=assert(require("shardpilot.client").new(config({token_provider=function()
+   assert_true(client:shutdown());before=json.encode(client:snapshot())
+   error("synthetic provider failure after closure")
+  end})))
+  client.wake_pending_publish_work=function()wakes=wakes+1 end
+  assert_equal(client:refresh_token(),false)
+  assert_equal(client.initialized,false)
+  assert_equal(json.encode(client:snapshot()),before,"provider failure must not change closed diagnostics")
+  assert_equal(wakes,0,"provider failure must not wake closed work")
+  assert_equal(client.token_request_in_flight,false,"provider failure settles in-flight marker")
+ end)
+ scene("closed stale-epoch token",function()
+  local held
+  local client=assert(require("shardpilot.client").new(config({token_provider=function(callback)held=callback end})))
+  client:refresh_token();assert_equal(type(held),"function","real provider called")
+  assert_true(client:identify("synthetic-next-user"));assert_true(client:shutdown())
+  local before=json.encode(client:snapshot());local wakes=0
+  client.wake_pending_publish_work=function()wakes=wakes+1 end
+  held("synthetic-old-epoch-token",nil,nil)
+  assert_equal(client.token,nil);assert_equal(json.encode(client:snapshot()),before)
+  assert_equal(wakes,0,"stale completion must not wake closed work")
+  assert_equal(client.token_request_in_flight,false)
+ end)
+ scene("live provider exception control",function()
+  local calls=0
+  local client=assert(require("shardpilot.client").new(config({token_provider=function()
+   calls=calls+1;error("synthetic live provider failure")
+  end})))
+  assert_equal(client:refresh_token(),false);assert_equal(calls,1,"real provider called")
+  assert_equal(client:snapshot().last_error,"token_unavailable","live exception still records failure")
+  assert_equal(client.token_request_in_flight,false)
+  assert_true(client:shutdown())
+ end)
+ print(string.format("client-boundary total: %d pass, %d fail",passed,failed))
+ assert_equal(failed,0,"client-boundary scenes")
 end)()

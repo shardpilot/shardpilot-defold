@@ -4120,6 +4120,11 @@ function Client:refresh_token()
 	local epoch = self.token_epoch
 	local ok, err = pcall(self.config.token_provider, function(new_token, new_expires_at, callback_error)
 		self.token_request_in_flight = false
+		-- Closed clients settle the request without installing or waking work.
+		-- A refused shutdown leaves the client initialized for a retry.
+		if not self.initialized then
+			return
+		end
 		if epoch ~= self.token_epoch then
 			-- DISCARDED, not failed: identify() moved the identity while this
 			-- mint was in flight, so the token vouches for the previous actor
@@ -4189,7 +4194,10 @@ function Client:refresh_token()
 	end)
 	if not ok then
 		self.token_request_in_flight = false
-		self:fail_token_settlement()
+		-- A synchronous provider may close the client before it throws.
+		if self.initialized then
+			self:fail_token_settlement()
+		end
 		return false
 	end
 	return self.token ~= nil

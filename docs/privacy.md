@@ -26,9 +26,13 @@ an unreadable trail; plus,
 once a run with `experiments_enabled` has minted one, the SDK-minted
 experiment subject id (`spcid_…`) — is
 written through
-`sys.get_save_file("shardpilot.<workspace_id>.<app_id>", "identity")`
-(segments sanitized) with `sys.save`/`sys.load`. The per-app namespace keeps
-two games on the same device from sharing an anonymous ID or consent record.
+`sys.get_save_file("shardpilot.w<workspace-hex>.a<app-hex>", "identity")`
+with `sys.save`/`sys.load`. Each raw identifier byte becomes two lowercase hex
+digits; punctuation and case stay distinct even on a case-insensitive filesystem.
+Every record category uses this base, with separate filenames or category suffixes.
+An app-only crash scope uses an empty workspace segment. The storage-path format
+changes here; records under earlier namespaces are not imported. Backend path
+limits and write failures still use the storage failure behavior described below.
 When the Defold `sys` API is unavailable, the record degrades to in-memory
 state for the process lifetime.
 
