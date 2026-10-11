@@ -2,6 +2,14 @@
 
 ### Unreleased
 
+- Public `track()` refuses reserved event names with `reserved_event_name` and
+  empty or ASCII-whitespace-only names with `event_name_required`. Each name
+  refusal counts one drop, records the diagnostic, and sends nothing. Matching
+  trims ASCII whitespace, removes one leading `app.`, and is case-sensitive;
+  the wire keeps the same trim without folding Unicode whitespace. Migrate
+  direct session, ad-revenue and experiment event calls to their typed methods;
+  ordinary custom events remain available. See [reserved names](docs/events.md#reserved-names).
+
 - Remote-config fetches omit the anonymous ID and targeting attributes under
   unknown, denied and forced-minor consent. Granted requests keep per-client
   bucketing; host user IDs are never sent. Identifier-free cache values and

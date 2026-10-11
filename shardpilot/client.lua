@@ -3150,7 +3150,7 @@ function Client:session_end(reason)
 	if type(reason) ~= "string" or reason == "" then
 		reason = "session_end"
 	end
-	local ok, err = self:track("app.session_ended", { reason = reason })
+	local ok, err = self:enqueue_event("app.session_ended", { reason = reason })
 	if not ok then
 		return false, err
 	end
@@ -3414,8 +3414,8 @@ local function valid_unsigned_32(value)
 	return is_integer(value) and value >= 0 and value <= MAX_LEVEL_UNSIGNED_32
 end
 
--- Typed validation ends before enqueue_event. Count only those refusals here;
--- delegated delivery/consent/queue refusals already own their accounting.
+-- Count each intake or typed-validation refusal once. Delegated delivery,
+-- consent and queue refusals already own their accounting.
 function Client:_record_refusal(code)
 	self.stats.dropped = self.stats.dropped + 1
 	self.stats.last_error = code
@@ -3622,11 +3622,19 @@ function Client:track_ad_impression_revenue(
 			end
 		end
 	end
-	return self:track("ad_impression_revenue", out)
+	return self:enqueue_event("ad_impression_revenue", out)
 end
 
+local reserved_event_names = {
+	experiment_exposure = true, experiment_outcome = true,
+	governed_action_result = true, app_runtime_ping = true,
+	monitor_evaluation_recorded = true, llm_usage = true,
+	support_assistant_feedback = true, ad_impression_revenue = true,
+	session_started = true, session_ended = true,
+}
+
 function Client:track(event_name, props, context)
-	return self:enqueue_event(event_name, props, context, nil)
+	return self:enqueue_event(event_name, props, context, nil, true)
 end
 
 -- The shared enqueue path behind track() and the SDK-internal experiment
@@ -3684,14 +3692,10 @@ function Client:open_owed_session(fact)
 	return true
 end
 
-function Client:enqueue_event(event_name, props, context, fact)
+function Client:enqueue_event(event_name, props, context, fact, host_event)
 	if not self.initialized then
 		self.stats.dropped = self.stats.dropped + 1
 		return false, "shutdown"
-	end
-	if type(event_name) ~= "string" or event_name == "" then
-		self.stats.dropped = self.stats.dropped + 1
-		return false, "event_name_required"
 	end
 	if consent_denied_state(self.consent_state) then
 		self.stats.dropped = self.stats.dropped + 1
@@ -3706,6 +3710,21 @@ function Client:enqueue_event(event_name, props, context, fact)
 	if self.consent_state ~= "granted" then
 		self.stats.dropped = self.stats.dropped + 1
 		return false, "consent_unknown"
+	end
+	-- Keep ASCII-only normalization identical at admission and on the wire.
+	-- Only public track calls reject owned names; typed producers bypass that
+	-- predicate while retaining all lifecycle, consent and delivery gates.
+	if type(event_name) == "string" then
+		event_name = event_name:match("^[ \t\n\v\f\r]*(.-)[ \t\n\v\f\r]*$")
+	end
+	if type(event_name) ~= "string" or event_name == "" then
+		return self:_record_refusal("event_name_required")
+	end
+	if host_event then
+		local name = event_name:gsub("^app%.", "", 1)
+		if reserved_event_names[name] then
+			return self:_record_refusal("reserved_event_name")
+		end
 	end
 	if not valid_identity(self.user_id) and not valid_identity(self.anonymous_id) then
 		self.stats.dropped = self.stats.dropped + 1

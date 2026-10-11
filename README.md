@@ -109,6 +109,12 @@ not the platform boundary.
   `granted`, and fails closed (no variant served) until experiments are
   enabled server-side for your app. See [Experiments](#experiments).
 
+Public `track()` refuses reserved names with `false, "reserved_event_name"` and
+empty or ASCII-whitespace-only names with `false, "event_name_required"`.
+Each name refusal counts one drop and sends nothing. Use the typed session,
+ad-revenue and experiment methods for their owned events; see
+[reserved names and matching rules](docs/events.md#reserved-names).
+
 ## Installation
 
 `game.project` exposes only the SDK folder as a Defold library:
