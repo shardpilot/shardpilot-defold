@@ -40,6 +40,28 @@ the events batched alongside it are stored. Only a batch in which every event is
 unregistered is a whole-batch `400`. Either way the event produces no fact, so
 this list being accurate is not documentation hygiene.
 
+## Reserved names
+
+Public `track()` refuses SDK-owned and runtime-only names with
+`false, "reserved_event_name"`: `experiment_exposure`, `experiment_outcome`,
+`governed_action_result`, `app_runtime_ping`, `monitor_evaluation_recorded`,
+`llm_usage`, `support_assistant_feedback`, `ad_impression_revenue`,
+`session_started` and `session_ended`.
+
+Matching trims ASCII whitespace, removes exactly one leading `app.`, then
+compares case-sensitively. Empty or ASCII-whitespace-only names return
+`false, "event_name_required"`. Each name refusal increments `dropped` once,
+sets `last_error`, and reaches neither the queue, spool nor transport. Shutdown
+and consent refusals take precedence. Admitted names use the same ASCII trim
+on the wire; Unicode whitespace is preserved.
+
+Use `session_start()` / `session_end()`, `track_ad_impression_revenue()` and
+the experiment methods for their owned events. These typed producers retain
+their existing behavior. Ordinary names, including `app.screen_view`,
+`level_start`, `level_complete`, `level_fail`, `perf_summary`, `network_summary`,
+`purchase` and `economy_tx`, remain available to `track()`. Local admission does
+not guarantee acceptance by the server schema.
+
 ## Session end reasons
 
 **New in `v0.11.0`:** `session_end([reason])`, on a client or the module singleton,

@@ -15872,3 +15872,118 @@ end)()
 	print(string.format("Session replacement: %d passed, %d failed", passed, failed))
 	assert_equal(failed, 0, "session replacement failures")
 end)()
+
+-- Public names are refused before queue, spool or session work; typed producers
+-- keep their dedicated admission path. Exercise the client and facade APIs.
+;(function()
+	local scenes = {}
+	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
+	local function fresh(api, run, consent)
+		reset(); storage.reset()
+		local _, restore = install_stub_sys_storage()
+		local facade = dofile("shardpilot/sdk.lua")
+		local client = assert(facade[api](config()))
+		local function call(name, ...)
+			if api == "new" then return client[name](client, ...) end
+			return facade[name](...)
+		end
+		local ok, err = pcall(function()
+			if consent ~= "unknown" then
+				next_status = 200; next_response_body = '{"recorded":true,"replayed":false}'
+				assert_true(call("set_consent", consent ~= "denied"))
+			end
+			reset()
+			run(call)
+		end)
+		restore(); storage.reset(); assert_true(ok, err)
+	end
+	local reserved = {
+		"experiment_exposure", "experiment_outcome", "governed_action_result",
+		"app_runtime_ping", "monitor_evaluation_recorded", "llm_usage",
+		"support_assistant_feedback", "ad_impression_revenue", "session_started", "session_ended",
+	}
+	local names = {}
+	for _, name in ipairs(reserved) do
+		for _, spelling in ipairs({ name, "app." .. name, " \t\n\v\f\rapp." .. name .. "\r\n\v\f\t " }) do
+			names[#names + 1] = { spelling, "reserved_event_name" }
+		end
+	end
+	for _, name in ipairs({ "", " ", "\t\r\n\v\f" }) do
+		names[#names + 1] = { name, "event_name_required" }
+	end
+	for _, name in ipairs({
+		"ordinary_control", "app.screen_view", "level_start", "level_complete", "level_fail",
+		"perf_summary", "network_summary", "purchase", "economy_tx", "Session_started",
+		"APP.session_started", "app.app.session_started", "app. session_started", "session_started_suffix",
+		"\194\160session_started\194\160",
+	}) do names[#names + 1] = { name, nil, name } end
+	names[#names + 1] = { "\t ordinary_control \r\n", nil, "ordinary_control" }
+	for _, api in ipairs({ "new", "init" }) do
+		for i, entry in ipairs(names) do
+			scene(api .. " name " .. i, function()
+				fresh(api, function(call)
+					local before = call("snapshot")
+					local session = call("get_session_id")
+					local ok, code = call("track", entry[1], { probe = true })
+					if entry[2] then
+						assert_equal(ok, false, "reserved/empty name must be refused")
+						assert_equal(code, entry[2], "stable name refusal")
+						assert_equal(call("get_session_id"), session, "refusal must not open a session")
+						local after = call("snapshot")
+						assert_equal(after.dropped - before.dropped, 1, "one dropped event")
+						assert_equal(after.last_error, entry[2], "name diagnostic")
+						assert_equal(after.enqueued, before.enqueued, "refusal must not queue")
+						assert_equal(after.spooled, before.spooled, "refusal must not spool")
+						call("flush")
+						assert_equal(#requests, 0, "refusal must not send")
+						assert_equal(call("snapshot").failed_batches, before.failed_batches, "not a failed batch")
+					else
+						assert_true(ok, code)
+						call("flush")
+						assert_equal(#requests, 1, "ordinary event must reach transport")
+						local events = json.decode(requests[1].body).events
+						assert_equal(#events, 1)
+						assert_equal(events[1].event_name, entry[3], "exact normalized wire name")
+						assert_equal(call("snapshot").dropped, before.dropped)
+					end
+				end)
+			end)
+		end
+		for _, consent in ipairs({ "unknown", "denied" }) do
+			scene(api .. " consent " .. consent, function()
+				fresh(api, function(call)
+					for _, name in ipairs({ "app.session_started", " \t\r\n" }) do
+						local before = call("snapshot")
+						local ok, code = call("track", name)
+						assert_equal(ok, false); assert_equal(code, "consent_" .. consent)
+						assert_equal(call("snapshot").dropped - before.dropped, 1)
+					end
+					call("flush"); assert_equal(#requests, 0)
+				end, consent)
+			end)
+		end
+		scene(api .. " typed session", function()
+			fresh(api, function(call)
+				assert_true(call("session_start")); assert_true(call("session_end", "control"))
+				call("flush"); local events = json.decode(requests[1].body).events
+				assert_equal(#events, 2); assert_equal(events[1].event_name, "app.session_started")
+				assert_equal(events[2].event_name, "app.session_ended")
+			end)
+		end)
+		scene(api .. " typed ad revenue", function()
+			fresh(api, function(call)
+				assert_true(call("track_ad_impression_revenue", "impression-control", "network", 25, "USD"))
+				call("flush"); local events = json.decode(requests[1].body).events
+				assert_equal(#events, 1); assert_equal(events[1].event_name, "ad_impression_revenue")
+			end)
+		end)
+	end
+	local passed, failed = 0, 0
+	for _, entry in ipairs(scenes) do
+		local ok, err = pcall(entry.run)
+		if ok then passed = passed + 1 else failed = failed + 1 end
+		print("event name " .. entry.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	print(string.format("Event name admission: %d passed, %d failed", passed, failed))
+	assert_equal(failed, 0, "event name admission failures")
+end)()
