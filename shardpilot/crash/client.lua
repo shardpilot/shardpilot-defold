@@ -1247,6 +1247,5 @@ function Client:shutdown()
 	return true
 end
 
-M.Client = Client
 
 return M

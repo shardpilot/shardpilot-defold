@@ -196,7 +196,7 @@ json = {
 	decode = json_decode,
 }
 
-local sdk = require "shardpilot.sdk"
+local sdk = require("test.inspect_client").wrap(require "shardpilot.sdk")
 local remote_config = require "shardpilot.remote_config"
 local storage = require "shardpilot.storage"
 

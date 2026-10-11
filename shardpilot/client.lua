@@ -7263,6 +7263,5 @@ function Client:snapshot()
 end
 
 
-M.Client = Client
 
 return M

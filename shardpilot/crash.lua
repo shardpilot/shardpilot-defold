@@ -6,14 +6,30 @@
 -- (POST {crash_url}/api/v1/crashes/ingest) with a `crash:write` API key
 -- and the crash report JSON body — they are NEVER wrapped as a `mobile_crash`
 -- analytics event. A fatal report is ALWAYS sent (never sampled).
+local facade = require "shardpilot.internal.facade"
 local client_mod = require "shardpilot.crash.client"
 
 local M = {}
 local default_client = nil
 
+local instance_methods = {
+	record_breadcrumb = 1,
+	set_enabled = 1,
+	is_enabled = 0,
+	emit = 1,
+	emit_fatal = 1,
+	capture_previous = 1,
+	resend_pending = 0,
+	snapshot = 0,
+	shutdown = 0,
+}
+
 function M.new(config)
-	return client_mod.new(config)
+	local client, err = client_mod.new(config)
+	if not client then return nil, err end
+	return facade.new(client, instance_methods)
 end
+
 
 function M.init(config)
 	local client, err = client_mod.new(config)

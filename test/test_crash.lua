@@ -207,7 +207,7 @@ json = {
 	decode = json_decode,
 }
 
-local crash = require "shardpilot.crash"
+local crash = require("test.inspect_client").wrap(require "shardpilot.crash")
 local crash_client = require "shardpilot.crash.client"
 local sanitize = require "shardpilot.crash.sanitize"
 local event_mod = require "shardpilot.crash.event"

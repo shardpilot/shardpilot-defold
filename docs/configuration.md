@@ -115,6 +115,16 @@ Previously persisted envelopes/consent are not migrated or repaired, and crash
 and remote-config paths are outside this change. The rule therefore does not
 guarantee UTF-8 validity for every SDK request or repair an old corrupted identity.
 
+## Instance handles
+
+`new(config)` returns a handle exposing the documented module operations with
+colon-call syntax. Configuration, queues, tokens, module consumers and class
+tables are private implementation state. `snapshot()` and other value reads
+return their documented values; callers cannot change the client by editing a
+snapshot. The handle accepts the same arguments as its module counterparts,
+including `flush()` without internal options. This API boundary is not a Lua
+sandbox against `debug` or direct loading of implementation files.
+
 ## One client per app
 
 The SDK supports **one live client per app** in a process. An app is the

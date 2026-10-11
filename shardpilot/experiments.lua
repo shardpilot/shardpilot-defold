@@ -3765,6 +3765,4 @@ function Experiments:track_outcome(experiment_key, outcome_key, outcome_value)
 	return true
 end
 
-M.Experiments = Experiments
-
 return M

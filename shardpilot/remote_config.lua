@@ -851,6 +851,4 @@ function RemoteConfig:get_version()
 	return self.version
 end
 
-M.RemoteConfig = RemoteConfig
-
 return M

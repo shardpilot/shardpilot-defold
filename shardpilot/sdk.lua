@@ -1,3 +1,4 @@
+local facade = require "shardpilot.internal.facade"
 local client_mod = require "shardpilot.client"
 
 local M = {}
@@ -41,9 +42,53 @@ function M.supports(capability)
 	return capabilities[capability] == true
 end
 
+local instance_methods = {
+	identify = 1,
+	set_anonymous_id = 1,
+	get_session_id = 0,
+	get_anonymous_id = 0,
+	get_consent_state = 0,
+	set_consent = 2,
+	fetch_remote_config = 1,
+	set_remote_config_attributes = 1,
+	remote_config_value = 1,
+	remote_config_string = 2,
+	remote_config_number = 2,
+	remote_config_boolean = 2,
+	remote_config_values = 0,
+	remote_config_version = 0,
+	fetch_experiment_assignment = 3,
+	fetch_experiment_assignment_with_age_band = 4,
+	experiment_variant = 1,
+	experiment_payload = 1,
+	apply_experiment_variant = 1,
+	track_exposure = 1,
+	track_outcome = 3,
+	session_start = 1,
+	session_end = 1,
+	screen_view = 2,
+	track = 3,
+	track_level_start = 3,
+	track_level_complete = 5,
+	track_level_fail = 5,
+	track_ad_impression_revenue = 8,
+	update = 1,
+	observe_ping_ms = 1,
+	observe_disconnect = 1,
+	flush = 0,
+	on_window_event = 1,
+	persist = 0,
+	shutdown = 1,
+	get_rejections = 0,
+	snapshot = 0,
+}
+
 function M.new(config)
-	return client_mod.new(config)
+	local client, err = client_mod.new(config)
+	if not client then return nil, err end
+	return facade.new(client, instance_methods)
 end
+
 
 function M.init(config)
 	if default_client or initializing then

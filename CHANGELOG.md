@@ -2,6 +2,9 @@
 
 ### Unreleased
 
+- Analytics and crash instances expose only documented operations. Implementation
+  state and class tables stay private; `flush()` has no private options.
+
 - Host configuration uses explicit credential, origin and duration names with
   no aliases. Unknown old keys are refused before callbacks or storage work.
   `remote_config_enabled` defaults to `false`: an application origin alone no

@@ -192,7 +192,7 @@ json = {
 	decode = json_decode,
 }
 
-local sdk = require "shardpilot.sdk"
+local sdk = require("test.inspect_client").wrap(require "shardpilot.sdk")
 local sampling = require "shardpilot.sampling"
 local platform = require "shardpilot.platform"
 local storage = require "shardpilot.storage"
@@ -14118,7 +14118,7 @@ end)()
 		local stores, clients, paths = {}, {}, {}
 		local core = require "shardpilot.client"
 		local real_new = core.new
-		local facade = dofile("shardpilot/sdk.lua")
+		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local function cfg(app, hook)
 			return config({ app_id = app, anonymous_id = app .. "-actor", diagnostics = hook })
 		end
@@ -14545,7 +14545,7 @@ end)()
 	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
 	local function fresh(run)
 		reset(); storage.reset()
-		local facade = dofile("shardpilot/sdk.lua")
+		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local core = require "shardpilot.client"
 		local real_new, real_load, calls = core.new, storage.load, 0
 		core.new = function(...)
@@ -14674,7 +14674,7 @@ end)()
 	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
 	local function fresh(run)
 		reset(); storage.reset()
-		local facade = dofile("shardpilot/sdk.lua")
+		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local options = config({ app_id = "synthetic-consent-getter", anonymous_id = "synthetic-reader" })
 		local ok, err = pcall(run, facade, options)
 		storage.reset()
@@ -14746,9 +14746,9 @@ end)()
 			local ok, code, warning = client:set_consent(false)
 			storage.clear_spool = real_clear
 			assert_equal(ok, true); assert_equal(code, nil); assert_equal(warning, "spool_purge_failed")
-			assert_true(client.spool_purge_pending, "real denial retains purge debt")
+			assert_true(require("test.inspect_client").state(client).spool_purge_pending, "real denial retains purge debt")
 			read_only(function() return client:get_consent_state() end, "denied")
-			assert_true(client.spool_purge_pending, "getter does not settle purge debt")
+			assert_true(require("test.inspect_client").state(client).spool_purge_pending, "getter does not settle purge debt")
 		end)
 	end)
 	scene("retryable shutdown retains the current facade state", function()
@@ -14786,7 +14786,7 @@ end)()
 		for _, key in ipairs({ "save", "clear_spool", "save_consent_outbox", "save_consent_denial_marker" }) do
 			saved[key] = storage[key]
 		end
-		local facade = dofile("shardpilot/sdk.lua")
+		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local options = config({ app_id = "synthetic-consent-results", anonymous_id = "synthetic-actor" })
 		if mode == "publishable" then options.token_provider = nil; options.publishable_key = "sp_ingest_synthetic" end
 		local ok, err = pcall(function()
@@ -15624,7 +15624,7 @@ end)()
 	local function fresh(api, options, run, consent)
 		reset(); storage.reset()
 		local _, restore = install_stub_sys_storage()
-		local facade = dofile("shardpilot/sdk.lua")
+		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local client = assert(facade[api](config(options)))
 		local function call(name, ...)
 			if api == "new" then return client[name](client, ...) end
@@ -15792,7 +15792,7 @@ end)()
 	local function fresh(api, run, consent)
 		reset(); storage.reset()
 		local _, restore = install_stub_sys_storage()
-		local facade = dofile("shardpilot/sdk.lua")
+		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local client = assert(facade[api](config()))
 		local function call(name, ...)
 			if api == "new" then return client[name](client, ...) end
@@ -16139,4 +16139,70 @@ end)()
 	end
 	print(string.format("Schema surface: %d passed, %d failed", passed, failed))
 	assert_equal(failed, 0, "schema surface failures")
+end)()
+
+
+-- Public instance handles expose only the documented operations.
+;(function()
+ local passed, failed = 0, 0
+ local function scene(name, run)
+  reset(); storage.reset()
+  local original_sys = sys
+  local ok, err = pcall(run)
+  sys = original_sys; storage.reset()
+  if ok then passed=passed+1 else failed=failed+1 end
+  print("client-boundary "..name..": "..(ok and "PASS" or "FAIL "..tostring(err)))
+ end
+ for _, kind in ipairs({"analytics", "crash"}) do
+  scene(kind.." public handle", function()
+   local public = require(kind=="analytics" and "shardpilot.sdk" or "shardpilot.crash")
+   local cfg = kind=="analytics" and config() or {
+    crash_url="http://localhost:8086", crash_key="synthetic-crash-key", app_id="synthetic"}
+   local client=assert(public.new(cfg))
+   assert_true(client.config==nil and client.stats==nil and client.remote_config==nil and client.experiments==nil,
+    "implementation state must not escape")
+   assert_true(getmetatable(client)==nil, "no implementation metatable")
+   local count=0
+   for name in pairs(client) do
+    assert_true(type(client[name])=="function" and type(public[name])=="function", "supported operations only: "..name)
+    assert_true(name~="new" and name~="init" and name~="supports", "instance operations only")
+    count=count+1
+   end
+   local expected=0
+   for name,value in pairs(public) do
+    if type(value)=="function" and name~="new" and name~="init" and name~="supports" then
+     assert_equal(type(client[name]),"function","missing public operation: "..name);expected=expected+1
+    end
+   end
+   assert_equal(count,expected,"complete public operation census")
+   local snapshot=client:snapshot();snapshot.last_error="synthetic mutation"
+   assert_not_equal(client:snapshot().last_error,"synthetic mutation","snapshot is a value")
+   assert_true(client:shutdown())
+  end)
+ end
+ for _, module in ipairs({{"shardpilot.client","Client"},{"shardpilot.crash.client","Client"},
+  {"shardpilot.experiments","Experiments"},{"shardpilot.remote_config","RemoteConfig"}}) do
+  scene(module[1].." class private",function() assert_equal(require(module[1])[module[2]],nil,"implementation class not exported") end)
+ end
+ scene("public flush ignores implementation options",function()
+  seed_granted_consent()
+  local client=assert(require("shardpilot.sdk").new(config()))
+  assert_true(client:session_start());client:observe_ping_ms(25)
+  assert_true(client:flush({include_summaries=false}))
+  local found=false
+  for _, request in ipairs(requests) do if request.body and request.body:find('"network_summary"',1,true) then found=true end end
+  assert_true(found,"public flush includes summaries regardless of private options")
+  assert_true(client:shutdown())
+ end)
+ for _, kind in ipairs({"analytics", "crash"}) do
+  scene(kind.." unknown-key control", function()
+   local module=require(kind=="analytics" and "shardpilot.sdk" or "shardpilot.crash")
+   local cfg=kind=="analytics" and config() or {crash_url="http://localhost:8086",crash_key="synthetic-crash-key",app_id="synthetic"}
+   cfg.synthetic_unknown=true
+   local client,err=module.new(cfg);assert_equal(client,nil);assert_equal(err,"unknown_config_key")
+  end)
+ end
+ scene("capability control",function() assert_equal(require("shardpilot.sdk").supports("schema_revision_declaration"),false) end)
+ print(string.format("Public handles: %d pass, %d fail",passed,failed))
+ assert_equal(failed,0,"public handle scenes")
 end)()
