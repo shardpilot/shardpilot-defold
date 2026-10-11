@@ -217,8 +217,9 @@ them.
   **depth-bounded copy of the variant payload** — structurally identical to
   what the server sent down to 16 levels of nesting, below which subtrees are
   truncated and never reach disk, so an at-rest audit should not expect a
-  deeper subtree to be present — the `version`, the `assignment_unit`, the
-  fetch timestamp, and — this is the part worth reviewing — the **normalized
+  deeper subtree to be present — the `version`, its exact wire spelling, the
+  `assignment_unit`, the fetch timestamp, `served_revision` (exact wire spelling),
+  `served_kill_gate`, `served_at`, and — this is the part worth reviewing — the **normalized
   targeting attributes and age declarations the assignment was evaluated under**.
   These come from the host's `fetch_experiment_assignment` attributes or
   `fetch_experiment_assignment_with_age_band` declaration and attributes: `geo`,
@@ -242,7 +243,8 @@ them.
   record also keeps a `fact_key_history` section: per experiment, the
   server-minted `subject_fact_key` values of the player's earlier assignments
   (a republished version rotates the key; a kill switch removes the
-  assignment) for as long as an undelivered fact still carries one, so a
+  assignment), including a new attribution key returned by apply, for as long
+  as an undelivered fact still carries one, so a
   later `age_ineligible` refusal can withdraw those facts too. A key leaves
   the section once its last fact is delivered, dropped or withdrawn.
   A fetch declaring a non-adult age that ends without the server's answer

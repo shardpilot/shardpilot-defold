@@ -247,6 +247,12 @@ function M.experiment_payload(experiment_key)
 	return client:experiment_payload(experiment_key)
 end
 
+function M.apply_experiment_variant(experiment_key)
+	local client = default()
+	if not client then return nil, "not_initialized" end
+	return client:apply_experiment_variant(experiment_key)
+end
+
 function M.track_exposure(experiment_key)
 	return with_default("track_exposure", experiment_key)
 end

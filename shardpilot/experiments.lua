@@ -19,7 +19,7 @@
 -- flag-flip registry preconditions, not by this module.
 --
 -- Wire contract (assignment fetch):
---   GET {remote_config_url}/api/v1/runtime/experiments/assignment
+--   GET {remote_config_url}/api/cp/v1/runtime/experiments/assignment
 --     ?app_key=&environment_key=&experiment_key=&subject_key=&<attributes>
 --   Authorization: Bearer <publishable api_key>   (same credential as the
 --   remote-config fetch; the endpoint requires the experiment-assignment
@@ -37,8 +37,8 @@
 --     "targeting_unmatched" (may change when attributes change),
 --     "kill_switch" (operator kill), "age_ineligible" (no eligible adult
 --     declaration). All four drop the cached assignment
---     for the experiment; a kill additionally guarantees no exposure is
---     emitted for it. An age refusal also WITHDRAWS the subject's owed
+--     for the experiment; a kill stops new applications. An age refusal
+--     also WITHDRAWS the subject's owed
 --     applications for the experiment — owed exposures and every fact
 --     accepted but not yet delivered — where the other three keep them
 --     (see apply_age_withdrawal). A host fetch that DECLARES a non-adult age
@@ -77,8 +77,8 @@
 -- fetch needs it, validated against the wire grammar on load, and re-minted
 -- only on storage loss/corruption (re-bucketing, same as a fresh install).
 -- It is NOT the anonymous id (the remote-config identity is unchanged), and
--- it egresses ONLY as the assignment fetch's subject_key — never in
--- analytics events, in any props, or as an envelope identity.
+-- it egresses ONLY to the configured remote-config host as subject_key in assignment and apply
+-- requests — never in analytics events, props or envelope identity.
 --
 -- Consent posture (assignment plane): fetches are GRANTED-ONLY — while
 -- analytics consent is unknown or denied (either denial flavor, including
@@ -96,31 +96,24 @@
 --
 -- Exposure lane (analytics plane): `experiment_exposure` facts ride the
 -- normal event pipeline (queue → batch → spool → consent gates) with the
--- strict server-side props allowlist. Emission timing is a PROPOSED SDK
--- convention pending platform ratification: at most once per
--- (experiment_key, experiment_version, subject) per session, emitted when
--- the assigned variant is first applied (a fresh fetch resolution, or the
--- first tick serving a cache-restored assignment), with a deterministic
--- event_id so at-least-once retries collapse server-side as duplicates.
--- `track_exposure` is the explicit re-arm escape hatch (a re-arm mints a
--- distinct deterministic id). The `assignment_key` prop carries the
--- server-minted subject-fact key VERBATIM for client_id-unit assignments
--- (the raw subject id is structurally rejected there) and the subject key
--- for synthetic-unit ones. NOTE: the server may reject these event names
--- from game-embedded publishable keys; an emitted exposure then comes back
--- as a per-event reject, surfaced through diagnostics and tolerated silently
--- otherwise. That server-side block is load-bearing and this SDK
--- deliberately relies on it staying authoritative.
+-- strict server-side props allowlist.
+-- Explicit application records exposure once per (experiment, version, subject,
+-- session). Fetch/getter/restore never applies. Owed applications pin serving
+-- inputs, then become byte-preserved signed facts after the apply hop.
+-- The existing analytics lane carries the sealed fact and analytics identity.
+-- Raw subject identity stays on the configured remote-config host.
 
 local clock = require "shardpilot.clock"
 local id = require "shardpilot.id"
 local random = require "shardpilot.random"
-local sha1 = require "shardpilot.sha1"
 local storage = require "shardpilot.storage"
+
+local facts = require "shardpilot.experiment_facts"
+local experiment_http = require "shardpilot.experiment_http"
 
 local M = {}
 
-local assignment_route = "/api/v1/runtime/experiments/assignment"
+local assignment_route = "/api/cp/v1/runtime/experiments/assignment"
 
 local scope_separator = "\31"
 
@@ -178,7 +171,7 @@ local function escape_component(value)
 end
 
 -- Pure-arithmetic 32-bit rolling hash (shared by the credential fingerprint
--- and the deterministic exposure event id below).
+-- and attribution tuples).
 local function hash32(text, seed, mult)
 	local hash = seed
 	for i = 1, #text do
@@ -608,7 +601,7 @@ end
 
 -- The positive wire grammar for an experiment version: a positive, finite
 -- integer. The version drives the exposure de-dupe tuple and the
--- deterministic event ids, so a garbled value — negative, fractional, NaN —
+-- attribution inputs, so a garbled value — negative, fractional, NaN —
 -- must read as MALFORMED: it never installs, and it never executes the
 -- not-assigned path's authoritative durable drop on garbage input (the
 -- closed-vocabulary rule, applied to the version field).
@@ -624,7 +617,7 @@ end
 -- `"app_key": null` inside a variant payload can never read as a malformed
 -- top-level scope echo. Deterministic plain-Lua chars walk — identical on
 -- every interpreter.
-local function top_level_projection(body)
+local function top_level_projection(body, nested_value)
 	if type(body) ~= "string" then
 		return ""
 	end
@@ -654,6 +647,8 @@ local function top_level_projection(body)
 			depth = depth + 1
 			if depth == 1 then
 				out[#out + 1] = ch
+			elseif depth == 2 and nested_value then
+				out[#out + 1] = nested_value
 			end
 		elseif ch == "}" or ch == "]" then
 			if depth == 1 then
@@ -769,11 +764,27 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 				return serve_entry_or_fail(entry, "malformed_response",
 					requested_attributes), { transient = true }
 			end
+			local _, fields = facts.object(top_level_projection(body_text, "null"))
+			if not fields then
+				return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
+			end
+			local has_pins = fields.served_revision or fields.served_kill_gate or fields.served_at
+			local version_wire = fields and facts.integer(fields.version, 1)
+			local revision_wire = fields and facts.integer(fields.served_revision, 0)
+			if has_pins and (not version_wire or not revision_wire
+				or type(decoded.served_kill_gate) ~= "boolean"
+				or type(decoded.served_at) ~= "string" or decoded.served_at == "") then
+				return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
+			end
 			local new_entry = {
 				assignment_key = decoded.assignment_key,
 				variant_key = decoded.variant_key,
 				variant_payload = copy_value(decoded.variant_payload, 0),
 				version = decoded.version,
+				version_wire = version_wire,
+				served_revision_wire = revision_wire,
+				served_kill_gate = decoded.served_kill_gate,
+				served_at = decoded.served_at,
 				assignment_unit = assignment_unit,
 				subject_fact_key = valid_subject_fact_key(decoded.subject_fact_key)
 					and decoded.subject_fact_key or nil,
@@ -928,40 +939,6 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 		{ authoritative = true, unproven = true }
 end
 
--- ── exposure event id ─────────────────────────────────────────────────────────
-
--- Deterministic exposure event id (PROPOSED convention, see the module
--- header): a stable digest of (session marker, subject, experiment, version,
--- arm counter) — exactly the de-dupe tuple plus the session marker and the
--- re-arm counter, so the id-uniqueness domain and the de-dupe domain
--- coincide. The same tuple always derives the same id, so an accidental
--- double emission inside one session collapses server-side as a duplicate
--- even if the assignment key was regenerated between the two; an explicit
--- re-arm bumps the counter (so does a readmission after an age withdrawal),
--- and a rotated session marker or re-minted subject derives a distinct id.
--- Retries of one emitted fact are idempotent regardless — the id is stamped
--- once at enqueue and the spool re-sends it verbatim. New IDs use RFC 9562
--- UUIDv5: SHA-1(namespace bytes || canonical tuple), then version/variant bits.
--- Fixed SDK exposure namespace: 01e2e885-f600-4118-80b6-f8470ece21bb.
-local exposure_namespace = ("01e2e885f600411880b6f8470ece21bb"):gsub("%x%x", function(byte)
-	return string.char(tonumber(byte, 16))
-end)
-
-function M.exposure_event_id(session_marker, subject_key, experiment_key, version, arm)
-	local text = table.concat({
-		"exposure",
-		tostring(session_marker),
-		tostring(subject_key),
-		tostring(experiment_key),
-		string.format("%.0f", version),
-		string.format("%.0f", arm),
-	}, "\31")
-	local digest = sha1.hex(exposure_namespace .. text)
-	return digest:sub(1, 8) .. "-" .. digest:sub(9, 12) .. "-5" .. digest:sub(14, 16)
-		.. "-" .. string.format("%02x", tonumber(digest:sub(17, 18), 16) % 64 + 128)
-		.. digest:sub(19, 20) .. "-" .. digest:sub(21, 32)
-end
-
 -- ── the consumer ──────────────────────────────────────────────────────────────
 
 local Experiments = {}
@@ -1045,28 +1022,13 @@ function M.new(config, deps)
 	local ex = setmetatable({
 		config = config,
 		deps = deps,
+		http_transport = experiment_http.new(),
 		-- In-memory serving cache: experiment_key → entry. Only assigned
 		-- entries exist here; every not-assigned outcome drops its key.
 		entries = {},
-		-- Applications whose exposure fact is still OWED: experiment_key →
-		-- a bounded FIFO of { entry, session } snapshots, each carrying THE
-		-- SESSION THE APPLICATION BELONGS TO (a renewal must queue the new
-		-- session's fact behind the prior session's owed one, never
-		-- overwrite it — each session's treatment gets its own fact and
-		-- deterministic id). Swept on tick while consent is granted. The
-		-- snapshot — not the serving cache — is the emission source, so an
-		-- owed fact for a variant that really ran survives a later drop of
-		-- the live entry, an ordinary auth latch, and a subject re-mint
-		-- (exposure facts are facts about the PAST, like receipts; only the
-		-- real-subjects sentinel — whose fact keys must not outlive it —
-		-- discards them).
+		-- Per-experiment bounded FIFO: first pinned applications, then sealed
+		-- facts owed to analytics. New serving state never rewrites a record.
 		pending_exposure = {},
-		-- Consent-purge re-arm INTENTS: experiment_key → true for a live
-		-- assignment whose exposure must re-arm when consent returns. The
-		-- snapshot is deliberately NOT minted at purge time (a denied
-		-- period must not stamp the future fact's identity); it
-		-- materializes at the first granted sweep.
-		pending_rearm = {},
 		-- Durable-write convergence: (scope\31key) composite →
 		-- { key, scope, as_of, drop } for an OWED sync (memory changed,
 		-- disk did not), retried every tick; plus an owed whole-record
@@ -1118,24 +1080,11 @@ function M.new(config, deps)
 		-- Set by teardown(): an in-flight response landing afterwards must
 		-- not install, persist, pace, or call back into game code.
 		torn_down = false,
-		-- Session-scoped exposure dedup: tuple key → { arm, auto }. `arm` is
-		-- the highest arm handed out for the tuple; `auto` records whether
-		-- the AUTOMATIC arm-0 fact has emitted — an explicit re-arm may run
-		-- while that emission is still owed in the queue, and must not
-		-- consume its slot.
+		-- Session-scoped tuple -> original application, and the last applied
+		-- value per experiment for outcomes (independent of newer fetches).
 		exposed = {},
-		-- Arms an age withdrawal RETIRED: session marker \31 tuple key → the
-		-- first arm none of the withdrawn facts can have used under that
-		-- marker. A readmission's automatic fact takes that arm instead of
-		-- arm 0, so it never re-derives the id of a withdrawn fact that may
-		-- still be on the wire (see apply_age_withdrawal); a drop-time
-		-- capture of its owed snapshot derives the same arm, so the pair
-		-- keeps one id. Survives marker rotations: an owed snapshot keeps
-		-- its own marker. Empty unless a withdrawal ran.
-		retired_arms = {},
-		-- One marker per constructed consumer (= per SDK session): part of
-		-- the deterministic exposure id, so each session's first application
-		-- emits its own fact while duplicates within the session collapse.
+		applications = {},
+		-- Per-process session marker scopes application deduplication.
 		session_marker = id.uuid(),
 		-- Per-(scope, experiment) sequence fence for out-of-order responses,
 		-- remote-config discipline: only an outcome newer than every settled
@@ -1184,10 +1133,7 @@ function M.new(config, deps)
 	}, Experiments)
 	-- Serve the persisted last-known-good assignments immediately after a
 	-- restart when a stored subject id exists and the record matches this
-	-- exact scope; their exposures re-arm for this launch and are emitted
-	-- once a session exists to attribute them to (the first-session
-	-- migration, a host-opened lazy session, or the shutdown drain — never
-	-- a background-tick lazy open). No subject id is minted here.
+	-- exact scope. Restoration records no application and mints no subject.
 	-- A durable condemnation outlives the process: a real-subjects
 	-- sentinel clear that could not land before an exit left its stamp
 	-- AND scope in the sidecar marker. Re-arm the clear here and REFUSE
@@ -1265,26 +1211,9 @@ function M.new(config, deps)
 					-- them; malformed age declarations remain refusals,
 					-- never a missing value beside an adult alias.
 					entry.attributes = sanitize_restored_attributes(entry.attributes)
+					entry.subject_key = entry.subject_key or subject
 					ex.entries[key] = entry
-					if deps.consent() == "granted" then
-						-- The restored assignment APPLIES at this restore
-						-- (this launch's serving), so the snapshot's
-						-- identity is the construction moment's — session
-						-- nil until the first real session migrates it,
-						-- anonymous id and timestamp of NOW.
-						ex.pending_exposure[key] = { ex:exposure_snapshot(entry) }
-					else
-						-- Restored under a NON-GRANTED persisted state:
-						-- the getters serve nothing while consent is
-						-- closed, so the assignment is not actually
-						-- applied yet. The exposure arms as INTENT and
-						-- materializes at the first granted sweep with
-						-- the serving-resumed identity — a launch-time
-						-- snapshot would stamp the future fact with a
-						-- denied-period timestamp (the same rule as the
-						-- consent-purge re-arm).
-						ex.pending_rearm[key] = true
-					end
+
 				end
 			end
 		end
@@ -1298,6 +1227,7 @@ end
 -- after shutdown).
 function Experiments:teardown()
 	self.torn_down = true
+	self.http_transport:teardown()
 end
 
 function Experiments:diagnose(status, code)
@@ -1353,6 +1283,7 @@ function Experiments:adopt_minted_subject_id()
 	-- keys (see tick's generation check).
 	self.cache_generation = self.cache_generation + 1
 	self.exposed = {}
+	self.applications = {}
 	-- Owed durable WRITE intents die with the rotation: their source
 	-- entries were just cleared, and the retired subject's record must not
 	-- be reshaped from another subject's memory. Owed DROPS survive — they
@@ -1425,17 +1356,8 @@ function Experiments:adopt_minted_subject_id()
 	return minted
 end
 
--- ⚠ THE SESSION ENDED, and nothing opened yet. Two kinds of owed snapshot
--- must not be confused afterwards:
---   * one armed with no session id under THIS session's marker lived through
---     the session that ended (a pre-session snapshot of a lazily opened
---     session), so it takes that session's id now;
---   * one armed AFTER the end belongs to the NEXT session.
--- The marker rotates to tell them apart, and the next session's start
--- migrates the second kind into itself (is_renewal = false). Stamping them
--- with the ended session instead, while the start re-armed the assignment,
--- was one application exposed twice: once under a session that had already
--- ended, once in the new one.
+-- An end closes deduplication and outcome attribution. Existing owed records
+-- retain the session in which the host applied them.
 function Experiments:on_session_ended(ended_session_id)
 	if type(ended_session_id) == "string" and ended_session_id ~= "" then
 		for _, list in pairs(self.pending_exposure) do
@@ -1448,159 +1370,24 @@ function Experiments:on_session_ended(ended_session_id)
 	end
 	self.session_marker = id.uuid()
 	self.exposed = {}
-	self:prune_retired_arms()
+	self.applications = {}
 end
 
--- A renewed analytics session (an explicit session_start) re-arms the
--- once-per-SESSION exposure contract: the session marker rotates so each
--- session derives its own deterministic ids, the de-dupe map resets, and
--- every still-applied assignment re-exposes on its next application sweep —
--- exactly like a cache-restored assignment does at launch.
--- `is_renewal` distinguishes a genuine renewal (a session is OPEN — lazily or
--- explicitly started) from the process's FIRST explicit session_start: owed snapshots armed under the pre-session constructor
--- marker (cache restores in the common init-then-start-session launch flow)
--- belong to that first real session — no session existed for them to have
--- run in — so they MIGRATE to it instead of a duplicate being queued. A
--- genuine renewal preserves prior sessions' owed snapshots untouched: those
--- treatments really ran in their sessions.
---
--- A start that follows an END (on_session_ended above) is not a renewal: no
--- session is open to renew. The client passes is_renewal = false for it, so
--- snapshots armed after the end MIGRATE to the new session like a first
--- session's.
--- The retired arms whose session marker nothing can reach any more: not the
--- current marker, and no owed exposure snapshot's. Only an emission under
--- that marker reads an entry (the automatic slot, a snapshot's own fact, a
--- drop-time capture), so once the marker has rotated away and its last owed
--- snapshot has drained, the entry is dead weight. Run when the marker
--- rotates; an entry whose snapshot drains later goes at the next rotation.
-function Experiments:prune_retired_arms()
-	if next(self.retired_arms) == nil then
-		return
-	end
-	local reachable = { [self.session_marker] = true }
-	for _, list in pairs(self.pending_exposure) do
-		for i = 1, #list do
-			reachable[list[i].session] = true
-		end
-	end
-	for key in pairs(self.retired_arms) do
-		if not reachable[key:match("^([^\31]*)\31")] then
-			self.retired_arms[key] = nil
-		end
-	end
-end
-
-function Experiments:on_session_renewed(is_renewal, previous_session_id)
-	local previous = self.session_marker
+-- A renewed session accepts a new explicit application of every tuple.
+function Experiments:on_session_renewed()
 	self.session_marker = id.uuid()
 	self.exposed = {}
-	local migrated = nil
-	if not is_renewal then
-		local session_id = self.deps.analytics_session
-			and self.deps.analytics_session() or nil
-		for key, list in pairs(self.pending_exposure) do
-			for i = 1, #list do
-				if list[i].session == previous then
-					list[i].session = self.session_marker
-					-- The migrated snapshot belongs to the FIRST real
-					-- session — its analytics SESSION identity included.
-					-- The anonymous id and the timestamp deliberately stay
-					-- the ARM moment's: migration reattributes which
-					-- session the fact belongs to, not when it happened or
-					-- which device identity it happened under.
-					list[i].session_id = session_id
-					migrated = migrated or {}
-					migrated[key] = true
-				end
-			end
-		end
-	elseif previous_session_id ~= nil then
-		-- A RENEWAL with pre-session snapshots still owed: host activity
-		-- lazily opened the first real session before the first explicit
-		-- session_start (the explicit-first flow migrates above instead),
-		-- and the sweep held these snapshots unattributed through it. They
-		-- lived through THAT session — the analytics canon says a lazily
-		-- opened session IS the first real session and an explicit start
-		-- after it is a renewal — so they take its session id: stamping
-		-- any later session (or holding them forever) would misattribute
-		-- or lose them. Marker, anonymous id, and timestamp stay the arm
-		-- moment's, exactly like the migration above.
-		for _, list in pairs(self.pending_exposure) do
-			for i = 1, #list do
-				if list[i].session_id == nil and list[i].session == previous then
-					list[i].session_id = previous_session_id
-				end
-			end
-		end
-	end
-	for key, entry in pairs(self.entries) do
-		-- Migration and re-arm are ALTERNATIVES, never both: a key whose
-		-- pre-session snapshot just migrated already owes this first
-		-- session its fact with the ARM-moment identity — re-arming would
-		-- coalesce into that migrated tail and re-stamp it with the
-		-- session-start moment's timestamp and anonymous id (the FIFO
-		-- drains in order, so anything still owed at session start
-		-- includes the latest application; keys with nothing owed re-arm
-		-- normally).
-		if not (migrated and migrated[key]) then
-			self:arm_exposure(key, entry)
-		end
-	end
-	self:prune_retired_arms()
+	self.applications = {}
 end
 
--- A consent denial purges queued-but-unpublished analytics facts — the OWED
--- exposure snapshots included: they are queued-but-unsent facts, and the
--- consent contract outranks the facts-about-the-past retention that governs
--- auth latches and subject re-mints. Snapshots for since-dropped
--- assignments die HERE (a re-grant must never publish a treatment the
--- server already killed). Still-live assignments re-arm on re-grant and
--- emit in the fresh session, with that session's distinct deterministic id.
--- Only retries of the SAME fact collapse server-side as duplicates.
---
--- The re-arm is recorded as INTENT only (`pending_rearm`), not as a
--- snapshot: consent is already denied when this runs, getters serve
--- nothing during denial, and a snapshot minted NOW would stamp the future
--- fact with a denied-period timestamp and anonymous identity for a
--- treatment that was not being served. The replacement snapshot
--- materializes at the grant — the moment serving actually
--- resumes — with THAT moment's identity; an intent whose entry died
--- meanwhile is discarded (dead treatments never re-emit).
+-- Consent denial withdraws both application stages and last-applied state.
+-- A later grant requires another explicit application.
 function Experiments:on_analytics_purge()
 	self.pending_exposure = {}
 	self.exposed = {}
-	self.pending_rearm = {}
-	for key in pairs(self.entries) do
-		self.pending_rearm[key] = true
-	end
+	self.applications = {}
 	-- The purged facts no longer hold their history keys.
 	self.fact_key_prune_owed = true
-end
-
--- Materialize the purge/denied-restore re-arm INTENTS at the moment consent
--- returns: serving actually resumes AT THE GRANT (the getters re-serve the
--- retained assignments immediately), so the replacement snapshot captures
--- the grant moment's identity — session, anonymous id, timestamp. The
--- previous posture materialized lazily at the first granted sweep, which
--- left a window in which automatic exposure work existed only as intents:
--- has_owed_exposures() reported none, so a Mode B set_anonymous_id() could
--- rotate the anon before the fact materialized and the treatment that
--- resumed serving under the OLD anon would emit under the new one. Grant-
--- time materialization closes the window structurally — the intents become
--- armed snapshots before any rotation can be requested, and the existing
--- rotation gate covers them naturally; the first-granted-sweep
--- materialization in sweep_owed stays as the belt for consumers driven
--- without a client. An intent whose entry died meanwhile is discarded:
--- dead treatments never re-emit.
-function Experiments:on_consent_granted()
-	for key in pairs(self.pending_rearm) do
-		local entry = self.entries[key]
-		if entry then
-			self:arm_exposure(key, entry)
-		end
-		self.pending_rearm[key] = nil
-	end
 end
 
 function Experiments:scope_for(subject_id)
@@ -2413,7 +2200,7 @@ end
 -- regenerated key for the same tuple must not over-count exposures. The
 -- emitted fact still carries the current fact key as a PROP.
 local function exposure_tuple(experiment_key, entry)
-	return experiment_key .. "\31" .. string.format("%.0f", entry.version)
+	return experiment_key .. "\31" .. (entry.version_wire or string.format("%.0f", entry.version))
 		.. "\31" .. tostring(entry.subject_key)
 end
 
@@ -2423,251 +2210,197 @@ end
 -- application's still-unemitted fact.
 local max_owed_exposures = 8
 
--- Arm one application snapshot for emission. A same-tuple snapshot already
--- armed at the tail is refreshed in place (renewals and purges re-arm the
--- same application; the de-dupe collapses same-tuple emissions anyway), so
--- the queue only grows across genuinely distinct applications.
--- One owed-application snapshot: the applied entry plus THE IDENTITY OF THE
--- ARM MOMENT. A late drain enqueues with exactly this identity — the
--- analytics session the treatment ran in, the anonymous id active when it
--- ran, and the wall-clock instant it ran — never the values current at
--- drain time (normal events snapshot all three at track time; an owed fact
--- must not lose that property just because the queue was full). The
--- envelope fields NOT snapshotted are each deliberate: event_id derives
--- deterministically from the snapshot itself, user_id is omitted by the
--- facts contract, props are the entry snapshot, and session_sequence stays
--- the enqueue-time stream's (documented residual — see the client's fact
--- handling).
+-- A host application pins the serving inputs and its analytics identity once.
+-- Fetches, getters and cache restoration never call this path.
 function Experiments:exposure_snapshot(entry)
+	local at = clock.iso_utc()
 	return {
-		entry = entry,
+		entry = copy_value(entry, 0),
 		session = self.session_marker,
-		session_id = self.deps.analytics_session
-			and self.deps.analytics_session() or nil,
-		anonymous_id = self.deps.analytics_anonymous_id
-			and self.deps.analytics_anonymous_id() or nil,
-		event_ts = clock.iso_utc(),
+		session_id = self.deps.analytics_session and self.deps.analytics_session() or nil,
+		anonymous_id = self.deps.analytics_anonymous_id and self.deps.analytics_anonymous_id() or nil,
+		application_id = random.hex(32),
+		applied_at = at,
+		event_ts = at,
 	}
 end
 
-function Experiments:arm_exposure(experiment_key, entry)
-	local list = self.pending_exposure[experiment_key]
-	if type(list) ~= "table" then
-		list = {}
-		self.pending_exposure[experiment_key] = list
-	end
-	local snapshot = self:exposure_snapshot(entry)
-	local tail = list[#list]
-	if tail and tail.session == self.session_marker
-		and exposure_tuple(experiment_key, tail.entry) == exposure_tuple(experiment_key, entry) then
-		-- A same-tuple re-arm refreshes the WHOLE application moment in
-		-- place — the entry and every identity field: the re-arm is a new
-		-- application of the same treatment, so its fact carries the newer
-		-- moment's identity.
-		list[#list] = snapshot
-		return
-	end
-	list[#list + 1] = snapshot
+function Experiments:queue_application(experiment_key, record)
+	local list = self.pending_exposure[experiment_key] or {}
+	self.pending_exposure[experiment_key] = list
+	list[#list + 1] = record
 	if #list > max_owed_exposures then
 		table.remove(list, 1)
-		self:diagnose("exposure_skipped", "owed_overflow")
+		self:diagnose("fact_skipped", "owed_overflow")
 	end
 end
 
--- True when `list` still holds an armed CURRENT-SESSION snapshot for
--- `tuple`: this session's automatic arm-0 emission is owed in the queue,
--- not yet emitted. Prior sessions' owed snapshots are another session's
--- facts and do not count against this session's arm accounting.
-local function owed_tuple_armed(list, experiment_key, tuple, session_marker)
-	if type(list) ~= "table" then
-		return false
-	end
-	for i = 1, #list do
-		if list[i].session == session_marker
-			and exposure_tuple(experiment_key, list[i].entry) == tuple then
-			return true
-		end
-	end
-	return false
+local function serving_pins(entry)
+	return facts.integer(entry.version_wire, 1)
+		and facts.integer(entry.served_revision_wire, 0)
+		and type(entry.served_kill_gate) == "boolean"
+		and type(entry.served_at) == "string" and entry.served_at ~= ""
 end
 
--- Emit one exposure fact for one applied-entry snapshot. Returns:
---   true                      — emitted, or already emitted this session;
---   false, code, true         — terminally skipped (no server-safe fact
---                               key; the SDK subject id never egresses);
---   false, code               — retryable (consent closed, queue full):
---                               the armed snapshot stays for a later sweep.
--- `snapshot` is the owed-application snapshot the emission drains (nil for
--- an IMMEDIATE emission — the explicit re-arm path — which uses the current
--- moment's identity by definition). Its session marker names the SESSION
--- THE APPLICATION BELONGS TO: the deterministic id derives from it, so a
--- prior session's owed fact keeps its own identity when it finally drains,
--- and the current session's dedup bookkeeping (`exposed`) is consulted and
--- updated ONLY for current-session emissions — a late prior-session drain
--- must neither suppress nor be suppressed by this session's arm accounting
--- (its once-only guarantee is the per-(session, tuple) arm-time coalescing
--- plus FIFO removal). The snapshot's arm-time identity fields (session_id,
--- anonymous_id, event_ts) ride the emit as envelope overrides.
--- Arm accounting: `exposed[tuple]` records the highest arm handed out and
--- whether the AUTOMATIC arm-0 fact has emitted. An explicit re-arm that
--- runs while that automatic emission is still owed in the queue takes arm 1
--- and leaves the owed snapshot its arm 0 — the re-arm buys an EXTRA fact,
--- never the owed one's slot — and the later sweep emits the arm 0 exactly
--- once. After an age withdrawal the automatic slot of the withdrawn tuple
--- moves to its first unretired arm (`retired_arms`, keyed by the marker the
--- emission derives its id from), and the re-arm arithmetic shifts with it.
-function Experiments:emit_entry_exposure(experiment_key, entry, rearm, snapshot)
-	local refusal = consent_refusal(self.deps.consent())
-	if refusal then
-		return false, refusal
+function Experiments:pace_apply(retry_after)
+	self:pace_transient(retry_after)
+	-- Assignment fetch allows an immediate first retry; update-driven apply
+	-- work needs a floor so offline/malformed responses cannot spin each frame.
+	if not self.retry_after_ms or self.retry_after_ms <= clock.unix_ms() then
+		self:defer_revalidation(backoff_base_seconds)
 	end
-	-- ⚠ AN IMMEDIATE EMISSION OPENS THE OWED SESSION BEFORE ANYTHING BELOW IS
-	-- READ. After an end, its enqueue would start the next session, and that
-	-- start rotates the marker and re-arms the automatic exposure. Read first,
-	-- the marker and arm state were the ended boundary's, and the state
-	-- written after the emission overwrote the new session's, so the sweep
-	-- discarded the automatic fact as already emitted. A snapshot carries its
-	-- own session and opens nothing. Skipped when no fact would be emitted.
-	if not snapshot and self.deps.open_owed_session
-		and type(entry.subject_fact_key) == "string" and entry.subject_fact_key ~= "" then
-		local opened, open_err = self.deps.open_owed_session()
-		if not opened then
-			return false, open_err
-		end
+end
+
+-- The callback owns a record only while that exact object remains at the
+-- queue head. Purges, age withdrawals, overflow and teardown invalidate it.
+function Experiments:seal_application(experiment_key, record)
+	local entry = record.entry
+	local request = {
+		app_key = self.config.app_id, environment_key = self.config.environment_id,
+		experiment_key = experiment_key, variant_key = entry.variant_key,
+		subject_key = entry.subject_key, served_kill_gate = entry.served_kill_gate,
+		served_at = entry.served_at, applied_at = record.applied_at,
+	}
+	local raw_members = {
+		experiment_version = entry.version_wire, served_revision = entry.served_revision_wire,
+	}
+	local attributes = {}
+	for _, attribute in ipairs(entry.attributes or {}) do
+		attributes[#attributes + 1] = json.encode(attribute.name) .. ":" .. json.encode(attribute.value)
 	end
-	local marker = snapshot and snapshot.session or self.session_marker
-	local current_session = marker == self.session_marker
-	local tuple = exposure_tuple(experiment_key, entry)
-	local exposed = current_session and self.exposed[tuple] or nil
-	if exposed and not rearm and exposed.auto then
-		return true
-	end
-	-- Facts carry ONLY the server-minted subject-fact key as the
-	-- assignment_key prop (opaque, verbatim — the ingest service
-	-- structurally requires it for client_id-unit facts). The SDK-minted
-	-- subject id NEVER egresses on the analytics plane, so an assignment
-	-- without a subject-fact key — a synthetic-unit answer included —
-	-- emits NO fact: skipped terminally, surfaced through diagnostics.
-	local fact_key = entry.subject_fact_key
-	if type(fact_key) ~= "string" or fact_key == "" then
-		self:diagnose("exposure_skipped", "no_subject_fact_key")
-		return false, "exposure_no_subject_fact_key", true
-	end
-	local first = self.retired_arms[marker .. "\31" .. tuple] or 0
-	local arm = first
-	local next_exposed
-	if rearm then
-		if exposed then
-			arm = exposed.arm + 1
-			next_exposed = { arm = arm, auto = exposed.auto }
-		elseif owed_tuple_armed(
-			self.pending_exposure[experiment_key], experiment_key, tuple,
-			self.session_marker) or self.pending_rearm[experiment_key] then
-			-- The automatic emission is still owed — as an armed snapshot
-			-- in the queue, or as a purge-deferred INTENT that has not
-			-- materialized yet (the window between a re-grant and its
-			-- first sweep): the explicit re-arm counts as the EXTRA fact
-			-- on top of it, never consuming the automatic slot — the
-			-- intent still materializes arm 0 and both facts emit with
-			-- distinct deterministic ids.
-			arm = first + 1
-			next_exposed = { arm = arm, auto = false }
-		else
-			next_exposed = { arm = first, auto = true }
-		end
+	raw_members.attributes = "{" .. table.concat(attributes, ",") .. "}"
+	local event_name = "experiment_exposure"
+	local route = "/api/cp/v1/runtime/experiments/exposures"
+	if record.outcome_key then
+		event_name = "experiment_outcome"
+		route = "/api/cp/v1/runtime/experiments/outcomes"
+		request.outcome_id = record.application_id
+		request.occurred_at = record.event_ts
+		request.outcome_key = record.outcome_key
+		raw_members.outcome_value = record.outcome_value_wire
 	else
-		-- The automatic emission: arm 0 by definition (the first unretired
-		-- arm after an age withdrawal). Reachable with `exposed` already
-		-- set only while that fact was owed behind explicit re-arms —
-		-- emitting it completes the auto slot without lowering the
-		-- recorded highest arm.
-		next_exposed = { arm = exposed and exposed.arm or first, auto = true }
+		request.exposure_id = record.application_id
 	end
-	local event_id = M.exposure_event_id(
-		marker, entry.subject_key, experiment_key, entry.version, arm)
-	local ok, err = self.deps.emit("experiment_exposure", {
-		experiment_key = experiment_key,
-		experiment_version = entry.version,
-		assignment_key = fact_key,
-		variant_key = entry.variant_key,
-		assignment_unit = entry.assignment_unit,
-	}, event_id, snapshot and {
-		session_id = snapshot.session_id,
-		anonymous_id = snapshot.anonymous_id,
-		event_ts = snapshot.event_ts,
-		-- A snapshot-backed emission is RETRYABLE by construction: a
-		-- queue-full refusal keeps the snapshot armed and the sweep tries
-		-- again, so the attempt is not a dropped event (the immediate
-		-- track_exposure path passes no snapshot and stays a countable,
-		-- host-retried failure).
-		retryable = true,
-	} or nil)
-	if not ok then
-		return false, err
+	local members = {}
+	for key, value in pairs(request) do members[#members + 1] = json.encode(key) .. ":" .. json.encode(value) end
+	for key, value in pairs(raw_members) do members[#members + 1] = json.encode(key) .. ":" .. value end
+	table.sort(members)
+	local body = "{" .. table.concat(members, ",") .. "}"
+	local flight = {}
+	local epoch = self.consent_epoch
+	local auth_epoch = self.auth_epoch
+	local dispatched = clock.unix_ms()
+	local scope = self:scope_for(entry.subject_key)
+	record.flight = flight
+	record.deadline = dispatched + self.config.publish_timeout_seconds * 1000
+	local function complete(_, _, response)
+		if record.flight ~= flight then return end
+		record.flight = nil
+		record.complete = nil
+		local list = self.pending_exposure[experiment_key]
+		if self.torn_down or not list or list[1] ~= record
+			or epoch ~= self.consent_epoch or consent_refusal(self.deps.consent()) then return end
+		response = type(response) == "table" and response or {}
+		local status = tonumber(response.status) or 0
+		if status == 403 and response_error_text(response) == sentinel_real_subjects_disabled then
+			self.auth_blocked = true
+			self.auth_epoch = self.auth_epoch + 1
+			self:apply_sentinel_withdrawal(scope, clock.unix_ms(), dispatched)
+			self:diagnose("fact_skipped", "real_subjects_disabled")
+			return
+		end
+		if auth_epoch ~= self.auth_epoch then return end
+		if status == 200 then
+			local sealed, err = facts.decode(response.response, {
+				workspace_key = self.config.workspace_id, app_key = self.config.app_id,
+				environment_key = self.config.environment_id, event_name = event_name,
+				experiment_key = experiment_key, version_wire = entry.version_wire,
+				variant_key = entry.variant_key, outcome_key = record.outcome_key,
+				outcome_value_wire = record.outcome_value_wire,
+			})
+			if sealed then
+				-- Retain both keys until the fact leaves every analytics store:
+				-- an age refusal must find a key newly returned by apply too.
+				record.sealed_fact = sealed
+				record.entry = {
+					subject_fact_key = sealed.props.assignment_key,
+					assignment_unit = sealed.props.assignment_unit,
+				}
+				if sealed.props.assignment_key ~= entry.subject_fact_key
+					and scope == self:scope_for(self:current_subject_id()) then
+					self:retire_fact_key(scope, experiment_key, sealed.props.assignment_key)
+					local durable = self:durable_record_for(scope)
+					if not self:save_fact_key_history(durable) then
+						-- Never publish a new attribution key that a later
+						-- launch cannot withdraw. Retry the same occurrence.
+						record.sealed_fact, record.entry = nil, entry
+						self:diagnose("fact_deferred", "fact_key_unsaved")
+						self:pace_apply(nil)
+						return
+					end
+				end
+				self.backoff_attempt = 0
+				return
+			end
+			self:diagnose("fact_deferred", err)
+		elseif status == 401 or status == 403 then
+			self.auth_blocked = true
+			self.auth_epoch = self.auth_epoch + 1
+			self.entries = {}
+			for key, pending in pairs(self.durable_pending) do
+				if not pending.drop then self.durable_pending[key] = nil end
+			end
+			self:diagnose("fact_deferred", "apply_" .. tostring(status))
+			return
+		elseif status >= 400 and status < 500 and status ~= 408 and status ~= 429 then
+			local decoded = decode_object(response.response)
+			if status == 409 and decoded and decoded.error == "not_assigned" and decoded.reason == "age_ineligible" then
+				self:apply_age_withdrawal(scope, experiment_key, clock.unix_ms(), entry.subject_fact_key)
+			else
+				table.remove(list, 1)
+				if not list[1] then self.pending_exposure[experiment_key] = nil end
+			end
+			self:diagnose("fact_skipped", "apply_" .. tostring(status))
+			return
+		end
+		self:pace_apply(retry_after_seconds(response))
 	end
-	if current_session then
-		self.exposed[tuple] = next_exposed
-	end
-	return true
+	record.complete = complete
+	if not self.http_transport:available() then complete(nil, nil, { status = 0 }); return end
+	local ok = pcall(self.http_transport.request, self.http_transport, trim_slash(self.config.remote_config_url) .. route, "POST", complete,
+		{ Authorization = "Bearer " .. self.config.api_key, ["Content-Type"] = "application/json" },
+		body, { timeout = self.config.publish_timeout_seconds })
+	if not ok then complete(nil, nil, { status = 0 }) end
 end
 
--- Drain one experiment's owed-exposure queue in order: emitted and
--- terminally skipped snapshots leave the queue; a retryable failure (queue
--- full, consent closed) stops the drain and keeps the remainder armed for a
--- later sweep, so an older application's fact is never leapfrogged or lost.
+-- Drain in FIFO order. Sealing runs only from background/final sweeps, never
+-- inside an application or outcome call. A full analytics queue keeps the
+-- sealed record, without repeating the apply hop.
 function Experiments:sweep_pending(experiment_key, mode)
 	local list = self.pending_exposure[experiment_key]
-	if type(list) ~= "table" then
-		self.pending_exposure[experiment_key] = nil
-		return
-	end
+	if type(list) ~= "table" then return end
 	while list[1] do
-		if self.declaring[experiment_key] then
-			-- A non-adult declaration of the experiment is unanswered: its
-			-- owed applications wait, unsent, for the answer — kept when it
-			-- governs that they survive (kill_switch), withdrawn when it
-			-- refuses or never comes. Re-checked at every head.
-			return
+		local record = list[1]
+		if self.declaring[experiment_key] or (self.auth_blocked and not record.sealed_fact) then return end
+		if record.flight then
+			if clock.unix_ms() < record.deadline then return end
+			record.complete(nil, nil, { status = 0 })
 		end
-		if mode == "background" and list[1].session_id == nil
-			and self.config.source ~= "backend"
-			and (not self.deps.analytics_session
-				or self.deps.analytics_session() == nil) then
-			-- A still-unattributed PRE-SESSION snapshot (a constructor
-			-- restore, or an intent materialized pre-session) met by a
-			-- BACKGROUND sweep while NO analytics session exists: emitting
-			-- it would make the client's enqueue lazily OPEN a session as
-			-- a side effect of the tick — a phantom session no host
-			-- activity created — and the host's first explicit
-			-- session_start would then read as a RENEWAL, skip the
-			-- first-session migration, and re-arm the entry: the same
-			-- single application emitting twice. UNSWEEPABLE here until
-			-- attribution runs — the explicit-first session_start migrates
-			-- it, a renewal stamps it with the lazy first session it lived
-			-- through — and the FIFO holds the tail behind it (order is
-			-- the contract). BACKEND sources are exempt from the hold
-			-- entirely: their envelopes are legitimately sessionless on
-			-- the normal enqueue path (no lazy session exists to phantom-
-			-- open and no session_start to double-arm), so holding would
-			-- park restored-assignment facts FOREVER in a long-lived
-			-- backend process — they drain sessionless in background
-			-- sweeps. The partition is deliberate and narrow:
-			-- HOST-INITIATED drains (an install's immediate sweep — the
-			-- host called fetch) keep the analytics canon that host
-			-- activity may lazily open the first session, and a background
-			-- sweep with a LIVE session drains into that real session.
-			-- The shutdown sweep passes "final": at teardown no later
-			-- session_start can double-arm and the fact must not exit
-			-- unemitted — it rides the exit-time session, lazily opened at
-			-- the very end only when none ever existed.
-			return
+		if not record.sealed_fact then
+			if mode ~= "background" and mode ~= "final" then return end
+			if self.retry_after_ms and clock.unix_ms() < self.retry_after_ms then return end
+			self:seal_application(experiment_key, record)
+			if self.pending_exposure[experiment_key] ~= list then return end
+			if list[1] == record and not record.sealed_fact then return end
 		end
-		local ok, _, terminal = self:emit_entry_exposure(
-			experiment_key, list[1].entry, false, list[1])
-		if ok or terminal then
+		if list[1] == record and record.sealed_fact then
+			local sealed = record.sealed_fact
+			local ok = self.deps.emit(sealed.event_name, sealed.props, sealed.event_id, {
+				session_id = record.session_id, anonymous_id = record.anonymous_id,
+				event_ts = sealed.event_ts, sealed_fact = sealed, retryable = true,
+			})
+			if not ok or self.pending_exposure[experiment_key] ~= list then return end
 			table.remove(list, 1)
-		else
-			return
 		end
 	end
 	self.pending_exposure[experiment_key] = nil
@@ -2678,23 +2411,9 @@ end
 -- by the tick, and once more by the client's successful shutdown after the
 -- final flush frees queue room — a treatment applied under a FULL queue
 -- must not exit without its fact.
-function Experiments:sweep_owed(final)
+function Experiments:sweep_owed(network)
 	if consent_refusal(self.deps.consent()) then
 		return
-	end
-	-- Purge-deferred re-arms normally materialize at the GRANT
-	-- (on_consent_granted); this block is the belt for consumers driven
-	-- without a client and stays idempotent — the first granted sweep is
-	-- still a serving-resumed moment, so the replacement snapshot captures
-	-- THIS moment's identity (session, anonymous id, timestamp), never the
-	-- denied period's. An intent whose entry died meanwhile is discarded:
-	-- dead treatments never re-emit.
-	for key in pairs(self.pending_rearm) do
-		local entry = self.entries[key]
-		if entry then
-			self:arm_exposure(key, entry)
-		end
-		self.pending_rearm[key] = nil
 	end
 	if not next(self.pending_exposure) then
 		return
@@ -2705,7 +2424,7 @@ function Experiments:sweep_owed(final)
 	end
 	table.sort(keys)
 	for i = 1, #keys do
-		self:sweep_pending(keys[i], final and "final" or "background")
+		self:sweep_pending(keys[i], network and "background" or "local")
 	end
 end
 
@@ -2879,22 +2598,11 @@ function Experiments:apply_sentinel_withdrawal(scope, resolved_at_ms, dispatched
 		end
 	end
 	self.entries = {}
-	-- The sentinel withdraws the assignments AND their subject-fact
-	-- keys outright: owed exposure snapshots carry those keys and
-	-- go with them. (A snapshot whose entry survives the partition
-	-- below dies too — conservative toward the sentinel's privacy
-	-- mandate; the survivor re-arms from the durable record at the
-	-- next construction.)
+	-- The sentinel withdraws both application stages, deduplication and
+	-- last-applied state. A later explicit application gets a new occurrence.
 	self.pending_exposure = {}
-	-- The session's arm accounting resets WITH the discarded and
-	-- purged facts: a purged emission never egressed, so a
-	-- refetched same-session tuple (the platform flipping the flag
-	-- back on) must expose again — a retained `exposed` mark would
-	-- silently under-count the re-served treatment. Re-emission
-	-- derives the SAME deterministic id, so anything that had
-	-- already published collapses server-side (the consent-purge
-	-- rule, applied to the sentinel's discard).
 	self.exposed = {}
+	self.applications = {}
 	-- Queue-resident facts die with the snapshots: exposure and
 	-- outcome facts ALREADY ACCEPTED into the analytics pipeline
 	-- (queued below batch size, retained behind a publish retry
@@ -2980,45 +2688,17 @@ end
 function Experiments:apply_entry_drop(scope, experiment_key, resolved_at_ms)
 	local dropped = self.entries[experiment_key]
 	self.entries[experiment_key] = nil
-	-- The OWED exposures deliberately survive the drop: an application
-	-- that already happened is a fact — the drop stops future serving,
-	-- not the record of real treatment. The sweep emits them from the
-	-- retained snapshots. The durable drop converges keyed on the DISK
-	-- state (a latch may have cleared serving while the record retains
-	-- the entry) and is retried until it lands — the kill rule demands
-	-- the drop reach the disk. And because this delete removes the only
-	-- persisted state the owed fact could have re-armed from, each owed
-	-- snapshot is durably CAPTURED into the analytics spool before the
-	-- delete: a process KILL before the next sweep/persist then replays
-	-- the fact at the next launch instead of losing it. Narrow by
-	-- contract — drop-time only; owed facts whose entries live on stay
-	-- memory-only until the ordinary dispatch-point captures
-	-- (persist/shutdown/failed publish). The snapshot stays armed for
-	-- the live process — the deterministic event_id collapses the
-	-- pair: a successful publish acks the spool copy away, a post-kill
-	-- replay dedups server-side. Best-effort corners, documented: no
-	-- session identity to stamp (a background capture opens no phantom
-	-- session), spool disabled, storage down — the
-	-- storage-down-through-exit family.
+	-- A treatment already applied remains owed after an ordinary kill.
+	-- Sealed facts can be captured through the existing spool; unsealed
+	-- applications remain memory-only until their apply hop completes.
 	local owed = self.pending_exposure[experiment_key]
 	if owed and self.deps.capture_fact then
-		for i = 1, #owed do
-			local snapshot = owed[i]
-			local held = snapshot.entry
-			local fact_key = held and held.subject_fact_key
-			if type(fact_key) == "string" and fact_key ~= "" then
-				self.deps.capture_fact("experiment_exposure", {
-					experiment_key = experiment_key,
-					experiment_version = held.version,
-					assignment_key = fact_key,
-					variant_key = held.variant_key,
-					assignment_unit = held.assignment_unit,
-				}, M.exposure_event_id(snapshot.session,
-					held.subject_key, experiment_key,
-					held.version, self.retired_arms[snapshot.session .. "\31" .. exposure_tuple(experiment_key, held)] or 0), {
-					session_id = snapshot.session_id,
-					anonymous_id = snapshot.anonymous_id,
-					event_ts = snapshot.event_ts,
+		for _, record in ipairs(owed) do
+			local sealed = record.sealed_fact
+			if sealed then
+				self.deps.capture_fact(sealed.event_name, sealed.props, sealed.event_id, {
+					session_id = record.session_id, anonymous_id = record.anonymous_id,
+					event_ts = sealed.event_ts, sealed_fact = sealed,
 				})
 			end
 		end
@@ -3044,17 +2724,8 @@ end
 -- durably. The steps:
 --   * the served entry leaves memory, so serving stops and a new
 --     track_outcome for the key is refused locally (no_assignment);
---   * the subject's owed exposure snapshots and any consent-purge re-arm
---     intent are discarded — never swept, and never captured into the spool:
---     the kill path's drop-time capture is exactly what must not run here;
---   * the session's arm accounting for the subject's tuples resets, so a
---     later adult readmission in this session is exposed again — under a
---     FRESH id: every arm the tuple handed out under this session's marker
---     is retired (`retired_arms`), and the readmission's automatic fact
---     takes the next one. A withdrawn fact may already be on the wire, past
---     recall; a readmission re-deriving its id would let that batch's
---     acknowledgment (ack-based spool removal is keyed by event_id) delete
---     the readmission's durable copy;
+--   * the subject's owed records and last-applied state are discarded;
+--   * deduplication resets, so readmission can record a fresh random occurrence;
 --   * the client withdraws the key's facts already accepted into the
 --     analytics pipeline — memory queue, retained batch, loaded spool
 --     chunks, durable spool record (Client:withdraw_experiment_facts);
@@ -3074,8 +2745,8 @@ end
 -- already ON THE WIRE is past recall (the consent purge's carve-out): it is
 -- neither re-sent nor counted as withdrawn.
 -- `keep_assignment` (an unanswered non-adult declaration keeping a
--- synthetic-subject assignment): the entry, its durable copy, its re-arm
--- intent and its exposure accounting stay, and only the subject's owed
+-- synthetic-subject assignment): the entry and its durable copy stay,
+-- and only the subject's owed
 -- CLIENT-ID applications of the experiment are withdrawn with their facts.
 function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms, refused_fact_key, keep_assignment)
 	local dropped = nil
@@ -3083,7 +2754,7 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 		dropped = self.entries[experiment_key]
 		self.entries[experiment_key] = nil
 	end
-	-- An install applies here, so a kept synthetic assignment's own owed
+	-- A kept synthetic assignment's own explicit
 	-- application is not among the withdrawn: only age-gated ones are.
 	local function withdrawable(held)
 		return not (keep_assignment and age_exempt(held))
@@ -3144,22 +2815,13 @@ function Experiments:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 		end
 		self.pending_exposure[experiment_key] = kept[1] and kept or nil
 	end
-	if not keep_assignment then
-		self.pending_rearm[experiment_key] = nil
-	end
-	-- The withdrawn applications' exposure slots are retired even when a
-	-- synthetic-subject assignment is kept: a re-admission later in the
-	-- session is a new application, exposed with a fresh id.
+	local application = self.applications[experiment_key]
+	if application and withdrawable(application.entry) then self.applications[experiment_key] = nil end
 	if subject then
 		local prefix = experiment_key .. "\31"
 		local suffix = "\31" .. subject
-		for tuple, exposed in pairs(self.exposed) do
-			if tuple:sub(1, #prefix) == prefix and tuple:sub(-#suffix) == suffix then
-				local retired = self.session_marker .. "\31" .. tuple
-				self.retired_arms[retired] = math.max(
-					self.retired_arms[retired] or 0, exposed.arm + 1)
-				self.exposed[tuple] = nil
-			end
+		for tuple in pairs(self.exposed) do
+			if tuple:sub(1, #prefix) == prefix and tuple:sub(-#suffix) == suffix then self.exposed[tuple] = nil end
 		end
 	end
 	if self.deps.withdraw_facts then
@@ -3213,7 +2875,7 @@ function Experiments:apply_destructive_outcome(seq, scope, experiment_key, outco
 	end
 	if outcome.withdraw_owed then
 		-- An age refusal withdraws the subject's owed applications on these
-		-- partitions too (a deny→re-grant race re-armed them at the grant).
+		-- partitions too (a later explicit application may be owed).
 		self:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 			outcome.refused_fact_key)
 		return
@@ -3519,15 +3181,8 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 		-- covered state is durably gone (no-op unless a marker is owed).
 		self:retire_clear_marker_if_settled()
 		self:arm_revalidation(clock.unix_ms())
-		-- The variant takes effect at this resolution (a variant change on
-		-- republish applies here too — no mid-session flapping guard beyond
-		-- the fetch cadence): the application point. The snapshot is ARMED
-		-- behind any still-owed earlier applications (the queue preserves
-		-- them — a full analytics queue must not cost the previous
-		-- treatment its fact) and the sweep drains in order; a locally
-		-- failed emit is retried by the tick sweep instead of being lost.
-		self:arm_exposure(experiment_key, entry)
-		self:sweep_pending(experiment_key)
+		-- Fetch installs serving state only. The host records an application.
+
 	end
 end
 
@@ -3703,7 +3358,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		normalized_attributes = {}
 	end
 
-	if not http or not http.request then
+	if not self.http_transport:available() then
 		local result = serve_entry_or_fail(entry, "http_unavailable",
 			normalized_attributes)
 		conclude(result)
@@ -3734,7 +3389,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	-- — a sibling's fresh 200, meaning the flag flipped back on — postdates
 	-- the directive and survives its partition.
 	local dispatched_at_ms = clock.unix_ms()
-	http.request(url, "GET", function(_, _, response)
+	self.http_transport:request(url, "GET", function(_, _, response)
 		-- A torn-down consumer discards in-flight responses outright:
 		-- nothing installs, persists, or paces, and game code is not
 		-- called back after shutdown (the documented teardown contract).
@@ -3764,7 +3419,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 			-- 404, authoritative not-assigned, the real-subjects sentinel)
 			-- still applies its local withdrawal — the cache is retained
 			-- across denial by design, so discarding the directive would
-			-- let a later re-grant re-serve the assignment (and re-arm
+			-- let a later re-grant re-serve the assignment (with explicit
 			-- facts for a subject-fact key) the server already withdrew.
 			-- Constructive results stay suppressed, no subject id is ever
 			-- minted here (the grammar re-mint is NOT destructive and is
@@ -3941,6 +3596,7 @@ function Experiments:tick(_)
 	if self.torn_down then
 		return
 	end
+	self.http_transport:tick()
 	-- Owed durable writes retry FIRST and regardless of consent: this is
 	-- local disk housekeeping (no network, no serving decisions), and a
 	-- kill drop decided under grant must land durably even if consent
@@ -3955,9 +3611,9 @@ function Experiments:tick(_)
 		return
 	end
 	-- Owed-exposure sweep: cache-restored applications, locally failed
-	-- emissions, and applications whose facts a consent purge re-armed all
+	-- emissions, and later explicit applications all
 	-- drain here, in per-experiment order, while consent is granted.
-	self:sweep_owed()
+	self:sweep_owed(true)
 	if self.auth_blocked or not next(self.entries) then
 		return
 	end
@@ -4042,74 +3698,71 @@ function Experiments:payload(experiment_key)
 	return copy_value(entry.variant_payload, 0)
 end
 
--- Explicit exposure re-arm: emits one more exposure fact for the cached
--- assignment (a distinct deterministic id per arm), for hosts that want
--- session-scoped re-exposure semantics on top of the automatic
--- once-per-session emission.
-function Experiments:track_exposure(experiment_key)
-	if type(experiment_key) ~= "string" or experiment_key == "" then
-		return false, "experiment_key_required"
-	end
-	-- The explicit re-arm targets the LIVE assignment only (none while a
-	-- non-adult declaration is pending).
+-- Applying a variant is the host's statement that it acted on the value.
+-- The once-per-tuple record is independent of how often it fetched or read it.
+function Experiments:record_application(experiment_key, extra)
+	if type(experiment_key) ~= "string" or experiment_key == "" then return nil, "experiment_key_required" end
+	local refusal = consent_refusal(self.deps.consent())
+	if refusal then return nil, refusal end
 	local entry = self:served_entry(experiment_key)
-	if not entry then
-		return false, "no_assignment"
+	if not entry then return nil, "no_assignment" end
+	if not valid_subject_fact_key(entry.subject_fact_key) then
+		self:diagnose("fact_skipped", "no_subject_fact_key")
+		return entry.variant_key, "exposure_no_subject_fact_key"
 	end
-	local ok, err = self:emit_entry_exposure(experiment_key, entry, true)
-	return ok, err
+	if not serving_pins(entry) then
+		self:diagnose("fact_skipped", "serving_pins_missing")
+		return entry.variant_key, "serving_pins_missing"
+	end
+	if self.deps.open_owed_session then
+		local opened, err = self.deps.open_owed_session()
+		if not opened then return nil, err end
+	end
+	local tuple = exposure_tuple(experiment_key, entry)
+	local previous = self.exposed[tuple]
+	if previous and not extra then
+		self.applications[experiment_key] = copy_value(previous, 0)
+		return entry.variant_key
+	end
+	local record = self:exposure_snapshot(entry)
+	if type(record.anonymous_id) ~= "string" or record.anonymous_id == "" then
+		return entry.variant_key, "anonymous_id_required"
+	end
+	self.applications[experiment_key] = copy_value(record, 0)
+	if not extra then self.exposed[tuple] = copy_value(record, 0) end
+	self:queue_application(experiment_key, record)
+	return entry.variant_key
 end
 
--- Host-triggered outcome fact: stamps the same per-unit props from the
--- cached assignment plus the outcome key/value pair. Each call is a distinct
--- fact (a fresh event id); consent gating and identity rules apply on the
--- analytics pipeline like any other event.
+function Experiments:apply_variant(experiment_key)
+	return self:record_application(experiment_key, false)
+end
+
+-- Compatibility API for an additional explicit application in this session.
+function Experiments:track_exposure(experiment_key)
+	local variant, err = self:record_application(experiment_key, true)
+	return variant ~= nil and err == nil, err
+end
+
 function Experiments:track_outcome(experiment_key, outcome_key, outcome_value)
-	if type(experiment_key) ~= "string" or experiment_key == "" then
-		return false, "experiment_key_required"
-	end
-	if type(outcome_key) ~= "string" or outcome_key == "" then
-		return false, "invalid_outcome_key"
-	end
-	-- FINITE numbers only. NaN and ±inf are Lua numbers but have no JSON
-	-- representation, so accepting one here poisons the whole batch it lands
-	-- in: the encoder either fails (terminal json_encode_failed, and the
-	-- batch — including unrelated events — is dropped, never spooled) or
-	-- emits a non-JSON token the server rejects. The same positive,
-	-- finite-number discipline valid_wire_version applies to the version
-	-- field; NaN fails every comparison, so the ordering test catches it.
-	if type(outcome_value) ~= "number"
-		or outcome_value ~= outcome_value
-		or outcome_value <= -math.huge or outcome_value >= math.huge then
+	if type(experiment_key) ~= "string" or experiment_key == "" then return false, "experiment_key_required" end
+	local refusal = consent_refusal(self.deps.consent())
+	if refusal then return false, refusal end
+	if type(outcome_key) ~= "string" or #outcome_key < 1 or #outcome_key > 128
+		or not outcome_key:match("^[%w._:%-]+$") then return false, "invalid_outcome_key" end
+	if type(outcome_value) ~= "number" or outcome_value ~= outcome_value
+		or math.abs(outcome_value) > 9007199254740992 or outcome_value % 1 ~= 0 then
 		return false, "invalid_outcome_value"
 	end
-	-- A pending non-adult declaration records nothing under the earlier one:
-	-- not against an age-gated entry (served_entry hides it), nor under a
-	-- server fact key carried by a synthetic-subject one.
-	local entry = self:served_entry(experiment_key)
-	if not entry then
-		return false, "no_assignment"
-	end
-	if self.declaring[experiment_key]
-		and type(entry.subject_fact_key) == "string" and entry.subject_fact_key ~= "" then
-		return false, "no_assignment"
-	end
-	-- Same egress rule as the exposure lane: the server-minted subject-fact
-	-- key or nothing — the SDK-minted subject id never rides an analytics
-	-- fact.
-	local fact_key = entry.subject_fact_key
-	if type(fact_key) ~= "string" or fact_key == "" then
-		return false, "exposure_no_subject_fact_key"
-	end
-	return self.deps.emit("experiment_outcome", {
-		experiment_key = experiment_key,
-		experiment_version = entry.version,
-		assignment_key = fact_key,
-		variant_key = entry.variant_key,
-		assignment_unit = entry.assignment_unit,
-		outcome_key = outcome_key,
-		outcome_value = outcome_value,
-	}, id.uuid())
+	local application = self.applications[experiment_key]
+	if self.auth_blocked or self.declaring[experiment_key] or not application then return false, "no_assignment" end
+	local record = copy_value(application, 0)
+	record.application_id = random.hex(32)
+	record.event_ts = clock.iso_utc()
+	record.outcome_key = outcome_key
+	record.outcome_value_wire = string.format("%.0f", outcome_value == 0 and 0 or outcome_value)
+	self:queue_application(experiment_key, record)
+	return true
 end
 
 M.Experiments = Experiments

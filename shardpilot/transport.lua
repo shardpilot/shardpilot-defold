@@ -1,5 +1,6 @@
 local schema_revision = require "shardpilot.schema_revision"
 local compression = require "shardpilot.compression"
+local experiment_facts = require "shardpilot.experiment_facts"
 
 local M = {}
 
@@ -41,7 +42,8 @@ local function dispatch(config, token, route, payload, callback, compress)
 		return false
 	end
 
-	local ok, encoded = pcall(json.encode, payload)
+	local encoder = route == "/v1/events:batch" and experiment_facts.encode_batch or json.encode
+	local ok, encoded = pcall(encoder, payload)
 	if not ok then
 		callback(false, "json_encode_failed", false, false)
 		return false

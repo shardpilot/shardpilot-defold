@@ -754,10 +754,10 @@ per-app spool and re-sends them on a later launch. Enabled by default
   | Owed debt | `persist()` reports | `shutdown()` reports |
   |---|---|---|
   | assignment-cache write still failing | `experiments_pending` | `experiments_pending` |
-  | exposure fact not captured (queue full) | `experiments_pending` | `queue_full` |
+  | application not sealed, or sealed fact not captured | `experiments_pending` | `queue_full` |
 
   Both codes are **retryable**, exactly like `spool_persist_failed`:
-  `flush()` and call again. Branch on the code the method you called actually
+  drive `update()` and call again. Branch on the code the method you called actually
   emits — a host that treats any non-`true` return as fatal will tear down
   over recoverable debt.
 
@@ -1100,7 +1100,7 @@ shardpilot.init({
 In Mode B, `token_provider` and `api_key` are configured *together* (the
 documented exception to "exactly one" — see [Authentication](#authentication)):
 the token stays the ingest `Bearer`, the `api_key` authenticates the
-remote-config and assignment fetches. Feature-detect the surface before
+remote-config, assignment and experiment apply requests. Feature-detect the surface before
 `init()` with `shardpilot.supports("experiments_assignment")`. The separate
 `shardpilot.supports("experiments_age_band")` capability detects the age-band
 method; the original experiment capability does not promise that newer method.
@@ -1112,7 +1112,8 @@ feature-detect the method as shown below.
 
 <!-- doc-region: none -- the experiments API, which the minimal example does not use -->
 ```lua
-if not shardpilot.supports("experiments_age_band") then
+if not shardpilot.supports("experiments_age_band")
+    or type(shardpilot.apply_experiment_variant) ~= "function" then
   return -- Keep the control experience on an older SDK.
 end
 
@@ -1131,7 +1132,10 @@ shardpilot.fetch_experiment_assignment_with_age_band("menu_layout", "adult", fun
   -- 200 for host introspection (e.g. `assignment_unit`, `production_rollout`).
   -- Read it if you want it; the SDK itself only acts on `assignment_unit`.
   if result.ok and result.assigned then
-    apply_layout(result.variant_key, result.variant_payload)
+    local variant = shardpilot.apply_experiment_variant("menu_layout")
+    if variant then
+      apply_layout(variant, shardpilot.experiment_payload("menu_layout"))
+    end
   end
 end)
 
@@ -1145,14 +1149,16 @@ shardpilot.fetch_experiment_assignment_with_age_band("menu_layout", "adult",
 local variant = shardpilot.experiment_variant("menu_layout") -- variant key string, or nil
 local payload = shardpilot.experiment_payload("menu_layout") -- variant payload copy, or nil
 
--- Emit one extra exposure fact for the live assignment (the automatic
--- at-most-once-per-session exposure needs no call). Returns ok, err.
-shardpilot.track_exposure("menu_layout")
+-- Call at the point your game acts on the variant. Repeated calls count once
+-- per experiment, version, subject and session. No network runs in this call.
+local applied, err = shardpilot.apply_experiment_variant("menu_layout")
 
--- Record a host-defined outcome. `outcome_value` must be a FINITE number
--- (NaN and infinities are rejected -- JSON cannot carry them).
--- Returns ok, err.
-shardpilot.track_outcome("menu_layout", "purchase_value", 4.99)
+-- Record an additional explicit application when your measurement needs one.
+shardpilot.track_exposure("menu_layout") -- ok, err
+
+-- Outcomes use the last explicit application's pinned inputs. Use integer
+-- units (for example, cents), with absolute value at most 2^53.
+shardpilot.track_outcome("menu_layout", "purchase_cents", 499) -- ok, err
 ```
 
 | Call | Returns | Failure codes you can branch on |
@@ -1161,12 +1167,16 @@ shardpilot.track_outcome("menu_layout", "purchase_value", 4.99)
 | `fetch_experiment_assignment_with_age_band(key, age_band, [attributes], callback)` | The same dispatch status and callback as `fetch_experiment_assignment` | The same failures, plus `invalid_experiment_age_band` for an unsupported band or conflicting canonical attribute, and `invalid_experiment_attributes` for a non-table attributes argument |
 | `experiment_variant(key)` | variant key `string`, or `nil` | — (never fails) |
 | `experiment_payload(key)` | the variant payload (a copy), or `nil` | — (never fails) |
-| `track_exposure(key)` | `ok, err` | `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `no_assignment`, `consent_unknown`, `consent_denied`, `exposure_no_subject_fact_key`, `queue_full` |
-| `track_outcome(key, outcome_key, outcome_value)` | `ok, err` | the `track_exposure` codes plus `invalid_outcome_key` (non-empty string required) and `invalid_outcome_value` (a **finite** number required — `NaN` and `±inf` are rejected) |
+| `apply_experiment_variant(key)` | variant key, or `nil`; optional `err` | `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `no_assignment`, `consent_unknown`, `consent_denied`, `queue_full`; a served variant with `serving_pins_missing` or `exposure_no_subject_fact_key` applies without recording |
+| `track_exposure(key)` | `ok, err` | `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `no_assignment`, `consent_unknown`, `consent_denied`, `exposure_no_subject_fact_key`, `serving_pins_missing`, `queue_full` |
+| `track_outcome(key, outcome_key, outcome_value)` | `ok, err` | `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `consent_unknown`, `consent_denied`, `no_assignment` (no explicit application, or authorization/age hold), `invalid_outcome_key` (1–128 ASCII letters, digits, `_`, `.`, `:`, `-`) and `invalid_outcome_value` (an integer with absolute value ≤2^53) |
 
-`queue_full` is the one worth retrying: the in-memory event queue is at
-`buffer_size`, so flush (or wait for the next batch) and call again rather
-than dropping the exposure or outcome.
+`queue_full` from an application call means the next analytics session could
+not open while its lifecycle events were queued. Flush and retry before acting
+on a returned variant. An accepted application or outcome goes into a separate
+FIFO of eight records per experiment; overflow drops the oldest with a
+`fact_skipped` / `owed_overflow` diagnostic. A full analytics queue keeps an
+already sealed record until room is available.
 
 Two callback rules worth internalizing. **Consent can close the plane while a
 request is in flight** — a downgrade mid-flight resolves the callback with
@@ -1178,12 +1188,13 @@ successful shutdown never calls back at all, by design, so never leave state
 parked that only a callback can release.
 
 The fetch is
-`GET {remote_config_url}/api/v1/runtime/experiments/assignment?app_key=&environment_key=&experiment_key=&subject_key=`
+`GET {remote_config_url}/api/cp/v1/runtime/experiments/assignment?app_key=&environment_key=&experiment_key=&subject_key=`
 with the publishable `api_key` as the `Bearer`. The subject is an
 **SDK-minted, SDK-managed** id (`spcid_` + 32 hex) persisted in the durable
 identity record: there is deliberately no config field and no setter for it,
-it is distinct from the anonymous ID, and it egresses **only** as this fetch's
-`subject_key` — never in an analytics event, prop, or envelope identity.
+it is distinct from the anonymous ID, and it egresses **only** to the configured remote-config host as `subject_key` in assignment
+fetches and application requests — never in an analytics event, prop, or
+envelope identity.
 
 Its persistence is **best effort, and that has a stickiness consequence.** On
 a host with no working save-file backend, or when the durable write simply
@@ -1373,49 +1384,49 @@ game has to handle specially.
   the vocabulary are
   dropped client-side and never sent. Matching is **100% server-evaluated**;
   the SDK evaluates no rules.
-- **Exposure and outcome facts** ride the normal analytics pipeline (queue →
-  batch → spool → consent gates). When the assigned variant is first applied
-  the SDK emits an `experiment_exposure` for you; `track_exposure` emits an
-  extra one on demand, and `track_outcome` records host-defined numeric
-  outcomes.
+- **Explicit application records exposure.** Call `apply_experiment_variant`
+  exactly where your game acts on the returned variant. Fetching, revalidation,
+  getters, cache restoration, session renewal and consent re-grant record
+  nothing by themselves. An explicit application counts once per experiment,
+  version, subject and session; `track_exposure` records an additional
+  application. `track_outcome` follows the last explicit application, even if a
+  later fetch has served a different version.
+- **Two delivery stages.** `update()` first posts the pinned application to
+  `{remote_config_url}/api/cp/v1/runtime/experiments/exposures` or `outcomes`
+  using the existing `api_key`. It carries the served version, revision, kill
+  gate, served time, application time, normalized fetch attributes, subject and
+  a random occurrence ID minted once. An outcome adds its own occurrence ID,
+  time, key and integer value. Nothing is re-read from a newer assignment.
+  The apply response supplies the fact and seal. The SDK then forwards those
+  exact signed JSON bytes through its analytics queue, batching and spool,
+  with `schema_version: 2`, literal `workspace_key`, `app_key`,
+  `environment_key`, `source: client`, and the analytics anonymous/session
+  identity. It omits `user_id`. Ordinary analytics events retain their existing
+  v1 envelope. Raw subjects never reach analytics; analytics identities never
+  reach the apply endpoint. A new attribution key returned by apply must be
+  saved for later age withdrawal before the fact can be forwarded.
+- **Retry and withdrawal.** A `200` with a valid matching fact seals the record.
+  `401`/`403` holds it and stops apply traffic until an authorized fetch;
+  the real-subjects-disabled sentinel withdraws all owed records and cached
+  assignments. Other `4xx` responses are terminal, except `408` and `429`.
+  An `age_ineligible` apply refusal also withdraws that subject's experiment
+  facts. Offline, timeout, malformed responses, `3xx`, `408`, `429` and `5xx`
+  keep the occurrence and retry with backoff and delta-seconds `Retry-After`.
+  Redirects are refused, including HTML5's browser transport. Queue overflow
+  and terminal apply responses report `fact_skipped`; deferred failures report
+  `fact_deferred`. Analytics per-event rejections remain terminal and visible
+  through the existing rejection ring. Retries keep the sealed ID and bytes;
+  a new application uses a new occurrence ID.
+- **Persistence and consent.** Unsealed applications are memory-only: `persist()`
+  performs no network work and reports `false` while any remain. Sealed facts
+  can use the existing durable spool. `shutdown()` tries the network within its
+  existing deadline, but an offline exit can lose unsealed records. A denial
+  purges both stages and clears the last application; a re-grant requires a
+  fresh explicit application. A legacy cache entry without serving pins keeps
+  serving but returns `serving_pins_missing` when applied, recording nothing
+  until a fetch re-serves it. An entry without a server fact key likewise
+  serves with `exposure_no_subject_fact_key`. Both skips are diagnosed.
 
-  **Treat exposure delivery as best-effort, and the `diagnostics` hook as the
-  place you learn otherwise.** Facts carry a deterministic `event_id`, so the
-  server counts retries of the same fact once. Newly derived exposure IDs use
-  RFC 9562 UUIDv5: SHA-1 of the SDK namespace UUID
-  `01e2e885-f600-4118-80b6-f8470ece21bb` in network byte order followed by
-  `exposure`, session marker, subject key, experiment key, decimal version and
-  decimal arm counter joined by byte `0x1f`. The first 128 digest bits receive
-  UUID version 5 and RFC variant bits. The pure-Lua derivation is identical
-  on every supported runtime.
-  Queued and spooled facts retain their stamped IDs on retry. **New in `v0.11.0`:** a consent denial
-  closes the session; after re-grant, retained assignments re-arm into the
-  fresh session and use its distinct exposure ID. Those are separate facts,
-  not duplicate sends of the pre-denial exposure. Under sustained queue
-  pressure the SDK sheds owed exposures rather than growing without bound.
-  A drop-time durable capture with no arm-time session is also refused after
-  the current background pause expires, just as after an explicit session end.
-  It opens no session; the live owed exposure remains for its later sweep.
-  A capture carrying its arm-time session keeps that attribution.
-  Automatic exposure failures surface on the hook as
-  `status = "exposure_skipped"` with a `code` naming the reason. Watch it if
-  the measured population matters to you.
-
-  Two specific gaps worth knowing by name, because neither is an error from
-  your point of view:
-
-  - An applied treatment emits **no** exposure at all when the assignment
-    carries no server-supplied attribution key — a synthetic-unit answer, for
-    instance. The variant still applies; only the measurement is skipped,
-    because the SDK-minted subject id must never reach the analytics plane.
-    Reported as `code = "no_subject_fact_key"` on the hook. The distinct
-    `exposure_no_subject_fact_key` value is the `err` returned from an
-    explicit `track_exposure` / `track_outcome` call — monitoring only that
-    one misses every automatic skip.
-  - The platform currently rejects these fact names from game-embedded
-    publishable keys by design, so an emitted exposure is expected to come
-    back as a per-event reject until that producer lane opens. Surfaced
-    through the same hook and otherwise tolerated silently.
 
 ## Crash wire contract
 
@@ -1877,7 +1888,7 @@ separate prerequisites; the client does not prove the notice was displayed.
 | `shardpilot/queue.lua` | Bounded in-memory event queue |
 | `shardpilot/transport.lua` | Batch/consent dispatch (`/v1/events:batch`, `/v1/consent`) |
 | `shardpilot/remote_config.lua` | Remote-config fetch (`GET /config/v1/...`), ETag cache, typed getters |
-| `shardpilot/experiments.lua` | Experiment-assignment consumer (off by default): assignment fetch, durable cache, revalidation, exposure/outcome facts |
+| `shardpilot/experiments.lua` | Experiment-assignment consumer (off by default): assignment fetch, explicit application, signed exposure/outcome forwarding |
 | `shardpilot/storage.lua` | The **only** module allowed to call `sys.save`/`sys.load` |
 | `shardpilot/clock.lua` · `id.lua` · `platform.lua` · `sampling.lua` | Time, UUIDv7, platform detect, runtime sampling |
 | `shardpilot/consent_policy.lua` | Consent-regime preparation before SDK init; imports nothing from this SDK |
