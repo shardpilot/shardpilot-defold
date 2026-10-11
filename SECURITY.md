@@ -22,7 +22,10 @@ details.
 
 - Client tokens are memory-only.
 - The in-memory event queue is bounded. A bounded, per-app offline event spool
-  additionally persists undeliverable event envelopes across restarts; it is
+  additionally persists undeliverable event envelopes and local intake/attempt
+  clocks across restarts. Events expire after seven days from intake or fifteen
+  minutes from the first potentially delivered HTTP attempt, whichever is first;
+  missing, invalid or future clocks expire conservatively. The spool is
   written only while analytics consent is currently granted, is loaded at
   launch only when a persisted grant is on record, and is purged fail-closed
   in every other state. A grant whose identity-record persistence fails can

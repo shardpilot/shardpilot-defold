@@ -508,6 +508,12 @@ Crash configuration retains its separate platform behavior. See `docs/crash.md`.
 
 ## Offline event spool
 
+Delivery is bounded by seven days from local event intake and fifteen minutes
+from the first potentially delivered HTTP attempt. Neither is configurable or
+renewed by retry. Missing, invalid or future stored clocks expire conservatively;
+older spool records without clocks are dropped. See [delivery age](../README.md#offline-durability-event-spool)
+for HTTP outcomes, persistence failures and the one-live-client-per-app contract.
+
 Three knobs control the durable offline event spool (full behavior in the
 README's "Offline durability" section and [`docs/events.md`](events.md)):
 
@@ -663,7 +669,7 @@ including between module `init()` and its first `update()`.
 
 Counts are also available on `snapshot()` (`accepted`, `dropped`, `last_error`,
 `rejected`, `duplicates`, `observed`, `suppressed`, `last_event_issue`, plus
-the spool counters `spooled`, `spool_resent`, `spool_evicted`,
+the spool counters `spooled`, `spool_resent`, `spool_evicted`, `spool_expired`,
 `spool_persist_failed` and the consent-outbox counters
 `consent_outbox_evicted`, `consent_outbox_persist_failed`). The
 SDK honors a `429` `Retry-After` header by deferring the next publish, and

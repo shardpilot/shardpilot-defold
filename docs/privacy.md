@@ -290,9 +290,9 @@ rate-limited, or a server error), when undelivered events remain at
 written to a per-app spool so a later launch can re-send them (de-duplicated
 by the service on the stable event id). This spool:
 
-- stores only the **event envelopes that were already bound for the wire** —
-  the same fields the batch endpoint would have received, nothing extra and
-  **never tokens**;
+- stores the **event envelopes already bound for the wire**, plus two local
+  delivery clocks per event ID: intake time and first potentially delivered
+  HTTP attempt time. The clocks stay outside the wire envelope; **never tokens**;
 - is **bounded** by both an entry count (`spool_max_events`) and an
   approximate serialized size (`spool_max_bytes`), evicting the oldest
   entries first, so it can never grow without limit;
@@ -312,12 +312,18 @@ by the service on the stable event id). This spool:
   completes **before** an otherwise permitted grant takes effect: `set_consent(true)` is not
   applied while that purge is owed (the persisted decision stays denied), so
   pre-revocation events can never replay under a granted decision;
+- expires individual events after seven days from local intake or fifteen
+  minutes from the first potentially delivered HTTP attempt. Proven-unsent
+  attempts and received `4xx` do not start a new ambiguity budget, but cannot
+  clear an earlier one. Missing, invalid or future clocks expire conservatively,
+  including legacy records; expiry reports `spool_expired` with the original ID.
+  The clocks survive restart and are independent of the envelope's `event_ts`;
 - is **cleared on acknowledgment** — entries are removed as soon as the
   server accepts their batch, or on a permanent rejection (never retried); a
   failed removal rewrite keeps them marked and retries until storage
   recovers;
 - may store a server-requested **backpressure deadline** (a `429`
-  `Retry-After` timestamp — no other metadata) so a relaunch does not hammer
+  `Retry-After` timestamp) so a relaunch does not hammer
   a server that asked for space;
 - is **cleared on an identity change under Mode B auth** — envelopes whose
   anonymous ID no longer matches the client's are dropped at load rather than
