@@ -478,7 +478,8 @@ Crash reporting is ON by default and needs no first-run decision; an explicit
 
 ## Remote-config cache
 
-When remote config is enabled (`app_url`), the last successfully
+When remote config is enabled (`remote_config_enabled = true` with `app_url`
+and `publishable_key`; default `false`), the last successfully
 served configuration is kept in one durable per-app record so a restart or an
 offline launch still gets the previously fetched values. This cache:
 
@@ -502,6 +503,8 @@ offline launch still gets the previously fetched values. This cache:
 - carries **targeting attributes only under an explicit grant** and opt-in
   (dark by default): with the targeting opt-in
   (`remote_config_attributes_enabled = true`) the attributes the game stores
+  can accompany an already enabled fetch (`remote_config_enabled = true`).
+  The attribute flag does not construct the consumer. Values set
   via `set_remote_config_attributes` ride the fetch as query parameters so
   server-side delivery rules can target this client — and they ride ONLY
   while the consent state read at dispatch time is granted. Unknown consent

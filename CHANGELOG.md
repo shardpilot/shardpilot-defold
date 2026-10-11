@@ -108,8 +108,8 @@
   anonymous-ID replacement clears the prior actor's exclusion and starts the
   replacement at `unknown`; same-ID and refused replacements retain it.
 
-- Crash reports emit the root `component` key. `crash_component` is the preferred
-  configuration option; `crash_source` remains a deprecated fallback when blank.
+- Crash reports emit the root `component` key. `crash_component` is the only
+  configuration option for it; there is no deprecated fallback alias.
   Durable replay renames old root `source` keys without changing value bytes,
   nested fields or crash IDs. Older prepared-table records are encoded once and
   receive the same rename. Both-key records remain queued without dispatch.

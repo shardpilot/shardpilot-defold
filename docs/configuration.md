@@ -222,10 +222,12 @@ the `publishable_key` authenticates only the remote-config fetch.
 - `experiments_enabled` and `remote_config_attributes_enabled` require the
   application origin independently of the remote-config switch.
 - **`remote_config_attributes_enabled`** (default `false` = dark, boolean).
+  This flag does not construct the consumer; set `remote_config_enabled = true`
+  to enable fetches. Experiments remain independent of that switch.
   Opt-in: fetches carry the targeting attributes stored via
   `set_remote_config_attributes(attributes)` as query parameters, so
   server-side delivery rules can target this client (`nil`/empty clears; the
-  setter is inert while the flag is off, and the flag without
+  setter is inert while the flag or remote-config consumer is off, and the flag without
   `app_url` is rejected with
   `remote_config_attributes_requires_app_url`). The vocabulary and
   bounds are the experiment consumer's, verbatim: `geo`, `app_version`,

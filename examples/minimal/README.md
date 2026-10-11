@@ -29,7 +29,10 @@ follow the README's host requirements before initializing processing.
 
 ## Running it
 
-Drop `main.script` into a Defold collection, point `app_url`, `ingest_url` and
-`app_url` at your own services, and replace
+Drop `main.script` into a Defold collection. Set the consent-policy context's
+`app_url` to your policy origin. In the analytics configuration, set `ingest_url`
+to your ingest origin and `app_url` to your application origin; the example
+also sets `remote_config_enabled = true`. Set the crash configuration's
+`crash_url` to your crash origin. Replace
 `present_consent_notice` — the placeholder declines immediately, so the example
 runs with every plan-dependent lane closed while it cannot authenticate a plan.

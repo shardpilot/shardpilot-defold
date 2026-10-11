@@ -52,10 +52,10 @@ crash.init({
 | `app_id` | yes | App/project scope; must match the API key's app scope. A product slug such as `user_app` or `customer_portal` is fine; a value carrying real PII (an email, an IP, a token, a digit-bearing raw actor id) fails `crash.init` with `invalid_app_id`. |
 | `app_version`, `app_build` | no | Defaulted onto every report. |
 | `platform` | no | Auto-detected from `sys.get_sys_info` (`ios`/`android`/`windows`/`macos`/`linux`/`web`). Set it explicitly when running outside Defold or on an unrecognized system; if it is neither configured nor auto-detectable, `crash.init` fails with `platform_required` rather than returning a client that can never send a report. |
-| `crash_component` | no | Preferred component slug (see below). |
+| `crash_component` | no | Component slug (see below); no fallback configuration alias. |
 | `crash_sample_every` | no | Every-Nth sampling for **non-fatal** reports (default 10): a deterministic per-process counter transmits calls N, 2N, 3N, … — the first N−1 non-fatals of a process are always dropped, so a process emitting fewer than N non-fatals in its lifetime reports none (set `1` to send every one). Set `0` to disable non-fatal reports, including the custom sampler. Fatal reports are **never** sampled. |
 | `crash_http_timeout_seconds` | no | Per-request timeout (default 30). |
-| `sampler` | no | A custom `function(event) -> boolean` for non-fatal reports. A fatal report bypasses it. |
+| `sampler` | no | A custom `function(event) -> boolean` for non-fatal reports when `crash_sample_every` is positive. Zero disables non-fatals before this callback; fatal reports bypass it. |
 | `diagnostics` | no | A hook invoked with `{ scope, status, code, retryable, response }` when a report is rejected or unauthorized. |
 | `anonymous_id` | no | The pseudonymous actor key a report is attributed to — a `function` resolved per report (pass `shardpilot.get_anonymous_id` to track the analytics id, including later rotations) or a fixed string. Absent means reports carry no actor key, as before. See [Attributing crashes to a player](#attributing-crashes-to-a-player). |
 | `session_id` | no | The session a crash happened in; same `function`-or-string shape. `shardpilot.get_session_id` returns `nil` until a session opens, which is handled. |
@@ -139,8 +139,9 @@ entirely. Only `emit` (non-fatal) is sampled, and the default sampler is
 **deterministic, not probabilistic**: a per-process counter transmits every
 Nth call (10th, 20th, … at the default), so the first N−1 non-fatals of any
 process are always dropped. A sampled-out `emit` looks exactly like a sent
-one at the call site; supply a custom `sampler` (e.g. `function() return
-true end`) to transmit every non-fatal.
+one at the call site. `crash_sample_every = 0` disables every non-fatal report
+before the custom `sampler` runs. At a positive rate, a custom `sampler`
+(e.g. `function() return true end`) can admit every non-fatal.
 
 **New in `v0.11.0`:** newly captured reports carry SDK-stamped `fatal` on the wire.
 An admitted non-fatal report also carries `non_fatal_sample_one_in` when the

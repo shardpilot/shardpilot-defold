@@ -978,6 +978,10 @@ Set `request_compression_enabled = false` to opt out entirely.
 
 ## Remote config
 
+Set `remote_config_enabled = true` together with `app_url` and
+`publishable_key` before fetching. The switch defaults to `false`; an address
+alone does not construct the consumer. Experiments use their own switch.
+
 <!-- doc-region: none -- the remote-config API, which the flow only parks a value from -->
 ```lua
 shardpilot.fetch_remote_config(function(result)
@@ -1062,7 +1066,9 @@ response replaces it; a consent change alone does not clear that snapshot.
 - Fetching remains available in every consent state. The anonymous ID and
   targeting attributes require granted consent; the other states use the
   identifier-free route. See [`docs/privacy.md`](docs/privacy.md).
-- **Targeting attributes also require a dark opt-in.** With
+- **Targeting attributes also require a dark opt-in.** The attribute flag does
+  not enable remote config: `remote_config_enabled = true` is needed first.
+  With
   `remote_config_attributes_enabled = true`, attributes stored via
   `shardpilot.set_remote_config_attributes({ geo = "US", … })` ride each
   fetch as sorted, percent-escaped query parameters so **server-side**

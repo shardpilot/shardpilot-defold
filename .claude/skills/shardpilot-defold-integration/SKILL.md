@@ -1028,7 +1028,8 @@ launches. `remote_config_version()` reads the response wrapper's `version`
 metadata.
 
 Targeting attributes are a dark opt-in and — unlike the fetch —
-granted-consent-only: `remote_config_attributes_enabled = true` plus
+granted-consent-only. They do not enable remote config: the consumer needs
+`remote_config_enabled = true` first. Then `remote_config_attributes_enabled = true` plus
 `shardpilot.set_remote_config_attributes({ geo = "US", … })` makes fetches
 carry the experiment attribute vocabulary (`geo`, `app_version`,
 `device_type`, `install_date`, `user_segment`, `custom_attribute_<name>`;
@@ -1080,7 +1081,9 @@ crash.record_breadcrumb("menu.open")
   (`"opt_out" | "settings_read_failed" | "not_initialized"`).
 - **Fatal is never sampled**; non-fatal `emit` is sampled deterministically
   1-in-N (`crash_sample_every`, default 10 — the first N−1 non-fatals of a process
-  are dropped; set `1` or a custom `sampler` to send every one).
+  are dropped; set `1` to send every one). `crash_sample_every = 0` disables
+  all non-fatal reports, including a custom `sampler`; at a positive rate,
+  a custom sampler returning `true` admits every non-fatal.
 - **Write-ahead durability (best-effort)**: before its send attempt, every
   dispatched report is persisted to a bounded per-app pending sidecar
   (8 records / 64 KB each / 384 KB total, ~7-day TTL) and re-sent

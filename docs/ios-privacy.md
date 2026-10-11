@@ -112,7 +112,9 @@ against what your service actually does with each type.
 - Explicit consent decisions and retained receipts still transmit actor identity
   and decision metadata while analytics is denied or unknown. A fresh install
   without a decision has no receipt to send.
-- An explicitly configured remote-config fetch transmits the anonymous client ID
+- Remote-config fetching requires `remote_config_enabled = true`, `app_url`
+  and `publishable_key`; the switch defaults to `false`. An explicit fetch
+  transmits the anonymous client ID
   only with granted analytics consent. Unknown and both denied states fetch
   without identity or targeting attributes; the host user ID is never sent.
   Targeting attributes also require their opt-in. Experiments are off by default
