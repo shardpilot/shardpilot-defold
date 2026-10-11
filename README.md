@@ -821,6 +821,8 @@ before `http.request`, for live batches as well as restored spool entries.
 Eligible members retain their original envelope bytes and IDs. Expired members
 are dropped individually, counted in `snapshot().spool_expired`, and reported
 with diagnostic code `spool_expired` and their original `event_id`.
+A batch emptied by preflight expiry counts as a successful local drain for
+`flush()` and `shutdown()`, without an HTTP request.
 
 The spool stores these two clocks as local metadata outside the wire envelope.
 A new clock for an already persisted event must save before HTTP can start;

@@ -7063,7 +7063,8 @@ function Client:flush(options)
 			return false
 		end
 		local dispatched, completed, succeeded = self:start_publish_batch(options.automatic == true)
-		if not dispatched or (completed and not succeeded) then
+		-- Preflight expiry can complete a successful local drain without HTTP.
+		if (completed and not succeeded) or (not completed and not dispatched) then
 			return false
 		end
 		if self.publish_in_flight then
