@@ -11,7 +11,6 @@ local platform = require "shardpilot.platform"
 local queue = require "shardpilot.queue"
 local remote_config_mod = require "shardpilot.remote_config"
 local sampling = require "shardpilot.sampling"
-local schema_revision_mod = require "shardpilot.schema_revision"
 local storage = require "shardpilot.storage"
 local transport = require "shardpilot.transport"
 local utf8 = require "shardpilot.utf8"
@@ -546,7 +545,6 @@ local config_keys = {
 	remote_config_attributes_enabled = true,
 	remote_config_url = true,
 	request_compression_enabled = true,
-	schema_revision = true,
 	session_timeout_seconds = true,
 	source = true,
 	spool_enabled = true,
@@ -724,26 +722,6 @@ local function validate_config(config, diagnostics)
 	if not spool_max_bytes then
 		return nil, spool_max_bytes_err
 	end
-	-- Schema-revision declaration. Default (nil): every
-	-- events:batch request declares the SDK's built-in schema-set revision
-	-- (shardpilot/schema_revision.lua) in the X-ShardPilot-Schema-Revision
-	-- request header. A non-empty string overrides the declared value (e.g.
-	-- matched to a self-hosted server build); `false` or `""`
-	-- stops declaring entirely — the escape hatch the server contract
-	-- documents: an undeclared batch always passes the server's check, in
-	-- every handshake mode. The header rides only on batches, and only ones
-	-- that already passed the consent gate — declaring is orthogonal to the
-	-- consent-first semantics.
-	local declared_schema_revision
-	if config.schema_revision == nil then
-		declared_schema_revision = schema_revision_mod.REVISION
-	elseif config.schema_revision == false or config.schema_revision == "" then
-		declared_schema_revision = nil
-	elseif type(config.schema_revision) == "string" then
-		declared_schema_revision = config.schema_revision
-	else
-		return nil, "invalid_schema_revision"
-	end
 	-- Consent-receipt `kind` emission.
 	-- Default (nil/true): every `POST /v1/consent` body carries the
 	-- receipt's stored actor class next to `actor_identifier`. `false` is
@@ -770,7 +748,6 @@ local function validate_config(config, diagnostics)
 		app_version = config.app_version,
 		app_build = config.app_build,
 		source = source,
-		schema_revision = declared_schema_revision,
 		consent_kind_emission_enabled = config.consent_kind_emission_enabled ~= false,
 		request_compression_enabled = config.request_compression_enabled ~= false,
 		platform = resolve_envelope_platform(config, diagnostics),
@@ -4390,29 +4367,6 @@ function Client:apply_error_envelope(err, response)
 	end
 	if error_obj.code then
 		self.stats.last_error = err .. ":" .. tostring(error_obj.code)
-	end
-	if error_obj.code == "schema_revision_mismatch" then
-		-- Terminal by server contract: the declared schema
-		-- revision no longer matches the schema set the ingest service
-		-- serves, and retrying the same batch from the same build can never
-		-- succeed (the 409 carries no Retry-After). The batch takes the
-		-- normal terminal-failure path — dropped, never retried or spooled —
-		-- and this log line makes the fix actionable. Discrimination is by
-		-- error.code, never the bare 409 status: the other ingest 409 codes
-		-- keep their existing handling. While armed, the service answers
-		-- with its own revision in the same header (the real Defold http
-		-- API lowercases response header keys); include it when present.
-		local served
-		if type(response) == "table" and type(response.headers) == "table" then
-			served = response.headers["x-shardpilot-schema-revision"]
-				or response.headers["X-ShardPilot-Schema-Revision"]
-		end
-		print("[shardpilot] schema revision mismatch: this build declares "
-			.. tostring(self.config.schema_revision)
-			.. (served ~= nil and (" but the ingest service serves " .. tostring(served)) or "")
-			.. "; the batch is dropped (terminal, never retried)."
-			.. " Update the SDK (re-sync shardpilot/schema_revision.lua)"
-			.. " or stop declaring (config schema_revision = false).")
 	end
 	self:diagnose({
 		scope = "batch",

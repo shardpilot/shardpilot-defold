@@ -54,10 +54,6 @@ not select the SDK's HTTP transport. A non-string value returns
   spool_enabled = true,
   spool_max_events = 500,
   spool_max_bytes = 262144,
-  -- Schema-revision declaration on batch ingest (default: the SDK's
-  -- built-in revision). A string overrides the declared value; false (or
-  -- "") stops declaring. See "Schema-revision declaration" below.
-  -- schema_revision = false,
   diagnostics = function(issue)
     -- issue = { scope, event_id?, status, code?, message?, detail_codes? }
   end,
@@ -480,28 +476,12 @@ Crash configuration retains its separate platform behavior. See `docs/crash.md`.
 
 ## Schema-revision declaration
 
-- **`schema_revision`** (default: the SDK's built-in revision; string or
-  `false`). Every `POST {ingest_url}/v1/events:batch` request declares, in
-  the `X-ShardPilot-Schema-Revision` request header, the revision of the
-  ingest envelope-schema set this SDK build was provisioned
-  against (`shardpilot/schema_revision.lua` — a public content digest of
-  the service's embedded schema files, not a secret; it is re-synced when
-  the service's schema set changes). The ingest service uses the
-  declaration to detect writer builds whose schema set went stale; while
-  the server-side handshake is off (its default), the header is ignored
-  entirely, so declaring is inert until the service arms it. A non-empty
-  string overrides the declared value (e.g. matched to a self-hosted
-  service build); `false` or `""` disables declaring — an undeclared batch
-  always passes the server's check, in every handshake mode. The header
-  rides only the events-batch route (never the consent, crash, or
-  remote-config requests) and only on batches that already passed the
-  consent gate. If an armed service rejects a batch with a
-  `schema_revision_mismatch` `409`, the batch is dropped as terminal —
-  never retried or spooled, since a retry from the same build cannot
-  succeed — and a log line names the declared and served revisions; the
-  fix is updating the SDK (re-syncing the constant) or disabling the
-  declaration. Feature-detect with
-  `shardpilot.supports("schema_revision_declaration")`.
+The SDK does not send `X-ShardPilot-Schema-Revision`. Engine builds do not
+redeploy with the server's schema set. There is no `schema_revision` setting or
+exported default revision: constructors reject that key with
+`unknown_config_key`, including `false` and an empty string.
+`shardpilot.supports("schema_revision_declaration")` returns `false`.
+This does not change the `schema_version` carried by each event envelope.
 
 ## Offline event spool
 

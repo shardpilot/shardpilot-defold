@@ -900,8 +900,9 @@ bugs.
 - **Feature detection.** `shardpilot.supports(capability)` works before
   `init()` and returns `false` for unknown names on older and newer SDKs
   alike. Keys today: `"consent_receipt_outbox"`,
-  `"consent_state_denied_forced_minor"`, `"schema_revision_declaration"`,
-  `"experiments_assignment"`. Gate new call shapes on it — including the
+  `"consent_state_denied_forced_minor"`,
+  `"experiments_assignment"`, `"experiments_age_band"`.
+  `"schema_revision_declaration"` returns `false`. Gate new call shapes on it — including the
   experiment surface, whose config field an older SDK would silently ignore:
 
 <!-- doc-region: none -- the feature-detection API, outside the quick-start flow -->
@@ -985,10 +986,9 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
   launch). `false, "consent_pending"` means a consent receipt could not be
   durably captured — retry `shutdown` (keep pumping so async HTTP callbacks
   can settle).
-- A `schema_revision_mismatch` batch rejection (HTTP 409 with that error
-  code) is terminal: the batch is dropped, never retried. Fix by updating the
-  SDK (re-sync `shardpilot/schema_revision.lua`) or setting
-  `schema_revision = false` to stop declaring.
+- The SDK sends no schema-set revision header and exports no default digest.
+  There is no `schema_revision` configuration key; constructors reject it with
+  `unknown_config_key`.
 
 ## Remote config
 
