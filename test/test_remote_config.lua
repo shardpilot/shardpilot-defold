@@ -256,14 +256,14 @@ end
 local function config(overrides)
 	local out = {
 		ingest_url = "http://localhost:8080",
-		remote_config_url = "http://localhost:18081",
+		app_url = "http://localhost:18081", remote_config_enabled = true,
 		workspace_id = "workspace-test",
 		app_id = "app-test",
 		environment_id = "develop",
 		anonymous_id = "anon-client",
-		api_key = "sp_ingest_publishable_key",
+		publishable_key = "sp_ingest_publishable_key",
 		flush_interval_seconds = 1,
-		publish_timeout_seconds = 2,
+		http_timeout_seconds = 2,
 	}
 	for key, value in pairs(overrides or {}) do
 		out[key] = value
@@ -271,7 +271,7 @@ local function config(overrides)
 	return out
 end
 
-local anonymous_fetch_url = config().remote_config_url .. "/config/v1/workspace-test/develop"
+local anonymous_fetch_url = config().app_url .. "/config/v1/workspace-test/develop"
 
 local function values_body(values, version)
 	return json.encode({ version = version or 1, values = values })
@@ -324,11 +324,11 @@ end
 local function test_config_validation()
 	reset()
 	local invalid_cases = {
-		{ { remote_config_url = 42 }, "invalid_remote_config_url" },
-		{ { remote_config_url = "" }, "invalid_remote_config_url" },
-		{ { remote_config_url = "https://config.example.com/path" }, "invalid_remote_config_url" },
-		{ { remote_config_url = "https://config.example.com?x" }, "invalid_remote_config_url" },
-		{ { remote_config_url = "http://example.com" }, "invalid_remote_config_url" },
+		{ { app_url = 42 }, "invalid_app_url" },
+		{ { app_url = "" }, "invalid_app_url" },
+		{ { app_url = "https://config.example.com/path" }, "invalid_app_url" },
+		{ { app_url = "https://config.example.com?x" }, "invalid_app_url" },
+		{ { app_url = "http://example.com" }, "invalid_app_url" },
 	}
 	for _, entry in ipairs(invalid_cases) do
 		local client, err = sdk.new(config(entry[1]))
@@ -336,7 +336,7 @@ local function test_config_validation()
 		assert_equal(err, entry[2])
 	end
 
-	-- Remote config authenticates with the publishable api_key only, so a
+	-- Remote config authenticates with the publishable publishable_key only, so a
 	-- Mode B config that enables it must also carry the key...
 	-- (Overriding with nil through config() is a no-op in Lua, so absent
 	-- fields are removed explicitly.)
@@ -345,10 +345,10 @@ local function test_config_validation()
 			callback("client-token-placeholder", nil, nil)
 		end,
 	})
-	mode_b_only.api_key = nil
+	mode_b_only.publishable_key = nil
 	local client, err = sdk.new(mode_b_only)
 	assert_equal(client, nil)
-	assert_equal(err, "remote_config_api_key_required")
+	assert_equal(err, "remote_config_publishable_key_required")
 
 	-- ...and that is the ONE configuration where both credentials are valid
 	-- together. Without remote config, both-set stays rejected.
@@ -363,7 +363,8 @@ local function test_config_validation()
 			callback("client-token-placeholder", nil, nil)
 		end,
 	})
-	both_without_rc.remote_config_url = nil
+	both_without_rc.app_url = nil
+	both_without_rc.remote_config_enabled = false
 	client, err = sdk.new(both_without_rc)
 	assert_equal(client, nil)
 	assert_equal(err, "auth_mode_conflict")
@@ -402,7 +403,7 @@ local function test_mode_b_with_remote_config_splits_credentials()
 	local request = last_request()
 	assert_equal(request.method, "GET")
 	assert_equal(request.headers["Authorization"], "Bearer sp_ingest_publishable_key",
-		"the remote-config Bearer must be the publishable api_key, never the ingest token")
+		"the remote-config Bearer must be the publishable publishable_key, never the ingest token")
 end
 
 -- ── fetch outcomes ────────────────────────────────────────────────────────────
@@ -445,7 +446,7 @@ local function test_fresh_fetch_serves_values_and_writes_cache()
 	assert_true(record ~= nil, "the fetch must persist a cache record")
 	assert_equal(record.etag, '"rcfg-3-abc"')
 	assert_equal(record.scope,
-		remote_config.build_scope("workspace-test", "develop", "", config().remote_config_url))
+		remote_config.build_scope("workspace-test", "develop", "", config().app_url))
 end
 
 local function test_revalidation_304_serves_cached_snapshot()
@@ -1577,7 +1578,7 @@ local function test_corrupt_cache_record_reads_as_a_miss()
 	storage.reset()
 	stores[record_path] = {
 		scope = remote_config.build_scope(
-			"workspace-test", "develop", "", config().remote_config_url),
+			"workspace-test", "develop", "", config().app_url),
 		etag = '"stale-etag"',
 		body = "garbage",
 		fetched_at_ms = 1,
@@ -1729,7 +1730,8 @@ end
 local function test_getters_without_remote_config_serve_defaults()
 	reset()
 	local no_remote_config = config()
-	no_remote_config.remote_config_url = nil
+	no_remote_config.app_url = nil
+	no_remote_config.remote_config_enabled = false
 	local client = assert(sdk.new(no_remote_config))
 	assert_equal(client:remote_config_string("title", "fallback"), "fallback")
 	assert_equal(client:remote_config_number("limit", 7), 7)
@@ -1800,10 +1802,11 @@ local function test_attributes_config_validation()
 
 	-- Without the base URL there is no fetch for attributes to ride.
 	local no_base = config({ remote_config_attributes_enabled = true })
-	no_base.remote_config_url = nil
+	no_base.app_url = nil
+	no_base.remote_config_enabled = false
 	client, err = sdk.new(no_base)
 	assert_equal(client, nil)
-	assert_equal(err, "remote_config_attributes_requires_remote_config_url")
+	assert_equal(err, "remote_config_attributes_requires_app_url")
 end
 
 local function test_attributes_never_ride_while_the_opt_in_is_off()
@@ -2084,7 +2087,7 @@ local function test_anonymous_config_cache_is_separate_across_restart_and_regran
 	next_response_headers = { etag = '"anonymous"' }
 	assert_true(fetch(restarted).ok)
 	assert_nil(last_request().headers["If-None-Match"], "identified validator must not ride anonymous fetch")
-	local scope = remote_config.build_scope("workspace-test", "develop", "", config().remote_config_url)
+	local scope = remote_config.build_scope("workspace-test", "develop", "", config().app_url)
 	assert_equal(storage.load_remote_config(restarted.config).scope, scope)
 	storage.reset()
 	local anonymous = assert(sdk.new(config()))
@@ -2120,7 +2123,7 @@ local function test_anonymous_response_keeps_dispatch_scope_after_grant()
 	assert_true(result.ok)
 	assert_equal(client:remote_config_number("v", 0), 7, "anonymous response must still install after grant")
 	assert_equal(storage.load_remote_config(client.config).scope,
-		remote_config.build_scope("workspace-test", "develop", "", config().remote_config_url),
+		remote_config.build_scope("workspace-test", "develop", "", config().app_url),
 		"late response persists the dispatch scope")
 end
 

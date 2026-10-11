@@ -30,6 +30,6 @@ follow the README's host requirements before initializing processing.
 ## Running it
 
 Drop `main.script` into a Defold collection, point `endpoint`, `ingest_url` and
-`remote_config_url` at your own services, and replace
+`app_url` at your own services, and replace
 `present_consent_notice` — the placeholder declines immediately, so the example
 runs with every plan-dependent lane closed while it cannot authenticate a plan.

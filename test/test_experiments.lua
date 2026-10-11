@@ -336,16 +336,16 @@ local fixture_subject_fact_key = "sfk1_" .. string.rep("b", 64)
 local function config(overrides)
 	local out = {
 		ingest_url = "http://localhost:8080",
-		remote_config_url = "http://localhost:18081",
+		app_url = "http://localhost:18081", remote_config_enabled = true,
 		workspace_id = "workspace-test",
 		app_id = "app-test",
 		environment_id = "develop",
 		anonymous_id = "anon-client",
-		api_key = "sp_ingest_publishable_key",
+		publishable_key = "sp_ingest_publishable_key",
 		experiments_enabled = true,
 		batch_size = 100,
 		flush_interval_seconds = 3600,
-		publish_timeout_seconds = 2,
+		http_timeout_seconds = 2,
 	}
 	for key, value in pairs(overrides or {}) do
 		out[key] = value
@@ -493,10 +493,11 @@ local function test_config_validation()
 	-- The assignment endpoint lives on the host the
 	-- remote-config base names, so the flag requires that base URL.
 	local no_base = config()
-	no_base.remote_config_url = nil
+	no_base.app_url = nil
+	no_base.remote_config_enabled = false
 	client, err = sdk.new(no_base)
 	assert_equal(client, nil)
-	assert_equal(err, "experiments_requires_remote_config_url")
+	assert_equal(err, "experiments_requires_app_url")
 
 	-- Default off: the consumer is not constructed.
 	local off = config()
@@ -3165,7 +3166,7 @@ local function test_credential_swap_scopes_the_cache()
 	-- An IN-PLACE key swap (same workspace/app/environment) is another
 	-- tenant's plane: the previous tenant's cached assignment and its
 	-- subject-fact key must be a safe scope-miss, never served.
-	local swapped = assert(sdk.new(config({ api_key = "sp_ingest_publishable_key_b" })))
+	local swapped = assert(sdk.new(config({ publishable_key = "sp_ingest_publishable_key_b" })))
 	assert_nil(swapped:experiment_variant("exp-checkout"),
 		"a swapped credential must not serve the previous tenant's cache")
 
@@ -4158,7 +4159,7 @@ end
 local function test_mode_b_rotation_blocked_while_exposure_owed()
 	reset()
 	seed_granted_consent()
-	-- Mode B analytics (token_provider) + the publishable api_key for
+	-- Mode B analytics (token_provider) + the publishable publishable_key for
 	-- remote config: a valid dual-credential configuration. Owed exposure
 	-- snapshots hold the OLD anon identity outside the queue, so a flushed
 	-- queue must not admit rotation while one is owed — the later sweep
@@ -11801,7 +11802,7 @@ function extra_tests.test_apply_timeout_ignores_old_callback()
 		end
 	end
 	client.experiments:tick(0)
-	advance_seconds(client.config.publish_timeout_seconds + 1)
+	advance_seconds(client.config.http_timeout_seconds + 1)
 	client.experiments:tick(0)
 	assert_true(client.experiments.retry_after_ms ~= nil)
 	advance_seconds(60)

@@ -21,11 +21,12 @@ not select the SDK's HTTP transport. A non-string value returns
 ```lua
 {
   ingest_url = "https://ingest.shardpilot.com",
-  -- Optional: enables remote config (a SEPARATE service from the ingest
-  -- endpoint; requires api_key — see "Remote config" below).
-  -- remote_config_url = "https://config.shardpilot.com",
+  -- Optional application origin (a SEPARATE service from the ingest
+  -- endpoint; requires publishable_key — see "Remote config" below).
+  -- app_url = "https://config.shardpilot.com",
+  -- remote_config_enabled = true, -- explicit opt-in; default false
   -- Optional: enables experiments (default false = off). Requires BOTH
-  -- remote_config_url and api_key — see "Experiments" below.
+  -- app_url and publishable_key — see "Experiments" below.
   -- experiments_enabled = true,
   workspace_id = "workspace",
   app_id = "app",
@@ -36,12 +37,12 @@ not select the SDK's HTTP transport. A non-string value returns
   -- Optional network-summary label (not the SDK HTTP implementation):
   -- transport = "websocket",
   -- Auth: configure EXACTLY ONE of token_provider (Mode B) or
-  -- api_key (Mode A). See "Authentication modes" below.
+  -- publishable_key (Mode A). See "Authentication modes" below.
   token_provider = function(callback)
     callback("client-token-placeholder", expires_at_unix_ms, nil)
   end,
   -- Mode A alternative (publishable key, no token_provider):
-  -- api_key = "sp_ingest_...",
+  -- publishable_key = "sp_ingest_...",
   batch_size = 25,
   buffer_size = 1000,
   -- flush_interval_seconds defaults to 15; at the historical tag v0.10.1 the
@@ -49,7 +50,7 @@ not select the SDK's HTTP transport. A non-string value returns
   -- waits before publishing, not a heartbeat: update(dt) publishes nothing
   -- when the queue is empty. Set it explicitly only if you want a different
   -- cadence -- pinning it to 1 here is what stopped batching from happening.
-  publish_timeout_seconds = 2,
+  http_timeout_seconds = 2,
   -- Offline event spool (durable, per app). See "Offline event spool" below.
   spool_enabled = true,
   spool_max_events = 500,
@@ -69,7 +70,7 @@ in this release. Use non-production endpoints for source evaluation until a late
 release explicitly publishes production infrastructure.
 
 Required fields are `ingest_url`, `workspace_id`, `app_id`, `environment_id`,
-and exactly one auth source (`token_provider` OR `api_key`). A UUIDv7 anonymous
+and exactly one auth source (`token_provider` OR `publishable_key`). A UUIDv7 anonymous
 ID is generated and persisted automatically (config `anonymous_id` or
 `set_anonymous_id` override it); `identify(user_id)` upgrades attribution to a
 known user. A config `anonymous_id` that replaces a DIFFERENT persisted
@@ -171,36 +172,36 @@ Configure **exactly one**:
   end,
   ```
 
-- **Mode A — `api_key`** (publishable key). The non-secret `sp_ingest_...`
+- **Mode A — `publishable_key`** (publishable key). The non-secret `sp_ingest_...`
   publishable key, used directly as the `Bearer` credential. It is safe to
   embed client-side, never expires, and needs no token round-trip.
 
   ```lua
-  api_key = "sp_ingest_...",
+  publishable_key = "sp_ingest_...",
   ```
 
 Mode is selected by presence: a configured `token_provider` is used (Mode B);
-otherwise the `api_key` is the standing Bearer (Mode A). Configuring **both**
+otherwise the `publishable_key` is the standing Bearer (Mode A). Configuring **both**
 is rejected (`auth_mode_conflict`); configuring **neither** is rejected
 (`auth_required`). `anonymous_id` is sent on the wire in both modes. Mode B
 JWTs are memory-only.
 
 **Remote config is the exception to "exactly one".** The remote-config
-endpoint authenticates with the publishable `api_key` only — a Mode B ingest
+endpoint authenticates with the publishable `publishable_key` only — a Mode B ingest
 JWT is scoped to event ingest and the remote-config endpoint rejects it. With
-`remote_config_url` set, an `api_key` is therefore required even in Mode B
-(rejected with `remote_config_api_key_required` otherwise), and configuring
+`app_url` set, a `publishable_key` is therefore required even in Mode B
+(rejected with `remote_config_publishable_key_required` otherwise), and configuring
 both credentials becomes valid: the `token_provider` keeps the ingest Bearer,
-the `api_key` authenticates only the remote-config fetch.
+the `publishable_key` authenticates only the remote-config fetch.
 
 ## Remote config
 
-- **`remote_config_url`** (default `nil` = disabled, string). The base URL of
+- **`app_url`** (default `nil`, string). The base URL of
   the remote-config endpoint, validated with the same shape rules as
   `ingest_url` (`https://…`, or `http://` for loopback hosts only; no
   path/query/fragment). This is a **separate service** from the ingest
-  endpoint — pointing it at `ingest_url` is wrong. When set, the client
-  exposes `fetch_remote_config(callback)` plus the typed getters
+  endpoint — pointing it at `ingest_url` is wrong. With
+  **`remote_config_enabled = true`** (default `false`), the client enables `fetch_remote_config(callback)` plus the typed getters
   (`remote_config_string/number/boolean/value/values/version`); fetching is
   always an explicit call (the SDK never fetches configuration on its own),
   responses are cached in one durable per-app record, and getters serve the
@@ -212,13 +213,15 @@ the `api_key` authenticates only the remote-config fetch.
   Full semantics — ETag revalidation, offline
   fallback, the `401`/`403` fail-closed rule, and the cache's scope check —
   are in the README's "Remote config" section.
+- `experiments_enabled` and `remote_config_attributes_enabled` require the
+  application origin independently of the remote-config switch.
 - **`remote_config_attributes_enabled`** (default `false` = dark, boolean).
   Opt-in: fetches carry the targeting attributes stored via
   `set_remote_config_attributes(attributes)` as query parameters, so
   server-side delivery rules can target this client (`nil`/empty clears; the
   setter is inert while the flag is off, and the flag without
-  `remote_config_url` is rejected with
-  `remote_config_attributes_requires_remote_config_url`). The vocabulary and
+  `app_url` is rejected with
+  `remote_config_attributes_requires_app_url`). The vocabulary and
   bounds are the experiment consumer's, verbatim: `geo`, `app_version`,
   `device_type`, `install_date`, `user_segment`, `custom_attribute_<name>`;
   ≤512-byte values, 64-attribute cap, sorted, out-of-vocabulary names
@@ -253,18 +256,18 @@ the `api_key` authenticates only the remote-config fetch.
 **Enabling it requires two more fields.** The assignment endpoint is served by
 the same host as the remote-config fetch and authenticates with the same
 publishable key, so `experiments_enabled = true` is only a valid configuration
-alongside `remote_config_url` **and** `api_key`:
+alongside `app_url` **and** `publishable_key`:
 
 | Setting this… | …also requires | Otherwise `init()` returns |
 |---|---|---|
-| `experiments_enabled = true` | `remote_config_url` | `false, "experiments_requires_remote_config_url"` |
-| `remote_config_url` | `api_key` | `false, "remote_config_api_key_required"` |
+| `experiments_enabled = true` | `app_url` | `false, "experiments_requires_app_url"` |
+| `app_url` | `publishable_key` | `false, "remote_config_publishable_key_required"` |
 
 ```lua
 {
   ingest_url = "https://…",
-  remote_config_url = "https://…", -- required by experiments_enabled
-  api_key = "sp_ingest_…",         -- required by remote_config_url
+  app_url = "https://…", -- required by experiments_enabled
+  publishable_key = "sp_ingest_…",         -- required by app_url
   workspace_id = "workspace",
   app_id = "app",
   environment_id = "production",
@@ -274,7 +277,7 @@ alongside `remote_config_url` **and** `api_key`:
 
 In Mode B this is the same documented exception to "configure exactly one"
 that remote config already uses: `token_provider` stays the ingest `Bearer`
-and the `api_key` authenticates remote-config, assignment and apply requests.
+and the `publishable_key` authenticates remote-config, assignment and apply requests.
 Feature-detect the surface before `init()` with
 `shardpilot.supports("experiments_assignment")`.
 
@@ -343,7 +346,7 @@ Use `type(shardpilot.apply_experiment_variant) == "function"` when supporting
 older SDKs. The existing experiment capability does not promise this method.
 
 **Success means queued locally.** `update()` seals an application via
-`{remote_config_url}/api/cp/v1/runtime/experiments/exposures` or `outcomes`,
+`{app_url}/api/cp/v1/runtime/experiments/exposures` or `outcomes`,
 then forwards the exact fact and seal to analytics as a v2 event with literal
 `*_key` scope fields. Raw subject identity goes only to the configured remote-config host; anonymous
 and session identity go only to analytics. `user_id` is omitted. Both stages
@@ -601,7 +604,7 @@ unknown states alike, because a receipt documents the decision itself. See
   receipt, denials included): it suppresses the **wire field only** — the
   kind is still chosen at decision time, persisted with the receipt, and
   used to select the dispatch credential (anon-keyed receipts under the
-  publishable `api_key` where configured; `user_verified` receipts only
+  publishable `publishable_key` where configured; `user_verified` receipts only
   under the minted Mode B token).
 
 Per-event rejections are retained without opting into diagnostics. Set

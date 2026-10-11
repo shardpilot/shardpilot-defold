@@ -86,10 +86,10 @@ not the platform boundary.
   an analytics event. Stamps a component-slug `component`, scrubs PII, samples
   non-fatal reports while **always** sending fatal ones, and forwards a
   previous-session native crash dump on next launch — automatically from
-  `crash.init` (disable with `capture_previous_on_boot = false`), with the
+  `crash.init` (disable with `previous_crash_capture_enabled = false`), with the
   engine module's symbol identity synthesized as `dmengine-<version_sha1>`
   and an opt-in (default-off) Lua script-error auto-capture
-  (`script_error_capture_enabled`). Every dispatched report is
+  (`crash_hooks_enabled`). Every dispatched report is
   persisted **write-ahead** to a bounded per-app sidecar and re-sent on a later
   launch until the server acknowledges it — byte-identical, one report at a
   time. Crash reporting is **on by default** with a persisted per-app opt-out
@@ -266,7 +266,7 @@ drift apart:
 -- and several copies is how they drift apart.
 local function policy_context()
 	return {
-		endpoint = "http://localhost:8082",
+		app_url = "http://localhost:8082",
 		workspace_key = "workspace-example",
 		app_key = "app-example",
 		environment_key = "develop",
@@ -576,7 +576,7 @@ README, `docs/`, and the skill above are the reference.
 
 `init(config)` / `new(config)` take a Lua table. Required: `ingest_url`,
 `workspace_id`, `app_id`, `environment_id`, and **exactly one** of
-`token_provider` (Mode B) or `api_key` (Mode A) — see [Authentication](#authentication).
+`token_provider` (Mode B) or `publishable_key` (Mode A) — see [Authentication](#authentication).
 
 Unsupported keys return `unknown_config_key`, including misspellings and keys
 belonging to the other client. A constructor returns `nil, code`; a facade
@@ -597,14 +597,15 @@ initialization attempt. `new(config)` creates an independent client instance.
 | Field | Default | Notes |
 |---|---|---|
 | `ingest_url` | — (required) | `https://…`, or `http://` only for `localhost`/`127.0.0.1`/`::1`; no query/fragment/path |
-| `remote_config_url` | `nil` (disabled) | Remote-config base URL (same shape rules as `ingest_url`); a **separate** service from the ingest endpoint. Requires `api_key` — see [Remote config](#remote-config) |
-| `remote_config_attributes_enabled` | `false` (dark) | Opt-in: fetches carry the attributes stored via `set_remote_config_attributes` as query parameters — only while consent is **granted** (unknown/denied fetch without identity or attributes). Requires `remote_config_url` — see [Remote config](#remote-config) |
-| `experiments_enabled` | `false` (off) | Opts into the experiment-assignment consumer. Requires **both** `remote_config_url` and `api_key` — see [Experiments](#experiments) |
+| `app_url` | `nil` | Application-service base URL (same shape rules as `ingest_url`); a **separate** service from the ingest endpoint. Requires `publishable_key` — see [Remote config](#remote-config) |
+| `remote_config_enabled` | `false` | Enables remote config; requires `app_url`. Setting an address alone does not enable fetches. Experiments have their own switch. |
+| `remote_config_attributes_enabled` | `false` (dark) | Opt-in: fetches carry the attributes stored via `set_remote_config_attributes` as query parameters — only while consent is **granted** (unknown/denied fetch without identity or attributes). Requires `app_url` — see [Remote config](#remote-config) |
+| `experiments_enabled` | `false` (off) | Opts into the experiment-assignment consumer. Requires **both** `app_url` and `publishable_key` — see [Experiments](#experiments) |
 | `workspace_id` | — (required) | Tenant key |
 | `app_id` | — (required) | Product key |
 | `environment_id` | — (required) | Environment scope (e.g. `local` / `develop` / `stage` / `prod`); any non-empty string is accepted |
-| `token_provider` | — | **Mode B** (one of `token_provider`/`api_key` required): `function(callback)` → `callback(token, expires_at_unix_ms, err)` |
-| `api_key` | — | **Mode A** (one of `token_provider`/`api_key` required): non-secret publishable `sp_ingest_…` key used directly as the `Bearer` |
+| `token_provider` | — | **Mode B** (one of `token_provider`/`publishable_key` required): `function(callback)` → `callback(token, expires_at_unix_ms, err)` |
+| `publishable_key` | — | **Mode A** (one of `token_provider`/`publishable_key` required): non-secret publishable `sp_ingest_…` key used directly as the `Bearer` |
 | `source` | `"client"` | One of `client`, `server`, `backend` |
 | `transport` | omitted | Optional string label on `network_summary`, such as `"websocket"`; non-strings return `invalid_transport`. This does not select the SDK HTTP transport. |
 | `app_version` | `nil` | Sent in the envelope |
@@ -617,9 +618,9 @@ initialization attempt. `new(config)` creates an independent client instance.
 | `buffer_size` | `1000` | Max queued events (≥1); cross-SDK canonical default |
 | `flush_interval_seconds` | `15` (was `1`) *(new in `v0.10.2`)* | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value *(new in `v0.10.2`)*. |
 | `session_timeout_seconds` | `30` **New in `v0.11.0`** | A background stay this long or longer (>0, finite) ends the session at the resume, stamped at the moment the stay reached it (`reason = "idle_timeout"`), and starts the next session. Needs the host to forward window events to `on_window_event`. |
-| `publish_timeout_seconds` | `2` | Per-request timeout (>0) |
+| `http_timeout_seconds` | `2` | Per-request timeout (>0) |
 | `request_compression_enabled` | `true` *(new in `v0.10.2`)* | Compress analytics batch bodies over 1 KiB with `Content-Encoding: deflate` (RFC 1950 zlib — see [Request compression](#request-compression)). Sub-threshold bodies go uncompressed: zlib framing makes a single-event batch bigger, not smaller. No-op on engine versions without the `zlib` module. |
-| `token_refresh_lead_ms` | `60000` | Refresh lead before token expiry (≥0) |
+| `token_refresh_lead_seconds` | `60` | Refresh lead before token expiry (≥0) |
 | `spool_enabled` | `true` | Durable offline event spool ([details](#offline-durability-event-spool)); `false` also clears a previously persisted record at init |
 | `spool_max_events` | `500` | Max spooled entries (≥1); oldest evicted first |
 | `spool_max_bytes` | `262144` | Approx. spool size budget (1024–393216); oldest evicted first |
@@ -670,21 +671,21 @@ The ingest endpoint accepts two credential kinds; configure **exactly one**:
 
 - **Mode B — `token_provider`**: an async function yielding a short-lived per-tenant
   ingest JWT minted by your backend. The SDK manages refresh, expiry-lead, and 401-retry.
-- **Mode A — `api_key`**: the non-secret publishable `sp_ingest_…` key, used directly as
+- **Mode A — `publishable_key`**: the non-secret publishable `sp_ingest_…` key, used directly as
   the `Bearer`. Safe to embed client-side, never expires, no token round-trip.
 
 Mode is selected by presence: a configured `token_provider` is used (Mode B); otherwise
-`api_key` is the standing `Bearer` (Mode A). Configuring both is rejected
+`publishable_key` is the standing `Bearer` (Mode A). Configuring both is rejected
 (`auth_mode_conflict`); configuring neither is rejected (`auth_required`). `anonymous_id`
 is always sent on the wire in both modes.
 
 > **Remote config is the exception.** The remote-config endpoint authenticates
-> with the publishable `sp_ingest_…` `api_key` only — a Mode B ingest JWT is
+> with the publishable `sp_ingest_…` `publishable_key` only — a Mode B ingest JWT is
 > scoped to event ingest and the remote-config endpoint rejects it. So with
-> `remote_config_url` set, `api_key` is required even in Mode B
-> (`remote_config_api_key_required` otherwise), and that is the **one**
+> `app_url` set, `publishable_key` is required even in Mode B
+> (`remote_config_publishable_key_required` otherwise), and that is the **one**
 > configuration where both credentials are valid together: the
-> `token_provider` keeps the ingest `Bearer`, the `api_key` authenticates only
+> `token_provider` keeps the ingest `Bearer`, the `publishable_key` authenticates only
 > the remote-config fetch.
 
 ## Wire contract
@@ -966,11 +967,11 @@ local motd = shardpilot.remote_config_string("motd", "")
 local hard_mode = shardpilot.remote_config_boolean("hard_mode", false)
 ```
 
-The fetch uses the publishable `api_key` as the `Bearer`. With granted consent,
-its URL is `GET {remote_config_url}/config/v1/{workspace_id}/{environment_id}/{client_id}`,
+The fetch uses the publishable `publishable_key` as the `Bearer`. With granted consent,
+its URL is `GET {app_url}/config/v1/{workspace_id}/{environment_id}/{client_id}`,
 where `client_id` is the persisted anonymous ID used for per-client bucketing.
 With unknown, denied or forced-minor consent, it omits that final path segment
-and all targeting attributes: `GET {remote_config_url}/config/v1/{workspace_id}/{environment_id}`.
+and all targeting attributes: `GET {app_url}/config/v1/{workspace_id}/{environment_id}`.
 The host user ID is never sent; config requests have no body. The endpoint answers
 `{ "version": <number>, "values": { key: value } }` with an `ETag`; the getters
 serve the `values` map, and `remote_config_version()` reads the wrapper's
@@ -1005,7 +1006,7 @@ Fetch semantics:
   snapshot are left untouched.
 
 The cache is scoped to the `(workspace_id, environment_id, client_id,
-remote_config_url)` tuple; a record written by any other scope is a miss (its
+app_url)` tuple; a record written by any other scope is a miss (its
 ETag is never sent, its values never served) and is overwritten by the next
 successful fetch. Identifier-free requests use an empty client component, so
 identified values and ETags are not reused for them, including on restart.
@@ -1077,19 +1078,19 @@ by itself is rejected at `init()`:
 
 | Setting this… | …also requires | Otherwise `init()` returns |
 |---|---|---|
-| `experiments_enabled = true` | `remote_config_url` | `false, "experiments_requires_remote_config_url"` |
-| `remote_config_url` | `api_key` | `false, "remote_config_api_key_required"` |
+| `experiments_enabled = true` | `app_url` | `false, "experiments_requires_app_url"` |
+| `app_url` | `publishable_key` | `false, "remote_config_publishable_key_required"` |
 
 The assignment endpoint is served by the **same host** as the remote-config
-fetch and authenticates with the **same publishable `api_key`**, so a valid
+fetch and authenticates with the **same publishable `publishable_key`**, so a valid
 experiments configuration always carries all three fields together:
 
 <!-- doc-region: none -- the configuration table, whose fields this section documents one by one -->
 ```lua
 shardpilot.init({
   ingest_url = "https://…",
-  remote_config_url = "https://…", -- required by experiments_enabled
-  api_key = "sp_ingest_…",         -- required by remote_config_url
+  app_url = "https://…", -- required by experiments_enabled
+  publishable_key = "sp_ingest_…",         -- required by app_url
   workspace_id = "workspace-example",
   app_id = "app-example",
   environment_id = "develop",
@@ -1097,9 +1098,9 @@ shardpilot.init({
 })
 ```
 
-In Mode B, `token_provider` and `api_key` are configured *together* (the
+In Mode B, `token_provider` and `publishable_key` are configured *together* (the
 documented exception to "exactly one" — see [Authentication](#authentication)):
-the token stays the ingest `Bearer`, the `api_key` authenticates the
+the token stays the ingest `Bearer`, the `publishable_key` authenticates the
 remote-config, assignment and experiment apply requests. Feature-detect the surface before
 `init()` with `shardpilot.supports("experiments_assignment")`. The separate
 `shardpilot.supports("experiments_age_band")` capability detects the age-band
@@ -1188,8 +1189,8 @@ successful shutdown never calls back at all, by design, so never leave state
 parked that only a callback can release.
 
 The fetch is
-`GET {remote_config_url}/api/cp/v1/runtime/experiments/assignment?app_key=&environment_key=&experiment_key=&subject_key=`
-with the publishable `api_key` as the `Bearer`. The subject is an
+`GET {app_url}/api/cp/v1/runtime/experiments/assignment?app_key=&environment_key=&experiment_key=&subject_key=`
+with the publishable `publishable_key` as the `Bearer`. The subject is an
 **SDK-minted, SDK-managed** id (`spcid_` + 32 hex) persisted in the durable
 identity record: there is deliberately no config field and no setter for it,
 it is distinct from the anonymous ID, and it egresses **only** to the configured remote-config host as `subject_key` in assignment
@@ -1392,8 +1393,8 @@ game has to handle specially.
   application. `track_outcome` follows the last explicit application, even if a
   later fetch has served a different version.
 - **Two delivery stages.** `update()` first posts the pinned application to
-  `{remote_config_url}/api/cp/v1/runtime/experiments/exposures` or `outcomes`
-  using the existing `api_key`. It carries the served version, revision, kill
+  `{app_url}/api/cp/v1/runtime/experiments/exposures` or `outcomes`
+  using the existing `publishable_key`. It carries the served version, revision, kill
   gate, served time, application time, normalized fetch attributes, subject and
   a random occurrence ID minted once. An outcome adds its own occurrence ID,
   time, key and integer value. Nothing is re-read from a newer assignment.
@@ -1432,7 +1433,7 @@ game has to handle specially.
 
 Crashes use a **separate** module and endpoint. The crash client
 (`require "shardpilot.crash"`) sends one report per crash as
-`POST {crash_ingest_url}/api/v1/crashes/ingest` with a `crash:write` API key as
+`POST {crash_url}/api/v1/crashes/ingest` with a `crash:write` API key as
 the `Bearer`, carrying the crash report JSON body: `crash_id`
 (UUIDv7), `occurred_at`, `app{id,version,build_id}`, a component-slug `component`,
 `platform`, `os`, `exception`, `modules[]`, `threads[]`/`frames[]`,
@@ -1464,7 +1465,7 @@ consent_policy.prepare(context, function(decision) ... end)
 
 `context` is validated locally before anything is sent, and a value outside
 its closed vocabulary **costs no request**: `endpoint` (the same URL rule
-`ingest_url` and `crash_ingest_url` obey — **https anywhere, plain http only
+`ingest_url` and `crash_url` obey — **https anywhere, plain http only
 for a loopback host**, no userinfo, query, fragment or path), `workspace_key`, `app_key`, `environment_key`,
 `app_version`, `locale`, `platform` (use `platform.detect()`), and optionally
 `store` and `age_band` — which is accepted, sent as given, and **ignored by
@@ -1805,7 +1806,7 @@ separate prerequisites; the client does not prove the notice was displayed.
   **most-vouching credential**: the minted Mode B token whenever it vouches
   for the receipt's actor (the current verified user, or the current anon
   the mint binds as its subject — so current-anon grants stay deliverable
-  in the dual configuration), the publishable `api_key` only for
+  in the dual configuration), the publishable `publishable_key` only for
   historic-anon receipts the token cannot vouch for and in pure Mode A. A
   `user_verified` receipt **parks** while the current session cannot vouch
   for its actor — no `token_provider`, no `identify()` yet, or a different
@@ -1825,7 +1826,7 @@ separate prerequisites; the client does not prove the notice was displayed.
   spool's `identity_changed` rule (each entry keeps a decision-time anon
   snapshot as retention metadata, never sent on the wire) — a minted token
   binds the current identity, so replaying them could only wedge the trail;
-  with an `api_key` configured, historic-anon receipts re-send under it
+  with a `publishable_key` configured, historic-anon receipts re-send under it
   unchanged. Receipt delivery is
   **consent-plane traffic**: it stays permitted while analytics consent is
   denied or unknown — the receipt documents the decision itself — and the

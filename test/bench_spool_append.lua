@@ -81,7 +81,7 @@ local client = assert(sdk.new({
 	app_build = "100",
 	token_provider = function(callback) callback("client-token-placeholder", nil, nil) end,
 	flush_interval_seconds = 1,
-	publish_timeout_seconds = 2,
+	http_timeout_seconds = 2,
 }))
 
 local function make_envelope(i)

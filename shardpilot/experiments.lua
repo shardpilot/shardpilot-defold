@@ -19,12 +19,12 @@
 -- flag-flip registry preconditions, not by this module.
 --
 -- Wire contract (assignment fetch):
---   GET {remote_config_url}/api/cp/v1/runtime/experiments/assignment
+--   GET {app_url}/api/cp/v1/runtime/experiments/assignment
 --     ?app_key=&environment_key=&experiment_key=&subject_key=&<attributes>
---   Authorization: Bearer <publishable api_key>   (same credential as the
+--   Authorization: Bearer <publishable publishable_key>   (same credential as the
 --   remote-config fetch; the endpoint requires the experiment-assignment
 --   read scope on that key, granted server-side)
--- The base URL is the configured `remote_config_url` — the remote-config
+-- The base URL is the configured `app_url` — the remote-config
 -- host — with the path swapped; no new endpoint configuration exists.
 --
 -- Outcomes (decided by M.apply, pure):
@@ -1395,8 +1395,8 @@ function Experiments:scope_for(subject_id)
 		self.config.workspace_id,
 		self.config.environment_id,
 		subject_id,
-		self.config.remote_config_url,
-		self.config.api_key)
+		self.config.app_url,
+		self.config.publishable_key)
 end
 
 local function consent_refusal(state)
@@ -2292,7 +2292,7 @@ function Experiments:seal_application(experiment_key, record)
 	local dispatched = clock.unix_ms()
 	local scope = self:scope_for(entry.subject_key)
 	record.flight = flight
-	record.deadline = dispatched + self.config.publish_timeout_seconds * 1000
+	record.deadline = dispatched + self.config.http_timeout_seconds * 1000
 	local function complete(_, _, response)
 		if record.flight ~= flight then return end
 		record.flight = nil
@@ -2367,9 +2367,9 @@ function Experiments:seal_application(experiment_key, record)
 	end
 	record.complete = complete
 	if not self.http_transport:available() then complete(nil, nil, { status = 0 }); return end
-	local ok = pcall(self.http_transport.request, self.http_transport, trim_slash(self.config.remote_config_url) .. route, "POST", complete,
-		{ Authorization = "Bearer " .. self.config.api_key, ["Content-Type"] = "application/json" },
-		body, { timeout = self.config.publish_timeout_seconds })
+	local ok = pcall(self.http_transport.request, self.http_transport, trim_slash(self.config.app_url) .. route, "POST", complete,
+		{ Authorization = "Bearer " .. self.config.publishable_key, ["Content-Type"] = "application/json" },
+		body, { timeout = self.config.http_timeout_seconds })
 	if not ok then complete(nil, nil, { status = 0 }) end
 end
 
@@ -3374,12 +3374,12 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	for i = 1, #normalized_attributes do
 		query[#query + 1] = normalized_attributes[i]
 	end
-	local url = M.build_url(self.config.remote_config_url, query)
+	local url = M.build_url(self.config.app_url, query)
 	local headers = {
-		["Authorization"] = "Bearer " .. self.config.api_key,
+		["Authorization"] = "Bearer " .. self.config.publishable_key,
 	}
 	local options = {
-		timeout = self.config.publish_timeout_seconds,
+		timeout = self.config.http_timeout_seconds,
 	}
 
 	-- The dispatch bound: the server truth any answer to THIS request can

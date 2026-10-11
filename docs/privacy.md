@@ -141,8 +141,8 @@ Credential selection is **most-vouching**: a receipt is sent under the
 minted Mode B token whenever that token vouches for the receipt's actor —
 the current verified `user_id`, or the current `anonymous_id` the mint
 binds as its subject, so a current-anon grant stays deliverable in the
-dual `token_provider` + `api_key` configuration — and under the
-publishable `api_key` only when the token cannot vouch for it: a
+dual `token_provider` + `publishable_key` configuration — and under the
+publishable `publishable_key` only when the token cannot vouch for it: a
 HISTORIC-anon receipt (the key is the one credential that can still carry
 it; a historic-anon pure grant takes the documented terminal `403`), and
 every anon receipt in pure Mode A. `user_verified` receipts go only under
@@ -166,7 +166,7 @@ fetches and separately configured crash reporting follow their own rules.
 service records **denial** receipts — `set_consent(false)` and the
 forced-minor `reason`-bearing denial alike — for the key's own
 workspace/app/environment scope. A **grant** receipt (`set_consent(true)`)
-posted with the publishable `api_key` is rejected `403` with the distinct
+posted with the publishable `publishable_key` is rejected `403` with the distinct
 detail code `consent_grant_requires_verified_credential` and, like every
 non-transient rejection, is terminally dropped from the outbox: a public
 key can safely deny its own actor's analytics but cannot vouch for a
@@ -401,11 +401,11 @@ outbox:
   for a previous session — so an undelivered verified denial survives
   signed-out relaunches;
 - is **cleared on an identity change only when the receipt could never
-  send**: in a Mode-B-ONLY configuration (no publishable `api_key`),
+  send**: in a Mode-B-ONLY configuration (no publishable `publishable_key`),
   anon-keyed receipts whose decision-time anonymous id no longer matches
   the client's are dropped at load (diagnosed as `identity_changed`) rather
   than replayed into a guaranteed auth rejection that would wedge the
-  trail; with an `api_key` configured (Mode A, or Mode B + `api_key`),
+  trail; with an `publishable_key` configured (Mode A, or Mode B + `publishable_key`),
   historic-anon receipts re-send under the publishable key unchanged — the
   historic actor is the correct subject of those decisions — and
   `user_verified` receipts are never dropped this way (they park, above);
@@ -472,7 +472,7 @@ Crash reporting is ON by default and needs no first-run decision; an explicit
 
 ## Remote-config cache
 
-When remote config is enabled (`remote_config_url`), the last successfully
+When remote config is enabled (`app_url`), the last successfully
 served configuration is kept in one durable per-app record so a restart or an
 offline launch still gets the previously fetched values. This cache:
 

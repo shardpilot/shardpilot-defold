@@ -1,5 +1,5 @@
 -- The crash ingest client: a dedicated client that POSTs crash reports to
--- {crash_ingest_url}/api/v1/crashes/ingest with a `crash:write` API key, stamps
+-- {crash_url}/api/v1/crashes/ingest with a `crash:write` API key, stamps
 -- the component-slug `component` on every report, samples NON-fatal reports, and
 -- ALWAYS sends a fatal crash (emit_fatal bypasses the sampler). Behavior is
 -- consistent across our SDKs.
@@ -13,8 +13,8 @@ local platform = require "shardpilot.platform"
 
 local M = {}
 
-local default_sample_every = 10
-local default_publish_timeout_seconds = 30
+local default_crash_sample_every = 10
+local default_crash_http_timeout_seconds = 30
 
 -- Reuse the analytics URL shape rules: absolute http(s) base, https required
 -- outside loopback, no path/query/fragment/userinfo. The crash route is appended
@@ -122,17 +122,16 @@ local config_keys = {
 	app_build = true,
 	app_id = true,
 	app_version = true,
-	capture_previous_on_boot = true,
-	crash_api_key = true,
+	previous_crash_capture_enabled = true,
+	crash_key = true,
 	crash_component = true,
-	crash_ingest_url = true,
-	crash_source = true,
+	crash_url = true,
 	diagnostics = true,
 	platform = true,
-	publish_timeout_seconds = true,
-	sample_every = true,
+	crash_http_timeout_seconds = true,
+	crash_sample_every = true,
 	sampler = true,
-	script_error_capture_enabled = true,
+	crash_hooks_enabled = true,
 	session_id = true,
 }
 
@@ -151,7 +150,7 @@ local function snapshot_config(config)
 end
 
 local function validate_config(config)
-	local required = { "crash_ingest_url", "app_id" }
+	local required = { "crash_url", "app_id" }
 	for _, key in ipairs(required) do
 		if config[key] == nil or config[key] == "" then
 			return nil, key .. "_required"
@@ -160,8 +159,8 @@ local function validate_config(config)
 			return nil, "invalid_" .. key
 		end
 	end
-	if not valid_ingest_url(config.crash_ingest_url) then
-		return nil, "invalid_crash_ingest_url"
+	if not valid_ingest_url(config.crash_url) then
+		return nil, "invalid_crash_url"
 	end
 	-- app_id is operator-set product scope, validated here at init time so a
 	-- misconfiguration is surfaced as a clear config error instead of silently
@@ -175,27 +174,27 @@ local function validate_config(config)
 	end
 	-- Crash ingest authenticates with a STATIC `crash:write` API key. There is no
 	-- token_provider / dual-mode here: the key is the standing Bearer.
-	if not non_empty_string(config.crash_api_key) then
-		return nil, "crash_api_key_required"
+	if not non_empty_string(config.crash_key) then
+		return nil, "crash_key_required"
 	end
 	-- Component slug stamped on every report. Mirrors how the analytics `source`
 	-- is configured (a config field defaulted onto every event), but the VALUE
 	-- space is the component slug, not the analytics client/server/backend enum.
 	-- Empty/absent = bare app.
-	local crash_source = config.crash_component
-	if type(crash_source) == "string" then crash_source = crash_source:match("^%s*(.-)%s*$") end
-	if crash_source == nil or crash_source == "" then crash_source = config.crash_source or "" end
-	if not event_mod.valid_source(crash_source) then
-		return nil, "invalid_crash_source"
+	local crash_component = config.crash_component
+	if type(crash_component) == "string" then crash_component = crash_component:match("^%s*(.-)%s*$") end
+	if crash_component == nil then crash_component = "" end
+	if not event_mod.valid_source(crash_component) then
+		return nil, "invalid_crash_component"
 	end
-	local sample_every, sample_err =
-		normalize_integer(config.sample_every, default_sample_every, 1, "invalid_sample_every")
-	if not sample_every then
+	local crash_sample_every, sample_err =
+		normalize_integer(config.crash_sample_every, default_crash_sample_every, 0, "invalid_crash_sample_every")
+	if not crash_sample_every then
 		return nil, sample_err
 	end
-	local publish_timeout_seconds, timeout_err = normalize_positive_number(
-		config.publish_timeout_seconds, default_publish_timeout_seconds, "invalid_publish_timeout_seconds")
-	if not publish_timeout_seconds then
+	local crash_http_timeout_seconds, timeout_err = normalize_positive_number(
+		config.crash_http_timeout_seconds, default_crash_http_timeout_seconds, "invalid_crash_http_timeout_seconds")
+	if not crash_http_timeout_seconds then
 		return nil, timeout_err
 	end
 	-- Resolve the platform once, at init time. Every crash report requires a
@@ -245,11 +244,11 @@ local function validate_config(config)
 	end
 	-- boot auto-capture: ON by default (crash.init forwards the
 	-- previous-session dump itself — the Defold auto-capture model); an
-	-- explicit `capture_previous_on_boot = false` keeps the manual
+	-- explicit `previous_crash_capture_enabled = false` keeps the manual
 	-- capture_previous() flow. Boolean-or-absent, like spool_enabled on the
 	-- analytics client.
-	if config.capture_previous_on_boot ~= nil and type(config.capture_previous_on_boot) ~= "boolean" then
-		return nil, "invalid_capture_previous_on_boot"
+	if config.previous_crash_capture_enabled ~= nil and type(config.previous_crash_capture_enabled) ~= "boolean" then
+		return nil, "invalid_previous_crash_capture_enabled"
 	end
 	-- script-error auto-capture: DARK by default (the
 	-- experiments_enabled `== true` shape). While off, ZERO handler code
@@ -257,26 +256,25 @@ local function validate_config(config)
 	-- SDK's handler; Defold has a single process-wide error-handler slot, so
 	-- hosts that run their own handler should keep this off and call
 	-- emit_fatal themselves (documented in docs/crash.md).
-	if config.script_error_capture_enabled ~= nil and type(config.script_error_capture_enabled) ~= "boolean" then
-		return nil, "invalid_script_error_capture_enabled"
+	if config.crash_hooks_enabled ~= nil and type(config.crash_hooks_enabled) ~= "boolean" then
+		return nil, "invalid_crash_hooks_enabled"
 	end
 	return {
-		crash_ingest_url = trim_slash(config.crash_ingest_url),
-		crash_api_key = config.crash_api_key,
+		crash_url = trim_slash(config.crash_url),
+		crash_key = config.crash_key,
 		app_id = config.app_id,
 		app_version = config.app_version,
 		app_build = config.app_build,
-		crash_source = crash_source ~= "" and crash_source or nil,
-		crash_component = crash_source ~= "" and crash_source or nil,
+		crash_component = crash_component ~= "" and crash_component or nil,
 		platform = resolved_platform,
-		sample_every = sample_every,
-		publish_timeout_seconds = publish_timeout_seconds,
+		crash_sample_every = crash_sample_every,
+		crash_http_timeout_seconds = crash_http_timeout_seconds,
 		diagnostics = config.diagnostics,
 		sampler = config.sampler,
 		anonymous_id = config.anonymous_id,
 		session_id = config.session_id,
-		capture_previous_on_boot = config.capture_previous_on_boot ~= false,
-		script_error_capture_enabled = config.script_error_capture_enabled == true,
+		previous_crash_capture_enabled = config.previous_crash_capture_enabled ~= false,
+		crash_hooks_enabled = config.crash_hooks_enabled == true,
 	}
 end
 
@@ -407,7 +405,7 @@ function M.new(config)
 	-- slot, so an opted-out (or fail-closed) boot must not replace the
 	-- game's handler with an inert ShardPilot one — a later
 	-- set_enabled(true) installs it then.
-	if normalized.script_error_capture_enabled and enabled then
+	if normalized.crash_hooks_enabled and enabled then
 		client:install_script_error_handler()
 	end
 	return client
@@ -530,7 +528,7 @@ function Client:set_enabled(enabled)
 	end
 	self.enabled = enabled
 	self.enabled_reason = (not enabled) and "opt_out" or nil
-	if enabled and self.config.script_error_capture_enabled and not self.script_error_handler_installed then
+	if enabled and self.config.crash_hooks_enabled and not self.script_error_handler_installed then
 		-- The script-error handler defers past a disabled boot (see M.new); a
 		-- re-enable is the first enabled instant, so install here. A runtime
 		-- opt-out AFTER an install cannot restore the game's previous
@@ -706,8 +704,9 @@ end
 
 -- Decide whether a NON-fatal report is sampled in. A fatal report never reaches
 -- here (emit_fatal bypasses the sampler). A custom sampler returns a boolean;
--- the default is deterministic 1-in-N (sample_every).
+-- the default is deterministic 1-in-N (crash_sample_every).
 local function should_emit(self, event)
+	if self.config.crash_sample_every == 0 then return false end
 	local custom = self.config.sampler
 	if type(custom) == "function" then
 		-- The report has already been sanitized and validated. Hand the sampler a
@@ -722,17 +721,17 @@ local function should_emit(self, event)
 		end
 		return keep ~= false
 	end
-	local sample_every = self.config.sample_every
+	local crash_sample_every = self.config.crash_sample_every
 	local known_rate
-	if sample_every >= 1 and sample_every <= 1000000
-		and sample_every == math.floor(sample_every) then
-		known_rate = sample_every
+	if crash_sample_every >= 1 and crash_sample_every <= 1000000
+		and crash_sample_every == math.floor(crash_sample_every) then
+		known_rate = crash_sample_every
 	end
-	if sample_every <= 1 then
+	if crash_sample_every <= 1 then
 		return true, known_rate
 	end
 	self.sample_counter = self.sample_counter + 1
-	return (self.sample_counter % sample_every) == 0, known_rate
+	return (self.sample_counter % crash_sample_every) == 0, known_rate
 end
 
 -- Core emit. `fatal` bypasses the sampler (a fatal crash is ALWAYS sent).
@@ -1205,11 +1204,11 @@ function Client:dispatch_pending(entry, on_settled)
 
 	local dispatched
 	if type(entry.body) == "string" and entry.body ~= "" then
-		dispatched = transport.ingest_body(self.config, self.config.crash_api_key, entry.body, handle)
+		dispatched = transport.ingest_body(self.config, self.config.crash_key, entry.body, handle)
 	else
 		-- A legacy pending entry (or a fresh report whose encode failed —
 		-- the transport then reports the same setup failure it always did).
-		dispatched = transport.ingest(self.config, self.config.crash_api_key, entry.report, handle)
+		dispatched = transport.ingest(self.config, self.config.crash_key, entry.report, handle)
 	end
 	if not dispatched then
 		-- The transport reported a synchronous setup failure (no http/json,

@@ -1,5 +1,5 @@
 -- Crash ingest transport: POSTs a single crash report JSON body to
--- {crash_ingest_url}/api/v1/crashes/ingest with a `crash:write` API key as the
+-- {crash_url}/api/v1/crashes/ingest with a `crash:write` API key as the
 -- Bearer. Distinct from the analytics transport (shardpilot/transport.lua),
 -- which batches analytics events to /v1/events:batch — a crash is NEVER wrapped
 -- as a `mobile_crash` analytics event.
@@ -231,20 +231,20 @@ end
 -- Send one crash report (a prepared table; encoded here). The callback
 -- signature mirrors the analytics transport:
 -- (ok, err, unauthorized, retryable, response, retry_after).
-function M.ingest(config, api_key, event, callback)
+function M.ingest(config, publishable_key, event, callback)
 	local encoded, encode_err = M.encode(event)
 	if not encoded then
 		callback(false, encode_err, false, false)
 		return false
 	end
-	return M.ingest_body(config, api_key, encoded, callback)
+	return M.ingest_body(config, publishable_key, encoded, callback)
 end
 
 -- Send one ALREADY-ENCODED crash report body VERBATIM. The resend path uses
 -- this so a persisted report goes out byte-identical to its original
 -- attempt; the crash ingest service de-duplicates by the stable crash_id
 -- embedded in the body.
-function M.ingest_body(config, api_key, encoded, callback)
+function M.ingest_body(config, publishable_key, encoded, callback)
 	if not http or not http.request then
 		callback(false, "http_unavailable", false, true)
 		return false
@@ -256,13 +256,13 @@ function M.ingest_body(config, api_key, encoded, callback)
 
 	local headers = {
 		["Content-Type"] = "application/json",
-		["Authorization"] = "Bearer " .. api_key,
+		["Authorization"] = "Bearer " .. publishable_key,
 	}
 	local options = {
-		timeout = config.publish_timeout_seconds,
+		timeout = config.crash_http_timeout_seconds,
 	}
 
-	http.request(trim_slash(config.crash_ingest_url) .. crash_ingest_route, "POST", function(_, _, response)
+	http.request(trim_slash(config.crash_url) .. crash_ingest_route, "POST", function(_, _, response)
 		local status = response and response.status or 0
 		if status == 401 or status == 403 then
 			callback(false, "unauthorized", true, false, response)

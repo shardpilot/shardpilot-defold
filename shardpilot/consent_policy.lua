@@ -750,7 +750,7 @@ local function parse_timestamp(value)
 end
 
 -- ⚠ COPIED VERBATIM FROM client.lua, NOT REQUIRED FROM IT. The endpoint obeys
--- the SAME rule as ingest_url and crash_ingest_url — https anywhere, http only
+-- the SAME rule as ingest_url and crash_url — https anywhere, http only
 -- for a loopback host, no userinfo, no query, no fragment, no path beyond a
 -- single trailing slash — and there is exactly one way for this module to obey
 -- it: copy the predicate. Requiring shardpilot.client would pull in storage and
@@ -871,7 +871,7 @@ local function context_key(context)
 	field(context.locale)
 	field(context.platform)
 	field(context.store)
-	field(context.endpoint)
+	field(context.app_url)
 	field(context.age_band and context.age_band.vocabulary)
 	field(context.age_band and context.age_band.band)
 	return table.concat(parts, "|")
@@ -943,7 +943,7 @@ end
 -- shape it actually takes in practice is a typo: `age_bnad` is silently no age
 -- band at all, so the request goes out claiming this player has none.
 local CONTEXT_KEYS = {
-	endpoint = true,
+	app_url = true,
 	workspace_key = true,
 	app_key = true,
 	environment_key = true,
@@ -978,16 +978,16 @@ function M.validate_context(context)
 	-- of prepare rather than taking the strict path: the single callback this
 	-- module promises was never invoked at all, leaving the caller with no
 	-- decision to fail closed on.
-	if not bounded_string(context.endpoint, MAX_ENDPOINT) then
-		return false, "endpoint is missing or over its bound"
+	if not bounded_string(context.app_url, MAX_ENDPOINT) then
+		return false, "app_url is missing or over its bound"
 	end
 	-- ⚠ AND PLAIN http OFF LOOPBACK IS REFUSED, by the SDK's own predicate
 	-- rather than by a second opinion. A consent-regime request carries this
 	-- app's scope and this player's locale and age band; sending that in the
 	-- clear to a remote host is the kind of exception nobody revisits. An
 	-- earlier cut here accepted any `^https?://`, which is exactly that hole.
-	if not valid_ingest_url(context.endpoint) then
-		return false, "endpoint must be https, or http only for a loopback host"
+	if not valid_ingest_url(context.app_url) then
+		return false, "app_url must be https, or http only for a loopback host"
 	end
 	if context.store ~= nil and not STORES[context.store] then
 		return false, "store is not one of the permitted kinds"
@@ -1395,7 +1395,7 @@ function M.prepare(context, callback)
 		callback(decision)
 	end
 
-	http.request(trim_slash(context.endpoint) .. ROUTE, "POST", function(_, _, response)
+	http.request(trim_slash(context.app_url) .. ROUTE, "POST", function(_, _, response)
 		local arrived = now_seconds()
 		if not arrived then
 			settle(fallback("clock_unavailable", "no clock is available to evaluate the plan's expiry"))

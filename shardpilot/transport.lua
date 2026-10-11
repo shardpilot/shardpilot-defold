@@ -52,7 +52,7 @@ local function dispatch(config, token, route, payload, callback, compress)
 	-- Dual-mode Bearer: `token` is the resolved Authorization
 	-- credential the client already selected — a per-tenant ingest JWT in
 	-- Mode B (yielded by token_provider) or the non-secret publishable
-	-- `sp_ingest_...` api_key in Mode A. The ingest endpoint accepts both, so
+	-- `sp_ingest_...` publishable_key in Mode A. The ingest endpoint accepts both, so
 	-- the transport stays mode-agnostic and always sends `Bearer <token>`.
 	local headers = {
 		["Content-Type"] = "application/json",
@@ -87,7 +87,7 @@ local function dispatch(config, token, route, payload, callback, compress)
 		headers[schema_revision.HEADER] = config.schema_revision
 	end
 	local options = {
-		timeout = config.publish_timeout_seconds,
+		timeout = config.http_timeout_seconds,
 	}
 
 	http.request(trim_slash(config.ingest_url) .. route, "POST", function(_, _, response)
