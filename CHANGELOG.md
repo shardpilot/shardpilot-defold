@@ -2,6 +2,12 @@
 
 ### Unreleased
 
+- Removed schema-set revision declaration from engine requests. There is no
+  `schema_revision` configuration key or exported default revision module;
+  the `schema_revision_declaration` capability now answers `false`.
+  Per-event `schema_version` is unchanged. Remove the setting from host
+  configuration; `false`, empty strings and overrides are all unknown keys.
+
 - New deterministic exposure IDs use RFC 9562 UUIDv5 with a fixed SDK namespace
   and SHA-1 of the canonical exposure tuple, computed in pure Lua.
   The same exposure tuple keeps the same ID, explicit re-arms remain distinct,

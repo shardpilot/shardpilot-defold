@@ -132,7 +132,9 @@ jobs:
         run: python3 scripts/test_gate_integrity.py
 
       - name: Static library checks
-        run: ./scripts/check_library.sh
+        run: |
+          ./scripts/check_library.sh
+          python3 scripts/test_library_files.py
 
       - name: Headless SDK sender contract fixtures (loopback only)
         run: |

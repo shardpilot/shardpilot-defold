@@ -195,7 +195,6 @@ json = {
 local sdk = require "shardpilot.sdk"
 local sampling = require "shardpilot.sampling"
 local platform = require "shardpilot.platform"
-local schema_revision = require "shardpilot.schema_revision"
 local storage = require "shardpilot.storage"
 
 local function assert_true(value, message)
@@ -353,9 +352,9 @@ local function test_config_validation()
 		{ { spool_max_events = 1.5 }, "invalid_spool_max_events" },
 		{ { spool_max_bytes = 512 }, "invalid_spool_max_bytes" },
 		{ { spool_max_bytes = 1000000 }, "invalid_spool_max_bytes" },
-		{ { schema_revision = 42 }, "invalid_schema_revision" },
-		{ { schema_revision = true }, "invalid_schema_revision" },
-		{ { schema_revision = {} }, "invalid_schema_revision" },
+		{ { schema_revision = 42 }, "unknown_config_key" },
+		{ { schema_revision = true }, "unknown_config_key" },
+		{ { schema_revision = {} }, "unknown_config_key" },
 		{ { consent_kind_emission_enabled = "yes" }, "invalid_consent_kind_emission_enabled" },
 		{ { consent_kind_emission_enabled = 1 }, "invalid_consent_kind_emission_enabled" },
 	}
@@ -387,8 +386,6 @@ local function test_config_validation()
 	assert_equal(client.config.spool_enabled, true)
 	assert_equal(client.config.spool_max_events, 500)
 	assert_equal(client.config.spool_max_bytes, 262144)
-	-- Default: declare the SDK's built-in schema-set revision on batch ingest.
-	assert_equal(client.config.schema_revision, schema_revision.REVISION)
 	-- Default: consent receipts carry their actor kind on the wire.
 	assert_equal(client.config.consent_kind_emission_enabled, true)
 
@@ -7877,99 +7874,7 @@ local function test_no_receipt_chaining_after_shutdown()
 	storage.reset()
 end
 
--- Capability discovery: a game feature-detects the new consent surface before
--- init() and without version parsing; unknown names are false everywhere.
--- Schema-revision handshake, emission side: every events:batch
--- request declares the SDK's schema-set revision in the
--- X-ShardPilot-Schema-Revision request header — and ONLY the batch route.
--- The consent route shares the same transport dispatch and must stay
--- header-free (the crash and remote-config routes use their own transports,
--- pinned header-free in their own suites). The declaration is a header,
--- never a body field: the ingest body is strict-decoded server-side and an
--- unknown field would 400 the whole batch.
-local function test_schema_revision_header_on_batch_only()
-	reset()
-	storage.reset()
-	seed_granted_consent()
-	local client = assert(sdk.new(config()))
-	assert_true(client:identify("user-example"))
-	assert_true(client:track("play_cta_click"))
-	assert_true(client:flush({ include_summaries = false }))
-	assert_equal(#requests, 1)
-	local batch = requests[1]
-	assert_equal(batch.url, "http://localhost:8080/v1/events:batch")
-	-- The exact provisioned value: "sha256:" + the 64-hex digest of the
-	-- server schema set this SDK build was provisioned against
-	-- (a public content identity, re-synced when the schema set changes).
-	assert_equal(batch.headers["X-ShardPilot-Schema-Revision"], schema_revision.REVISION)
-	assert_equal(schema_revision.REVISION,
-		"sha256:e1ba01d4b76b9e73444e2edd5639281929fd89496cadc1dcc79eb68208c6a0a0")
-	assert_true(schema_revision.REVISION:match("^sha256:[0-9a-f]+$") ~= nil,
-		"the built-in revision must be sha256: plus lowercase hex")
-	assert_equal(#schema_revision.REVISION, 71)
-	assert_not_contains(batch.body, "schema_revision")
-	assert_not_contains(batch.body, "X-ShardPilot-Schema-Revision")
-
-	-- The consent route rides the same dispatch and must NOT declare.
-	assert_true(client:set_consent(true))
-	assert_equal(#requests, 2)
-	local consent = requests[2]
-	assert_contains(consent.url, "/v1/consent")
-	assert_equal(consent.headers["X-ShardPilot-Schema-Revision"], nil,
-		"the consent route must not carry the schema-revision header")
-	assert_equal(consent.headers["Authorization"], "Bearer client-token-placeholder")
-	storage.reset()
-end
-
--- Config knob: a non-empty string overrides the declared value; false or ""
--- stops declaring entirely (the server treats an undeclared batch as
--- always-passing, so disabling is the no-rebuild escape hatch).
-local function test_schema_revision_override_and_disable()
-	reset()
-	storage.reset()
-	seed_granted_consent()
-
-	-- Override: a custom declared value (assembled, not a real digest).
-	local override = "sha256:" .. string.rep("ab", 32)
-	local client = assert(sdk.new(config({ schema_revision = override })))
-	assert_true(client:identify("user-example"))
-	assert_true(client:track("boot"))
-	assert_true(client:flush({ include_summaries = false }))
-	assert_equal(#requests, 1)
-	assert_equal(requests[1].headers["X-ShardPilot-Schema-Revision"], override)
-
-	-- Disable via false: no header on the batch at all.
-	reset()
-	local silent = assert(sdk.new(config({ schema_revision = false })))
-	assert_equal(silent.config.schema_revision, nil)
-	assert_true(silent:identify("user-example"))
-	assert_true(silent:track("boot"))
-	assert_true(silent:flush({ include_summaries = false }))
-	assert_equal(#requests, 1)
-	assert_equal(requests[1].headers["X-ShardPilot-Schema-Revision"], nil,
-		"schema_revision = false must stop declaring")
-
-	-- Disable via empty string: the same escape hatch.
-	reset()
-	local empty = assert(sdk.new(config({ schema_revision = "" })))
-	assert_equal(empty.config.schema_revision, nil)
-	assert_true(empty:identify("user-example"))
-	assert_true(empty:track("boot"))
-	assert_true(empty:flush({ include_summaries = false }))
-	assert_equal(#requests, 1)
-	assert_equal(requests[1].headers["X-ShardPilot-Schema-Revision"], nil,
-		'schema_revision = "" must stop declaring')
-	storage.reset()
-end
-
--- Schema-revision handshake, response side: a 409 whose error.code is
--- "schema_revision_mismatch" is TERMINAL for the batch — the server sends no
--- Retry-After and a retry from the same build can never succeed. The batch
--- must ride the existing terminal-failure path (dropped; never retained,
--- deferred, or spooled) with a clear log line naming the declared and served
--- revisions. Discrimination is by error.code, never the bare 409 status:
--- another 409 code takes the same terminal transport path without the
--- schema-revision log line.
+-- Synthetic conflict responses still use ordinary terminal handling and diagnostics.
 local function test_schema_revision_mismatch_409_is_terminal()
 	reset()
 	storage.reset()
@@ -8015,12 +7920,8 @@ local function test_schema_revision_mismatch_409_is_terminal()
 	assert_equal(#issues, 1)
 	assert_equal(issues[1].scope, "batch")
 	assert_equal(issues[1].code, "schema_revision_mismatch")
-	-- The log line names both revisions and the fix.
-	assert_equal(#logged, 1)
-	assert_contains(logged[1], "schema revision mismatch")
-	assert_contains(logged[1], schema_revision.REVISION)
-	assert_contains(logged[1], served)
-	assert_contains(logged[1], "schema_revision = false")
+	-- No revision-specific configuration or log advice remains.
+	assert_equal(#logged, 0, "no obsolete configuration advice")
 	-- The pipeline is not wedged: a fresh batch publishes immediately.
 	reset()
 	assert_true(client:track("after"))
@@ -8040,14 +7941,14 @@ local function test_schema_revision_mismatch_409_is_terminal()
 	assert_equal(other_ok, false)
 	assert_equal(client:snapshot().last_error, "http_409:workspace_override_conflict")
 	assert_equal(client.in_flight_batch, nil)
-	assert_equal(#logged, 0, "only schema_revision_mismatch produces the schema log line")
+	assert_equal(#logged, 0, "ordinary conflicts do not print configuration advice")
 	storage.reset()
 end
 
 local function test_supports_capability_discovery()
 	assert_equal(sdk.supports("consent_receipt_outbox"), true)
 	assert_equal(sdk.supports("consent_state_denied_forced_minor"), true)
-	assert_equal(sdk.supports("schema_revision_declaration"), true)
+	assert_equal(sdk.supports("schema_revision_declaration"), false)
 	assert_equal(sdk.supports("time_travel"), false)
 	assert_equal(sdk.supports(nil), false)
 	assert_equal(sdk.supports(42), false)
@@ -8802,8 +8703,6 @@ local tests = {
 	test_identifier_byte_clamp_boundary,
 	test_oversized_identifier_cannot_wedge_consent_teardown,
 	test_no_receipt_chaining_after_shutdown,
-	test_schema_revision_header_on_batch_only,
-	test_schema_revision_override_and_disable,
 	test_schema_revision_mismatch_409_is_terminal,
 	test_supports_capability_discovery,
 	-- Declared inline rather than as `local function`: Lua 5.4 caps a chunk at
@@ -15221,7 +15120,6 @@ end)()
 							app_version = "1.0",
 							app_build = "1",
 							source = "client",
-							schema_revision = false,
 							consent_kind_emission_enabled = false,
 							request_compression_enabled = false,
 							platform = "linux",
@@ -15258,7 +15156,7 @@ end)()
 					end
 					for key, value in pairs(extra) do opts[key] = value end
 					local count = 0; for _ in pairs(opts) do count = count + 1 end
-					assert_equal(count, kind == "analytics" and 30 or 16, "all supported caller keys are exercised")
+					assert_equal(count, kind == "analytics" and 29 or 16, "all supported caller keys are exercised")
 					local ok, err = facade(kind)[api](opts); assert_true(ok, err)
 					assert_true(counts.reads > 0, "real accepted constructor reached storage")
 				end)
@@ -15986,4 +15884,105 @@ end)()
 	end
 	print(string.format("Event name admission: %d passed, %d failed", passed, failed))
 	assert_equal(failed, 0, "event name admission failures")
+end)()
+
+-- Public schema surface: exercise the real constructors and HTTP dispatch.
+;(function()
+	local scenes = {}
+	local function scene(name, run) scenes[#scenes + 1] = { name = name, run = run } end
+	local function fresh(api, mode, run)
+		sdk.shutdown()
+		reset(); storage.reset(); seed_granted_consent()
+		local opts = mode == "publishable" and config_mode_a() or config()
+		local client = assert(sdk[api](opts))
+		local function call(method, ...)
+			if api == "init" then return sdk[method](...) end
+			return client[method](client, ...)
+		end
+		local ok, err = pcall(run, call)
+		if api == "init" then sdk.shutdown() else client:shutdown() end
+		reset(); storage.reset()
+		assert_true(ok, err)
+	end
+	for _, api in ipairs({ "new", "init" }) do
+		for _, mode in ipairs({ "publishable", "token" }) do
+			scene(api .. " " .. mode .. " batch omits declaration", function()
+				fresh(api, mode, function(call)
+					assert_true(call("identify", "synthetic-user"))
+					assert_true(call("track", "synthetic_event"))
+					assert_true(call("flush", { include_summaries = false }))
+					assert_equal(#requests, 1)
+					local request = requests[1]
+					assert_contains(request.url, "/v1/events:batch")
+					assert_equal(json.decode(request.body).events[1].event_name, "synthetic_event")
+					assert_equal(request.headers.Authorization, "Bearer " ..
+						(mode == "publishable" and "sp_ingest_publishable_key" or "client-token-placeholder"))
+					assert_equal(request.headers["X-ShardPilot-Schema-Revision"], nil, "batch must omit declaration")
+					assert_not_contains(request.body, "schema_revision")
+				end)
+			end)
+			scene(api .. " " .. mode .. " consent control", function()
+				fresh(api, mode, function(call)
+					assert_true(call("set_consent", true))
+					assert_equal(#requests, 1)
+					assert_contains(requests[1].url, "/v1/consent")
+					assert_equal(requests[1].headers["X-ShardPilot-Schema-Revision"], nil)
+				end)
+			end)
+		end
+		for index, value in ipairs({ false, "", "sha256:" .. string.rep("ab", 32), true, 42, {} }) do
+			scene(api .. " refuses removed setting " .. index .. " (" .. type(value) .. ")", function()
+				sdk.shutdown(); reset(); storage.reset()
+				local called = 0
+				local opts = config({ schema_revision = value, token_provider = function() called = called + 1 end })
+				local client, err = sdk[api](opts)
+				if client then
+					if api == "init" then sdk.shutdown() else client:shutdown() end
+				end
+				if api == "init" then assert_equal(client, false, "removed setting must refuse init")
+				else assert_equal(client, nil, "removed setting must refuse construction") end
+				assert_equal(err, "unknown_config_key", "removed setting uses unknown-key refusal")
+				assert_equal(called, 0); assert_equal(#requests, 0)
+			end)
+		end
+	end
+	scene("capability census", function()
+		assert_equal(sdk.supports("schema_revision_declaration"), false, "declaration capability must be false")
+		for _, name in ipairs({ "consent_receipt_outbox", "consent_state_denied_forced_minor",
+			"experiments_assignment", "experiments_age_band" }) do
+			assert_equal(sdk.supports(name), true, name)
+		end
+		assert_equal(sdk.supports("SCHEMA_REVISION_DECLARATION"), false)
+		assert_equal(sdk.supports("synthetic_unknown"), false)
+		assert_equal(sdk.supports(nil), false)
+	end)
+	scene("no exported revision module", function()
+		local source = io.open("shardpilot/schema_revision.lua", "r")
+		if source then source:close() end
+		assert_equal(source, nil, "default revision module must be absent")
+	end)
+	scene("conflict diagnostics without obsolete advice", function()
+		fresh("new", "token", function(call)
+			next_status = 409
+			next_response_body = '{"error":{"code":"schema_revision_mismatch","message":"synthetic refusal"}}'
+			assert_true(call("track", "synthetic_event"))
+			local lines, old_print = {}, print
+			print = function(line) lines[#lines + 1] = line end
+			local executed, result = pcall(call, "flush", { include_summaries = false })
+			print = old_print
+			assert_true(executed, result); assert_equal(result, false)
+			assert_equal(#requests, 1)
+			assert_equal(call("snapshot").last_error, "http_409:schema_revision_mismatch")
+			assert_equal(call("snapshot").dropped, 1)
+			assert_equal(#lines, 0, "no advice for a removed setting")
+		end)
+	end)
+	local passed, failed = 0, 0
+	for _, entry in ipairs(scenes) do
+		local ok, err = pcall(entry.run)
+		if ok then passed = passed + 1 else failed = failed + 1 end
+		print("schema surface " .. entry.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	print(string.format("Schema surface: %d passed, %d failed", passed, failed))
+	assert_equal(failed, 0, "schema surface failures")
 end)()
