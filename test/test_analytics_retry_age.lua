@@ -2,6 +2,7 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local now, disk, requests, response_status = 1700000000000, {}, {}, 202
 local save_hook, encode_hook, request_hook, pending_response, issues
+local response_body, response_documents
 local function copy(value)
 	if type(value) ~= "table" then return value end
 	local out = {}
@@ -34,6 +35,7 @@ sys = {
 json = {
 	encode = encode,
 	decode = function(text)
+		if response_documents and response_documents[text] then return copy(response_documents[text]) end
 		if text == '{"accepted":1}' then return { accepted = 1 } end
 		return {}
 	end,
@@ -42,8 +44,12 @@ http = { request = function(url, method, callback, headers, body)
 	if url:find("/v1/events:batch", 1, true) then
 		requests[#requests + 1] = body
 		if request_hook then request_hook(body) end
-		local complete = function() callback(nil, nil, { status = response_status, response = '{"accepted":1}' }) end
+		local complete = function() callback(nil, nil, { status = response_status, response = response_body or '{"accepted":1}' }) end
 		if pending_response then pending_response = complete else complete() end
+	elseif url:find("/runtime/experiments/assignment", 1, true) then
+		local body = encode({ error = "experiment real-subject assignment is disabled" })
+		response_documents[body] = { error = "experiment real-subject assignment is disabled" }
+		callback(nil, nil, { status = 403, response = body })
 	else callback(nil, nil, { status = 202, response = "{}" }) end
 end }
 local clients = require "shardpilot.client"
@@ -57,11 +63,14 @@ local config = {
 	source = "backend", batch_size = 25, flush_interval_seconds = 3600,
 	diagnostics = function(issue) issues[#issues + 1] = issue end,
 }
-local function fresh()
+local function fresh(overrides)
 	now, disk, requests, response_status = 1700000000000, {}, {}, 202
 	save_hook, encode_hook, request_hook, pending_response, issues = nil, nil, nil, nil, {}
 	storage.reset()
-	local client = assert(clients.new(config))
+	response_body, response_documents = nil, {}
+	local options = copy(config)
+	for k, v in pairs(overrides or {}) do options[k] = v end
+	local client = assert(clients.new(options))
 	assert(client:set_consent(true))
 	return client
 end
@@ -152,7 +161,75 @@ local function malformed_clock(field, value)
 	spool_record().delivery_age[id][field] = value
 	survives_restart(id, 0, false)
 end
+local function settle_after_consent(regrant, accepted, purge)
+	local client = fresh(purge and {
+		experiments_enabled = true, remote_config_url = "https://config.example.invalid",
+	} or nil)
+	local ids = {}
+	for i = 1, 5 do
+		assert(client:track("held_response_" .. i)); ids[i] = client.queue.items[i].event_id
+	end
+	pending_response = true; client:flush()
+	eq(#requests, 1, "the request was handed to HTTP before consent changed")
+	local complete = pending_response; eq(type(complete), "function", "HTTP response remains held")
+	if purge then
+		local answered = false
+		client:fetch_experiment_assignment("held-response", { age_band = "adult" }, function() answered = true end)
+		assert(answered, "the assignment refusal was received through its public API")
+		eq(client.experiment_purge_awaited, true, "the on-wire request owes deferred purge settlement")
+	end
+	assert(client:set_consent(false)); if regrant then assert(client:set_consent(true)) end
+	local dropped_before = client:snapshot().dropped
+	local result = { accepted = 1, rejected = 1, duplicates = 1, events = {
+		{ event_id = ids[4], status = "observed" },
+		{ event_id = ids[5], status = "suppressed_no_consent" },
+	} }
+	response_body = encode(result); response_documents[response_body] = result
+	response_status = accepted and 202 or 503; pending_response = nil; complete()
+	local stats = client:snapshot()
+	if accepted then
+		eq(stats.published, 5, "an accepted on-wire batch remains published after consent changes")
+		for _, key in ipairs({ "accepted", "rejected", "duplicates", "observed", "suppressed" }) do
+			eq(stats[key], 1, "the actual response settles " .. key)
+		end
+		eq(stats.dropped, dropped_before, "already published members are not local drops")
+	else
+		eq(stats.failed_batches, 1, "the failed on-wire response is accounted")
+		eq(stats.dropped, dropped_before + 5, "the stale failed batch is dropped")
+	end
+	eq(client.in_flight_batch, nil, "the completed old batch is settled")
+	eq(client.experiment_purge_awaited, false, "deferred purge state is consumed")
+	eq(client.experiment_withdrawals_awaited, nil, "deferred withdrawals are consumed")
+	if regrant then
+		requests, response_status, response_body = {}, 202, nil
+		assert(client:track("fresh_after_response")); client:flush()
+		eq(#requests, 1, "fresh work can publish under the new grant")
+		assert(not requests[1]:find("held_response_", 1, true), "an old failed batch cannot retry after regrant")
+	end
+end
 local cases = {
+	{ "stale_401_keeps_new_identity_credential", function()
+		local minted = 0
+		local client = fresh({ remote_config_url = "https://config.example.invalid",
+			token_provider = function(callback)
+				minted = minted + 1; callback("synthetic-credential-" .. minted, nil, nil)
+			end,
+		})
+		assert(client:track("old_credential_request")); pending_response = true; client:flush()
+		local complete = pending_response; eq(type(complete), "function", "old authenticated request is on wire")
+		local old = client.token
+		assert(client:set_consent(false)); assert(client:identify("replacement-user")); assert(client:set_consent(true))
+		local replacement = client.token
+		assert(replacement and replacement ~= old, "the new identity receipt minted a different credential")
+		pending_response = nil; response_status = 401; complete()
+		eq(client.token, replacement, "a stale response cannot invalidate the new identity credential")
+		eq(client:snapshot().failed_batches, 1, "the old unauthorized response is still accounted")
+		eq(client.in_flight_batch, nil, "the old unauthorized batch is settled")
+	end },
+	{ "successful_response_after_denial", function() settle_after_consent(false, true, false) end },
+	{ "successful_response_after_regrant", function() settle_after_consent(true, true, false) end },
+	{ "failed_response_after_regrant", function() settle_after_consent(true, false, false) end },
+	{ "successful_response_settles_deferred_purge", function() settle_after_consent(true, true, true) end },
 	{ "ambiguous_sixteen_minutes", function() restart_case(16, true, false) end },
 	{ "ambiguous_fourteen_minutes", function() restart_case(14, true, true) end },
 	{ "offline_two_hours", function() restart_case(120, false, true) end },

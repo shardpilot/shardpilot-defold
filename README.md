@@ -814,6 +814,8 @@ the first HTTP attempt whose delivery may have occurred, whichever comes first.
 An event held offline without an attempt keeps the seven-day budget. Received
 `4xx` responses and attempts proven not to have reached HTTP clear only a clock
 started by that attempt; an earlier ambiguous attempt keeps its original clock.
+A request already handed to HTTP settles its actual response even if consent
+changes before the reply. A failed old attempt cannot retry under a new grant.
 Retries never renew either budget. Expiry is checked after serialization and
 before `http.request`, for live batches as well as restored spool entries.
 Eligible members retain their original envelope bytes and IDs. Expired members

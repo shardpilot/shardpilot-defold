@@ -6,7 +6,9 @@
   from the first potentially delivered HTTP attempt. Persist local clocks
   outside envelopes, retain original payloads, and diagnose expired members as
   `spool_expired` with their original IDs. Legacy or invalid clock metadata is
-  dropped conservatively; retry cannot renew either budget.
+  dropped conservatively; retry cannot renew either budget. Responses already
+  on the wire retain their actual accounting after consent changes, while
+  failed old attempts cannot retry under a later grant.
 
 - New deterministic exposure IDs use RFC 9562 UUIDv5 with a fixed SDK namespace
   and SHA-1 of the canonical exposure tuple, computed in pure Lua.

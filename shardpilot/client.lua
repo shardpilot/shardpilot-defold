@@ -6635,21 +6635,6 @@ function Client:start_publish_batch(automatic)
 				if age and age.ambiguous_ms == 0 then age.ambiguous_ms = attempt_started_ms end
 			end
 		end
-		if not owns_batch() then
-			if not ok and delivery ~= "unsent" then
-				self.stats.failed_batches = self.stats.failed_batches + 1
-				self.stats.last_error = err
-			end
-			if self.in_flight_batch == events then
-				self.stats.dropped = self.stats.dropped + #events
-				self.in_flight_batch = nil
-			end
-			return
-		end
-		if err == "analytics_delivery_deferred" then
-			if #events == 0 then self.in_flight_batch = nil; succeeded = true end
-			return
-		end
 		-- A sentinel purge that ran while this batch was ON THE WIRE could
 		-- not touch it (the attempt itself is past recall); settle the
 		-- deferred recall now, whatever the outcome — a successful publish
@@ -6661,6 +6646,19 @@ function Client:start_publish_batch(automatic)
 		-- only): egressed on success, filtered from a retained failure.
 		local withdrawals_awaited = self.experiment_withdrawals_awaited
 		self.experiment_withdrawals_awaited = nil
+		if err == "analytics_delivery_deferred" then
+			if not owns_batch() and self.in_flight_batch == events then
+				self.stats.dropped = self.stats.dropped + #events
+				self.in_flight_batch = nil
+				self:prune_fact_key_history()
+			elseif #events == 0 then
+				self.in_flight_batch = nil
+				succeeded = true
+			end
+			return
+		end
+		-- A request already handed to HTTP is past recall. Settle its actual
+		-- response even after consent changes; stale failures cannot act on a new epoch.
 		if ok then
 			if compressed then
 				self.compression_proven = true
@@ -6698,6 +6696,16 @@ function Client:start_publish_batch(automatic)
 		-- Surface the server error envelope (error.code + detail codes) on a
 		-- non-2xx instead of leaving only the bare transport status.
 		local detail_codes = self:apply_error_envelope(err, response)
+		-- The completed attempt may report its outcome, but may not change
+		-- credentials or retry state belonging to a later consent epoch.
+		if not owns_batch() then
+			if self.in_flight_batch == events then
+				self.stats.dropped = self.stats.dropped + batch_count
+				self.in_flight_batch = nil
+			end
+			self:prune_fact_key_history()
+			return
+		end
 		-- The ingest deployment cannot read this request's content coding.
 		-- Stop compressing for the rest of the session and KEEP the batch: an
 		-- encoding refusal arrives as an ordinary 400 — terminal by default,
@@ -6719,8 +6727,8 @@ function Client:start_publish_batch(automatic)
 		-- deferred); in Mode A the static key cannot change, so it is terminal.
 		local mode_b = self.config.token_provider ~= nil
 		-- A batch is retained for retry only when the failure is retryable AND
-		-- consent has not been denied meanwhile; a denial recorded while the
-		-- publish was in flight must drop the batch instead of republishing it. A
+		-- this consent epoch still owns it; a denial recorded while the
+		-- publish was in flight must drop it even after a new grant. A
 		-- Mode A 401 is non-retryable, so the batch is dropped here too. Compute
 		-- this FIRST so the deferral below is only set for a batch we keep.
 		local retain = (is_retryable_publish_failure(err, unauthorized, retryable, mode_b) or encoding_refused)
