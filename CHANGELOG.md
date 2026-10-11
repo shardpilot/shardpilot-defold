@@ -2,6 +2,11 @@
 
 ### Unreleased
 
+- New deterministic exposure IDs use RFC 9562 UUIDv5 with a fixed SDK namespace
+  and SHA-1 of the canonical exposure tuple, computed in pure Lua.
+  The same exposure tuple keeps the same ID, explicit re-arms remain distinct,
+  and queued or spooled retries preserve their original IDs.
+
 - Public `track()` refuses reserved event names with `reserved_event_name` and
   empty or ASCII-whitespace-only names with `event_name_required`. Each name
   refusal counts one drop, records the diagnostic, and sends nothing. Matching

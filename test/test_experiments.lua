@@ -11388,7 +11388,99 @@ function extra_tests.test_retired_arm_of_an_owed_readmission_survives_a_renewal(
 	storage.reset()
 end
 
+function extra_tests.test_exposure_uuid_version_bits()
+	for arm = 0, 63 do
+		local value = experiments.exposure_event_id("marker", "spcid_" .. string.rep("f", 32), "exp", 3, arm)
+		assert_equal(value:sub(15, 15), "5", "exposure UUID version bits")
+	end
+end
+
+function extra_tests.test_exposure_uuid_variant_bits()
+	for arm = 0, 63 do
+		local value = experiments.exposure_event_id("marker", "spcid_" .. string.rep("f", 32), "exp", 3, arm)
+		assert_match(value:sub(20, 20), "^[89ab]$", "exposure UUID RFC variant bits")
+	end
+end
+
+function extra_tests.test_exposure_uuid_golden_vectors()
+	for index, row in ipairs(require "test.fixtures.exposure_uuid5") do
+		assert_equal(experiments.exposure_event_id(row[1], row[2], row[3], row[4], row[5]),
+			row[6], "Python uuid.uuid5 known answer " .. index)
+	end
+end
+
+function extra_tests.test_exposure_sha1_known_answers()
+	-- Independent hashlib.sha1 digests include both sides of the padding boundary.
+	local sha1 = require "shardpilot.sha1"
+	local vectors = {
+		{ "", "da39a3ee5e6b4b0d3255bfef95601890afd80709" },
+		{ "abc", "a9993e364706816aba3e25717850c26c9cd0d89d" },
+		{ "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", "84983e441c3bd26ebaae4aa1f95129e5e54670f1" },
+		{ string.rep("a", 55), "c1c8bbdc22796e28c0e15163d20899b65621d65a" },
+		{ string.rep("a", 56), "c2db330f6083854c99d4b5bfb6e8f29f201be699" },
+		{ string.rep("a", 63), "03f09f5b158a7a8cdad920bddc29b81c18a551f5" },
+		{ string.rep("a", 64), "0098ba824b5c16427bd7a1122a5a442a25ec644d" },
+		{ string.rep("a", 65), "11655326c708d70319be2610e8a57d9a5b959d3b" },
+		{ string.rep("a", 1000), "291e9a6c66994949b57ba5e650361e98fc36b1ba" },
+	}
+	for index, row in ipairs(vectors) do
+		assert_equal(sha1.hex(row[1]), row[2], "SHA-1 known answer " .. index)
+	end
+end
+
+function extra_tests.test_exposure_uuid_reload_is_stable()
+	local before = experiments.exposure_event_id("marker", "subject", "experiment", 1, 7)
+	local loaded = package.loaded["shardpilot.experiments"]
+	package.loaded["shardpilot.experiments"] = nil
+	local reloaded = require "shardpilot.experiments"
+	package.loaded["shardpilot.experiments"] = loaded
+	assert_equal(reloaded.exposure_event_id("marker", "subject", "experiment", 1, 7),
+		before, "namespace and canonical tuple are stable across module reloads")
+end
+
+function extra_tests.test_exposure_uuid_wire_and_retry()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	assert_true(fetch(client, "exp-checkout").ok)
+	assert_true(client:track_exposure("exp-checkout"))
+	local attempts = {}
+	responder = function(url, method, callback)
+		if url:find("/v1/events:batch", 1, true) then
+			attempts[#attempts + 1] = requests[#requests].body
+			callback(nil, nil, { status = #attempts == 1 and 503 or 202,
+				response = #attempts == 1 and "{}" or '{"accepted":2}' })
+			return true
+		end
+	end
+	assert_true(not client:flush({ include_summaries = false }), "first publish must reach the failing responder")
+	assert_true(client:flush({ include_summaries = false }), "retry must reach the accepting responder")
+	assert_equal(#attempts, 2, "one failed publish and one retry")
+	assert_equal(attempts[1], attempts[2], "exposure retry keeps the original bytes")
+	local seen = {}
+	local count = 0
+	for _, event in ipairs(json.decode(attempts[2]).events) do
+		if event.event_name == "experiment_exposure" then
+			local value = event.event_id
+			assert_equal(#value, 36, "wire UUID length")
+			assert_equal(value:lower(), value, "wire UUID lowercase")
+			assert_match(value, "^%x+%-%x+%-5%x%x%x%-[89ab]%x%x%x%-%x+$", "wire UUID version and variant")
+			assert_true(not seen[value], "automatic and rearmed facts have distinct IDs")
+			seen[value] = true
+			count = count + 1
+		end
+	end
+	assert_equal(count, 2, "automatic and explicit exposure reached the wire")
+end
+
 local tests = {
+	extra_tests.test_exposure_sha1_known_answers,
+	extra_tests.test_exposure_uuid_reload_is_stable,
+	extra_tests.test_exposure_uuid_version_bits,
+	extra_tests.test_exposure_uuid_variant_bits,
+	extra_tests.test_exposure_uuid_golden_vectors,
+	extra_tests.test_exposure_uuid_wire_and_retry,
+
 	extra_tests.test_age_remote_config_keeps_targeting_rules,
 	extra_tests.test_age_api_lifecycle_precedes_arguments,
 	extra_tests.test_age_capability_is_distinct,

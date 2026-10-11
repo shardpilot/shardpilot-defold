@@ -115,6 +115,7 @@
 local clock = require "shardpilot.clock"
 local id = require "shardpilot.id"
 local random = require "shardpilot.random"
+local sha1 = require "shardpilot.sha1"
 local storage = require "shardpilot.storage"
 
 local M = {}
@@ -939,7 +940,13 @@ end
 -- re-arm bumps the counter (so does a readmission after an age withdrawal),
 -- and a rotated session marker or re-minted subject derives a distinct id.
 -- Retries of one emitted fact are idempotent regardless — the id is stamped
--- once at enqueue and the spool re-sends it verbatim.
+-- once at enqueue and the spool re-sends it verbatim. New IDs use RFC 9562
+-- UUIDv5: SHA-1(namespace bytes || canonical tuple), then version/variant bits.
+-- Fixed SDK exposure namespace: 01e2e885-f600-4118-80b6-f8470ece21bb.
+local exposure_namespace = ("01e2e885f600411880b6f8470ece21bb"):gsub("%x%x", function(byte)
+	return string.char(tonumber(byte, 16))
+end)
+
 function M.exposure_event_id(session_marker, subject_key, experiment_key, version, arm)
 	local text = table.concat({
 		"exposure",
@@ -949,13 +956,10 @@ function M.exposure_event_id(session_marker, subject_key, experiment_key, versio
 		string.format("%.0f", version),
 		string.format("%.0f", arm),
 	}, "\31")
-	return string.format("%08x-%04x-%04x-%04x-%08x%04x",
-		hash32(text, 2166136261, 131),
-		hash32(text, 5381, 33) % 65536,
-		hash32(text, 0, 65599) % 65536,
-		hash32(text, 40503, 257) % 65536,
-		hash32(text, 8675309, 131),
-		hash32(text, 1013904223, 33) % 65536)
+	local digest = sha1.hex(exposure_namespace .. text)
+	return digest:sub(1, 8) .. "-" .. digest:sub(9, 12) .. "-5" .. digest:sub(14, 16)
+		.. "-" .. string.format("%02x", tonumber(digest:sub(17, 18), 16) % 64 + 128)
+		.. digest:sub(19, 20) .. "-" .. digest:sub(21, 32)
 end
 
 -- ── the consumer ──────────────────────────────────────────────────────────────
