@@ -1488,7 +1488,7 @@ consent_policy.prepare(context, function(decision) ... end)
 ```
 
 `context` is validated locally before anything is sent, and a value outside
-its closed vocabulary **costs no request**: `endpoint` (the same URL rule
+its closed vocabulary **costs no request**: `app_url` (the same URL rule
 `ingest_url` and `crash_url` obey — **https anywhere, plain http only
 for a loopback host**, no userinfo, query, fragment or path), `workspace_key`, `app_key`, `environment_key`,
 `app_version`, `locale`, `platform` (use `platform.detect()`), and optionally
