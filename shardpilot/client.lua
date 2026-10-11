@@ -1,4 +1,5 @@
 local envelope = require "shardpilot.envelope"
+local analytics_retry = require "shardpilot.analytics_retry"
 local envelope_platform = require "shardpilot.envelope_platform"
 local clock = require "shardpilot.clock"
 local compression = require "shardpilot.compression"
@@ -1059,6 +1060,7 @@ function M.new(config, defer_init_diagnostics)
 			spooled = 0,
 			spool_resent = 0,
 			spool_evicted = 0,
+			spool_expired = 0,
 			spool_persist_failed = 0,
 			last_consent_error = nil,
 			last_error = nil,
@@ -1072,6 +1074,8 @@ function M.new(config, defer_init_diagnostics)
 		-- its result instead of installing a token that cannot vouch for the
 		-- current one (refresh_token fences its callback on this).
 		token_epoch = 0,
+		delivery_epoch = 0,
+		delivery_clocks = setmetatable({}, { __mode = "v" }),
 		in_flight_batch = nil,
 		-- Set when a sentinel fact purge finds a publish mid-flight: the
 		-- batch on the wire is past recall, but if it fails and is
@@ -1780,6 +1784,8 @@ function M.new(config, defer_init_diagnostics)
 	else
 		local spooled, stored_deadline, spool_miss, spool_migrated, spool_dropped =
 			storage.load_spool(normalized)
+		for _, event in ipairs(spooled) do client.delivery_clocks[event.event_id] = analytics_retry.get(event) end
+		local expired = client:expire_delivery_batch(spooled)
 		-- Server-requested backpressure survives a relaunch: when the record
 		-- carries a still-future Retry-After deadline, seed the publish
 		-- deferral so the startup resend waits out the remaining window
@@ -2009,7 +2015,7 @@ function M.new(config, defer_init_diagnostics)
 		-- -- re-filtered every launch, and replayed onto the wire by a rollback
 		-- to an SDK that has no migration.
 		if #spooled > 0 or mismatched > 0 or condemned > 0 or withdrawn > 0
-			or (spool_migrated or 0) > 0 then
+			or (spool_migrated or 0) > 0 or expired > 0 then
 			if #spooled == 0 then
 				client.spool_retry_after_ms = nil
 			end
@@ -2793,6 +2799,7 @@ function Client:set_consent(decision, notice)
 	if granted and self:consent_outbox_denial_full() then
 		return false, "consent_outbox_full"
 	end
+	if not granted then self.delivery_epoch = self.delivery_epoch + 1 end
 	self.consent_state = next_state
 	if state_changed and self.experiments then
 		-- Every consent TRANSITION opens a new consent epoch: responses
@@ -3822,6 +3829,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event)
 		sealed_fact = fact and fact.sealed_fact or nil,
 		context = context_snapshot,
 	}
+	self:register_delivery(event)
 	if fact and fact.stage then return true, nil, { event = event, stream = stream, now_ms = now_ms } end
 	local ok = commit_event(self, event, stream, now_ms)
 	if not ok then
@@ -5938,7 +5946,10 @@ function Client:capture_experiment_fact(event_name, props, event_id, overrides)
 	}
 	stream.sequence = event.session_sequence
 	self:mirror_session()
-	return self:spool_envelopes({ envelope.build(self.config, self, event) })
+	self:register_delivery(event)
+	local built = envelope.build(self.config, self, event)
+	self.delivery_clocks[event.event_id] = analytics_retry.get(event)
+	return self:spool_envelopes({ built })
 end
 
 -- True while envelopes loaded from a previous launch still await re-send.
@@ -5954,6 +5965,7 @@ function Client:ensure_batch_payload(batch)
 		local envelopes = {}
 		for i, event in ipairs(batch) do
 			envelopes[i] = envelope.build(self.config, self, event)
+			self.delivery_clocks[event.event_id] = analytics_retry.get(event)
 		end
 		batch.payload = { events = envelopes }
 	end
@@ -6010,6 +6022,7 @@ function Client:write_spool_record(events)
 		self:owe_fact_key_prune()
 	end
 	self.spool_record = saved
+	self.delivery_clock_write_owed = false
 	-- The derived append state describes the PREVIOUS record. Dropping it
 	-- here is belt; the identity check in spool_state_for_record is braces,
 	-- so a future assignment site that forgets this costs a rebuild rather
@@ -6181,7 +6194,7 @@ function Client:spool_envelopes(envelopes)
 		end
 	end
 	if #fresh == 0 and not replaced then
-		return true
+		return not self.delivery_clock_write_owed or self:fence_delivery_clocks()
 	end
 	-- ⚠ THE APPEND PATH, AND WHY IT IS NARROW. Appending one envelope used to
 	-- copy the whole record, re-estimate every entry in it (json.encode per
@@ -6229,6 +6242,7 @@ function Client:spool_envelopes(envelopes)
 			self.spool_index[shed[i].event_id] = nil
 		end
 		self.spool_record = saved
+		self.delivery_clock_write_owed = false
 		self.stats.spool_evicted = self.stats.spool_evicted + #evicted + #shed
 		if #evicted + #shed > 0 then
 			self:owe_fact_key_prune()
@@ -6479,6 +6493,48 @@ function Client:persist()
 	return true
 end
 
+-- Filter individual members, retaining the original IDs and payloads of
+-- eligible siblings. The age object also suppresses duplicate accounting when
+-- a persist snapshot and a queued copy refer to the same event.
+function Client:register_delivery(event)
+	analytics_retry.start(event, self.delivery_clocks[event.event_id])
+	self.delivery_clocks[event.event_id] = analytics_retry.get(event)
+end
+
+function Client:expire_delivery_batch(events)
+	local expired, now = {}, clock.unix_ms()
+	for _, event in ipairs(events) do
+		if analytics_retry.expired(event, now) then
+			expired[#expired + 1] = event
+			local age = analytics_retry.get(event)
+			if not age or not age.expired then
+				if age then age.expired = true end
+				self.stats.spool_expired = self.stats.spool_expired + 1
+				self.stats.dropped = self.stats.dropped + 1
+				self:diagnose({ scope = "spool", status = "dropped", code = "spool_expired", event_id = event.event_id })
+			end
+		end
+	end
+	if #expired > 0 then
+		filter_batch_facts(events, function(event) return analytics_retry.expired(event, now) end)
+		self:clear_spooled_batch({ payload = { events = expired } })
+	end
+	return #expired
+end
+
+-- Retry clock corrections without admission or eviction. A no-op append
+-- still owes this write when a known-unsent attempt could not clear its stamp.
+function Client:fence_delivery_clocks()
+	if not self.config.spool_enabled or #self.spool_record == 0 then
+		self.delivery_clock_write_owed = false
+		return true
+	end
+	local ok = storage.fence_spool(self.config, self.spool_record, self.spool_retry_after_ms)
+	self.delivery_clock_write_owed = not ok
+	if not ok then self.stats.spool_persist_failed = self.stats.spool_persist_failed + 1 end
+	return ok
+end
+
 function Client:start_publish_batch(automatic)
 	if self.publish_in_flight or not self.in_flight_batch or #self.in_flight_batch == 0 then
 		return true, false, true
@@ -6515,16 +6571,85 @@ function Client:start_publish_batch(automatic)
 		return false, false, false
 	end
 	local events = self.in_flight_batch
+	self:expire_delivery_batch(events)
+	if #events == 0 then self.in_flight_batch = nil; return true, true, true end
 	self:ensure_batch_payload(events)
 	self.publish_in_flight = true
 	local completed = false
 	local succeeded = false
 	local batch_count = #events
 	local compress = self.config.request_compression_enabled and not self.compression_refused
-	local dispatched = transport.publish(self.config, self.token, events.payload, function(ok, err, unauthorized, retryable, response, retry_after, compressed)
+	local epoch, provisional = self.delivery_epoch, {}
+	local attempt_started_ms = clock.unix_ms()
+	local function owns_batch()
+		return self.initialized and self.consent_state == "granted"
+			and self.delivery_epoch == epoch and self.in_flight_batch == events
+	end
+	local function fence() return self:fence_delivery_clocks() end
+	local function rollback()
+		for age in pairs(provisional) do age.ambiguous_ms = 0 end
+		local changed = next(provisional) ~= nil
+		provisional = {}
+		if changed and owns_batch() then fence() end
+	end
+	local function before_send()
+		if not owns_batch() then return nil end
+		for age in pairs(provisional) do
+			if clock.unix_ms() - age.ambiguous_ms >= 15 * 60000 then rollback(); break end
+		end
+		-- Recheck after serialization and each write. A slow write cannot turn
+		-- the stamp for an unsent attempt into an old ambiguous attempt.
+		for _ = 1, 2 do
+			self:expire_delivery_batch(events)
+			if #events == 0 or not owns_batch() then return nil end
+			local now = clock.unix_ms()
+			for _, event in ipairs(events) do
+				local age = analytics_retry.get(event)
+				if age.ambiguous_ms == 0 then age.ambiguous_ms = now; provisional[age] = true end
+			end
+			if ((next(provisional) ~= nil or self.delivery_clock_write_owed) and not fence())
+				or not owns_batch() then rollback(); return nil end
+			local stale = false
+			for age in pairs(provisional) do
+				if clock.unix_ms() - age.ambiguous_ms >= 15 * 60000 then stale = true end
+			end
+			if not stale then
+				self:expire_delivery_batch(events)
+				if #events == 0 or not owns_batch() then rollback(); return nil end
+				batch_count = #events
+				return self:ensure_batch_payload(events)
+			end
+			rollback()
+		end
+		return nil
+	end
+	local dispatched = transport.publish(self.config, self.token, events.payload, function(ok, err, unauthorized, retryable, response, retry_after, compressed, delivery)
 		completed = true
 		succeeded = ok == true
 		self.publish_in_flight = false
+		if delivery == "unsent" or delivery == "rejected" then rollback()
+		elseif not ok then
+			-- An unknown transport failure is not evidence that nothing left.
+			for _, event in ipairs(events) do
+				local age = analytics_retry.get(event)
+				if age and age.ambiguous_ms == 0 then age.ambiguous_ms = attempt_started_ms end
+			end
+		end
+		if not owns_batch() then
+			if not ok and delivery ~= "unsent" then
+				self.stats.failed_batches = self.stats.failed_batches + 1
+				self.stats.last_error = err
+			end
+			if self.in_flight_batch == events then
+				self.stats.dropped = self.stats.dropped + #events
+				self.in_flight_batch = nil
+			end
+			return
+		end
+		if err == "analytics_delivery_deferred" then
+			if #events == 0 then self.in_flight_batch = nil; succeeded = true end
+			return
+		end
 		-- A sentinel purge that ran while this batch was ON THE WIRE could
 		-- not touch it (the attempt itself is past recall); settle the
 		-- deferred recall now, whatever the outcome — a successful publish
@@ -6786,7 +6911,7 @@ function Client:start_publish_batch(automatic)
 		-- A dropped batch, or withdrawn facts filtered out of a retained one,
 		-- no longer holds its fact-key history keys either.
 		self:prune_fact_key_history()
-	end, compress)
+	end, compress, before_send)
 	if not dispatched and self.publish_in_flight then
 		self.publish_in_flight = false
 	end

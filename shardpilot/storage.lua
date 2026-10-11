@@ -13,6 +13,7 @@
 -- `shardpilot` namespace is only used when no scope is configured.
 
 local clock = require "shardpilot.clock"
+local analytics_retry = require "shardpilot.analytics_retry"
 local consent_notice = require "shardpilot.consent_notice"
 local random = require "shardpilot.random"
 local experiment_facts = require "shardpilot.experiment_facts"
@@ -1041,6 +1042,7 @@ local function write_spool(ns, events, retry_after_until_ms)
 		events = events,
 		retry_after_until_ms = sanitize_deadline(retry_after_until_ms),
 		wire_names = spool_wire_name_epoch,
+		delivery_age = analytics_retry.snapshot(events),
 	}
 	local path = save_path(ns, "spool")
 	if not path then
@@ -1103,6 +1105,7 @@ function M.load_spool(scope)
 		record_epoch = stamp
 	end
 	local kept, migrated, dropped = migrate_spool_events(shaped, record_epoch)
+	analytics_retry.restore(kept, type(record.delivery_age) == "table" and record.delivery_age or {})
 	return kept, sanitize_deadline(record.retry_after_until_ms), nil, migrated, dropped
 end
 
@@ -1331,6 +1334,12 @@ function M.save_spool(scope, events, max_events, max_bytes, retry_after_until_ms
 	local state = { events = {}, sizes = {}, total = spool_estimate_base, ids = {} }
 	M.spool_admit(state, events, max_events, max_bytes)
 	return M.write_spool_state(scope, state, retry_after_until_ms)
+end
+
+-- Updating delivery clocks may neither evict members nor report a shrinking
+-- retry as a successful fence. An unsuccessful write leaves the batch unsent.
+function M.fence_spool(scope, events, retry_after_until_ms)
+	return write_spool(spool_namespace(scope), events, retry_after_until_ms)
 end
 
 -- Drop the whole spool — envelopes and any stored deadline (consent revoked,
@@ -2622,6 +2631,7 @@ end
 
 -- Clears the in-memory fallback records only; intended for tests.
 function M.reset()
+	analytics_retry.reset()
 	memory_records = {}
 	consent_denial_memory = {}
 	pending_memory = {}

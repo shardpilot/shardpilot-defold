@@ -797,16 +797,37 @@ events, honoring the same token, consent, `Retry-After`-deferral, and backoff
 gates. Envelopes are stored and re-sent **verbatim**: the `event_id` and
 `event_ts` stamped at `track()` time are never rebuilt, so the ingest service
 de-duplicates a re-send that raced an original delivery. Entries leave the
-spool only when the server acknowledges their batch (2xx) — ack-based removal
+spool when the server acknowledges their batch (2xx) — ack-based removal
 keyed by `event_id` — or when a re-send is permanently rejected (surfaced via
 the `diagnostics` hook with `scope = "spool"`). A transient re-send failure
-keeps the entry for the launch after that. If the removal rewrite itself hits
+keeps the entry for a later launch while its delivery age remains eligible. If the removal rewrite itself hits
 a storage error, the entries stay marked settled and the rewrite is retried on
 the flush cadence until it lands. A server-requested delay also survives a
 relaunch: when a `429` `Retry-After` arrives while a batch is spooled, the
 deadline is stored with the record, and a launch inside that window waits out
 the remainder before re-sending (bounded by the same 24-hour clamp as the
 in-process deferral).
+
+**Delivery age.** Each accepted event has a local intake clock, separate from
+`event_ts`. Events expire after seven days from intake, or fifteen minutes from
+the first HTTP attempt whose delivery may have occurred, whichever comes first.
+An event held offline without an attempt keeps the seven-day budget. Received
+`4xx` responses and attempts proven not to have reached HTTP clear only a clock
+started by that attempt; an earlier ambiguous attempt keeps its original clock.
+Retries never renew either budget. Expiry is checked after serialization and
+before `http.request`, for live batches as well as restored spool entries.
+Eligible members retain their original envelope bytes and IDs. Expired members
+are dropped individually, counted in `snapshot().spool_expired`, and reported
+with diagnostic code `spool_expired` and their original `event_id`.
+
+The spool stores these two clocks as local metadata outside the wire envelope.
+A new clock for an already persisted event must save before HTTP can start;
+a failed clock write leaves the batch unsent and does not evict stored events.
+Missing, invalid or future clocks are treated as expired, including older spool
+records without this metadata. A backward wall-clock correction can therefore
+drop an event whose intake time is now in the future. Retry-After cannot extend these bounds.
+Use only [one live client per app](#configuration); shut down the old client
+successfully before constructing its replacement.
 
 **Caps.** The spool is bounded by `spool_max_events` (default 500) and
 `spool_max_bytes` (default 256 KB, max 384 KB to keep headroom under the
@@ -843,8 +864,8 @@ previous one are dropped from the record at load (surfaced via the
 being re-sent into a guaranteed rejection; Mode A has no token binding and
 re-sends historic-identity envelopes unchanged. Disabling the spool
 (`spool_enabled = false`) also deletes any previously persisted record at the
-next init. The spool stores only the envelope fields that were already bound
-for the wire — never tokens. See [`docs/privacy.md`](docs/privacy.md).
+next init. The spool stores the envelope fields already bound for the wire and local
+delivery clocks — never tokens. See [`docs/privacy.md`](docs/privacy.md).
 
 **Recommended: forward your window events.** The SDK never installs global
 listeners itself — on mobile an iconified app can be killed without `final()`

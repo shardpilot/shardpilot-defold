@@ -1,4 +1,5 @@
 local clock = require "shardpilot.clock"
+local analytics_retry = require "shardpilot.analytics_retry"
 local id = require "shardpilot.id"
 local utf8 = require "shardpilot.utf8"
 
@@ -50,6 +51,7 @@ function M.build(config, state, event)
 		out.event_id, out.event_name, out.event_ts, out.props = fact.event_id, fact.event_name, fact.event_ts, fact.props
 		out.attestation_seal, out.sealed_fact = fact.seal, fact
 	end
+	analytics_retry.bind(out, event)
 	return out
 end
 
