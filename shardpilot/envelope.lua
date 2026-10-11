@@ -1,5 +1,6 @@
 local clock = require "shardpilot.clock"
 local analytics_retry = require "shardpilot.analytics_retry"
+local experiment_facts = require "shardpilot.experiment_facts"
 local id = require "shardpilot.id"
 local utf8 = require "shardpilot.utf8"
 
@@ -53,6 +54,19 @@ function M.build(config, state, event)
 	end
 	analytics_retry.bind(out, event)
 	return out
+end
+
+-- Measure the complete raw element with the same encoder as batch transport.
+-- In particular, sealed facts retain their signed bytes and interior spacing.
+function M.admission_error(config, state, event)
+	if not json or type(json.encode) ~= "function" then return "json_unavailable" end
+	local ok, encoded = pcall(function()
+		return experiment_facts.encode_event(M.build(config, state, event))
+	end)
+	if not ok or type(encoded) ~= "string" then return "json_encode_failed" end
+	local trimmed = encoded:match("^%s*(.-)%s*$")
+	if #trimmed > 2048 then return "event_too_large" end
+	return nil
 end
 
 return M

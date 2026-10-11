@@ -3798,6 +3798,14 @@ function Client:enqueue_event(event_name, props, context, fact, host_event)
 		sealed_fact = fact and fact.sealed_fact or nil,
 		context = context_snapshot,
 	}
+	local admission_err = envelope.admission_error(self.config, self, event)
+	if admission_err then
+		if opened_lazy_session then
+			self.session = nil
+			self:mirror_session()
+		end
+		return self:_record_refusal(admission_err)
+	end
 	self:register_delivery(event)
 	if fact and fact.stage then return true, nil, { event = event, stream = stream, now_ms = now_ms } end
 	local ok = commit_event(self, event, stream, now_ms)
@@ -3955,6 +3963,8 @@ function Client:enqueue_owed_summary(entry)
 	if self.consent_state ~= "granted" then
 		return false, "consent_unknown"
 	end
+	local admission_err = envelope.admission_error(self.config, self, entry.event)
+	if admission_err then return self:_record_refusal(admission_err) end
 	if not queue.push(self.queue, entry.event) then
 		-- Still owed — never counted dropped here: like a retryable owed
 		-- fact, the snapshot stays armed and re-enqueues once room frees.
@@ -5898,6 +5908,8 @@ function Client:capture_experiment_fact(event_name, props, event_id, overrides)
 		sealed_fact = overrides.sealed_fact,
 		context = nil,
 	}
+	local admission_err = envelope.admission_error(self.config, self, event)
+	if admission_err then return self:_record_refusal(admission_err) end
 	stream.sequence = event.session_sequence
 	self:mirror_session()
 	self:register_delivery(event)

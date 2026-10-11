@@ -16345,3 +16345,210 @@ end)()
  print(string.format("client-boundary total: %d pass, %d fail",passed,failed))
  assert_equal(failed,0,"client-boundary scenes")
 end)()
+
+-- Complete-event admission scenes: the serializer is the transport's encoder.
+;(function()
+ local Client=require "shardpilot.client"
+ local envelope=require "shardpilot.envelope"
+ local facts=require "shardpilot.experiment_facts"
+ local clock=require "shardpilot.clock"
+ local saved={sys=sys,http=http,json=json,socket=socket}
+ local passed,failed=0,0
+ local function reset()
+  sys={get_sys_info=function()return {system_name="Linux"}end}
+  json={encode=encode_value,decode=json_decode}
+  socket={now=1000,gettime=function()socket.now=socket.now+0.1;return socket.now end}
+  requests={}
+  http={request=function(url,method,callback,headers,body,options)
+   requests[#requests+1]={url=url,body=body}
+   callback(nil,nil,{status=202,response='{"accepted":1}'})
+  end}
+ end
+ local function scene(name,fn)
+  reset()
+  local ok,err=pcall(fn)
+  if ok then passed=passed+1;print("event-size PASS "..name)
+  else failed=failed+1;print("event-size FAIL "..name..": "..tostring(err))end
+ end
+ local function fresh(options)
+  local cfg=config({source="backend",flush_interval_seconds=9999})
+  for k,v in pairs(options or {})do cfg[k]=v end
+  local client=assert(Client.new(cfg));assert_true(client:set_consent(true))
+  requests={}
+  return client
+ end
+ local function event(client,props,context,name)
+  return {event_id="01900000-0000-7000-8000-000000000001",event_name=name or "limit_probe",
+   event_ts=clock.iso_utc(),anonymous_id=client.anonymous_id,user_id=client.user_id,
+   session_id=client.session and client.session.id or nil,
+   session_sequence=client:sequence_stream().sequence+1,props=props,context=context}
+ end
+ local function wire(client,value)return facts.encode_event(envelope.build(client.config,client,value))end
+ local function sized_props(client,bytes)
+  local props={pad=""};local base=#wire(client,event(client,props))
+  assert_true(bytes>=base);props.pad=string.rep("x",bytes-base)
+  assert_equal(#wire(client,event(client,props)),bytes,"complete calibration")
+  return props
+ end
+ local function refused(client,ok,err,code,before_queue,before_dropped)
+  assert_equal(ok,false);assert_equal(err,code)
+  assert_equal(#client.queue.items,before_queue,"refused event never queued")
+  assert_equal(client.stats.dropped,before_dropped+1,"one terminal refusal")
+  assert_equal(client.stats.last_error,code)
+  local clocks=0;for _ in pairs(client.delivery_clocks)do clocks=clocks+1 end
+  assert_equal(clocks,before_queue,"refusal registers no delivery clock")
+ end
+ for _,bytes in ipairs({2047,2048,2049})do
+  scene("complete boundary "..bytes,function()
+   local c=fresh();local props=sized_props(c,bytes)
+   local ok,err=c:track("limit_probe",props)
+   if bytes<=2048 then
+    assert_true(ok,err);assert_equal(#c.queue.items,1)
+    assert_equal(#wire(c,c.queue.items[1]),bytes,"actual accepted wire size")
+   else refused(c,ok,err,"event_too_large",0,0)end
+  end)
+ end
+ scene("envelope overhead counts",function()
+  local c=fresh();local props={pad=string.rep("x",1800)}
+  assert_true(#encode_value(props)<2048);assert_true(#wire(c,event(c,props))>2048)
+  local ok,err=c:track("limit_probe",props);refused(c,ok,err,"event_too_large",0,0)
+ end)
+ scene("context counts",function()
+  local c=fresh();local context={pad=string.rep("x",2000)}
+  local ok,err=c:track("limit_probe",{small=true},context);refused(c,ok,err,"event_too_large",0,0)
+ end)
+ for name,pad in pairs({utf8=string.rep("é",900),escaping=string.rep('"',900)})do
+  scene(name.." uses encoded bytes",function()
+   local c=fresh();local props={pad=pad};assert_true(#wire(c,event(c,props))>2048)
+   local ok,err=c:track("limit_probe",props);refused(c,ok,err,"event_too_large",0,0)
+  end)
+ end
+ scene("outer whitespace does not spend event budget",function()
+  local c=fresh();local props=sized_props(c,2048)
+  json.encode=function(value)return " \r\n\t"..encode_value(value).." \n\t" end
+  assert_true(c:track("limit_probe",props));assert_equal(#c.queue.items,1)
+  assert_true(#wire(c,c.queue.items[1])>2048,"wire really carries outer whitespace")
+ end)
+ scene("interior whitespace spends event budget",function()
+  local c=fresh()
+  json.encode=function(value)local encoded=encode_value(value);return encoded:sub(1,1)..string.rep(" ",2048)..encoded:sub(2)end
+  local ok,err=c:track("limit_probe",{small=true});refused(c,ok,err,"event_too_large",0,0)
+ end)
+ for name,encoder in pairs({throws=function()error("synthetic encoding failure")end,
+  nonstring=function()return 42 end})do
+  scene("encoder "..name.." refuses locally",function()
+   local c=fresh();json.encode=encoder
+   local ok,err=c:track("limit_probe",{});refused(c,ok,err,"json_encode_failed",0,0)
+  end)
+ end
+ scene("missing encoder refuses locally",function()
+  local c=fresh();json=nil
+  local ok,err=c:track("limit_probe",{});refused(c,ok,err,"json_unavailable",0,0)
+ end)
+ scene("consent refusal still precedes size admission",function()
+  local c=fresh();assert_true(c:set_consent(false));json=nil
+  local ok,err=c:track("limit_probe",{pad=string.rep("x",3000)})
+  assert_equal(ok,false);assert_equal(err,"consent_denied");assert_equal(#c.queue.items,0)
+ end)
+ scene("lazy session is rolled back",function()
+  local c=fresh({source="client"});assert_equal(c.session,nil)
+  local sequence=c:sequence_stream().sequence
+  local ok,err=c:track("limit_probe",{pad=string.rep("x",3000)})
+  refused(c,ok,err,"event_too_large",0,0);assert_equal(c.session,nil)
+  assert_equal(c:sequence_stream().sequence,sequence)
+  assert_true(c:track("small_control",{}));assert_equal(c.session.sequence,1)
+ end)
+ scene("live session and good neighbour survive",function()
+  local c=fresh({source="client"});assert_true(c:track("small_control",{}))
+  local session=c.session;local sequence=session.sequence;local dropped=c.stats.dropped
+  local ok,err=c:track("limit_probe",{pad=string.rep("x",3000)})
+  refused(c,ok,err,"event_too_large",1,dropped)
+  assert_equal(c.session,session);assert_equal(session.sequence,sequence)
+  assert_true(c:flush());local sent=json_decode(requests[#requests].body).events
+  assert_equal(#sent,1);assert_equal(sent[1].event_name,"small_control")
+ end)
+ scene("staged session replacement refuses atomically",function()
+  local c=fresh({source="client"});assert_true(c:session_start({small=true}))
+  local session=c.session;local sequence=session.sequence;local before=#c.queue.items
+  local ok,err=c:session_start({pad=string.rep("x",3000)})
+  refused(c,ok,err,"event_too_large",before,0)
+  assert_equal(c.session,session);assert_equal(session.sequence,sequence)
+ end)
+ scene("queue full does not mask terminal size refusal",function()
+  local c=fresh({buffer_size=1});assert_true(c:track("small_control",{}))
+  local ok,err=c:track("limit_probe",{pad=string.rep("x",3000)})
+  refused(c,ok,err,"event_too_large",1,0)
+ end)
+ scene("owed summary cannot bypass admission",function()
+  local c=fresh();c.owed_summaries={{event=event(c,{pad=string.rep("x",3000)})},
+   {event=event(c,{small=true},nil,"small_control")}}
+  assert_true(c:drain_owed_summaries());assert_equal(#c.owed_summaries,0)
+  assert_equal(#c.queue.items,1);assert_equal(c.queue.items[1].event_name,"small_control")
+  assert_equal(c.stats.dropped,1);assert_equal(c.stats.last_error,"event_too_large")
+ end)
+ local function sealed(padding)
+  local value={event_id="01900000-0000-7000-8000-000000000002",event_name="experiment_exposure",
+   event_ts="2026-01-01T00:00:00.000Z",workspace_key="workspace-example",app_key="app-example",
+   environment_key="develop",props={pad=padding}}
+  value.raw=encode_value(value);value.seal="synthetic-seal"
+  return value
+ end
+ for _,size in ipairs({16,3000})do
+  scene("sealed wire admission "..size,function()
+   local c=fresh();local fact=sealed(string.rep("x",size))
+   -- The decoded props are small on purpose: the signed raw bytes own size.
+   fact.props={small=true}
+   local ok,err=c:enqueue_event(fact.event_name,fact.props,nil,{sealed_fact=fact,omit_user_id=true})
+   if size==16 then assert_true(ok,err);assert_equal(#c.queue.items,1)
+   else refused(c,ok,err,"event_too_large",0,0)end
+  end)
+  scene("direct fact capture "..size,function()
+   local c=fresh();local fact=sealed(string.rep("x",size));fact.props={small=true}
+   local writes=0;c.spool_envelopes=function(_,batch)writes=writes+1;assert_equal(#batch,1);return true end
+   local sequence=c:sequence_stream().sequence
+   local ok,err=c:capture_experiment_fact(fact.event_name,fact.props,fact.event_id,{sealed_fact=fact})
+   if size==16 then assert_true(ok,err);assert_equal(writes,1)
+   else assert_equal(ok,false);assert_equal(err,"event_too_large");assert_equal(writes,0)
+    assert_equal(c:sequence_stream().sequence,sequence);assert_equal(c.stats.dropped,1)end
+  end)
+ end
+ for _,bytes in ipairs({2048,2049})do
+  scene("sealed complete boundary "..bytes,function()
+   local c=fresh();local fact=sealed("");fact.props={small=true}
+   local probe=event(c,fact.props,nil,fact.event_name);probe.sealed_fact=fact
+   local base=#wire(c,probe);fact=sealed(string.rep("x",bytes-base));fact.props={small=true}
+   probe.sealed_fact=fact;assert_equal(#wire(c,probe),bytes,"sealed raw calibration")
+   local ok,err=c:enqueue_event(fact.event_name,fact.props,nil,{sealed_fact=fact,omit_user_id=true})
+   if bytes==2048 then assert_true(ok,err);assert_equal(#wire(c,c.queue.items[1]),bytes)
+   else refused(c,ok,err,"event_too_large",0,0)end
+  end)
+ end
+ scene("missing encode function refuses locally",function()
+  local c=fresh();json={}
+  local ok,err=c:track("limit_probe",{});refused(c,ok,err,"json_unavailable",0,0)
+ end)
+ scene("terminal oversized fact does not block next fact",function()
+  local c=fresh({source="client",experiments_enabled=true,app_url="https://config.example",publishable_key="sp_ingest_synthetic"})
+  assert_true(c:session_start());local before=#c.queue.items
+  local large=sealed(string.rep("x",3000));local small=sealed("small")
+  c.experiments.pending_exposure.synthetic={
+   {sealed_fact=large,session_id=c.session.id,anonymous_id=c.anonymous_id},
+   {sealed_fact=small,session_id=c.session.id,anonymous_id=c.anonymous_id}}
+  c.experiments:sweep_pending("synthetic","background")
+  assert_equal(c.experiments.pending_exposure.synthetic,nil,"terminal head retired")
+  assert_equal(#c.queue.items,before+1,"following valid fact admitted")
+  assert_equal(c.stats.dropped,1)
+  c.experiments:sweep_pending("synthetic","background");assert_equal(c.stats.dropped,1)
+ end)
+ scene("full queue retains a valid owed fact",function()
+  local c=fresh({source="client",buffer_size=1,experiments_enabled=true,app_url="https://config.example",publishable_key="sp_ingest_synthetic"})
+  assert_true(c:session_start());local small=sealed("small")
+  c.experiments.pending_exposure.synthetic={{sealed_fact=small,session_id=c.session.id,anonymous_id=c.anonymous_id}}
+  c.experiments:sweep_pending("synthetic","background")
+  assert_equal(#c.experiments.pending_exposure.synthetic,1)
+  assert_equal(#c.queue.items,1);assert_equal(c.stats.dropped,0)
+ end)
+ sys,http,json,socket=saved.sys,saved.http,saved.json,saved.socket
+ print(string.format("event-size total: %d pass, %d fail",passed,failed))
+ assert_equal(failed,0,"event-size admission scenes")
+end)()

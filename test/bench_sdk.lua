@@ -68,18 +68,13 @@ http = {
 
 -- The `json` global, from the SAME encoder the test suite installs.
 --
--- ⚠ AND IT IS NOT WHAT FIXED THIS FILE'S NUMBERS — I claimed it was, and
--- measuring it said otherwise. Removing the shim and re-running changes the
--- result by less than a byte per call (916 → 916, 928 → 928, 1290 → 1290),
--- because `track()` ENQUEUES and serialization happens later, at publish, which
--- is outside the measured window by design.
---
--- It stays because the SDK should be in a realistic state while being measured
--- and the publish path errors without it — but as scaffolding, honestly
--- labelled, not as the measurement. The actual defect is recorded at
--- `buffer_size` below, and the reason this comment says all of it is that the
--- first version of this file carried a confident, wrong explanation of its own
--- numbers, which is worse than carrying none.
+-- Before event-size admission, serialization ran only at publish: removing
+-- this shim then changed the measured allocation by less than a byte per call
+-- (916 → 916, 928 → 928, 1290 → 1290). That historical diagnosis does not
+-- describe the current path. Admission now encodes each complete event, so its
+-- allocation and per-call cost belong in this benchmark. Publishing stays
+-- outside the measured window. The original capacity defect is recorded at
+-- `buffer_size` below.
 local function encode_string(value)
 	return '"' .. tostring(value):gsub("\\", "\\\\"):gsub('"', '\\"') .. '"'
 end

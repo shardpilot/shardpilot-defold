@@ -2395,11 +2395,15 @@ function Experiments:sweep_pending(experiment_key, mode)
 		end
 		if list[1] == record and record.sealed_fact then
 			local sealed = record.sealed_fact
-			local ok = self.deps.emit(sealed.event_name, sealed.props, sealed.event_id, {
+			local ok, err = self.deps.emit(sealed.event_name, sealed.props, sealed.event_id, {
 				session_id = record.session_id, anonymous_id = record.anonymous_id,
 				event_ts = sealed.event_ts, sealed_fact = sealed, retryable = true,
 			})
-			if not ok or self.pending_exposure[experiment_key] ~= list then return end
+			if self.pending_exposure[experiment_key] ~= list then return end
+			-- A complete event over the fixed cap cannot succeed on a later
+			-- attempt. Retire that fact so it cannot block valid neighbours;
+			-- capacity and unavailable encoding still keep their retry posture.
+			if not ok and err ~= "event_too_large" then return end
 			table.remove(list, 1)
 		end
 	end
