@@ -3,6 +3,8 @@
 -- Bearer. Distinct from the analytics transport (shardpilot/transport.lua),
 -- which batches analytics events to /v1/events:batch — a crash is NEVER wrapped
 -- as a `mobile_crash` analytics event.
+local clock = require "shardpilot.clock"
+
 local M = {}
 
 local crash_ingest_route = "/api/v1/crashes/ingest"
@@ -13,27 +15,52 @@ local function trim_slash(value)
 	return (value:gsub("/+$", ""))
 end
 
--- Read the Retry-After header (whole seconds) when present; returns a
--- non-negative number or nil. The real Defold http API lowercases header keys.
-local function retry_after_seconds(response)
-	if type(response) ~= "table" or type(response.headers) ~= "table" then
-		return nil
-	end
-	local value = response.headers["retry-after"] or response.headers["Retry-After"]
-	if type(value) == "number" then
-		if value < 0 then
-			return nil
+local months = { Jan=1, Feb=2, Mar=3, Apr=4, May=5, Jun=6, Jul=7, Aug=8, Sep=9, Oct=10, Nov=11, Dec=12 }
+local function http_date(value)
+	local weekday = value:match("^(%a+)")
+	local valid = {Sun=true,Mon=true,Tue=true,Wed=true,Thu=true,Fri=true,Sat=true,
+		Sunday=true,Monday=true,Tuesday=true,Wednesday=true,Thursday=true,Friday=true,Saturday=true}
+	if not valid[weekday] then return nil end
+	local day, mon, year, hour, minute, second = value:match("^%a+, (%d%d) (%a%a%a) (%d%d%d%d) (%d%d):(%d%d):(%d%d) GMT$")
+	if not day then
+		day, mon, year, hour, minute, second = value:match("^%a+, (%d%d)%-(%a%a%a)%-(%d%d) (%d%d):(%d%d):(%d%d) GMT$")
+		if year then
+			local current = tonumber(os.date("!%Y", math.floor(clock.unix_ms()/1000)))
+			year = math.floor(current/100)*100 + tonumber(year)
+			if year > current+50 then year=year-100 end
 		end
-		return math.floor(value)
 	end
-	if type(value) ~= "string" then
-		return nil
+	if not day then
+		mon, day, hour, minute, second, year = value:match("^%a%a%a (%a%a%a) +(%d%d?) (%d%d):(%d%d):(%d%d) (%d%d%d%d)$")
 	end
-	local seconds = tonumber(value:match("^%s*(%d+)%s*$"))
-	if not seconds or seconds < 0 then
-		return nil
+	day, year, hour, minute, second = tonumber(day), tonumber(year), tonumber(hour), tonumber(minute), tonumber(second)
+	local month = months[mon]
+	if not day or not month or year < 1 or hour > 23 or minute > 59 or second > 59 then return nil end
+	local leap = year%4==0 and (year%100~=0 or year%400==0)
+	local days = {31, leap and 29 or 28, 31,30,31,30,31,31,30,31,30,31}
+	if day<1 or day>days[month] then return nil end
+	local y = year-1
+	local total = 365*y + math.floor(y/4)-math.floor(y/100)+math.floor(y/400)-719162+day-1
+	for m=1,month-1 do total=total+days[m] end
+	return total*86400+hour*3600+minute*60+second
+end
+
+-- Bound both delta-seconds and all three HTTP-date spellings before use.
+local function retry_after_seconds(response)
+	if type(response) ~= "table" or type(response.headers) ~= "table" then return nil end
+	local value = response.headers["retry-after"] or response.headers["Retry-After"]
+	local seconds
+	if type(value)=="number" then seconds=value
+	elseif type(value)=="string" and #value<=128 then
+		value=value:match("^%s*(.-)%s*$")
+		seconds=tonumber(value:match("^%d+$"))
+		if not seconds then
+			local at=http_date(value)
+			if at then seconds=math.max(0, math.ceil(at-clock.unix_ms()/1000)) end
+		end
 	end
-	return math.floor(seconds)
+	if not seconds or seconds~=seconds or seconds<0 then return nil end
+	return math.min(86400, math.floor(seconds))
 end
 
 local MAX_SCAN_DEPTH = 32
@@ -175,6 +202,20 @@ skip_value = function(text, pos, depth, collect)
 	return stop + 1
 end
 
+-- Only an exact typed code in a bounded, complete, unambiguous object is
+-- authoritative. Missing decoding, malformed JSON and unknown codes keep the
+-- ordinary status classification; message text never changes retry policy.
+local function disabled_kind(response)
+	local body=type(response)=="table" and response.response
+	if type(body)~="string" or #body>65536 or not json or type(json.decode)~="function" then return false end
+	local start=skip_space(body,1)
+	if body:sub(start,start)~="{" then return false end
+	local after=skip_value(body,start,0)
+	if not after or skip_space(body,after)<=#body then return false end
+	local ok, value=pcall(json.decode,body)
+	return ok and type(value)=="table" and type(value.error)=="table" and value.error.code=="kind_not_enabled"
+end
+
 -- Rename only an unambiguous root key in a durable JSON body.
 function M.migrate_component(body)
 	if type(body) ~= "string" then return nil end
@@ -266,6 +307,10 @@ function M.ingest_body(config, publishable_key, encoded, callback)
 		local status = response and response.status or 0
 		if status == 401 or status == 403 then
 			callback(false, "unauthorized", true, false, response)
+			return
+		end
+		if (status == 400 or status == 404) and disabled_kind(response) then
+			callback(false, "kind_not_enabled", false, true, response, retry_after_seconds(response))
 			return
 		end
 		if status >= 200 and status < 300 then

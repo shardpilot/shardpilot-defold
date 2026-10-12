@@ -10,6 +10,9 @@ local transport = require "shardpilot.crash.transport"
 local dump = require "shardpilot.crash.dump"
 local storage = require "shardpilot.storage"
 local platform = require "shardpilot.platform"
+local clock = require "shardpilot.clock"
+local crash_deadline = require "shardpilot.crash.deadline"
+local random = require "shardpilot.random"
 
 local M = {}
 
@@ -350,17 +353,20 @@ function M.new(config)
 		-- snapshot skips them so a manual resend_pending() during a live
 		-- send can never dispatch the same body twice concurrently.
 		tokens_in_flight = {},
-		-- Set when a send was throttled (a Retry-After window persisted)
+		-- Set when a send armed a Retry-After or local backoff window
 		-- so an ACTIVE pass stops before its next dispatch instead of
 		-- sending into the window the server just requested. Cleared when a
 		-- send is accepted and at the start of each (window-gated) pass.
 		backpressure_hit = false,
-		-- Bumped on every throttled send. An accepted send clears the
+		-- Bumped on every retryable failure. An accepted send clears the
 		-- stored window ONLY when no throttle landed after it was
 		-- dispatched: two sends can be in flight concurrently (a live fatal
 		-- alongside a pass record), and the accept of the EARLIER one must
 		-- not erase the window the later 429 just requested.
 		backpressure_epoch = 0,
+		retry_attempt = 0,
+		retry_deadline_ms = nil,
+		retry_after_deadline_ms = nil,
 		-- True while a serial resend pass over the pending sidecar is running
 		-- (one pass at a time; each pass sends strictly one report at a time).
 		resend_active = false,
@@ -381,7 +387,7 @@ function M.new(config)
 			last_error = nil,
 			last_issue = nil,
 			-- Last non-fatal processing notice and last server-instructed Retry-After
-			-- (whole seconds, from a 429/503), surfaced via snapshot() for observability.
+			-- (bounded whole seconds), surfaced via snapshot() for observability.
 			last_warning = nil,
 			last_retry_after = nil,
 			-- When a resend pass found pending reports but a stored backpressure
@@ -692,14 +698,38 @@ function Client:record_accepted_response(response)
 	return false
 end
 
--- Record a server-instructed Retry-After (whole seconds, from a 429/503) for
--- observability. A pending report is resent on a later launch, well past any
--- seconds-scale wait, so this is surfaced via snapshot() rather than used as an
--- in-process backoff.
-function Client:record_retry_after(retry_after)
-	if type(retry_after) == "number" and retry_after >= 0 then
+-- The deadline gates host-driven passes, without a timer or retry loop.
+-- A server floor persists; local jitter also protects memory-only reports
+-- when the sidecar cannot be written. Concurrent failures never shorten it.
+function Client:retry_deadline(stored)
+	local now = clock.unix_ms()
+	self.retry_deadline_ms = crash_deadline.normalize(self.retry_deadline_ms, now, crash_deadline.local_limit_ms)
+	self.retry_after_deadline_ms = crash_deadline.normalize(self.retry_after_deadline_ms, now, crash_deadline.server_limit_ms)
+	stored = crash_deadline.normalize(stored, now, crash_deadline.server_limit_ms)
+	local deadline = math.max(stored or 0, self.retry_deadline_ms or 0, self.retry_after_deadline_ms or 0)
+	if deadline > now then return deadline end
+	return nil
+end
+
+function Client:pace_retry(retry_after)
+	self.retry_attempt = math.min(self.retry_attempt + 1, 7)
+	local ceiling = math.min(60, 2 ^ (self.retry_attempt - 1))
+	local delay = 1 + random.unit() * (ceiling - 1)
+	local _, stored = storage.load_pending_entries(self:pending_scope())
+	self:retry_deadline(stored)
+	local now = clock.unix_ms()
+	self.retry_deadline_ms = math.max(self.retry_deadline_ms or 0, now + math.ceil(delay * 1000))
+	if type(retry_after) == "number" then
 		self.stats.last_retry_after = retry_after
+		if retry_after > 0 then
+			self.retry_after_deadline_ms = math.max(self.retry_after_deadline_ms or 0, stored or 0,
+				now + math.min(crash_deadline.server_limit_ms, retry_after * 1000))
+			storage.set_pending_crash_retry_after(self:pending_scope(), (self.retry_after_deadline_ms - now) / 1000)
+		end
 	end
+	self.stats.resend_deferred_until_ms = self:retry_deadline(stored)
+	self.backpressure_hit = true
+	self.backpressure_epoch = self.backpressure_epoch + 1
 end
 
 -- Decide whether a NON-fatal report is sampled in. A fatal report never reaches
@@ -839,6 +869,7 @@ function Client:emit_internal(event, fatal, trusted_frame_functions, prepare_opt
 			return true
 		end
 		local _, window = storage.load_pending_entries(self:pending_scope())
+		window = self:retry_deadline(window)
 		if type(window) == "number" then
 			self.stats.resend_deferred_until_ms = window
 			return true
@@ -992,8 +1023,9 @@ function Client:resend_pending()
 		self.stats.resend_deferred_until_ms = nil
 		return true
 	end
+	deadline = self:retry_deadline(deadline)
 	if type(deadline) == "number" then
-		-- Server backpressure from an earlier send is still in force (the
+		-- Server backpressure or local backoff is still in force (the
 		-- stored deadline reads as nil once spent): defer the whole pass and
 		-- surface the deadline. The reports stay durable; a later
 		-- resend_pending() — typically the next launch — retries.
@@ -1158,6 +1190,9 @@ function Client:dispatch_pending(entry, on_settled)
 				storage.set_pending_crash_retry_after(self:pending_scope(), nil)
 			end
 			if not window_stands then
+				self.retry_deadline_ms = nil
+				self.retry_after_deadline_ms = nil
+				self.retry_attempt = 0
 				self.stats.resend_deferred_until_ms = nil
 				self.backpressure_hit = false
 			end
@@ -1171,7 +1206,6 @@ function Client:dispatch_pending(entry, on_settled)
 		if not unauthorized and not retryable then
 			self.stats.rejected = self.stats.rejected + 1
 		end
-		self:record_retry_after(retry_after)
 		-- A retryable failure leaves the pending copy in place (on-disk for a
 		-- later launch, or in-memory for an in-session pass). A server
 		-- Retry-After is persisted with the pending record so the
@@ -1181,11 +1215,7 @@ function Client:dispatch_pending(entry, on_settled)
 		-- A non-retryable reject is terminal: remove the pending copy so it
 		-- is not retried forever.
 		if retryable then
-			if type(retry_after) == "number" and retry_after > 0 then
-				storage.set_pending_crash_retry_after(self:pending_scope(), retry_after)
-				self.backpressure_hit = true
-				self.backpressure_epoch = self.backpressure_epoch + 1
-			end
+			self:pace_retry(retry_after)
 		elseif pending_token then
 			self:remove_pending(pending_token)
 		end

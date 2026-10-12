@@ -13,6 +13,7 @@
 -- scope has an empty workspace segment, not a shared fallback.
 
 local clock = require "shardpilot.clock"
+local crash_deadline = require "shardpilot.crash.deadline"
 local analytics_retry = require "shardpilot.analytics_retry"
 local consent_notice = require "shardpilot.consent_notice"
 local random = require "shardpilot.random"
@@ -199,7 +200,7 @@ local max_pending_total_bytes = 384 * 1024
 -- with the record (one day, matching the analytics publish deferral): a
 -- corrupt or absurd stored deadline must never park crash resend
 -- effectively forever.
-local max_pending_retry_after_ms = 24 * 60 * 60 * 1000
+local max_pending_retry_after_ms = crash_deadline.server_limit_ms
 
 -- A pending crash report older than this is a stale retry that is discarded on
 -- read rather than resent: a report that has failed to send for a week is not
@@ -373,21 +374,6 @@ local function load_raw_record(ns)
 	return record
 end
 
--- Normalize the stored resend-backpressure deadline: a number strictly in the
--- future and no further out than the one-day clamp survives; anything else —
--- expired, absurdly far ahead (wall-clock skew or a corrupt value), or not a
--- number — reads as none, so a bad stored deadline can never park crash
--- resend effectively forever.
-local function normalize_pending_deadline(value, current_ms)
-	if type(value) ~= "number" then
-		return nil
-	end
-	if value <= current_ms or value > current_ms + max_pending_retry_after_ms then
-		return nil
-	end
-	return value
-end
-
 -- forward declaration: read_pending_record writes back an adopted/pruned list.
 local write_pending_list
 
@@ -397,7 +383,7 @@ local function read_pending_record(ns)
 	local raw_items = type(raw) == "table" and raw.items or nil
 	local raw_deadline = type(raw) == "table" and raw.retry_after_until_ms or nil
 	local items, changed = normalize_items(raw_items, current_ms)
-	local deadline = normalize_pending_deadline(raw_deadline, current_ms)
+	local deadline = crash_deadline.normalize(raw_deadline, current_ms, max_pending_retry_after_ms)
 	if deadline ~= raw_deadline and raw_deadline ~= nil then
 		-- A spent or absurd stored deadline self-cleans with the rewrite.
 		changed = true
