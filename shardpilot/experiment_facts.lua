@@ -86,6 +86,9 @@ function M.integer(node, minimum)
 	return raw
 end
 
+-- The published fact is open. A member this release does not know, in the
+-- fact or its props, travels inside the signed bytes, and so does an
+-- attestation it does not know. Only the members below are decoded.
 local fact_fields = {
 	workspace_key = true, app_key = true, environment_key = true,
 	event_id = true, event_name = true, event_ts = true, props = true,
@@ -95,9 +98,35 @@ local prop_fields = {
 	experiment_key = true, experiment_version = true, variant_key = true,
 	outcome_key = true, outcome_value = true,
 }
-local function closed(fields, allowed)
-	for key in pairs(fields) do if not allowed[key] then return false end end
-	return true
+-- Envelope members encode_event appends to a forwarded fact, or the envelope
+-- strips from it. A fact member under one of these names, in any case, would
+-- duplicate or reintroduce a member the SDK owns.
+local envelope_metadata = { "anonymous_id", "session_id", "session_sequence", "platform", "app_version", "app_build" }
+local envelope_owned = {
+	schema_version = true, source = true, attestation_seal = true,
+	user_id = true, workspace_id = true, app_id = true, environment_id = true,
+}
+for _, key in ipairs(envelope_metadata) do envelope_owned[key] = true end
+for key in pairs(fact_fields) do envelope_owned[key] = true end
+
+local function owned(fields, envelope)
+	for key in pairs(fields) do
+		local lower = key:lower()
+		if lower == "subject_key" or (envelope and envelope_owned[lower] and not fact_fields[key]) then
+			return true
+		end
+	end
+	return false
+end
+
+-- The raw subject goes only to the apply endpoint, never to analytics.
+local function names_subject(value, subject)
+	if type(value) == "string" then return value:find(subject, 1, true) ~= nil end
+	if type(value) ~= "table" then return false end
+	for key, child in pairs(value) do
+		if names_subject(key, subject) or names_subject(child, subject) then return true end
+	end
+	return false
 end
 
 function M.decode(body, expected)
@@ -105,9 +134,11 @@ function M.decode(body, expected)
 	local raw = fields and fields.fact
 	local fact = decoded and decoded.fact
 	local props = type(fact) == "table" and fact.props or nil
-	if not raw or not raw.fields or not closed(raw.fields, fact_fields)
+	if not raw or not raw.fields or owned(raw.fields, true)
 		or not raw.fields.props or not raw.fields.props.fields
-		or not closed(raw.fields.props.fields, prop_fields)
+		or owned(raw.fields.props.fields, false)
+		or (type(expected.subject_key) == "string" and expected.subject_key ~= ""
+			and names_subject(fact, expected.subject_key))
 		or type(props) ~= "table" or type(decoded.seal) ~= "string"
 		or not decoded.seal:match("^sps1%.[%w_%-]+%.[%w_%-]+$")
 		or type(fact.event_id) ~= "string" or #fact.event_id ~= 69
@@ -116,7 +147,9 @@ function M.decode(body, expected)
 		or type(props.assignment_key) ~= "string" or #props.assignment_key ~= 69
 		or not props.assignment_key:match("^sfk1_[0-9a-f]+$")
 		or props.assignment_unit ~= "client_id"
-		or (props.attestation ~= "client_attested" and props.attestation ~= "backend_attested") then
+		-- The published contract never forwards a server_attested fact.
+		or type(props.attestation) ~= "string" or props.attestation == ""
+		or props.attestation == "server_attested" then
 		return nil, "malformed_sealed_fact"
 	end
 	for _, key in ipairs({ "workspace_key", "app_key", "environment_key", "event_name" }) do
@@ -138,11 +171,14 @@ function M.decode(body, expected)
 		or raw.fields.props.fields.outcome_key or raw.fields.props.fields.outcome_value then
 		return nil, "sealed_fact_mismatch"
 	end
+	-- Unread members stay in raw; the queue copies only what routing reads.
+	local read = {}
+	for key in pairs(prop_fields) do read[key] = props[key] end
 	return {
 		raw = raw.raw, seal = decoded.seal, event_id = fact.event_id,
 		event_name = fact.event_name, event_ts = fact.event_ts,
 		workspace_key = fact.workspace_key, app_key = fact.app_key,
-		environment_key = fact.environment_key, props = props,
+		environment_key = fact.environment_key, props = read,
 	}
 end
 
@@ -152,7 +188,7 @@ function M.encode_event(event)
 	if not event.sealed_fact then return json.encode(event) end
 	local sealed = event.sealed_fact
 	local metadata = { schema_version = 2, source = "client", attestation_seal = sealed.seal }
-	for _, key in ipairs({ "anonymous_id", "session_id", "session_sequence", "platform", "app_version", "app_build" }) do
+	for _, key in ipairs(envelope_metadata) do
 		metadata[key] = event[key]
 	end
 	return sealed.raw:sub(1, -2) .. "," .. json.encode(metadata):sub(2)

@@ -1,5 +1,14 @@
 # Changelog
 
+### Unreleased
+
+- A sealed experiment fact may carry members, in the fact or its props, and an
+  `attestation` value this release does not know. They are forwarded unchanged
+  inside the signed bytes instead of deferring the occurrence on every retry.
+  A `server_attested` fact, a fact that carries the raw subject, and a fact
+  with a top-level member the SDK owns on the analytics envelope are still
+  refused.
+
 ## v0.12.0 — 2026-10-12
 
 ### Migration from `v0.11.2`

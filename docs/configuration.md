@@ -443,6 +443,10 @@ then forwards the exact fact and seal to analytics as a v2 event with literal
 and session identity go only to analytics. `user_id` is omitted. Both stages
 share an eight-record FIFO per experiment; overflow drops the oldest and reports
 `fact_skipped` / `owed_overflow`. A full analytics queue retains a sealed record.
+A fact member or `attestation` value this release does not know is forwarded
+unchanged inside the signed bytes. A `server_attested` fact, a fact that carries
+the raw subject, and a fact with a top-level member the SDK owns on the analytics
+envelope are refused as malformed and retried.
 
 Apply `401`/`403` responses hold the record until an authorized fetch; the
 exact `403` `real_subjects_disabled` code withdraws the whole plane.

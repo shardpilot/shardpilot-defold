@@ -11841,6 +11841,137 @@ function extra_tests.test_sealed_response_rejects_ambiguous_or_mismatched_values
 	end
 end
 
+-- The published fact may grow. A member this release does not know, in the
+-- fact or its props, and an attestation it does not know travel inside the
+-- signed bytes; only the members the SDK reads are decoded for routing.
+function extra_tests.sealed_open_expected(request_body)
+	return { workspace_key = "workspace-test", app_key = "app-test", environment_key = "develop",
+		event_name = "experiment_exposure", experiment_key = "exp-checkout", version_wire = "3",
+		variant_key = "treatment", subject_key = json.decode(request_body).subject_key }
+end
+
+function extra_tests.test_sealed_response_accepts_additive_members()
+	local client = extra_tests.application_client()
+	client:apply_experiment_variant("exp-checkout")
+	client.experiments:tick(0)
+	local body = extra_tests.sealed_answer(requests[#requests].body)
+	local expected = extra_tests.sealed_open_expected(requests[#requests].body)
+	local facts = require "shardpilot.experiment_facts"
+	assert_true(facts.decode(body, expected) ~= nil, "valid response control")
+	for _, case in ipairs({
+		{ (body:gsub('"event_id":', '"region":"eu-west","event_id":')), '"region":"eu-west"' },
+		{ (body:gsub('"props":{', '"props":{"assignment_reason":"traffic",')), '"assignment_reason":"traffic"' },
+		{ (body:gsub('"props":{', '"props":{"detail":{"a":{"b":{"c":{"d":[1,2]}}}},')), '"d":[1,2]' },
+		{ (body:gsub('"client_attested"', '"device_attested"')), '"attestation":"device_attested"' },
+		-- Props are nested, so an envelope member's name is an ordinary prop there.
+		{ (body:gsub('"props":{', '"props":{"source":"server",')), '"source":"server"' },
+	}) do
+		local fact, err = facts.decode(case[1], expected)
+		assert_true(fact ~= nil, "additive response refused: " .. tostring(err))
+		assert_true(fact.raw:find(case[2], 1, true) ~= nil, "additive member left the signed bytes")
+		assert_nil(fact.props.assignment_reason, "an unread member was decoded")
+		assert_nil(fact.props.detail, "an unread member was decoded")
+		assert_equal(fact.props.assignment_key, fixture_subject_fact_key)
+	end
+	local fact = facts.decode((body:gsub('"client_attested"', '"device_attested"')), expected)
+	assert_equal(fact.props.attestation, "device_attested")
+end
+
+-- Openness stops where forwarding would change meaning: the published
+-- contract never forwards a server_attested fact, the SDK owns the envelope
+-- members it appends or strips, and the subject never reaches analytics.
+function extra_tests.test_sealed_response_open_keeps_its_refusals()
+	local client = extra_tests.application_client()
+	client:apply_experiment_variant("exp-checkout")
+	client.experiments:tick(0)
+	local body = extra_tests.sealed_answer(requests[#requests].body)
+	local expected = extra_tests.sealed_open_expected(requests[#requests].body)
+	local subject = expected.subject_key
+	assert_true(type(subject) == "string" and subject ~= "", "apply carried the subject")
+	local facts = require "shardpilot.experiment_facts"
+	assert_true(facts.decode(body, expected) ~= nil, "valid response control")
+	for name, bad in pairs({
+		server_attested = (body:gsub('"client_attested"', '"server_attested"')),
+		empty_attestation = (body:gsub('"client_attested"', '""')),
+		numeric_attestation = (body:gsub('"client_attested"', '7')),
+		appended_anonymous_id = (body:gsub('"event_id":', '"anonymous_id":"other","event_id":')),
+		appended_seal = (body:gsub('"event_id":', '"attestation_seal":"sps1.x.y","event_id":')),
+		appended_case = (body:gsub('"event_id":', '"Session_Id":"other","event_id":')),
+		stripped_user_id = (body:gsub('"event_id":', '"user_id":"player","event_id":')),
+		stripped_scope = (body:gsub('"event_id":', '"workspace_id":"other","event_id":')),
+		known_case = (body:gsub('"event_id":', '"EVENT_ID":"other","event_id":')),
+		fact_subject_name = (body:gsub('"event_id":', '"subject_key":"forbidden","event_id":')),
+		escaped_subject_name = (body:gsub('"props":{', '"props":{"subject_\\u006bey":"forbidden",')),
+		subject_in_props = (body:gsub('"props":{', '"props":{"note":' .. json.encode(subject) .. ',')),
+		subject_nested = (body:gsub('"event_id":', '"trace":{"who":["x' .. subject .. 'y"]},"event_id":')),
+		subject_as_name = (body:gsub('"props":{', '"props":{' .. json.encode(subject) .. ':1,')),
+		outcome_on_exposure = (body:gsub('"props":{', '"props":{"outcome_key":"purchase",')),
+	}) do
+		assert_nil(facts.decode(bad, expected), "open decoder accepted " .. name)
+	end
+end
+
+-- End to end: an apply answer carrying additive members seals the record and
+-- forwards the members inside the signed bytes, instead of deferring the
+-- occurrence on every retry.
+function extra_tests.test_sealed_additive_members_reach_the_wire()
+	local client = extra_tests.application_client()
+	local diagnostics = {}
+	client.experiments.diagnose = function(_, status, code)
+		diagnostics[#diagnostics + 1] = tostring(status) .. ":" .. tostring(code)
+	end
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
+	responder = function(url, _, callback)
+		if url:find("/experiments/exposures", 1, true) then
+			local answer = extra_tests.sealed_answer(requests[#requests].body)
+				:gsub('"event_id":', '"region":"eu-west","event_id":')
+				:gsub('"props":{', '"props":{"detail":{"a":{"b":{"c":{"d":[1,2]}}}},')
+				:gsub('"client_attested"', '"device_attested"')
+			callback(nil, nil, { status = 200, response = answer })
+			return true
+		end
+	end
+	client.experiments:tick(0)
+	assert_equal(table.concat(diagnostics, ","), "", "additive answer was deferred")
+	local queued = queued_events(client, "experiment_exposure")
+	assert_equal(#queued, 1, "additive answer did not seal the record")
+	assert_nil(client.experiments.pending_exposure["exp-checkout"])
+	assert_true(client:flush({ include_summaries = false }))
+	local batch = requests[#requests].body
+	for _, member in ipairs({ '"region":"eu-west"', '"d":[1,2]', '"attestation":"device_attested"' }) do
+		assert_true(batch:find(member, 1, true) ~= nil, member .. " left the forwarded fact")
+	end
+	assert_true(not batch:find(client.experiments:current_subject_id(), 1, true), "subject reached analytics")
+	local sent = json.decode(batch).events
+	assert_equal(#sent, 1)
+	assert_equal(sent[1].event_name, "experiment_exposure")
+	assert_equal(sent[1].anonymous_id, client.anonymous_id)
+end
+
+-- The apply hop knows the subject it sent, so an answer that carries it is
+-- deferred like any refused answer and never reaches analytics.
+function extra_tests.test_sealed_answer_naming_the_subject_is_not_forwarded()
+	local client = extra_tests.application_client()
+	local diagnostics = {}
+	client.experiments.diagnose = function(_, status, code)
+		diagnostics[#diagnostics + 1] = tostring(status) .. ":" .. tostring(code)
+	end
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
+	local subject = client.experiments:current_subject_id()
+	responder = function(url, _, callback)
+		if url:find("/experiments/exposures", 1, true) then
+			local answer = extra_tests.sealed_answer(requests[#requests].body)
+				:gsub('"props":{', '"props":{"note":' .. json.encode(subject) .. ',')
+			callback(nil, nil, { status = 200, response = answer })
+			return true
+		end
+	end
+	client.experiments:tick(0)
+	assert_equal(table.concat(diagnostics, ","), "fact_deferred:malformed_sealed_fact")
+	assert_equal(#queued_events(client, "experiment_exposure"), 0, "an answer naming the subject was queued")
+	assert_equal(#client.experiments.pending_exposure["exp-checkout"], 1, "the occurrence stays owed")
+end
+
 function extra_tests.test_apply_refusals_withdraw_their_fact_population()
 	for _, sentinel in ipairs({ false, true }) do
 		local restore = install_fake_sys_storage()
@@ -11892,6 +12023,10 @@ local tests = {
 	extra_tests.test_seal_survives_queue_pressure_without_second_apply,
 	extra_tests.test_apply_timeout_ignores_old_callback,
 	extra_tests.test_sealed_response_rejects_ambiguous_or_mismatched_values,
+	extra_tests.test_sealed_response_accepts_additive_members,
+	extra_tests.test_sealed_response_open_keeps_its_refusals,
+	extra_tests.test_sealed_additive_members_reach_the_wire,
+	extra_tests.test_sealed_answer_naming_the_subject_is_not_forwarded,
 	extra_tests.test_signed_apply_legacy_and_corrupt_serving_pins,
 	extra_tests.test_signed_apply_int64_pins_survive_both_hops,
 	extra_tests.test_signed_apply_persist_never_starts_apply,

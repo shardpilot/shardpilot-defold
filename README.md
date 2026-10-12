@@ -1475,6 +1475,10 @@ game has to handle specially.
   reach the apply endpoint. A new attribution key returned by apply must be
   saved for later age withdrawal before the fact can be forwarded.
 - **Retry and withdrawal.** A `200` with a valid matching fact seals the record.
+  The fact may carry members and an `attestation` value this release does not
+  know; they travel unchanged inside the signed bytes. A fact is refused as
+  malformed when it is `server_attested`, carries the raw subject, or has a
+  top-level member the SDK adds to or removes from the analytics envelope.
   `401`/`403` holds it and stops apply traffic until an authorized fetch;
   `403` `experiment_apply_disabled` reports a `disabled` diagnostic and keeps
   unsent facts; `403` `real_subjects_disabled` withdraws all owed records and

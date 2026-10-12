@@ -49,8 +49,10 @@ excepted; no path or regex exception or encoded private value is used. The SHA-2
   or bypass any other gate. The captured full-traffic fixture assigns `control`.
 - `age_ineligible` is an authoritative not-assigned reason: return it unchanged,
   drop memory and durable assignment caches, and do not retry it as a transient.
-- Unknown future reasons remain malformed; the test's `future_age_reason` is an
-  explicitly derived negative control, not a captured server verdict.
+- A reason outside this list is reported as `unknown`: an authoritative
+  not-assigned answer that drops the cached assignment, not a malformed
+  response. The test's `future_age_reason` is an explicitly derived control,
+  not a captured server verdict.
 - Synthetic-subject experiments bypass this age gate; the SDK uses client ids.
 
 Projection source: [Go SDK contract](https://github.com/shardpilot/shardpilot-go/blob/ac6ab1439adc5e7a85cf594bde47e8f3358cd47e/testdata/experiment-age/contract.md). The four JSON files retain that projection byte for byte.
