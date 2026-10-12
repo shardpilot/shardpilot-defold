@@ -1113,6 +1113,12 @@ function M.new(config, deps)
 		fetch_seq = 0,
 		fetch_started = {},
 		settled = {},
+		-- experiment_key → seq of the latest HOST fetch still in flight, and
+		-- the apply-mismatch refetch waiting for it to end (see
+		-- refetch_stale_assignment): a host request outranks an SDK
+		-- correction, a cadence attempt does not.
+		host_fetch = {},
+		refetch_owed = {},
 		-- The host's non-adult age declarations whose fetch has not ended:
 		-- experiment_key → { fence_seq, seq, decided } (see
 		-- begin_host_declaration). While one stands the experiment is not
@@ -2314,7 +2320,6 @@ function Experiments:seal_application(experiment_key, record)
 	local dispatched = clock.unix_ms()
 	local scope = self:scope_for(entry.subject_key)
 	local assignment_at_dispatch = self.entries[experiment_key]
-	local fetch_at_dispatch = self.fetch_started[experiment_key]
 	record.flight = flight
 	record.deadline = dispatched + self.config.http_timeout_seconds * 1000
 	local function complete(_, _, response)
@@ -2388,11 +2393,14 @@ function Experiments:seal_application(experiment_key, record)
 				if not list[1] then self.pending_exposure[experiment_key] = nil end
 				if status == 409 and (code == "version_mismatch" or code == "variant_mismatch" or code == "unit_not_recordable")
 					and scope == self:scope_for(self:current_subject_id())
-					and self.entries[experiment_key] == assignment_at_dispatch
-					and self.fetch_started[experiment_key] == fetch_at_dispatch then
-					-- Do not let a refused old occurrence outrank a newer host
-					-- request or installed assignment. Reuse current targeting.
-					self:fetch(experiment_key, nil, nil, true, (assignment_at_dispatch or entry).attributes)
+					and self.entries[experiment_key] == assignment_at_dispatch then
+					-- The refused occurrence's assignment is still the
+					-- installed one: no newer assignment, host or cadence,
+					-- has superseded it. A cadence attempt that failed or is
+					-- still in flight supersedes nothing, so it never
+					-- suppresses this refetch. Reuse current targeting.
+					self:refetch_stale_assignment(scope, experiment_key, assignment_at_dispatch,
+						(assignment_at_dispatch or entry).attributes)
 				end
 			end
 			self:diagnose("fact_skipped", "apply_" .. tostring(status))
@@ -2406,6 +2414,36 @@ function Experiments:seal_application(experiment_key, record)
 		{ Authorization = "Bearer " .. self.config.publishable_key, ["Content-Type"] = "application/json" },
 		body, { timeout = self.config.http_timeout_seconds })
 	if not ok then complete(nil, nil, { status = 0 }) end
+end
+
+-- An apply refused the occurrence's assignment as stale (version, variant or
+-- unit mismatch): fetch it again with the targeting it was served under. A
+-- host request still in flight for the experiment outranks this correction
+-- (its answer may install the newer assignment, and this refetch would fence
+-- it out), so the refetch is owed until that request ends instead.
+function Experiments:refetch_stale_assignment(scope, experiment_key, applied, attributes)
+	if self.host_fetch[experiment_key] then
+		self.refetch_owed[experiment_key] = { scope = scope, applied = applied, attributes = attributes }
+		return
+	end
+	self.refetch_owed[experiment_key] = nil
+	self:fetch(experiment_key, nil, nil, true, attributes)
+end
+
+-- A host fetch for the experiment ended, whatever its outcome. The latest
+-- one in flight releases the owed refetch, which is sent once — unless a
+-- newer assignment installed meanwhile or the subject changed.
+function Experiments:end_host_fetch(experiment_key, seq)
+	if self.host_fetch[experiment_key] ~= seq then
+		return
+	end
+	self.host_fetch[experiment_key] = nil
+	local owed = self.refetch_owed[experiment_key]
+	self.refetch_owed[experiment_key] = nil
+	if owed and self.entries[experiment_key] == owed.applied
+		and owed.scope == self:scope_for(self:current_subject_id()) then
+		self:refetch_stale_assignment(owed.scope, experiment_key, owed.applied, owed.attributes)
+	end
 end
 
 -- Drain in FIFO order. Sealing runs only from background/final sweeps, never
@@ -3320,13 +3358,19 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	end
 	-- Every path that ends this fetch ends its declaration first, so the
 	-- caller sees the state the declaration left. A cache serve the
-	-- unconfirmed declaration just withdrew is not handed back.
+	-- unconfirmed declaration just withdrew is not handed back. A host
+	-- fetch then releases any apply-mismatch refetch that waited for it.
+	local host_seq
 	local function conclude(result)
 		if declaration and self:end_non_adult_declaration(experiment_key, declaration)
 			and result.from_cache then
 			result = { ok = false, from_cache = false, error = result.error }
 		end
-		return finish(result)
+		local concluded = finish(result)
+		if host_seq then
+			self:end_host_fetch(experiment_key, host_seq)
+		end
+		return concluded
 	end
 	if is_revalidation and self.declaring[experiment_key] then
 		-- A revalidation re-sends an earlier declaration — the cadence's
@@ -3357,6 +3401,10 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	self.fetch_seq = self.fetch_seq + 1
 	local seq = self.fetch_seq
 	self.fetch_started[experiment_key] = seq
+	if not is_revalidation then
+		host_seq = seq
+		self.host_fetch[experiment_key] = seq
+	end
 	if own_declaration and self.declaring[experiment_key] == declaration then
 		declaration.seq = seq
 	elseif preset_attributes ~= nil and not is_revalidation

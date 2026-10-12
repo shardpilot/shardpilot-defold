@@ -12498,6 +12498,98 @@ for _,later in ipairs({"pending","installed"})do
   assert_equal(c:experiment_variant("exp-checkout"),"newer")
  end)
 end
+-- The cadence leaves its fetch right after the owed apply in the same tick.
+-- A cadence attempt that fails or is still in flight has superseded
+-- nothing, so the mismatch must still refetch with the applied targeting.
+for _,cadence in ipairs({"failed","pending"})do
+ scene("apply mismatch refetches past a "..cadence.." cadence fetch",function()
+  reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout",{geo="GB"})
+  c:apply_experiment_variant("exp-checkout");local held_apply,held_cadence,corrective
+  responder=function(url,_,cb)
+   if url:find('/experiments/exposures',1,true)then held_apply=cb;return true end
+   if not is_assignment_request({url=url})then return false end
+   assert_equal(query_params(url).geo,"GB")
+   if not corrective then
+    if cadence=="failed"then cb(nil,nil,{status=500,response=envelope("internal")})else held_cadence=cb end
+    return true
+   end
+   cb(nil,nil,{status=200,response=assignment_body({version=4,variant_key="fresh"})});return true
+  end
+  advance_seconds(400);c:update(0)
+  assert_true(held_apply~=nil,"tick did not send the owed apply");assert_equal(#assignment_requests(),2,"tick did not send the cadence fetch")
+  corrective=true;held_apply(nil,nil,{status=409,response=envelope("version_mismatch")})
+  assert_equal(#assignment_requests(),3,"a "..cadence.." cadence fetch suppressed the refetch")
+  assert_equal(c:experiment_variant("exp-checkout"),"fresh")
+  if held_cadence then
+   held_cadence(nil,nil,{status=200,response=assignment_body()})
+   assert_equal(c:experiment_variant("exp-checkout"),"fresh","the older cadence answer outranked the refetch")
+  end
+ end)
+end
+-- A pending host request defers the refetch: sent once if the host request
+-- ends without installing, dropped if it installs a newer assignment.
+for _,host in ipairs({"failed","installed"})do
+ scene("apply mismatch refetch waits for a host request that "..host,function()
+  reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout",{geo="GB"})
+  c:apply_experiment_variant("exp-checkout");local held_apply,held_fetch
+  responder=function(url,_,cb)
+   if url:find('/experiments/exposures',1,true)then held_apply=cb;return true end
+   if not is_assignment_request({url=url})then return false end
+   if not held_fetch then held_fetch=cb;return true end
+   assert_equal(query_params(url).geo,"GB");cb(nil,nil,{status=200,response=assignment_body({version=4,variant_key="fresh"})});return true
+  end
+  c.experiments:seal_application("exp-checkout",c.experiments.pending_exposure["exp-checkout"][1]);assert_true(held_apply~=nil)
+  c:fetch_experiment_assignment("exp-checkout",{geo="FR"},function()end);assert_true(held_fetch~=nil)
+  held_apply(nil,nil,{status=409,response=envelope("version_mismatch")})
+  assert_equal(#assignment_requests(),2,"refetch outranked the pending host request")
+  if host=="failed"then
+   held_fetch(nil,nil,{status=500,response=envelope("internal")})
+   assert_equal(#assignment_requests(),3,"refetch lost when the host request failed")
+   assert_equal(c:experiment_variant("exp-checkout"),"fresh")
+  else
+   held_fetch(nil,nil,{status=200,response=assignment_body({version=4,variant_key="newer"})})
+   assert_equal(#assignment_requests(),2,"refetch sent after a newer assignment installed")
+   assert_equal(c:experiment_variant("exp-checkout"),"newer")
+  end
+ end)
+end
+scene("owed refetch waits for the latest host request",function()
+ reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout",{geo="GB"})
+ c:apply_experiment_variant("exp-checkout");local held_apply,held={},{}
+ responder=function(url,_,cb)
+  if url:find('/experiments/exposures',1,true)then held_apply[1]=cb;return true end
+  if not is_assignment_request({url=url})then return false end
+  held[#held+1]=cb;return true
+ end
+ c.experiments:seal_application("exp-checkout",c.experiments.pending_exposure["exp-checkout"][1])
+ c:fetch_experiment_assignment("exp-checkout",{geo="FR"},function()end)
+ c:fetch_experiment_assignment("exp-checkout",{geo="DE"},function()end);assert_equal(#held,2)
+ held_apply[1](nil,nil,{status=409,response=envelope("version_mismatch")})
+ held[1](nil,nil,{status=500,response=envelope("internal")})
+ assert_equal(#held,2,"an older host request released the refetch while a newer one was pending")
+ held[2](nil,nil,{status=200,response=assignment_body({version=4,variant_key="newer"})})
+ assert_equal(#held,2,"refetch sent after a newer assignment installed");assert_equal(c:experiment_variant("exp-checkout"),"newer")
+end)
+scene("owed refetch is dropped when the subject changes before the host request ends",function()
+ reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout",{geo="GB"})
+ c:apply_experiment_variant("exp-checkout");local record=c.experiments.pending_exposure["exp-checkout"][1]
+ next_response_body=not_assigned_body(nil);fetch(c,"exp-checkout");assert_nil(c:experiment_variant("exp-checkout"))
+ assert_equal(c.experiments.pending_exposure["exp-checkout"][1],record,"the withdrawn assignment's occurrence stays owed")
+ local held_apply,held_fetch
+ responder=function(url,_,cb)
+  if url:find('/experiments/exposures',1,true)then held_apply=cb;return true end
+  if not is_assignment_request({url=url})then return false end
+  if not held_fetch then held_fetch=cb;return true end
+  cb(nil,nil,{status=500,response=envelope("internal")});return true
+ end
+ c.experiments:seal_application("exp-checkout",record);assert_true(held_apply~=nil)
+ c:fetch_experiment_assignment("exp-checkout",{geo="FR"},function()end);assert_true(held_fetch~=nil)
+ held_apply(nil,nil,{status=409,response=envelope("version_mismatch")});assert_equal(#assignment_requests(),3)
+ local subject=c.experiments:current_subject_id()
+ held_fetch(nil,nil,{status=400,response=envelope("subject_id_invalid")})
+ assert_true(c.experiments:current_subject_id()~=subject,"the host request did not re-mint the subject")
+ assert_equal(#assignment_requests(),4,"refetch sent for the re-minted subject")
+end)
 scene("apply-disabled diagnosis keeps occurrence and halts retry",function()
  reset();local diagnostics={};local c=granted_client({diagnostics=function(v)diagnostics[#diagnostics+1]=v end})
  next_response_body=assignment_body();fetch(c,"exp-checkout");c:apply_experiment_variant("exp-checkout")
