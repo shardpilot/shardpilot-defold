@@ -31,8 +31,8 @@ Names and calls change hard, with no aliases. Update host code as follows:
   (storage could not keep everything; a `shutdown` diagnostic names it), the
   server's terminal refusal, `shutdown` or `invalid_timeout_seconds`. A
   second call on the same client gets the first answer. From the call on,
-  events, `session_start`, exposures, outcomes and experiment fetches answer
-  `shutdown`. No closing client outlives its deadline. A denial whose identity and marker writes both failed deletes
+  events, `session_start`, exposures, outcomes, variant applications and
+  experiment fetches answer `shutdown`. No closing client outlives its deadline. A denial whose identity and marker writes both failed deletes
   the stored identity before teardown, so the next launch starts with
   consent unknown. The module releases its default client once the close
   ends.

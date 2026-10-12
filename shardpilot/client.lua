@@ -2693,7 +2693,7 @@ function Client:experiment_payload(experiment_key)
 end
 
 function Client:apply_experiment_variant(experiment_key)
-	if not self.initialized then return nil, "shutdown" end
+	if not self.initialized or self.closing then return nil, "shutdown" end
 	if not self.experiments then return nil, "experiments_not_configured" end
 	return self.experiments:apply_variant(experiment_key)
 end

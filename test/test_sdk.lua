@@ -17293,9 +17293,12 @@ end)()
    {"track_outcome",function()return client:track_outcome("exp_after_quit","won",1)end},
    {"fetch_experiment_assignment",function()return client:fetch_experiment_assignment("exp_after_quit",nil,function()end)end},
    {"track_ad_impression_revenue",function()return client:track_ad_impression_revenue("imp_after_quit","network",1000,"USD","exact","unit","banner","menu")end},
+   {"apply_experiment_variant",function()return client:apply_experiment_variant("exp_after_quit")end,returns_nil=true},
   })do
    local ok,code=attempt[2]()
-   assert_equal(ok,false,attempt[1].." is refused while closing")
+   local refused=false
+   if attempt.returns_nil then refused=nil end
+   assert_equal(ok,refused,attempt[1].." is refused while closing")
    assert_equal(code,"shutdown",attempt[1].." code")
   end
   assert_true(client.initialized,"the close still drains")

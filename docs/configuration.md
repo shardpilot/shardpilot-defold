@@ -187,8 +187,9 @@ first call's answer. The module releases its client when the close ends, so a
 later module-level `shutdown` answers `not_initialized`.
 
 From the call on, the client admits nothing new: `track` and the other event
-calls, `session_start`, `track_exposure`, `track_outcome` and experiment
-fetches answer `false, "shutdown"`. It keeps draining what it holds through
+calls, `session_start`, `track_exposure`, `track_outcome`,
+`apply_experiment_variant` and experiment fetches answer `false, "shutdown"`
+(`apply_experiment_variant` answers `nil, "shutdown"`). It keeps draining what it holds through
 `update()`, and the module holds it: `init()` answers `already_initialized`
 until the callback has run.
 
