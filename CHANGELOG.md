@@ -2,6 +2,15 @@
 
 ### Unreleased
 
+- `flush(timeout_seconds, callback)` replaces the Boolean `flush()`. It delivers
+  what the client holds at the call, batch after batch from `update()`, until
+  all of it is settled or the timeout (default 10 s) passes, and answers once
+  on the main loop: `true`, or `false` with `pending`, `spool_persist_failed`,
+  `consent_receipt_pending`, `shutdown`, `not_initialized`, the server's
+  terminal refusal, or `invalid_timeout_seconds`. Events the SDK removes itself
+  count as settled. The return value says only whether the call was taken. See
+  [Flush](docs/configuration.md#flush).
+
 - Every request to a ShardPilot service carries
   `X-ShardPilot-SDK: defold/<version>`, the version being the release constant
   in `shardpilot/version.lua`. HTML5 builds need the server's CORS to allow the

@@ -1218,6 +1218,10 @@ function M.new(config, defer_init_diagnostics)
 		-- into the durable spool the same way; a denial clears them with the
 		-- rest of the un-egressed analytics data.
 		owed_summaries = {},
+		-- Bounded flush calls still waiting for their events (see
+		-- bounded_flush): each holds the event ids queued at its call, its
+		-- deadline, its callback, and the first terminal refusal among them.
+		flush_drains = {},
 		flush_elapsed_seconds = 0,
 		-- Summed update(dt): the frame time the session boundary compares
 		-- against wall time (on_window_event).
@@ -2735,6 +2739,12 @@ function Client:set_consent(decision, notice)
 		return false, "invalid_consent"
 	end
 	local granted = next_state == "granted"
+	if not granted and self.flush_drains[1] then
+		-- A revocation removes held events: a bounded flush whose deadline
+		-- already passed answers first, as of now, so the purge cannot make
+		-- it a success.
+		self:settle_flush_drains()
+	end
 	if self.consent_state == "denied_forced_minor" then
 		if granted then return false, "consent_forced_minor" end
 		-- The forced denial already stands. A new reasonless receipt would
@@ -3828,6 +3838,11 @@ function Client:update(dt)
 	if not self.initialized then
 		return
 	end
+	if self.flush_drains[1] then
+		-- A bounded flush whose deadline passed answers before this tick can
+		-- dispatch anything more: the timeout bounds the work of the call.
+		self:settle_flush_drains()
+	end
 	if type(dt) == "number" and dt > 0 then
 		self.flush_elapsed_seconds = self.flush_elapsed_seconds + dt
 		self.frame_seconds = self.frame_seconds + dt
@@ -3893,6 +3908,9 @@ function Client:update(dt)
 		-- receipt is already holding the pipeline and fresh queued events
 		-- could not have published on this tick either.
 		self:flush({ include_summaries = false, automatic = true })
+	end
+	if self.flush_drains[1] then
+		self:pump_flush_drains()
 	end
 end
 
@@ -6570,6 +6588,12 @@ function Client:start_publish_batch(automatic)
 		return nil
 	end
 	local dispatched = transport.publish(self.config, self.token, events.payload, function(ok, err, unauthorized, retryable, response, retry_after, compressed, delivery)
+		if self.flush_drains[1] then
+			-- A response after a bounded flush's deadline must not make that
+			-- flush a success: drains answer as of now, before this response
+			-- changes what is held.
+			self:settle_flush_drains()
+		end
 		completed = true
 		succeeded = ok == true
 		self.publish_in_flight = false
@@ -6834,6 +6858,7 @@ function Client:start_publish_batch(automatic)
 			end
 		end
 		if not retain and self.in_flight_batch == events then
+			self:note_terminal_drop(events, err)
 			self.stats.dropped = self.stats.dropped + batch_count
 			self.in_flight_batch = nil
 			-- The batch is gone, so any deadline armed for it is stale — the
@@ -7017,6 +7042,189 @@ function Client:flush(options)
 			return false, "pending"
 		end
 	end
+end
+
+-- ── bounded flush ─────────────────────────────────────────────────────────────
+--
+-- The public flush(timeout_seconds, callback) is bounded_flush: it delivers
+-- what this client holds at the moment of the call (queued events, a batch on
+-- the wire or retained for retry, spool chunks from an earlier launch, owed
+-- summaries) until all of it is delivered or the timeout passes. Client:flush
+-- above stays the one dispatch step that update(), shutdown and this drain all
+-- drive. The callback runs exactly once, on the main loop (from this call or
+-- from update()), with (true) or (false, code):
+--   pending                  the timeout passed; the remnant stays queued and,
+--                            with the durable spool on, is written to it
+--   spool_persist_failed     the timeout passed and the durable spool write of
+--                            the remnant failed
+--   consent_receipt_pending  the timeout passed with the batch still held
+--                            behind an undispatched consent grant receipt
+--   shutdown                 the client was shut down first
+--   <error code>             the server refused this call's events terminally
+-- Events the SDK removes itself (a consent purge, retry-age expiry) count as
+-- done: success means nothing from the call is still held.
+local DEFAULT_FLUSH_TIMEOUT_SECONDS = 10
+
+-- The summaries a flush builds itself: the only events that join a bounded
+-- flush after its call.
+local CALL_SUMMARIES = { perf_summary = true, network_summary = true }
+
+-- Every event id this client still holds for delivery, mapped to its event
+-- name (or true when the held copy carries none).
+function Client:pending_delivery_ids()
+	local ids = {}
+	local function hold(event)
+		ids[event.event_id] = event.event_name or true
+	end
+	for i = 1, #self.queue.items do
+		hold(self.queue.items[i])
+	end
+	local batch = self.in_flight_batch
+	if batch then
+		for i = 1, #batch do
+			hold(batch[i])
+		end
+	end
+	for i = 1, #self.spool_batches do
+		local chunk = self.spool_batches[i]
+		for j = 1, #chunk do
+			hold(chunk[j])
+		end
+	end
+	for i = 1, #self.owed_summaries do
+		local event = self.owed_summaries[i].event
+		if event then
+			hold(event)
+		end
+	end
+	return ids
+end
+
+-- A batch the server refused terminally: every waiting drain that holds one
+-- of its events (or is still registering, when everything dispatched belongs
+-- to it) ends with that refusal once its other events settle.
+function Client:note_terminal_drop(events, code)
+	for _, drain in ipairs(self.flush_drains) do
+		for i = 1, #events do
+			if drain.ids[events[i].event_id]
+				or (drain.registering and CALL_SUMMARIES[events[i].event_name]) then
+				drain.failed = drain.failed or tostring(code or "rejected")
+				break
+			end
+		end
+	end
+end
+
+function Client:bounded_flush(timeout_seconds, callback)
+	local function refuse(code)
+		if type(callback) == "function" then
+			pcall(callback, false, code)
+		end
+		return false, code
+	end
+	if callback ~= nil and type(callback) ~= "function" then
+		return false, "invalid_callback"
+	end
+	if not self.initialized then
+		return refuse("shutdown")
+	end
+	if timeout_seconds == nil then
+		timeout_seconds = DEFAULT_FLUSH_TIMEOUT_SECONDS
+	end
+	if type(timeout_seconds) ~= "number" or timeout_seconds ~= timeout_seconds
+		or timeout_seconds <= 0 or timeout_seconds == math.huge then
+		return refuse("invalid_timeout_seconds")
+	end
+	local drain = {
+		ids = self:pending_delivery_ids(),
+		deadline_ms = clock.unix_ms() + timeout_seconds * 1000,
+		callback = callback,
+		registering = true,
+	}
+	self.flush_drains[#self.flush_drains + 1] = drain
+	-- The explicit attempt: summaries are built now and belong to this call,
+	-- and an explicit caller outranks this client's own backoff, as before.
+	-- Anything else that appeared meanwhile (a host hook tracking from inside
+	-- the dispatch) was not held at the call and is not part of it.
+	self:flush()
+	for id, name in pairs(self:pending_delivery_ids()) do
+		if not drain.ids[id] and CALL_SUMMARIES[name] then
+			drain.ids[id] = true
+		end
+	end
+	drain.registering = nil
+	self:settle_flush_drains()
+	return true
+end
+
+-- Dispatch the next batch as soon as the last one settles, rather than on the
+-- batching cadence, but never inside a deferral window or a mint in flight.
+function Client:pump_flush_drains()
+	if not self.publish_in_flight and not self.token_request_in_flight
+		and (self:has_pending_publish_work() or #self.owed_summaries > 0)
+		and not self:publish_dispatch_deferred(true) then
+		self:flush({ include_summaries = false, automatic = true })
+	end
+	self:settle_flush_drains()
+end
+
+-- End every drain whose events are all settled, or whose deadline passed. With
+-- `ending` (teardown) every drain still waiting ends with that code.
+function Client:settle_flush_drains(ending)
+	if not self.flush_drains[1] then
+		return
+	end
+	local pending = self:pending_delivery_ids()
+	local now = clock.unix_ms()
+	local kept, done = {}, {}
+	local deadline_code
+	for _, drain in ipairs(self.flush_drains) do
+		local waiting = drain.registering == true
+		for id in pairs(drain.ids) do
+			if pending[id] then
+				waiting = true
+				break
+			end
+		end
+		if not waiting then
+			done[#done + 1] = { drain, drain.failed == nil, drain.failed }
+		elseif ending then
+			done[#done + 1] = { drain, false, ending }
+		elseif now >= drain.deadline_ms then
+			deadline_code = deadline_code or self:flush_deadline_code()
+			done[#done + 1] = { drain, false, deadline_code }
+		else
+			kept[#kept + 1] = drain
+		end
+	end
+	self.flush_drains = kept
+	for _, result in ipairs(done) do
+		local drain = result[1]
+		if drain.callback then
+			pcall(drain.callback, result[2], result[3])
+		end
+	end
+end
+
+-- Why a drain's deadline passed with its events still held.
+function Client:flush_deadline_code()
+	if self:grant_receipt_pending_dispatch() then
+		return "consent_receipt_pending"
+	end
+	if self.config.spool_enabled and self.consent_state == "granted"
+		and storage.spool_is_durable(self.config) then
+		-- Owed summaries join the same durable write as the queue and the
+		-- batch on the wire, as persist() does: one write, sized as a whole.
+		local owed = nil
+		for i = 1, #self.owed_summaries do
+			owed = owed or {}
+			owed[#owed + 1] = envelope.build(self.config, self, self.owed_summaries[i].event)
+		end
+		if not self:spool_undelivered(owed) then
+			return "spool_persist_failed"
+		end
+	end
+	return "pending"
 end
 
 function Client:shutdown(reason)
@@ -7251,6 +7459,9 @@ function Client:shutdown(reason)
 		self.experiments:teardown()
 	end
 	self.initialized = false
+	-- A bounded flush still waiting ends with the client: its events were
+	-- delivered, refused, or left to the spool by the final flush above.
+	self:settle_flush_drains("shutdown")
 	return true
 end
 

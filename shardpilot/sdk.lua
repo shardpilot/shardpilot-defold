@@ -75,7 +75,7 @@ local instance_methods = {
 	update = 1,
 	observe_ping_ms = 1,
 	observe_disconnect = 1,
-	flush = 0,
+	flush = { 2, "bounded_flush" },
 	on_window_event = 1,
 	persist = 0,
 	shutdown = 1,
@@ -379,8 +379,17 @@ function M.observe_disconnect(reason)
 	return with_default("observe_disconnect", reason)
 end
 
-function M.flush()
-	return with_default("flush")
+-- Deliver what is queued now, within timeout_seconds (default 10). The
+-- callback runs once, on the main loop, with (true) or (false, code); see
+-- docs/configuration.md. Without an initialized client it is told at once.
+function M.flush(timeout_seconds, callback)
+	if not default() then
+		if type(callback) == "function" then
+			pcall(callback, false, "not_initialized")
+		end
+		return false, "not_initialized"
+	end
+	return with_default("bounded_flush", timeout_seconds, callback)
 end
 
 -- Forward every window event the host's listener receives (the engine allows
