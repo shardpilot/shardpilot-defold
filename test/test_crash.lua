@@ -6095,6 +6095,70 @@ end)()
   c:resend_pending();assert_equal(#requests,2);assert_equal(c:snapshot().resend_deferred_until_ms,clock.unix_ms()+30000)
   local _,deadline=storage.load_pending_entries(c:pending_scope());assert_equal(deadline,clock.unix_ms()+30000)
  end)
+
+ for _,source in ipairs({"local","server","failed_store"})do
+  for _,entry in ipairs({"resend","nonfatal"})do
+   scene("rollback "..source.." "..entry,function()
+    if source~="local" then install_fake_sys_storage()end
+    if source=="failed_store" then sys.save=function()return false end end
+    next_status=404;next_response_body=disabled
+    if source~="local" then next_response_headers={["retry-after"]="7"}end
+    local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event())
+    assert_equal(#requests,1);assert_equal(#pending(c),1)
+    socket.now=socket.now-(source=="local" and 120 or 2*86400)
+    next_status=202
+    if entry=="resend" then c:resend_pending()else c:emit(presymbolicated_event())end
+    assert_equal(#requests,2,"implausible deadline does not strand a valid report")
+   end)
+  end
+ end
+ scene("short local rollback retains plausible server floor",function()
+  install_fake_sys_storage();sys.save=function()return false end
+  next_status=404;next_response_body=disabled;next_response_headers={["retry-after"]="7"}
+  local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event())
+  socket.now=socket.now-120;c:resend_pending();assert_equal(#requests,1)
+  assert_equal(c:snapshot().resend_deferred_until_ms,clock.unix_ms()+127000)
+ end)
+ for _,source in ipairs({"local","server"})do
+  scene("rollback within "..source.." bound still waits",function()
+   next_status=404;next_response_body=disabled
+   if source=="server" then next_response_headers={["retry-after"]="7"}end
+   local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event())
+   socket.now=socket.now-(source=="local" and 59 or 86393)
+   c:resend_pending();assert_equal(#requests,1)
+   local wait=source=="local" and 60 or 86400
+   assert_equal(c:snapshot().resend_deferred_until_ms,clock.unix_ms()+wait*1000)
+   socket.now=socket.now+wait;next_status=202;c:resend_pending();assert_equal(#requests,2)
+  end)
+ end
+ scene("relaunch rejects implausible stored floor",function()
+  install_fake_sys_storage();next_status=404;next_response_body=disabled;next_response_headers={["retry-after"]="7"}
+  local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event())
+  local body=requests[1].body;storage.reset();socket.now=socket.now-2*86400
+  local relaunched=assert(crash.new(config({crash_sample_every=1})))
+  local _,deadline=storage.load_pending_entries(relaunched:pending_scope());assert_equal(deadline,nil)
+  next_status=202;relaunched:resend_pending();assert_equal(#requests,2);assert_equal(requests[2].body,body)
+ end)
+ scene("only server floor persists beside longer local backoff",function()
+  install_fake_sys_storage();next_status=404;next_response_body=disabled
+  local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event())
+  socket.now=socket.now+1;c:resend_pending();socket.now=socket.now+2
+  next_response_headers={["retry-after"]="1"};c:resend_pending()
+  local _,deadline=storage.load_pending_entries(c:pending_scope())
+  assert_equal(deadline,clock.unix_ms()+1000);assert_equal(c:snapshot().resend_deferred_until_ms,clock.unix_ms()+4000)
+ end)
+ for _,older in ipairs({false,true})do
+  scene("acceptance clears server floor older="..tostring(older),function()
+   local callbacks={};http.request=function(url,method,callback,headers,body)requests[#requests+1]={body=body};callbacks[#callbacks+1]=callback end
+   local c=assert(crash.new(config({crash_sample_every=1})))
+   if older then c:emit_fatal(presymbolicated_event())end
+   c:emit_fatal(presymbolicated_event());callbacks[#callbacks](nil,nil,{status=404,response=disabled,headers={["retry-after"]="30"}})
+   if older then callbacks[1](nil,nil,{status=202,response="{}"})else
+    c:emit_fatal(presymbolicated_event());callbacks[#callbacks](nil,nil,{status=202,response="{}"})
+   end
+   local before=#requests;c:resend_pending();assert_equal(#requests,before+(older and 0 or 1))
+  end)
+ end
  print("crash-retry total: "..passed.." pass, "..failed.." fail")
  assert_equal(failed,0,"crash retry scenes")
 end)()

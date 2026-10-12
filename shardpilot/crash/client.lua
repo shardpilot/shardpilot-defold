@@ -11,6 +11,7 @@ local dump = require "shardpilot.crash.dump"
 local storage = require "shardpilot.storage"
 local platform = require "shardpilot.platform"
 local clock = require "shardpilot.clock"
+local crash_deadline = require "shardpilot.crash.deadline"
 local random = require "shardpilot.random"
 
 local M = {}
@@ -365,6 +366,7 @@ function M.new(config)
 		backpressure_epoch = 0,
 		retry_attempt = 0,
 		retry_deadline_ms = nil,
+		retry_after_deadline_ms = nil,
 		-- True while a serial resend pass over the pending sidecar is running
 		-- (one pass at a time; each pass sends strictly one report at a time).
 		resend_active = false,
@@ -701,9 +703,11 @@ end
 -- when the sidecar cannot be written. Concurrent failures never shorten it.
 function Client:retry_deadline(stored)
 	local now = clock.unix_ms()
-	local deadline = math.max(stored or 0, self.retry_deadline_ms or 0)
+	self.retry_deadline_ms = crash_deadline.normalize(self.retry_deadline_ms, now, crash_deadline.local_limit_ms)
+	self.retry_after_deadline_ms = crash_deadline.normalize(self.retry_after_deadline_ms, now, crash_deadline.server_limit_ms)
+	stored = crash_deadline.normalize(stored, now, crash_deadline.server_limit_ms)
+	local deadline = math.max(stored or 0, self.retry_deadline_ms or 0, self.retry_after_deadline_ms or 0)
 	if deadline > now then return deadline end
-	self.retry_deadline_ms = nil
 	return nil
 end
 
@@ -711,16 +715,19 @@ function Client:pace_retry(retry_after)
 	self.retry_attempt = math.min(self.retry_attempt + 1, 7)
 	local ceiling = math.min(60, 2 ^ (self.retry_attempt - 1))
 	local delay = 1 + random.unit() * (ceiling - 1)
+	local _, stored = storage.load_pending_entries(self:pending_scope())
+	self:retry_deadline(stored)
+	local now = clock.unix_ms()
+	self.retry_deadline_ms = math.max(self.retry_deadline_ms or 0, now + math.ceil(delay * 1000))
 	if type(retry_after) == "number" then
 		self.stats.last_retry_after = retry_after
-		delay = math.max(delay, math.min(86400, retry_after))
+		if retry_after > 0 then
+			self.retry_after_deadline_ms = math.max(self.retry_after_deadline_ms or 0, stored or 0,
+				now + math.min(crash_deadline.server_limit_ms, retry_after * 1000))
+			storage.set_pending_crash_retry_after(self:pending_scope(), (self.retry_after_deadline_ms - now) / 1000)
+		end
 	end
-	local _, stored = storage.load_pending_entries(self:pending_scope())
-	self.retry_deadline_ms = math.max(self:retry_deadline(stored) or 0, clock.unix_ms()+math.ceil(delay*1000))
-	self.stats.resend_deferred_until_ms = self.retry_deadline_ms
-	if type(retry_after) == "number" and retry_after > 0 then
-		storage.set_pending_crash_retry_after(self:pending_scope(), (self.retry_deadline_ms-clock.unix_ms())/1000)
-	end
+	self.stats.resend_deferred_until_ms = self:retry_deadline(stored)
 	self.backpressure_hit = true
 	self.backpressure_epoch = self.backpressure_epoch + 1
 end
@@ -1184,6 +1191,7 @@ function Client:dispatch_pending(entry, on_settled)
 			end
 			if not window_stands then
 				self.retry_deadline_ms = nil
+				self.retry_after_deadline_ms = nil
 				self.retry_attempt = 0
 				self.stats.resend_deferred_until_ms = nil
 				self.backpressure_hit = false

@@ -332,8 +332,12 @@ the body.
   are supported. Retry-After is a floor, capped at 24 hours. Without a hint,
   host-driven retries wait for jittered exponential backoff: at least one
   second, with a ceiling doubling from one to 60 seconds. This local deadline
-  also gates memory-only recovery if storage fails; it is not persisted unless
-  a server floor was supplied. No timer or background loop is created.
+  also gates memory-only recovery if storage fails; only the server floor is
+  persisted. Both memory and disk use the same deadline plausibility rule:
+  expired deadlines or deadlines beyond their source's bound after clock
+  rollback are discarded (60 seconds local, 24 hours server). A plausible
+  server floor remains effective even if the local deadline is discarded.
+  No timer or background loop is created.
   A current accepted send clears pacing; an older acceptance cannot erase a
   newer failure's window. Non-fatal live reports join the paced backlog; fatal
   live sends retain their existing immediate-attempt behavior. Opt-out, purge
