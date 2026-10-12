@@ -412,11 +412,13 @@ end
 -- (true) or (false, code). See docs/configuration.md. The default client is
 -- released when it is torn down, so a later init() starts a new one.
 function M.shutdown(timeout_seconds, callback)
-	-- A shutdown ends the current boot delivery attempt.
-	if active_init_drain then active_init_drain.cancelled = true end
+	-- Refused before the wrapper below, which would make any callback valid.
+	if callback ~= nil and type(callback) ~= "function" then
+		return false, "invalid_callback"
+	end
 	local client = default()
 	if not client then
-		if type(callback) == "function" then
+		if callback then
 			pcall(callback, false, "not_initialized")
 		end
 		return false, "not_initialized"
@@ -430,10 +432,15 @@ function M.shutdown(timeout_seconds, callback)
 	end
 	local ok, err = client:bounded_shutdown(timeout_seconds, function(done, code)
 		release()
-		if type(callback) == "function" then
+		if callback then
 			callback(done, code)
 		end
 	end)
+	-- A shutdown the client takes ends the current boot delivery attempt; a
+	-- refused one changes nothing.
+	if active_init_drain and err ~= "invalid_timeout_seconds" then
+		active_init_drain.cancelled = true
+	end
 	release()
 	return ok, err
 end

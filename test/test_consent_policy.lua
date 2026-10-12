@@ -1024,9 +1024,14 @@ local function run_example(between, window_events, dts, finalize, opts)
 		end
 	end
 	local saved = {}
-	for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform" }) do
+	for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform", "shardpilot.consent_policy" }) do
 		saved[name] = package.loaded[name]
 	end
+	if opts and opts.policy then
+		package.loaded["shardpilot.consent_policy"] = opts.policy
+	end
+	-- The real shutdown answers on a later update(), so this one does too.
+	local closing = nil
 	package.loaded["shardpilot.sdk"] = {
 		init = function()
 			seen[#seen + 1] = "sdk.init"
@@ -1061,14 +1066,22 @@ local function run_example(between, window_events, dts, finalize, opts)
 		remote_config_number = function(_, default)
 			return default
 		end,
-		update = function() end,
+		update = function()
+			if closing then
+				local answer = closing
+				closing = nil
+				seen[#seen + 1] = "sdk.closed"
+				answer(true)
+			end
+		end,
 		persist = function() end,
 		on_window_event = function(event)
 			seen[#seen + 1] = "sdk.on_window_event:" .. tostring(event)
 			return true
 		end,
-		shutdown = function(reason)
-			seen[#seen + 1] = "sdk.shutdown:" .. tostring(reason)
+		shutdown = function(_, callback)
+			seen[#seen + 1] = "sdk.shutdown"
+			closing = callback
 			return true
 		end,
 	}
@@ -1197,7 +1210,7 @@ local function run_example(between, window_events, dts, finalize, opts)
 	window = saved_window
 
 	print = saved_print
-	for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform" }) do
+	for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform", "shardpilot.consent_policy" }) do
 		package.loaded[name] = saved[name]
 	end
 	assert_true(ok, "the example must run: " .. tostring(err))
@@ -1240,6 +1253,73 @@ local function test_example_stays_closed_without_authenticated_restrictions()
 		assert_equal(#requests, 2, "launch and resume re-resolve; frames do not spin")
 
 	end
+end
+
+-- A lane closed because its plan expired opens again once the close answers,
+-- when the replacement decision permits it. The close answers on a later frame,
+-- so the decision that arrives meanwhile meets a lane that is still closing.
+local function test_example_reopens_a_lane_after_its_close_ends()
+	reset()
+	local decision = {
+		regime = consent_policy.STRICT_OPT_IN, plan_used = true, consent_text_version = "v1",
+		presented_language = "en", policy_version = "p1", explicit_grant_required = true,
+		analytics_choice_default = consent_policy.CHOICE_DEFAULT_OFF,
+		crash_profile = "off", valid_for_seconds = 5, operation_blocks = {},
+	}
+	local resolved = 0
+	local policy = setmetatable({
+		prepare = function(_, callback)
+			resolved = resolved + 1
+			callback(decision)
+		end,
+		invalidate = function() end,
+	}, { __index = consent_policy })
+	local calls = run_example(nil, nil, { 6, 1 }, false, { age_band = "adult", answer = true, policy = policy })
+	local closed_at = calls:find("sdk.closed", 1, true)
+	assert_true(closed_at ~= nil, "the expired plan closed the lane: " .. calls)
+	assert_equal(select(2, calls:gsub("sdk%.init", "")), 2, "the lane opens again: " .. calls)
+	assert_true(calls:find("sdk.init", closed_at, true) ~= nil, "and only after its close ended")
+	assert_equal(resolved, 4, "launch, answer, expiry, and the one pass the close deferred")
+end
+
+-- A notice text that changes while the lane is open closes it and asks again.
+-- The question waits for the close, and the crash lane stays shut until the
+-- new answer: the pass that meets the closing lane ends there.
+local function test_example_asks_again_only_after_a_closing_lane_ends()
+	reset()
+	local function decision(text)
+		return {
+			regime = consent_policy.STRICT_OPT_IN, plan_used = true, consent_text_version = text,
+			presented_language = "en", policy_version = "p1", explicit_grant_required = true,
+			analytics_choice_default = consent_policy.CHOICE_DEFAULT_OFF,
+			crash_profile = consent_policy.CRASH_MINIMAL, valid_for_seconds = 50, operation_blocks = {},
+		}
+	end
+	local resolved = 0
+	local policy = setmetatable({
+		prepare = function(_, callback)
+			resolved = resolved + 1
+			callback(decision(resolved <= 2 and "v1" or "v2"))
+		end,
+		invalidate = function() end,
+	}, { __index = consent_policy })
+	local calls = run_example(nil, { "focus_gained" }, { 0 }, false,
+		{ age_band = "adult", answer = true, policy = policy })
+	local function positions(needle)
+		local found, from = {}, 1
+		while true do
+			local at = calls:find(needle, from, true)
+			if not at then return found end
+			found[#found + 1] = at
+			from = at + 1
+		end
+	end
+	local notices, crash_starts, closed = positions("notice:default="), positions("crash.init"), positions("sdk.closed")
+	assert_equal(#notices, 2, "the changed text is asked again: " .. calls)
+	assert_equal(#closed, 1, "the open lane closed first")
+	assert_true(notices[2] > closed[1], "the question waits for the close")
+	assert_equal(#crash_starts, 2, "the crash lane reopens after the answer")
+	assert_true(crash_starts[2] > notices[2], "and not before it: " .. calls)
 end
 
 -- Both responses are unused, but an older dispatch must retain its superseded
@@ -2888,6 +2968,8 @@ local tests = {
 	test_a_signal_must_state_its_availability_as_a_boolean,
 	test_fallback_decisions_are_independent,
 	test_example_stays_closed_without_authenticated_restrictions,
+	test_example_reopens_a_lane_after_its_close_ends,
+	test_example_asks_again_only_after_a_closing_lane_ends,
 	test_an_older_response_cannot_overwrite_a_newer_one,
 	test_an_encoder_failure_still_answers,
 	test_unsigned_soft_cannot_authorize_an_offline_call,

@@ -223,6 +223,11 @@ local crash = require "shardpilot.crash"
 -- what is still owed a shutdown.
 local analytics_running = false
 local crash_running = false
+-- A shutdown() still closing the analytics client: it answers on a later
+-- frame, and the flag above stays set until then. A reconcile pass that meets
+-- it owes one more pass once the close has ended.
+local analytics_closing = false
+local reconcile_owed = false
 
 -- The player's standing answer, and the notice text it was given against. It
 -- SURVIVES a suspension — a plan expiring is not a reason to ask again — and
@@ -460,6 +465,12 @@ reconcile = function(fresh)
 			notice_open = false
 			notice_generation = notice_generation + 1
 		end
+	elseif analytics_closing then
+		-- ⚠ A LANE STILL CLOSING CANNOT OPEN OR ASK YET: init() is refused
+		-- until the close answers. This decision is not kept for later; the
+		-- policy is resolved again, fresh, once the close has ended (update()).
+		reconcile_owed = true
+		return
 	elseif not analytics_running then
 		if answered then
 			if start_analytics(answered.granted, fresh, answered.fresh_answer == true, answered.notice) then

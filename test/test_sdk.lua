@@ -14473,6 +14473,25 @@ end)()
 			end)
 		end)
 	end
+	scene("a refused shutdown keeps the client and its boot delivery", function()
+		with_boot("both", function(facade, outer, clients)
+			local seen, refusals = {}, {}
+			outer.diagnostics = function(issue)
+				seen[#seen + 1] = issue.code
+				if #seen == 1 then
+					refusals[1] = { facade.shutdown(1, {}) }
+					refusals[2] = { facade.shutdown(0) }
+				end
+			end
+			assert_true(facade.init(outer))
+			facade.update(0)
+			assert_equal(refusals[1][1], false); assert_equal(refusals[1][2], "invalid_callback")
+			assert_equal(refusals[2][1], false); assert_equal(refusals[2][2], "invalid_timeout_seconds")
+			assert_equal(#seen, 2, "the boot delivery goes on after a refused shutdown")
+			assert_equal(clients["boot-outer"].initialized, true, "nothing was torn down")
+			assert_equal(facade.get_anonymous_id(), "boot-outer-actor", "the module keeps its client")
+		end)
+	end)
 	local failed = 0
 	for _, entry in ipairs(scenes) do
 		local ok, err = pcall(entry.body)
