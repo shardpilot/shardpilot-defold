@@ -315,7 +315,57 @@ class SenderTest(unittest.TestCase):
                     self.assertEqual(event["user_id"], "sender-user")
                     self.assertEqual(event["anonymous_id"], "sender-anonymous")
 
-    def test_actual_sdk_and_all_ten_exchanges(self):
+    def test_local_receipt_refuses_missing_or_contradictory_measurements(self):
+        sender = send.Sender({name: "synthetic-" + name for name in send.FIELDS})
+        good = {"track_ok": False, "track_error": "event_too_large",
+                "before": {"enqueued": 9, "published": 8, "dropped": 0},
+                "after": {"enqueued": 9, "published": 8, "dropped": 1,
+                          "last_error": "event_too_large"}}
+        self.assertFalse(sender.local_size_holds())
+        sender.local_sizes = [good, good]
+        self.assertFalse(sender.local_size_holds())
+        sender.local_sizes = [good]
+        self.assertTrue(sender.local_size_holds())
+        for path, value in [("track_ok", True), ("track_error", "queue_full"),
+                            ("before.enqueued", 8), ("after.enqueued", 10),
+                            ("after.published", 9), ("after.dropped", 0),
+                            ("after.last_error", None)]:
+            with self.subTest(path=path):
+                changed = json.loads(json.dumps(good))
+                obj = changed
+                keys = path.split(".")
+                for key in keys[:-1]:
+                    obj = obj[key]
+                obj[keys[-1]] = value
+                sender.local_sizes = [changed]
+                self.assertFalse(sender.local_size_holds())
+
+    def test_local_refusal_and_separate_raw_wire_server_probe(self):
+        result, requests = self.run_sender()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+        local = [r for r in lines if r.get("case") == "local-size-refusal"]
+        self.assertEqual(len(local), 1)
+        local = local[0]
+        self.assertIs(local["track_ok"], False)
+        self.assertEqual(local["track_error"], "event_too_large")
+        self.assertEqual(local["after"]["enqueued"], local["before"]["enqueued"])
+        self.assertEqual(local["after"]["dropped"], local["before"]["dropped"] + 1)
+        self.assertEqual(local["after"]["last_error"], "event_too_large")
+        self.assertEqual(local["before"]["enqueued"] - local["before"]["published"], 1)
+        self.assertNotIn("L" * 2500, json.dumps(requests))
+        mixed = next(r for r in lines if r.get("case") == "mixed-size")
+        self.assertEqual(mixed["producer"], "raw-wire-server-size")
+        self.assertEqual(len(mixed["sdk_event_bytes"]), 2)
+        self.assertTrue(all(n <= 2048 for n in mixed["sdk_event_bytes"]))
+        self.assertLessEqual(mixed["event_bytes"][0], 2048)
+        self.assertGreater(mixed["event_bytes"][1], 2048)
+        self.assertEqual(mixed["event_result"]["events"][0]["status"], "accepted")
+        self.assertEqual(mixed["event_result"]["events"][1]["code"], "event_too_large")
+        self.assertTrue(lines[-1]["local_size_ok"])
+        self.assertTrue(lines[-1]["caller_view_ok"])
+
+    def test_actual_sdk_and_all_thirteen_exchanges(self):
         result, requests = self.run_sender()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(requests), 13)
@@ -333,6 +383,7 @@ class SenderTest(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout.splitlines()[-1]),
                          {"case": "summary", "requests": 13, "contract_match": True,
                           "cases": sorted(send.CASES), "one_attempt_per_case": True,
+                          "local_size_ok": True,
                           "caller_view_ok": True, "probe_terminal": True, "sessions_ok": True,
                           "sessions": 4, "plan_ok": True, "probe_settlement": "retained",
                           "rejected_events": 1, "exit_code": 0})
@@ -523,7 +574,8 @@ class SenderTest(unittest.TestCase):
                                and r.get("latency_ms") is not None)
                 self.assertEqual(attempt["status"], status)
                 self.assertEqual((probe["status"], probe["settlement"]), (status, settlement))
-                self.assertEqual(probe["snapshot"]["dropped"], dropped)
+                self.assertEqual(probe["before"]["dropped"], 1)
+                self.assertEqual(probe["snapshot"]["dropped"], 1 + dropped)
                 self.assertFalse(probe["flush_ok"])
                 self.assertEqual(probe["snapshot"]["failed_batches"], 1)
                 self.assertEqual(probe["snapshot"]["spooled"], 0)
@@ -707,7 +759,7 @@ class SenderTest(unittest.TestCase):
         counters = {"dropped": dropped, "failed_batches": 1, "spooled": 0}
         counters.update(snapshot)
         sender.probe = {"flush_ok": False, "flush_error": None, "status": status,
-                        "settlement": settlement, "snapshot": counters}
+                        "settlement": settlement, "before": {"dropped": 0}, "snapshot": counters}
         return sender
 
     def test_probe_check_fails_when_delivery_is_claimed_or_the_id_returns(self):

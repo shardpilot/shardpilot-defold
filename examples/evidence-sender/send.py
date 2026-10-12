@@ -228,6 +228,7 @@ class Sender:
         self.oversize_event_id = ""
         # What the SDK reported about the refused admission probe.
         self.probe = None
+        self.local_sizes = []
         self.sessions = []
         self.lua = LuaRuntime(unpack_returned_tuples=True)
         self.opener = request.build_opener(request.ProxyHandler({}), RefuseRedirect())
@@ -244,7 +245,7 @@ class Sender:
         self.issues.append(issue)
         self.log({"case": "sdk-issue", "issue": issue})
 
-    def record_probe(self, published, error, snapshot):
+    def record_probe(self, published, error, before, snapshot):
         # The settlement STATEMENT is derived from the status the door actually
         # returned, because the SDK settles the two refusals differently. An
         # unconditional sentence would misdescribe one of them.
@@ -253,23 +254,45 @@ class Sender:
         settlement, reason = PROBE_SETTLEMENT.get(status, ("unknown",
             "the door answered neither 401 nor 403, so this case took no admission measurement"))
         self.probe = {"flush_ok": published is True, "flush_error": error, "status": status,
-                      "settlement": settlement,
+                      "settlement": settlement, "before": before,
                       "snapshot": snapshot if isinstance(snapshot, dict) else {}}
         self.log({"case": "probe-settlement", "status": status, "settlement": settlement,
                   "flush_ok": self.probe["flush_ok"], "flush_error": self.probe["flush_error"],
-                  "snapshot": self.probe["snapshot"], "sdk_classification": reason})
+                  "before": before, "snapshot": self.probe["snapshot"], "sdk_classification": reason})
 
     def record_rejections(self, rows):
         self.rejections = rows if isinstance(rows, list) else []
         self.log({"case": "caller-view", "sdk_rejections": self.rejections,
                   "source": "client:get_rejections()"})
 
-    def exchange(self, url, method, headers, body):
+    def record_local_size(self, ok, error, before, after):
+        record = {"case": "local-size-refusal", "track_ok": ok, "track_error": error,
+                  "before": before, "after": after}
+        self.local_sizes.append(record)
+        self.log(record)
+
+    def local_size_holds(self):
+        if len(self.local_sizes) != 1:
+            return False
+        record = self.local_sizes[0]
+        before, after = record["before"], record["after"]
+        dropped, enqueued, published = (before.get(k) for k in ("dropped", "enqueued", "published"))
+        return (record["track_ok"] is False and record["track_error"] == "event_too_large"
+                and type(enqueued) is int and type(published) is int
+                and enqueued - published == 1
+                and after.get("enqueued") == enqueued and after.get("published") == published
+                and type(dropped) is int and dropped >= 0
+                and after.get("dropped") == dropped + 1
+                and after.get("last_error") == "event_too_large")
+
+    def exchange(self, url, method, headers, body, sdk_event_bytes=None):
         sent = json.loads(body)
         if self.case == "mixed-size":
             sizes = [len(encode(e).encode()) for e in sent["events"]]
-            if len(sizes) != 2 or not (sizes[0] <= 2048 < sizes[1]):
-                raise ValueError("mixed-size did not contain one small and one oversize SDK event")
+            if (len(sizes) != 2 or not (sizes[0] <= 2048 < sizes[1])
+                    or sdk_event_bytes is None or len(sdk_event_bytes) != 2
+                    or not all(0 < n <= 2048 for n in sdk_event_bytes)):
+                raise ValueError("mixed-size requires two small SDK events and a separately expanded raw-wire probe")
             self.oversize_event_id = sent["events"][1]["event_id"]
         else:
             sizes = [len(encode(e).encode()) for e in sent.get("events", [])]
@@ -316,13 +339,24 @@ class Sender:
                   "authorization_present": any(k.lower() == "authorization" for k in headers),
                   "latency_ms": round((time.perf_counter() - started) * 1000, 3),
                   "event_result": event_result, "contract_match": passed}
+        if self.case == "mixed-size":
+            record.update(producer="raw-wire-server-size", sdk_event_bytes=sdk_event_bytes)
         self.log(record)
         self.records.append(record)
         self.raw.setdefault(self.case, (url, method, headers, body))
         return {"status": status, "response": received, "headers": response_headers}
 
     def http(self, url, method, callback, headers, body, options):
-        response = self.exchange(url, method, from_lua(headers), body)
+        sdk_event_bytes = None
+        if self.case == "mixed-size":
+            sent = json.loads(body)
+            events = sent.get("events", [])
+            if len(events) != 2 or events[1].get("props") != {"sample_padding": "raw-wire-probe"}:
+                raise ValueError("missing explicit raw-wire size probe")
+            sdk_event_bytes = [len(encode(event).encode()) for event in events]
+            events[1]["props"]["sample_padding"] = "x" * 2500
+            body = encode(sent)
+        response = self.exchange(url, method, from_lua(headers), body, sdk_event_bytes)
         callback(None, None, self.lua.table_from(response, recursive=True))
 
     def caller_view_holds(self):
@@ -407,7 +441,10 @@ class Sender:
         # 401: the batch is kept, so nothing is dropped. 403: it is dropped
         # exactly once, and nothing stays pending.
         snapshot = self.probe["snapshot"]
-        if snapshot.get("dropped") != (0 if status == 401 else 1):
+        before = self.probe.get("before", {})
+        dropped = before.get("dropped")
+        if (type(dropped) is not int or dropped < 0
+                or snapshot.get("dropped") != dropped + (0 if status == 401 else 1)):
             return False
         # One failed batch, and NOTHING durable: a spooled envelope would
         # outlive the process and make the refusal an obligation for the next
@@ -476,8 +513,10 @@ class Sender:
         g.bridge_stage = lambda value: setattr(self, "case", value)
         g.bridge_issue = lambda value: self.record_issue(from_lua(value))
         g.bridge_rejections = lambda value: self.record_rejections(from_lua(value))
-        g.bridge_probe = lambda published, error, snapshot: self.record_probe(
-            published, from_lua(error), from_lua(snapshot))
+        g.bridge_probe = lambda published, error, before, snapshot: self.record_probe(
+            published, from_lua(error), from_lua(before), from_lua(snapshot))
+        g.bridge_local_size = lambda ok, error, before, after: self.record_local_size(
+            ok, from_lua(error), from_lua(before), from_lua(after))
         g.package.path = str(ROOT / "?.lua") + ";" + str(ROOT / "?" / "init.lua")
         self.lua.execute("""
             json = { encode = function(v) return bridge_encode(v) end,
@@ -487,7 +526,8 @@ class Sender:
             stage = function(v) bridge_stage(v) end
             report_issue = function(v) bridge_issue(v) end
             report_rejections = function(v) bridge_rejections(v) end
-            report_probe = function(ok, err, snap) bridge_probe(ok, err, snap) end
+            report_probe = function(ok, err, before, snap) bridge_probe(ok, err, before, snap) end
+            report_local_size = function(ok, err, before, after) bridge_local_size(ok, err, before, after) end
         """)
         self.log({"case": "runtime", "python": platform.python_version(), "lupa": lupa.__version__,
                   "lua": self.lua.lua_implementation, "sdk": str(ROOT / "shardpilot"),
@@ -504,12 +544,13 @@ class Sender:
         for record in self.records:
             by_case.setdefault(record["case"], []).append(record)
         one_attempt = all(len(attempts) == 1 for attempts in by_case.values())
+        local_size = self.local_size_holds()
         caller_view = self.caller_view_holds()
         probe_terminal = self.probe_is_terminal()
         sessions_ok = self.session_lifecycle_holds()
         plan_ok = self.planned_shape_holds()
         passed = (set(by_case) == set(CASES) and one_attempt and caller_view and probe_terminal
-                  and sessions_ok and plan_ok
+                  and local_size and sessions_ok and plan_ok
                   and all(record["contract_match"] for record in self.records))
         # The deliberate oversize rejection is a PASSING rejection: it is the
         # measurement the mixed-size case exists to take. A rejection in any
@@ -517,6 +558,7 @@ class Sender:
         exit_code = 0 if passed else 1
         self.log({"case": "summary", "requests": len(self.records), "contract_match": passed,
                   "cases": sorted(by_case), "one_attempt_per_case": one_attempt,
+                  "local_size_ok": local_size,
                   "caller_view_ok": caller_view, "probe_terminal": probe_terminal,
                   "sessions_ok": sessions_ok, "sessions": len(self.sessions),
                   "plan_ok": plan_ok, "probe_settlement": self.probe["settlement"] if self.probe else "none",

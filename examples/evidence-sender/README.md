@@ -90,7 +90,9 @@ The run is **thirteen exchanges, one HTTP attempt each**, named with the Go
 protocol witness's case names so one aggregate checker reads either sender's
 log. Three of them carry only session lifecycle events: a counted case must
 carry exactly the events a reader expects verdicts for, so the housekeeping
-cannot ride with them.
+cannot ride with them. Before the `mixed-size` HTTP exchange, a separate
+`local-size-refusal` record measures an oversized `track` returning
+`false, "event_too_large"`. This local refusal makes no HTTP request.
 
 | Case | What the SDK does | Go witness case |
 | --- | --- | --- |
@@ -100,7 +102,8 @@ cannot ride with them.
 | `session-close` | `session_end` — ended, not replaced | none |
 | `realistic-batch` | two `session_start`/`session_end` pairs in ONE batch: four events, two sessions, each carrying sequence 1 for its start and 2 for its end, with an entry point and an end reason (finished, then backgrounded) | `realistic-batch` |
 | `session-resume` | `session_start` — realistic-batch left its second session ended | none |
-| `mixed-size` | one small `track` beside one with 2,500 padding characters, in ONE batch | `mixed-size` |
+| `local-size-refusal` | one valid neighbour queued, then a 2,500-character payload refused before admission; return code and before/after counters recorded, no HTTP exchange | none |
+| `mixed-size` | two small SDK events in ONE batch; the host expands the second event's raw wire props to 2,500 padding characters after SDK serialization, labelled `producer: raw-wire-server-size` | `mixed-size` |
 | `lua-nonfatal` | `emit` | none (Go has no nonfatal form) |
 | `lua-fatal` | `emit_fatal`, pre-symbolicated Lua frame | `go-panic` |
 | `native-json` | `emit_fatal`, synthetic SIGSEGV address plus module/debug identity | `native-json` |
@@ -182,8 +185,20 @@ acknowledgement without one leaves the report ungrouped, so a blank or absent
 fingerprint fails the case. None of this proves symbolication, and a successful
 ingest reply alone does not prove downstream storage.
 
-The mixed outcome is also measured **as the calling game sees it**, which is the
-row a transport-only witness cannot close. The sender installs the SDK's
+The local size measurement requires `false, "event_too_large"`, unchanged
+`enqueued`/`published` counters, one new `dropped` event, and the matching
+`last_error`. Its valid queued neighbour must still receive an accepted reply.
+The rejected local payload is never sent. The summary requires `local_size_ok`.
+
+The separate server-size test admits two small SDK events, then expands only
+the explicitly marked second event at the host's HTTP seam. The log records
+both `sdk_event_bytes` (before expansion, each at most 2,048) and `event_bytes`
+(actually transmitted), with `producer: raw-wire-server-size`. This tests a raw
+server rejection, not a claim that the guarded SDK admits oversized events.
+The host passes the real reply back through the SDK callback unchanged.
+
+That server outcome is also measured **as the calling game sees it**, which is
+the row a transport-only witness cannot close. The sender installs the SDK's
 documented `diagnostics` hook and reads `client:get_rejections()` after the
 flush, so the rejected event ID and its `event_too_large` reason are recorded
 from the SDK's own surfaces rather than inferred from the HTTP body the host
@@ -209,8 +224,10 @@ the client as unauthorized *and* retryable, and with a `token_provider`
 configured the SDK **retains** that batch for a re-minted retry; a `403` falls
 through as a terminal `http_403` — neither unauthorized nor retryable — so the
 batch is **dropped** and nothing is owed. Measured on the loopback fixture:
-`dropped` stays `0` for the 401 and becomes `1` for the 403, and both leave one
-attempt and a failed batch. `probe_terminal` is true only when the SDK did not
+relative to the `before` snapshot taken just before this probe, `dropped`
+increases by `0` for the 401 and by `1` for the 403. The earlier local size refusal
+already contributes one drop, so the run totals are `1` and `2` respectively.
+Both leave one attempt and a failed batch. `probe_terminal` is true only when the SDK did not
 claim delivery, the recorded status is one of those two, the printed settlement
 matches that status, the SDK's own counters agree with it — `dropped` for the
 settlement, one failed batch and **nothing spooled**, since a durable remnant
@@ -246,7 +263,7 @@ self and pass; the receipt reports `plan_ok`.
 The deliberate oversize rejection is a **passing** rejection — it is the
 measurement the `mixed-size` case exists to take — so a complete demonstration
 exits **0** with `contract_match: true`, `rejected_events: 1`, `exit_code: 0`,
-`caller_view_ok: true`, `probe_terminal: true`, `sessions_ok: true`,
+`local_size_ok: true`, `caller_view_ok: true`, `probe_terminal: true`, `sessions_ok: true`,
 `sessions: 4`, `plan_ok: true` and the probe's settlement. A rejection in any other case fails that case's
 contract and exits **1**. Unexpected responses, a missing case, a second attempt
 at one, transport/SDK failures or incomplete caller-visible evidence also exit

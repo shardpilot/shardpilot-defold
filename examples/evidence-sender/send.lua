@@ -70,9 +70,17 @@ return function(c)
 	stage("session-resume")
 	assert(client:session_start({ entry_point = "synthetic_sender_resume" }))
 	assert(client:flush({ include_summaries = false }))
-	stage("mixed-size")
+	stage("local-size")
 	assert(client:track(c.event_name, {}))
-	assert(client:track(c.event_name, { sample_padding = string.rep("x", 2500) }))
+	local before_size = client:snapshot()
+	local tracked, size_err = client:track(c.event_name, { sample_padding = string.rep("L", 2500) })
+	report_local_size(tracked, size_err, before_size, client:snapshot())
+	assert(tracked == false and size_err == "event_too_large", "missing local size refusal")
+	-- The separate server-size probe admits a SMALL event. The Python host
+	-- expands only its raw wire props after SDK serialization; its response
+	-- still travels through the SDK callback, rejection queue and diagnostics.
+	stage("mixed-size")
+	assert(client:track(c.event_name, { sample_padding = "raw-wire-probe" }))
 	assert(client:flush({ include_summaries = false }))
 	-- What the caller can see, read through the public API rather than
 	-- inferred from the response the host already has.
@@ -120,7 +128,8 @@ return function(c)
 	-- allows one. A game process that exits without a shutdown leaves its
 	-- session open the same way.
 	stage("unauthenticated")
+	local before_probe = client:snapshot()
 	assert(client:track(c.event_name, { synthetic_admission_probe = true }))
 	local published, publish_err = client:flush({ include_summaries = false })
-	report_probe(published, publish_err, client:snapshot())
+	report_probe(published, publish_err, before_probe, client:snapshot())
 end
