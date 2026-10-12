@@ -107,6 +107,7 @@ local clock = require "shardpilot.clock"
 local id = require "shardpilot.id"
 local random = require "shardpilot.random"
 local storage = require "shardpilot.storage"
+local enums = require "shardpilot.experiment_enums"
 
 local facts = require "shardpilot.experiment_facts"
 local experiment_http = require "shardpilot.experiment_http"
@@ -701,6 +702,16 @@ local function body_field_is_null(body_text, field)
 	return body_text:find('"' .. field .. '"%s*:%s*null%s*[,}%]]') ~= nil
 end
 
+-- A future unit cannot authorize a treatment or a new exposure. Preserve
+-- other boundary members for introspection while exposing its known fallback.
+local function unknown_unit_result(decoded, boundary)
+	local normalized = copy_value(boundary, 0)
+	normalized.assignment_unit = "unknown"
+	return { ok = true, from_cache = false, assigned = false, reason = "unknown",
+		version = decoded.version, boundary = normalized },
+		{ authoritative = true, drop_entry = true }
+end
+
 -- `requested_attributes` is the normalized attribute set THIS request
 -- dispatched: every stale-cache serve inside is fenced on it matching the
 -- entry's stored set (see serve_entry_or_fail).
@@ -742,7 +753,7 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 			and type(decoded.assignment_key) == "string" and decoded.assignment_key ~= ""
 			and type(decoded.variant_key) == "string" and decoded.variant_key ~= ""
 			and valid_wire_version(decoded.version)
-			and type(assignment_unit) == "string" and assignment_unit ~= "" then
+			and type(assignment_unit) == "string" then
 			if assignment_unit == "client_id"
 				and not valid_subject_fact_key(decoded.subject_fact_key) then
 				-- A client_id-unit assignment WITHOUT a server-minted
@@ -775,6 +786,9 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 				or type(decoded.served_kill_gate) ~= "boolean"
 				or type(decoded.served_at) ~= "string" or decoded.served_at == "") then
 				return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
+			end
+			if not enums.known_unit(assignment_unit) then
+				return unknown_unit_result(decoded, boundary)
 			end
 			local new_entry = {
 				assignment_key = decoded.assignment_key,
@@ -815,29 +829,20 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 				return serve_entry_or_fail(entry, "malformed_response",
 					requested_attributes), { transient = true }
 			end
-			-- The four not-assigned shapes, distinguished only by `reason`,
-			-- form a CLOSED vocabulary: ABSENT (deterministic traffic-gate
-			-- miss), "targeting_unmatched", "kill_switch", "age_ineligible".
-			-- Each drops the cached assignment: the server just said this subject has no
-			-- variant NOW, and a kill in particular must stop applying at
-			-- the next safe point and emit no exposure. Anything else a
-			-- PRESENT reason field carries — an unknown string, or a
-			-- non-string value that must not be coerced into the "absent"
-			-- entry — is semantics this client cannot honor: MALFORMED
-			-- (serve-stale transient), never executed as a drop directive it
-			-- does not understand.
+			-- Unknown strings are an authoritative not-assigned verdict.
+			-- Types/nulls remain malformed; enum openness changes no shape rule.
 			local reason = decoded.reason
-			if (reason ~= nil and (type(reason) ~= "string"
-				or (reason ~= "kill_switch"
-					and reason ~= "targeting_unmatched"
-					and reason ~= "age_ineligible")))
+			if (reason ~= nil and type(reason) ~= "string")
 				or (reason == nil and body_field_is_null(body_scan, "reason")) then
-				-- A PRESENT-NULL reason is the presence/type split's blind
-				-- spot on null→nil decoders: present and outside the
-				-- closed vocabulary — malformed, never the traffic-gate
-				-- miss its nil disguise would read as.
 				return serve_entry_or_fail(entry, "malformed_response",
 					requested_attributes), { transient = true }
+			end
+			if type(assignment_unit) == "string" and not enums.known_unit(assignment_unit) then
+				return unknown_unit_result(decoded, boundary)
+			end
+			if reason ~= nil and reason ~= "kill_switch"
+				and reason ~= "targeting_unmatched" and reason ~= "age_ineligible" then
+				reason = "unknown"
 			end
 			local outcome = { authoritative = true, drop_entry = true }
 			if reason == "age_ineligible" then

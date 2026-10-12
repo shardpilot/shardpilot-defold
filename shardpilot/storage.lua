@@ -18,6 +18,7 @@ local analytics_retry = require "shardpilot.analytics_retry"
 local consent_notice = require "shardpilot.consent_notice"
 local random = require "shardpilot.random"
 local experiment_facts = require "shardpilot.experiment_facts"
+local experiment_enums = require "shardpilot.experiment_enums"
 
 local M = {}
 
@@ -2167,7 +2168,7 @@ local function sanitize_experiment_entries(entries)
 					and experiment_facts.integer(entry.served_revision_wire, 0)
 					and type(entry.served_kill_gate) == "boolean"
 					and type(entry.served_at) == "string" and entry.served_at ~= ""))
-			and type(entry.assignment_unit) == "string" and entry.assignment_unit ~= ""
+			and experiment_enums.known_unit(entry.assignment_unit)
 			and (entry.assignment_unit ~= "client_id"
 				or valid_subject_fact_key(entry.subject_fact_key))
 			and (entry.subject_key == nil or type(entry.subject_key) == "string")

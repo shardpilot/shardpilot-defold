@@ -306,7 +306,11 @@ The public calls, verified against `shardpilot/sdk.lua`:
   boundary?, reason?, error? }` — `boundary` being a copy of the server's
   boundary table, passed through on a `200` for host introspection (it
   carries e.g. `assignment_unit` and `production_rollout`; the SDK itself
-  acts only on `assignment_unit`). Never treat a synchronous `true` as a resolved
+  acts only on `assignment_unit`). Future reason strings become `unknown`
+  and install not assigned. A future assignment-unit string also becomes
+  `unknown` and installs not assigned, clearing the affected cache without
+  creating an exposure; other boundary members remain available. Malformed
+  types and scope mismatches are still validated. Never treat a synchronous `true` as a resolved
   assignment; branch on `result`. **One case produces no callback at all:** a
   request still in flight when `shutdown()` succeeds is cancelled and never
   calls back, by design — so do not park state that only a callback can

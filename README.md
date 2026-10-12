@@ -1262,10 +1262,12 @@ the id is never host-settable: there is no supported way to pin it yourself.
   a payload nested 16+ deep reaches your game silently truncated. Keep
   variant payloads shallow; they are meant to be configuration, not a
   document tree.
-- **Not assigned** — `ok = true, assigned = false` with a closed `reason`
-  vocabulary: absent (a deterministic traffic-gate miss),
+- **Not assigned** — `ok = true, assigned = false`. Known `reason` values are
+  absent (a deterministic traffic-gate miss),
   `"targeting_unmatched"`, `"kill_switch"` (an operator kill), or
-  `"age_ineligible"` (no eligible adult declaration). All four drop the cached assignment, and a kill additionally stops any *future*
+  `"age_ineligible"` (no eligible adult declaration). Future reason strings
+  become `"unknown"` and also install the not-assigned verdict. These outcomes
+  drop the cached assignment, and a kill additionally stops any *future*
   exposure for it. It does **not** retroactively suppress a treatment that
   already ran: an exposure still owed at kill time — the variant was applied
   but the fact had not left yet, e.g. the queue was full — is deliberately
@@ -1275,6 +1277,12 @@ the id is never host-settable: there is no supported way to pin it yourself.
   `"age_ineligible"` is the exception: it withdraws what the refused player
   still owes for that experiment, as described under
   [Declare the player's age band](#declare-the-players-age-band).
+- **Unknown assignment units** — a future `boundary.assignment_unit` string
+  becomes `"unknown"`; the result is not assigned with reason `"unknown"`.
+  It clears the affected cached treatment and creates no new exposure. Only
+  `client_id` and `synthetic_subject_key` can install or restore a treatment.
+  Other response members remain open; malformed types, nulls, required fields
+  and cross-scope answers retain their validation rules.
 - **`401`/`403` fail closed** — the fetch reports `unauthorized`, **nothing is
   served** for that outcome, the getters go `nil`, and revalidation stops
   until re-`init()` or a later authorized fetch. The durable record is kept —
@@ -1321,7 +1329,8 @@ A server response with `reason = "age_ineligible"` returns `ok = true`,
 `assigned = false`, `from_cache = false`, and that exact `reason`. Like a
 targeting miss, it removes the memory and durable assignment and stops its
 revalidation; use the normal experience. A later explicit fetch may declare a
-new band. A truly unknown response reason remains `malformed_response`.
+new band. A future reason string becomes `"unknown"` and clears the assignment;
+it does not acquire the age-specific withdrawal effect.
 
 Unlike the other not-assigned reasons, an `age_ineligible` response also
 withdraws what the refused player still owes for that experiment: an exposure
