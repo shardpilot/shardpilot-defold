@@ -74,9 +74,11 @@ one local refusal, and leaves valid queued neighbours available for delivery.
 This also applies to typed/session events, summaries and sealed experiment
 facts. Missing or failed JSON encoding returns `json_unavailable` or
 `json_encode_failed` locally. Automatic session transitions wait until the
-triggering event passes this precheck. Retained experiment facts retry unavailable
-encoding without counting each attempt as a drop; terminal oversized facts retire
-and count once. A failed durable-copy attempt keeps its source fact owed.
+triggering event passes this precheck. Refusal accounting follows the producer's
+retention rule: lifecycle obligations and failed durable-copy attempts remain
+owed; experiment facts retain failures except terminal oversize; summaries retain
+only queue pressure. A retained attempt is not counted as dropped, including
+validation and encoding failures. Retirement counts the loss once.
 Previously persisted envelopes are not rewritten.
 
 ## Session end reasons

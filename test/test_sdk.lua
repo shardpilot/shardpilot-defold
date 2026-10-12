@@ -16618,6 +16618,81 @@ end)()
    end)
   end
  end
+ for _,entry in ipairs({"resume","start","end","consent_resume"})do
+  for _,failure in ipairs({"missing","throws","oversize"})do
+   scene("retained lifecycle "..entry.." "..failure,function()
+    local c=fresh({source="client",platform="android",session_timeout_seconds=10})
+    assert_true(c:session_start());local session=c.session
+    if entry=="consent_resume" then assert_true(c:set_consent(false));assert_true(c:set_consent(true))
+    else c.backgrounded=true;c.paused={session=session,wall_ms=clock.unix_ms()-11000,frames=c.frame_seconds}end
+    local before,dropped,paused=#c.queue.items,c.stats.dropped,c.paused
+    local saved_window=window;window={WINDOW_EVENT_FOCUS_GAINED=901,WINDOW_EVENT_FOCUS_LOST=902}
+    local function attempt()
+     if entry=="start" then return c:session_start()
+     elseif entry=="end" then return c:session_end("finished")
+     else return c:on_window_event(901)end
+    end
+    if failure=="missing" then json=nil
+    elseif failure=="throws" then json.encode=function()error("synthetic encoder failure")end
+    else json.encode=function(v)local b=encode_value(v);return b:sub(1,1)..string.rep(" ",3000)..b:sub(2)end end
+    for _=1,3 do local ok=attempt();assert_equal(ok,false)end
+    window=saved_window
+    assert_equal(c.stats.dropped,dropped,"retained lifecycle is not a loss")
+    assert_equal(#c.queue.items,before);assert_equal(c.paused,paused)
+    json={encode=encode_value,decode=json_decode};window={WINDOW_EVENT_FOCUS_GAINED=901,WINDOW_EVENT_FOCUS_LOST=902}
+    assert_true(attempt());window=saved_window
+    assert_equal(c.stats.dropped,dropped);assert_true(#c.queue.items>before)
+   end)
+  end
+ end
+ for _,closing in ipairs({false,true})do
+  for _,kind in ipairs({"perf","network"})do
+  scene(kind.." summary retires encoder failure closing="..tostring(closing),function()
+   local c=fresh({source="client"});assert_true(c:session_start())
+   if kind=="perf" then c:update(0.016);c:update(0.016) else c:observe_ping_ms(40)end
+   local dropped=c.stats.dropped;json=nil
+   if closing then c:finalize_session(c.session) else c:enqueue_summaries()end
+   assert_equal(c.stats.dropped,dropped+1,"terminal summary counted once")
+   assert_equal(#c.owed_summaries,0)
+   if closing then c:finalize_session(c.session) else c:enqueue_summaries()end
+   assert_equal(c.stats.dropped,dropped+1,"consumed summary not recounted")
+  end)
+  end
+ end
+ for _,invalid in ipairs({"props","name"})do
+  scene("retained experiment validation "..invalid,function()
+   local c=fresh({source="client",experiments_enabled=true,app_url="https://config.example",publishable_key="sp_ingest_synthetic"})
+   assert_true(c:session_start());local fact=sealed("small");local before=#c.queue.items
+   if invalid=="props" then fact.props.loop=fact.props else fact.event_name=""end
+   c.experiments.pending_exposure.synthetic={{sealed_fact=fact,session_id=c.session.id,anonymous_id=c.anonymous_id}}
+   for _=1,3 do c.experiments:sweep_pending("synthetic","background")end
+   assert_equal(c.stats.dropped,0,"retained validation attempts are not losses")
+   assert_equal(#c.queue.items,before);assert_equal(#c.experiments.pending_exposure.synthetic,1)
+   fact.props={pad="small"};fact.event_name="experiment_exposure"
+   c.experiments:sweep_pending("synthetic","background")
+   assert_equal(c.stats.dropped,0);assert_equal(c.experiments.pending_exposure.synthetic,nil)
+   assert_equal(#c.queue.items,before+1)
+  end)
+ end
+ for _,retained in ipairs({false,true})do
+  for _,reason in ipairs({"shutdown","consent_denied","consent_unknown","event_name_required","identity_required","invalid_props","invalid_context","queue_full"})do
+   scene("shared refusal "..reason.." retained="..tostring(retained),function()
+    local c=fresh({buffer_size=1});local name,props,context="control",{},nil
+    if reason=="shutdown" then c.initialized=false
+    elseif reason=="consent_denied" then c.consent_state="denied"
+    elseif reason=="consent_unknown" then c.consent_state="unknown"
+    elseif reason=="event_name_required" then name=""
+    elseif reason=="identity_required" then c.user_id=nil;c.anonymous_id=nil
+    elseif reason=="invalid_props" then props.loop=props
+    elseif reason=="invalid_context" then context={};context.loop=context
+    else assert_true(c:track("existing",{}))end
+    local before=#c.queue.items;local dropped=c.stats.dropped
+    local ok,err=c:enqueue_event(name,props,context,retained and {retryable=true} or nil)
+    assert_equal(ok,false);assert_equal(err,reason);assert_equal(#c.queue.items,before)
+    assert_equal(c.stats.dropped,dropped+(retained and 0 or 1),"shared retention policy owns accounting")
+   end)
+  end
+ end
  sys,http,json,socket=saved.sys,saved.http,saved.json,saved.socket
  print(string.format("event-size total: %d pass, %d fail",passed,failed))
  assert_equal(failed,0,"event-size admission scenes")

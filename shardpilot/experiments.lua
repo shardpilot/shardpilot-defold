@@ -2376,6 +2376,9 @@ end
 -- Drain in FIFO order. Sealing runs only from background/final sweeps, never
 -- inside an application or outcome call. A full analytics queue keeps the
 -- sealed record, without repeating the apply hop.
+-- The same declaration controls retirement and intake loss accounting.
+local terminal_emit_errors = { event_too_large = true }
+
 function Experiments:sweep_pending(experiment_key, mode)
 	local list = self.pending_exposure[experiment_key]
 	if type(list) ~= "table" then return end
@@ -2398,12 +2401,13 @@ function Experiments:sweep_pending(experiment_key, mode)
 			local ok, err = self.deps.emit(sealed.event_name, sealed.props, sealed.event_id, {
 				session_id = record.session_id, anonymous_id = record.anonymous_id,
 				event_ts = sealed.event_ts, sealed_fact = sealed, retryable = true,
+				terminal_errors = terminal_emit_errors,
 			})
 			if self.pending_exposure[experiment_key] ~= list then return end
 			-- A complete event over the fixed cap cannot succeed on a later
 			-- attempt. Retire that fact so it cannot block valid neighbours;
 			-- capacity and unavailable encoding still keep their retry posture.
-			if not ok and err ~= "event_too_large" then return end
+			if not ok and not terminal_emit_errors[err] then return end
 			table.remove(list, 1)
 		end
 	end
