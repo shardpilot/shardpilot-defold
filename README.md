@@ -557,7 +557,7 @@ local client = sdk.new(config)
 client:identify("user-123")
 client:set_consent(true) -- consent-first: required before any event flows
 client:track("play_cta_click", { cta_source = "main_menu" })
-client:flush()
+client:flush(10, function(ok, code) print("flush", ok, code) end)
 client:shutdown("app_final")
 ```
 
@@ -660,8 +660,8 @@ read `client:get_rejections()` or the initialized singleton's
 finite positive integer (default `64`); invalid values fail initialization with
 `invalid_rejection_capacity`. This surface is new in `v0.10.2`.
 
-Defold keeps its Boolean `flush()` contract: `true` means transport work has
-settled, even when a parsed `202` contains rejections. `snapshot().rejected`
+A parsed `202` that contains rejections settles its events, so
+[`flush()`](docs/configuration.md#flush) answers success for them. `snapshot().rejected`
 counts the server's cumulative rejected totals; `last_event_issue` retains the
 latest non-accepted status and code. The ring also records automatic publishes.
 Only per-event `rejected` entries enter it; whole-batch errors and other statuses

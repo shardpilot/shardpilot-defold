@@ -13137,12 +13137,18 @@ end)()
 			assert_true(singleton.track("singleton_fixture"))
 			local held, restore_http = hold_http_requests()
 			local ok, failure = pcall(function()
-				assert_equal(singleton.flush(), false, "the asynchronous verdict is still pending")
+				local verdicts = {}
+				assert_true(singleton.flush(5, function(ok, code) verdicts[#verdicts + 1] = { ok, code } end),
+					"the flush is accepted")
+				assert_equal(#verdicts, 0, "the asynchronous verdict is still pending")
 				assert_equal(#held, 1)
 				local events = json_decode(requests[#requests].body).events
 				assert_equal(#events, 1)
 				held[1](nil, nil, { status = 202, response = encode_value({ accepted = 0, rejected = 1, events = {
 					{ event_id = events[1].event_id, status = "rejected", code = "event_too_large", message = "too large" } } }) })
+				assert_true(singleton.update(0) ~= false)
+				assert_equal(#verdicts, 1, "the verdict arrives on the main loop")
+				assert_equal(verdicts[1][1], true, "a 202 delivers the call's events")
 				assert_true(singleton.flush())
 				assert_equal(singleton.get_rejections()[1].event_id, events[1].event_id)
 				assert_equal(singleton.snapshot().rejected, 1)
@@ -16067,7 +16073,7 @@ end)()
 				fresh(api, mode, function(call)
 					assert_true(call("identify", "synthetic-user"))
 					assert_true(call("track", "synthetic_event"))
-					assert_true(call("flush", { include_summaries = false }))
+					assert_true(call("flush"))
 					assert_equal(#requests, 1)
 					local request = requests[1]
 					assert_contains(request.url, "/v1/events:batch")
@@ -16187,14 +16193,16 @@ end)()
   {"shardpilot.experiments","Experiments"},{"shardpilot.remote_config","RemoteConfig"}}) do
   scene(module[1].." class private",function() assert_equal(require(module[1])[module[2]],nil,"implementation class not exported") end)
  end
- scene("public flush ignores implementation options",function()
+ scene("public flush takes only a timeout and a callback",function()
   seed_granted_consent()
   local client=assert(require("shardpilot.sdk").new(config()))
   assert_true(client:session_start());client:observe_ping_ms(25)
-  assert_true(client:flush({include_summaries=false}))
+  local refused,code=client:flush({include_summaries=false})
+  assert_equal(refused,false);assert_equal(code,"invalid_timeout_seconds","implementation options are not a timeout")
+  assert_true(client:flush())
   local found=false
   for _, request in ipairs(requests) do if request.body and request.body:find('"network_summary"',1,true) then found=true end end
-  assert_true(found,"public flush includes summaries regardless of private options")
+  assert_true(found,"public flush includes summaries")
   assert_true(client:shutdown())
  end)
  for _, kind in ipairs({"analytics", "crash"}) do
@@ -16696,4 +16704,289 @@ end)()
  sys,http,json,socket=saved.sys,saved.http,saved.json,saved.socket
  print(string.format("event-size total: %d pass, %d fail",passed,failed))
  assert_equal(failed,0,"event-size admission scenes")
+end)()
+
+-- Bounded flush: flush(timeout_seconds, callback) drains what this client
+-- holds at the call, to completion or to the deadline, and answers once.
+;(function()
+ local saved_socket=socket
+ local passed,failed=0,0
+ local function scene(name,run)
+  reset();storage.reset()
+  local real_request=http.request
+  socket={now=1000,gettime=function()return socket.now end}
+  local ok,err=pcall(run)
+  socket=saved_socket;http.request=real_request
+  sys.get_save_file,sys.save,sys.load=nil,nil,nil
+  storage.reset()
+  if ok then passed=passed+1 else failed=failed+1 end
+  print("bounded-flush "..name..": "..(ok and "PASS" or "FAIL "..tostring(err)))
+ end
+ local function answers()
+  local calls={}
+  return calls,function(ok,code)calls[#calls+1]={ok=ok,code=code}end
+ end
+ local function client_with(overrides)
+  seed_granted_consent()
+  local cfg=config({flush_interval_seconds=9999})
+  for k,v in pairs(overrides or {})do cfg[k]=v end
+  local client=assert(sdk.new(cfg))
+  assert_true(client:identify("user-example"))
+  return client
+ end
+ local function batches()
+  local n=0
+  for _,r in ipairs(requests)do if r.url:find("/v1/events:batch",1,true)then n=n+1 end end
+  return n
+ end
+ local function answered(calls,ok,code,message)
+  assert_equal(#calls,1,(message or "answer").." count")
+  assert_equal(calls[1].ok,ok,(message or "answer").." result")
+  assert_equal(calls[1].code,code,(message or "answer").." code")
+ end
+
+ scene("drains every held batch on the next tick and answers success once",function()
+  local client=client_with({batch_size=2})
+  for i=1,5 do assert_true(client:track("drain_"..i))end
+  local held=hold_http_requests()
+  local calls,cb=answers()
+  assert_equal(client:bounded_flush(5,cb),true)
+  assert_equal(batches(),1,"one batch on the wire")
+  assert_equal(#calls,0,"a dispatched request is not the result")
+  release_held_request(held)
+  assert_equal(#calls,0,"settled on the main loop")
+  client:update(0)
+  assert_equal(batches(),2,"the next batch goes on the next tick, not on the flush cadence")
+  release_held_request(held);client:update(0)
+  assert_equal(batches(),3,"the short last batch goes on the next tick too")
+  assert_equal(#calls,0,"the last batch is still out")
+  release_held_request(held);client:update(0)
+  answered(calls,true,nil,"drained")
+  client:update(0);assert_equal(#calls,1,"exactly once")
+ end)
+
+ scene("the deadline answers pending and keeps the remnant",function()
+  local client=client_with()
+  assert_true(client:track("late"))
+  local held=hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(2,cb))
+  socket.now=socket.now+1;client:update(0)
+  assert_equal(#calls,0,"not before the deadline")
+  socket.now=socket.now+1;client:update(0)
+  answered(calls,false,"pending","deadline")
+  assert_true(client.in_flight_batch~=nil,"the remnant is kept for the next send")
+  release_held_request(held);client:update(0)
+  assert_equal(#calls,1,"exactly once");assert_equal(client.in_flight_batch,nil)
+ end)
+
+ for _,writes in ipairs({true,false})do
+  scene("a durable spool "..(writes and "keeping" or "refusing").." the remnant at the deadline",function()
+   local stores=install_stub_sys_storage()
+   local client=client_with()
+   assert_true(client:track("spooled"))
+   hold_http_requests()
+   local calls,cb=answers()
+   assert_true(client:bounded_flush(1,cb))
+   for path in pairs(stores)do if path:sub(-6)=="/spool" then stores[path]=nil end end
+   if not writes then sys.save=function()return false end end
+   socket.now=socket.now+1;client:update(0)
+   answered(calls,false,writes and "pending" or "spool_persist_failed","spool")
+   local record=stored_spool_record(stores)
+   if writes then assert_true(record~=nil and #record.events>0,"the remnant is on disk")
+   else assert_equal(record,nil,"nothing reached the disk")end
+  end)
+ end
+
+ scene("a terminal refusal during the call answers its code",function()
+  local client=client_with()
+  assert_true(client:track("refused_now"))
+  next_status=400;next_response_body='{"error":{"code":"validation_failed","message":"synthetic"}}'
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(1,cb))
+  answered(calls,false,"http_400","synchronous refusal")
+ end)
+
+ scene("a terminal refusal after the call answers its code",function()
+  local client=client_with()
+  assert_true(client:track("refused_later"))
+  local held=hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(5,cb))
+  table.remove(held,1)(nil,nil,{status=422,response='{"error":{"code":"validation_failed","message":"synthetic"}}'})
+  client:update(0)
+  answered(calls,false,"http_422","held refusal")
+ end)
+
+ scene("a refused batch of the call's own summaries answers its code",function()
+  local client=client_with()
+  assert_true(client:session_start());assert_true(client:flush())
+  client:update(0.016);client:observe_ping_ms(25)
+  assert_equal(#client.queue.items,0,"nothing queued before the call")
+  next_status=400;next_response_body='{"error":{"code":"validation_failed","message":"synthetic"}}'
+  local before=batches()
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(1,cb))
+  assert_equal(batches(),before+1,"the call built and sent its summaries")
+  answered(calls,false,"http_400","summary refusal")
+ end)
+
+ scene("a consent purge during the drain answers success",function()
+  local client=client_with({batch_size=1})
+  assert_true(client:track("purged_1"));assert_true(client:track("purged_2"))
+  local held=hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(5,cb))
+  assert_true(client:set_consent(false))
+  release_held_request(held);client:update(0)
+  answered(calls,true,nil,"purged")
+  assert_equal(#client.queue.items,0,"the queued event was purged locally")
+ end)
+
+ scene("a grant receipt still undispatched at the deadline answers consent_receipt_pending",function()
+  local client=assert(sdk.new(config({flush_interval_seconds=9999})))
+  assert_true(client:identify("user-example"))
+  next_status=503;next_response_headers={["retry-after"]="30"}
+  client:set_consent(true)
+  next_status=202;next_response_headers=nil
+  assert_true(client:track("behind_the_receipt"))
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(1,cb))
+  assert_equal(#calls,0)
+  socket.now=socket.now+1;client:update(0)
+  answered(calls,false,"consent_receipt_pending","receipt")
+  assert_equal(batches(),0,"the event waits behind the receipt")
+ end)
+
+ scene("shutdown ends a waiting call and refuses a later one",function()
+  install_stub_sys_storage()
+  local client=client_with()
+  assert_true(client:track("at_shutdown"))
+  hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(5,cb))
+  assert_true(client:shutdown())
+  answered(calls,false,"shutdown","teardown")
+  local later,cb2=answers()
+  local ok,code=client:bounded_flush(5,cb2)
+  assert_equal(ok,false);assert_equal(code,"shutdown")
+  answered(later,false,"shutdown","after teardown")
+ end)
+
+ scene("the module without a client answers not_initialized",function()
+  local module=require("shardpilot.sdk")
+  local calls,cb=answers()
+  local ok,code=module.flush(1,cb)
+  assert_equal(ok,false);assert_equal(code,"not_initialized")
+  answered(calls,false,"not_initialized","module")
+ end)
+
+ for _,bad in ipairs({0,-1,0/0,math.huge,"5",true})do
+  scene("timeout "..tostring(bad).." is refused",function()
+   local client=client_with()
+   assert_true(client:track("unflushed"))
+   local calls,cb=answers()
+   local ok,code=client:bounded_flush(bad,cb)
+   assert_equal(ok,false);assert_equal(code,"invalid_timeout_seconds")
+   answered(calls,false,"invalid_timeout_seconds","refusal")
+   assert_equal(batches(),0,"a refused call sends nothing")
+  end)
+ end
+
+ scene("a callback that is not a function is refused",function()
+  local client=client_with()
+  assert_true(client:track("unflushed"))
+  local ok,code=client:bounded_flush(1,"callback")
+  assert_equal(ok,false);assert_equal(code,"invalid_callback")
+  assert_equal(batches(),0,"a refused call sends nothing")
+ end)
+
+ scene("the default timeout is ten seconds and the callback is optional",function()
+  local client=client_with()
+  assert_true(client:track("default_deadline"))
+  hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(nil,cb))
+  assert_true(client:bounded_flush())
+  socket.now=socket.now+9;client:update(0)
+  assert_equal(#calls,0,"not before ten seconds")
+  socket.now=socket.now+1;client:update(0)
+  answered(calls,false,"pending","default deadline")
+  assert_equal(#client.flush_drains,0,"the uncalled drain ends too")
+ end)
+
+ scene("events tracked after the call do not extend its drain",function()
+  local client=client_with({batch_size=1})
+  assert_true(client:track("before_the_call"))
+  local held=hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(5,cb))
+  assert_true(client:track("after_the_call"))
+  release_held_request(held);client:update(0)
+  answered(calls,true,nil,"own events only")
+  assert_true(#client.queue.items+(client.in_flight_batch and #client.in_flight_batch or 0)==1,"the later event is still held")
+ end)
+
+ scene("a throwing callback runs once and leaves the client working",function()
+  local client=client_with()
+  assert_true(client:track("thrower"))
+  local held=hold_http_requests()
+  local count=0
+  assert_true(client:bounded_flush(5,function()count=count+1;error("synthetic host failure")end))
+  release_held_request(held);client:update(0);client:update(0)
+  assert_equal(count,1,"exactly once")
+  assert_true(client:track("still_working"))
+ end)
+
+ scene("two calls keep their own deadlines",function()
+  local client=client_with()
+  assert_true(client:track("shared"))
+  local held=hold_http_requests()
+  local first,cb1=answers();local second,cb2=answers()
+  assert_true(client:bounded_flush(1,cb1));assert_true(client:bounded_flush(3,cb2))
+  socket.now=socket.now+1;client:update(0)
+  answered(first,false,"pending","first");assert_equal(#second,0,"the second still waits")
+  release_held_request(held);client:update(0)
+  answered(second,true,nil,"second")
+ end)
+
+ scene("summaries built by the call are part of it",function()
+  local client=client_with({buffer_size=1})
+  assert_true(client:session_start())
+  client:update(0.016);client:update(0.020);client:observe_ping_ms(42)
+  local held=hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(5,cb))
+  assert_true(#client.owed_summaries>0,"the summaries are owed behind the full queue")
+  release_held_request(held);client:update(0)
+  assert_equal(#calls,0,"the owed summaries are still undelivered")
+  while held[1] do release_held_request(held);client:update(0)end
+  answered(calls,true,nil,"summaries delivered")
+  assert_equal(#client.owed_summaries,0)
+ end)
+
+ scene("spool chunks from an earlier launch are part of the call",function()
+  install_stub_sys_storage()
+  local first=client_with()
+  assert_true(first:track("from_the_last_launch_1"));assert_true(first:track("from_the_last_launch_2"))
+  hold_http_requests()
+  assert_true(first:persist())
+  first.initialized=false
+  http.request=function(url,method,callback,headers,body,options)
+   requests[#requests+1]={url=url,body=body};callback(nil,nil,{status=202,response='{"accepted":1}'})
+  end
+  local client=assert(sdk.new(config({flush_interval_seconds=9999,batch_size=1})))
+  assert_equal(#client.spool_batches,2,"the earlier launch left two spool chunks")
+  local held=hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(5,cb))
+  assert_equal(#calls,0,"the first spooled chunk is on the wire")
+  release_held_request(held);client:update(0)
+  assert_equal(#calls,0,"the second spooled chunk is still out")
+  while held[1] do release_held_request(held);client:update(0)end
+  answered(calls,true,nil,"spool drained")
+ end)
+
+ print(string.format("bounded flush: %d pass, %d fail",passed,failed))
+ assert_equal(failed,0,"bounded flush scenes")
 end)()

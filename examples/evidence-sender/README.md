@@ -212,10 +212,12 @@ one request body for the whole run, and every case has exactly one attempt.
 Installing the hook replaces the SDK's default `print` warnings, so those
 warnings no longer appear in a healthy run.
 
-The admission probe is measured the same way. `flush` returns **false** for it —
-that is what a refused batch must report, and a `true` would be the SDK claiming
-delivery of a batch the door turned away — so the result is recorded in a
-`probe-settlement` line together with `snapshot()`'s counters, and a `true`
+The admission probe is measured the same way. `flush` never answers success for
+it — a success would be the SDK claiming delivery of a batch the door turned
+away. A `403` answers `false` with the refusal inside the call; a `401` batch the
+SDK keeps for its retry has not answered when the call returns, which the sender
+records as `false, "unanswered"`. The result is recorded in a
+`probe-settlement` line together with `snapshot()`'s counters, and a success
 fails the run.
 
 **The two passing refusals settle differently inside the SDK, so the receipt

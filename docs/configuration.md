@@ -122,8 +122,39 @@ colon-call syntax. Configuration, queues, tokens, module consumers and class
 tables are private implementation state. `snapshot()` and other value reads
 return their documented values; callers cannot change the client by editing a
 snapshot. The handle accepts the same arguments as its module counterparts,
-including `flush()` without internal options. This API boundary is not a Lua
+including `flush(timeout_seconds, callback)`, which takes no internal options.
+This API boundary is not a Lua
 sandbox against `debug` or direct loading of implementation files.
+
+## Flush
+
+`flush(timeout_seconds, callback)` delivers what the client holds at the
+moment of the call: queued events, a batch on the wire or kept for a retry,
+spool chunks from an earlier launch, and the summaries the call builds. It
+sends batch after batch from `update()`, without waiting for
+`flush_interval_seconds`, until all of it is settled or `timeout_seconds`
+(default `10`) passes. Events tracked after the call are not part of it.
+
+The callback runs once, on the main loop: inside the call when everything
+settles at once, otherwise from `update()`. It receives `true`, or `false` and
+a code:
+
+| Answer | Meaning |
+|---|---|
+| `true` | Nothing from the call is still held. Events the SDK removed itself (a consent-denial purge, retry-age expiry) and per-event rejections in a `202` count as settled; they show in `snapshot()` counters and diagnostics, not here. |
+| `false, "pending"` | The timeout passed. The remnant stays queued and, with the durable spool on, is written to it for the next launch. |
+| `false, "spool_persist_failed"` | The timeout passed and the durable spool could not store the remnant. |
+| `false, "consent_receipt_pending"` | The timeout passed with the events held behind a consent grant receipt that has not been sent yet. |
+| `false, "shutdown"` | The client was shut down before the call settled, or before the call. |
+| `false, "not_initialized"` | The module-level `flush` has no client. |
+| `false, "http_<status>"` or `false, "unauthorized"` | The server refused events of the call terminally. |
+| `false, "invalid_timeout_seconds"` | `timeout_seconds` is not a finite number above zero. |
+
+The call itself returns `true` when the drain starts, or `false` and the code
+it also hands the callback when it refuses at once. A `callback` that is not a
+function is refused with `false, "invalid_callback"`, and nothing is sent. A
+drain that does not settle inside the call answers only from `update()`, so a
+host that stops calling `update()` gets no answer.
 
 ## One client per app
 
@@ -633,7 +664,7 @@ a configured hook replaces that channel while retention remains mandatory.
 The ring belongs to the client instance and clears on reinitialization; it is
 neither persisted nor retried. These additions are new in
 `v0.10.2`. See [Batch verdicts](../README.md#batch-verdicts) for the warning limits
-and the unchanged Boolean `flush()` contract.
+and how [`flush()`](#flush) answers such a batch.
 
 The optional `diagnostics` hook is invoked with each non-accepted ingest
 outcome the server reports, and with construction issues such as a configured

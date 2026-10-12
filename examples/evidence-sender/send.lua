@@ -9,6 +9,15 @@ local function lua_error()
 			frames = {{ ["function"] = "sender.update", file = "sender.lua", line = 1 }} }} }
 end
 
+-- flush(timeout_seconds, callback) answers on the main loop. This host's HTTP
+-- bridge is synchronous, so a batch that settles answers inside the call; a
+-- batch the SDK keeps for a retry has not answered when the call returns.
+local function flush_now(client)
+	local answer = { false, "unanswered" }
+	assert(client:flush(nil, function(ok, code) answer = { ok, code } end))
+	return answer[1], answer[2]
+end
+
 return function(c)
 	local client = assert(sdk.new({
 		ingest_url = c.ingest_url, anonymous_id = c.anonymous_id,
@@ -45,15 +54,15 @@ return function(c)
 	-- counts verdicts per case.
 	stage("session-open")
 	assert(client:session_start({ entry_point = "synthetic_sender_open" }))
-	assert(client:flush({ include_summaries = false }))
+	assert(flush_now(client))
 	stage("single")
 	assert(client:track(c.event_name, {}))
-	assert(client:flush({ include_summaries = false }))
+	assert(flush_now(client))
 	-- Ended explicitly rather than replaced: the next session_start would renew
 	-- the session and leave this one with a start and no end.
 	stage("session-close")
 	assert(client:session_end("finished"))
-	assert(client:flush({ include_summaries = false }))
+	assert(flush_now(client))
 	-- Two synthetic sessions, each with a start and an end, in ONE batch:
 	-- session_start resets the per-session sequence, so each session carries
 	-- sequence 1 for its start and 2 for its end.
@@ -62,14 +71,14 @@ return function(c)
 	assert(client:session_end("completed"))
 	assert(client:session_start({ entry_point = "synthetic_sender_second" }))
 	assert(client:session_end("backgrounded"))
-	assert(client:flush({ include_summaries = false }))
+	assert(flush_now(client))
 	-- realistic-batch left its second session ENDED, and session_end keeps the
 	-- id while clearing session_active (client.lua:2790-2794), so tracking here
 	-- would land facts on an ended session id with its sequence running on.
 	-- Begin a fresh session for the remaining analytics cases.
 	stage("session-resume")
 	assert(client:session_start({ entry_point = "synthetic_sender_resume" }))
-	assert(client:flush({ include_summaries = false }))
+	assert(flush_now(client))
 	stage("local-size")
 	assert(client:track(c.event_name, {}))
 	local before_size = client:snapshot()
@@ -81,14 +90,14 @@ return function(c)
 	-- still travels through the SDK callback, rejection queue and diagnostics.
 	stage("mixed-size")
 	assert(client:track(c.event_name, { sample_padding = "raw-wire-probe" }))
-	assert(client:flush({ include_summaries = false }))
+	assert(flush_now(client))
 	-- What the caller can see, read through the public API rather than
 	-- inferred from the response the host already has.
 	report_rejections(client:get_rejections())
 	-- And what the caller must NOT do: a rejected event is not re-queued, so
 	-- this flush publishes nothing and the case keeps its single attempt. A
 	-- re-queued event would appear here as a second exchange for the case.
-	assert(client:flush({ include_summaries = false }))
+	assert(flush_now(client))
 	stage("lua-nonfatal")
 	assert(crashes:emit(lua_error()))
 	stage("lua-fatal")
@@ -130,6 +139,6 @@ return function(c)
 	stage("unauthenticated")
 	local before_probe = client:snapshot()
 	assert(client:track(c.event_name, { synthetic_admission_probe = true }))
-	local published, publish_err = client:flush({ include_summaries = false })
+	local published, publish_err = flush_now(client)
 	report_probe(published, publish_err, before_probe, client:snapshot())
 end
