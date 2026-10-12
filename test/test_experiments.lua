@@ -706,7 +706,7 @@ local function test_grammar_400_reminted_once()
 	reset()
 	local client = granted_client()
 	local grammar_reject = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	})
 	local answers = 0
 	responder = function(url, _, callback)
@@ -863,7 +863,7 @@ local function test_real_subjects_sentinel_drops_durable_cache()
 	fetch(client, "exp-checkout")
 
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	local result = fetch(client, "exp-checkout")
 	assert_equal(result.error, "unauthorized")
 	assert_nil(client:experiment_variant("exp-checkout"))
@@ -1614,7 +1614,7 @@ local function test_remint_rearms_exposure_for_new_subject()
 	-- The Q4 tuple is per subject, so the new subject's first application
 	-- must emit its own exposure.
 	local grammar_reject = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	})
 	local answers = 0
 	responder = function(url, _, callback)
@@ -1674,7 +1674,7 @@ local function test_revalidation_remints_rejected_subject()
 	-- must heal it (re-mint once and retry) without waiting for an explicit
 	-- host fetch.
 	local grammar_reject = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	})
 	local answers = 0
 	responder = function(url, _, callback)
@@ -1942,7 +1942,7 @@ local function test_midflight_consent_revocation_fails_closed()
 	responder = nil
 	assert_true(client:set_consent(false))
 	held[2](nil, nil, { status = 400, response = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	}) })
 	assert_equal(client.experiments_client_id, minted,
 		"no subject id is minted after a revocation")
@@ -2199,7 +2199,7 @@ local function test_owed_clear_never_wipes_newer_state()
 		return fail_experiment_saves(path)
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	fetch(client, "exp-a")
 	state.fail_save = nil
 
@@ -2255,7 +2255,7 @@ local function test_pre_remint_response_reports_stale_subject()
 	local client = granted_client()
 	local held = {}
 	local grammar_reject = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	})
 	local answers = 0
 	responder = function(url, _, callback)
@@ -2597,7 +2597,7 @@ local function test_owed_clear_demoted_before_ordinary_latch()
 		return fail_experiment_saves(path)
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	fetch(client, "exp-a")
 	state.fail_save = nil
 
@@ -2661,7 +2661,7 @@ local function test_stale_grammar_reject_does_not_remint()
 		return false
 	end
 	local grammar_reject = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	})
 
 	-- An older request is in flight when a NEWER same-key response settles.
@@ -2794,7 +2794,7 @@ local function test_remint_preserves_owed_exposure_of_past_treatment()
 	-- id).
 	local other_fact_key = "sfk1_" .. string.rep("c", 64)
 	local grammar_reject = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	})
 	local answers = 0
 	responder = function(url, _, callback)
@@ -2842,7 +2842,7 @@ local function test_sentinel_discards_owed_exposures()
 	-- exposure snapshots too — a withdrawn fact key must not egress after
 	-- the platform flipped real subjects off.
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 
 	next_status = 200
@@ -2868,7 +2868,7 @@ local function test_cadence_remint_retry_carries_attributes()
 	-- targeted assignment retried un-targeted would drop as
 	-- targeting_unmatched.
 	local grammar_reject = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	})
 	local answers = 0
 	responder = function(url, _, callback)
@@ -2918,7 +2918,7 @@ local function test_stale_scope_retry_after_does_not_park_revalidation()
 	client:fetch_experiment_assignment("exp-slow", function() end)
 	assert_equal(#held, 1)
 	local grammar_reject = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	})
 	local answers = 0
 	responder = function(url, _, callback)
@@ -3235,7 +3235,7 @@ local function test_failed_sentinel_clear_never_resurrects_serving()
 		return fail_experiment_saves(path)
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	fetch(client, "exp-checkout")
 	assert_nil(client:experiment_variant("exp-checkout"))
 	local record = storage.load_experiments(client.config)
@@ -3334,7 +3334,7 @@ local function test_grammar_400_after_spent_budget_drops_entry()
 	local restore = install_fake_sys_storage()
 	local client = granted_client()
 	local grammar_reject = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	})
 	local answers = 0
 	responder = function(url, _, callback)
@@ -3449,7 +3449,7 @@ local function test_owed_drop_lands_against_retired_scope()
 	-- against the retired record: a failed subject persist could put the
 	-- old subject back at the next launch and resurrect it.
 	local grammar_reject = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	})
 	local answers = 0
 	responder = function(url, _, callback)
@@ -3499,7 +3499,7 @@ local function test_rotation_cancels_owed_writes()
 	state.fail_save = nil
 
 	local grammar_reject = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	})
 	local answers = 0
 	responder = function(url, _, callback)
@@ -3879,7 +3879,7 @@ local function test_owed_clear_retry_preserves_sibling_fresh_write()
 	state.fail_save = fail_experiment_saves
 	next_status = 403
 	next_response_body = json.encode({
-		error = "experiment real-subject assignment is disabled",
+		error = { code = "real_subjects_disabled", message = "synthetic feature refusal" },
 	})
 	fetch(a, "exp-checkout")
 	state.fail_save = nil
@@ -3919,7 +3919,7 @@ local function test_owed_clear_demotion_preserves_fresh_disk_entry()
 	state.fail_save = fail_experiment_saves
 	next_status = 403
 	next_response_body = json.encode({
-		error = "experiment real-subject assignment is disabled",
+		error = { code = "real_subjects_disabled", message = "synthetic feature refusal" },
 	})
 	fetch(a, "exp-checkout")
 	state.fail_save = nil
@@ -4003,7 +4003,7 @@ local function test_stale_inflight_sentinel_preserves_sibling_write()
 	fetch(b, "exp-onboarding")
 
 	held(nil, nil, { status = 403, response = json.encode({
-		error = "experiment real-subject assignment is disabled",
+		error = { code = "real_subjects_disabled", message = "synthetic feature refusal" },
 	}) })
 	local record = storage.load_experiments(config())
 	assert_true(record ~= nil,
@@ -4030,7 +4030,7 @@ local function test_condemned_record_refused_after_restart()
 	state.fail_save = fail_experiment_saves
 	next_status = 403
 	next_response_body = json.encode({
-		error = "experiment real-subject assignment is disabled",
+		error = { code = "real_subjects_disabled", message = "synthetic feature refusal" },
 	})
 	fetch(a, "exp-checkout")
 	next_status = 200
@@ -4063,7 +4063,7 @@ local function test_condemned_survivor_restores_and_converges()
 	state.fail_save = fail_experiment_saves
 	next_status = 403
 	next_response_body = json.encode({
-		error = "experiment real-subject assignment is disabled",
+		error = { code = "real_subjects_disabled", message = "synthetic feature refusal" },
 	})
 	fetch(a, "exp-checkout", { age_band = "adult" })
 	next_status = 200
@@ -4328,7 +4328,7 @@ local function test_sentinel_clear_never_condemns_foreign_scope()
 	local a = assert(sdk.new(config()))
 	next_status = 403
 	next_response_body = json.encode({
-		error = "experiment real-subject assignment is disabled",
+		error = { code = "real_subjects_disabled", message = "synthetic feature refusal" },
 	})
 	fetch(a, "exp-checkout", { age_band = "adult" })
 	next_status = 200
@@ -4344,7 +4344,7 @@ local function test_sentinel_clear_never_condemns_foreign_scope()
 	state.fail_save = fail_experiment_saves
 	next_status = 403
 	next_response_body = json.encode({
-		error = "experiment real-subject assignment is disabled",
+		error = { code = "real_subjects_disabled", message = "synthetic feature refusal" },
 	})
 	fetch(a, "exp-checkout", { age_band = "adult" })
 	next_status = 200
@@ -4381,7 +4381,7 @@ local function test_marker_survives_demotion_until_drops_durable()
 	state.fail_save = fail_experiment_saves
 	next_status = 403
 	next_response_body = json.encode({
-		error = "experiment real-subject assignment is disabled",
+		error = { code = "real_subjects_disabled", message = "synthetic feature refusal" },
 	})
 	fetch(a, "exp-checkout")
 	next_status = 200
@@ -4551,7 +4551,7 @@ local function test_fresh_install_outranks_pending_clear_marker()
 	-- land, so the condemnation persists as the sidecar marker.
 	state.fail_save = fail_experiment_saves
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	fetch(client, "exp-checkout", { age_band = "adult" })
 
 	-- The clock rolls back below the marker's stamp, storage recovers, and
@@ -4585,7 +4585,7 @@ local function test_marker_survives_unreadable_record()
 	-- Sentinel with the record store down: marker persisted, clear owed.
 	state.fail_save = fail_experiment_saves
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	fetch(client, "exp-checkout")
 
 	local marker_path = nil
@@ -4701,7 +4701,7 @@ local function test_stale_sentinel_stamp_ignores_post_dispatch_install()
 	assert_equal(client:experiment_variant("exp-two"), "beta-2",
 		"the sibling key's fresh 200 installed first")
 	held(nil, nil, { status = 403,
-		response = json.encode({ error = "experiment real-subject assignment is disabled" }) })
+		response = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } }) })
 	responder = nil
 
 	local record_path = nil
@@ -4769,7 +4769,7 @@ local function test_sentinel_purges_queue_resident_exposure_facts()
 	-- verbatim and must not ship on the next flush — the kill switch stops
 	-- egress, not just future serving.
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0,
 		"queue-resident exposure facts are purged with the sentinel")
@@ -4814,7 +4814,7 @@ local function test_sentinel_purges_retained_backoff_batch()
 	-- the next attempt re-sends them verbatim.
 	responder = nil
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 
 	responder = function(url, _, callback)
@@ -4866,7 +4866,7 @@ local function test_sentinel_purges_spooled_facts_from_prior_launch()
 	local second = assert(sdk.new(config()))
 	assert_true(second:spool_pending(), "the spooled envelopes await re-send")
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(second, "exp-checkout")
 
 	next_status = 200
@@ -4927,7 +4927,7 @@ local function test_sentinel_purged_tuple_reexposes_on_refetch()
 	local original_id = exposures[1].event_id
 
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	assert_equal(#queued_events(client, "experiment_exposure"), 0)
 
@@ -4974,7 +4974,7 @@ local function test_condemned_relaunch_filters_spooled_facts()
 		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	state.fail_save = nil
 	storage.reset()
@@ -5175,7 +5175,7 @@ local function test_stale_marker_does_not_condemn_new_scope_spool()
 	-- stamped with THIS (develop) scope.
 	state.fail_save = fail_experiment_saves
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 
 	-- New launch under a DIFFERENT scope (environment rotated). The stale
@@ -5332,7 +5332,7 @@ local function test_new_application_capture_survives_settled_purge()
 		return path:match("/spool$") ~= nil
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 
 	-- The flag flips back on and the host applies again: this is a new
@@ -5410,7 +5410,7 @@ local function test_reissued_fact_key_replaces_settled_spool_copy()
 		return path:match("/spool$") ~= nil
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 
 	next_status = 200
@@ -5470,7 +5470,7 @@ local function test_condemned_marker_holds_without_subject()
 		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	state.fail_save = nil
 
@@ -5533,7 +5533,7 @@ local function test_condemnation_survives_failed_spool_clear()
 		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 
 	-- SECOND launch with the spool store still down: the condemnation
@@ -5599,7 +5599,7 @@ local function test_evicted_replacement_reports_capture_failure()
 		return path:match("/spool$") ~= nil
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	next_status = 200
 	next_response_body = assignment_body({ subject_fact_key = new_fact_key })
@@ -5630,7 +5630,7 @@ local function test_settled_marker_spares_fresh_facts()
 	-- Sentinel with the record store down mints the marker...
 	state.fail_save = fail_experiment_saves
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	-- ...the record store heals but the SIDECAR delete fails: the clear
 	-- fully settles on the first tick while the stale marker file stays.
@@ -5748,7 +5748,7 @@ local function test_spool_only_debt_persists_marker()
 		return path:match("/spool$") ~= nil
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	local marker_path = nil
 	for key in pairs(stores) do
@@ -5800,7 +5800,7 @@ local function test_same_key_replacement_carries_post_sentinel_identity()
 		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 
 	advance_seconds(2)
@@ -5852,7 +5852,7 @@ local function test_same_second_fresh_fact_survives_partition()
 	local anchor_second = math.floor(socket.now)
 	state.fail_save = fail_experiment_saves
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	state.fail_save = function(path)
 		return path:match("/experiments%-clear$") ~= nil
@@ -5930,7 +5930,7 @@ local function test_presettle_persist_excludes_wire_batch_facts()
 	-- BEFORE the settle must not snapshot the withdrawn facts into the
 	-- durable spool: a crash pre-settle would replay them.
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	client:persist()
 
@@ -6172,7 +6172,7 @@ function extra_tests.test_sync_remint_stops_stale_cadence_keys()
 	-- dispatch — they would be revalidations for the fresh subject,
 	-- installing assignments the host never requested.
 	local grammar_reject = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	})
 	local checkout_answers = 0
 	responder = function(url, _, callback)
@@ -6289,7 +6289,7 @@ function extra_tests.test_disabled_relaunch_filters_condemned_spool()
 		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	state.fail_save = nil
 	storage.reset()
@@ -6455,7 +6455,7 @@ local function stage_condemned_spool_launch(state)
 		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	state.fail_save = nil
 	next_status = 200
@@ -6726,7 +6726,7 @@ function extra_tests.test_unreadable_demotion_keeps_clear_owed()
 	advance_seconds(2)
 	state.fail_save = fail_experiment_saves
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	fetch(client, "exp-checkout")
 	state.fail_save = nil
 	next_status = 200
@@ -6883,7 +6883,7 @@ function extra_tests.test_spool_shadow_never_masks_unreadable()
 	advance_seconds(2)
 	state.fail_save = fail_experiment_saves
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	state.fail_save = nil
 	next_status = 200
@@ -7013,7 +7013,7 @@ function extra_tests.test_sentinel_preserves_owed_post_dispatch_write()
 	-- ride out the wipe.
 	next_response_body = nil
 	held[1](nil, nil, { status = 403,
-		response = json.encode({ error = "experiment real-subject assignment is disabled" }) })
+		response = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } }) })
 	state.fail_save = nil
 
 	-- The store heals: the clear lands against exp-a, and exp-b's owed
@@ -7118,7 +7118,7 @@ function extra_tests.test_unreadable_record_keeps_whole_clear_owed()
 	end
 	next_response_body = nil
 	held[1](nil, nil, { status = 403,
-		response = json.encode({ error = "experiment real-subject assignment is disabled" }) })
+		response = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } }) })
 
 	-- The read heals: the partition runs on real evidence — the covered
 	-- entry drops, the survivor stays, and the marker retires.
@@ -7168,7 +7168,7 @@ function extra_tests.test_remint_tombstones_old_scope_durably()
 		answers = answers + 1
 		if answers == 1 then
 			callback(nil, nil, { status = 400, response = json.encode({
-				error = "experiment metadata must use synthetic local-safe identifiers only",
+				error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 			}) })
 		else
 			callback(nil, nil, { status = 503, response = "{}" })
@@ -7223,7 +7223,7 @@ function extra_tests.test_latched_remint_tombstones_durable_entries()
 		answers = answers + 1
 		if answers == 1 then
 			callback(nil, nil, { status = 400, response = json.encode({
-				error = "experiment metadata must use synthetic local-safe identifiers only",
+				error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 			}) })
 		else
 			callback(nil, nil, { status = 503, response = "{}" })
@@ -7274,7 +7274,7 @@ function extra_tests.test_later_sentinel_cancels_covered_snapshot_write()
 	fetch(client, "exp-b", { age_band = "adult" })
 	next_response_body = nil
 	held[1](nil, nil, { status = 403,
-		response = json.encode({ error = "experiment real-subject assignment is disabled" }) })
+		response = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } }) })
 
 	-- Sentinel TWO is dispatched AFTER exp-b's stamp — its authority
 	-- covers the snapshot — and a fresh exp-d lands after ITS dispatch
@@ -7298,7 +7298,7 @@ function extra_tests.test_later_sentinel_cancels_covered_snapshot_write()
 	fetch(client, "exp-d", { age_band = "adult" })
 	next_response_body = nil
 	held[2](nil, nil, { status = 403,
-		response = json.encode({ error = "experiment real-subject assignment is disabled" }) })
+		response = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } }) })
 	state.fail_save = nil
 
 	-- The store heals: sentinel TWO's clear settles first, then the owed
@@ -7370,7 +7370,7 @@ function extra_tests.test_spool_purge_clears_condemnation_debt()
 		return path:match("/spool$") ~= nil
 	end
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	next_status = 200
 	next_response_body = nil
@@ -10085,7 +10085,7 @@ function extra_tests.test_age_declaration_blocks_stale_grammar_retry()
 	assert_equal(#held, 2, "setup: the declaration is in flight")
 	local from = #assignment_requests()
 	held[1](nil, nil, { status = 400, response = json.encode({
-		error = "experiment metadata must use synthetic local-safe identifiers only",
+		error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 	}) })
 	assert_true(client.experiments.reminted, "setup: the grammar reject re-minted the subject")
 	local check, verify = extra_tests.checklist()
@@ -10378,7 +10378,7 @@ function extra_tests.test_age_declaration_answered_by_its_grammar_retry()
 		answers = answers + 1
 		if answers == 1 then
 			callback(nil, nil, { status = 400, response = json.encode({
-				error = "experiment metadata must use synthetic local-safe identifiers only",
+				error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 			}) })
 		else
 			callback(nil, nil, { status = 200, response = extra_tests.served_age_golden() })
@@ -11036,7 +11036,7 @@ function extra_tests.test_declaration_end_after_remint_keeps_the_retired_subject
 		answers = answers + 1
 		if answers == 1 then
 			callback(nil, nil, { status = 400, response = json.encode({
-				error = "experiment metadata must use synthetic local-safe identifiers only",
+				error = { code = "subject_id_invalid", message = "synthetic subject refusal" },
 			}) })
 		else
 			callback(nil, nil, { status = 401, response = json.encode({ error = "unauthorized" }) })
@@ -11124,7 +11124,7 @@ end
 function extra_tests.test_sentinel_emptying_restored_spool_clears_its_deadline()
 	local client, restore = extra_tests.spool_with_deadline(false)
 	next_status = 403
-	next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	fetch(client, "exposure-banner")
 	next_status = 200
 	next_response_body = nil
@@ -11246,7 +11246,7 @@ end
 function extra_tests.test_sentinel_clears_the_deadline_of_a_record_without_restored_facts()
 	extra_tests.deadline_of_a_record_without_restored_facts("sentinel", function(client)
 		next_status = 403
-		next_response_body = json.encode({ error = "experiment real-subject assignment is disabled" })
+		next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 		fetch(client, "exposure-banner")
 		next_status = 200
 		next_response_body = nil
@@ -11852,8 +11852,8 @@ function extra_tests.test_apply_refusals_withdraw_their_fact_population()
 		responder = function(url, _, callback)
 			if url:find("/experiments/exposures", 1, true) then
 				callback(nil, nil, { status = sentinel and 403 or 409,
-					response = sentinel and json.encode({ error = "experiment real-subject assignment is disabled" })
-						or json.encode({ error = "not_assigned", reason = "age_ineligible" }) })
+					response = sentinel and json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
+						or json.encode({ error = { code = "not_assigned", message = "synthetic refusal", details = { { field = "reason", code = "age_ineligible", message = "synthetic age refusal" } } } }) })
 				return true
 			end
 		end
@@ -12320,4 +12320,329 @@ print("shardpilot defold experiments tests passed")
  end)
  print("assignment-enum total: "..passed.." pass, "..failed.." fail")
  assert_equal(failed,0,"assignment response openness")
+end)()
+
+-- Exact error-envelope actions through the real HTTP consumer.
+;(function()
+
+local pass,fail=0,0
+local function scene(name,fn)
+ local ok,err=pcall(fn)
+ if ok then pass=pass+1;print("PASS "..name) else fail=fail+1;print("FAIL "..name.." :: "..tostring(err)) end
+end
+local function envelope(code,details,message)
+ return json.encode({error={code=code,message=message or "synthetic human text",details=details}})
+end
+local grammar="experiment metadata must use synthetic local-safe identifiers only"
+local disabled="experiment real-subject assignment is disabled"
+for _,case in ipairs({
+ {"typed subject_id_invalid remints",400,envelope("subject_id_invalid"),2},
+ {"typed subject_pii_marker remints",400,envelope("subject_pii_marker"),2},
+ {"old flat grammar is status-only",400,json.encode({error=grammar}),1},
+ {"message cannot select remint",400,envelope("invalid_request",nil,grammar),1},
+ {"case mismatch is status-only",400,envelope("SUBJECT_ID_INVALID"),1},
+ {"subject_invalid_byte never remints",400,envelope("subject_invalid_byte"),1},
+ {"subject_not_synthetic never remints",400,envelope("subject_not_synthetic"),1},
+ {"wrong-type code is status-only",400,envelope(false),1},
+ {"unknown code is status-only",400,envelope("future_code"),1},
+ {"definition_invalid never remints",500,envelope("definition_invalid"),1},
+}) do
+ scene(case[1],function()
+  reset();local c=granted_client();local n=0
+  responder=function(url,_,cb)
+   if not url:find('/runtime/experiments/assignment',1,true) then return false end
+   n=n+1; cb(nil,nil,{status=n==1 and case[2] or 200,response=n==1 and case[3] or assignment_body()});return true
+  end
+  local result=fetch(c,"exp-checkout")
+  assert_true(n>=1,"real HTTP assignment subject did not run")
+  assert_equal(n,case[4],"actual HTTP assignment count")
+  if n==2 then
+   assert_true(result.ok and result.assigned,"retry did not accept control")
+   local req=assignment_requests();assert_true(query_params(req[1].url).subject_key~=query_params(req[2].url).subject_key,"subject unchanged")
+  end
+ end)
+end
+for _,case in ipairs({
+ {"typed assignment real-subject refusal withdraws owed",envelope("real_subjects_disabled"),true},
+ {"old flat assignment text cannot withdraw",json.encode({error=disabled}),false},
+ {"unknown assignment code retains owed",envelope("future_code",nil,disabled),false},
+}) do
+ scene(case[1],function()
+  reset();local c=granted_client();next_response_body=assignment_body();assert_true(fetch(c,"exp-checkout").assigned)
+  assert_equal(c:apply_experiment_variant("exp-checkout"),"treatment")
+  assert_true(c.experiments:has_owed_exposures(),"seeded owed control missing")
+  next_status=403;next_response_body=case[2];fetch(c,"exp-checkout")
+  assert_equal(#assignment_requests(),2,"real assignment callback ran")
+  assert_equal(c.experiments:has_owed_exposures(),not case[3],"owed population")
+ end)
+end
+for _,code in ipairs({"runtime_disabled","experiments_disabled","experiment_assignment_disabled"}) do
+ scene("feature-off "..code.." is not credential fault",function()
+  reset();local c=granted_client();next_status=403;next_response_body=envelope(code)
+  local result=fetch(c,"exp-checkout");assert_equal(#assignment_requests(),1,"real assignment callback ran")
+  assert_true(result.error~="unauthorized","reported credential fault: "..tostring(result.error))
+ end)
+end
+for _,case in ipairs({
+ {"typed apply age reason withdraws population",409,envelope("not_assigned",{{field="reason",code="age_ineligible",message="synthetic"}}),0},
+ {"old flat apply age cannot withdraw population",409,json.encode({error="not_assigned",reason="age_ineligible"}),1},
+ {"unknown apply reason drops only refused item",409,envelope("not_assigned",{{field="reason",code="future_reason",message="age_ineligible"}}),1},
+ {"wrong-field age code drops only refused item",409,envelope("not_assigned",{{field="other",code="age_ineligible",message="synthetic"}}),1},
+ {"case mismatch age code drops only refused item",409,envelope("not_assigned",{{field="reason",code="AGE_INELIGIBLE",message="synthetic"}}),1},
+ {"typed apply real-subject refusal withdraws population",403,envelope("real_subjects_disabled"),0},
+ {"old flat apply text cannot withdraw",403,json.encode({error=disabled}),2},
+ {"apply-disabled keeps unsent facts",403,envelope("experiment_apply_disabled"),2},
+ {"seal-unavailable keeps unsent facts",503,envelope("seal_unavailable"),2},
+}) do
+ scene(case[1],function()
+  reset();local c=granted_client();next_response_body=assignment_body();assert_true(fetch(c,"exp-checkout",{age_band="adult"}).assigned)
+  assert_equal(c:apply_experiment_variant("exp-checkout"),"treatment")
+  assert_true(c:track_outcome("exp-checkout","score",1))
+  local list=c.experiments.pending_exposure["exp-checkout"];assert_equal(#list,2,"two owed controls")
+  local n=0
+  responder=function(url,_,cb)
+   if not url:find('/experiments/exposures',1,true) then return false end
+   n=n+1;cb(nil,nil,{status=case[2],response=case[3]});return true
+  end
+  c.experiments:seal_application("exp-checkout",list[1])
+  assert_equal(n,1,"real apply HTTP callback ran")
+  assert_equal(#(c.experiments.pending_exposure["exp-checkout"] or {}),case[4],"owed population")
+ end)
+end
+
+for _,body in ipairs({
+ '{"error":{"code":"subject_id_invalid","code":"future"}}',
+ '{"error":{"code":"future","code":"subject_id_invalid"}}',
+ '{"error":{"code":"future","c\\u006fde":"subject_id_invalid"}}',
+ '{"error":[{"code":"subject_id_invalid"}]}',
+ '{"error":{"code":["subject_id_invalid"]}}',
+ '{"error":{"code":"subject_id_invalid"}} trailing',
+ '<html>subject_id_invalid</html>',
+ 'null',
+}) do
+ scene("malformed envelope status-only "..body,function()
+  reset();local c=granted_client();next_status=400;next_response_body=body
+  fetch(c,"exp-checkout");assert_equal(#assignment_requests(),1,"malformed envelope cannot remint")
+ end)
+end
+scene("remint budget is shared by both codes",function()
+ reset();local c=granted_client();local n=0
+ responder=function(url,_,cb)
+  if not is_assignment_request({url=url}) then return false end
+  n=n+1;cb(nil,nil,{status=400,response=envelope(n==1 and "subject_id_invalid" or "subject_pii_marker")});return true
+ end
+ local result=fetch(c,"exp-checkout");assert_equal(n,2);assert_equal(result.error,"bad_request")
+ fetch(c,"exp-checkout");assert_equal(n,3,"second host fetch cannot remint again")
+end)
+scene("typed remint revalidation preserves targeting",function()
+ reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout",{age_band="adult",geo="GB"})
+ local subject=query_params(assignment_requests()[1].url).subject_key;local n=0
+ responder=function(url,_,cb)
+  if not is_assignment_request({url=url}) then return false end
+  n=n+1;assert_equal(query_params(url).geo,"GB");cb(nil,nil,{status=n==1 and 400 or 200,response=n==1 and envelope("subject_pii_marker") or assignment_body()});return true
+ end
+ advance_seconds(400);c:update(0);assert_equal(n,2);assert_true(subject~=query_params(assignment_requests()[3].url).subject_key)
+end)
+for _,status in ipairs({403,404,500}) do
+ scene("remint code on wrong status "..status,function()
+  reset();local c=granted_client();next_status=status;next_response_body=envelope("subject_id_invalid")
+  fetch(c,"exp-checkout");assert_equal(#assignment_requests(),1)
+ end)
+end
+scene("disabled latch reports disabled to raced callback and resumes explicitly",function()
+ reset();local diagnostics={};local c=granted_client({diagnostics=function(v)diagnostics[#diagnostics+1]=v end})
+ next_response_body=assignment_body();fetch(c,"exp-checkout");local held,results={},{}
+ responder=function(url,_,cb)if is_assignment_request({url=url})then held[#held+1]=cb;return true end end
+ c:fetch_experiment_assignment("exp-checkout",function(v)results[1]=v end)
+ c:fetch_experiment_assignment("other",function(v)results[2]=v end)
+ assert_equal(#held,2)
+ held[1](nil,nil,{status=403,response=envelope("experiments_disabled")})
+ held[2](nil,nil,{status=200,response=assignment_body({experiment_key="other"})})
+ assert_equal(results[1].error,"disabled");assert_equal(results[2].error,"disabled")
+ assert_nil(c:experiment_variant("exp-checkout"));advance_seconds(400);c:update(0);assert_equal(#held,2,"disabled cadence dispatched")
+ local found=false;for _,v in ipairs(diagnostics)do if v.status=="disabled" and v.code=="experiments_disabled" then found=true end end;assert_true(found,"missing disabled diagnostic")
+ responder=nil;next_status=200;next_response_body=assignment_body();assert_true(fetch(c,"exp-checkout").assigned)
+ assert_equal(c:experiment_variant("exp-checkout"),"treatment")
+end)
+for _,route in ipairs({"exposures","outcomes"}) do
+ for _,code in ipairs({"version_mismatch","variant_mismatch","unit_not_recordable","future_code","VERSION_MISMATCH"})do
+  scene(route.." refusal "..code,function()
+   reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout",{age_band="adult",geo="GB"})
+   c:apply_experiment_variant("exp-checkout");if route=="outcomes"then c:track_outcome("exp-checkout","score",1);table.remove(c.experiments.pending_exposure["exp-checkout"],1)end
+   local record=c.experiments.pending_exposure["exp-checkout"][1];local n=0
+   responder=function(url,_,cb)
+    if url:find('/experiments/'..route,1,true)then n=n+1;cb(nil,nil,{status=409,response=envelope(code)});return true end
+    if is_assignment_request({url=url})then assert_equal(query_params(url).geo,"GB");cb(nil,nil,{status=200,response=assignment_body({version=4,variant_key="fresh"})});return true end
+   end
+   c.experiments:seal_application("exp-checkout",record);assert_equal(n,1);assert_nil(c.experiments.pending_exposure["exp-checkout"])
+   local known=code=="version_mismatch" or code=="variant_mismatch" or code=="unit_not_recordable"
+   assert_equal(#assignment_requests(),known and 2 or 1,"assignment refetch count")
+   assert_equal(c:experiment_variant("exp-checkout"),known and "fresh" or "treatment")
+  end)
+ end
+end
+for _,later in ipairs({"pending","installed"})do
+ scene("apply mismatch cannot supersede "..later.." host request",function()
+  reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout",{geo="GB"})
+  c:apply_experiment_variant("exp-checkout");local held_apply,held_fetch
+  responder=function(url,_,cb)
+   if is_assignment_request({url=url})then held_fetch=cb;return true end
+   if url:find('/experiments/exposures',1,true)then held_apply=cb;return true end
+  end
+  c.experiments:seal_application("exp-checkout",c.experiments.pending_exposure["exp-checkout"][1]);assert_true(held_apply~=nil)
+  c:fetch_experiment_assignment("exp-checkout",{geo="FR"},function()end);assert_true(held_fetch~=nil)
+  if later=="installed"then held_fetch(nil,nil,{status=200,response=assignment_body({version=4,variant_key="newer"})})end
+  held_apply(nil,nil,{status=409,response=envelope("version_mismatch")})
+  assert_equal(#assignment_requests(),2,"redundant refetch outranked host request")
+  if later=="pending"then held_fetch(nil,nil,{status=200,response=assignment_body({version=4,variant_key="newer"})})end
+  assert_equal(c:experiment_variant("exp-checkout"),"newer")
+ end)
+end
+-- The cadence leaves its fetch right after the owed apply in the same tick.
+-- A cadence attempt that fails or is still in flight has superseded
+-- nothing, so the mismatch must still refetch with the applied targeting.
+for _,cadence in ipairs({"failed","pending"})do
+ scene("apply mismatch refetches past a "..cadence.." cadence fetch",function()
+  reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout",{geo="GB"})
+  c:apply_experiment_variant("exp-checkout");local held_apply,held_cadence,corrective
+  responder=function(url,_,cb)
+   if url:find('/experiments/exposures',1,true)then held_apply=cb;return true end
+   if not is_assignment_request({url=url})then return false end
+   assert_equal(query_params(url).geo,"GB")
+   if not corrective then
+    if cadence=="failed"then cb(nil,nil,{status=500,response=envelope("internal")})else held_cadence=cb end
+    return true
+   end
+   cb(nil,nil,{status=200,response=assignment_body({version=4,variant_key="fresh"})});return true
+  end
+  advance_seconds(400);c:update(0)
+  assert_true(held_apply~=nil,"tick did not send the owed apply");assert_equal(#assignment_requests(),2,"tick did not send the cadence fetch")
+  corrective=true;held_apply(nil,nil,{status=409,response=envelope("version_mismatch")})
+  assert_equal(#assignment_requests(),3,"a "..cadence.." cadence fetch suppressed the refetch")
+  assert_equal(c:experiment_variant("exp-checkout"),"fresh")
+  if held_cadence then
+   held_cadence(nil,nil,{status=200,response=assignment_body()})
+   assert_equal(c:experiment_variant("exp-checkout"),"fresh","the older cadence answer outranked the refetch")
+  end
+ end)
+end
+-- A pending host request defers the refetch: sent once if the host request
+-- ends without installing, dropped if it installs a newer assignment.
+for _,host in ipairs({"failed","installed"})do
+ scene("apply mismatch refetch waits for a host request that "..host,function()
+  reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout",{geo="GB"})
+  c:apply_experiment_variant("exp-checkout");local held_apply,held_fetch
+  responder=function(url,_,cb)
+   if url:find('/experiments/exposures',1,true)then held_apply=cb;return true end
+   if not is_assignment_request({url=url})then return false end
+   if not held_fetch then held_fetch=cb;return true end
+   assert_equal(query_params(url).geo,"GB");cb(nil,nil,{status=200,response=assignment_body({version=4,variant_key="fresh"})});return true
+  end
+  c.experiments:seal_application("exp-checkout",c.experiments.pending_exposure["exp-checkout"][1]);assert_true(held_apply~=nil)
+  c:fetch_experiment_assignment("exp-checkout",{geo="FR"},function()end);assert_true(held_fetch~=nil)
+  held_apply(nil,nil,{status=409,response=envelope("version_mismatch")})
+  assert_equal(#assignment_requests(),2,"refetch outranked the pending host request")
+  if host=="failed"then
+   held_fetch(nil,nil,{status=500,response=envelope("internal")})
+   assert_equal(#assignment_requests(),3,"refetch lost when the host request failed")
+   assert_equal(c:experiment_variant("exp-checkout"),"fresh")
+  else
+   held_fetch(nil,nil,{status=200,response=assignment_body({version=4,variant_key="newer"})})
+   assert_equal(#assignment_requests(),2,"refetch sent after a newer assignment installed")
+   assert_equal(c:experiment_variant("exp-checkout"),"newer")
+  end
+ end)
+end
+scene("owed refetch waits for the latest host request",function()
+ reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout",{geo="GB"})
+ c:apply_experiment_variant("exp-checkout");local held_apply,held={},{}
+ responder=function(url,_,cb)
+  if url:find('/experiments/exposures',1,true)then held_apply[1]=cb;return true end
+  if not is_assignment_request({url=url})then return false end
+  held[#held+1]=cb;return true
+ end
+ c.experiments:seal_application("exp-checkout",c.experiments.pending_exposure["exp-checkout"][1])
+ c:fetch_experiment_assignment("exp-checkout",{geo="FR"},function()end)
+ c:fetch_experiment_assignment("exp-checkout",{geo="DE"},function()end);assert_equal(#held,2)
+ held_apply[1](nil,nil,{status=409,response=envelope("version_mismatch")})
+ held[1](nil,nil,{status=500,response=envelope("internal")})
+ assert_equal(#held,2,"an older host request released the refetch while a newer one was pending")
+ held[2](nil,nil,{status=200,response=assignment_body({version=4,variant_key="newer"})})
+ assert_equal(#held,2,"refetch sent after a newer assignment installed");assert_equal(c:experiment_variant("exp-checkout"),"newer")
+end)
+scene("owed refetch is dropped when the subject changes before the host request ends",function()
+ reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout",{geo="GB"})
+ c:apply_experiment_variant("exp-checkout");local record=c.experiments.pending_exposure["exp-checkout"][1]
+ next_response_body=not_assigned_body(nil);fetch(c,"exp-checkout");assert_nil(c:experiment_variant("exp-checkout"))
+ assert_equal(c.experiments.pending_exposure["exp-checkout"][1],record,"the withdrawn assignment's occurrence stays owed")
+ local held_apply,held_fetch
+ responder=function(url,_,cb)
+  if url:find('/experiments/exposures',1,true)then held_apply=cb;return true end
+  if not is_assignment_request({url=url})then return false end
+  if not held_fetch then held_fetch=cb;return true end
+  cb(nil,nil,{status=500,response=envelope("internal")});return true
+ end
+ c.experiments:seal_application("exp-checkout",record);assert_true(held_apply~=nil)
+ c:fetch_experiment_assignment("exp-checkout",{geo="FR"},function()end);assert_true(held_fetch~=nil)
+ held_apply(nil,nil,{status=409,response=envelope("version_mismatch")});assert_equal(#assignment_requests(),3)
+ local subject=c.experiments:current_subject_id()
+ held_fetch(nil,nil,{status=400,response=envelope("subject_id_invalid")})
+ assert_true(c.experiments:current_subject_id()~=subject,"the host request did not re-mint the subject")
+ assert_equal(#assignment_requests(),4,"refetch sent for the re-minted subject")
+end)
+scene("apply-disabled diagnosis keeps occurrence and halts retry",function()
+ reset();local diagnostics={};local c=granted_client({diagnostics=function(v)diagnostics[#diagnostics+1]=v end})
+ next_response_body=assignment_body();fetch(c,"exp-checkout");c:apply_experiment_variant("exp-checkout")
+ local record=c.experiments.pending_exposure["exp-checkout"][1];local n=0
+ responder=function(url,_,cb)if url:find('/experiments/exposures',1,true)then n=n+1;cb(nil,nil,{status=403,response=envelope("experiment_apply_disabled")});return true end end
+ c.experiments:tick(0);assert_equal(n,1);assert_equal(c.experiments.pending_exposure["exp-checkout"][1],record)
+ advance_seconds(400);c.experiments:tick(0);assert_equal(n,1)
+ local found=false;for _,v in ipairs(diagnostics)do if v.status=="disabled" and v.code=="experiment_apply_disabled"then found=true end end;assert_true(found,"missing disabled diagnostic")
+end)
+for _,case in ipairs({{"pinless invalid version",false,"future_unit",false},{"pinless future unit",3,"future_unit",true},{"pinless known unit",3,"client_id",true}})do
+ scene(case[1],function()
+  reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout")
+  local body=json.decode(assignment_body({version=case[2],boundary={assignment_unit=case[3]}}))
+  body.served_revision=nil;body.served_kill_gate=nil;body.served_at=nil;next_response_body=json.encode(body)
+  local result=fetch(c,"exp-checkout");assert_equal(#assignment_requests(),2)
+  if not case[4]then assert_equal(result.error,"malformed_response");assert_true(result.from_cache)
+  elseif case[3]=="future_unit"then assert_true(result.ok and not result.assigned);assert_equal(result.reason,"unknown")
+  else assert_true(result.ok and result.assigned and not result.from_cache)end
+ end)
+end
+
+for _,case in ipairs({
+ {"age detail on wrong status",400,envelope("not_assigned",{{field="reason",code="age_ineligible"}}),1},
+ {"age detail on unknown code",409,envelope("future_code",{{field="reason",code="age_ineligible"}}),1},
+ {"age detail object is not array",409,envelope("not_assigned",{field="reason",code="age_ineligible"}),1},
+ {"duplicate age detail is ambiguous",409,'{"error":{"code":"not_assigned","details":[{"field":"reason","code":"future","code":"age_ineligible"}]}}',1},
+ {"outcome age withdrawal",409,envelope("not_assigned",{{field="reason",code="age_ineligible"}}),0},
+ {"outcome real-subject withdrawal",403,envelope("real_subjects_disabled"),0},
+})do
+ scene(case[1],function()
+  reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout",{age_band="adult"})
+  c:apply_experiment_variant("exp-checkout");c:track_outcome("exp-checkout","score",1);c:track_outcome("exp-checkout","score",2)
+  local list=c.experiments.pending_exposure["exp-checkout"];table.remove(list,1);assert_equal(#list,2)
+  local n=0;responder=function(url,_,cb)if url:find('/experiments/outcomes',1,true)then n=n+1;cb(nil,nil,{status=case[2],response=case[3]});return true end end
+  c.experiments:seal_application("exp-checkout",list[1]);assert_equal(n,1)
+  assert_equal(#(c.experiments.pending_exposure["exp-checkout"] or {}),case[4])
+ end)
+end
+scene("old subject fact cannot refetch for new subject",function()
+ reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout")
+ c:apply_experiment_variant("exp-checkout");local old=c.experiments.pending_exposure["exp-checkout"][1]
+ local n=0;responder=function(url,_,cb)
+  if is_assignment_request({url=url})then n=n+1;cb(nil,nil,{status=n==1 and 400 or 200,response=n==1 and envelope("subject_id_invalid") or assignment_body({experiment_key="other"})});return true end
+ end
+ fetch(c,"other");assert_equal(n,2);assert_true(old.entry.subject_key~=c.experiments:current_subject_id())
+ responder=function(url,_,cb)
+  if url:find('/experiments/exposures',1,true)then cb(nil,nil,{status=409,response=envelope("version_mismatch")});return true end
+  if is_assignment_request({url=url})then n=n+1;cb(nil,nil,{status=200,response=assignment_body()});return true end
+ end
+ c.experiments:seal_application("exp-checkout",old);assert_equal(n,2,"retired subject triggered fresh assignment")
+ assert_nil(c.experiments.pending_exposure["exp-checkout"]);assert_nil(c:experiment_variant("exp-checkout"))
+end)
+
+print(string.format("error-code total: %d pass, %d fail",pass,fail))
+assert_equal(fail,0,"experiment error-code actions")
 end)()

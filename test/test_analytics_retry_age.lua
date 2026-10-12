@@ -35,6 +35,8 @@ sys = {
 json = {
 	encode = encode,
 	decode = function(text)
+		-- The envelope reader decodes object member names as JSON strings.
+		if text:match('^"[a-z_]+"$') then return text:sub(2, -2) end
 		if response_documents and response_documents[text] then return copy(response_documents[text]) end
 		if text == '{"accepted":1}' then return { accepted = 1 } end
 		return {}
@@ -47,8 +49,8 @@ http = { request = function(url, method, callback, headers, body)
 		local complete = function() callback(nil, nil, { status = response_status, response = response_body or '{"accepted":1}', headers = response_headers }) end
 		if pending_response then pending_response = complete else complete() end
 	elseif url:find("/runtime/experiments/assignment", 1, true) then
-		local body = encode({ error = "experiment real-subject assignment is disabled" })
-		response_documents[body] = { error = "experiment real-subject assignment is disabled" }
+		local body = encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
+		response_documents[body] = { error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } }
 		callback(nil, nil, { status = 403, response = body })
 	else callback(nil, nil, { status = 202, response = "{}" }) end
 end }
