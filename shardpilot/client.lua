@@ -3832,6 +3832,11 @@ function Client:update(dt)
 	if not self.initialized then
 		return
 	end
+	if self.flush_drains[1] then
+		-- A bounded flush whose deadline passed answers before this tick can
+		-- dispatch anything more: the timeout bounds the work of the call.
+		self:settle_flush_drains()
+	end
 	if type(dt) == "number" and dt > 0 then
 		self.flush_elapsed_seconds = self.flush_elapsed_seconds + dt
 		self.frame_seconds = self.frame_seconds + dt
@@ -6577,6 +6582,12 @@ function Client:start_publish_batch(automatic)
 		return nil
 	end
 	local dispatched = transport.publish(self.config, self.token, events.payload, function(ok, err, unauthorized, retryable, response, retry_after, compressed, delivery)
+		if self.flush_drains[1] then
+			-- A response after a bounded flush's deadline must not make that
+			-- flush a success: drains answer as of now, before this response
+			-- changes what is held.
+			self:settle_flush_drains()
+		end
 		completed = true
 		succeeded = ok == true
 		self.publish_in_flight = false
@@ -7149,7 +7160,7 @@ function Client:settle_flush_drains(ending)
 	local kept, done = {}, {}
 	local deadline_code
 	for _, drain in ipairs(self.flush_drains) do
-		local waiting = false
+		local waiting = drain.registering == true
 		for id in pairs(drain.ids) do
 			if pending[id] then
 				waiting = true
@@ -7183,7 +7194,14 @@ function Client:flush_deadline_code()
 	end
 	if self.config.spool_enabled and self.consent_state == "granted"
 		and storage.spool_is_durable(self.config) then
-		if not self:spool_undelivered() then
+		-- Owed summaries join the same durable write as the queue and the
+		-- batch on the wire, as persist() does: one write, sized as a whole.
+		local owed = nil
+		for i = 1, #self.owed_summaries do
+			owed = owed or {}
+			owed[#owed + 1] = envelope.build(self.config, self, self.owed_summaries[i].event)
+		end
+		if not self:spool_undelivered(owed) then
 			return "spool_persist_failed"
 		end
 	end

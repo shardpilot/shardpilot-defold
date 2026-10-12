@@ -16987,6 +16987,55 @@ end)()
   answered(calls,true,nil,"spool drained")
  end)
 
+ scene("a tick after the deadline answers before it dispatches more",function()
+  local client=client_with({batch_size=2})
+  assert_true(client:track("on_time_1"));assert_true(client:track("on_time_2"));assert_true(client:track("too_late"))
+  local held=hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(1,cb))
+  release_held_request(held)
+  http.request=function(url,method,callback,headers,body,options)
+   requests[#requests+1]={url=url,body=body};callback(nil,nil,{status=202,response='{"accepted":1}'})
+  end
+  local sent=batches()
+  client.flush_elapsed_seconds=0 -- the batching cadence is not due: only the drain could send
+  socket.now=socket.now+1;client:update(0)
+  answered(calls,false,"pending","the deadline bounds the work")
+  assert_equal(batches(),sent,"nothing is dispatched for an expired call")
+ end)
+
+ scene("a response after the deadline does not turn the call into success",function()
+  local client=client_with()
+  assert_true(client:track("late_response"))
+  local held=hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(1,cb))
+  socket.now=socket.now+1
+  release_held_request(held)
+  client:update(0)
+  answered(calls,false,"pending","the deadline came first")
+ end)
+
+ scene("the deadline spool keeps owed summaries too",function()
+  local stores=install_stub_sys_storage()
+  local client=client_with({buffer_size=1})
+  assert_true(client:session_start())
+  client:update(0.016);client:update(0.020);client:observe_ping_ms(42)
+  hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(1,cb))
+  assert_true(#client.owed_summaries>0,"summaries are owed behind the full queue")
+  local owed={}
+  for i=1,#client.owed_summaries do owed[client.owed_summaries[i].event.event_id]=true end
+  socket.now=socket.now+1;client:update(0)
+  answered(calls,false,"pending","owed summaries kept")
+  local record=stored_spool_record(stores)
+  local kept=0
+  for _,env in ipairs(record and record.events or {}) do if owed[env.event_id] then kept=kept+1 end end
+  local want=0;for _ in pairs(owed) do want=want+1 end
+  assert_equal(kept,want,"every owed summary is in the durable spool")
+ end)
+
  print(string.format("bounded flush: %d pass, %d fail",passed,failed))
  assert_equal(failed,0,"bounded flush scenes")
 end)()
