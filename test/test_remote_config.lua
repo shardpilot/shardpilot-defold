@@ -428,6 +428,8 @@ local function test_fresh_fetch_serves_values_and_writes_cache()
 	assert_equal(request.method, "GET")
 	assert_equal(request.url, anonymous_fetch_url)
 	assert_equal(request.headers["Authorization"], "Bearer sp_ingest_publishable_key")
+	assert_equal(request.headers["X-ShardPilot-SDK"], "defold/" .. require("shardpilot.version").VERSION,
+		"the remote-config fetch names this SDK")
 	assert_nil(request.headers["If-None-Match"], "the first fetch must not revalidate")
 	-- The schema-revision declaration belongs to events:batch
 	-- ingest only; the remote-config fetch must never carry it.

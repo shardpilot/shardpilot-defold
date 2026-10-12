@@ -4,6 +4,7 @@
 -- which batches analytics events to /v1/events:batch — a crash is NEVER wrapped
 -- as a `mobile_crash` analytics event.
 local clock = require "shardpilot.clock"
+local sdk_header = require "shardpilot.sdk_header"
 
 local M = {}
 
@@ -298,6 +299,7 @@ function M.ingest_body(config, publishable_key, encoded, callback)
 	local headers = {
 		["Content-Type"] = "application/json",
 		["Authorization"] = "Bearer " .. publishable_key,
+		[sdk_header.NAME] = sdk_header.VALUE,
 	}
 	local options = {
 		timeout = config.crash_http_timeout_seconds,
