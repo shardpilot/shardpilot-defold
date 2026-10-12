@@ -192,10 +192,11 @@ for _, case in ipairs({
 	end
 end
 
--- 8. THE CRASH PLATFORM IS NOT THIS FIELD.
+-- 8. THE CRASH PLATFORM IS THIS FIELD (A8).
 --
 -- Each constructor owns its key set. A mixed table is refused; carrying the
--- same platform into valid per-client tables must still preserve crash groups.
+-- same platform into valid per-client tables folds it the same way on both
+-- planes, and never mutates the caller's table.
 do
 	local shared = base_config({
 		platform = "Win64_Shipping",
@@ -214,8 +215,8 @@ do
 	check(analytics_options.platform == shared.platform, "analytics config platform was mutated")
 	check(crash_options.platform == shared.platform, "crash config platform was mutated")
 	check(shared.platform == "Win64_Shipping", "the fold mutated the caller's own table")
-	check(crash.config.platform == "Win64_Shipping",
-		"the fold reached the CRASH wire: crash platform is "
+	check(crash.config.platform == "other",
+		"the crash plane did not fold an unmapped value to the fallback: "
 		.. tostring(crash.config.platform))
 	check(analytics.config.platform == "other",
 		"an unmapped value did not use the fallback")

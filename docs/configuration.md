@@ -504,7 +504,8 @@ stored values retain the aggregate diagnostic
 `event_id` and `event_ts` remain unchanged. Source is `client` by default and
 country is omitted; platform normalization changes neither.
 
-Crash configuration retains its separate platform behavior. See `docs/crash.md`.
+Crash reports and the consent-policy request use the same twelve values and
+the same folding. See `docs/crash.md`.
 
 ## Schema-revision declaration
 

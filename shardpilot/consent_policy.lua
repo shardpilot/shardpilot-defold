@@ -35,6 +35,7 @@
 
 local M = {}
 local version_ok = require "shardpilot.consent_version"
+local envelope_platform = require "shardpilot.envelope_platform"
 
 M.STRICT_OPT_IN = "STRICT_OPT_IN"
 M.SOFT_OPT_OUT = "SOFT_OPT_OUT"
@@ -83,9 +84,6 @@ local MAX_NOTICE = 2048
 local MAX_ADVISORY_BASIS = 2048
 
 local STORES = { steam = true, apple = true, google_play = true, standalone = true }
-local PLATFORMS = {
-	windows = true, macos = true, linux = true, android = true, ios = true, web = true,
-}
 local SIGNAL_REASONS = {
 	source_not_permitted = true, source_unavailable = true, not_enabled_in_release = true,
 }
@@ -1001,8 +999,11 @@ function M.validate_context(context)
 	if not bounded_string(context.locale, MAX_LANGUAGE) then
 		return false, "locale is missing or over its bound"
 	end
-	if not PLATFORMS[context.platform] then
-		return false, "platform is not one of the permitted values"
+	-- The platform is folded to one of the twelve the resolver accepts before
+	-- it travels (prepare): a spelling the table cannot map is sent as "other".
+	-- Only a missing or non-string platform is refused here.
+	if type(context.platform) ~= "string" or context.platform == "" then
+		return false, "platform is missing or not a string"
 	end
 	-- ⚠ THE ADVISORY PART IS ASKED FOR, NEVER ASSUMED. true asks the resolver
 	-- for it; absent or false sends the request without the member, which the
@@ -1337,6 +1338,7 @@ function M.prepare(context, callback)
 	-- response. A context change also fences
 	-- callbacks dispatched before the change, even if that context returns later.
 	context = copy_value(context, 0)
+	context.platform = envelope_platform.fold(context.platform)
 	local key = context_key(context)
 	if active_context ~= key then
 		M.invalidate()

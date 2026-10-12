@@ -10,6 +10,7 @@
 local clock = require "shardpilot.clock"
 local id = require "shardpilot.id"
 local sanitize = require "shardpilot.crash.sanitize"
+local envelope_platform = require "shardpilot.envelope_platform"
 
 local M = {}
 
@@ -1439,8 +1440,20 @@ function M.prepare(client, event, trusted_frame_functions, options)
 	if not source_omitted_for_fatal and not non_empty(event.source) then
 		event.source = client.config.crash_component
 	end
-	if not non_empty(event.platform) then
-		event.platform = client.config.platform
+	-- A per-report platform is folded through the same table as the configured
+	-- one. One the table cannot map keeps the configured platform, as a bad one
+	-- always has, so a fatal is never sent with a raw or empty platform.
+	local event_platform, event_platform_mapped = envelope_platform.fold(event.platform)
+	event.platform = event_platform_mapped and event_platform or client.config.platform
+	-- A module's platform is folded the same way. One the table cannot map is
+	-- omitted, and the service gives the module the crash's own platform.
+	if type(event.modules) == "table" then
+		for _, module in ipairs(event.modules) do
+			if type(module) == "table" and module.platform ~= nil then
+				local module_platform, module_platform_mapped = envelope_platform.fold(module.platform)
+				module.platform = module_platform_mapped and module_platform or nil
+			end
+		end
 	end
 	if event.crash_id == "" then
 		event.crash_id = id.uuid_v7()
