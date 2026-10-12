@@ -1012,7 +1012,7 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
   once: `true`, `false, "pending"` (the remnant is in the spool, re-sent next
   launch) or `false, "spool_persist_failed"` (storage could not keep
   everything; a `shutdown` diagnostic names it). Nothing needs a retry: the
-  client always ends by its deadline.
+  client ends by its deadline while `update()` keeps running.
 - The SDK sends no schema-set revision header and exports no default digest.
   There is no `schema_revision` configuration key; constructors reject it with
   `unknown_config_key`.

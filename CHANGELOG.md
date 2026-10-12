@@ -19,7 +19,7 @@ Names and calls change hard, with no aliases. Update host code as follows:
 |---|---|
 | `flush()` returning `true`/`false` | `flush(timeout_seconds, callback)`; read the answer in the callback ([Flush](docs/configuration.md#flush)) |
 | `shutdown(reason)` | `shutdown(timeout_seconds, callback)`; no reason, the session ends with `app_final` ([Shutdown](docs/configuration.md#shutdown)) |
-| retry `shutdown()` until it returns `true` | wait for the shutdown callback; the client always ends by the deadline |
+| retry `shutdown()` until it returns `true` | wait for the shutdown callback; the client ends by the deadline while `update()` keeps running |
 | configuration and crash setting names | the "Removed name → Replacement" table below |
 | `experiments_requires_remote_config_url` | `experiments_requires_app_url` |
 | `remote_config_attributes_requires_remote_config_url` | `remote_config_attributes_requires_app_url` |
@@ -41,7 +41,9 @@ Names and calls change hard, with no aliases. Update host code as follows:
   server's terminal refusal, `shutdown` or `invalid_timeout_seconds`. A
   second call on the same client gets the first answer. From the call on,
   events, `session_start`, exposures, outcomes, variant applications and
-  experiment fetches answer `shutdown`. No closing client outlives its deadline. A denial whose identity and marker writes both failed deletes
+  experiment fetches answer `shutdown`. The close advances from `update()`, so
+  the client is torn down by its deadline only while the host keeps calling
+  `update()`. A denial whose identity and marker writes both failed deletes
   the stored identity before teardown, so the next launch starts with
   consent unknown. The module releases its default client once the close
   ends.
