@@ -5965,7 +5965,7 @@ end)()
  local cases={
   {"typed400",400,disabled,true},{"typed404",404,disabled,true},
   {"bare404",404,"",false},{"unknown400",400,'{"error":{"code":"unknown"}}',false},
-  {"case404",404,'{"error":{"code":"KIND_NOT_ENABLED"}}',false},
+  {"case404",404,'{"error":{"code":"Kind_not_enabled"}}',false},
   {"message404",404,'{"error":{"message":"kind_not_enabled"}}',false},
   {"malformed404",404,"{",false},{"array404",404,'[{"error":{"code":"kind_not_enabled"}}]',false},
   {"duplicate404",404,'{"error":{"code":"unknown","code":"kind_not_enabled"}}',false},
