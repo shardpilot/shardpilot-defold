@@ -109,6 +109,7 @@ local enums = require "shardpilot.experiment_enums"
 
 local facts = require "shardpilot.experiment_facts"
 local experiment_http = require "shardpilot.experiment_http"
+local sdk_header = require "shardpilot.sdk_header"
 
 local M = {}
 
@@ -2411,7 +2412,8 @@ function Experiments:seal_application(experiment_key, record)
 	record.complete = complete
 	if not self.http_transport:available() then complete(nil, nil, { status = 0 }); return end
 	local ok = pcall(self.http_transport.request, self.http_transport, trim_slash(self.config.app_url) .. route, "POST", complete,
-		{ Authorization = "Bearer " .. self.config.publishable_key, ["Content-Type"] = "application/json" },
+		{ Authorization = "Bearer " .. self.config.publishable_key, ["Content-Type"] = "application/json",
+			[sdk_header.NAME] = sdk_header.VALUE, },
 		body, { timeout = self.config.http_timeout_seconds })
 	if not ok then complete(nil, nil, { status = 0 }) end
 end
@@ -3471,6 +3473,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	local url = M.build_url(self.config.app_url, query)
 	local headers = {
 		["Authorization"] = "Bearer " .. self.config.publishable_key,
+		[sdk_header.NAME] = sdk_header.VALUE,
 	}
 	local options = {
 		timeout = self.config.http_timeout_seconds,

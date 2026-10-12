@@ -569,6 +569,8 @@ local function test_fetch_happy_path_and_boundary_passthrough()
 		"^http://localhost:18081/api/cp/v1/runtime/experiments/assignment%?")
 	assert_equal(request.headers["Authorization"], "Bearer sp_ingest_publishable_key",
 		"the assignment fetch authenticates with the publishable key")
+	assert_equal(request.headers["X-ShardPilot-SDK"], "defold/" .. require("shardpilot.version").VERSION,
+		"the assignment fetch names this SDK")
 	assert_nil(request.headers["X-ShardPilot-Schema-Revision"],
 		"the assignment fetch must not carry the schema-revision header")
 	assert_nil(request.body, "an assignment fetch carries no request body")
@@ -12409,6 +12411,17 @@ for _,case in ipairs({
   assert_equal(#(c.experiments.pending_exposure["exp-checkout"] or {}),case[4],"owed population")
  end)
 end
+scene("the apply request names this SDK",function()
+ reset();local c=granted_client();next_response_body=assignment_body();assert_true(fetch(c,"exp-checkout",{age_band="adult"}).assigned)
+ assert_equal(c:apply_experiment_variant("exp-checkout"),"treatment")
+ local list=c.experiments.pending_exposure["exp-checkout"];assert_true(list and #list>0,"an owed exposure")
+ local before=#requests
+ c.experiments:seal_application("exp-checkout",list[1])
+ local apply
+ for i=before+1,#requests do if requests[i].url:find("/experiments/exposures",1,true) then apply=requests[i] end end
+ assert_true(apply~=nil,"the apply was sent")
+ assert_equal(apply.headers["X-ShardPilot-SDK"],"defold/" .. require("shardpilot.version").VERSION,"the apply names this SDK")
+end)
 
 for _,body in ipairs({
  '{"error":{"code":"subject_id_invalid","code":"future"}}',

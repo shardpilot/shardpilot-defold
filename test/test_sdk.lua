@@ -445,6 +445,8 @@ local function test_app_first_payload()
 	assert_equal(request.url, "http://localhost:8080/v1/events:batch")
 	assert_equal(request.method, "POST")
 	assert_equal(request.headers["Authorization"], "Bearer client-token-placeholder")
+	assert_equal(request.headers["X-ShardPilot-SDK"], "defold/" .. require("shardpilot.version").VERSION,
+		"the event batch names this SDK")
 	assert_equal(request.options.timeout, 2)
 	assert_contains(request.body, '"workspace_id":"workspace-example"')
 	assert_contains(request.body, '"app_id":"app-example"')
@@ -1139,6 +1141,8 @@ local function test_consent_tri_state_gating_and_queue_clear()
 	assert_equal(consent_request.url, "http://localhost:8080/v1/consent")
 	assert_equal(consent_request.method, "POST")
 	assert_equal(consent_request.headers["Authorization"], "Bearer client-token-placeholder")
+	assert_equal(consent_request.headers["X-ShardPilot-SDK"], "defold/" .. require("shardpilot.version").VERSION,
+		"the consent receipt names this SDK")
 	assert_contains(consent_request.body, '"workspace_id":"workspace-example"')
 	assert_contains(consent_request.body, '"app_id":"app-example"')
 	assert_contains(consent_request.body, '"environment_id":"develop"')
@@ -16696,4 +16700,18 @@ end)()
  sys,http,json,socket=saved.sys,saved.http,saved.json,saved.socket
  print(string.format("event-size total: %d pass, %d fail",passed,failed))
  assert_equal(failed,0,"event-size admission scenes")
+end)()
+
+-- The SDK identity header: its name, and its value's grammar.
+;(function()
+ local sdk_header=require "shardpilot.sdk_header"
+ assert_equal(sdk_header.NAME,"X-ShardPilot-SDK")
+ assert_equal(sdk_header.VALUE,"defold/"..require("shardpilot.version").VERSION,"the value is the release constant")
+ assert_equal(sdk_header.value_for("1.2.3+build.7"),"defold/1.2.3","build metadata is not sent")
+ assert_equal(sdk_header.value_for("0.12.0-alpha.1"),"defold/0.12.0-alpha.1","a pre-release is kept")
+ for _,bad in ipairs({"v0.12.0","0.12","0.12.0-","","0.12.0 ",false,
+  string.rep("1",30).."."..string.rep("2",30)..".3"}) do
+  assert_true(not pcall(sdk_header.value_for,bad),"refused release version: "..tostring(bad))
+ end
+ print("sdk header: PASS")
 end)()

@@ -714,6 +714,12 @@ revision setting or exported default digest;
 `shardpilot.supports("schema_revision_declaration")` returns `false`.
 Individual event envelopes keep their existing `schema_version`.
 
+Every request to a ShardPilot service (event batches, consent receipts, crash
+reports, remote config, experiment assignment and apply, and the consent-policy
+request) carries `X-ShardPilot-SDK: defold/<version>`, where `<version>` is
+`shardpilot/version.lua`'s release constant without build metadata. The SDK sets
+no `User-Agent`. An HTML5 build needs a server whose CORS allows this header.
+
 ## Offline durability (event spool)
 
 Player devices go offline and games get killed mid-session. To keep those
