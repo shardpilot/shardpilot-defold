@@ -87,7 +87,7 @@ Previously persisted envelopes are not rewritten.
 preserves a non-empty string reason. An absent, empty or non-string reason uses
 `session_end`. With no session open, the call emits nothing and opens nothing;
 a second end is also a no-op. `shutdown()` uses `app_final`, including a retry
-after queue pressure; a legacy caller reason is ignored. Both methods resolve
+after queue pressure, and takes no reason. Both methods resolve
 an already-expired background pause first, emitting one `idle_timeout` end at
 its deadline and opening no replacement. End events require no duration prop,
 and are suppressed unless analytics consent is granted.
@@ -172,7 +172,7 @@ the record: a relaunch inside the window waits out the remainder before
 re-sending. Durable capture is strict: when the runtime has no save-file API,
 or
 the caps evicted part of the remnant being captured, `shutdown()`/`persist()`
-report failure instead of claiming durability. A config
+report `spool_persist_failed` instead of claiming durability. A config
 `anonymous_id` override that replaces a different persisted identity boots a
 fresh identity — consent `unknown`, spool purged at init (see
 [`docs/privacy.md`](privacy.md)). Within a restored grant, Mode B auth drops

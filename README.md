@@ -18,8 +18,8 @@ not the platform boundary.
   a local stack you run yourself. Which endpoints are available today is stated
   under Configuration below and in [`docs/configuration.md`](docs/configuration.md);
   read that before configuring a hosted deployment.
-- **Version `0.11.2`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.11.2`; the `v0.11.2` tag
+- **Version `0.12.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.12.0`; the `v0.12.0` tag
   is created by the owner after the version-bump merge (pending until then).
 
 ## What it does
@@ -53,7 +53,7 @@ not the platform boundary.
   `ad_impression_revenue`, plus arbitrary `track(name, props)`.
 - **Session helpers (new in `v0.11.0`):** `session_end([reason])` is available on both
   a client and the module singleton. It ends only an open session; `shutdown()`
-  uses `app_final` regardless of a legacy reason argument. See
+  ends an open session with `app_final` and takes no reason. See
   [session end reasons](docs/events.md#session-end-reasons) for defaults and
   background expiry.
 - Generates and persists a UUIDv7 anonymous ID per configured app and supports
@@ -131,11 +131,11 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — after owner tagging, the latest tag is `v0.11.2`:
+published tag's source archive — after owner tagging, the latest tag is `v0.12.0`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.11.2.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.12.0.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
@@ -558,7 +558,7 @@ client:identify("user-123")
 client:set_consent(true) -- consent-first: required before any event flows
 client:track("play_cta_click", { cta_source = "main_menu" })
 client:flush(10, function(ok, code) print("flush", ok, code) end)
-client:shutdown("app_final")
+client:shutdown(10, function(ok, code) print("shutdown", ok, code) end)
 ```
 
 Most methods return `ok, err` so callers can branch on failures (e.g.
@@ -593,10 +593,11 @@ hooks. Metatable-provided fields are absent; use explicit table entries for
 required options. Later changes to the caller's table do not change the captured
 configuration. Function options retain their normal callback behavior.
 
-The module holds one default client. While it is being constructed or remains
-live, another `init(config)` returns `false, "already_initialized"` without
-constructing a replacement. Retry `shutdown()` until it succeeds before calling
-`init` again. A refused configuration leaves the module available for another
+The module holds one default client. While it is being constructed, remains
+live or is still closing, another `init(config)` returns
+`false, "already_initialized"` without constructing a replacement. Call `init`
+again once `shutdown()`'s callback has run: the default client is released when
+it is torn down. A refused configuration leaves the module available for another
 initialization attempt. `new(config)` creates an independent client instance.
 
 | Field | Default | Notes |
@@ -636,7 +637,7 @@ the event spool and the experiment records are stored per app, and each client
 works from its own in-memory copy of them. Two live clients of one app do not
 see each other's changes: an `age_ineligible` refusal received by one does not
 stop the other serving that experiment or delivering its queued and spooled
-facts. To replace a client, retry `shutdown()` until it returns `true`, and
+facts. To replace a client, call `shutdown()` and wait for its callback, and
 let any `fetch_remote_config()` callback of the old client run, then create
 the next one. Clients of different apps are independent; create each with
 `new(config)` and keep every instance (`init` holds one default client). Ids
@@ -733,22 +734,20 @@ per-app spool and re-sends them on a later launch. Enabled by default
   unreachable, timeout, `429`, or `5xx` (the same classification that already
   retains a batch for in-process retry; a Mode B `401` is included since a
   fresh token can be minted, a Mode A `401` is terminal and never spooled).
-- The **undelivered remnant at `shutdown()`** (queue + in-flight batch). When
-  that remnant is durably saved, `shutdown()` completes the teardown and
-  returns `true` — the events are safe on disk, so a host retry loop is no
-  longer needed for events. "Durably" is strict: on a runtime without the
-  save-file API (where the spool falls back to process memory), or when part
-  of the remnant itself was evicted by the caps, `shutdown()` keeps the old
-  contract and returns `false, err` so the host can retry. The same holds
-  when a **permanent** rejection during the final flush dropped the batch:
-  nothing is left to spool (permanent rejects never are), so the failure
-  surfaces as `false, err` instead of a clean teardown — a repeated
-  `shutdown()` call then completes normally, since the queue is already
-  clean. An undelivered consent receipt holds teardown
-  (`false, "consent_pending"`) only when it is NOT durably retained — a
-  receipt safe in the durable consent outbox re-sends next launch, so
-  `shutdown()` completes over it exactly like it does over spooled events
-  (see [Privacy & consent](#privacy--consent)).
+- The **undelivered remnant at `shutdown()`** (queue, the batch on the wire,
+  owed summaries). `shutdown()` writes it to the spool as soon as it starts,
+  so a process that ends before the answer loses nothing, and its delivery
+  removes that copy. What is still undelivered at the deadline stays in the
+  spool and the callback answers `false, "pending"`. "Durably" is strict: on
+  a runtime without the save-file API (where the spool falls back to process
+  memory), with the spool disabled, or when the caps would evict part of the
+  remnant, the client still tears down at the deadline, the callback answers
+  `false, "spool_persist_failed"`, and a `shutdown` diagnostic names what was
+  lost. A **permanent** rejection during the final flush answers that
+  refusal's code. A consent receipt safe in the durable consent outbox
+  re-sends next launch; one that cannot be stored is retried until the
+  deadline and then reported the same way (see
+  [Privacy & consent](#privacy--consent)).
 - An explicit **`persist()`** snapshot (instance + singleton): writes every
   undelivered event to the spool without sending or tearing down, while the
   client keeps running. It reports `false, "spool_persist_failed"` when the
@@ -759,15 +758,15 @@ per-app spool and re-sends them on a later launch. Enabled by default
   while something owed has not been captured, but the code depends on which
   debt and which call:
 
-  | Owed debt | `persist()` reports | `shutdown()` reports |
+  | Owed debt | `persist()` reports | `shutdown()` answers at its deadline |
   |---|---|---|
-  | assignment-cache write still failing | `experiments_pending` | `experiments_pending` |
-  | application not sealed, or sealed fact not captured | `experiments_pending` | `queue_full` |
+  | assignment-cache write still failing | `experiments_pending` | `spool_persist_failed` |
+  | application not sealed, or sealed fact not captured | `experiments_pending` | `spool_persist_failed` |
 
-  Both codes are **retryable**, exactly like `spool_persist_failed`:
-  drive `update()` and call again. Branch on the code the method you called actually
-  emits — a host that treats any non-`true` return as fatal will tear down
-  over recoverable debt.
+  `persist()`'s code is **retryable**, exactly like `spool_persist_failed`:
+  drive `update()` and call again. `shutdown()` retries the same debt itself
+  until its deadline, then tears down and names it in a `shutdown`
+  diagnostic.
 
   The table describes `persist()` **only when the spool is enabled**. With
   `spool_enabled = false`, `persist()` returns `false, "spool_disabled"`
@@ -775,8 +774,7 @@ per-app spool and re-sends them on a later launch. Enabled by default
   a host waiting for `experiments_pending` there would wait forever. The
   assignment-cache sync still runs first in that mode, so a spool-less
   configuration converges its cache; it is only the *reporting* that stops at
-  `spool_disabled`. `shutdown()` is unaffected and keeps reporting both
-  codes.
+  `spool_disabled`. `shutdown()` is unaffected.
 
   Exposure debt also holds the **Mode B anonymous-id rotation**:
   `set_anonymous_id` refuses with `events_pending` while an experiment
@@ -1609,10 +1607,10 @@ below; the later flow in the example is not evidence of authenticated admission.
   returns true the reporter is still live, so the lane is not actually closed.
   The example keeps the state and retries at teardown, which is enough to show
   the shape and not enough to guarantee the closure.
-- **Keep `analytics_running` until `shardpilot.shutdown()` returns true, retry
-  it, and never `init()` over a live client.** The analytics client has the
-  same pending posture, and a re-`init` while one is still settling produces
-  two clients over one spool ([one client per app](#configuration)).
+- **Keep `analytics_running` until `shardpilot.shutdown()`'s callback runs,
+  and never `init()` over a live client.** The analytics client keeps closing
+  (and needs `update()`) until its deadline at the latest, and the module
+  refuses a second `init()` until then ([one client per app](#configuration)).
 - **Check notice compatibility BEFORE paying an owed consent write.** A failed
   `set_consent` leaves a debt; if the next decision carries a different
   `consent_text_version` or `presented_language`, paying that debt records the
@@ -1791,12 +1789,12 @@ separate prerequisites; the client does not prove the notice was displayed.
   Lua test host) it degrades gracefully to in-memory state. `get_anonymous_id()`
   returns the persisted anonymous ID so a host can hand it to its own backend at
   token-mint time (Mode B); the SDK always sends that same anonymous ID on the wire.
-  The module getter returns `nil` before initialization and after successful
-  shutdown; it keeps returning the current ID while shutdown still needs retrying.
+  The module getter returns `nil` before initialization and after shutdown
+  completes; it keeps returning the current ID while the client is closing.
 - **`get_consent_state()`** reads `unknown`, `granted`, `denied`, or
   `denied_forced_minor` from the client, without sending or persisting anything.
   Both a client instance and the module expose it. The module returns `unknown`
-  before initialization and after successful shutdown. A retained instance still
+  before initialization and after shutdown completes. A retained instance still
   reports its last state after shutdown. This is the current in-memory decision,
   not confirmation that its storage write or receipt delivery succeeded.
 - **`set_consent(decision)`** records an explicit decision — `true`
@@ -1908,10 +1906,12 @@ separate prerequisites; the client does not prove the notice was displayed.
   server); retry once the outbox drains. Denial appends still apply at the
   cap (an all-denials overflow evicts the oldest denial). `shutdown()` completes
   over a durably retained receipt (it re-sends next launch — a receipt still
-  in flight at teardown never chains further requests) and returns
-  `false, "consent_pending"` only when the receipt could not be durably
-  captured — call it again once a token is available or storage recovers so
-  the decision is not dropped at exit.
+  in flight at teardown never chains further requests). A receipt that cannot
+  be durably captured is retried until the deadline; then the client tears
+  down anyway and answers `false, "spool_persist_failed"`. A denial that
+  neither the identity record nor its marker could store deletes the stored
+  identity first, so the next launch starts with consent unknown instead of
+  restoring the earlier grant.
 - **Crash reporting is on by default, with a persisted opt-out.** Crash
   reports ride their own plane, independent of analytics consent:
   `crash.set_enabled(false)` persists a per-app opt-out that stops

@@ -151,9 +151,9 @@ HISTORIC-anon receipt (the key is the one credential that can still carry
 it; a historic-anon pure grant takes the documented terminal `403`), and
 every anon receipt in pure Mode A. `user_verified` receipts go only under
 the minted Mode B token, never a publishable fallback.
-`shutdown` tears the client down while receipts are still pending only when
-they are safely on disk; otherwise it returns `false, "consent_pending"` so
-the host can retry. While consent is unknown no receipt exists to send: the
+`shutdown` tears the client down over pending receipts at once when they
+are safely on disk; otherwise it retries the write until its deadline, then
+tears down anyway and answers `false, "spool_persist_failed"`. While consent is unknown no receipt exists to send: the
 receipt reports an explicit player decision, never the absence of one.
 
 **Receipt delivery is consent-plane traffic, not analytics.** A receipt is
@@ -427,8 +427,9 @@ outbox:
 - is **per-app** (namespaced like the identity record) and goes through
   Defold `sys.save` only (browser storage on HTML5), degrading to in-memory
   retention for the process lifetime outside Defold — in that degraded mode
-  `shutdown()` keeps refusing to tear down (`consent_pending`) while a
-  receipt is undelivered, because nothing durable would survive the exit.
+  `shutdown()` keeps trying to deliver an undelivered receipt until its
+  deadline and then answers `spool_persist_failed`, because nothing durable
+  would survive the exit.
   After teardown the client dispatches nothing: a receipt still in flight
   settles its local bookkeeping, and the remaining durable receipts re-send
   on the next launch instead of chaining more requests.

@@ -49,7 +49,7 @@ the deeper reference.
 
 ## Install
 
-Version pin (CI-checked): this skill matches shardpilot-defold `v0.11.2`.
+Version pin (CI-checked): this skill matches shardpilot-defold `v0.12.0`.
 
 This version includes request compression, a 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history; these were absent from `v0.10.1`.
 
@@ -64,10 +64,10 @@ Two supported paths:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.11.2.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.12.0.zip
 ```
 
-`v0.11.2` is the version this skill matches, and it is the same pin the
+`v0.12.0` is the version this skill matches, and it is the same pin the
 README's Installation section carries.
 
 The earlier off-main `v0.10.1` tag still declares `0.10.0`; see the [changelog](../../../CHANGELOG.md).
@@ -283,11 +283,16 @@ local function suspend_analytics(reason)
 		return
 	end
 	print("shardpilot: analytics suspended (" .. reason .. ")")
-	local ok, err = shardpilot.shutdown("policy_" .. reason)
-	if not ok then
-		print("shardpilot suspend not complete: " .. tostring(err))
-	end
-	analytics_running = false
+	-- shutdown() ends the session, delivers what is queued within its timeout
+	-- (10 s by default) and answers on the main loop. update() keeps pumping
+	-- the closing client, so the flag stays set until that answer: until then
+	-- the module still holds it, and a new init() would be refused.
+	shardpilot.shutdown(nil, function(ok, err)
+		if not ok then
+			print("shardpilot suspend ended with " .. tostring(err))
+		end
+		analytics_running = false
+	end)
 end
 ```
 
@@ -749,18 +754,15 @@ function final(self)
 		crash_running = false
 	end
 	if analytics_running then
-		-- shutdown() starts a final flush. Events it cannot deliver are written
-		-- to the durable offline spool and re-sent on the next launch, so
-		-- shutdown returns true even when the network is down. An undelivered
-		-- consent receipt is handled the same way — durably retained in the
-		-- consent outbox, it re-sends next launch — so shutdown returns
-		-- false, "consent_pending" only when the receipt could NOT be durably
-		-- captured (retry shutdown then); with spool_enabled = false it
-		-- returns false, err whenever events remain undelivered.
-		local ok, err = shardpilot.shutdown("app_final")
-		if not ok then
-			print("shardpilot shutdown not complete: " .. tostring(err))
-		end
+		-- shutdown() ends the session and starts a bounded final flush. What it
+		-- still holds is written to the durable offline spool at once and re-sent
+		-- on the next launch, so the process may end before the answer arrives;
+		-- the answer matters to a host that keeps running.
+		shardpilot.shutdown(nil, function(ok, err)
+			if not ok then
+				print("shardpilot shutdown ended with " .. tostring(err))
+			end
+		end)
 		analytics_running = false
 	end
 end
@@ -824,7 +826,7 @@ Wire the frame loop and teardown:
 <!-- doc-region: none -- the one-line lifecycle reminder; the real lifecycle is the extracted region above -->
 ```lua
 function update(self, dt) shardpilot.update(dt) end  -- drives flush timer + frame sampling
-function final(self)      shardpilot.shutdown("app_final") end
+function final(self)      shardpilot.shutdown() end  -- bounded; what is held is spooled at once
 ```
 
 Identity: a UUIDv7 `anonymous_id` is generated and persisted per app on first
@@ -888,9 +890,10 @@ bugs.
   handed to the transport strictly **before** that cycle's event batch —
   sequencing (handoff order) only; the batch never waits for the receipt's
   acknowledgment. While an analytics **grant** receipt is still awaiting its
-  handoff, `flush()` holds the event batch and returns
-  `false, "consent_receipt_pending"` — expected and self-resolving on the
-  next dispatch; do not treat it as an error.
+  handoff, the event batch waits for it; a `flush(timeout_seconds, callback)`
+  whose deadline passes meanwhile answers `false, "consent_receipt_pending"`
+  in its callback — expected and self-resolving on the next dispatch; do not
+  treat it as an error.
 - **AC-8 / `denied_forced_minor`.** For age-gate-forced denials (under-age
   players), record `set_consent("denied_forced_minor")`. Analytics-wise it is
   identical to `denied` (drop + purge + zero analytics egress); the receipt
@@ -983,11 +986,14 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
   sending. `on_window_event(event)` does this on a background signal and also
   drives the automatic session boundary, so forward every window event to it;
   call `persist()` directly only where there is no window listener.
-- `shutdown(reason)` runs a final flush; with the spool enabled it returns
-  `true` once everything is delivered **or durably spooled** (re-sent next
-  launch). `false, "consent_pending"` means a consent receipt could not be
-  durably captured — retry `shutdown` (keep pumping so async HTTP callbacks
-  can settle).
+- `shutdown(timeout_seconds, callback)` ends the open session with
+  `app_final`, writes what the client holds to the spool at once, delivers it
+  within the timeout (default 10 s) while `update()` keeps pumping, and tears
+  the client down when that settles or at the deadline. The callback answers
+  once: `true`, `false, "pending"` (the remnant is in the spool, re-sent next
+  launch) or `false, "spool_persist_failed"` (storage could not keep
+  everything; a `shutdown` diagnostic names it). Nothing needs a retry: the
+  client always ends by its deadline.
 - The SDK sends no schema-set revision header and exports no default digest.
   There is no `schema_revision` configuration key; constructors reject it with
   `unknown_config_key`.
@@ -1055,8 +1061,8 @@ crash.init({
   crash_key    = "<YOUR-CRASH-WRITE-KEY>",       -- crash:write scope
   app_id           = "<YOUR-APP-ID>",
   app_version      = "1.2.3",
-  -- platform = "windows", -- auto-detected in-engine; REQUIRED explicitly
-  --                       -- outside Defold, or init fails platform_required
+  -- platform = "windows", -- auto-detected in-engine; outside Defold an
+  --                       -- unrecognised runtime is sent as "other"
   -- crash_hooks_enabled = true, -- opt-in Lua script-error auto-capture (dark by default)
 })
 -- crash.init auto-forwards last session's native dump;
@@ -1133,8 +1139,8 @@ crash.record_breadcrumb("menu.open")
 - Consent rules override durability: denied purges the spool; only a
   granted launch loads it (see the consent section).
 - On hosts without Defold's save-file API the spool falls back to process
-  memory and `shutdown()`/`persist()` honestly report `false` rather than
-  claiming durability.
+  memory and `shutdown()`/`persist()` honestly report `spool_persist_failed`
+  rather than claiming durability.
 
 ## Verify your integration
 
@@ -1157,10 +1163,12 @@ surface — no guessing from logs.
 5. **Emit a test event**: `shardpilot.track("integration_test", { ok = true })`
    returns `true` (enqueued).
 6. **Deliver**: keep calling `shardpilot.update(dt)` from your script's
-   `update` (or call `shardpilot.flush()`); HTTP is async, so completion lands
-   on a later frame. `flush()` returning `false, "pending"` (batch in flight)
-   or `false, "consent_receipt_pending"` (grant receipt awaiting handoff) is
-   normal mid-cycle; `true` means the pipeline is drained.
+   `update`, or call `shardpilot.flush(10, function(ok, code) ... end)`. HTTP
+   is async, so the answer arrives in the callback on a later frame; the
+   return value only says the call was taken. `true` means everything held at
+   the call was delivered; `false, "pending"` means the timeout passed with
+   events still queued, and `false, "consent_receipt_pending"` that a grant
+   receipt was still awaiting handoff.
 7. **Confirm acceptance** via `local s = shardpilot.snapshot()` (a copy of the
    client counters):
    - `s.enqueued` ≥ 1, `s.published` ≥ 1, and **`s.accepted` ≥ 1** — the
@@ -1190,9 +1198,9 @@ surface — no guessing from logs.
    returns `true`; then `crash.snapshot()` shows `emitted` ≥ 1 and, after the
    async callback, `accepted` ≥ 1 (`suppressed` counts reports the server
    accepted but did not store; `last_error`/`last_issue` name failures).
-   Outside the Defold engine, set `platform` explicitly in `crash.init` first
-   — auto-detection fails there and `crash.init` returns
-   `platform_required`.
+   Outside the Defold engine, set `platform` explicitly in `crash.init` if
+   you want a specific value: auto-detection cannot identify the runtime there
+   and the report is sent as `other`.
 10. **Offline durability**: go offline, `track` a granted event, then make it
    durable **before** killing the app — a kill right after `track` alone
    loses the event, because `track` only queues it in memory. Either call
@@ -1200,8 +1208,9 @@ surface — no guessing from logs.
    failed offline publish spools the batch (`snapshot().spooled` ≥ 1). Then
    kill, relaunch, come back online — `snapshot()` shows `spool_resent` ≥ 1
    and the event arrives with its original `event_id`.
-11. **Shutdown**: `shardpilot.shutdown("app_final")` returns `true` (or
-    retry it while pumping `update`; see the shutdown notes above).
+11. **Shutdown**: `shardpilot.shutdown(10, function(ok, code) ... end)`
+    answers `true` in its callback once everything is delivered (keep pumping
+    `update` until then; see the shutdown notes above).
 
 ## Known limitations (release preparation 2026-10-02 for `v0.11.2`)
 

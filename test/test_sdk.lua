@@ -2155,23 +2155,29 @@ local function test_flush_and_shutdown_wait_for_async_publish()
 	http.request = original_request
 end
 
-local function test_singleton_shutdown_keeps_client_after_retryable_failure()
+local function test_singleton_shutdown_tears_down_at_the_deadline_after_retryable_failure()
 	reset()
 	seed_granted_consent()
 	next_status = 500
-	-- spool_enabled=false: without the durable spool, a retryable final-flush
-	-- failure must keep the singleton alive for a host retry loop.
+	-- spool_enabled=false: the remnant of a retryable final-flush failure
+	-- cannot be kept, and the close still ends at its deadline.
 	local ok, err = sdk.init(config({ spool_enabled = false }))
 	assert_true(ok, err)
 	assert_true(sdk.identify("user-example"))
 	assert_true(sdk.session_start())
-	ok, err = sdk.shutdown("app_final")
-	assert_equal(ok, false)
+	local answer
+	local ticking = socket.gettime
+	socket.gettime = function() return socket.now end
+	assert_true(sdk.shutdown(1, function(done, code) answer = { done, code } end))
+	assert_equal(answer, nil, "the close waits for its deadline")
 	local snapshot, snapshot_err = sdk.snapshot()
 	assert_true(type(snapshot) == "table", snapshot_err)
-
-	next_status = 202
-	assert_true(sdk.shutdown("app_final"))
+	socket.now = socket.now + 1
+	sdk.update(0)
+	socket.gettime = ticking
+	assert_true(answer ~= nil, "the deadline ends the close")
+	assert_equal(answer[1], false)
+	assert_equal(answer[2], "spool_persist_failed")
 	local missing, missing_err = sdk.snapshot()
 	assert_equal(missing, false)
 	assert_equal(missing_err, "not_initialized")
@@ -2215,7 +2221,7 @@ local function test_singleton_guard()
 			return sdk.persist()
 		end },
 		{ "shutdown", function()
-			return sdk.shutdown("app_final")
+			return sdk.shutdown()
 		end },
 		{ "snapshot", function()
 			return sdk.snapshot()
@@ -2229,7 +2235,7 @@ local function test_singleton_guard()
 	assert_true(ok, err)
 	assert_true(sdk.identify("user-example"))
 	assert_true(sdk.track("singleton_event"))
-	assert_true(sdk.shutdown("app_final"))
+	assert_true(sdk.shutdown())
 
 	for _, entry in ipairs(calls) do
 		assert_not_initialized("post-shutdown " .. entry[1], entry[2])
@@ -8035,7 +8041,7 @@ local tests = {
 	test_session_end_queue_full_keeps_session_active,
 	test_shutdown_queue_full_completes_after_final_flush,
 	test_flush_and_shutdown_wait_for_async_publish,
-	test_singleton_shutdown_keeps_client_after_retryable_failure,
+	test_singleton_shutdown_tears_down_at_the_deadline_after_retryable_failure,
 	test_batch_response_surfaces_per_event_outcomes,
 	test_batch_response_surfaces_suppressed_no_consent,
 	test_batch_response_without_events_array_keeps_accepted,
@@ -13549,7 +13555,7 @@ print("shardpilot defold lua tests passed")
 		assert_true(singleton.session_end(""))
 		assert_true(singleton.flush())
 		one_end("session_end", original)
-		assert_true(singleton.shutdown("ignored"))
+		assert_true(singleton.shutdown())
 		ok, err = singleton.session_end()
 		assert_equal(ok, false)
 		assert_equal(err, "not_initialized")
@@ -14455,7 +14461,7 @@ end)()
 				assert_true(facade.init(outer))
 				assert_true(facade.track("boot_pending", { synthetic = true }))
 				facade.update(0.75)
-				assert_equal(first_ok, false, "real shutdown failed with an undurable remnant")
+				assert_equal(first_ok, true, "the shutdown is taken and closes by its deadline")
 				assert_true(pending_after_failure, "failed shutdown retained the undurable batch")
 				assert_true(#requests > 0, "shutdown ran the real publisher")
 				assert_equal(boot_calls, 1, "failed shutdown also stops remaining boot hooks")
@@ -14641,7 +14647,7 @@ end)()
 			assert_equal(facade.get_anonymous_id(), "synthetic-after-error")
 		end)
 	end)
-	scene("retryable shutdown retains facade ownership", function()
+	scene("a closing client keeps facade ownership until its close ends", function()
 		fresh(function(facade, calls)
 			local original = cfg("synthetic-pending")
 			original.spool_enabled = false
@@ -14649,17 +14655,21 @@ end)()
 			assert_true(facade.init(original))
 			assert_true(facade.session_start())
 			next_status = 500
-			local ok = facade.shutdown()
-			assert_equal(ok, false, "real shutdown has work left")
+			local answer
+			assert_true(facade.shutdown(nil, function(done, code) answer = { done, code } end), "the shutdown is taken")
 			assert_true(#requests > 0, "real publisher ran")
-			local code
-			ok, code = facade.init(cfg("synthetic-replacement"))
+			assert_equal(answer, nil, "the close still has work left")
+			local ok, code = facade.init(cfg("synthetic-replacement"))
 			assert_equal(ok, false)
 			assert_equal(code, "already_initialized")
 			assert_equal(calls(), 1)
 			assert_equal(facade.get_anonymous_id(), "synthetic-pending")
 			next_status = 202
-			assert_true(facade.shutdown())
+			for _ = 1, 400 do
+				if answer then break end
+				facade.update(0.1)
+			end
+			assert_true(answer ~= nil, "the close ends by its deadline")
 			assert_true(facade.init(cfg("synthetic-next")))
 		end)
 	end)
@@ -14764,17 +14774,23 @@ end)()
 			assert_true(require("test.inspect_client").state(client).spool_purge_pending, "getter does not settle purge debt")
 		end)
 	end)
-	scene("retryable shutdown retains the current facade state", function()
+	scene("a closing client keeps the current facade state until its close ends", function()
 		fresh(function(facade, options)
 			options.spool_enabled = false
 			seed_granted_consent(options)
 			assert_true(facade.init(options)); assert_true(facade.session_start())
 			next_status = 500
-			assert_equal(facade.shutdown(), false)
+			local answer
+			assert_true(facade.shutdown(nil, function(done, code) answer = { done, code } end))
 			assert_true(#requests > 0, "real shutdown publisher ran")
+			assert_equal(answer, nil, "the close still has work left")
 			read_only(function() return facade.get_consent_state() end, "granted")
 			next_status = 202
-			assert_true(facade.shutdown())
+			for _ = 1, 400 do
+				if answer then break end
+				facade.update(0.1)
+			end
+			assert_true(answer ~= nil, "the close ends by its deadline")
 			read_only(function() return facade.get_consent_state() end, "unknown")
 		end)
 	end)
@@ -17090,4 +17106,235 @@ end)()
   assert_true(not pcall(sdk_header.value_for,bad),"refused release version: "..tostring(bad))
  end
  print("sdk header: PASS")
+end)()
+
+-- Bounded shutdown: shutdown(timeout_seconds, callback) ends the open session,
+-- drains what is held like flush(), and tears the client down once that
+-- settles, or at the deadline whatever is left, answering every caller once.
+;(function()
+ local saved_socket=socket
+ local passed,failed=0,0
+ local function scene(name,run)
+  reset();storage.reset()
+  local real_request,real_remove=http.request,os.remove
+  socket={now=1000,gettime=function()return socket.now end}
+  local ok,err=pcall(run)
+  socket=saved_socket;http.request=real_request;os.remove=real_remove
+  sys.get_save_file,sys.save,sys.load=nil,nil,nil
+  storage.reset()
+  if ok then passed=passed+1 else failed=failed+1 end
+  print("bounded-shutdown "..name..": "..(ok and "PASS" or "FAIL "..tostring(err)))
+ end
+ local function answers()
+  local calls={}
+  return calls,function(ok,code)calls[#calls+1]={ok=ok,code=code}end
+ end
+ local function answered(calls,ok,code,message)
+  assert_equal(#calls,1,(message or "answer").." count")
+  assert_equal(calls[1].ok,ok,(message or "answer").." result")
+  assert_equal(calls[1].code,code,(message or "answer").." code")
+ end
+ local function client_with(overrides)
+  seed_granted_consent()
+  local cfg=config({flush_interval_seconds=9999})
+  for k,v in pairs(overrides or {})do cfg[k]=v end
+  local client=assert(sdk.new(cfg))
+  assert_true(client:identify("user-example"))
+  return client
+ end
+ local function session_ends()
+  local reasons={}
+  for _,r in ipairs(requests)do
+   for reason in (r.body or ""):gmatch('"event_name":"app.session_ended".-"reason":"([%w_]+)"') do reasons[#reasons+1]=reason end
+  end
+  return reasons
+ end
+
+ scene("ends the session, drains, then tears down and answers success",function()
+  local client=client_with()
+  assert_true(client:session_start());assert_true(client:track("before_quit"))
+  local held=hold_http_requests()
+  local calls,cb=answers()
+  assert_equal(client:bounded_shutdown(5,cb),true)
+  assert_equal(#session_ends(),1,"the session ends before the final drain goes out")
+  assert_equal(#calls,0,"the close waits for the network")
+  assert_true(client.initialized,"the client lives while it closes")
+  while held[1] do release_held_request(held);client:update(0) end
+  answered(calls,true,nil,"drained")
+  assert_equal(client.initialized,false,"torn down")
+  local ends=session_ends()
+  assert_equal(#ends,1,"one session end");assert_equal(ends[1],"app_final")
+ end)
+
+ scene("a pause past its deadline ends with idle_timeout",function()
+  local client=client_with({session_timeout_seconds=10})
+  assert_true(client:session_start())
+  client.backgrounded=true
+  client.paused={session=client.session,wall_ms=require("shardpilot.clock").unix_ms()-11000,frames=client.frame_seconds}
+  local calls,cb=answers()
+  assert_true(client:bounded_shutdown(5,cb))
+  answered(calls,true,nil,"closed")
+  local ends=session_ends()
+  assert_equal(#ends,1,"one session end");assert_equal(ends[1],"idle_timeout")
+ end)
+
+ scene("no open session sends no end",function()
+  local client=client_with()
+  assert_true(client:track("in_a_session"));assert_true(client:session_end("finished"))
+  local calls,cb=answers()
+  assert_true(client:bounded_shutdown(5,cb))
+  answered(calls,true,nil,"closed")
+  local ends=session_ends()
+  assert_equal(#ends,1,"only the host's own end");assert_equal(ends[1],"finished")
+ end)
+
+ scene("the deadline spools the remnant, tears down and answers pending",function()
+  local stores=install_stub_sys_storage()
+  local client=client_with()
+  assert_true(client:track("unsent"))
+  hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_shutdown(1,cb))
+  assert_equal(#calls,0)
+  socket.now=socket.now+1;client:update(0)
+  answered(calls,false,"pending","deadline")
+  assert_equal(client.initialized,false,"torn down at the deadline")
+  local record=stored_spool_record(stores)
+  assert_true(record~=nil and #record.events>0,"the remnant is kept for the next launch")
+ end)
+
+ scene("what the close holds is on disk before any answer",function()
+  local stores=install_stub_sys_storage()
+  local client=client_with()
+  assert_true(client:session_start());assert_true(client:track("exit_now"))
+  hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_shutdown(5,cb))
+  assert_equal(#calls,0,"the close is still waiting")
+  local record=stored_spool_record(stores)
+  local names={}
+  for _,env in ipairs(record and record.events or {}) do names[env.event_name]=true end
+  assert_true(names.exit_now,"a process exit now still keeps the event")
+  assert_true(names["app.session_ended"],"and the session end")
+ end)
+
+ scene("the deadline without durable storage answers spool_persist_failed",function()
+  local issues={}
+  local client=client_with({spool_enabled=false,diagnostics=function(issue)issues[#issues+1]=issue end})
+  assert_true(client:track("unkept"))
+  hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_shutdown(1,cb))
+  socket.now=socket.now+1;client:update(0)
+  answered(calls,false,"spool_persist_failed","deadline")
+  assert_equal(client.initialized,false,"no client is kept alive past the deadline")
+  local told=false
+  for _,issue in ipairs(issues)do if issue.scope=="shutdown" and issue.code=="spool_persist_failed" then told=true end end
+  assert_true(told,"a diagnostic names the loss")
+ end)
+
+ scene("a terminal refusal answers its code and tears down",function()
+  local client=client_with()
+  assert_true(client:track("refused"))
+  next_status=400;next_response_body='{"error":{"code":"validation_failed","message":"synthetic"}}'
+  local calls,cb=answers()
+  assert_true(client:bounded_shutdown(5,cb))
+  answered(calls,false,"http_400","refusal")
+  assert_equal(client.initialized,false)
+ end)
+
+ scene("a concurrent call joins and a later call gets the first answer",function()
+  local client=client_with()
+  assert_true(client:track("shared"))
+  local held=hold_http_requests()
+  local first,cb1=answers();local second,cb2=answers()
+  assert_true(client:bounded_shutdown(5,cb1))
+  assert_equal(client:bounded_shutdown(1,cb2),true,"a concurrent call is taken")
+  assert_equal(#second,0,"and waits for the same close")
+  while held[1] do release_held_request(held);client:update(0) end
+  answered(first,true,nil,"first");answered(second,true,nil,"second")
+  local third,cb3=answers()
+  local ok,code=client:bounded_shutdown(5,cb3)
+  assert_equal(ok,true);assert_equal(code,nil)
+  answered(third,true,nil,"after the close")
+ end)
+
+ scene("a refused call keeps the client",function()
+  local client=client_with()
+  local calls,cb=answers()
+  local ok,code=client:bounded_shutdown(0,cb)
+  assert_equal(ok,false);assert_equal(code,"invalid_timeout_seconds")
+  answered(calls,false,"invalid_timeout_seconds","refusal")
+  ok,code=client:bounded_shutdown(1,"callback")
+  assert_equal(ok,false);assert_equal(code,"invalid_callback")
+  assert_true(client.initialized,"nothing was torn down")
+  assert_true(client:track("still_open"))
+ end)
+
+ for _,delete_works in ipairs({true,false})do
+  scene("an unstored denial at the deadline "..(delete_works and "deletes the stored grant" or "is reported when nothing can be written"),function()
+   local stores=install_stub_sys_storage()
+   local issues={}
+   local client=client_with({diagnostics=function(issue)issues[#issues+1]=issue end})
+   local save=sys.save
+   sys.save=function(path,record)
+    if not delete_works then return false end
+    if path:sub(-9)=="/identity" or path:sub(-15)=="/consent-denial" then return false end
+    return save(path,record)
+   end
+   os.remove=function(path)
+    if delete_works then stores[path]=nil;return true end
+    return nil,"synthetic remove failure"
+   end
+   assert_true(client:set_consent(false))
+   assert_true(client.consent_denial_record_pending and client.consent_denial_marker_pending,"neither write landed")
+   local calls,cb=answers()
+   assert_true(client:bounded_shutdown(1,cb))
+   assert_equal(#calls,0,"storage is retried until the deadline")
+   socket.now=socket.now+1;client:update(0)
+   answered(calls,false,"spool_persist_failed","deadline")
+   assert_equal(client.initialized,false,"torn down at the deadline")
+   local said
+   for _,issue in ipairs(issues)do if issue.scope=="shutdown" then said=issue.message end end
+   assert_true(said~=nil,"a diagnostic names the loss")
+   assert_contains(said,delete_works and "denial_stored_as_unknown" or "denial_not_stored")
+   if delete_works then
+    sys.save=save;storage.reset()
+    local relaunched=assert(sdk.new(config({flush_interval_seconds=9999})))
+    assert_equal(relaunched.consent_state,"unknown","the next launch does not restore the grant")
+   end
+  end)
+ end
+
+ scene("the module releases its client when the close ends",function()
+  local module=require("shardpilot.sdk")
+  local calls,cb=answers()
+  local ok,code=module.shutdown(1,cb)
+  assert_equal(ok,false);assert_equal(code,"not_initialized")
+  answered(calls,false,"not_initialized","before init")
+  seed_granted_consent()
+  assert_true(module.init(config({flush_interval_seconds=9999})))
+  local held=hold_http_requests()
+  assert_true(module.track("on_the_way_out"))
+  local closed,cb2=answers()
+  assert_true(module.shutdown(5,cb2))
+  assert_equal(module.init(config()),false,"the closing client still owns the module")
+  while held[1] do release_held_request(held);module.update(0) end
+  answered(closed,true,nil,"closed")
+  assert_true(module.init(config({flush_interval_seconds=9999})),"a new client after the close")
+  assert_true(module.shutdown())
+ end)
+
+ scene("the public handle takes a timeout and a callback",function()
+  seed_granted_consent()
+  local handle=assert(require("shardpilot.sdk").new(config({flush_interval_seconds=9999})))
+  local calls,cb=answers()
+  assert_true(handle:shutdown(5,cb))
+  answered(calls,true,nil,"closed")
+  local ok,code=handle:track("after")
+  assert_equal(ok,false);assert_equal(code,"shutdown")
+ end)
+
+ print(string.format("bounded shutdown: %d pass, %d fail",passed,failed))
+ assert_equal(failed,0,"bounded shutdown scenes")
 end)()
