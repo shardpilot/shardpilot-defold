@@ -44,23 +44,21 @@
 --     (see apply_age_withdrawal). A host fetch that DECLARES a non-adult age
 --     stops a client-id experiment serving until it ends, and withdraws it
 --     the same way when it ends without the server's answer applied (see
---     begin_host_declaration). An UNKNOWN reason — like a 200 whose
---     body names a DIFFERENT experiment than the request — is treated as
---     malformed (transient serve-stale), never executed as a directive
---     this client does not understand.
+--     begin_host_declaration). Future reason strings become unknown and
+--     install not-assigned; malformed types and cross-scope answers remain
+--     transient. Unsupported units cannot authorize a treatment.
 --   * 401/403 — fail CLOSED: the result never serves a cached assignment,
 --     in-memory serving stops (getters return nil) and revalidation halts
 --     until re-init or a later successful, authorized fetch. The durable
 --     cache record itself is left untouched (remote-config parity) EXCEPT
---     for the server's real-subjects kill sentinel ("experiment real-subject
---     assignment is disabled"), which additionally drops the durable record
+--     for exact error.code real_subjects_disabled, which drops the durable record
 --     — the platform flipped the real-subjects flag back off, and the cached
 --     assignment plus its subject-fact key must not outlive that.
 --   * 404 — permanent for the experiment: treated as not-assigned, the
 --     cached assignment is dropped and never served stale, and revalidation
 --     stops asking for that key (the drop removes it from the cache).
---   * 400 — permanent for this input set. One special case: the subject-id
---     grammar sentinel with an SDK-minted subject id re-mints the id ONCE
+--   * 400 — permanent except subject_id_invalid or subject_pii_marker:
+--     those codes with an SDK-minted subject id re-mint the id ONCE
 --     per process and retries (a conforming mint that still 400s is a bug,
 --     surfaced through diagnostics, never a retry loop).
 --   * 503 / 429 / 5xx / offline / timeout / malformed — transient: the
@@ -153,10 +151,11 @@ local custom_attribute_prefix = "custom_attribute_"
 local max_attribute_value_bytes = 512
 local max_attributes = 64
 
--- Server error sentinels this client reacts to by text (the error contract
--- distinguishes same-status outcomes only by the body's `error` string).
-local sentinel_real_subjects_disabled = "experiment real-subject assignment is disabled"
-local sentinel_subject_grammar = "experiment metadata must use synthetic local-safe identifiers only"
+-- Codes are exact and paired with their route/status by each caller.
+local function feature_disabled(code, apply)
+	return code == "runtime_disabled" or code == "experiments_disabled"
+		or code == (apply and "experiment_apply_disabled" or "experiment_assignment_disabled")
+end
 
 local function trim_slash(value)
 	return (value:gsub("/+$", ""))
@@ -496,13 +495,26 @@ local function copy_value(value, depth)
 	return out
 end
 
--- The body `error` string of a non-2xx answer, or nil.
-local function response_error_text(response)
-	local decoded = decode_object(type(response) == "table" and response.response or nil)
-	if decoded and type(decoded.error) == "string" then
-		return decoded.error
+-- Only a complete, unambiguous envelope grants a code-specific action.
+-- The bounded object reader rejects duplicate members, including escaped keys.
+-- Human messages and unknown members never select an action.
+local function response_error(response)
+	local decoded, fields = facts.object(type(response) == "table" and response.response or nil)
+	local raw = fields and fields.error
+	local err = decoded and decoded.error
+	if not raw or not raw.fields or type(err) ~= "table" or type(err.code) ~= "string" then
+		return nil, false
 	end
-	return nil
+	local age = false
+	local details = raw.fields.details
+	if details and details.raw:sub(1, 1) == "[" and type(err.details) == "table" then
+		for _, detail in ipairs(err.details) do
+			if type(detail) == "table" and detail.field == "reason" and detail.code == "age_ineligible" then
+				age = true
+			end
+		end
+	end
+	return err.code, age
 end
 
 -- Order-insensitive-in-effect equality of two normalized attribute sets
@@ -868,17 +880,21 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 	end
 
 	-- Unauthorized / forbidden fail CLOSED (a dark server, a revoked or
-	-- unscoped key, a suspended tenant — indistinguishable here, all must
+	-- unscoped key, a suspended tenant — diagnostics distinguish codes; all must
 	-- stop serving): the cached record is never served for this outcome and
 	-- revalidation halts. The durable record is kept EXCEPT under the
 	-- real-subjects kill sentinel, which drops it — the assignment and its
 	-- subject-fact key must not outlive the platform flipping that flag off.
+	local code = response_error(response)
 	if status == 401 or status == 403 then
 		local outcome = { authoritative = true, auth_blocked = true }
-		if status == 403 and response_error_text(response) == sentinel_real_subjects_disabled then
+		if status == 403 and code == "real_subjects_disabled" then
 			outcome.drop_all = true
+		elseif status == 403 and feature_disabled(code, false) then
+			outcome.disabled_code = code
 		end
-		return { ok = false, from_cache = false, error = "unauthorized" }, outcome
+		return { ok = false, from_cache = false,
+			error = outcome.disabled_code and "disabled" or "unauthorized" }, outcome
 	end
 
 	-- Unknown experiment key or nothing published in scope: permanent for
@@ -896,8 +912,8 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 	end
 
 	-- Bad inputs are permanent for this input set — retrying unchanged cannot
-	-- help. The one self-healing case: the subject-grammar sentinel with an
-	-- SDK-minted id means the persisted id went bad; the caller re-mints once
+	-- help. The two self-healing codes identify an invalid SDK-minted subject
+	-- or a PII-marker collision; the caller re-mints once
 	-- (fresh-install semantics) and retries — deliberately NOT a drop: the
 	-- assignment itself was never rejected, the subject id was. Every OTHER
 	-- 400 fails closed for the experiment: a cached assignment whose
@@ -905,7 +921,7 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 	-- forever while the cadence re-sends the same invalid input set, so the
 	-- entry drops (durably, with the usual decision-time stamp raise).
 	if status == 400 then
-		if response_error_text(response) == sentinel_subject_grammar then
+		if code == "subject_id_invalid" or code == "subject_pii_marker" then
 			return { ok = false, from_cache = false, error = "bad_request" },
 				{ authoritative = true, remint = true }
 		end
@@ -1095,6 +1111,7 @@ function M.new(config, deps)
 		-- remote-config discipline: only an outcome newer than every settled
 		-- one for its key may install.
 		fetch_seq = 0,
+		fetch_started = {},
 		settled = {},
 		-- The host's non-adult age declarations whose fetch has not ended:
 		-- experiment_key → { fence_seq, seq, decided } (see
@@ -2296,6 +2313,8 @@ function Experiments:seal_application(experiment_key, record)
 	local auth_epoch = self.auth_epoch
 	local dispatched = clock.unix_ms()
 	local scope = self:scope_for(entry.subject_key)
+	local assignment_at_dispatch = self.entries[experiment_key]
+	local fetch_at_dispatch = self.fetch_started[experiment_key]
 	record.flight = flight
 	record.deadline = dispatched + self.config.http_timeout_seconds * 1000
 	local function complete(_, _, response)
@@ -2307,7 +2326,9 @@ function Experiments:seal_application(experiment_key, record)
 			or epoch ~= self.consent_epoch or consent_refusal(self.deps.consent()) then return end
 		response = type(response) == "table" and response or {}
 		local status = tonumber(response.status) or 0
-		if status == 403 and response_error_text(response) == sentinel_real_subjects_disabled then
+		local code, age_refusal = response_error(response)
+		if status == 403 and code == "real_subjects_disabled" then
+			self.blocked_error = "unauthorized"
 			self.auth_blocked = true
 			self.auth_epoch = self.auth_epoch + 1
 			self:apply_sentinel_withdrawal(scope, clock.unix_ms(), dispatched)
@@ -2349,21 +2370,30 @@ function Experiments:seal_application(experiment_key, record)
 			end
 			self:diagnose("fact_deferred", err)
 		elseif status == 401 or status == 403 then
+			local disabled = status == 403 and feature_disabled(code, true)
+			self.blocked_error = disabled and "disabled" or "unauthorized"
 			self.auth_blocked = true
 			self.auth_epoch = self.auth_epoch + 1
 			self.entries = {}
 			for key, pending in pairs(self.durable_pending) do
 				if not pending.drop then self.durable_pending[key] = nil end
 			end
-			self:diagnose("fact_deferred", "apply_" .. tostring(status))
+			self:diagnose(disabled and "disabled" or "fact_deferred", disabled and code or "apply_" .. tostring(status))
 			return
 		elseif status >= 400 and status < 500 and status ~= 408 and status ~= 429 then
-			local decoded = decode_object(response.response)
-			if status == 409 and decoded and decoded.error == "not_assigned" and decoded.reason == "age_ineligible" then
+			if status == 409 and code == "not_assigned" and age_refusal then
 				self:apply_age_withdrawal(scope, experiment_key, clock.unix_ms(), entry.subject_fact_key)
 			else
 				table.remove(list, 1)
 				if not list[1] then self.pending_exposure[experiment_key] = nil end
+				if status == 409 and (code == "version_mismatch" or code == "variant_mismatch" or code == "unit_not_recordable")
+					and scope == self:scope_for(self:current_subject_id())
+					and self.entries[experiment_key] == assignment_at_dispatch
+					and self.fetch_started[experiment_key] == fetch_at_dispatch then
+					-- Do not let a refused old occurrence outrank a newer host
+					-- request or installed assignment. Reuse current targeting.
+					self:fetch(experiment_key, nil, nil, true, (assignment_at_dispatch or entry).attributes)
+				end
 			end
 			self:diagnose("fact_skipped", "apply_" .. tostring(status))
 			return
@@ -3092,6 +3122,8 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 		-- assignments outright.
 		self.auth_blocked = true
 		self.auth_epoch = self.auth_epoch + 1
+		self.blocked_error = outcome.disabled_code and "disabled" or "unauthorized"
+		if outcome.disabled_code then self:diagnose("disabled", outcome.disabled_code) end
 		if outcome.drop_all then
 			self:apply_sentinel_withdrawal(scope, resolved_at_ms,
 				dispatched_at_ms)
@@ -3324,6 +3356,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	local subject = self:ensure_subject_id()
 	self.fetch_seq = self.fetch_seq + 1
 	local seq = self.fetch_seq
+	self.fetch_started[experiment_key] = seq
 	if own_declaration and self.declaring[experiment_key] == declaration then
 		declaration.seq = seq
 	elseif preset_attributes ~= nil and not is_revalidation
@@ -3553,7 +3586,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		-- latch-setting response itself re-derives its own identical
 		-- closed result here.)
 		if auth_epoch ~= self.auth_epoch then
-			conclude({ ok = false, from_cache = false, error = "unauthorized" })
+			conclude({ ok = false, from_cache = false, error = self.blocked_error or "unauthorized" })
 			return
 		end
 		-- The subject-scope re-check guards the callback the same way: a

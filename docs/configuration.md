@@ -318,7 +318,7 @@ The public calls, verified against `shardpilot/sdk.lua`:
   Pre-dispatch failure codes: `not_initialized`, `shutdown`,
   `experiments_not_configured`, `experiment_key_required`, `consent_unknown`,
   `consent_denied`, `http_unavailable`, `json_unavailable`. Values that reach
-  you as `result.error`: `unauthorized`, `not_found`, `bad_request`,
+  you as `result.error`: `disabled`, `unauthorized`, `not_found`, `bad_request`,
   `malformed_response`, `stale_subject`, `superseded`, the consent trio
   below, and the transient family — `http_0` (no connection),
   `transient_408`, `transient_429`, `transient_<5xx>` — with `http_<status>`
@@ -370,9 +370,14 @@ share an eight-record FIFO per experiment; overflow drops the oldest and reports
 `fact_skipped` / `owed_overflow`. A full analytics queue retains a sealed record.
 
 Apply `401`/`403` responses hold the record until an authorized fetch; the
-real-subjects-disabled sentinel withdraws the whole plane. Other `4xx` responses
-are terminal except `408` and `429`. An age-ineligible refusal withdraws the
-subject's facts for that experiment. Offline, timeout, malformed responses,
+exact `403` `real_subjects_disabled` code withdraws the whole plane.
+`403` `experiment_apply_disabled` keeps unsent facts and reports a `disabled`
+diagnostic. Other `4xx` responses
+are terminal except `408` and `429`. Exact `409` `not_assigned` with
+`details:[{"field":"reason","code":"age_ineligible"}]` withdraws the subject's
+facts for that experiment. `409` `version_mismatch`, `variant_mismatch`, and
+`unit_not_recordable` drop the refused fact and refetch current targeting unless
+a newer host fetch or assignment already supersedes the request. Offline, timeout, malformed responses,
 redirects, `408`, `429` and `5xx` retry with backoff and delta-seconds
 `Retry-After`. Redirects are never followed. Analytics per-event rejection stays
 terminal and visible through the rejection ring.
@@ -389,17 +394,21 @@ game sees before the first fetch resolves, when the subject is not assigned,
 and in every fail-closed state below.
 
 **Experiments must also be enabled server-side for your app.** Until they
-are, the assignment endpoint answers `403` and this client treats it like any
-other unauthorized answer — it **fails closed**: the fetch reports
-`error = "unauthorized"`, **no variant is served** (not even a previously
-cached one), the getters return `nil`, and in-memory serving plus the
-revalidation cadence stop until you re-`init()` or a later fetch is
-authorized. The durable cache record is kept, not destroyed — with one
-exception: a `403` whose body reports that real-subject assignment was
-switched off also drops the stored record, so a withdrawn assignment cannot
-outlive the switch. Both flavors report the same `unauthorized`, so game code
-has nothing extra to branch on. So shipping a build with the flag on is safe
-on its own: with nothing enabled server-side your game runs the control path.
+are, `403` with `error.code` `runtime_disabled`, `experiments_disabled`, or
+`experiment_assignment_disabled` **fails closed** and reports `error = "disabled"`
+plus a `disabled` diagnostic with that code. Other `401`/`403` answers report
+`unauthorized`. No variant is served, the getters return `nil`, and revalidation
+stops until re-`init()` or a later authorized explicit fetch. The durable cache
+is retained except for exact `403` `real_subjects_disabled`, which also
+withdraws every cached assignment and owed experiment fact.
+
+Assignment and apply actions use exact, case-sensitive `error.code`, never
+human messages. Unknown codes, malformed/ambiguous envelopes, and older flat
+error strings get the status-only policy. This build requires the structured
+SDK error envelope from the server; there is no dual-read text fallback.
+Exact `400` `subject_id_invalid` or `subject_pii_marker` remints the SDK's subject
+once per process and retries the same targeting. Other `400` codes never remint;
+`500` `definition_invalid` remains transient and serves matching stale state.
 
 **Consent: granted-only.** Assignment fetches, cached serving, revalidation,
 and the subject-id mint all require analytics consent `granted`. Under

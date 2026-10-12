@@ -1198,7 +1198,7 @@ shardpilot.track_outcome("menu_layout", "purchase_cents", 499) -- ok, err
 
 | Call | Returns | Failure codes you can branch on |
 |---|---|---|
-| `fetch_experiment_assignment(key, [attributes], callback)` | `true` = dispatched, or `false, err` = refused before dispatch; the assignment arrives through `callback` unless `shutdown()` cancels it first | pre-dispatch: `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `consent_unknown`, `consent_denied`, `http_unavailable`, `json_unavailable`. In the callback's `result.error`: `unauthorized`, `not_found`, `bad_request`, `malformed_response`, `stale_subject`, `superseded`, `consent_unknown`, `consent_denied`, `consent_changed`, `http_0`, `transient_408`, `transient_429`, `transient_<5xx>`, and `http_<status>` for anything unclassified |
+| `fetch_experiment_assignment(key, [attributes], callback)` | `true` = dispatched, or `false, err` = refused before dispatch; the assignment arrives through `callback` unless `shutdown()` cancels it first | pre-dispatch: `not_initialized`, `shutdown`, `experiments_not_configured`, `experiment_key_required`, `consent_unknown`, `consent_denied`, `http_unavailable`, `json_unavailable`. In the callback's `result.error`: `disabled`, `unauthorized`, `not_found`, `bad_request`, `malformed_response`, `stale_subject`, `superseded`, `consent_unknown`, `consent_denied`, `consent_changed`, `http_0`, `transient_408`, `transient_429`, `transient_<5xx>`, and `http_<status>` for anything unclassified |
 | `fetch_experiment_assignment_with_age_band(key, age_band, [attributes], callback)` | The same dispatch status and callback as `fetch_experiment_assignment` | The same failures, plus `invalid_experiment_age_band` for an unsupported band or conflicting canonical attribute, and `invalid_experiment_attributes` for a non-table attributes argument |
 | `experiment_variant(key)` | variant key `string`, or `nil` | — (never fails) |
 | `experiment_payload(key)` | the variant payload (a copy), or `nil` | — (never fails) |
@@ -1283,13 +1283,23 @@ the id is never host-settable: there is no supported way to pin it yourself.
   `client_id` and `synthetic_subject_key` can install or restore a treatment.
   Other response members remain open; malformed types, nulls, required fields
   and cross-scope answers retain their validation rules.
-- **`401`/`403` fail closed** — the fetch reports `unauthorized`, **nothing is
-  served** for that outcome, the getters go `nil`, and revalidation stops
-  until re-`init()` or a later authorized fetch. The durable record is kept —
-  with one exception: a `403` whose body reports that real-subject assignment
-  was switched off also drops the stored record, so a withdrawn assignment
-  cannot outlive the switch. Both flavors report the same `unauthorized`, so
-  game code has nothing extra to branch on.
+- **`401`/`403` fail closed** — nothing is served, getters return `nil`, and
+  revalidation stops until re-`init()` or a later authorized explicit fetch.
+  A `403` with `error.code` `runtime_disabled`, `experiments_disabled`, or
+  `experiment_assignment_disabled` reports `result.error = "disabled"` and a
+  `disabled` diagnostic with that code. Other `401`/`403` responses report
+  `unauthorized`. The durable record is retained except for exact `403`
+  `real_subjects_disabled`, which withdraws every cached assignment and owed
+  experiment fact.
+- **Subject refusals** — exact `400` `subject_id_invalid` or
+  `subject_pii_marker` remints the SDK's subject once per process and retries
+  with the same targeting attributes. Other `400` codes never remint;
+  `500` `definition_invalid` keeps the transient/stale policy.
+- **Error envelope** — assignment and apply use status plus exact,
+  case-sensitive `error.code`. Human messages, retired flat error strings,
+  unknown codes, and malformed or ambiguous envelopes grant no special action.
+  This build requires a server that supplies the structured SDK error envelope;
+  it does not also match older server messages.
 - **`404`** — permanent for that experiment key: treated as not-assigned,
   never served stale, and the revalidation cadence stops asking for it.
 - **Transient** (`429`, `5xx`, `408`, offline, timeout, malformed body) — the
@@ -1393,10 +1403,10 @@ other eligibility and consent checks.
 ### Before the server enables experiments for your app
 
 Experiments must be enabled **server-side for your app** as well. Until that
-happens, the assignment endpoint answers `403`, and this client treats it
-exactly like any other unauthorized answer — it **fails closed**:
+happens, the assignment endpoint answers `403` with a feature-disabled code,
+and this client **fails closed**:
 
-- the fetch reports `ok = false, error = "unauthorized"`;
+- the fetch reports `ok = false, error = "disabled"`;
 - **no variant is served** — not even a previously cached one;
 - `experiment_variant` / `experiment_payload` return `nil`, so your game runs
   its control experience;
@@ -1451,10 +1461,14 @@ game has to handle specially.
   saved for later age withdrawal before the fact can be forwarded.
 - **Retry and withdrawal.** A `200` with a valid matching fact seals the record.
   `401`/`403` holds it and stops apply traffic until an authorized fetch;
-  the real-subjects-disabled sentinel withdraws all owed records and cached
-  assignments. Other `4xx` responses are terminal, except `408` and `429`.
-  An `age_ineligible` apply refusal also withdraws that subject's experiment
-  facts. Offline, timeout, malformed responses, `3xx`, `408`, `429` and `5xx`
+  `403` `experiment_apply_disabled` reports a `disabled` diagnostic and keeps
+  unsent facts; `403` `real_subjects_disabled` withdraws all owed records and
+  cached assignments. Other `4xx` responses are terminal, except `408` and `429`.
+  Exact `409` `not_assigned` with a `details` array entry whose `field` is
+  `reason` and `code` is `age_ineligible` withdraws that subject's experiment
+  facts. `409` `version_mismatch`, `variant_mismatch`, or `unit_not_recordable`
+  drops the refused fact and refetches assignment with current targeting,
+  unless a newer host request or assignment already supersedes that request. Offline, timeout, malformed responses, `3xx`, `408`, `429` and `5xx`
   keep the occurrence and retry with backoff and delta-seconds `Retry-After`.
   Redirects are refused, including HTML5's browser transport. Queue overflow
   and terminal apply responses report `fact_skipped`; deferred failures report
