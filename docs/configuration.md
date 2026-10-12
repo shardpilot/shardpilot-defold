@@ -168,7 +168,8 @@ host that stops calling `update()` gets no answer.
    durable spool as soon as the call starts, so a process that ends before
    the answer loses nothing.
 3. It tears the client down once that settles, or at the deadline with
-   whatever is left. Nothing keeps a closing client alive past its deadline.
+   whatever is left. The close advances from `update()`, so the client is
+   torn down by its deadline only while the host keeps calling `update()`.
 
 The callback runs once, on the main loop, with `true` or `false` and a code:
 
