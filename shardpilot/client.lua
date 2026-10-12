@@ -2739,6 +2739,12 @@ function Client:set_consent(decision, notice)
 		return false, "invalid_consent"
 	end
 	local granted = next_state == "granted"
+	if not granted and self.flush_drains[1] then
+		-- A revocation removes held events: a bounded flush whose deadline
+		-- already passed answers first, as of now, so the purge cannot make
+		-- it a success.
+		self:settle_flush_drains()
+	end
 	if self.consent_state == "denied_forced_minor" then
 		if granted then return false, "consent_forced_minor" end
 		-- The forced denial already stands. A new reasonless receipt would
@@ -7059,28 +7065,36 @@ end
 -- done: success means nothing from the call is still held.
 local DEFAULT_FLUSH_TIMEOUT_SECONDS = 10
 
--- Every event id this client still holds for delivery.
+-- The summaries a flush builds itself: the only events that join a bounded
+-- flush after its call.
+local CALL_SUMMARIES = { perf_summary = true, network_summary = true }
+
+-- Every event id this client still holds for delivery, mapped to its event
+-- name (or true when the held copy carries none).
 function Client:pending_delivery_ids()
 	local ids = {}
+	local function hold(event)
+		ids[event.event_id] = event.event_name or true
+	end
 	for i = 1, #self.queue.items do
-		ids[self.queue.items[i].event_id] = true
+		hold(self.queue.items[i])
 	end
 	local batch = self.in_flight_batch
 	if batch then
 		for i = 1, #batch do
-			ids[batch[i].event_id] = true
+			hold(batch[i])
 		end
 	end
 	for i = 1, #self.spool_batches do
 		local chunk = self.spool_batches[i]
 		for j = 1, #chunk do
-			ids[chunk[j].event_id] = true
+			hold(chunk[j])
 		end
 	end
 	for i = 1, #self.owed_summaries do
 		local event = self.owed_summaries[i].event
 		if event then
-			ids[event.event_id] = true
+			hold(event)
 		end
 	end
 	return ids
@@ -7092,7 +7106,8 @@ end
 function Client:note_terminal_drop(events, code)
 	for _, drain in ipairs(self.flush_drains) do
 		for i = 1, #events do
-			if drain.registering or drain.ids[events[i].event_id] then
+			if drain.ids[events[i].event_id]
+				or (drain.registering and CALL_SUMMARIES[events[i].event_name]) then
 				drain.failed = drain.failed or tostring(code or "rejected")
 				break
 			end
@@ -7129,9 +7144,13 @@ function Client:bounded_flush(timeout_seconds, callback)
 	self.flush_drains[#self.flush_drains + 1] = drain
 	-- The explicit attempt: summaries are built now and belong to this call,
 	-- and an explicit caller outranks this client's own backoff, as before.
+	-- Anything else that appeared meanwhile (a host hook tracking from inside
+	-- the dispatch) was not held at the call and is not part of it.
 	self:flush()
-	for id in pairs(self:pending_delivery_ids()) do
-		drain.ids[id] = true
+	for id, name in pairs(self:pending_delivery_ids()) do
+		if not drain.ids[id] and CALL_SUMMARIES[name] then
+			drain.ids[id] = true
+		end
 	end
 	drain.registering = nil
 	self:settle_flush_drains()

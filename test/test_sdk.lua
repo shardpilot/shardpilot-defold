@@ -17036,6 +17036,40 @@ end)()
   assert_equal(kept,want,"every owed summary is in the durable spool")
  end)
 
+ scene("a revocation after the deadline does not turn the call into success",function()
+  local client=client_with()
+  assert_true(client:track("revoked_late"))
+  next_status=503;next_response_headers={["retry-after"]="30"}
+  local calls,cb=answers()
+  assert_true(client:bounded_flush(1,cb))
+  next_status=202;next_response_headers=nil
+  assert_equal(#calls,0,"the batch is kept for its retry")
+  socket.now=socket.now+1
+  assert_true(client:set_consent(false))
+  client:update(0)
+  answered(calls,false,"pending","the deadline came before the purge")
+ end)
+
+ scene("an event a host hook tracks during the call is not part of it",function()
+  seed_granted_consent()
+  local client
+  local armed=false
+  local cfg=config({flush_interval_seconds=9999,batch_size=1,token_provider=function(callback)
+   if armed then armed=false;assert_true(client:track("tracked_by_the_hook")) end
+   callback("client-token-placeholder",nil,nil)
+  end})
+  client=assert(sdk.new(cfg))
+  assert_true(client:identify("user-example"))
+  assert_true(client:track("held_at_the_call"))
+  local held=hold_http_requests()
+  local calls,cb=answers()
+  armed=true
+  assert_true(client:bounded_flush(5,cb))
+  assert_equal(armed,false,"the hook ran inside the call")
+  release_held_request(held);client:update(0)
+  answered(calls,true,nil,"only the call's own events")
+ end)
+
  print(string.format("bounded flush: %d pass, %d fail",passed,failed))
  assert_equal(failed,0,"bounded flush scenes")
 end)()
