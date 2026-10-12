@@ -116,6 +116,10 @@ Each name refusal counts one drop and sends nothing. Use the typed session,
 ad-revenue and experiment methods for their owned events; see
 [reserved names and matching rules](docs/events.md#reserved-names).
 
+New analytics events over 2,048 bytes of complete encoded JSON are refused
+locally with `event_too_large` before queueing; equality is allowed. See
+[event size](docs/events.md#event-size) for what counts and the local error codes.
+
 ## Installation
 
 `game.project` exposes only the SDK folder as a Defold library:

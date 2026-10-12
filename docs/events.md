@@ -62,6 +62,25 @@ their existing behavior. Ordinary names, including `app.screen_view`,
 `purchase` and `economy_tx`, remain available to `track()`. Local admission does
 not guarantee acceptance by the server schema.
 
+## Event size
+
+Each newly admitted analytics event must fit in **2,048 bytes** of complete,
+uncompressed JSON; exactly 2,048 is allowed. Envelope fields, context, UTF-8
+bytes, escaped characters and sealed-fact bytes all count. Only whitespace
+outside the JSON element is excluded; interior whitespace still counts.
+
+An oversized event returns `false, "event_too_large"` before queueing, records
+one local refusal, and leaves valid queued neighbours available for delivery.
+This also applies to typed/session events, summaries and sealed experiment
+facts. Missing or failed JSON encoding returns `json_unavailable` or
+`json_encode_failed` locally. Automatic session transitions wait until the
+triggering event passes this precheck. Refusal accounting follows the producer's
+retention rule: lifecycle obligations and failed durable-copy attempts remain
+owed; experiment facts retain failures except terminal oversize; summaries retain
+only queue pressure. A retained attempt is not counted as dropped, including
+validation and encoding failures. Retirement counts the loss once.
+Previously persisted envelopes are not rewritten.
+
 ## Session end reasons
 
 **New in `v0.11.0`:** `session_end([reason])`, on a client or the module singleton,
