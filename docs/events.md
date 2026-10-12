@@ -73,7 +73,11 @@ An oversized event returns `false, "event_too_large"` before queueing, records
 one local refusal, and leaves valid queued neighbours available for delivery.
 This also applies to typed/session events, summaries and sealed experiment
 facts. Missing or failed JSON encoding returns `json_unavailable` or
-`json_encode_failed` locally. Previously persisted envelopes are not rewritten.
+`json_encode_failed` locally. Automatic session transitions wait until the
+triggering event passes this precheck. Retained experiment facts retry unavailable
+encoding without counting each attempt as a drop; terminal oversized facts retire
+and count once. A failed durable-copy attempt keeps its source fact owed.
+Previously persisted envelopes are not rewritten.
 
 ## Session end reasons
 

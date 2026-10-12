@@ -16509,7 +16509,7 @@ end)()
    local ok,err=c:capture_experiment_fact(fact.event_name,fact.props,fact.event_id,{sealed_fact=fact})
    if size==16 then assert_true(ok,err);assert_equal(writes,1)
    else assert_equal(ok,false);assert_equal(err,"event_too_large");assert_equal(writes,0)
-    assert_equal(c:sequence_stream().sequence,sequence);assert_equal(c.stats.dropped,1)end
+    assert_equal(c:sequence_stream().sequence,sequence);assert_equal(c.stats.dropped,0,"capture keeps the source fact owed")end
   end)
  end
  for _,bytes in ipairs({2048,2049})do
@@ -16548,6 +16548,76 @@ end)()
   assert_equal(#c.experiments.pending_exposure.synthetic,1)
   assert_equal(#c.queue.items,1);assert_equal(c.stats.dropped,0)
  end)
+ for _,boundary in ipairs({"ended","expired"})do
+  scene("refused activity preserves "..boundary.." session boundary",function()
+   local c=fresh({source="client",session_timeout_seconds=10})
+   assert_true(c:session_start())
+   if boundary=="ended" then assert_true(c:session_end("finished"))
+   else c.backgrounded=true;c.paused={session=c.session,wall_ms=clock.unix_ms()-11000,frames=c.frame_seconds}end
+   local session,ended,paused=c.session,c.ended_session,c.paused
+   local before,enqueued,dropped=#c.queue.items,c.stats.enqueued,c.stats.dropped
+   local ok,err=c:track("limit_probe",{pad=string.rep("x",3000)})
+   refused(c,ok,err,"event_too_large",before,dropped)
+   assert_equal(c.stats.enqueued,enqueued);assert_equal(c.session,session)
+   assert_equal(c.ended_session,ended);assert_equal(c.paused,paused)
+   assert_true(c:track("small_control",{}));assert_true(c.session~=session)
+   assert_equal(c.queue.items[#c.queue.items].event_name,"small_control")
+   assert_equal(c.queue.items[#c.queue.items].session_id,c.session.id,"measured session is committed")
+   assert_equal(c.session.sequence,2)
+   assert_equal(c.queue.items[#c.queue.items].session_sequence,2)
+  end)
+ end
+ for _,mode in ipairs({"missing","throws"})do
+  scene("retained fact encoding "..mode.." never counts a drop",function()
+   local c=fresh({source="client",experiments_enabled=true,app_url="https://config.example",publishable_key="sp_ingest_synthetic"})
+   assert_true(c:session_start());local fact=sealed("small");local before=#c.queue.items
+   c.experiments.pending_exposure.synthetic={{sealed_fact=fact,session_id=c.session.id,anonymous_id=c.anonymous_id}}
+   if mode=="missing" then json=nil else json.encode=function()error("synthetic encoder failure")end end
+   for _=1,3 do c.experiments:sweep_pending("synthetic","background")end
+   assert_equal(c.stats.dropped,0,"retained retries are not losses")
+   assert_equal(#c.queue.items,before);assert_equal(#c.experiments.pending_exposure.synthetic,1)
+   json={encode=encode_value,decode=json_decode}
+   c.experiments:sweep_pending("synthetic","background")
+   assert_equal(c.stats.dropped,0);assert_equal(c.experiments.pending_exposure.synthetic,nil)
+   assert_equal(#c.queue.items,before+1)
+  end)
+ end
+ for _,mode in ipairs({"missing","throws","oversize"})do
+  scene("direct capture retains without recounting "..mode,function()
+   local c=fresh({source="client",experiments_enabled=true,app_url="https://config.example",publishable_key="sp_ingest_synthetic"})
+   assert_true(c:session_start());local fact=sealed(mode=="oversize" and string.rep("x",3000) or "small")
+   local before=#c.queue.items;local sequence=c.session.sequence
+   local own={sealed_fact=fact,session_id=c.session.id,anonymous_id=c.anonymous_id,event_ts=fact.event_ts}
+   c.experiments.pending_exposure.synthetic={own}
+   if mode=="missing" then json=nil elseif mode=="throws" then json.encode=function()error("synthetic encoder failure")end end
+   local writes=0;c.spool_envelopes=function()writes=writes+1;return true end
+   for _=1,3 do assert_equal(c:capture_experiment_fact(fact.event_name,fact.props,fact.event_id,own),false)end
+   assert_equal(writes,0);assert_equal(c.stats.dropped,0,"source fact remains owed")
+   assert_equal(#c.experiments.pending_exposure.synthetic,1);assert_equal(c.session.sequence,sequence)
+   json={encode=encode_value,decode=json_decode};c.experiments:sweep_pending("synthetic","background")
+   assert_equal(c.experiments.pending_exposure.synthetic,nil)
+   assert_equal(c.stats.dropped,mode=="oversize" and 1 or 0)
+   assert_equal(#c.queue.items,before+(mode=="oversize" and 0 or 1))
+  end)
+ end
+ for _,boundary in ipairs({"ended","expired"})do
+  for _,mode in ipairs({"missing","throws"})do
+   scene(boundary.." boundary remains unchanged on encoder "..mode,function()
+    local c=fresh({source="client",session_timeout_seconds=10});assert_true(c:session_start())
+    if boundary=="ended" then assert_true(c:session_end("finished"))
+    else c.backgrounded=true;c.paused={session=c.session,wall_ms=clock.unix_ms()-11000,frames=c.frame_seconds}end
+    local session,ended,paused=c.session,c.ended_session,c.paused
+    local before,enqueued,dropped=#c.queue.items,c.stats.enqueued,c.stats.dropped
+    if mode=="missing" then json=nil else json.encode=function()error("synthetic encoder failure")end end
+    local ok,err=c:track("small_control",{})
+    refused(c,ok,err,mode=="missing" and "json_unavailable" or "json_encode_failed",before,dropped)
+    assert_equal(c.stats.enqueued,enqueued);assert_equal(c.session,session)
+    assert_equal(c.ended_session,ended);assert_equal(c.paused,paused)
+    json={encode=encode_value,decode=json_decode};assert_true(c:track("small_control",{}))
+    assert_equal(c.queue.items[#c.queue.items].session_sequence,2)
+   end)
+  end
+ end
  sys,http,json,socket=saved.sys,saved.http,saved.json,saved.socket
  print(string.format("event-size total: %d pass, %d fail",passed,failed))
  assert_equal(failed,0,"event-size admission scenes")

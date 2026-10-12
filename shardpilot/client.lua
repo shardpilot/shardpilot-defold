@@ -3030,7 +3030,7 @@ end
 -- nothing to roll back, because nothing was touched.
 function Client:start_session(props, fact)
 	local replaced = self.session
-	local fresh = new_session("session-" .. id.uuid())
+	local fresh = fact and fact.prepared_session or new_session("session-" .. id.uuid())
 	local first = replaced == nil and self.ended_session == nil
 	if first then
 		self:adopt_sessionless_samplers(fresh)
@@ -3368,10 +3368,10 @@ local function valid_unsigned_32(value)
 	return is_integer(value) and value >= 0 and value <= MAX_LEVEL_UNSIGNED_32
 end
 
--- Count each intake or typed-validation refusal once. Delegated delivery,
--- consent and queue refusals already own their accounting.
-function Client:_record_refusal(code)
-	self.stats.dropped = self.stats.dropped + 1
+-- Count terminal intake or typed-validation refusal once. A retained fact is
+-- still owed; delegated delivery, consent and queue paths own their accounting.
+function Client:_record_refusal(code, retained)
+	if not retained then self.stats.dropped = self.stats.dropped + 1 end
 	self.stats.last_error = code
 	return false, code
 end
@@ -3611,19 +3611,27 @@ end
 -- activity is retryable. The explicit exposure calls this BEFORE it reads the
 -- experiments marker, so the exposure's ids and arm state are the next
 -- session's (experiments emit_entry_exposure).
-function Client:open_owed_session(fact)
-	local carries_own_session = fact ~= nil
-		and (fact.session_table ~= nil
-			or (type(fact.session_id) == "string" and fact.session_id ~= ""))
-	local backend_internal = self.config.source == "backend" and fact ~= nil
-	if carries_own_session or backend_internal then
+local function activity_carries_session(client, fact)
+	return fact ~= nil and (fact.session_table ~= nil
+		or (type(fact.session_id) == "string" and fact.session_id ~= "")
+		or client.config.source == "backend")
+end
+
+local function activity_owes_session(client, fact)
+	return not activity_carries_session(client, fact)
+		and (client:timed_out_in_background()
+			or (client.session == nil and client.ended_session ~= nil))
+end
+
+function Client:open_owed_session(fact, prepared_session)
+	if activity_carries_session(self, fact) then
 		return true
 	end
 	-- ⚠ AN EXPIRED PAUSE IS RESOLVED FIRST. Activity past the deadline, before
 	-- the resume, used to land in the session that had already timed out; the
 	-- boundary ends it and starts the next one before this activity is placed.
 	if self:timed_out_in_background() then
-		local ended, end_err = self:run_boundary(true)
+		local ended, end_err = self:run_boundary(false)
 		if not ended then
 			if not (fact and fact.retryable) then
 				self.stats.dropped = self.stats.dropped + 1
@@ -3634,7 +3642,7 @@ function Client:open_owed_session(fact)
 	if self.session ~= nil or self.ended_session == nil then
 		return true
 	end
-	local started, start_err = self:start_session(nil, { retryable = true })
+	local started, start_err = self:start_session(nil, { retryable = true, prepared_session = prepared_session })
 	if not started then
 		-- Today the start can only meet the same full queue the activity
 		-- would meet; this holds the rule for any other refusal.
@@ -3711,40 +3719,15 @@ function Client:enqueue_event(event_name, props, context, fact, host_event)
 		self.stats.dropped = self.stats.dropped + 1
 		return false, context_err
 	end
-	-- ⚠ AFTER AN END, THIS EVENT STARTS THE NEXT SESSION. session_end keeps
-	-- session_id (the shutdown summaries describe the session that collected
-	-- their samples and ride it), so the lazy open below, which fires only on
-	-- a nil id, used to file every later event under the ENDED session, after
-	-- its own app.session_ended. A session's length is read from its first
-	-- and last events, so that stretched the ended session over everything
-	-- played after it.
-	--
-	-- An event that carries its own session is not the next activity and
-	-- starts nothing: a late-drained experiment fact rides the session it was
-	-- armed in, a summary the one that collected it. session_start's own
-	-- event cannot recurse here: it marks the session active before tracking.
-	-- A backend client that explicitly opened and ended a session renews on
-	-- its next HOST event too; one that never opened a session has no ended
-	-- session to owe. An SDK-internal fact of a backend client never owes one:
-	-- backend facts and summaries drain sessionless, and a background sweep
-	-- must not open a session no host activity asked for.
-	local opened, open_err = self:open_owed_session(fact)
-	if not opened then
-		return false, open_err
-	end
-	-- The server requires session_id for non-backend sources; an event tracked
-	-- before session_start() would otherwise ship with no session_id and the
-	-- whole batch would be 400-rejected. Lazily open a session so a session_id
-	-- is always present. An explicit session_start() still renews the session.
-	local opened_lazy_session = false
-	if self.session == nil and self.ended_session == nil and self.config.source ~= "backend"
-		and not (fact ~= nil and fact.session_table ~= nil) then
-		local lazy = new_session("session-" .. id.uuid())
-		self:adopt_sessionless_samplers(lazy)
-		self.session = lazy
-		self:mirror_session()
-		self:pause_if_backgrounded(lazy)
-		opened_lazy_session = true
+	-- Build the exact prospective stream before any automatic lifecycle effect.
+	-- A refusal cannot announce an owed start or expire the previous session.
+	local opens_owed = activity_owes_session(self, fact)
+	local opens_lazy = not activity_carries_session(self, fact)
+		and self.session == nil and self.ended_session == nil and self.config.source ~= "backend"
+	local prepared_session
+	if opens_owed or opens_lazy then
+		prepared_session = new_session("session-" .. id.uuid())
+		if opens_lazy then self:adopt_sessionless_samplers(prepared_session) end
 	end
 	local user_id = self.user_id
 	local event_id = nil
@@ -3784,7 +3767,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event)
 	-- own; with none open (a backend source) it is sessionless. Its sequence
 	-- comes from that value, or from the stream the client last numbered.
 	local own = fact ~= nil and fact.session_table or nil
-	local stream = own or self:sequence_stream()
+	local stream = own or prepared_session or self:sequence_stream()
 	local now_ms = ts_override == nil and clock.unix_ms() or nil
 	local event = {
 		event_id = event_id or id.uuid(),
@@ -3792,32 +3775,32 @@ function Client:enqueue_event(event_name, props, context, fact, host_event)
 		event_ts = ts_override or clock.iso_utc(now_ms),
 		user_id = user_id,
 		anonymous_id = anonymous_override or self.anonymous_id,
-		session_id = session_override or (own and own.id) or (self.session and self.session.id) or nil,
-		session_sequence = stream.sequence + 1,
+		session_id = session_override or (own and own.id) or (prepared_session and prepared_session.id)
+			or (self.session and self.session.id) or nil,
+		session_sequence = stream.sequence + 1 + (opens_owed and 1 or 0),
 		props = props_snapshot,
 		sealed_fact = fact and fact.sealed_fact or nil,
 		context = context_snapshot,
 	}
 	local admission_err = envelope.admission_error(self.config, self, event)
 	if admission_err then
-		if opened_lazy_session then
-			self.session = nil
-			self:mirror_session()
+		-- The sealed-fact consumer retains encoding failures, but retires a
+		-- terminal oversize fact. Count loss only in the latter case.
+		local retained = fact and fact.retryable and fact.sealed_fact and admission_err ~= "event_too_large"
+		return self:_record_refusal(admission_err, retained)
+	end
+	if opens_owed then
+		local opened, open_err = self:open_owed_session(fact, prepared_session)
+		if not opened then return false, open_err end
+		if now_ms then
+			now_ms = session_boundary_ms(prepared_session, now_ms)
+			event.event_ts = clock.iso_utc(now_ms)
 		end
-		return self:_record_refusal(admission_err)
 	end
 	self:register_delivery(event)
 	if fact and fact.stage then return true, nil, { event = event, stream = stream, now_ms = now_ms } end
 	local ok = commit_event(self, event, stream, now_ms)
 	if not ok then
-		-- The lazy session above was committed before the push. If the push
-		-- fails the event never enters the queue, so roll the session back —
-		-- otherwise update()/shutdown() would later sample or emit a
-		-- session_end for a session that carries no events.
-		if opened_lazy_session then
-			self.session = nil
-			self:mirror_session()
-		end
 		-- A RETRYABLE refusal is not a dropped event: the owed-snapshot
 		-- machinery (exposure facts, the enqueue_summaries builds) keeps the
 		-- work armed and re-enqueues it once the queue has room, so counting
@@ -3838,8 +3821,9 @@ function Client:enqueue_event(event_name, props, context, fact, host_event)
 		-- from, which rides with it. Other callers ignore the extra values.
 		return false, "queue_full", event, stream
 	end
-	if opened_lazy_session then
-		-- committed: the lazy first session keeps the samplers it adopted
+	if opens_lazy then
+		self.session = prepared_session
+		self:pause_if_backgrounded(prepared_session)
 		self:renew_sessionless_samplers()
 	end
 	self:mirror_session()
@@ -5909,7 +5893,9 @@ function Client:capture_experiment_fact(event_name, props, event_id, overrides)
 		context = nil,
 	}
 	local admission_err = envelope.admission_error(self.config, self, event)
-	if admission_err then return self:_record_refusal(admission_err) end
+	-- Capture never retires its pending source fact; the eventual sweep owns
+	-- terminal loss accounting, even if this durable-copy attempt cannot fit.
+	if admission_err then return self:_record_refusal(admission_err, true) end
 	stream.sequence = event.session_sequence
 	self:mirror_session()
 	self:register_delivery(event)
