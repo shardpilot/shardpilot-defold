@@ -36,6 +36,7 @@
 local M = {}
 local version_ok = require "shardpilot.consent_version"
 local envelope_platform = require "shardpilot.envelope_platform"
+local sdk_header = require "shardpilot.sdk_header"
 
 M.STRICT_OPT_IN = "STRICT_OPT_IN"
 M.SOFT_OPT_OUT = "SOFT_OPT_OUT"
@@ -1505,7 +1506,7 @@ function M.prepare(context, callback)
 		-- or trusted key exists in this build, so even an unsigned strict plan
 		-- must not supply restrictions or remove ones a host already enforces.
 		settle(fallback("plan_unsigned", "this build cannot authenticate a consent plan"))
-	end, { ["Content-Type"] = "application/json" }, encoded, { timeout = DEADLINE_SECONDS })
+	end, { ["Content-Type"] = "application/json", [sdk_header.NAME] = sdk_header.VALUE, }, encoded, { timeout = DEADLINE_SECONDS })
 end
 
 return M

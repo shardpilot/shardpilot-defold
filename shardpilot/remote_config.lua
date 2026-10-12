@@ -59,6 +59,7 @@
 local clock = require "shardpilot.clock"
 local experiments = require "shardpilot.experiments"
 local storage = require "shardpilot.storage"
+local sdk_header = require "shardpilot.sdk_header"
 
 local M = {}
 
@@ -762,6 +763,7 @@ function RemoteConfig:fetch(callback)
 
 	local headers = {
 		["Authorization"] = "Bearer " .. self.config.publishable_key,
+		[sdk_header.NAME] = sdk_header.VALUE,
 	}
 	if cache and cache.etag ~= "" then
 		headers["If-None-Match"] = cache.etag

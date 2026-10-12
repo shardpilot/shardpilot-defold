@@ -1,5 +1,6 @@
 local compression = require "shardpilot.compression"
 local experiment_facts = require "shardpilot.experiment_facts"
+local sdk_header = require "shardpilot.sdk_header"
 
 local M = {}
 
@@ -57,6 +58,7 @@ local function dispatch(config, token, route, payload, callback, compress, befor
 		local headers = {
 			["Content-Type"] = "application/json",
 			["Authorization"] = "Bearer " .. token,
+			[sdk_header.NAME] = sdk_header.VALUE,
 		}
 		-- Request-body compression. The body is replaced with the compressed bytes
 		-- and the coding declared; `compressed` is reported back on EVERY callback

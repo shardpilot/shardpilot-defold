@@ -11,6 +11,11 @@
   count as settled. The return value says only whether the call was taken. See
   [Flush](docs/configuration.md#flush).
 
+- Every request to a ShardPilot service carries
+  `X-ShardPilot-SDK: defold/<version>`, the version being the release constant
+  in `shardpilot/version.lua`. HTML5 builds need the server's CORS to allow the
+  header before they upgrade.
+
 - Crash reports and the consent-policy request send one of the twelve
   platform values (`windows`, `macos`, `linux`, `android`, `ios`, `tvos`,
   `web`, `ps4`, `ps5`, `xbox`, `switch`, `other`), folded through the same

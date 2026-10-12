@@ -631,6 +631,8 @@ local function test_a_well_formed_unsigned_plan_is_unused()
 	assert_true(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_OFF, "STRICT closes optional processing on this verdict alone")
 	assert_equal(#requests, 1, "one request")
 	assert_true(requests[1].url:find("/api/cp/v1/consent/policy", 1, true) ~= nil, "the published route")
+	assert_equal(requests[1].headers["X-ShardPilot-SDK"], "defold/" .. require("shardpilot.version").VERSION,
+		"the consent-policy request names this SDK")
 end
 
 -- ⚠ RULE (a): NO SINGLETON, NO IDENTITY, NO DISK. Asserted against the SOURCE

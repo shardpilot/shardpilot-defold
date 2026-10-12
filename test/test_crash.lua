@@ -427,6 +427,8 @@ local function test_routes_to_dedicated_crash_endpoint()
 	assert_equal(request.method, "POST")
 	assert_equal(request.headers["Authorization"], "Bearer sp_crash_write_key")
 	assert_equal(request.headers["Content-Type"], "application/json")
+	assert_equal(request.headers["X-ShardPilot-SDK"], "defold/" .. require("shardpilot.version").VERSION,
+		"the crash report names this SDK")
 	-- The schema-revision declaration belongs to events:batch
 	-- ingest only; the crash route must never carry it.
 	assert_equal(request.headers["X-ShardPilot-Schema-Revision"], nil,
