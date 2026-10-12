@@ -2348,7 +2348,7 @@ function Experiments:seal_application(experiment_key, record)
 				environment_key = self.config.environment_id, event_name = event_name,
 				experiment_key = experiment_key, version_wire = entry.version_wire,
 				variant_key = entry.variant_key, outcome_key = record.outcome_key,
-				outcome_value_wire = record.outcome_value_wire,
+				outcome_value_wire = record.outcome_value_wire, subject_key = entry.subject_key,
 			})
 			if sealed then
 				-- Retain both keys until the fact leaves every analytics store:
