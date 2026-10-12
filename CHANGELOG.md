@@ -30,8 +30,9 @@ Names and calls change hard, with no aliases. Update host code as follows:
   with `pending` (the remnant is in the spool), `spool_persist_failed`
   (storage could not keep everything; a `shutdown` diagnostic names it), the
   server's terminal refusal, `shutdown` or `invalid_timeout_seconds`. A
-  second call gets the first answer. No closing client outlives its
-  deadline. A denial whose identity and marker writes both failed deletes
+  second call on the same client gets the first answer. From the call on,
+  events, `session_start`, exposures, outcomes and experiment fetches answer
+  `shutdown`. No closing client outlives its deadline. A denial whose identity and marker writes both failed deletes
   the stored identity before teardown, so the next launch starts with
   consent unknown. The module releases its default client once the close
   ends.

@@ -2640,9 +2640,9 @@ function Client:fetch_experiment_assignment(experiment_key, attributes, callback
 		attributes = nil
 	end
 	-- The callback is game code; never let it break the SDK.
-	if not self.initialized then
-		-- No request is dispatched on a torn-down client, nothing is
-		-- written, game code is not called back later.
+	if not self.initialized or self.closing then
+		-- No request is dispatched on a torn-down or closing client, nothing
+		-- is written, game code is not called back later.
 		if type(callback) == "function" then
 			pcall(callback, { ok = false, from_cache = false, error = "shutdown" })
 		end
@@ -2665,7 +2665,7 @@ function Client:fetch_experiment_assignment_with_age_band(experiment_key, band, 
 	if type(attributes) == "function" and callback == nil then
 		callback, attributes = attributes, nil
 	end
-	if not self.initialized or not self.experiments then
+	if not self.initialized or self.closing or not self.experiments then
 		return self:fetch_experiment_assignment(experiment_key, attributes, callback)
 	end
 	local declared, err = experiments_mod.attributes_with_age_band(band, attributes)
@@ -2699,7 +2699,7 @@ function Client:apply_experiment_variant(experiment_key)
 end
 
 function Client:track_exposure(experiment_key)
-	if not self.initialized then
+	if not self.initialized or self.closing then
 		return false, "shutdown"
 	end
 	if not self.experiments then
@@ -2709,7 +2709,7 @@ function Client:track_exposure(experiment_key)
 end
 
 function Client:track_outcome(experiment_key, outcome_key, outcome_value)
-	if not self.initialized then
+	if not self.initialized or self.closing then
 		return false, "shutdown"
 	end
 	if not self.experiments then
@@ -3022,6 +3022,10 @@ local function commit_event(client, event, stream, now_ms)
 end
 
 function Client:session_start(props)
+	-- A closing client has ended its session; it opens no other.
+	if self.closing then
+		return false, "shutdown"
+	end
 	if self.initialized and self:timed_out_in_background() then
 		-- ⚠ A START PAST THE DEADLINE ENDS THE TIMED-OUT SESSION FIRST, at the
 		-- boundary instant. As a live renewal it would replace that session
@@ -3546,6 +3550,9 @@ function Client:track_ad_impression_revenue(
 	ad_format,
 	placement
 )
+	if self.closing then
+		return self:_record_refusal("shutdown")
+	end
 	if not self:_require_client_source() then
 		return self:_record_refusal("source_not_client")
 	end
@@ -3687,7 +3694,9 @@ function Client:open_experiment_application_session()
 end
 
 function Client:enqueue_event(event_name, props, context, fact, host_event)
-	if not self.initialized then
+	-- From the shutdown call on, the host adds nothing; the close's own
+	-- session end and summaries still go through.
+	if not self.initialized or (host_event and self.closing) then
 		return self:_record_refusal("shutdown", fact)
 	end
 	if consent_denied_state(self.consent_state) then

@@ -182,9 +182,15 @@ The callback runs once, on the main loop, with `true` or `false` and a code:
 | `false, "not_initialized"` | The module-level `shutdown` has no client. |
 | `false, "invalid_timeout_seconds"` | The timeout is not a finite number above zero. Nothing is torn down. |
 
-A second call, during the close or after it, gets the first call's answer.
-While the client closes it keeps working through `update()`, and the module
-holds it: `init()` answers `already_initialized` until the callback has run.
+A second call on the same client, during the close or after it, gets the
+first call's answer. The module releases its client when the close ends, so a
+later module-level `shutdown` answers `not_initialized`.
+
+From the call on, the client admits nothing new: `track` and the other event
+calls, `session_start`, `track_exposure`, `track_outcome` and experiment
+fetches answer `false, "shutdown"`. It keeps draining what it holds through
+`update()`, and the module holds it: `init()` answers `already_initialized`
+until the callback has run.
 
 A denial that neither the identity record nor its write-ahead marker could
 store would let the next launch restore the earlier grant. At the deadline the

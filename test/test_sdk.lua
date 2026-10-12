@@ -17278,6 +17278,39 @@ end)()
   answered(third,true,nil,"after the close")
  end)
 
+ scene("a closing client admits nothing new",function()
+  local client=client_with()
+  assert_true(client:session_start());assert_true(client:track("before_quit"))
+  client:observe_ping_ms(40)
+  local held=hold_http_requests()
+  local calls,cb=answers()
+  assert_true(client:bounded_shutdown(5,cb))
+  for _,attempt in ipairs({
+   {"track",function()return client:track("after_quit")end},
+   {"screen_view",function()return client:screen_view("after_quit_screen")end},
+   {"session_start",function()return client:session_start()end},
+   {"track_exposure",function()return client:track_exposure("exp_after_quit")end},
+   {"track_outcome",function()return client:track_outcome("exp_after_quit","won",1)end},
+   {"fetch_experiment_assignment",function()return client:fetch_experiment_assignment("exp_after_quit",nil,function()end)end},
+   {"track_ad_impression_revenue",function()return client:track_ad_impression_revenue("imp_after_quit","network",1000,"USD","exact","unit","banner","menu")end},
+  })do
+   local ok,code=attempt[2]()
+   assert_equal(ok,false,attempt[1].." is refused while closing")
+   assert_equal(code,"shutdown",attempt[1].." code")
+  end
+  assert_true(client.initialized,"the close still drains")
+  while held[1] do release_held_request(held);client:update(0) end
+  answered(calls,true,nil,"drained")
+  local wire={}
+  for _,r in ipairs(requests)do wire[#wire+1]=r.body or "" end
+  wire=table.concat(wire,"\n")
+  assert_true(wire:find("before_quit",1,true)~=nil,"what was held is delivered")
+  assert_true(wire:find('"event_name":"network_summary"',1,true)~=nil,"the close's own summary still goes out")
+  assert_equal(session_ends()[1],"app_final","and its own session end")
+  assert_true(wire:find("after_quit",1,true)==nil,"nothing tracked after the call travels")
+  assert_equal(select(2,wire:gsub('"event_name":"app.session_started"',"")),1,"no session opens after the end")
+ end)
+
  scene("a refused call keeps the client",function()
   local client=client_with()
   local calls,cb=answers()
