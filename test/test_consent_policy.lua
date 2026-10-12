@@ -716,7 +716,7 @@ local function test_a_refused_value_costs_no_request()
 
 	-- The other closed vocabularies behave the same way.
 	for _, override in ipairs({
-		{ platform = "toaster" }, { store = "epic" }, { app_version = "1 2 3" },
+		{ platform = 42 }, { store = "epic" }, { app_version = "1 2 3" },
 		{ locale = string.rep("x", 36) }, { workspace_key = "__nil__" },
 		{ age_band = { vocabulary = "v1" } },
 	}) do
@@ -2836,7 +2836,34 @@ local function test_scope_key_wire_contract()
 	assert_equal(failed, 0, "scope wire contract")
 end
 
+-- The request platform is one of the twelve the resolver accepts (A8). A host
+-- spelling is folded through the SDK's one platform table; a string it cannot
+-- map is sent as "other"; only a missing or non-string platform is refused.
+local function test_the_request_platform_is_folded_to_the_twelve()
+	for _, case in ipairs({
+		{ "windows", "windows" }, { "macos", "macos" }, { "linux", "linux" },
+		{ "android", "android" }, { "ios", "ios" }, { "web", "web" },
+		{ "tvos", "tvos" }, { "ps4", "ps4" }, { "ps5", "ps5" }, { "xbox", "xbox" },
+		{ "switch", "switch" }, { "other", "other" },
+		{ "Mac", "macos" }, { "HTML5", "web" }, { "win64", "windows" }, { "toaster", "other" },
+	}) do
+		reset()
+		next_response_body = plan()
+		local _, calls = prepare(context({ platform = case[1] }))
+		assert_equal(calls, 1, "exactly one callback: " .. case[1])
+		assert_equal(#requests, 1, "the request is sent: " .. case[1])
+		assert_equal(requests[1].body:match('"platform":"([^"]*)"'), case[2], "platform " .. case[1])
+	end
+	for _, bad in ipairs({ 42, "__nil__", "", true }) do
+		reset()
+		local refused = prepare(context({ platform = bad }))
+		assert_equal(#requests, 0, "a missing or non-string platform costs zero requests")
+		assert_equal(refused.reason, "invalid_request")
+	end
+end
+
 local tests = {
+	test_the_request_platform_is_folded_to_the_twelve,
 	test_no_unauthenticated_plan_has_authority,
 	test_scope_key_wire_contract,
 	test_operation_blocks_remain_unknown_across_fallbacks,

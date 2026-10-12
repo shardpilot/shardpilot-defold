@@ -10,6 +10,7 @@ local transport = require "shardpilot.crash.transport"
 local dump = require "shardpilot.crash.dump"
 local storage = require "shardpilot.storage"
 local platform = require "shardpilot.platform"
+local envelope_platform = require "shardpilot.envelope_platform"
 local clock = require "shardpilot.clock"
 local crash_deadline = require "shardpilot.crash.deadline"
 local random = require "shardpilot.random"
@@ -200,24 +201,20 @@ local function validate_config(config)
 	if not crash_http_timeout_seconds then
 		return nil, timeout_err
 	end
-	-- Resolve the platform once, at init time. Every crash report requires a
-	-- platform (the server rejects one without it). When the caller omits
-	-- config.platform AND auto-detection cannot identify the runtime
-	-- (platform.detect() returns nil — e.g. an unmapped system or sys info
-	-- unavailable), creating the client would otherwise succeed but every emit
-	-- would fail platform_required. Fail crash.new() with a clear config error here
-	-- instead of handing back a client that can never send a crash.
-	local resolved_platform = config.platform or platform.detect()
-	if not non_empty_string(resolved_platform) then
-		return nil, "platform_required"
-	end
-	-- The platform is scrubbed on every emit. A caller-set platform that carries
-	-- PII/secret content (an email, a raw actor id like "user_123", an IP) scrubs
-	-- empty, after which every emit — including a fatal crash — would fail
-	-- platform_required. Validate the SANITIZED platform here so such a value is
-	-- rejected at config time rather than handing back a client that can never send.
-	if sanitize.sanitize_string(resolved_platform) == "" then
-		return nil, "platform_required"
+	-- Resolve the platform once, at init time, to one of the twelve values the
+	-- crash service accepts. A configured value is folded through the same table
+	-- as the analytics envelope; one it cannot map is sent as "other" and
+	-- reported once (platform_unmapped). The raw configured string never travels,
+	-- so a value carrying PII cannot reach the wire either. Without a configured
+	-- value (nil or blank) the runtime is detected, and an unknown runtime is
+	-- "other": a crash client is never refused for its platform.
+	local resolved_platform, platform_unmapped
+	if config.platform == nil or config.platform == "" then
+		resolved_platform = platform.detect()
+	else
+		local mapped
+		resolved_platform, mapped = envelope_platform.fold(config.platform)
+		platform_unmapped = not mapped or nil
 	end
 	if config.diagnostics ~= nil and type(config.diagnostics) ~= "function" then
 		return nil, "invalid_diagnostics"
@@ -270,6 +267,7 @@ local function validate_config(config)
 		app_build = config.app_build,
 		crash_component = crash_component ~= "" and crash_component or nil,
 		platform = resolved_platform,
+		platform_unmapped = platform_unmapped,
 		crash_sample_every = crash_sample_every,
 		crash_http_timeout_seconds = crash_http_timeout_seconds,
 		diagnostics = config.diagnostics,
@@ -413,6 +411,12 @@ function M.new(config)
 	-- set_enabled(true) installs it then.
 	if normalized.crash_hooks_enabled and enabled then
 		client:install_script_error_handler()
+	end
+	-- An unmappable configured platform is reported once, here, in the
+	-- envelope's shape. Integrator code: optional, never allowed to break
+	-- construction.
+	if normalized.platform_unmapped and type(normalized.diagnostics) == "function" then
+		pcall(normalized.diagnostics, { scope = "config", status = "ignored", code = "platform_unmapped" })
 	end
 	return client
 end

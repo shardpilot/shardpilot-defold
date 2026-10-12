@@ -2602,9 +2602,10 @@ local function test_bad_per_event_platform_falls_back_to_config()
 	assert_equal(ok, true, "a fatal must not be dropped over a bad per-event platform")
 	assert_equal(#requests, 1, "the fatal crash must reach the wire")
 	local body = requests[1].body
-	-- the bad per-event platform is gone, the configured platform is on the wire
+	-- the bad per-event platform is gone, the configured platform is on the wire,
+	-- folded to its canonical value (html5 is web)
 	assert_not_contains(body, "user_4242")
-	assert_contains(body, '"platform":"html5"')
+	assert_contains(body, '"platform":"web"')
 	assert_equal(client:snapshot().dropped, 0, "the fatal crash must not be counted as dropped")
 
 	-- an email-bearing per-event platform falls back identically
@@ -2618,7 +2619,7 @@ local function test_bad_per_event_platform_falls_back_to_config()
 	assert_equal(#requests, 1)
 	body = requests[1].body
 	assert_not_contains(body, "a@b.com")
-	assert_contains(body, '"platform":"html5"')
+	assert_contains(body, '"platform":"web"')
 	assert_equal(client:snapshot().dropped, 0)
 end
 
@@ -3300,40 +3301,33 @@ local function test_config_app_id_rejects_pii()
 	assert_true(crash.new(config({ app_id = "user_app" })), "an actor-prefixed scope must be accepted")
 end
 
--- ── platform must be resolvable at init, not deferred to a failing emit ──────
+-- ── a crash client is never refused for its platform (A8) ────────────────────
 
--- When config.platform is omitted AND auto-detection cannot identify the runtime
--- (platform.detect() returns nil), crash.new() must fail with a clear config error
--- instead of returning a client whose every emit fails platform_required.
+-- The platform is one of the twelve the crash service accepts. An unknown
+-- runtime is "other"; an explicit platform is folded; a configured value the
+-- table cannot map (including one that carries PII) is sent as "other", so the
+-- raw string never travels and no emit can fail platform_required.
 local function test_platform_required_at_init()
-	-- Force detection to fail: an unmapped system_name yields nil from detect().
 	local saved = sys.get_sys_info
 	sys.get_sys_info = function()
 		return { system_name = "PlanScape" }
 	end
-	local client, err = crash.new(config({ platform = nil }))
-	sys.get_sys_info = saved
-	assert_equal(client, nil, "crash.new must fail when no platform can be resolved")
-	assert_equal(err, "platform_required", "the failure is a clear config error")
+	local client = crash.new(config({ platform = nil }))
+	assert_true(client ~= nil, "an unknown runtime must still build a crash client")
+	assert_equal(client.config.platform, "other")
 
 	-- an explicit config.platform is honored even when detection would fail
-	sys.get_sys_info = function()
-		return { system_name = "PlanScape" }
-	end
 	local ok_client = crash.new(config({ platform = "ios" }))
 	sys.get_sys_info = saved
 	assert_true(ok_client, "an explicit platform must be accepted regardless of detection")
+	assert_equal(ok_client.config.platform, "ios")
 
-	-- an explicitly-set platform that carries PII/invalid content is non-empty (so
-	-- it passes the bare non-empty check) but scrubs to EMPTY on every emit — which
-	-- would make every report, including a fatal, fail platform_required. crash.new()
-	-- must reject the SANITIZED platform at init rather than hand back a client that
-	-- can never send.
+	-- a configured platform that carries PII/invalid content is unmappable: the
+	-- client is built, and it reports "other", never the raw value
 	for _, bad in ipairs({ "user_123", "ops@example.com", "10.0.0.5" }) do
-		local client_bad, err_bad = crash.new(config({ platform = bad }))
-		assert_equal(client_bad, nil, "a PII/invalid platform must be rejected at init: " .. bad)
-		assert_equal(err_bad, "platform_required",
-			"the reject reason is a clear config error: " .. bad)
+		local client_bad = crash.new(config({ platform = bad }))
+		assert_true(client_bad ~= nil, "an unmappable platform must not fail init: " .. bad)
+		assert_equal(client_bad.config.platform, "other", "an unmappable platform is other: " .. bad)
 	end
 end
 
@@ -5674,7 +5668,131 @@ local function test_component_wire_rejects_retired_key()
 	assert_equal(next(expected), nil, "all expected golden keys reached wire")
 end
 
+-- ── the closed twelve-value platform (A8) ─────────────────────────────────────
+
+-- Every crash platform is one of windows, macos, linux, android, ios, tvos, web,
+-- ps4, ps5, xbox, switch, other: never empty, never a raw host spelling. One
+-- closure keeps these scenes inside the main chunk's local-variable limit.
+local a8_platform_tests = (function()
+	local function sent_platform(body)
+		return body:match('"platform":"([^"]*)"')
+	end
+
+	local function with_system_name(name, fn)
+		local saved = sys.get_sys_info
+		sys.get_sys_info = function() return { system_name = name } end
+		local ok, err = pcall(fn)
+		sys.get_sys_info = saved
+		if not ok then error(err, 0) end
+	end
+
+	local function test_a8_unmapped_detection_sends_other()
+		with_system_name("PlanScape", function()
+			reset()
+			local client, err = crash.new(config({ crash_sample_every = 1, platform = nil }))
+			assert_true(client ~= nil, "an unmapped runtime must still build a crash client: " .. tostring(err))
+			assert_equal(client:emit_fatal({ exception = { type = "lua_error", reason = "boom" }, raw_text = "fatal in game.tick" }), true,
+				"an unknown runtime's fatal is sent")
+			assert_equal(#requests, 1)
+			assert_equal(sent_platform(requests[1].body), "other", "an unknown runtime is other")
+		end)
+		-- No sys info at all, or a sys info call that throws, is an unknown runtime too.
+		local saved = sys.get_sys_info
+		for _, get in ipairs({ false, function() error("sys info unavailable") end }) do
+			sys.get_sys_info = get or nil
+			local client, err = crash.new(config({ platform = nil }))
+			sys.get_sys_info = saved
+			assert_true(client ~= nil, "a runtime without sys info must still build a crash client: " .. tostring(err))
+			assert_equal(client.config.platform, "other", "a runtime without sys info is other")
+		end
+	end
+
+	local function test_a8_configured_platform_is_folded()
+		for _, case in ipairs({ { "Mac", "macos" }, { "html5", "web" }, { "win64", "windows" }, { "Switch", "switch" } }) do
+			reset()
+			local client = assert(crash.new(config({ crash_sample_every = 1, platform = case[1] })))
+			assert_equal(client:emit_fatal({ exception = { type = "lua_error", reason = "boom" }, raw_text = "fatal in game.tick" }), true)
+			assert_equal(sent_platform(requests[1].body), case[2], "configured " .. case[1])
+		end
+	end
+
+	local function test_a8_configured_unmappable_is_other_once()
+		for _, configured in ipairs({ "playstation-9", "ops@example.com", "user_123" }) do
+			reset()
+			local issues = {}
+			local client, err = crash.new(config({
+				crash_sample_every = 1, platform = configured,
+				diagnostics = function(issue) issues[#issues + 1] = issue end,
+			}))
+			assert_true(client ~= nil, "an unmappable configured platform must not fail init: " .. tostring(err))
+			for _ = 1, 2 do
+				assert_equal(client:emit_fatal({ exception = { type = "lua_error", reason = "boom" }, raw_text = "fatal in game.tick" }), true)
+			end
+			assert_equal(#requests, 2)
+			for i = 1, 2 do
+				assert_equal(sent_platform(requests[i].body), "other", "configured " .. configured)
+				assert_not_contains(requests[i].body, configured)
+			end
+			local unmapped = 0
+			for _, issue in ipairs(issues) do
+				if issue.code == "platform_unmapped" then
+					unmapped = unmapped + 1
+					assert_equal(issue.scope, "config")
+					assert_equal(issue.status, "ignored")
+				end
+			end
+			assert_equal(unmapped, 1, "the unmappable configured platform is reported once: " .. configured)
+		end
+	end
+
+	local function test_a8_event_and_module_platforms_are_folded()
+		reset()
+		local client = assert(crash.new(config({ crash_sample_every = 1, platform = "linux" })))
+		assert_equal(client:emit_fatal({
+			exception = { type = "lua_error", reason = "boom" }, raw_text = "fatal in game.tick",
+			platform = "darwin",
+		}), true)
+		assert_equal(sent_platform(requests[1].body), "macos", "a per-event alias is folded")
+
+		-- An unmappable per-event platform keeps the configured one, as a bad one
+		-- always has.
+		reset()
+		assert_equal(client:emit_fatal({
+			exception = { type = "lua_error", reason = "boom" }, raw_text = "fatal in game.tick",
+			platform = "toaster",
+		}), true)
+		assert_equal(sent_platform(requests[1].body), "linux")
+		assert_not_contains(requests[1].body, "toaster")
+
+		reset()
+		assert_equal(client:emit_fatal({
+			exception = { type = "lua_error", reason = "boom" }, raw_text = "fatal in game.tick",
+			modules = {
+				{ name = "libwin.dll", debug_id = "ABC1", load_address = "0x1000", platform = "win64" },
+				{ name = "libodd.so", debug_id = "ABC2", load_address = "0x2000", platform = "toaster" },
+			},
+		}), true)
+		local event = json.decode(requests[1].body)
+		local by_name = {}
+		for _, module in ipairs(event.modules or {}) do by_name[module.name] = module end
+		assert_true(by_name["libwin.dll"] ~= nil and by_name["libodd.so"] ~= nil, "both modules reach the wire")
+		assert_equal(by_name["libwin.dll"].platform, "windows", "a module alias is folded")
+		assert_equal(by_name["libodd.so"].platform, nil, "an unmappable module platform defaults to the crash's own")
+		assert_not_contains(requests[1].body, "toaster")
+	end
+	return {
+		test_a8_unmapped_detection_sends_other,
+		test_a8_configured_platform_is_folded,
+		test_a8_configured_unmappable_is_other_once,
+		test_a8_event_and_module_platforms_are_folded,
+	}
+end)()
+
 local tests = {
+	a8_platform_tests[1],
+	a8_platform_tests[2],
+	a8_platform_tests[3],
+	a8_platform_tests[4],
 	test_component_replay_structural_keys,
 	test_component_option_precedence,
 	test_legacy_component_replay_and_ambiguity,

@@ -2,6 +2,17 @@
 
 ### Unreleased
 
+- Crash reports and the consent-policy request send one of the twelve
+  platform values (`windows`, `macos`, `linux`, `android`, `ios`, `tvos`,
+  `web`, `ps4`, `ps5`, `xbox`, `switch`, `other`), folded through the same
+  table as analytics. `crash.init` no longer fails with `platform_required`:
+  an unrecognized system is `other`, and a configured value that cannot be
+  mapped (including one carrying personal data) is sent as `other` and
+  reported once as `platform_unmapped`, so the raw string never travels.
+  Per-report and module platforms are folded too. The consent-policy request
+  accepts all twelve values; a missing or non-string platform is still refused
+  locally.
+
 - Successful analytics shutdown discards pending token-provider completions,
   including synchronous provider failures after closure, without changing the
   closed client's diagnostics or scheduling work. Refused shutdowns stay live.

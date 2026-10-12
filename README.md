@@ -1524,7 +1524,9 @@ consent_policy.prepare(context, function(decision) ... end)
 its closed vocabulary **costs no request**: `app_url` (the same URL rule
 `ingest_url` and `crash_url` obey — **https anywhere, plain http only
 for a loopback host**, no userinfo, query, fragment or path), `workspace_key`, `app_key`, `environment_key`,
-`app_version`, `locale`, `platform` (use `platform.detect()`), and optionally
+`app_version`, `locale`, `platform` (use `platform.detect()`; another spelling
+is folded to one of the twelve platform values, and one that cannot be mapped is
+sent as `other`), and optionally
 `store` and `age_band` — which is accepted, sent as given, and **ignored by
 the resolver in this release** — and `advisory`, which must be `true` or
 `false`: `true` asks the resolver for the advisory part, and without it the

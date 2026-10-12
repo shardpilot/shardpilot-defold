@@ -16,16 +16,19 @@ local map = {
 	html5 = "web",
 }
 
+-- The runtime's platform, one of the twelve the services accept. The table maps
+-- the engine's documented system names; a runtime it does not know, or no sys
+-- info at all, is "other", never nil or empty.
 function M.detect()
 	if not sys or not sys.get_sys_info then
-		return nil
+		return "other"
 	end
 	local ok, info = pcall(sys.get_sys_info)
 	if not ok or type(info) ~= "table" then
-		return nil
+		return "other"
 	end
 	local name = tostring(info.system_name or info.system or ""):lower()
-	return map[name]
+	return map[name] or "other"
 end
 
 return M
