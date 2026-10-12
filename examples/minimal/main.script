@@ -24,6 +24,11 @@ local crash = require "shardpilot.crash"
 -- what is still owed a shutdown.
 local analytics_running = false
 local crash_running = false
+-- A shutdown() still closing the analytics client: it answers on a later
+-- frame, and the flag above stays set until then. A reconcile pass that meets
+-- it owes one more pass once the close has ended.
+local analytics_closing = false
+local reconcile_owed = false
 
 -- The player's standing answer, and the notice text it was given against. It
 -- SURVIVES a suspension — a plan expiring is not a reason to ask again — and
@@ -119,11 +124,18 @@ local function suspend_analytics(reason)
 		return
 	end
 	print("shardpilot: analytics suspended (" .. reason .. ")")
-	local ok, err = shardpilot.shutdown("policy_" .. reason)
-	if not ok then
-		print("shardpilot suspend not complete: " .. tostring(err))
-	end
-	analytics_running = false
+	-- shutdown() ends the session, delivers what is queued within its timeout
+	-- (10 s by default) and answers on the main loop. update() keeps pumping
+	-- the closing client, so the flag stays set until that answer: until then
+	-- the module still holds it, and a new init() would be refused.
+	analytics_closing = true
+	shardpilot.shutdown(nil, function(ok, err)
+		if not ok then
+			print("shardpilot suspend ended with " .. tostring(err))
+		end
+		analytics_closing = false
+		analytics_running = false
+	end)
 end
 -- doc-region-end: suspend-analytics
 
@@ -410,6 +422,12 @@ reconcile = function(fresh)
 			notice_open = false
 			notice_generation = notice_generation + 1
 		end
+	elseif analytics_closing then
+		-- ⚠ A LANE STILL CLOSING CANNOT OPEN OR ASK YET: init() is refused
+		-- until the close answers. This decision is not kept for later; the
+		-- policy is resolved again, fresh, once the close has ended (update()).
+		reconcile_owed = true
+		return
 	elseif not analytics_running then
 		if answered then
 			if start_analytics(answered.granted, fresh, answered.fresh_answer == true, answered.notice) then
@@ -552,6 +570,12 @@ function update(self, dt)
 	if analytics_running then
 		shardpilot.update(dt) -- drives flush timer + frame sampling
 	end
+
+	-- The pass a closing lane deferred, once the close has answered.
+	if reconcile_owed and not analytics_closing then
+		reconcile_owed = false
+		resolve_and_reconcile()
+	end
 end
 
 function final(self)
@@ -564,18 +588,15 @@ function final(self)
 		crash_running = false
 	end
 	if analytics_running then
-		-- shutdown() starts a final flush. Events it cannot deliver are written
-		-- to the durable offline spool and re-sent on the next launch, so
-		-- shutdown returns true even when the network is down. An undelivered
-		-- consent receipt is handled the same way — durably retained in the
-		-- consent outbox, it re-sends next launch — so shutdown returns
-		-- false, "consent_pending" only when the receipt could NOT be durably
-		-- captured (retry shutdown then); with spool_enabled = false it
-		-- returns false, err whenever events remain undelivered.
-		local ok, err = shardpilot.shutdown("app_final")
-		if not ok then
-			print("shardpilot shutdown not complete: " .. tostring(err))
-		end
+		-- shutdown() ends the session and starts a bounded final flush. What it
+		-- still holds is written to the durable offline spool at once and re-sent
+		-- on the next launch, so the process may end before the answer arrives;
+		-- the answer matters to a host that keeps running.
+		shardpilot.shutdown(nil, function(ok, err)
+			if not ok then
+				print("shardpilot shutdown ended with " .. tostring(err))
+			end
+		end)
 		analytics_running = false
 	end
 end

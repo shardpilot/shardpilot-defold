@@ -2640,9 +2640,9 @@ function Client:fetch_experiment_assignment(experiment_key, attributes, callback
 		attributes = nil
 	end
 	-- The callback is game code; never let it break the SDK.
-	if not self.initialized then
-		-- No request is dispatched on a torn-down client, nothing is
-		-- written, game code is not called back later.
+	if not self.initialized or self.closing then
+		-- No request is dispatched on a torn-down or closing client, nothing
+		-- is written, game code is not called back later.
 		if type(callback) == "function" then
 			pcall(callback, { ok = false, from_cache = false, error = "shutdown" })
 		end
@@ -2665,7 +2665,7 @@ function Client:fetch_experiment_assignment_with_age_band(experiment_key, band, 
 	if type(attributes) == "function" and callback == nil then
 		callback, attributes = attributes, nil
 	end
-	if not self.initialized or not self.experiments then
+	if not self.initialized or self.closing or not self.experiments then
 		return self:fetch_experiment_assignment(experiment_key, attributes, callback)
 	end
 	local declared, err = experiments_mod.attributes_with_age_band(band, attributes)
@@ -2693,13 +2693,13 @@ function Client:experiment_payload(experiment_key)
 end
 
 function Client:apply_experiment_variant(experiment_key)
-	if not self.initialized then return nil, "shutdown" end
+	if not self.initialized or self.closing then return nil, "shutdown" end
 	if not self.experiments then return nil, "experiments_not_configured" end
 	return self.experiments:apply_variant(experiment_key)
 end
 
 function Client:track_exposure(experiment_key)
-	if not self.initialized then
+	if not self.initialized or self.closing then
 		return false, "shutdown"
 	end
 	if not self.experiments then
@@ -2709,7 +2709,7 @@ function Client:track_exposure(experiment_key)
 end
 
 function Client:track_outcome(experiment_key, outcome_key, outcome_value)
-	if not self.initialized then
+	if not self.initialized or self.closing then
 		return false, "shutdown"
 	end
 	if not self.experiments then
@@ -3022,6 +3022,10 @@ local function commit_event(client, event, stream, now_ms)
 end
 
 function Client:session_start(props)
+	-- A closing client has ended its session; it opens no other.
+	if self.closing then
+		return false, "shutdown"
+	end
 	if self.initialized and self:timed_out_in_background() then
 		-- ⚠ A START PAST THE DEADLINE ENDS THE TIMED-OUT SESSION FIRST, at the
 		-- boundary instant. As a live renewal it would replace that session
@@ -3546,6 +3550,9 @@ function Client:track_ad_impression_revenue(
 	ad_format,
 	placement
 )
+	if self.closing then
+		return self:_record_refusal("shutdown")
+	end
 	if not self:_require_client_source() then
 		return self:_record_refusal("source_not_client")
 	end
@@ -3687,7 +3694,9 @@ function Client:open_experiment_application_session()
 end
 
 function Client:enqueue_event(event_name, props, context, fact, host_event)
-	if not self.initialized then
+	-- From the shutdown call on, the host adds nothing; the close's own
+	-- session end and summaries still go through.
+	if not self.initialized or (host_event and self.closing) then
 		return self:_record_refusal("shutdown", fact)
 	end
 	if consent_denied_state(self.consent_state) then
@@ -3911,6 +3920,9 @@ function Client:update(dt)
 	end
 	if self.flush_drains[1] then
 		self:pump_flush_drains()
+	end
+	if self.closing then
+		self:advance_close()
 	end
 end
 
@@ -7227,7 +7239,196 @@ function Client:flush_deadline_code()
 	return "pending"
 end
 
-function Client:shutdown(reason)
+-- ── bounded shutdown ──────────────────────────────────────────────────────────
+--
+-- The public shutdown(timeout_seconds, callback) is bounded_shutdown. It ends
+-- the open session (app_final; a pause already past its deadline ends with
+-- idle_timeout at that deadline; with no open session nothing is sent), drains
+-- what the client holds the way flush() does, and tears the client down once
+-- that settles and storage holds what it must, or at the deadline with
+-- whatever is left. Nothing keeps a closing client alive past its deadline.
+-- The callback runs once, on the main loop, with (true) or (false, code):
+--   pending               the deadline passed; the remnant is in the durable
+--                         spool for the next launch
+--   spool_persist_failed  at the deadline storage could not keep everything:
+--                         the remnant, a consent receipt or decision, or
+--                         experiment state (a diagnostic names which)
+--   <error code>          the server refused events of the final flush
+--                         terminally
+--   shutdown              the client was already shut down
+-- A second call, during the close or after it, gets the first call's answer.
+
+-- The codes a drain answers at its deadline, as opposed to a terminal refusal.
+local DEADLINE_CODES = {
+	pending = true,
+	spool_persist_failed = true,
+	consent_receipt_pending = true,
+}
+
+-- The codes the synchronous finish step uses to stay alive for a retry.
+local RETRY_CODES = {
+	consent_pending = true,
+	experiments_pending = true,
+	queue_full = true,
+	pending = true,
+}
+
+function Client:bounded_shutdown(timeout_seconds, callback)
+	if callback ~= nil and type(callback) ~= "function" then
+		return false, "invalid_callback"
+	end
+	local closing = self.closing
+	if closing then
+		if closing.result then
+			if callback then
+				pcall(callback, closing.result[1], closing.result[2])
+			end
+			return closing.result[1], closing.result[2]
+		end
+		closing.callbacks[#closing.callbacks + 1] = callback
+		return true
+	end
+	if not self.initialized then
+		if callback then
+			pcall(callback, false, "shutdown")
+		end
+		return false, "shutdown"
+	end
+	if timeout_seconds == nil then
+		timeout_seconds = DEFAULT_FLUSH_TIMEOUT_SECONDS
+	end
+	if type(timeout_seconds) ~= "number" or timeout_seconds ~= timeout_seconds
+		or timeout_seconds <= 0 or timeout_seconds == math.huge then
+		if callback then
+			pcall(callback, false, "invalid_timeout_seconds")
+		end
+		return false, "invalid_timeout_seconds"
+	end
+	closing = {
+		deadline_ms = clock.unix_ms() + timeout_seconds * 1000,
+		callbacks = { callback },
+	}
+	self.closing = closing
+	-- An experiment fetch still in flight is abandoned now: a non-adult age
+	-- declaration riding one ends unanswered, before the final drain.
+	if self.experiments then
+		self.experiments:abort_declarations()
+	end
+	-- The session ends first, once. A refusal (a full queue) is retried by
+	-- the finish step after the drain has made room.
+	self:session_end("app_final")
+	self:bounded_flush(timeout_seconds, function(ok, code)
+		closing.drained = { ok, code }
+	end)
+	-- The process may end before the answer (a host closing from final()
+	-- gets no later update): what is still held goes to the durable spool
+	-- now, as persist() writes it, and its delivery removes that copy.
+	if not closing.drained then
+		self:persist()
+	end
+	self:advance_close()
+	return true
+end
+
+-- Finish the close once the drain has settled, or force it at the deadline.
+-- Runs from bounded_shutdown and from every update() while closing.
+function Client:advance_close()
+	local closing = self.closing
+	if not closing or closing.result then
+		return
+	end
+	local expired = clock.unix_ms() >= closing.deadline_ms
+	if not closing.drained and not expired then
+		return
+	end
+	local spooled_before = #self.spool_record
+	local ok, err = self:shutdown()
+	if not ok and not RETRY_CODES[err] and not self:close_remnant_held() then
+		-- A terminal refusal dropped what the finish step dispatched; the
+		-- queue is clean now, so the step completes on its next run.
+		closing.refused = closing.refused or err
+		spooled_before = #self.spool_record
+		ok, err = self:shutdown()
+	end
+	if ok then
+		local drained = closing.drained
+		if closing.refused then
+			return self:finish_close(false, closing.refused)
+		elseif drained and drained[1] == false and not DEADLINE_CODES[drained[2]] then
+			return self:finish_close(false, drained[2])
+		elseif (drained and drained[1] == false) or #self.spool_record > spooled_before then
+			return self:finish_close(false, "pending")
+		end
+		return self:finish_close(true)
+	end
+	if not expired then
+		-- Storage is not holding everything yet: retry on the next tick,
+		-- until the deadline.
+		return
+	end
+	self:force_close(err)
+end
+
+-- Anything this client still holds for delivery or capture.
+function Client:close_remnant_held()
+	return self.in_flight_batch ~= nil or queue.size(self.queue) > 0
+		or self:spool_pending() or #self.owed_summaries > 0
+end
+
+-- The deadline passed with storage still failing: tear down anyway and say
+-- what could not be kept. A denial that neither the identity record nor its
+-- marker could store would let the next launch restore the earlier grant, so
+-- the stored identity (and the grant in it) is deleted first: a delete can
+-- succeed where a write fails, and the next launch then boots with consent
+-- unknown.
+function Client:force_close(err)
+	local kept = {}
+	if consent_denied_state(self.consent_state)
+		and self.consent_denial_record_pending and self.consent_denial_marker_pending
+		and not self:denial_receipt_retained_durably() then
+		local deleted = storage.delete_identity(self.config)
+		kept[#kept + 1] = deleted and "denial_stored_as_unknown" or "denial_not_stored"
+	end
+	if self:close_remnant_held() then
+		local owed = nil
+		for i = 1, #self.owed_summaries do
+			owed = owed or {}
+			owed[#owed + 1] = envelope.build(self.config, self, self.owed_summaries[i].event)
+		end
+		if not self:spool_undelivered(owed) then
+			kept[#kept + 1] = "remnant_not_stored"
+		end
+	end
+	self:diagnose({
+		scope = "shutdown",
+		status = "dropped",
+		code = "spool_persist_failed",
+		message = tostring(err) .. (kept[1] and (": " .. table.concat(kept, ", ")) or ""),
+	})
+	self:finish_teardown()
+	return self:finish_close(false, "spool_persist_failed")
+end
+
+-- Record the close's answer and give it to every caller waiting for it.
+function Client:finish_close(ok, code)
+	local closing = self.closing
+	if self.initialized then
+		self:finish_teardown()
+	end
+	closing.result = { ok, code }
+	local callbacks = closing.callbacks
+	closing.callbacks = {}
+	for i = 1, #callbacks do
+		pcall(callbacks[i], ok, code)
+	end
+end
+
+-- The synchronous finish step of bounded_shutdown (below): end the session,
+-- one final dispatch, durable capture of what is left, then teardown. It
+-- answers (false, code) and keeps the client alive when something could not
+-- be made durable yet; bounded_shutdown retries it until its deadline and then
+-- tears down regardless.
+function Client:shutdown()
 	-- Shutdown always uses app_final; caller reasons belong to session_end().
 	-- An experiment fetch still in flight is abandoned here: a non-adult age
 	-- declaration riding one ends now, unanswered, before the final flush.
@@ -7452,17 +7653,21 @@ function Client:shutdown(reason)
 		if self.experiments:has_owed_durable_sync() then
 			return false, "experiments_pending"
 		end
-		-- Stop the experiments consumer WITH the successful teardown (a
-		-- failed shutdown keeps the client — and the consumer — alive for
-		-- a host retry): an assignment response still in flight must not
-		-- install, persist, or call back into game code from now on.
+	end
+	self:finish_teardown()
+	return true
+end
+
+-- Stop the client. The experiments consumer stops with it (an assignment
+-- response still in flight must not install, persist, or call back into game
+-- code from now on), and a bounded flush still waiting ends with it: its
+-- events were delivered, refused, or left to the spool by the final flush.
+function Client:finish_teardown()
+	if self.experiments then
 		self.experiments:teardown()
 	end
 	self.initialized = false
-	-- A bounded flush still waiting ends with the client: its events were
-	-- delivered, refused, or left to the spool by the final flush above.
 	self:settle_flush_drains("shutdown")
-	return true
 end
 
 function Client:snapshot()

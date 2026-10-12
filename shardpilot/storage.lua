@@ -97,6 +97,26 @@ function M.save(scope, record)
 	return ok and saved == true
 end
 
+-- Delete the stored identity record and the consent decision it holds. A
+-- shutdown whose deadline passes with a denial that neither this record nor
+-- the denial marker could store uses it: a delete can succeed where a write
+-- fails, and the next launch then boots with consent unknown instead of
+-- restoring the earlier grant. True when no stored record is left to read.
+function M.delete_identity(scope)
+	local ns = namespace(scope)
+	memory_records[ns] = nil
+	local path = save_path(ns)
+	if not path then
+		return true
+	end
+	if type(os) ~= "table" or type(os.remove) ~= "function" then
+		return false
+	end
+	pcall(os.remove, path)
+	local ok, record = pcall(sys.load, path)
+	return ok and (record == nil or (type(record) == "table" and next(record) == nil))
+end
+
 -- ── consent denial marker ────────────────────────────────────────────────────
 --
 -- A small write-ahead record for DENIED consent decisions, paired 1:1 with

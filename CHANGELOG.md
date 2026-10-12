@@ -1,6 +1,41 @@
 # Changelog
 
-### Unreleased
+## v0.12.0 — 2026-10-12
+
+### Migration from `v0.11.2`
+
+Names and calls change hard, with no aliases. Update host code as follows:
+
+| `v0.11.2` | `v0.12.0` |
+|---|---|
+| `flush()` returning `true`/`false` | `flush(timeout_seconds, callback)`; read the answer in the callback ([Flush](docs/configuration.md#flush)) |
+| `shutdown(reason)` | `shutdown(timeout_seconds, callback)`; no reason, the session ends with `app_final` ([Shutdown](docs/configuration.md#shutdown)) |
+| retry `shutdown()` until it returns `true` | wait for the shutdown callback; the client always ends by the deadline |
+| configuration and crash setting names | the "Removed name → Replacement" table below |
+| `experiments_requires_remote_config_url` | `experiments_requires_app_url` |
+| `remote_config_attributes_requires_remote_config_url` | `remote_config_attributes_requires_app_url` |
+| `remote_config_api_key_required` | `remote_config_publishable_key_required` |
+| `crash_api_key_required` | `crash_key_required` |
+| `invalid_sample_every` | `invalid_crash_sample_every` |
+| `invalid_capture_previous_on_boot` | `invalid_previous_crash_capture_enabled` |
+| `invalid_publish_timeout_seconds` | `invalid_http_timeout_seconds`, crash `invalid_crash_http_timeout_seconds` |
+| `invalid_token_refresh_lead_ms` | `invalid_token_refresh_lead_seconds` |
+
+- `shutdown(timeout_seconds, callback)` replaces `shutdown(reason)`. It ends an
+  open session with `app_final` (a pause past its deadline ends with
+  `idle_timeout` at that deadline), writes what the client holds to the
+  durable spool at once, delivers it like `flush()` within the timeout
+  (default 10 s), and tears the client down when that settles or at the
+  deadline. The callback answers once on the main loop: `true`, or `false`
+  with `pending` (the remnant is in the spool), `spool_persist_failed`
+  (storage could not keep everything; a `shutdown` diagnostic names it), the
+  server's terminal refusal, `shutdown` or `invalid_timeout_seconds`. A
+  second call on the same client gets the first answer. From the call on,
+  events, `session_start`, exposures, outcomes, variant applications and
+  experiment fetches answer `shutdown`. No closing client outlives its deadline. A denial whose identity and marker writes both failed deletes
+  the stored identity before teardown, so the next launch starts with
+  consent unknown. The module releases its default client once the close
+  ends.
 
 - `flush(timeout_seconds, callback)` replaces the Boolean `flush()`. It delivers
   what the client holds at the call, batch after batch from `update()`, until

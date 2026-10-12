@@ -156,6 +156,50 @@ function is refused with `false, "invalid_callback"`, and nothing is sent. A
 drain that does not settle inside the call answers only from `update()`, so a
 host that stops calling `update()` gets no answer.
 
+## Shutdown
+
+`shutdown(timeout_seconds, callback)` ends the client in three steps:
+
+1. It ends an open session with `app_final`. A session paused past its
+   background deadline ends with `idle_timeout` at that deadline instead, and
+   with no open session nothing is sent.
+2. It delivers what the client holds, the same way [`flush()`](#flush) does,
+   within `timeout_seconds` (default `10`). What it holds is written to the
+   durable spool as soon as the call starts, so a process that ends before
+   the answer loses nothing.
+3. It tears the client down once that settles, or at the deadline with
+   whatever is left. Nothing keeps a closing client alive past its deadline.
+
+The callback runs once, on the main loop, with `true` or `false` and a code:
+
+| Answer | Meaning |
+|---|---|
+| `true` | Everything the client held was delivered, or removed locally. |
+| `false, "pending"` | The deadline passed. The remnant is in the durable spool and is sent on the next launch. |
+| `false, "spool_persist_failed"` | At the deadline, storage could not keep everything: the remnant, a consent receipt or decision, or experiment state. A diagnostic with `scope = "shutdown"` names what was lost. |
+| `false, "http_<status>"` or `false, "unauthorized"` | The server refused events of the final flush terminally. |
+| `false, "shutdown"` | The client was already shut down. |
+| `false, "not_initialized"` | The module-level `shutdown` has no client. |
+| `false, "invalid_timeout_seconds"` | The timeout is not a finite number above zero. Nothing is torn down. |
+
+A second call on the same client, during the close or after it, gets the
+first call's answer. The module releases its client when the close ends, so a
+later module-level `shutdown` answers `not_initialized`.
+
+From the call on, the client admits nothing new: `track` and the other event
+calls, `session_start`, `track_exposure`, `track_outcome`,
+`apply_experiment_variant` and experiment fetches answer `false, "shutdown"`
+(`apply_experiment_variant` answers `nil, "shutdown"`). It keeps draining what it holds through
+`update()`, and the module holds it: `init()` answers `already_initialized`
+until the callback has run.
+
+A denial that neither the identity record nor its write-ahead marker could
+store would let the next launch restore the earlier grant. At the deadline the
+client therefore deletes the stored identity record first: a delete can succeed
+where a write fails, and the next launch starts with consent unknown. When even
+the delete fails, the answer is `spool_persist_failed` with a diagnostic, and
+the next launch may still restore the earlier grant.
+
 ## One client per app
 
 The SDK supports **one live client per app** in a process. An app is the
@@ -172,8 +216,8 @@ withdraws that client's facts and its cached assignment. The other client
 keeps serving the experiment from memory, and delivers the facts it holds.
 
 - Create one client with `init(config)` (or `new(config)`) and keep it.
-- To replace it, retry `shutdown()` until it returns `true`, then create the
-  next client. A client that has not shut down is still live. `shutdown()`
+- To replace it, call `shutdown()` and wait for its callback, then create the
+  next client. A closing client is still live until then. `shutdown()`
   does not stop a `fetch_remote_config()` still in flight: its response is
   still cached and its callback still runs, so wait for every such callback
   of the old client first
@@ -182,7 +226,7 @@ keeps serving the experiment from memory, and delivers the facts it holds.
   independent and may run side by side. Create each with `new(config)` and
   keep every instance: `init(config)` holds one default client, and a second
   `init` returns `false, "already_initialized"` while that client remains live
-  or is being constructed. Successful shutdown releases the default client;
+  or is being constructed. A completed shutdown releases the default client;
   a later `init` can then create its replacement.
 - Raw workspace/app identifiers remain distinct in storage: `com.game` and
   `com_game`, or `Game` and `game`, have separate identity and consent records.
@@ -202,10 +246,10 @@ Configure **exactly one**:
 - **Mode B — `token_provider`** (async per-tenant JWT). A function that yields a
   short-lived ingest JWT minted by your backend. The SDK manages refresh,
   expiry-lead, and 401-retry, and requires a token before publishing.
-  After successful `shutdown()`, a pending token completion is discarded without
+  After `shutdown()` completes, a pending token completion is discarded without
   changing tokens, diagnostics or publish scheduling. This also applies if the
-  provider closes the client and then throws. A refused shutdown leaves the
-  client live, so its pending completion still settles normally.
+  provider closes the client and then throws. A closing client is still live,
+  so a completion that arrives before the close ends settles normally.
 
   ```lua
   token_provider = function(callback)

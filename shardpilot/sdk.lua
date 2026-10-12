@@ -78,7 +78,7 @@ local instance_methods = {
 	flush = { 2, "bounded_flush" },
 	on_window_event = 1,
 	persist = 0,
-	shutdown = 1,
+	shutdown = { 2, "bounded_shutdown" },
 	get_rejections = 0,
 	snapshot = 0,
 }
@@ -407,19 +407,41 @@ function M.persist()
 	return with_default("persist")
 end
 
-function M.shutdown(reason)
-	-- A failed teardown still ends the current boot delivery attempt.
-	if active_init_drain then active_init_drain.cancelled = true end
+-- End the session, deliver what is held within timeout_seconds (default 10),
+-- and tear the client down; the callback runs once, on the main loop, with
+-- (true) or (false, code). See docs/configuration.md. The default client is
+-- released when it is torn down, so a later init() starts a new one.
+function M.shutdown(timeout_seconds, callback)
+	-- Refused before the wrapper below, which would make any callback valid.
+	if callback ~= nil and type(callback) ~= "function" then
+		return false, "invalid_callback"
+	end
 	local client = default()
 	if not client then
+		if callback then
+			pcall(callback, false, "not_initialized")
+		end
 		return false, "not_initialized"
 	end
-	local ok, err = client:shutdown(reason)
-	-- A synchronous shutdown response hook may have adopted another client.
-	if ok and default_client == client then
-		default_client = nil
-		pending_init_flush = nil
+	local function release()
+		-- A shutdown response hook may have adopted another client.
+		if not client.initialized and default_client == client then
+			default_client = nil
+			pending_init_flush = nil
+		end
 	end
+	local ok, err = client:bounded_shutdown(timeout_seconds, function(done, code)
+		release()
+		if callback then
+			callback(done, code)
+		end
+	end)
+	-- A shutdown the client takes ends the current boot delivery attempt; a
+	-- refused one changes nothing.
+	if active_init_drain and err ~= "invalid_timeout_seconds" then
+		active_init_drain.cancelled = true
+	end
+	release()
 	return ok, err
 end
 
