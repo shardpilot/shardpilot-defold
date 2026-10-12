@@ -3200,23 +3200,22 @@ local function test_mismatched_experiment_key_is_malformed()
 	assert_nil(client:experiment_variant("exp-other"))
 end
 
-local function test_unknown_not_assigned_reason_is_malformed()
+local function test_unknown_not_assigned_reason_clears_assignment()
 	reset()
 	local client = granted_client()
 	next_response_body = assignment_body()
 	fetch(client, "exp-checkout")
 
-	-- The not-assigned reason vocabulary is CLOSED. An unknown reason is
-	-- semantics this client cannot honor: malformed serve-stale — never a
-	-- drop directive executed blind.
+	-- Future reason strings install the not-assigned answer as unknown.
 	next_response_body = not_assigned_body("mystery_gate")
 	local result = fetch(client, "exp-checkout")
-	assert_true(result.ok and result.from_cache)
-	assert_equal(result.error, "malformed_response")
-	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
-		"an unknown reason must not drop the cached assignment")
+	assert_true(result.ok and not result.assigned and not result.from_cache)
+	assert_equal(result.reason, "unknown")
+	assert_nil(client:experiment_variant("exp-checkout"))
 
 	-- The known vocabulary still drops.
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
 	next_response_body = not_assigned_body("kill_switch")
 	fetch(client, "exp-checkout")
 	assert_nil(client:experiment_variant("exp-checkout"))
@@ -7761,7 +7760,7 @@ function extra_tests.test_age_golden_under_threshold_refusal()
 	extra_tests.age_refusal("under_threshold")
 end
 
-function extra_tests.test_age_future_reason_stays_malformed()
+function extra_tests.test_age_future_reason_clears_assignment()
 	reset()
 	local client = granted_client({ app_id = "exposure-app" })
 	client:set_consent(true)
@@ -7771,9 +7770,9 @@ function extra_tests.test_age_future_reason_stays_malformed()
 	next_response_body = extra_tests.age_golden("unknown"):gsub('"age_ineligible"', '"future_age_reason"')
 	local result
 	client:fetch_experiment_assignment("exposure-banner", {}, function(value) result = value end)
-	assert_true(result.ok and result.assigned and result.from_cache)
-	assert_equal(result.error, "malformed_response")
-	assert_equal(client:experiment_variant("exposure-banner"), "control")
+	assert_true(result.ok and not result.assigned and not result.from_cache)
+	assert_equal(result.reason, "unknown")
+	assert_nil(client:experiment_variant("exposure-banner"))
 	client:shutdown()
 end
 
@@ -11913,7 +11912,7 @@ local tests = {
 	extra_tests.test_age_golden_undeclared_refusal,
 	extra_tests.test_age_golden_unknown_refusal,
 	extra_tests.test_age_golden_under_threshold_refusal,
-	extra_tests.test_age_future_reason_stays_malformed,
+	extra_tests.test_age_future_reason_clears_assignment,
 	extra_tests.test_age_api_contract,
 	extra_tests.test_age_api_invalid_and_conflicting,
 	extra_tests.test_age_attributes_keep_refusals,
@@ -12032,7 +12031,7 @@ local tests = {
 	test_stale_auth_refusal_does_not_latch,
 	test_credential_swap_scopes_the_cache,
 	test_mismatched_experiment_key_is_malformed,
-	test_unknown_not_assigned_reason_is_malformed,
+	test_unknown_not_assigned_reason_clears_assignment,
 	test_failed_sentinel_clear_never_resurrects_serving,
 	test_non_string_reason_is_malformed,
 	test_sibling_write_lands_owed_drops,
@@ -12194,3 +12193,131 @@ for _, test in ipairs(tests) do
 end
 
 print("shardpilot defold experiments tests passed")
+
+-- Assignment response openness scenes use the real HTTP/cache path.
+;(function()
+ local passed,failed=0,0
+ local function scene(name,fn)
+  reset();local restore=install_fake_sys_storage()
+  local ok,err=pcall(fn);restore()
+  if ok then passed=passed+1 else failed=failed+1 end
+  print("assignment-enum "..name..": "..(ok and "PASS" or "FAIL "..tostring(err)))
+ end
+ local function get(c,body,key)
+  next_response_body=body
+  return fetch(c,key or "exp-checkout",{age_band="adult"})
+ end
+ local function seed(c,key)
+  local r=get(c,assignment_body({experiment_key=key or "exp-checkout"}),key)
+  assert_true(r.ok and r.assigned,"real seed request accepted")
+ end
+ local function unknown_body(kind,value)
+  if kind=="reason" then return not_assigned_body(value)end
+  return assignment_body({boundary={assignment_unit=value,future_member={flag=true}}})
+ end
+ local function withdrawn(c,r,kind)
+  assert_equal(r.ok,true);assert_equal(r.from_cache,false);assert_equal(r.assigned,false);assert_equal(r.reason,"unknown")
+  if kind=="unit" then assert_equal(r.boundary.assignment_unit,"unknown");assert_true(r.boundary.future_member.flag)end
+  assert_nil(c:experiment_variant("exp-checkout"));assert_nil(c:apply_experiment_variant("exp-checkout"))
+  assert_nil(c.experiments.pending_exposure["exp-checkout"],"no new application/exposure")
+  local stored=storage.load_experiments(c.config);assert_true(not stored or not stored.entries["exp-checkout"],"durable assignment removed")
+  storage.reset();local relaunched=assert(sdk.new(config()));assert_nil(relaunched:experiment_variant("exp-checkout"),"no resurrection after relaunch")
+ end
+ for _,kind in ipairs({"reason","unit"})do
+  for _,value in ipairs({"future_value","",kind=="reason" and "Kill_switch" or "Client_id"})do
+   for _,warm in ipairs({false,true})do
+    scene(kind.." value="..value.." warm="..tostring(warm),function()
+     local c=granted_client();if warm then seed(c)end
+     local r=get(c,unknown_body(kind,value));assert_equal(#assignment_requests(),warm and 2 or 1)
+     withdrawn(c,r,kind)
+    end)
+   end
+  end
+  scene(kind.." revalidation",function()
+   local c=granted_client();seed(c);seed(c,"other-experiment")
+   responder=function(url,method,callback)
+    if is_assignment_request({url=url})then
+     local key=query_params(url).experiment_key
+     callback(nil,nil,{status=200,response=key=="exp-checkout" and unknown_body(kind,"future_value") or assignment_body({experiment_key=key})});return true
+    end
+   end
+   advance_seconds(400);c:update(0.016)
+   assert_equal(#assignment_requests(),4,"both real cadence requests ran")
+   assert_nil(c:experiment_variant("exp-checkout"));assert_equal(c:experiment_variant("other-experiment"),"treatment")
+   local stored=storage.load_experiments(c.config);assert_nil(stored.entries["exp-checkout"]);assert_true(stored.entries["other-experiment"]~=nil)
+  end)
+  scene(kind.." preserves older owed treatment",function()
+   local c=granted_client();seed(c);assert_equal(c:apply_experiment_variant("exp-checkout"),"treatment")
+   local owed=c.experiments.pending_exposure["exp-checkout"][1]
+   local r=get(c,unknown_body(kind,"future_value"));assert_equal(r.assigned,false);assert_nil(c:experiment_variant("exp-checkout"))
+   assert_equal(c.experiments.pending_exposure["exp-checkout"][1],owed,"past application still owed")
+   assert_nil(c:apply_experiment_variant("exp-checkout"));assert_equal(#c.experiments.pending_exposure["exp-checkout"],1)
+  end)
+  scene(kind.." older reply cannot remove newer treatment",function()
+   local c=granted_client();seed(c);local held={}
+   responder=function(url,method,callback)if is_assignment_request({url=url})then held[#held+1]=callback;return true end end
+   assert_true(c:fetch_experiment_assignment("exp-checkout",{age_band="adult"},function()end));assert_true(c:fetch_experiment_assignment("exp-checkout",{age_band="adult"},function()end))
+   assert_equal(#held,2)
+   held[2](nil,nil,{status=200,response=assignment_body({variant_key="newer",version=4})})
+   held[1](nil,nil,{status=200,response=unknown_body(kind,"future_value")})
+   assert_equal(c:experiment_variant("exp-checkout"),"newer")
+   assert_equal(storage.load_experiments(c.config).entries["exp-checkout"].variant_key,"newer")
+  end)
+  scene(kind.." newer refusal fences older treatment",function()
+   local c=granted_client();seed(c);local held={}
+   responder=function(url,method,callback)if is_assignment_request({url=url})then held[#held+1]=callback;return true end end
+   assert_true(c:fetch_experiment_assignment("exp-checkout",{age_band="adult"},function()end));assert_true(c:fetch_experiment_assignment("exp-checkout",{age_band="adult"},function()end));assert_equal(#held,2)
+   held[2](nil,nil,{status=200,response=unknown_body(kind,"future_value")})
+   held[1](nil,nil,{status=200,response=assignment_body({variant_key="older",version=4})})
+   assert_nil(c:experiment_variant("exp-checkout"))
+   local stored=storage.load_experiments(c.config);assert_true(not stored or not stored.entries["exp-checkout"])
+  end)
+ end
+ for _,reason in ipairs({"kill_switch","targeting_unmatched","age_ineligible","absent"})do
+  scene("known reason "..reason,function()
+   local c=granted_client();seed(c);local value=reason~="absent" and reason or nil
+   local r=get(c,not_assigned_body(value));assert_true(r.ok and not r.assigned and not r.from_cache);assert_equal(r.reason,value)
+   assert_nil(c:experiment_variant("exp-checkout"))
+  end)
+ end
+ for _,unit in ipairs({"client_id","synthetic_subject_key"})do
+  scene("known unit "..unit,function()
+   local c=granted_client();local r=get(c,assignment_body({boundary={assignment_unit=unit,future_member={flag=true}},future_member={nested=true}}))
+   assert_true(r.ok and r.assigned);assert_equal(r.boundary.assignment_unit,unit);assert_true(r.boundary.future_member.flag)
+   storage.reset();local relaunched=assert(sdk.new(config()));assert_equal(relaunched:experiment_variant("exp-checkout"),"treatment")
+  end)
+ end
+ for _,kind in ipairs({"reason","unit"})do
+  for _,wire in ipairs({"null","12","false","[]","{}"})do
+   scene("malformed "..kind.." "..wire,function()
+    local c=granted_client();seed(c);local body=unknown_body(kind,"replace_me"):gsub('"replace_me"',wire)
+    local r=get(c,body);assert_true(r.ok and r.from_cache);assert_equal(r.error,"malformed_response");assert_equal(c:experiment_variant("exp-checkout"),"treatment")
+   end)
+  end
+  scene("scope before unknown "..kind,function()
+   local c=granted_client();seed(c);local body=json.decode(unknown_body(kind,"future_value"));body.app_key="other-app"
+   local r=get(c,json.encode(body));assert_true(r.ok and r.from_cache);assert_equal(r.error,"malformed_response");assert_equal(c:experiment_variant("exp-checkout"),"treatment")
+  end)
+ end
+ for _,case in ipairs({"version","served_revision","assignment_key","variant_key"})do
+  scene("malformed assigned field "..case.." before unknown unit",function()
+   local c=granted_client();seed(c);local body=json.decode(unknown_body("unit","future_value"));body[case]=false
+   local r=get(c,json.encode(body));assert_true(r.ok and r.from_cache);assert_equal(r.error,"malformed_response")
+  end)
+ end
+ scene("unknown unit on not-assigned does not become age withdrawal",function()
+  local c=granted_client();seed(c);c:apply_experiment_variant("exp-checkout")
+  local owed=c.experiments.pending_exposure["exp-checkout"][1]
+  local r=get(c,json.encode({assigned=false,reason="age_ineligible",version=3,boundary={assignment_unit="future_unit"}}))
+  assert_equal(r.reason,"unknown");assert_equal(r.boundary.assignment_unit,"unknown");assert_nil(c:experiment_variant("exp-checkout"))
+  assert_equal(c.experiments.pending_exposure["exp-checkout"][1],owed)
+ end)
+ scene("unsupported stored unit cannot restore treatment",function()
+  local c=granted_client();seed(c);seed(c,"other-experiment")
+  local record=storage.load_experiments(c.config);record.entries["exp-checkout"].assignment_unit="future_unit"
+  assert_true(storage.save_experiments(c.config,record));storage.reset()
+  local relaunched=assert(sdk.new(config()));assert_nil(relaunched:experiment_variant("exp-checkout"));assert_equal(relaunched:experiment_variant("other-experiment"),"treatment")
+ end)
+ print("assignment-enum total: "..passed.." pass, "..failed.." fail")
+ assert_equal(failed,0,"assignment response openness")
+end)()
