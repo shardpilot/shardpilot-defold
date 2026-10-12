@@ -4232,6 +4232,7 @@ local function test_dump_persist_failure_falls_back_to_in_memory_pending()
 	-- IN-SESSION RESEND: the server now accepts (202). The in-memory entry resends,
 	-- is accepted, and is cleared (it is not resent again).
 	reset()
+	socket.now = socket.now + 1 -- The retained attempt becomes eligible after backoff.
 	next_status = 202
 	client:resend_pending()
 	assert_equal(#requests, 1, "the in-memory pending report is resent in-session")
@@ -4891,6 +4892,7 @@ local function test_memory_fallback_resends_oldest_first()
 	end
 	-- Twelve mints, eight retained: the oldest survivor is NF5.
 	reset()
+	socket.now = socket.now + 60 -- Let the bounded retry window expire.
 	next_status = 202
 	client:resend_pending()
 	assert_true(#requests >= 1, "the pass ran over the fallback")
@@ -5006,6 +5008,7 @@ local function test_resend_merges_memory_and_disk_by_age()
 	assert_equal(client:snapshot().persisted, 1, "the newer report persisted durably")
 
 	reset()
+	socket.now = socket.now + 2 -- Both retained failures have become eligible.
 	next_status = 202
 	client:resend_pending()
 	assert_true(#requests >= 2, "both reports resent")
@@ -5935,4 +5938,163 @@ print("shardpilot defold crash tests passed")
 		print("crash sampling scene " .. scene.name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
 	end
 	assert_equal(failed, 0, "crash sampling scene failures")
+end)()
+
+-- Crash retry contract scenes use real transport/client/storage with synthetic I/O.
+;(function()
+ local transport=require "shardpilot.crash.transport"
+ local clock=require "shardpilot.clock"
+ local random=require "shardpilot.random"
+ local passed,failed=0,0
+ local function scene(name,fn)
+  reset()
+  local saved={request=http.request,gettime=socket.gettime,unit=random.unit,get=sys.get_save_file,save=sys.save,load=sys.load}
+  socket.now=1791763200;socket.gettime=function()return socket.now end;random.unit=function()return 1 end
+  local ok,err=pcall(fn)
+  http.request=saved.request;socket.gettime=saved.gettime;random.unit=saved.unit
+  sys.get_save_file,sys.save,sys.load=saved.get,saved.save,saved.load;storage.reset()
+  if ok then passed=passed+1 else failed=failed+1 end
+  print("crash-retry "..name..": "..(ok and "PASS" or "FAIL "..tostring(err)))
+ end
+ local function pending(c)
+  local entries=storage.load_pending_entries(c:pending_scope())
+  for _,entry in pairs(c.in_memory_pending)do entries[#entries+1]=entry end
+  return entries
+ end
+ local disabled='{"error":{"code":"kind_not_enabled"}}'
+ local cases={
+  {"typed400",400,disabled,true},{"typed404",404,disabled,true},
+  {"bare404",404,"",false},{"unknown400",400,'{"error":{"code":"unknown"}}',false},
+  {"case404",404,'{"error":{"code":"KIND_NOT_ENABLED"}}',false},
+  {"message404",404,'{"error":{"message":"kind_not_enabled"}}',false},
+  {"malformed404",404,"{",false},{"array404",404,'[{"error":{"code":"kind_not_enabled"}}]',false},
+  {"duplicate404",404,'{"error":{"code":"unknown","code":"kind_not_enabled"}}',false},
+  {"trailing404",404,disabled.." garbage",false},{"oversize404",404,disabled..string.rep(" ",65536),false},
+  {"wrongstatus403",403,disabled,false},{"accepted202",202,disabled,false},
+  {"transient503",503,"",true},{"offline",0,"",true},{"rate429",429,"",true}
+ }
+ for _,case in ipairs(cases)do
+  scene("classification "..case[1],function()
+   next_status,next_response_body=case[2],case[3];local observed
+   transport.ingest_body(config(),"sp_crash_synthetic",'{"crash_id":"synthetic"}',function(ok,err,unauthorized,retryable)observed={ok=ok,err=err,retryable=retryable}end)
+   assert_equal(#requests,1);assert_equal(observed.retryable,case[4])
+   if case[1]=="typed400" or case[1]=="typed404" then assert_equal(observed.err,"kind_not_enabled")end
+  end)
+ end
+ for _,disk in ipairs({false,true})do
+  for _,status in ipairs({400,404})do
+   scene("retention disk="..tostring(disk).." status="..status,function()
+    if disk then install_fake_sys_storage()end
+    next_status=status;next_response_body=disabled
+    local c=assert(crash.new(config({crash_sample_every=1})))
+    assert_true(c:emit_fatal(presymbolicated_event()))
+    local body=requests[1].body;local original=pending(c)[1]
+    assert_equal(#pending(c),1);assert_equal(original.body,body);assert_equal(c:snapshot().rejected,0)
+    c:resend_pending();assert_equal(#requests,1,"first retry is paced")
+    socket.now=socket.now+2;c:resend_pending();assert_equal(#requests,2);assert_equal(requests[2].body,body)
+    local retained=pending(c)[1];assert_equal(retained.created_at,original.created_at);assert_equal(retained.crash_id,original.crash_id)
+    c:set_enabled(false);socket.now=socket.now+10;c:resend_pending();assert_equal(#requests,2,"opt-out prevents resend")
+    c:set_enabled(true);next_status=202;c:resend_pending();assert_equal(#requests,3);assert_equal(requests[3].body,body);assert_equal(#pending(c),0)
+   end)
+  end
+ end
+ scene("no-hint backoff grows and caps",function()
+  next_status=503;local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event())
+  for _,seconds in ipairs({1,2,4,8,16,32,60,60})do
+   local before=#requests;c:resend_pending();assert_equal(#requests,before)
+   local deadline=c:snapshot().resend_deferred_until_ms;assert_equal(deadline,clock.unix_ms()+seconds*1000)
+   socket.now=socket.now+seconds;c:resend_pending();assert_equal(#requests,before+1)
+  end
+  next_status=202;socket.now=socket.now+60;c:resend_pending();assert_equal(#pending(c),0)
+  next_status=503;c:emit_fatal(presymbolicated_event());c:resend_pending()
+  assert_equal(c:snapshot().resend_deferred_until_ms,clock.unix_ms()+1000,"accept resets attempts")
+ end)
+ for _,hint in ipairs({"7","999999","Mon, 12 Oct 2026 00:00:07 GMT","Monday, 12-Oct-26 00:00:07 GMT","Mon Oct 12 00:00:07 2026"})do
+  scene("retry-after "..hint,function()
+   install_fake_sys_storage();next_status=404;next_response_body=disabled;next_response_headers={["Retry-After"]=hint}
+   local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event());local body=requests[1].body
+   local wait=hint=="999999" and 86400 or 7
+   assert_equal(c:snapshot().last_retry_after,wait,"bounded parsed server floor")
+   local _,deadline=storage.load_pending_entries(c:pending_scope());assert_equal(deadline,clock.unix_ms()+wait*1000)
+   storage.reset();local relaunched=assert(crash.new(config({crash_sample_every=1})));relaunched:resend_pending();assert_equal(#requests,1)
+   socket.now=socket.now+wait;next_status=202;relaunched:resend_pending();assert_equal(#requests,2);assert_equal(requests[2].body,body)
+  end)
+ end
+ scene("hint is a floor, not a backoff reset",function()
+  next_status=503;local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event())
+  socket.now=socket.now+1;c:resend_pending();socket.now=socket.now+2
+  next_response_headers={["retry-after"]="1"};c:resend_pending();c:resend_pending()
+  assert_equal(c:snapshot().resend_deferred_until_ms,clock.unix_ms()+4000)
+ end)
+ scene("memory deadline survives failed storage",function()
+  install_fake_sys_storage()
+  sys.save=function()return false end
+  next_status=404;next_response_body=disabled;next_response_headers={["retry-after"]="7"}
+  local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event());c:resend_pending()
+  assert_equal(c:snapshot().persist_failed,1,"durable write actually failed")
+  assert_equal(#requests,1);assert_equal(#pending(c),1);assert_equal(c:snapshot().resend_deferred_until_ms,clock.unix_ms()+7000)
+ end)
+ scene("older acceptance cannot clear a later retry",function()
+  local callbacks={};http.request=function(url,method,callback,headers,body)requests[#requests+1]={body=body};callbacks[#callbacks+1]=callback end
+  local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event());c:emit_fatal(presymbolicated_event())
+  callbacks[2](nil,nil,{status=404,response=disabled});callbacks[1](nil,nil,{status=202,response="{}"})
+  c:resend_pending();assert_equal(#requests,2);assert_equal(#pending(c),1)
+  assert_equal(c:snapshot().resend_deferred_until_ms,clock.unix_ms()+1000)
+ end)
+ scene("analytics disabled-kind remains terminal",function()
+  next_status=400;next_response_body=disabled;local retry
+  require("shardpilot.transport").publish({ingest_url="https://ingest.example",http_timeout_seconds=5},"sp_ingest_synthetic",{events={}},function(ok,err,u,r)retry=r end)
+  assert_equal(retry,false)
+ end)
+
+ for _,hint in ipairs({"-3","junk","Tue, 30 Feb 2027 00:00:07 GMT","Bogus, 12 Oct 2026 00:00:07 GMT","0","Sun, 11 Oct 2026 23:59:00 GMT"})do
+  scene("invalid or elapsed floor "..hint,function()
+   next_status=404;next_response_body=disabled;next_response_headers={["retry-after"]=hint}
+   local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event());c:resend_pending()
+   assert_equal(#requests,1);assert_equal(c:snapshot().resend_deferred_until_ms,clock.unix_ms()+1000)
+  end)
+ end
+ scene("nonfatal live report joins paced backlog",function()
+  next_status=404;next_response_body=disabled
+  local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event());c:emit(presymbolicated_event())
+  assert_equal(#requests,1);assert_equal(#pending(c),2)
+  socket.now=socket.now+2;next_status=202;c:resend_pending();assert_equal(#requests,3);assert_equal(#pending(c),0)
+ end)
+ scene("no-hint retry stops the serial pass",function()
+  next_status=503;local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event());c:emit_fatal(presymbolicated_event())
+  socket.now=socket.now+3;next_status=400;next_response_body=disabled
+  c:resend_pending();assert_equal(#requests,3);assert_equal(#pending(c),2)
+  c:resend_pending();assert_equal(#requests,3)
+ end)
+ scene("typed refusal does not refresh retention age",function()
+  install_fake_sys_storage();next_status=400;next_response_body=disabled
+  local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event())
+  assert_equal(#pending(c),1);socket.now=socket.now+8*86400;c:resend_pending()
+  assert_equal(#pending(c),0);assert_equal(#requests,1)
+ end)
+ for _,mode in ipairs({"missing","throws"})do
+  scene("error decoder "..mode,function()
+   next_status=404;next_response_body=disabled;local saved=json.decode;local retry
+   json.decode=mode=="throws" and function()error("synthetic decode failure")end or nil
+   transport.ingest_body(config(),"sp_crash_synthetic","{}",function(ok,err,u,r)retry=r end)
+   json.decode=saved;assert_equal(retry,false)
+  end)
+ end
+
+ scene("jitter lower bound",function()
+  random.unit=function()return 0 end
+  next_status=503;local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event())
+  socket.now=socket.now+1;c:resend_pending();assert_equal(c:snapshot().resend_deferred_until_ms,clock.unix_ms()+1000)
+ end)
+ scene("concurrent failure cannot shorten server floor",function()
+  install_fake_sys_storage();local callbacks={}
+  http.request=function(url,method,callback,headers,body)requests[#requests+1]={body=body};callbacks[#callbacks+1]=callback end
+  local c=assert(crash.new(config({crash_sample_every=1})));c:emit_fatal(presymbolicated_event());c:emit_fatal(presymbolicated_event())
+  callbacks[2](nil,nil,{status=404,response=disabled,headers={["retry-after"]="30"}})
+  callbacks[1](nil,nil,{status=400,response=disabled,headers={["retry-after"]="1"}})
+  c:resend_pending();assert_equal(#requests,2);assert_equal(c:snapshot().resend_deferred_until_ms,clock.unix_ms()+30000)
+  local _,deadline=storage.load_pending_entries(c:pending_scope());assert_equal(deadline,clock.unix_ms()+30000)
+ end)
+ print("crash-retry total: "..passed.." pass, "..failed.." fail")
+ assert_equal(failed,0,"crash retry scenes")
 end)()

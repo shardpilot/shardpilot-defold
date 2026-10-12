@@ -314,7 +314,11 @@ the body.
 - **Settlement.** An entry is removed as soon as its send is **accepted**
   (2xx — including an accepted-but-suppressed report) or **terminally
   rejected** (a non-retryable 4xx that would fail forever). A retryable
-  failure — offline, `429`, `5xx` — leaves it persisted.
+  failure — offline, `429`, `5xx`, or HTTP `400`/`404` with the exact parsed
+  `error.code` `kind_not_enabled` — leaves it persisted. The disabled-kind
+  exception applies only to crash ingest. Bare/unknown-code refusals, malformed
+  bodies and message text containing that name keep ordinary status handling.
+  Retention preserves the original body, crash ID, kind and clocks.
 - **Resend: one at a time, oldest first.** `capture_previous()` (and a manual
   `resend_pending()`) runs a serial pass: the next report is dispatched only
   from the previous one's settlement, so a `429`/`Retry-After` stops the whole
@@ -324,7 +328,16 @@ the body.
   `Retry-After` is stored with the sidecar (clamped to one day; a spent or
   absurd stored deadline self-cleans) so the backpressure window survives a
   relaunch; while it holds, the pass defers and the deadline is surfaced via
-  `snapshot().resend_deferred_until_ms`. An accepted send clears the window.
+  `snapshot().resend_deferred_until_ms`. Delta-seconds and HTTP-date values
+  are supported. Retry-After is a floor, capped at 24 hours. Without a hint,
+  host-driven retries wait for jittered exponential backoff: at least one
+  second, with a ceiling doubling from one to 60 seconds. This local deadline
+  also gates memory-only recovery if storage fails; it is not persisted unless
+  a server floor was supplied. No timer or background loop is created.
+  A current accepted send clears pacing; an older acceptance cannot erase a
+  newer failure's window. Non-fatal live reports join the paced backlog; fatal
+  live sends retain their existing immediate-attempt behavior. Opt-out, purge
+  and retention limits still apply.
 - **Bounds.** At most **8 reports**, each at most **64 KB** encoded, at most
   **384 KB** total (Defold documents a 512 KB `sys.save` cap; the budget stays
   well under it). When a bound is exceeded the oldest **non-fatal** reports
