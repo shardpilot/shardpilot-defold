@@ -5110,14 +5110,13 @@ end
 
 local function test_unexpected_status_classification_pin()
 	reset()
-	-- PIN (passes before and after this round): the classification table
-	-- for statuses outside the handled set — 302/409/422 and kin — on a
-	-- cached assignment. Contract: authoritative-no-serve for THAT call
-	-- (closed http_<status> error, no stale serve), the cached record
-	-- RETAINED and STILL SERVED by the getters, and the revalidation
-	-- cadence KEEPS PROBING — the kill-switch reach survives, so no
-	-- unclassified status can freeze a stale assignment beyond the
-	-- server's own answers. No status lands in an implicit bucket.
+	-- PIN: the classification table for statuses outside the handled set —
+	-- 302/409/422 and kin — on a cached assignment. Contract: a terminal
+	-- answer fails closed. That call gets the closed http_<status> error
+	-- with no stale serve; the getters serve the host's default; the
+	-- cadence stops probing the experiment; and the record is kept for the
+	-- next session. Only an answered explicit fetch reopens it. No status
+	-- lands in an implicit bucket.
 	local client = granted_client()
 	assert_true(client:session_start())
 	next_response_body = assignment_body()
@@ -5129,22 +5128,22 @@ local function test_unexpected_status_classification_pin()
 	assert_equal(result.ok, false)
 	assert_equal(result.error, "http_409")
 	assert_equal(result.from_cache, false, "no stale serve on the failing call")
-	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
-		"the cached record is retained and served")
+	assert_nil(client:experiment_variant("exp-checkout"),
+		"the closed experiment serves the host default")
 
 	local probes_before = #assignment_requests()
 	advance_seconds(400)
 	client:update(0.016)
-	assert_true(#assignment_requests() > probes_before,
-		"the cadence keeps probing after the unexpected status")
-	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
-		"and the assignment keeps serving between probes")
+	assert_equal(#assignment_requests(), probes_before,
+		"the cadence stops probing the closed experiment")
+	assert_nil(client:experiment_variant("exp-checkout"),
+		"and nothing is served between explicit fetches")
 
 	next_status = 422
 	local unproc = fetch(client, "exp-checkout")
 	assert_equal(unproc.ok, false)
 	assert_equal(unproc.error, "http_422")
-	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+	assert_nil(client:experiment_variant("exp-checkout"))
 end
 
 local function test_shutdown_closes_session_opened_by_final_drain()
@@ -12042,7 +12041,196 @@ function extra_tests.test_apply_refusals_withdraw_their_fact_population()
 	end
 end
 
+-- ── a terminal assignment answer closes the key ──────────────────────────────
+
+function extra_tests.closed_client(status)
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_status = 200
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
+	next_status = status or 409
+	next_response_body = "{}"
+	return client, fetch(client, "exp-checkout")
+end
+
+function extra_tests.requests_for(experiment_key)
+	local count = 0
+	for _, request in ipairs(assignment_requests()) do
+		if query_params(request.url).experiment_key == experiment_key then
+			count = count + 1
+		end
+	end
+	return count
+end
+
+function extra_tests.test_terminal_assignment_answer_closes_the_key()
+	for _, status in ipairs({ 302, 307, 409, 410, 418, 422 }) do
+		reset()
+		local client, result = extra_tests.closed_client(status)
+		assert_equal(result.ok, false)
+		assert_equal(result.error, "http_" .. status)
+		assert_equal(result.from_cache, false)
+		assert_nil(client:experiment_variant("exp-checkout"),
+			"status " .. status .. " must serve the host default")
+		assert_nil(client:experiment_payload("exp-checkout"))
+		local variant, err = client:apply_experiment_variant("exp-checkout")
+		assert_nil(variant, "a closed key records no application")
+		assert_equal(err, "no_assignment")
+		local exposed, exposure_err = client:track_exposure("exp-checkout")
+		assert_equal(exposed, false, "a closed key records no exposure")
+		assert_equal(exposure_err, "no_assignment")
+	end
+end
+
+function extra_tests.test_closed_key_records_no_outcome()
+	reset()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
+	assert_true(client:track_outcome("exp-checkout", "score", 1))
+	next_status = 409
+	next_response_body = "{}"
+	fetch(client, "exp-checkout")
+	local ok, err = client:track_outcome("exp-checkout", "score", 2)
+	assert_equal(ok, false, "an outcome is not credited to a closed experiment")
+	assert_equal(err, "no_assignment")
+end
+
+function extra_tests.test_closed_key_serves_no_stale_assignment()
+	reset()
+	local client = extra_tests.closed_client(409)
+	for _, case in ipairs({ { 503, "transient_503" }, { 0, "http_0" }, { 408, "transient_408" },
+		{ 200, "malformed_response" }, { 204, "http_204" } }) do
+		next_status = case[1]
+		next_response_body = case[1] == 200 and "not json" or nil
+		local result = fetch(client, "exp-checkout")
+		assert_equal(result.ok, false, case[2] .. " must not serve a closed key")
+		assert_equal(result.from_cache, false)
+		assert_equal(result.error, case[2])
+		assert_nil(client:experiment_variant("exp-checkout"))
+	end
+	local saved_request = http.request
+	http.request = nil
+	local offline = fetch(client, "exp-checkout")
+	http.request = saved_request
+	assert_equal(offline.ok, false, "no transport must not serve a closed key")
+	assert_equal(offline.error, "http_unavailable")
+end
+
+function extra_tests.test_closed_key_is_not_probed_by_the_cadence()
+	reset()
+	local client = granted_client()
+	assert_true(client:session_start())
+	next_response_body = assignment_body({ experiment_key = "exp-banner" })
+	fetch(client, "exp-banner")
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	next_status = 409
+	next_response_body = "{}"
+	fetch(client, "exp-checkout")
+	local closed_before = extra_tests.requests_for("exp-checkout")
+	local open_before = extra_tests.requests_for("exp-banner")
+	next_status = 200
+	next_response_body = assignment_body({ experiment_key = "exp-banner" })
+	advance_seconds(400)
+	client:update(0.016)
+	assert_true(extra_tests.requests_for("exp-banner") > open_before, "an open key keeps revalidating")
+	assert_equal(extra_tests.requests_for("exp-checkout"), closed_before,
+		"a closed key is not probed until an explicit fetch or the next session")
+	assert_equal(client:experiment_variant("exp-banner"), "treatment", "closure is per key")
+	assert_nil(client:experiment_variant("exp-checkout"))
+end
+
+function extra_tests.test_successful_refetch_reopens_the_key()
+	reset()
+	local client = extra_tests.closed_client(422)
+	next_status = 200
+	next_response_body = assignment_body()
+	local result = fetch(client, "exp-checkout")
+	assert_true(result.ok, result.error)
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment", "a 200 reopens the key")
+	next_status = 503
+	next_response_body = nil
+	local stale = fetch(client, "exp-checkout")
+	assert_true(stale.ok, "a reopened key serves its cache on a transient failure")
+	assert_equal(stale.from_cache, true)
+	local before = extra_tests.requests_for("exp-checkout")
+	next_status = 200
+	next_response_body = assignment_body()
+	advance_seconds(400)
+	client:update(0.016)
+	assert_true(extra_tests.requests_for("exp-checkout") > before, "a reopened key revalidates again")
+
+	reset()
+	client = extra_tests.closed_client(409)
+	next_status = 200
+	next_response_body = not_assigned_body("targeting_unmatched")
+	fetch(client, "exp-checkout")
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"a not-assigned answer settles the key, and a later assignment serves")
+end
+
+function extra_tests.test_closure_lasts_for_the_session()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout", { age_band = "adult" })
+	next_status = 409
+	next_response_body = "{}"
+	fetch(client, "exp-checkout", { age_band = "adult" })
+	assert_nil(client:experiment_variant("exp-checkout"))
+	local next_session = assert(sdk.new(config()))
+	restore()
+	assert_equal(next_session:experiment_variant("exp-checkout"), "treatment",
+		"the record is kept, so the next session serves it again")
+end
+
+function extra_tests.test_non_200_success_status_keeps_serving()
+	for _, status in ipairs({ 201, 204 }) do
+		reset()
+		local client, result = extra_tests.closed_client(status)
+		assert_equal(result.ok, false)
+		assert_equal(result.error, "http_" .. status)
+		assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+			"a 2xx is not a terminal answer and does not close the key")
+	end
+end
+
+function extra_tests.test_stale_terminal_answer_cannot_close_the_key()
+	reset()
+	local client = granted_client()
+	assert_true(client:session_start())
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers }
+		held[#held + 1] = callback
+	end
+	client:fetch_experiment_assignment("exp-checkout")
+	client:fetch_experiment_assignment("exp-checkout")
+	http.request = saved_request
+	held[2](nil, nil, { status = 200, response = assignment_body() })
+	held[1](nil, nil, { status = 409, response = "{}" })
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
+		"an answer older than a settled one does not close the key")
+end
+
 local tests = {
+	extra_tests.test_terminal_assignment_answer_closes_the_key,
+	extra_tests.test_closed_key_records_no_outcome,
+	extra_tests.test_closed_key_serves_no_stale_assignment,
+	extra_tests.test_closed_key_is_not_probed_by_the_cadence,
+	extra_tests.test_successful_refetch_reopens_the_key,
+	extra_tests.test_closure_lasts_for_the_session,
+	extra_tests.test_non_200_success_status_keeps_serving,
+	extra_tests.test_stale_terminal_answer_cannot_close_the_key,
 	extra_tests.test_apply_refusals_withdraw_their_fact_population,
 	extra_tests.test_apply_returned_key_is_durable_before_forwarding,
 	extra_tests.test_seal_survives_queue_pressure_without_second_apply,

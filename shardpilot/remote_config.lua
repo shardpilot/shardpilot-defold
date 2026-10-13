@@ -22,16 +22,19 @@
 --   * A transient failure (offline, a request timeout (408), 429, 5xx,
 --     malformed body) — the cached snapshot is served with
 --     `from_cache = true` and `error` carrying the reason; with no usable
---     cache the fetch fails. A 429 or 5xx carrying `Retry-After` also paces
---     the next fetch for that scope (see RemoteConfig:fetch).
---   * 401/403 — fails CLOSED: the cached snapshot is never served for this
---     outcome (a revoked or wrong key must not keep supplying configuration),
---     but the cache file itself is left untouched.
+--     cache, or in a closed scope, the fetch fails. A 429 or 5xx carrying
+--     `Retry-After` also paces the next fetch for that scope (see
+--     RemoteConfig:fetch).
+--   * 401/403 — fails CLOSED: the cached snapshot is never served (a revoked
+--     or wrong key must not keep supplying configuration), the getters serve
+--     the game's defaults, and the scope stays closed (see
+--     RemoteConfig:close). The cache file is kept for the next session.
 --   * Any other status (a 404 for a removed environment, an unexpected 3xx,
 --     other 4xx) is a PERMANENT failure: the fetch fails rather than serving
 --     the cached snapshot as `ok = true` — retrying cannot help and stale
---     values must not masquerade as a healthy fetch. As with 401/403, the
---     cache record and the getter snapshot are left untouched.
+--     values must not masquerade as a healthy fetch. It closes the scope
+--     like 401/403. A 404 carrying the exact `remote_config_not_published`
+--     code also clears the cache record: nothing is published.
 --
 -- The cache is stamped with the (workspace, environment, client, url) scope
 -- it was fetched for; a cache written by any other scope is a miss (its ETag
@@ -293,8 +296,10 @@ local function serve_cache_or_fail(cache, error_code)
 end
 
 -- Decide one fetch outcome from the transport response and the cached
--- snapshot. Pure (no IO, no state) so tests can drive every branch. Returns
--- (result, new_cache, authoritative, revalidated_cache):
+-- snapshot. Pure (no IO, no state) so tests can drive every branch. `closed`
+-- marks a scope a terminal answer closed: its cache is never served for a
+-- transient failure, though a 304 still revalidates it. Returns
+-- (result, new_cache, authoritative, revalidated_cache, unpublished):
 --   * `new_cache` non-nil means "persist this record"; it exists only for a
 --     fresh 200, so no failure — unauthorized, permanent, malformed — and no
 --     cache-served outcome ever disturbs the last-known-good record.
@@ -311,8 +316,15 @@ end
 --     while the request was in flight. Whether the renewal may land is
 --     decided at install time: it never displaces a fresher record carrying
 --     a different body.
-function M.apply(cache, response, now_ms)
+--   * `unpublished` is true exactly for a 404 whose envelope carries the
+--     `remote_config_not_published` code: nothing is published, so the
+--     cache is cleared as well as closed.
+function M.apply(cache, response, now_ms, closed)
 	local status = type(response) == "table" and response.status or 0
+	local servable = cache
+	if closed then
+		servable = nil
+	end
 
 	if type(response) == "table" and status == 200 then
 		local values, version = parse_config(response.response)
@@ -328,7 +340,7 @@ function M.apply(cache, response, now_ms)
 				fetched_at_ms = now_ms,
 			}, true
 		end
-		return serve_cache_or_fail(cache, "malformed_response"), nil, false
+		return serve_cache_or_fail(servable, "malformed_response"), nil, false
 	end
 
 	if type(response) == "table" and status == 304 and cache then
@@ -360,8 +372,8 @@ function M.apply(cache, response, now_ms)
 	-- An unauthorized response is an authoritative "this key may not read
 	-- this configuration", not a transient outage: serving the cached
 	-- snapshot would keep a revoked or wrong key supplied with configuration
-	-- indefinitely. Fail closed; the cache file is kept untouched but is
-	-- never served for this outcome.
+	-- indefinitely. Fail closed; the cache file is kept for the next session
+	-- but is not served in this one (see install).
 	if type(response) == "table" and (status == 401 or status == 403) then
 		return { ok = false, from_cache = false, error = "unauthorized" }, nil, true
 	end
@@ -371,18 +383,21 @@ function M.apply(cache, response, now_ms)
 	-- error. Any other status — a 404 for a removed environment, an
 	-- unexpected redirect, other 4xx — is an authoritative "this
 	-- configuration is not being served here", so the fetch fails instead of
-	-- reporting stale values as a healthy `ok = true` (the cache record and
-	-- the getter snapshot stay untouched).
+	-- reporting stale values as a healthy `ok = true`, and closes the scope
+	-- like an unauthorized answer.
 	if status == 0 then
-		return serve_cache_or_fail(cache, "http_0"), nil, false
+		return serve_cache_or_fail(servable, "http_0"), nil, false
 	elseif status == 408 then
-		return serve_cache_or_fail(cache, "transient_408"), nil, false
+		return serve_cache_or_fail(servable, "transient_408"), nil, false
 	elseif status == 429 then
-		return serve_cache_or_fail(cache, "transient_429"), nil, false
+		return serve_cache_or_fail(servable, "transient_429"), nil, false
 	elseif status >= 500 then
-		return serve_cache_or_fail(cache, "transient_" .. tostring(status)), nil, false
+		return serve_cache_or_fail(servable, "transient_" .. tostring(status)), nil, false
 	end
-	return { ok = false, from_cache = false, error = "http_" .. tostring(status) }, nil, true
+	local unpublished = status == 404
+		and experiments.error_code(response) == "remote_config_not_published"
+	return { ok = false, from_cache = false, error = "http_" .. tostring(status) },
+		nil, true, nil, unpublished
 end
 
 -- Depth-bounded copy of a decoded configuration value, so a table handed to
@@ -454,6 +469,11 @@ function M.new(config, identity, consent)
 		-- armed by a 429 or 5xx that carried the header. In memory only and
 		-- never shortened; a fetch inside it does not reach the network.
 		paced = {},
+		-- Scopes a terminal answer closed: the getters serve the host's
+		-- defaults and no fetch serves the cache until a fresh 200 or a 304
+		-- reopens the scope. In memory only, so the next session starts
+		-- from the kept durable record.
+		closed = {},
 	}, RemoteConfig)
 	-- Serve the persisted last-known-good snapshot immediately after a
 	-- restart: getters work before (and without) any fetch when a cache for
@@ -565,6 +585,30 @@ function RemoteConfig:diagnose(status)
 	end
 end
 
+-- Fail a scope closed after a terminal answer: the getters serve the host's
+-- defaults, and the scope serves no cache until a fresh 200 or a 304 reopens
+-- it. The durable record is kept for the next session, unless nothing is
+-- published: then the record this fetch captured is cleared, in memory and
+-- on disk. A record no older than the captured one, or any record when none
+-- was captured, may be another same-app client's newer write that this
+-- answer cannot be ordered against, so it is kept.
+function RemoteConfig:close(scope, served_cache, unpublished)
+	self.closed[scope] = true
+	self.values = nil
+	self.version = nil
+	if not unpublished or not served_cache then
+		return
+	end
+	if self.cache and self.cache.scope == scope
+		and self.cache.fetched_at_ms <= served_cache.fetched_at_ms then
+		self.cache = nil
+	end
+	local durable = self:durable_record(scope)
+	if durable and durable.fetched_at_ms <= served_cache.fetched_at_ms then
+		storage.clear_remote_config(self.config)
+	end
+end
+
 -- The current-scope gate shared by installs and Retry-After windows: a
 -- response for a scope the identity has rotated away from is another
 -- client's, so it neither installs nor paces. The empty client scope stays
@@ -610,7 +654,7 @@ end
 -- The snapshot is a defensive copy: the result table is handed to game code,
 -- and a callback that mutates `result.values` must not corrupt what later
 -- getters read.
-function RemoteConfig:install(seq, result, new_cache, scope, authoritative, served_cache, revalidated_cache)
+function RemoteConfig:install(seq, result, new_cache, scope, authoritative, served_cache, revalidated_cache, unpublished)
 	if not self:scope_is_current(scope) then
 		return
 	end
@@ -622,6 +666,11 @@ function RemoteConfig:install(seq, result, new_cache, scope, authoritative, serv
 	end
 	if authoritative then
 		self.settled[scope] = seq
+		if result.ok then
+			self.closed[scope] = nil
+		else
+			self:close(scope, served_cache, unpublished)
+		end
 	end
 	if not result.ok then
 		return
@@ -799,7 +848,7 @@ function RemoteConfig:fetch(callback)
 		-- fetch stays off the network and answers like the response that
 		-- set the window, serving the last-known-good snapshot when one
 		-- exists.
-		local result = serve_cache_or_fail(cache, paced.error)
+		local result = serve_cache_or_fail(not self.closed[scope] and cache or nil, paced.error)
 		self:install(seq, result, nil, scope, false, cache)
 		finish(result)
 		return false, paced.error
@@ -808,7 +857,7 @@ function RemoteConfig:fetch(callback)
 	if not http or not http.request then
 		-- No transport on this runtime is a transient failure like any
 		-- other: serve the last-known-good snapshot when one exists.
-		local result = serve_cache_or_fail(cache, "http_unavailable")
+		local result = serve_cache_or_fail(not self.closed[scope] and cache or nil, "http_unavailable")
 		self:install(seq, result, nil, scope, false, cache)
 		finish(result)
 		return false, "http_unavailable"
@@ -832,9 +881,10 @@ function RemoteConfig:fetch(callback)
 	}
 
 	http.request(url, "GET", function(_, _, response)
-		local result, new_cache, authoritative, revalidated_cache = M.apply(cache, response, clock.unix_ms())
+		local result, new_cache, authoritative, revalidated_cache, unpublished =
+			M.apply(cache, response, clock.unix_ms(), self.closed[scope])
 		self:pace(seq, scope, response)
-		self:install(seq, result, new_cache, scope, authoritative, cache, revalidated_cache)
+		self:install(seq, result, new_cache, scope, authoritative, cache, revalidated_cache, unpublished)
 		finish(result)
 	end, headers, nil, options)
 	return true
@@ -849,7 +899,8 @@ end
 -- type mismatch, so game code always receives the type it asked for. The
 -- snapshot is last-served-wins: an identity rotation does not clear it (a
 -- mid-session rotation must not blank the game's tuning) — the next fetch,
--- scoped to the new identity, replaces it.
+-- scoped to the new identity, replaces it. A terminal answer clears it, so
+-- the getters serve the caller's defaults.
 
 -- The snapshot value for a getter key, or nil. Written with explicit
 -- branches — an and/or chain would collapse a stored `false` into nil and

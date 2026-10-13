@@ -22,6 +22,18 @@
   without a cache, and `fetch_remote_config` returns `false` with that code.
   Before, remote config ignored the header and every fetch reached the
   server.
+- A terminal answer now fails closed for the rest of the session. On remote
+  config, a `401`, `403`, `3xx` or other `4xx` clears the getter snapshot,
+  so the getters serve your defaults, and no later fetch serves the cache
+  until a `200` or a `304` reopens the scope. The durable record is kept for
+  the next session. A `404` with the exact code `remote_config_not_published`
+  clears the record as well. On experiment assignment, a `3xx` or other
+  `4xx` closes that experiment: the getters return `nil`, applications,
+  exposures and outcomes answer `no_assignment`, a transient failure serves
+  nothing, and the revalidation cadence stops asking for it until an
+  explicit fetch for it is answered or the next session. Before, remote
+  config getters kept the last values and assignment kept serving and
+  probing the cached variant.
 
 - A sealed experiment fact may carry members, in the fact or its props, and an
   `attestation` value this release does not know. They are forwarded unchanged

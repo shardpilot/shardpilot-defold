@@ -553,13 +553,13 @@ local function test_unauthorized_fails_closed_and_never_serves_cache()
 		assert_equal(result.error, "unauthorized")
 		assert_nil(result.values, "a revoked or wrong key must not keep serving cached config")
 
-		-- The cache FILE is untouched — only the fetch outcome fails closed:
-		-- the earlier snapshot still backs the getters, and a later
-		-- authorized fetch can revalidate against the kept ETag.
+		-- The cache FILE is kept for the next session, and a later
+		-- authorized fetch can revalidate against its ETag, but the getters
+		-- serve the host's defaults for the rest of this one.
 		assert_true(storage.load_remote_config(client.config) ~= nil,
 			"an unauthorized response must not delete the cache record")
-		assert_equal(client:remote_config_number("a", 0), 1,
-			"the getter snapshot keeps the last served values")
+		assert_equal(client:remote_config_number("a", 0), 0,
+			"the getters serve the host default after a terminal answer")
 	end
 end
 
@@ -613,9 +613,10 @@ local function test_permanent_http_error_fails_without_serving_cache()
 		assert_nil(result.values)
 	end
 
-	-- Like the unauthorized outcome, the record and the getter snapshot are
-	-- left untouched, and a later healthy fetch revalidates as usual.
-	assert_equal(client:remote_config_number("a", 0), 1)
+	-- Like the unauthorized outcome, the getters serve the host's defaults
+	-- while the record is kept, and a later healthy fetch revalidates it and
+	-- reopens the scope.
+	assert_equal(client:remote_config_number("a", 0), 0)
 	assert_true(storage.load_remote_config(client.config) ~= nil,
 		"a permanent error must not delete the cache record")
 	next_status = 304
@@ -623,6 +624,7 @@ local function test_permanent_http_error_fails_without_serving_cache()
 	assert_true(revalidated.ok, revalidated.error)
 	assert_equal(revalidated.from_cache, true)
 	assert_equal(revalidated.values.a, 1)
+	assert_equal(client:remote_config_number("a", 0), 1)
 end
 
 local function test_out_of_order_responses_do_not_install_stale_config()
@@ -713,9 +715,9 @@ local function test_fail_closed_fences_older_inflight_success()
 		headers = { etag = '"late"' },
 	})
 	assert_true(results.older.ok, "the older fetch still reports its own response")
-	assert_equal(client:remote_config_number("a", 0), 1,
+	assert_equal(client:remote_config_number("a", 0), 0,
 		"values must not sneak in after a newer fail-closed outcome")
-	assert_equal(client:remote_config_version(), 1)
+	assert_nil(client:remote_config_version())
 end
 
 local function test_identity_rotation_drops_inflight_response()
@@ -2314,6 +2316,253 @@ local function test_a_later_retry_after_never_shortens_the_window()
 end
 
 
+-- ── terminal answers fail closed ──────────────────────────────────────────────
+
+local function error_envelope(code)
+	return json.encode({ error = { code = code, message = "test" } })
+end
+
+local function primed_client(overrides)
+	local client = assert(sdk.new(config(overrides)))
+	next_status = 200
+	next_response_body = values_body({ a = 1 }, 3)
+	next_response_headers = { etag = '"v3"' }
+	fetch(client)
+	next_response_headers = nil
+	assert_equal(client:remote_config_number("a", 0), 1)
+	return client
+end
+
+local function test_terminal_answer_serves_host_defaults()
+	for _, status in ipairs({ 401, 403, 302, 400, 404, 410, 418 }) do
+		reset()
+		local client = primed_client()
+		next_status = status
+		next_response_body = nil
+		local result = fetch(client)
+		assert_equal(result.ok, false)
+		assert_equal(result.from_cache, false)
+		assert_nil(result.values)
+		assert_equal(client:remote_config_number("a", 0), 0,
+			"status " .. status .. " must serve the host default")
+		assert_nil(client:remote_config_value("a"))
+		assert_nil(client:remote_config_values())
+		assert_nil(client:remote_config_version())
+		assert_true(storage.load_remote_config(client.config) ~= nil,
+			"status " .. status .. " keeps the durable record for the next session")
+	end
+end
+
+local function test_closed_scope_never_serves_the_cache()
+	reset()
+	local client = primed_client()
+	next_status = 401
+	next_response_body = nil
+	fetch(client)
+	local cases = {
+		{ 503, nil, "transient_503" },
+		{ 0, nil, "http_0" },
+		{ 408, nil, "transient_408" },
+		{ 200, "not json", "malformed_response" },
+	}
+	for _, case in ipairs(cases) do
+		next_status = case[1]
+		next_response_body = case[2]
+		local result = fetch(client)
+		assert_equal(result.ok, false, case[3] .. " must not serve a closed cache")
+		assert_equal(result.from_cache, false)
+		assert_equal(result.error, case[3])
+		assert_nil(result.values)
+		assert_equal(client:remote_config_number("a", 0), 0)
+	end
+	local saved_request = http.request
+	http.request = nil
+	local offline = fetch(client)
+	http.request = saved_request
+	assert_equal(offline.ok, false, "no transport must not serve a closed cache")
+	assert_equal(offline.error, "http_unavailable")
+	assert_equal(client:remote_config_number("a", 0), 0)
+end
+
+local function test_closed_scope_paced_fetch_serves_no_cache()
+	reset()
+	local client = primed_client()
+	next_status = 403
+	next_response_body = nil
+	fetch(client)
+	next_status = 429
+	next_response_headers = { ["retry-after"] = "120" }
+	local limited = fetch(client)
+	next_response_headers = nil
+	assert_equal(limited.ok, false)
+	assert_equal(limited.error, "transient_429")
+	local before = #requests
+	local paced = fetch(client)
+	assert_equal(#requests, before, "the window still paces a closed scope")
+	assert_equal(paced.ok, false, "a paced fetch must not serve a closed cache")
+	assert_equal(paced.from_cache, false)
+	assert_equal(paced.error, "transient_429")
+	assert_equal(client:remote_config_number("a", 0), 0)
+end
+
+local function test_successful_refetch_reopens_the_scope()
+	reset()
+	local client = primed_client()
+	next_status = 401
+	next_response_body = nil
+	fetch(client)
+	next_status = 304
+	local revalidated = fetch(client)
+	assert_equal(last_request().headers["If-None-Match"], '"v3"',
+		"the kept record still revalidates")
+	assert_true(revalidated.ok, revalidated.error)
+	assert_equal(revalidated.from_cache, true)
+	assert_equal(revalidated.values.a, 1)
+	assert_equal(client:remote_config_number("a", 0), 1, "a 304 reopens the scope")
+	assert_equal(client:remote_config_version(), 3)
+	next_status = 503
+	local stale = fetch(client)
+	assert_true(stale.ok, "a reopened scope serves its cache on a transient failure")
+	assert_equal(stale.from_cache, true)
+
+	next_status = 418
+	fetch(client)
+	assert_equal(client:remote_config_number("a", 0), 0)
+	next_status = 200
+	next_response_body = values_body({ a = 2 }, 4)
+	local fresh = fetch(client)
+	assert_true(fresh.ok, fresh.error)
+	assert_equal(client:remote_config_number("a", 0), 2, "a 200 reopens the scope")
+end
+
+local function test_next_session_preloads_the_kept_record()
+	reset()
+	local client = primed_client()
+	next_status = 401
+	next_response_body = nil
+	fetch(client)
+	assert_equal(client:remote_config_number("a", 0), 0)
+	local next_session = assert(sdk.new(config()))
+	assert_equal(next_session:remote_config_number("a", 0), 1,
+		"closure lasts for the session; the next one preloads the kept record")
+end
+
+local function test_closure_is_per_scope()
+	reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:set_consent(true))
+	assert_true(client:set_anonymous_id("anon-other"))
+	next_status = 200
+	next_response_body = values_body({ b = 1 })
+	fetch(client)
+	-- The original identity is closed while the other one's record is held.
+	assert_true(client:set_anonymous_id("anon-client"))
+	next_status = 401
+	next_response_body = nil
+	fetch(client)
+	assert_true(client:set_anonymous_id("anon-other"))
+	next_status = 503
+	local other = fetch(client)
+	assert_true(other.ok, "another scope is not closed")
+	assert_equal(other.from_cache, true)
+	assert_equal(other.values.b, 1)
+end
+
+local function test_not_published_clears_the_cache()
+	reset()
+	local client = primed_client()
+	next_status = 404
+	next_response_body = error_envelope("remote_config_not_published")
+	local result = fetch(client)
+	assert_equal(result.ok, false)
+	assert_equal(result.error, "http_404")
+	assert_equal(client:remote_config_number("a", 0), 0)
+	assert_nil(storage.load_remote_config(client.config),
+		"nothing is published, so the durable record is cleared")
+	next_status = 503
+	next_response_body = nil
+	local after = fetch(client)
+	assert_equal(after.ok, false)
+	assert_nil(last_request().headers["If-None-Match"],
+		"the in-memory record is cleared too, so nothing is revalidated")
+	local next_session = assert(sdk.new(config()))
+	assert_equal(next_session:remote_config_number("a", 0), 0,
+		"the next session starts from the host defaults")
+end
+
+local function test_not_published_needs_the_exact_code()
+	local cases = {
+		{ 404, error_envelope("Remote_Config_Not_Published") },
+		{ 404, error_envelope("experiment_not_found") },
+		{ 404, '{"error":"published remote config not found"}' },
+		{ 404, json.encode({ error = { message = "remote_config_not_published" } }) },
+		{ 404, '{"error":{"code":"remote_config_not_published","code":"other"}}' },
+		{ 404, "remote_config_not_published" },
+		{ 410, error_envelope("remote_config_not_published") },
+	}
+	for i, case in ipairs(cases) do
+		reset()
+		local client = primed_client()
+		next_status = case[1]
+		next_response_body = case[2]
+		fetch(client)
+		assert_equal(client:remote_config_number("a", 0), 0)
+		assert_true(storage.load_remote_config(client.config) ~= nil,
+			"case " .. i .. " is not the exact code on a 404 and keeps the record")
+	end
+end
+
+local function test_stale_terminal_answer_cannot_close_or_clear()
+	for _, case in ipairs({ { 401, nil }, { 404, error_envelope("remote_config_not_published") } }) do
+		reset()
+		local client = assert(sdk.new(config()))
+		local held = {}
+		local saved_request = http.request
+		http.request = function(url, method, callback, headers, body, options)
+			requests[#requests + 1] = { url = url, method = method, headers = headers }
+			held[#held + 1] = callback
+		end
+		client:fetch_remote_config()
+		client:fetch_remote_config()
+		http.request = saved_request
+		held[2](nil, nil, { status = 200, response = values_body({ a = 2 }, 2) })
+		held[1](nil, nil, { status = case[1], response = case[2] })
+		assert_equal(client:remote_config_number("a", 0), 2,
+			"an answer older than a settled one neither closes nor clears")
+		assert_true(storage.load_remote_config(client.config) ~= nil)
+		next_status = 503
+		next_response_body = nil
+		assert_true(fetch(client).ok, "the scope is still open")
+	end
+end
+
+local function test_not_published_keeps_a_fresher_sibling_record()
+	reset()
+	local client = primed_client()
+	local held = nil
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers }
+		held = callback
+	end
+	client:fetch_remote_config()
+	http.request = saved_request
+	-- Another same-app client persists a fresher record while this request
+	-- is in flight; the two answers cannot be ordered from here.
+	local captured = storage.load_remote_config(client.config)
+	storage.save_remote_config(client.config, {
+		scope = captured.scope,
+		etag = '"v9"',
+		body = values_body({ a = 9 }, 9),
+		fetched_at_ms = captured.fetched_at_ms + 1000,
+	})
+	held(nil, nil, { status = 404, response = error_envelope("remote_config_not_published") })
+	assert_equal(client:remote_config_number("a", 0), 0)
+	local kept = storage.load_remote_config(client.config)
+	assert_true(kept ~= nil, "a fresher sibling record is not cleared")
+	assert_equal(kept.etag, '"v9"')
+end
+
 local tests = {
 	test_config_identity_requires_granted_consent,
 	test_anonymous_config_cache_is_separate_across_restart_and_regrant,
@@ -2382,6 +2631,16 @@ local tests = {
 	test_retry_after_for_a_rotated_identity_does_not_pace,
 	test_stale_retry_after_cannot_pace_after_a_settled_answer,
 	test_a_later_retry_after_never_shortens_the_window,
+	test_terminal_answer_serves_host_defaults,
+	test_closed_scope_never_serves_the_cache,
+	test_closed_scope_paced_fetch_serves_no_cache,
+	test_successful_refetch_reopens_the_scope,
+	test_next_session_preloads_the_kept_record,
+	test_closure_is_per_scope,
+	test_not_published_clears_the_cache,
+	test_not_published_needs_the_exact_code,
+	test_stale_terminal_answer_cannot_close_or_clear,
+	test_not_published_keeps_a_fresher_sibling_record,
 }
 
 for _, test in ipairs(tests) do
