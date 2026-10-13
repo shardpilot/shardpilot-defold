@@ -6,6 +6,28 @@ local utf8 = require "shardpilot.utf8"
 
 local M = {}
 
+-- The event contract version an event uses when the host selects none.
+M.DEFAULT_SCHEMA_VERSION = 1
+
+-- The version a track() options table selects: nil for the default, the
+-- selected integer, or false when the options are not a table whose only key
+-- is schema_version with an integer value from 1 through 65535. Nothing is
+-- coerced: strings, booleans, fractions and non-finite numbers are refused.
+function M.selected_schema_version(options)
+	if options == nil then return nil end
+	if type(options) ~= "table" then return false end
+	for key in pairs(options) do
+		if key ~= "schema_version" then return false end
+	end
+	local value = options.schema_version
+	if value == nil then return nil end
+	if type(value) ~= "number" or value ~= math.floor(value) or value < 1 or value > 65535 then
+		return false
+	end
+	-- An integral float becomes an integer, so the wire never carries "7.0".
+	return math.floor(value)
+end
+
 local function copy_table(value)
 	if type(value) ~= "table" then
 		return nil
@@ -27,7 +49,7 @@ function M.build(config, state, event)
 
 	local out = {
 		event_id = event.event_id or id.uuid(),
-		schema_version = 1,
+		schema_version = event.schema_version or M.DEFAULT_SCHEMA_VERSION,
 		event_name = event.event_name,
 		source = config.source,
 		event_ts = event.event_ts or clock.iso_utc(),

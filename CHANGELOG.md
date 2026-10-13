@@ -2,6 +2,14 @@
 
 ### Unreleased
 
+- `track(name, props, context, options)` takes an optional options table whose
+  one key, `schema_version`, selects the event's contract version: an integer
+  from 1 through 65535, sent as the event's `schema_version`; 1 when absent.
+  Any other value or key answers `false, "schema_version_invalid"` before the
+  event is queued. The selection stays with the event through retries and the
+  offline spool. Typed producers keep version 1 and sealed experiment facts
+  keep version 2. `shardpilot.supports("event_schema_version")` is `true`.
+
 - A sealed experiment fact may carry members, in the fact or its props, and an
   `attestation` value this release does not know. They are forwarded unchanged
   inside the signed bytes instead of deferring the occurrence on every retry.
