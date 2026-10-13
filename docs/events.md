@@ -81,6 +81,8 @@ shardpilot.track("level_complete", { level_id = "1-1" }, nil, { schema_version =
   Nothing is coerced or replaced with the default. The refusal counts one drop
   and sets `last_error`. It comes after the shutdown, consent and name checks,
   and before any session or queue effect.
+- Only the table's own entries count. A value inherited through `__index` is
+  not an option, and `__pairs` does not hide a key.
 - The selected version is copied when `track()` accepts the event. It stays
   with that event through retries and the offline spool.
 - Events in one batch may carry different versions.

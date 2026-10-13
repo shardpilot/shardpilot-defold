@@ -13,13 +13,15 @@ M.DEFAULT_SCHEMA_VERSION = 1
 -- selected integer, or false when the options are not a table whose only key
 -- is schema_version with an integer value from 1 through 65535. Nothing is
 -- coerced: strings, booleans, fractions and non-finite numbers are refused.
+-- Only the table's own entries count: __index and __pairs are not consulted.
 function M.selected_schema_version(options)
 	if options == nil then return nil end
 	if type(options) ~= "table" then return false end
-	for key in pairs(options) do
+	local value
+	for key, item in next, options do
 		if key ~= "schema_version" then return false end
+		value = item
 	end
-	local value = options.schema_version
 	if value == nil then return nil end
 	if type(value) ~= "number" or value ~= math.floor(value) or value < 1 or value > 65535 then
 		return false
