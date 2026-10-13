@@ -2563,7 +2563,263 @@ local function test_not_published_keeps_a_fresher_sibling_record()
 	assert_equal(kept.etag, '"v9"')
 end
 
+local function with_clear_store(scene)
+	reset()
+	local restore, stores = install_fake_sys_storage()
+	local ok, err = pcall(scene, stores)
+	restore()
+	if not ok then error(err, 0) end
+end
+
+local function refuse_cache_clears()
+	local save = sys.save
+	local attempts = { count = 0 }
+	sys.save = function(path, record)
+		if path:find("remote-config", 1, true) and next(record) == nil then
+			attempts.count = attempts.count + 1
+			return false
+		end
+		return save(path, record)
+	end
+	return save, attempts
+end
+
+local function unpublished_fetch(client)
+	next_status = 404
+	next_response_body = error_envelope("remote_config_not_published")
+	fetch(client)
+end
+
+local function test_failed_unpublished_clear_recovers_and_diagnoses_once()
+	with_clear_store(function()
+		local issues = {}
+		local client = primed_client({ diagnostics = function(issue)
+			issues[#issues + 1] = issue
+		end })
+		local save, attempts = refuse_cache_clears()
+		unpublished_fetch(client)
+		next_status, next_response_body = 503, nil
+		fetch(client)
+		assert_equal(attempts.count, 2, "every later fetch retries the owed clear")
+		assert_equal(#issues, 1, "one diagnostic per pending clear")
+		assert_equal(issues[1].status, "cache_clear_failed")
+		assert_equal(issues[1].scope, "remote_config")
+		sys.save = save
+		fetch(client)
+		assert_nil(storage.load_remote_config(client.config), "recovery clears the old record")
+		storage.reset()
+		local restarted = assert(sdk.new(config()))
+		assert_equal(restarted:remote_config_number("a", 0), 0, "restart cannot revive the removed record")
+	end)
+end
+
+local function test_clear_retry_precedes_pacing_and_missing_transport()
+	for _, mode in ipairs({ "paced", "no_transport", "no_json" }) do
+		with_clear_store(function()
+			local client = primed_client()
+			local save = refuse_cache_clears()
+			unpublished_fetch(client)
+			if mode == "paced" then
+				next_status, next_response_body = 503, nil
+				next_response_headers = { ["Retry-After"] = "60" }
+				fetch(client)
+				next_response_headers = nil
+			end
+			sys.save = save
+			local saved_http, saved_json = http, json
+			if mode == "no_transport" then http = nil end
+			if mode == "no_json" then json = nil end
+			local result
+			client:fetch_remote_config(function(value) result = value end)
+			http, json = saved_http, saved_json
+			assert_true(result ~= nil)
+			assert_nil(storage.load_remote_config(client.config), mode .. " still retries the clear")
+		end)
+	end
+end
+
+local function test_unpublished_clear_preserves_unordered_records()
+	for _, mode in ipairs({ "fresher", "foreign", "equal_stamp_different_body" }) do
+		with_clear_store(function()
+			local client = primed_client()
+			local captured = storage.load_remote_config(client.config)
+			local save, attempts = refuse_cache_clears()
+			unpublished_fetch(client)
+			sys.save = save
+			local newer = {
+				scope = mode == "foreign" and "other-scope" or captured.scope,
+				body = mode == "foreign" and captured.body or values_body({ a = 9 }, 9),
+				etag = mode == "foreign" and captured.etag or '"v9"',
+				fetched_at_ms = captured.fetched_at_ms + (mode == "fresher" and 1000 or 0),
+			}
+			storage.save_remote_config(client.config, newer)
+			next_status, next_response_body = 503, nil
+			fetch(client)
+			local kept = storage.load_remote_config(client.config)
+			assert_true(kept ~= nil, mode .. " record must survive")
+			assert_equal(kept.body, newer.body)
+			assert_equal(attempts.count, 1, "obsolete debt does not retry a clear")
+		end)
+	end
+end
+
+local function test_unpublished_clear_never_uses_a_read_shadow()
+	with_clear_store(function(stores)
+		local client = primed_client()
+		local path, captured
+		for key, value in pairs(stores) do
+			if key:find("remote-config", 1, true) then path, captured = key, value end
+		end
+		assert_true(path ~= nil)
+		local load, save = sys.load, sys.save
+		stores[path] = {
+			scope = captured.scope, body = values_body({ a = 9 }, 9), etag = '"v9"',
+			fetched_at_ms = captured.fetched_at_ms + 1000,
+		}
+		local clears = 0
+		sys.load = function(key)
+			if key == path then error("synthetic read outage") end
+			return load(key)
+		end
+		sys.save = function(key, value)
+			if key == path and next(value) == nil then clears = clears + 1 end
+			return save(key, value)
+		end
+		unpublished_fetch(client)
+		assert_equal(clears, 0, "an older memory shadow cannot authorize deletion")
+		sys.load = load
+		next_status, next_response_body = 503, nil
+		fetch(client)
+		assert_equal(clears, 0, "read recovery discovers the fresher record")
+		assert_equal(stores[path].etag, '"v9"')
+	end)
+end
+
+local function test_successful_fetch_cancels_owed_clear()
+	for _, status in ipairs({ 200, 304 }) do
+		with_clear_store(function()
+			local client = primed_client()
+			refuse_cache_clears()
+			unpublished_fetch(client)
+			next_status = status
+			next_response_body = status == 200 and values_body({ a = 2 }, 4) or nil
+			fetch(client)
+			local clear = storage.clear_remote_config
+			local clears = 0
+			storage.clear_remote_config = function(...) clears = clears + 1; return clear(...) end
+			next_status, next_response_body = 503, nil
+			fetch(client)
+			storage.clear_remote_config = clear
+			assert_equal(clears, 0, "authoritative recovery cancels debt")
+			assert_equal(client:remote_config_number("a", 0), status == 200 and 2 or 1)
+		end)
+	end
+end
+
+local function test_clear_diagnostic_reentry_preserves_recovery()
+	with_clear_store(function()
+		local client
+		local issues = 0
+		client = primed_client({ diagnostics = function(issue)
+			if issue.status ~= "cache_clear_failed" then return end
+			issues = issues + 1
+			next_status, next_response_body = 200, values_body({ a = 7 }, 7)
+			fetch(client)
+		end })
+		refuse_cache_clears()
+		unpublished_fetch(client)
+		assert_equal(issues, 1, "reporting is marked before host re-entry")
+		assert_equal(client:remote_config_number("a", 0), 7, "newer hook recovery wins")
+		next_status, next_response_body = 503, nil
+		assert_true(fetch(client).ok, "recovered scope stays open")
+	end)
+end
+
+local function test_cache_persist_diagnostic_cannot_revive_closed_scope()
+	with_clear_store(function()
+		local client
+		client = primed_client({ diagnostics = function(issue)
+			if issue.status == "cache_persist_failed" then unpublished_fetch(client) end
+		end })
+		sys.save = function() return false end
+		next_status, next_response_body = 200, values_body({ a = 2 }, 4)
+		fetch(client)
+		assert_equal(client:remote_config_number("a", 0), 0, "newer terminal hook answer must keep defaults")
+		assert_nil(client:remote_config_version())
+	end)
+end
+
+local function test_failed_overwrite_clear_recovers_without_rolling_back()
+	with_clear_store(function()
+		local client = primed_client()
+		local save = sys.save
+		sys.save = function(path, value)
+			if path:find("remote-config", 1, true) then return false end
+			return save(path, value)
+		end
+		next_status, next_response_body = 200, values_body({ a = 2 }, 4)
+		fetch(client)
+		sys.save = save
+		next_status, next_response_body = 503, nil
+		fetch(client)
+		assert_equal(client:remote_config_number("a", 0), 2, "fresh memory remains usable")
+		assert_nil(storage.load_remote_config(client.config), "owed overwrite cleanup removes the old durable body")
+	end)
+end
+
+local function test_failed_overwrite_never_clears_a_read_shadow()
+	with_clear_store(function(stores)
+		local client = primed_client()
+		local path, captured
+		for key, value in pairs(stores) do
+			if key:find("remote-config", 1, true) then path, captured = key, value end
+		end
+		stores[path] = {
+			scope = captured.scope, body = values_body({ a = 9 }, 9), etag = '"v9"',
+			fetched_at_ms = captured.fetched_at_ms + 1000,
+		}
+		local save, load = sys.save, sys.load
+		sys.load = function(key)
+			if key == path then error("synthetic read outage") end
+			return load(key)
+		end
+		sys.save = function(key, value)
+			if key == path and next(value) ~= nil then return false end
+			return save(key, value)
+		end
+		next_status, next_response_body = 200, values_body({ a = 2 }, 4)
+		fetch(client)
+		assert_equal(stores[path].etag, '"v9"', "read shadow cannot authorize failed-overwrite cleanup")
+	end)
+end
+
+local function test_open_scope_cached_fetch_restores_cleared_getters()
+	with_clear_store(function()
+		local client = primed_client()
+		assert_true(client:set_consent(true))
+		next_status, next_response_body = 401, nil
+		fetch(client)
+		assert_equal(client:remote_config_number("a", 0), 0)
+		assert_true(client:set_consent(false))
+		next_status, next_response_body = 503, nil
+		local result = fetch(client)
+		assert_true(result.ok and result.from_cache, "anonymous scope remains open")
+		assert_equal(result.values.a, 1)
+		assert_equal(client:remote_config_number("a", 0), 1, "getters match the cached fetch's values")
+	end)
+end
+
 local tests = {
+	test_open_scope_cached_fetch_restores_cleared_getters,
+	test_failed_overwrite_clear_recovers_without_rolling_back,
+	test_failed_overwrite_never_clears_a_read_shadow,
+	test_cache_persist_diagnostic_cannot_revive_closed_scope,
+	test_failed_unpublished_clear_recovers_and_diagnoses_once,
+	test_clear_retry_precedes_pacing_and_missing_transport,
+	test_unpublished_clear_preserves_unordered_records,
+	test_unpublished_clear_never_uses_a_read_shadow,
+	test_successful_fetch_cancels_owed_clear,
+	test_clear_diagnostic_reentry_preserves_recovery,
 	test_config_identity_requires_granted_consent,
 	test_anonymous_config_cache_is_separate_across_restart_and_regrant,
 	test_anonymous_response_keeps_dispatch_scope_after_grant,

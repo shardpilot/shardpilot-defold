@@ -474,6 +474,7 @@ function M.new(config, identity, consent)
 		-- reopens the scope. In memory only, so the next session starts
 		-- from the kept durable record.
 		closed = {},
+		clear_owed = {},
 	}, RemoteConfig)
 	-- Serve the persisted last-known-good snapshot immediately after a
 	-- restart: getters work before (and without) any fetch when a cache for
@@ -585,13 +586,49 @@ function RemoteConfig:diagnose(status)
 	end
 end
 
+-- A pending removal may touch only a freshly read record this answer
+-- outranks. A read outage keeps the debt; an availability shadow cannot
+-- authorize a destructive write over a newer same-app record.
+local function try_owed_clear(self, scope)
+	local owed = self.clear_owed[scope]
+	if not owed then return end
+	local durable, known = storage.load_remote_config(self.config, true)
+	if known then
+		local captured = owed.record
+		local outranked = durable and durable.scope == captured.scope
+			and durable.body ~= owed.keep_body
+			and (durable.fetched_at_ms < captured.fetched_at_ms
+				or (durable.fetched_at_ms == captured.fetched_at_ms
+					and durable.body == captured.body and durable.etag == captured.etag))
+		if not outranked or storage.clear_remote_config(self.config) then
+			self.clear_owed[scope] = nil
+			return
+		end
+	end
+	if not owed.reported then
+		owed.reported = true
+		self:diagnose("cache_clear_failed")
+	end
+end
+
+local function owe_clear(self, scope, captured, keep_body)
+	local owed = self.clear_owed[scope]
+	if not owed or owed.record.body ~= captured.body
+		or owed.record.etag ~= captured.etag
+		or owed.record.fetched_at_ms ~= captured.fetched_at_ms
+		or owed.keep_body ~= keep_body then
+		self.clear_owed[scope] = { record = captured, keep_body = keep_body, reported = false }
+	end
+	try_owed_clear(self, scope)
+end
+
 -- Fail a scope closed after a terminal answer: the getters serve the host's
 -- defaults, and the scope serves no cache until a fresh 200 or a 304 reopens
 -- it. The durable record is kept for the next session, unless nothing is
 -- published: then the record this fetch captured is cleared, in memory and
--- on disk. A record no older than the captured one, or any record when none
--- was captured, may be another same-app client's newer write that this
--- answer cannot be ordered against, so it is kept.
+-- on disk. Failed removal is owed and diagnosed once. Fresher, foreign and
+-- same-stamp different-body records cannot be ordered against this answer,
+-- so they are kept, as is any record when none was captured.
 function RemoteConfig:close(scope, served_cache, unpublished)
 	self.closed[scope] = true
 	self.values = nil
@@ -603,10 +640,7 @@ function RemoteConfig:close(scope, served_cache, unpublished)
 		and self.cache.fetched_at_ms <= served_cache.fetched_at_ms then
 		self.cache = nil
 	end
-	local durable = self:durable_record(scope)
-	if durable and durable.fetched_at_ms <= served_cache.fetched_at_ms then
-		storage.clear_remote_config(self.config)
-	end
+	owe_clear(self, scope, served_cache)
 end
 
 -- The current-scope gate shared by installs and Retry-After windows: a
@@ -668,6 +702,7 @@ function RemoteConfig:install(seq, result, new_cache, scope, authoritative, serv
 		self.settled[scope] = seq
 		if result.ok then
 			self.closed[scope] = nil
+			self.clear_owed[scope] = nil
 		else
 			self:close(scope, served_cache, unpublished)
 		end
@@ -721,20 +756,21 @@ function RemoteConfig:install(seq, result, new_cache, scope, authoritative, serv
 			-- just-confirmed body for a tombstone would be worse. The
 			-- record is re-read here: the failed write may have disturbed
 			-- what the pre-save read saw.
-			durable = self:durable_record(scope)
-			if durable and served_cache
-				and durable.fetched_at_ms <= served_cache.fetched_at_ms
-				and (new_cache ~= nil or durable.body ~= record.body) then
-				storage.clear_remote_config(self.config)
+			if served_cache then
+				owe_clear(self, scope, served_cache, revalidated_cache and record.body or nil)
 			end
 			self:diagnose("cache_persist_failed")
 		end
 	elseif served_cache and (not self.cache or self.cache.scope ~= scope
-		or served_cache.fetched_at_ms > self.cache.fetched_at_ms) then
+		or served_cache.fetched_at_ms > self.cache.fetched_at_ms
+		or (self.values == nil and served_cache.fetched_at_ms == self.cache.fetched_at_ms
+			and served_cache.body == self.cache.body and served_cache.etag == self.cache.etag)) then
 		self.cache = served_cache
 	else
 		return
 	end
+	-- Diagnostics invoke host code, which may settle a newer answer.
+	if not self:scope_is_current(scope) or seq < (self.settled[scope] or 0) then return end
 	self.values = copy_value(result.values, 0)
 	self.version = result.version
 end
@@ -826,6 +862,8 @@ function RemoteConfig:fetch(callback)
 		finish({ ok = false, from_cache = false, error = "client_id_unavailable" })
 		return false, "client_id_unavailable"
 	end
+	local scope = self:scope_for(client_id)
+	try_owed_clear(self, scope)
 	if not json or type(json.decode) ~= "function" then
 		-- Without a decoder neither a fresh body nor the cache can produce
 		-- values, so there is nothing to serve.
@@ -839,7 +877,6 @@ function RemoteConfig:fetch(callback)
 	-- Capture the identity ONCE per fetch: the URL, the ETag revalidation,
 	-- and the scope stamped on the resulting cache all describe the same
 	-- client id even if the identity rotates while the request is in flight.
-	local scope = self:scope_for(client_id)
 	local cache = self:load_cache(client_id)
 
 	local paced = self.paced[scope]

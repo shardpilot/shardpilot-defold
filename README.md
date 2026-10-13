@@ -1065,6 +1065,14 @@ Fetch semantics:
   and the record is kept. A `404` whose error envelope carries the exact
   code `remote_config_not_published` means nothing is published, so the
   cached record is cleared too, in memory and on disk.
+  A failed removal reports `cache_clear_failed` once for that pending clear.
+  Every later fetch retries it, including paced calls and unavailable transports.
+  Removal requires a fresh store read and preserves fresher, foreign-scope or
+  same-stamp different-body records. A successful `200` or `304` cancels that
+  pending removal. Failed-overwrite cleanup follows the same removal rule while
+  keeping a just-revalidated body. Pending work is local to this client instance:
+  if it ends before storage recovers, a later session may preload the old record
+  until an authoritative fetch closes or replaces it.
 - **A closed scope serves no cache.** After a `401`, `403` or permanent
   failure, a transient failure, a `Retry-After` window and a missing
   transport all fail instead of serving the cached snapshot. A `200`, or a

@@ -35,6 +35,14 @@
   config getters kept the last values and assignment kept serving and
   probing the cached variant.
 
+- Retry failed remote-config cache removals at every later fetch and diagnose
+  `cache_clear_failed` once per pending clear. Read the current durable record
+  before removal; preserve fresher or foreign records and a same-stamp different
+  body. Apply the same rule to failed-overwrite cleanup, retaining a body just
+  confirmed by `304`. A newer response from a diagnostics hook keeps its snapshot.
+  Pending removal is instance-local; storage failure through process exit can
+  still leave the old record available to the next session.
+
 - A sealed experiment fact may carry members, in the fact or its props, and an
   `attestation` value this release does not know. They are forwarded unchanged
   inside the signed bytes instead of deferring the occurrence on every retry.

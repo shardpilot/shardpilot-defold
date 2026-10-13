@@ -2013,24 +2013,30 @@ end
 -- without a scope stamp cannot be attributed to any (workspace, environment,
 -- client, url) tuple, and one without a body has nothing to serve — both
 -- read as no cache. Never throws.
-function M.load_remote_config(scope)
+-- With durable_only, the second return reports a successful durable read
+-- (or a memory-only host). A failed read never substitutes the memory shadow.
+function M.load_remote_config(scope, durable_only)
 	local ns = spool_namespace(scope)
 	local record = nil
 	local path = save_path(ns, "remote-config")
+	local read_known = not path
 	if path then
 		local ok, loaded = pcall(sys.load, path)
 		if ok and type(loaded) == "table" then
 			record = loaded
+			read_known = true
 		end
 	end
-	if record == nil then
+	if record == nil and (not path or not durable_only) then
 		record = remote_config_memory[ns]
 	end
 	if type(record) ~= "table"
 		or type(record.scope) ~= "string" or record.scope == ""
 		or type(record.body) ~= "string" or record.body == "" then
+		if durable_only then return nil, read_known end
 		return nil
 	end
+	if durable_only then return remote_config_record(record), read_known end
 	return remote_config_record(record)
 end
 
