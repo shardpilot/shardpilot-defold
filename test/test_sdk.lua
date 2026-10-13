@@ -17113,6 +17113,171 @@ end)()
  assert_equal(failed,0,"bounded flush scenes")
 end)()
 
+-- Per-event schema version: track()'s fourth argument is an options table
+-- whose one key, schema_version, selects an integer 1..65535; 1 when absent.
+;(function()
+ local passed,failed=0,0
+ local function scene(name,run)
+  reset();storage.reset()
+  local ok,err=pcall(run)
+  storage.reset()
+  if ok then passed=passed+1 else failed=failed+1 end
+  print("schema-version "..name..": "..(ok and "PASS" or "FAIL "..tostring(err)))
+ end
+ local function client_with(overrides)
+  seed_granted_consent()
+  local cfg=config({flush_interval_seconds=9999})
+  for k,v in pairs(overrides or {})do cfg[k]=v end
+  local client=assert(sdk.new(cfg))
+  assert_true(client:identify("user-example"))
+  return client
+ end
+ local function sent_versions()
+  local out={}
+  for _,event in ipairs(json_decode(requests[#requests].body).events)do out[event.event_name]=event.schema_version end
+  return out
+ end
+
+ scene("the capability is advertised under its exact key",function()
+  assert_equal(sdk.supports("event_schema_version"),true)
+  assert_equal(sdk.supports("Event_schema_version"),false)
+  assert_equal(sdk.supports("event_schema_versions"),false)
+ end)
+
+ scene("an omitted or empty option sends version 1",function()
+  local client=client_with()
+  assert_true(client:track("plain"))
+  assert_true(client:track("empty",{},nil,{}))
+  assert_true(client:track("nil_version",{},nil,{schema_version=nil}))
+  client:flush()
+  local versions=sent_versions()
+  assert_equal(versions.plain,1);assert_equal(versions.empty,1);assert_equal(versions.nil_version,1)
+ end)
+
+ scene("a selected version reaches the wire beside the default in one batch",function()
+  local client=client_with()
+  assert_true(client:track("v2",{level=1},nil,{schema_version=2}))
+  assert_true(client:track("vmax",nil,nil,{schema_version=65535}))
+  assert_true(client:track("v1"))
+  assert_true(client:track("float",nil,nil,{schema_version=7.0}))
+  client:flush()
+  assert_equal(#requests,1,"one mixed batch")
+  local versions=sent_versions()
+  assert_equal(versions.v2,2);assert_equal(versions.vmax,65535);assert_equal(versions.v1,1);assert_equal(versions.float,7)
+  assert_contains(requests[1].body,'"schema_version":7,')
+  assert_not_contains(requests[1].body,'"schema_version":7.0')
+ end)
+
+ scene("an invalid option is refused before anything is queued",function()
+  local client=client_with()
+  local bad={
+   {schema_version=0},{schema_version=65536},{schema_version=-1},{schema_version=1.5},
+   {schema_version="2"},{schema_version=true},{schema_version=0/0},{schema_version=math.huge},
+   {schema_version={}},{schemaVersion=2},{schema_version=2,extra=1},{[1]=2},"options",5,true,
+  }
+  local dropped=client:snapshot().dropped
+  for i,options in ipairs(bad)do
+   local ok,err=client:track("refused_"..i,nil,nil,options)
+   assert_equal(ok,false,"refused option "..i)
+   assert_equal(err,"schema_version_invalid","code for option "..i)
+  end
+  assert_equal(#client.queue.items,0,"nothing was queued")
+  assert_equal(client.session,nil,"a refused event opens no session")
+  assert_equal(client:snapshot().dropped,dropped+#bad,"each refusal counts as a drop")
+  assert_equal(client:snapshot().last_error,"schema_version_invalid")
+ end)
+
+ scene("the existing gates answer first",function()
+  storage.reset()
+  local unknown=assert(sdk.new(config({flush_interval_seconds=9999})))
+  local ok,err=unknown:track("e",nil,nil,{schema_version=0})
+  assert_equal(err,"consent_unknown","consent is checked first")
+  local client=client_with()
+  ok,err=client:track("app.session_started",nil,nil,{schema_version=0})
+  assert_equal(err,"reserved_event_name","the reserved name is checked first")
+  ok,err=client:track("",nil,nil,{schema_version=0})
+  assert_equal(err,"event_name_required","the name is checked first")
+ end)
+
+ scene("the selection is a snapshot",function()
+  local client=client_with()
+  local options={schema_version=3}
+  assert_true(client:track("snap",nil,nil,options))
+  options.schema_version=9
+  client:flush()
+  assert_equal(sent_versions().snap,3)
+ end)
+
+ scene("the option is read from the table's own entries",function()
+  local client=client_with()
+  local throwing={__index=function()error("index consulted")end}
+  assert_true(client:track("inherited",nil,nil,setmetatable({},{__index={schema_version=2}})))
+  assert_true(client:track("guarded",nil,nil,setmetatable({},throwing)))
+  assert_true(client:track("own",nil,nil,setmetatable({schema_version=3},throwing)))
+  local hidden=setmetatable({schema_version=2,extra=1},{__pairs=function()return next,{schema_version=2},nil end})
+  local ok,err=client:track("hidden",nil,nil,hidden)
+  assert_equal(ok,false,"a key hidden by __pairs is still seen")
+  assert_equal(err,"schema_version_invalid")
+  client:flush()
+  local versions=sent_versions()
+  assert_equal(versions.inherited,1,"an inherited value is not an option")
+  assert_equal(versions.guarded,1,"an absent option does not reach __index")
+  assert_equal(versions.own,3)
+  assert_equal(versions.hidden,nil)
+ end)
+
+ scene("a retried and spooled event keeps its version",function()
+  local stores,restore=install_stub_sys_storage()
+  next_status=500
+  local first=client_with()
+  assert_true(first:track("kept",nil,nil,{schema_version=4}))
+  first:flush()
+  assert_contains(requests[1].body,'"schema_version":4')
+  local record=stored_spool_record(stores)
+  assert_equal(record.events[1].schema_version,4,"the spool keeps the version")
+  next_status=500
+  socket.now=socket.now+600
+  first:flush()
+  assert_contains(requests[#requests].body,'"schema_version":4')
+  reset()
+  local second=assert(sdk.new(config({flush_interval_seconds=9999})))
+  assert_true(second:flush())
+  assert_equal(sent_versions().kept,4,"the next launch resends the same version")
+  restore()
+ end)
+
+ scene("the module and the handle pass the option through",function()
+  local module=require("shardpilot.sdk")
+  seed_granted_consent()
+  assert_true(module.init(config({flush_interval_seconds=9999})))
+  assert_true(module.identify("user-example"))
+  assert_true(module.track("module_event",nil,nil,{schema_version=5}))
+  local ok,err=module.track("module_bad",nil,nil,{schema_version=0})
+  assert_equal(err,"schema_version_invalid")
+  module.flush()
+  assert_equal(sent_versions().module_event,5)
+  assert_true(module.shutdown())
+  reset()
+  seed_granted_consent()
+  local handle=assert(module.new(config({flush_interval_seconds=9999})))
+  assert_true(handle:identify("user-example"))
+  assert_true(handle:track("handle_event",nil,nil,{schema_version=6}))
+  handle:flush()
+  assert_equal(sent_versions().handle_event,6)
+ end)
+
+ scene("typed producers keep version 1",function()
+  local client=client_with()
+  assert_true(client:screen_view("menu"))
+  assert_true(client:track_level_start("1-1",1))
+  client:flush()
+  for name,version in pairs(sent_versions())do assert_equal(version,1,name)end
+ end)
+
+ print(string.format("schema version: %d pass, %d fail",passed,failed))
+ assert_equal(failed,0,"schema version scenes")
+end)()
+
 -- The SDK identity header: its name, and its value's grammar.
 ;(function()
  local sdk_header=require "shardpilot.sdk_header"

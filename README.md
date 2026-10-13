@@ -77,7 +77,9 @@ not the platform boundary.
 - **Capability discovery.** `shardpilot.supports(capability)` feature-detects
   SDK abilities before `init()` — `"consent_receipt_outbox"`,
   `"consent_state_denied_forced_minor"`,
-  `"experiments_assignment"`, and `"experiments_age_band"` (New in `v0.11.0`); unknown names return `false` on older and
+  `"experiments_assignment"`, `"experiments_age_band"` (New in `v0.11.0`), and
+  `"event_schema_version"` (unreleased; `track()`'s fourth options argument, see
+  [the events guide](docs/events.md#event-schema-version)); unknown names return `false` on older and
   newer SDKs alike, so integrations can gate new call shapes safely.
   `"schema_revision_declaration"` returns `false`.
 - Samples basic runtime signals via `update(dt)`, `observe_ping_ms(ms)`, and

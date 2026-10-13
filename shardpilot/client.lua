@@ -3616,8 +3616,9 @@ local reserved_event_names = {
 	session_started = true, session_ended = true,
 }
 
-function Client:track(event_name, props, context)
-	return self:enqueue_event(event_name, props, context, nil, true)
+-- `options` is the per-event options table; see envelope.selected_schema_version.
+function Client:track(event_name, props, context, options)
+	return self:enqueue_event(event_name, props, context, nil, true, options)
 end
 
 -- The shared enqueue path behind track() and the SDK-internal experiment
@@ -3693,7 +3694,7 @@ function Client:open_experiment_application_session()
 	return true
 end
 
-function Client:enqueue_event(event_name, props, context, fact, host_event)
+function Client:enqueue_event(event_name, props, context, fact, host_event, options)
 	-- From the shutdown call on, the host adds nothing; the close's own
 	-- session end and summaries still go through.
 	if not self.initialized or (host_event and self.closing) then
@@ -3725,6 +3726,11 @@ function Client:enqueue_event(event_name, props, context, fact, host_event)
 		if reserved_event_names[name] then
 			return self:_record_refusal("reserved_event_name", fact)
 		end
+	end
+	-- After the consent and name gates, before any session or queue effect.
+	local schema_version = envelope.selected_schema_version(options)
+	if schema_version == false then
+		return self:_record_refusal("schema_version_invalid", fact)
 	end
 	if not valid_identity(self.user_id) and not valid_identity(self.anonymous_id) then
 		return self:_record_refusal("identity_required", fact)
@@ -3799,6 +3805,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event)
 		props = props_snapshot,
 		sealed_fact = fact and fact.sealed_fact or nil,
 		context = context_snapshot,
+		schema_version = schema_version,
 	}
 	local admission_err = envelope.admission_error(self.config, self, event)
 	if admission_err then

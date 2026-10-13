@@ -62,6 +62,40 @@ their existing behavior. Ordinary names, including `app.screen_view`,
 `purchase` and `economy_tx`, remain available to `track()`. Local admission does
 not guarantee acceptance by the server schema.
 
+## Event schema version
+
+`track(name, props, context, options)` takes an optional fourth argument, an
+options table. Its one key, `schema_version`, selects the version of the
+event's contract:
+
+```lua
+shardpilot.track("level_complete", { level_id = "1-1" }, nil, { schema_version = 2 })
+```
+
+- Without options, or with `schema_version` absent, the event uses version `1`.
+- A present value must be an integer from `1` through `65535`. It is sent as
+  the event's top-level `schema_version`, a JSON integer.
+- Anything else is refused with `false, "schema_version_invalid"`: a value of
+  another type or outside that range, a fraction, a non-finite number, an
+  options value that is not a table, or a key other than `schema_version`.
+  Nothing is coerced or replaced with the default. The refusal counts one drop
+  and sets `last_error`. It comes after the shutdown, consent and name checks,
+  and before any session or queue effect.
+- Only the table's own entries count. A value inherited through `__index` is
+  not an option, and `__pairs` does not hide a key.
+- The selected version is copied when `track()` accepts the event. It stays
+  with that event through retries and the offline spool.
+- Events in one batch may carry different versions.
+- The typed producers (`screen_view`, the level and ad-revenue verbs, session
+  events, summaries) keep version `1`, and sealed experiment facts keep version
+  `2`. None of them takes the option.
+
+The service decides whether the version exists for that event. An unregistered
+or inactive version comes back as that event's own verdict
+(`schema_version_rejected` or `schema_inactive`). The SDK does not retry with
+another version. Detect the option with
+`shardpilot.supports("event_schema_version")`.
+
 ## Event size
 
 Each newly admitted analytics event must fit in **2,048 bytes** of complete,

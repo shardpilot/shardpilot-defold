@@ -925,7 +925,9 @@ bugs.
   `init()` and returns `false` for unknown names on older and newer SDKs
   alike. Keys today: `"consent_receipt_outbox"`,
   `"consent_state_denied_forced_minor"`,
-  `"experiments_assignment"`, `"experiments_age_band"`.
+  `"experiments_assignment"`, `"experiments_age_band"`, `"event_schema_version"`
+  (`track(name, props, context, { schema_version = n })`, n an integer
+  1..65535; anything else answers `schema_version_invalid`).
   `"schema_revision_declaration"` returns `false`. Gate new call shapes on it — including the
   experiment surface, whose config field an older SDK would silently ignore:
 

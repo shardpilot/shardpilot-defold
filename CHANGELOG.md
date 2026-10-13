@@ -2,6 +2,13 @@
 
 ### Unreleased
 
+- `track(name, props, context, options)` takes an optional options table whose
+  one key, `schema_version`, selects the event's contract version: an integer
+  from 1 through 65535, sent as the event's `schema_version`; 1 when absent.
+  Any other value or key answers `false, "schema_version_invalid"` before the
+  event is queued. The selection stays with the event through retries and the
+  offline spool. Typed producers keep version 1 and sealed experiment facts
+  keep version 2. `shardpilot.supports("event_schema_version")` is `true`.
 - A `408` answer is retried like a `429` on analytics batches, consent
   receipts and crash reports. Before, it was terminal: the batch, receipt or
   report was dropped.

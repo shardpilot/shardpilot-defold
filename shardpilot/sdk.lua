@@ -36,6 +36,9 @@ local capabilities = {
 	experiments_assignment = true,
 	-- The declared-age fetch method is separate from the original consumer.
 	experiments_age_band = true,
+	-- track() takes a fourth options argument whose schema_version selects
+	-- the event's contract version, kept through serialization and retry.
+	event_schema_version = true,
 }
 
 function M.supports(capability)
@@ -67,7 +70,7 @@ local instance_methods = {
 	session_start = 1,
 	session_end = 1,
 	screen_view = 2,
-	track = 3,
+	track = 4,
 	track_level_start = 3,
 	track_level_complete = 5,
 	track_level_fail = 5,
@@ -314,8 +317,8 @@ function M.screen_view(screen_name, props)
 	return with_default("screen_view", screen_name, props)
 end
 
-function M.track(event_name, props, context)
-	return with_default("track", event_name, props, context)
+function M.track(event_name, props, context, options)
+	return with_default("track", event_name, props, context, options)
 end
 
 function M.track_level_start(level_id, attempt, props)
