@@ -69,7 +69,9 @@ options table. Its one key, `schema_version`, selects the version of the
 event's contract:
 
 ```lua
-shardpilot.track("level_complete", { level_id = "1-1" }, nil, { schema_version = 2 })
+-- "boss_defeated" stands for one of your own events whose tracking plan
+-- registers schema version 2.
+shardpilot.track("boss_defeated", { boss_id = "golem" }, nil, { schema_version = 2 })
 ```
 
 - Without options, or with `schema_version` absent, the event uses version `1`.
