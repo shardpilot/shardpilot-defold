@@ -22,7 +22,8 @@
 --   * A transient failure (offline, a request timeout (408), 429, 5xx,
 --     malformed body) — the cached snapshot is served with
 --     `from_cache = true` and `error` carrying the reason; with no usable
---     cache the fetch fails.
+--     cache the fetch fails. A 429 or 5xx carrying `Retry-After` also paces
+--     the next fetch for that scope (see RemoteConfig:fetch).
 --   * 401/403 — fails CLOSED: the cached snapshot is never served for this
 --     outcome (a revoked or wrong key must not keep supplying configuration),
 --     but the cache file itself is left untouched.
@@ -58,6 +59,7 @@
 
 local clock = require "shardpilot.clock"
 local experiments = require "shardpilot.experiments"
+local retry_after = require "shardpilot.retry_after"
 local storage = require "shardpilot.storage"
 local sdk_header = require "shardpilot.sdk_header"
 
@@ -448,6 +450,10 @@ function M.new(config, identity, consent)
 		-- in flight.
 		fetch_seq = 0,
 		settled = {},
+		-- Per scope, the server's Retry-After window: `{until_ms, error}`
+		-- armed by a 429 or 5xx that carried the header. In memory only and
+		-- never shortened; a fetch inside it does not reach the network.
+		paced = {},
 	}, RemoteConfig)
 	-- Serve the persisted last-known-good snapshot immediately after a
 	-- restart: getters work before (and without) any fetch when a cache for
@@ -559,6 +565,18 @@ function RemoteConfig:diagnose(status)
 	end
 end
 
+-- The current-scope gate shared by installs and Retry-After windows: a
+-- response for a scope the identity has rotated away from is another
+-- client's, so it neither installs nor paces. The empty client scope stays
+-- current across consent changes.
+function RemoteConfig:scope_is_current(scope)
+	if scope == self:scope_for("") then
+		return true
+	end
+	local current_id = self:client_id()
+	return current_id ~= nil and self:scope_for(current_id) == scope
+end
+
 -- Settle an authoritative fetch outcome and, when it may, install it: the
 -- in-process cache record, the durable copy (best-effort), and the getter
 -- snapshot. The gates, in order:
@@ -593,9 +611,7 @@ end
 -- and a callback that mutates `result.values` must not corrupt what later
 -- getters read.
 function RemoteConfig:install(seq, result, new_cache, scope, authoritative, served_cache, revalidated_cache)
-	local current_id = self:client_id()
-	if scope ~= self:scope_for("")
-		and (not current_id or self:scope_for(current_id) ~= scope) then
+	if not self:scope_is_current(scope) then
 		return
 	end
 	-- The per-scope fence: an outcome settled under another identity never
@@ -672,6 +688,31 @@ function RemoteConfig:install(seq, result, new_cache, scope, authoritative, serv
 	end
 	self.values = copy_value(result.values, 0)
 	self.version = result.version
+end
+
+-- Arm the scope's Retry-After window from a 429 or 5xx that carried the
+-- header (delta-seconds or an HTTP date, capped at 24 hours by the shared
+-- parser). The window is fenced like installs: a response for a scope the
+-- identity has rotated away from, or older than an outcome already settled
+-- for the scope, says nothing about the server's current load and cannot
+-- arm it. A later window extends an earlier one; nothing shortens it.
+function RemoteConfig:pace(seq, scope, response)
+	local status = type(response) == "table" and response.status or 0
+	if status ~= 429 and status < 500 then
+		return
+	end
+	if not self:scope_is_current(scope) or seq <= (self.settled[scope] or 0) then
+		return
+	end
+	local seconds = retry_after.seconds(response)
+	if not seconds or seconds <= 0 then
+		return
+	end
+	local until_ms = clock.unix_ms() + seconds * 1000
+	local current = self.paced[scope]
+	if not current or until_ms > current.until_ms then
+		self.paced[scope] = { until_ms = until_ms, error = "transient_" .. tostring(status) }
+	end
 end
 
 -- Fetch the configuration. `callback(result)` receives
@@ -752,6 +793,18 @@ function RemoteConfig:fetch(callback)
 	local scope = self:scope_for(client_id)
 	local cache = self:load_cache(client_id)
 
+	local paced = self.paced[scope]
+	if paced and clock.unix_ms() < paced.until_ms then
+		-- Inside the Retry-After window the server set for this scope: the
+		-- fetch stays off the network and answers like the response that
+		-- set the window, serving the last-known-good snapshot when one
+		-- exists.
+		local result = serve_cache_or_fail(cache, paced.error)
+		self:install(seq, result, nil, scope, false, cache)
+		finish(result)
+		return false, paced.error
+	end
+
 	if not http or not http.request then
 		-- No transport on this runtime is a transient failure like any
 		-- other: serve the last-known-good snapshot when one exists.
@@ -780,6 +833,7 @@ function RemoteConfig:fetch(callback)
 
 	http.request(url, "GET", function(_, _, response)
 		local result, new_cache, authoritative, revalidated_cache = M.apply(cache, response, clock.unix_ms())
+		self:pace(seq, scope, response)
 		self:install(seq, result, new_cache, scope, authoritative, cache, revalidated_cache)
 		finish(result)
 	end, headers, nil, options)

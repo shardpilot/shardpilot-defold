@@ -1043,6 +1043,15 @@ Fetch semantics:
 - **Transient failure** (offline, a request timeout (`408`), `429`, `5xx`,
   malformed body) — the cached snapshot is served with `from_cache = true`
   and `error` carrying the reason; with no usable cache the fetch fails.
+- **`Retry-After` paces the next fetch.** A `429` or `5xx` that carries
+  `Retry-After` (delta-seconds or an HTTP date, capped at 24 hours) opens a
+  window for that identity's scope. Until it ends, `fetch_remote_config`
+  stays off the network and answers like that response: the cached snapshot
+  with the same `error`, or a failure without a cache. It then returns
+  `false` with that code. A later `Retry-After` can lengthen the window but
+  never shorten it. A response that lands after a newer settled answer, or
+  after the identity rotated away from its scope, does not open one.
+  Without a readable `Retry-After` nothing is paced.
 - **`401`/`403` fails closed** — the fetch reports `unauthorized` and the
   cached snapshot is **not** served for that outcome, so a revoked or wrong
   key never keeps supplying config. The cache file itself is left untouched
