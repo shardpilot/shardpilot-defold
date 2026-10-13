@@ -2,6 +2,14 @@
 
 ### Unreleased
 
+- A `408` answer is retried like a `429` on analytics batches, consent
+  receipts and crash reports. Before, it was terminal: the batch, receipt or
+  report was dropped.
+- `Retry-After` is read the same way on every plane: delta-seconds or an HTTP
+  date (all three spellings), a floor for the next attempt, capped at 24
+  hours. Analytics batches, consent receipts and experiment assignment and
+  apply requests used to ignore an HTTP date.
+
 - A sealed experiment fact may carry members, in the fact or its props, and an
   `attestation` value this release does not know. They are forwarded unchanged
   inside the signed bytes instead of deferring the occurrence on every retry.

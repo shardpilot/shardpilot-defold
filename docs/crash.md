@@ -314,7 +314,7 @@ the body.
 - **Settlement.** An entry is removed as soon as its send is **accepted**
   (2xx — including an accepted-but-suppressed report) or **terminally
   rejected** (a non-retryable 4xx that would fail forever). A retryable
-  failure — offline, `429`, `5xx`, or HTTP `400`/`404` with the exact parsed
+  failure — offline, `408`, `429`, `5xx`, or HTTP `400`/`404` with the exact parsed
   `error.code` `kind_not_enabled` — leaves it persisted. The disabled-kind
   exception applies only to crash ingest. Bare/unknown-code refusals, malformed
   bodies and message text containing that name keep ordinary status handling.

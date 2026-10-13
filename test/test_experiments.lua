@@ -973,6 +973,31 @@ local function test_retry_after_paces_revalidation()
 		"the cadence must resume after the Retry-After window")
 end
 
+-- The same window given as an HTTP date holds the cadence too.
+local function test_http_date_retry_after_paces_revalidation()
+	reset()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	fetch(client, "exp-checkout")
+	local base = #assignment_requests()
+	local arrival = math.floor(require("shardpilot.clock").unix_ms() / 1000) + 400
+	next_status = 429
+	next_response_body = nil
+	next_response_headers = { ["retry-after"] = os.date("!%a, %d %b %Y %H:%M:%S GMT", arrival + 600) }
+	advance_seconds(400)
+	client:update(0.016)
+	assert_equal(#assignment_requests(), base + 1, "the cadence must have fired once")
+	advance_seconds(400)
+	client:update(0.016)
+	assert_equal(#assignment_requests(), base + 1, "an HTTP-date Retry-After must hold the cadence")
+	next_status = 200
+	next_response_body = assignment_body()
+	next_response_headers = nil
+	advance_seconds(300)
+	client:update(0.016)
+	assert_equal(#assignment_requests(), base + 2, "the cadence must resume after the window")
+end
+
 local function test_retry_after_honored_on_5xx()
 	reset()
 	local client = granted_client()
@@ -12104,6 +12129,7 @@ local tests = {
 	test_503_serves_stale_and_keeps_retrying,
 	test_offline_and_timeout_serve_stale,
 	test_retry_after_paces_revalidation,
+	test_http_date_retry_after_paces_revalidation,
 	test_retry_after_honored_on_5xx,
 	test_attribute_passthrough_trim_and_bounds,
 	test_attribute_count_cap_in_sorted_order,
