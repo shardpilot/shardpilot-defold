@@ -1,6 +1,7 @@
 local compression = require "shardpilot.compression"
 local experiment_facts = require "shardpilot.experiment_facts"
 local sdk_header = require "shardpilot.sdk_header"
+local retry_after = require "shardpilot.retry_after"
 
 local M = {}
 
@@ -8,29 +9,7 @@ local function trim_slash(value)
 	return (value:gsub("/+$", ""))
 end
 
--- The real Defold http API lowercases response header keys; the test mock
--- omits headers entirely. Read the Retry-After header (whole seconds) when
--- present and return it as a non-negative number, otherwise nil.
-local function retry_after_seconds(response)
-	if type(response) ~= "table" or type(response.headers) ~= "table" then
-		return nil
-	end
-	local value = response.headers["retry-after"] or response.headers["Retry-After"]
-	if type(value) == "number" then
-		if value < 0 then
-			return nil
-		end
-		return math.floor(value)
-	end
-	if type(value) ~= "string" then
-		return nil
-	end
-	local seconds = tonumber(value:match("^%s*(%d+)%s*$"))
-	if not seconds or seconds < 0 then
-		return nil
-	end
-	return math.floor(seconds)
-end
+local retry_after_seconds = retry_after.seconds
 
 local function dispatch(config, token, route, payload, callback, compress, before_send)
 	if not http or not http.request then
@@ -98,6 +77,12 @@ local function dispatch(config, token, route, payload, callback, compress, befor
 				end
 				if status == 0 then
 					callback(false, "http_0", false, true, response, nil, compressed)
+					return
+				end
+				-- The server did not receive the whole request: nothing was
+				-- processed, and the same request is retried like a 429.
+				if status == 408 then
+					callback(false, "transient_408", false, true, response, nil, compressed, "rejected")
 					return
 				end
 				if status == 429 then

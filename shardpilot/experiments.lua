@@ -110,6 +110,7 @@ local enums = require "shardpilot.experiment_enums"
 local facts = require "shardpilot.experiment_facts"
 local experiment_http = require "shardpilot.experiment_http"
 local sdk_header = require "shardpilot.sdk_header"
+local retry_after = require "shardpilot.retry_after"
 
 local M = {}
 
@@ -457,28 +458,7 @@ local function decode_object(body)
 	return decoded
 end
 
--- The real Defold http API lowercases response header keys; the test mock may
--- not. Returns the Retry-After header as non-negative whole seconds, or nil.
-local function retry_after_seconds(response)
-	if type(response) ~= "table" or type(response.headers) ~= "table" then
-		return nil
-	end
-	local value = response.headers["retry-after"] or response.headers["Retry-After"]
-	if type(value) == "number" then
-		if value < 0 then
-			return nil
-		end
-		return math.floor(value)
-	end
-	if type(value) ~= "string" then
-		return nil
-	end
-	local seconds = tonumber(value:match("^%s*(%d+)%s*$"))
-	if not seconds then
-		return nil
-	end
-	return math.floor(seconds)
-end
+local retry_after_seconds = retry_after.seconds
 
 -- Depth-bounded copy of a decoded JSON value, so a table handed to game code
 -- can be mutated freely without corrupting the cached entry later reads use.
