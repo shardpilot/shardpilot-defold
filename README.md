@@ -1042,7 +1042,8 @@ Fetch semantics:
   delivery time.
 - **Transient failure** (offline, a request timeout (`408`), `429`, `5xx`,
   malformed body) — the cached snapshot is served with `from_cache = true`
-  and `error` carrying the reason; with no usable cache the fetch fails.
+  and `error` carrying the reason; with no usable cache, or after a terminal
+  answer closed the scope (below), the fetch fails.
 - **`Retry-After` paces the next fetch.** A `429` or `5xx` that carries
   `Retry-After` (delta-seconds or an HTTP date, capped at 24 hours) opens a
   window for that identity's scope. Until it ends, `fetch_remote_config`
@@ -1053,15 +1054,30 @@ Fetch semantics:
   after the identity rotated away from its scope, does not open one.
   Without a readable `Retry-After` nothing is paced.
 - **`401`/`403` fails closed** — the fetch reports `unauthorized` and the
-  cached snapshot is **not** served for that outcome, so a revoked or wrong
-  key never keeps supplying config. The cache file itself is left untouched
-  (getters keep the last served snapshot; a later authorized fetch
-  revalidates against the kept ETag).
+  cached snapshot is **not** served, so a revoked or wrong key never keeps
+  supplying config. The getters serve your defaults for the rest of the
+  session. The cache file is kept: the next session preloads it, and a later
+  authorized fetch revalidates against its ETag.
 - **Any other status is a permanent failure** — a `404` for a removed
   environment, an unexpected redirect, other `4xx`: retrying cannot help, so
   the fetch fails (`http_<status>`) instead of reporting stale values as a
-  healthy `ok = true`. As with `401`/`403`, the record and the getter
-  snapshot are left untouched.
+  healthy `ok = true`. As with `401`/`403`, the getters serve your defaults
+  and the record is kept. A `404` whose error envelope carries the exact
+  code `remote_config_not_published` means nothing is published, so the
+  cached record is cleared too, in memory and on disk.
+  A failed removal reports `cache_clear_failed` once for that pending clear.
+  Every later fetch retries it, including paced calls and unavailable transports.
+  Removal requires a fresh store read and preserves fresher, foreign-scope or
+  same-stamp different-body records. A successful `200` or `304` cancels that
+  pending removal. Failed-overwrite cleanup follows the same removal rule while
+  keeping a just-revalidated body. Pending work is local to this client instance:
+  if it ends before storage recovers, a later session may preload the old record
+  until an authoritative fetch closes or replaces it.
+- **A closed scope serves no cache.** After a `401`, `403` or permanent
+  failure, a transient failure, a `Retry-After` window and a missing
+  transport all fail instead of serving the cached snapshot. A `200`, or a
+  `304` that revalidates the kept record, reopens the scope. Closure lives in
+  memory, so it ends with the session.
 
 The cache is scoped to the `(workspace_id, environment_id, client_id,
 app_url)` tuple; a record written by any other scope is a miss (its
@@ -1071,7 +1087,8 @@ identified values and ETags are not reused for them, including on restart.
 The scope selected at dispatch also labels the eventual response, even if
 consent changes while it is in flight. Rotating the anonymous ID re-scopes
 identified fetches. Getters retain the last served snapshot until another
-response replaces it; a consent change alone does not clear that snapshot.
+response replaces it or a terminal answer clears it; a consent change alone
+does not clear that snapshot.
 
 **Honest boundaries:**
 
@@ -1328,6 +1345,15 @@ the id is never host-settable: there is no supported way to pin it yourself.
   it does not also match older server messages.
 - **`404`** — permanent for that experiment key: treated as not-assigned,
   never served stale, and the revalidation cadence stops asking for it.
+- **Any other `3xx` or `4xx`** (`302`, `409`, `422` and the like) — terminal
+  for that experiment. The fetch fails with `http_<status>`, the getters
+  return `nil`, `apply_experiment_variant`, `track_exposure` and
+  `track_outcome` return `no_assignment`, and the revalidation cadence stops
+  asking for it. A transient failure serves nothing for it either. The cached
+  record is kept: an explicit fetch for the experiment that the server
+  answers reopens it, and the next session starts from the kept record. A
+  non-`200` `2xx` is not terminal and leaves the cached assignment
+  serving.
 - **Transient** (`429`, `5xx`, `408`, offline, timeout, malformed body) — the
   cached assignment is served with `from_cache = true` and `error` carrying
   the reason (`transient_429`, `transient_<5xx>`, `transient_408`, `http_0`,

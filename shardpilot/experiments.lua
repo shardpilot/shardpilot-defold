@@ -498,6 +498,12 @@ local function response_error(response)
 	return err.code, age
 end
 
+-- The same strict reader for remote config: the envelope's `error.code`, or
+-- nil when the body is not a complete, unambiguous envelope.
+function M.error_code(response)
+	return (response_error(response))
+end
+
 -- Order-insensitive-in-effect equality of two normalized attribute sets
 -- (both are name-sorted { name, value } arrays — the dispatch normalizer
 -- sorts, the entry stores the dispatched set, and the restore sanitizer
@@ -562,6 +568,9 @@ end
 --     closed;
 --   * remint — the subject-grammar 400 sentinel: the caller may re-mint the
 --     subject id once and retry;
+--   * close_entry — a terminal 3xx or other 4xx: stop serving the
+--     experiment's cached assignment and stop revalidating it until an
+--     explicit fetch for it is answered or the next session;
 --   * transient + retry_after_seconds — pace the revalidation backoff and
 --     honor a server Retry-After (429 and 5xx alike).
 -- A response scope echo is INVALID when the field is PRESENT but not a
@@ -928,17 +937,22 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 
 	-- Anything else (an unexpected redirect, another 4xx, a non-200 2xx) is
 	-- an authoritative "no assignment is served here" FOR THIS CALL: fail
-	-- without serving stale values. The classification is deliberate and
-	-- closed — the cached record stays untouched AND keeps revalidating (the
-	-- entry stays in memory, the cadence re-arms at every dispatch), so the
-	-- server is re-asked on schedule and a later kill switch still lands;
-	-- semantics this client cannot classify never earn a blind drop. The
-	-- outcome is UNPROVEN for the auth latch: unlike a parsed 200/404/400 —
-	-- proof the credential was accepted and processed — a stray redirect or
-	-- conflict says nothing about authorization, so it settles its sequence
-	-- fence but must not unlatch a fail-closed plane (see install).
-	return { ok = false, from_cache = false, error = "http_" .. tostring(status) },
-		{ authoritative = true, unproven = true }
+	-- without serving stale values. A 3xx or another 4xx is terminal, so it
+	-- also CLOSES the experiment: the getters serve the host's default and
+	-- the cadence stops probing it until an explicit fetch for it is
+	-- answered or the next session. The record itself is kept (semantics
+	-- this client cannot classify never earn a blind drop), so the next
+	-- session serves and revalidates it again. A non-200 2xx is not
+	-- terminal and leaves the entry serving. The outcome is UNPROVEN for
+	-- the auth latch: unlike a parsed 200/404/400 — proof the credential was
+	-- accepted and processed — a stray redirect or conflict says nothing
+	-- about authorization, so it settles its sequence fence but must not
+	-- unlatch a fail-closed plane (see install).
+	local outcome = { authoritative = true, unproven = true }
+	if status >= 300 and status < 500 then
+		outcome.close_entry = true
+	end
+	return { ok = false, from_cache = false, error = "http_" .. tostring(status) }, outcome
 end
 
 -- ── the consumer ──────────────────────────────────────────────────────────────
@@ -1107,6 +1121,11 @@ function M.new(config, deps)
 		-- ends without the server's answer applied withdraws the experiment
 		-- (end_non_adult_declaration). A later host declaration replaces it.
 		declaring = {},
+		-- experiment_key → true for an experiment a terminal 3xx or 4xx
+		-- closed: it is not served and the cadence leaves it alone until an
+		-- answered fetch for it installs, drops or withdraws its entry. In
+		-- memory only, so the next session serves the kept record again.
+		closed_keys = {},
 		-- Fail-closed latch: set by 401/403, cleared by re-init or a later
 		-- authoritative, authorized outcome of a fetch STARTED AFTER the
 		-- latch was set. While set, nothing is served and revalidation
@@ -3092,9 +3111,13 @@ function Experiments:abort_declarations()
 	end
 end
 
--- The entry the getters serve and record against: none while a non-adult
--- declaration of the experiment is pending, unless it is age-exempt.
+-- The entry the getters serve and record against: none while a terminal
+-- answer has closed the experiment, nor while a non-adult declaration of it
+-- is pending, unless it is age-exempt.
 function Experiments:served_entry(experiment_key)
+	if self.closed_keys[experiment_key] then
+		return nil
+	end
 	local entry = self.entries[experiment_key]
 	if entry and self.declaring[experiment_key] and not age_exempt(entry) then
 		return nil
@@ -3190,6 +3213,14 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 	-- plane — the deadline simply expires on its own (clamped to a day; the
 	-- deferral setter already keeps only the LATEST deadline).
 	self.backoff_attempt = 0
+	if outcome.close_entry then
+		self.closed_keys[experiment_key] = true
+		return
+	end
+	if outcome.withdraw_owed or outcome.drop_entry or outcome.new_entry then
+		-- The server answered for this experiment: a closed one reopens.
+		self.closed_keys[experiment_key] = nil
+	end
 	if outcome.withdraw_owed then
 		self:apply_age_withdrawal(scope, experiment_key, resolved_at_ms,
 			outcome.refused_fact_key)
@@ -3435,8 +3466,9 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 	end
 
 	if not self.http_transport:available() then
-		local result = serve_entry_or_fail(entry, "http_unavailable",
-			normalized_attributes)
+		local result = serve_entry_or_fail(
+			not self.closed_keys[experiment_key] and entry or nil,
+			"http_unavailable", normalized_attributes)
 		conclude(result)
 		return false, "http_unavailable"
 	end
@@ -3527,7 +3559,8 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		local entry_now = nil
 		if auth_epoch == self.auth_epoch then
 			local subject_now = self:current_subject_id()
-			if subject_now and self:scope_for(subject_now) == scope then
+			if subject_now and self:scope_for(subject_now) == scope
+				and not self.closed_keys[experiment_key] then
 				entry_now = self.entries[experiment_key]
 			end
 		end
@@ -3712,8 +3745,10 @@ function Experiments:tick(_)
 	local keys = {}
 	for key in pairs(self.entries) do
 		-- A key with a pending non-adult declaration is left alone: its
-		-- remembered attributes declare the earlier age.
-		if not self.declaring[key] then
+		-- remembered attributes declare the earlier age. So is a key a
+		-- terminal answer closed: only an explicit fetch or the next
+		-- session asks for it again.
+		if not self.declaring[key] and not self.closed_keys[key] then
 			keys[#keys + 1] = key
 		end
 	end
@@ -3832,7 +3867,8 @@ function Experiments:track_outcome(experiment_key, outcome_key, outcome_value)
 		return false, "invalid_outcome_value"
 	end
 	local application = self.applications[experiment_key]
-	if self.auth_blocked or self.declaring[experiment_key] or not application then return false, "no_assignment" end
+	if self.auth_blocked or self.declaring[experiment_key] or self.closed_keys[experiment_key]
+		or not application then return false, "no_assignment" end
 	local record = copy_value(application, 0)
 	record.application_id = random.hex(32)
 	record.event_ts = clock.iso_utc()
