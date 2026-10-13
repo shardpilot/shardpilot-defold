@@ -16,6 +16,12 @@
   date (all three spellings), a floor for the next attempt, capped at 24
   hours. Analytics batches, consent receipts and experiment assignment and
   apply requests used to ignore an HTTP date.
+- Remote config honours `Retry-After`. A `429` or `5xx` carrying it opens a
+  window for that identity's scope, and a fetch inside it stays off the
+  network: it serves the cached snapshot with the same error, or fails
+  without a cache, and `fetch_remote_config` returns `false` with that code.
+  Before, remote config ignored the header and every fetch reached the
+  server.
 
 - A sealed experiment fact may carry members, in the fact or its props, and an
   `attestation` value this release does not know. They are forwarded unchanged

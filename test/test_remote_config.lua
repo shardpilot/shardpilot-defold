@@ -2129,6 +2129,166 @@ local function test_anonymous_response_keeps_dispatch_scope_after_grant()
 		"late response persists the dispatch scope")
 end
 
+-- ── Retry-After pacing ────────────────────────────────────────────────────────
+
+local function http_date_in(seconds)
+	return os.date("!%a, %d %b %Y %H:%M:%S GMT", math.floor(socket.now) + seconds)
+end
+
+local function test_retry_after_paces_the_next_fetch()
+	-- Dates are built when their case runs: the clock moves between cases.
+	for _, case in ipairs({ { 429, "120" }, { 429, 120 }, { 503, "60" }, { 500, 60 } }) do
+		reset()
+		if type(case[2]) == "number" then
+			case[2] = http_date_in(case[2])
+		end
+		local client = assert(sdk.new(config()))
+		next_status = 200
+		next_response_body = values_body({ a = 1 })
+		fetch(client)
+
+		next_status = case[1]
+		next_response_body = nil
+		next_response_headers = { ["retry-after"] = case[2] }
+		local first = fetch(client)
+		assert_equal(first.error, "transient_" .. case[1])
+		next_response_headers = nil
+
+		-- Inside the window the fetch stays off the network and answers like
+		-- the response that set it: the cached snapshot, flagged.
+		local before = #requests
+		local dispatched, code = client:fetch_remote_config()
+		assert_equal(#requests, before, "a fetch inside the Retry-After window must not reach the network: " .. case[2])
+		assert_equal(dispatched, false)
+		assert_equal(code, "transient_" .. case[1])
+		local paced = fetch(client)
+		assert_true(paced.ok, "the paced fetch serves the cache")
+		assert_equal(paced.from_cache, true)
+		assert_equal(paced.error, "transient_" .. case[1])
+		assert_equal(paced.values.a, 1)
+
+		-- Once the window has passed, the next fetch asks the server again.
+		socket.now = socket.now + 130
+		next_status = 200
+		next_response_body = values_body({ a = 2 })
+		local after = fetch(client)
+		assert_equal(#requests, before + 1, "the window ends: " .. case[2])
+		assert_equal(after.values.a, 2)
+	end
+end
+
+local function test_retry_after_window_without_cache_fails()
+	reset()
+	local client = assert(sdk.new(config()))
+	next_status = 429
+	next_response_body = nil
+	next_response_headers = { ["retry-after"] = "30" }
+	fetch(client)
+	next_response_headers = nil
+	local before = #requests
+	local paced = fetch(client)
+	assert_equal(#requests, before, "no request inside the window")
+	assert_equal(paced.ok, false, "with no cache the paced fetch fails")
+	assert_equal(paced.error, "transient_429")
+end
+
+local function test_retry_after_window_is_capped_at_a_day()
+	reset()
+	local client = assert(sdk.new(config()))
+	next_status = 429
+	next_response_body = nil
+	next_response_headers = { ["retry-after"] = "999999" }
+	fetch(client)
+	next_response_headers = nil
+	local before = #requests
+	socket.now = socket.now + 86390
+	fetch(client)
+	assert_equal(#requests, before, "still paced just under a day")
+	socket.now = socket.now + 20
+	fetch(client)
+	assert_equal(#requests, before + 1, "a day later the fetch reaches the server")
+end
+
+local function test_absent_or_unreadable_retry_after_does_not_pace()
+	for _, header in ipairs({ false, "soon", "-5", "1.5" }) do
+		reset()
+		local client = assert(sdk.new(config()))
+		next_status = 429
+		next_response_body = nil
+		next_response_headers = header and { ["retry-after"] = header } or nil
+		fetch(client)
+		next_response_headers = nil
+		local before = #requests
+		fetch(client)
+		assert_equal(#requests, before + 1, "no readable Retry-After, no window: " .. tostring(header))
+	end
+end
+
+local function test_retry_after_window_is_per_scope()
+	reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:set_consent(true))
+	next_status = 429
+	next_response_body = nil
+	next_response_headers = { ["retry-after"] = "120" }
+	fetch(client)
+	next_response_headers = nil
+	-- A rotated identity is another scope: the window the server set for
+	-- the previous one does not pace it.
+	assert_true(client:set_anonymous_id("anon-other"))
+	local before = #requests
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	fetch(client)
+	assert_equal(#requests, before + 1, "another scope is not paced")
+	assert_equal(last_request().url, "http://localhost:18081/config/v1/workspace-test/develop/anon-other")
+end
+
+local function test_stale_retry_after_cannot_pace_after_a_settled_answer()
+	reset()
+	local client = assert(sdk.new(config()))
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers }
+		held[#held + 1] = callback
+	end
+	client:fetch_remote_config()
+	client:fetch_remote_config()
+	http.request = saved_request
+	-- The newer request settles first with fresh configuration...
+	held[2](nil, nil, { status = 200, response = values_body({ a = 2 }, 2) })
+	-- ...then the older one lands late with a 429. It says nothing about the
+	-- server's load now, so it must not pace the next fetch.
+	held[1](nil, nil, { status = 429, headers = { ["retry-after"] = "120" } })
+	local before = #requests
+	next_status = 304
+	next_response_body = nil
+	fetch(client)
+	assert_equal(#requests, before + 1, "a stale 429 must not arm the window")
+end
+
+local function test_a_later_retry_after_never_shortens_the_window()
+	reset()
+	local client = assert(sdk.new(config()))
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers }
+		held[#held + 1] = callback
+	end
+	client:fetch_remote_config()
+	client:fetch_remote_config()
+	http.request = saved_request
+	held[1](nil, nil, { status = 429, headers = { ["retry-after"] = "120" } })
+	held[2](nil, nil, { status = 429, headers = { ["retry-after"] = "10" } })
+	socket.now = socket.now + 30
+	local before = #requests
+	fetch(client)
+	assert_equal(#requests, before, "the longer window stands")
+end
+
+
 local tests = {
 	test_config_identity_requires_granted_consent,
 	test_anonymous_config_cache_is_separate_across_restart_and_regrant,
@@ -2189,6 +2349,13 @@ local tests = {
 	test_cache_persist_failure_is_best_effort_and_diagnosed,
 	test_facade_serves_defaults_when_not_initialized,
 	test_facade_delegates_to_the_default_client,
+	test_retry_after_paces_the_next_fetch,
+	test_retry_after_window_without_cache_fails,
+	test_retry_after_window_is_capped_at_a_day,
+	test_absent_or_unreadable_retry_after_does_not_pace,
+	test_retry_after_window_is_per_scope,
+	test_stale_retry_after_cannot_pace_after_a_settled_answer,
+	test_a_later_retry_after_never_shortens_the_window,
 }
 
 for _, test in ipairs(tests) do
