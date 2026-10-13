@@ -2244,6 +2244,31 @@ local function test_retry_after_window_is_per_scope()
 	assert_equal(last_request().url, "http://localhost:18081/config/v1/workspace-test/develop/anon-other")
 end
 
+local function test_retry_after_for_a_rotated_identity_does_not_pace()
+	reset()
+	local client = assert(sdk.new(config()))
+	assert_true(client:set_consent(true))
+	local held = {}
+	local saved_request = http.request
+	http.request = function(url, method, callback, headers, body, options)
+		requests[#requests + 1] = { url = url, method = method, headers = headers }
+		held[#held + 1] = callback
+	end
+	client:fetch_remote_config()
+	http.request = saved_request
+	-- The 429 lands after the identity rotated away: install drops it as
+	-- another client's response, so it must not open a window either.
+	assert_true(client:set_anonymous_id("anon-other"))
+	held[1](nil, nil, { status = 429, headers = { ["retry-after"] = "120" } })
+	assert_true(client:set_anonymous_id("anon-client"))
+	local before = #requests
+	next_status = 200
+	next_response_body = values_body({ a = 1 })
+	fetch(client)
+	assert_equal(#requests, before + 1, "a dropped response must not pace the scope")
+	assert_equal(client:remote_config_number("a", 0), 1)
+end
+
 local function test_stale_retry_after_cannot_pace_after_a_settled_answer()
 	reset()
 	local client = assert(sdk.new(config()))
@@ -2354,6 +2379,7 @@ local tests = {
 	test_retry_after_window_is_capped_at_a_day,
 	test_absent_or_unreadable_retry_after_does_not_pace,
 	test_retry_after_window_is_per_scope,
+	test_retry_after_for_a_rotated_identity_does_not_pace,
 	test_stale_retry_after_cannot_pace_after_a_settled_answer,
 	test_a_later_retry_after_never_shortens_the_window,
 }

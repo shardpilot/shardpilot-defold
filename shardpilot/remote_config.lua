@@ -565,6 +565,18 @@ function RemoteConfig:diagnose(status)
 	end
 end
 
+-- The current-scope gate shared by installs and Retry-After windows: a
+-- response for a scope the identity has rotated away from is another
+-- client's, so it neither installs nor paces. The empty client scope stays
+-- current across consent changes.
+function RemoteConfig:scope_is_current(scope)
+	if scope == self:scope_for("") then
+		return true
+	end
+	local current_id = self:client_id()
+	return current_id ~= nil and self:scope_for(current_id) == scope
+end
+
 -- Settle an authoritative fetch outcome and, when it may, install it: the
 -- in-process cache record, the durable copy (best-effort), and the getter
 -- snapshot. The gates, in order:
@@ -599,9 +611,7 @@ end
 -- and a callback that mutates `result.values` must not corrupt what later
 -- getters read.
 function RemoteConfig:install(seq, result, new_cache, scope, authoritative, served_cache, revalidated_cache)
-	local current_id = self:client_id()
-	if scope ~= self:scope_for("")
-		and (not current_id or self:scope_for(current_id) ~= scope) then
+	if not self:scope_is_current(scope) then
 		return
 	end
 	-- The per-scope fence: an outcome settled under another identity never
@@ -682,16 +692,16 @@ end
 
 -- Arm the scope's Retry-After window from a 429 or 5xx that carried the
 -- header (delta-seconds or an HTTP date, capped at 24 hours by the shared
--- parser). The window is fenced like installs: a response older than an
--- outcome already settled for the scope says nothing about the server's
--- current load and cannot arm it. A later window extends an earlier one;
--- nothing shortens it.
+-- parser). The window is fenced like installs: a response for a scope the
+-- identity has rotated away from, or older than an outcome already settled
+-- for the scope, says nothing about the server's current load and cannot
+-- arm it. A later window extends an earlier one; nothing shortens it.
 function RemoteConfig:pace(seq, scope, response)
 	local status = type(response) == "table" and response.status or 0
 	if status ~= 429 and status < 500 then
 		return
 	end
-	if seq <= (self.settled[scope] or 0) then
+	if not self:scope_is_current(scope) or seq <= (self.settled[scope] or 0) then
 		return
 	end
 	local seconds = retry_after.seconds(response)
