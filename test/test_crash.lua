@@ -6091,7 +6091,8 @@ end)()
   {"duplicate404",404,'{"error":{"code":"unknown","code":"kind_not_enabled"}}',false},
   {"trailing404",404,disabled.." garbage",false},{"oversize404",404,disabled..string.rep(" ",65536),false},
   {"wrongstatus403",403,disabled,false},{"accepted202",202,disabled,false},
-  {"transient503",503,"",true},{"offline",0,"",true},{"rate429",429,"",true}
+  {"transient503",503,"",true},{"offline",0,"",true},{"rate429",429,"",true},
+  {"timeout408",408,"",true}
  }
  for _,case in ipairs(cases)do
   scene("classification "..case[1],function()

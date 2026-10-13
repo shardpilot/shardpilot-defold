@@ -458,8 +458,8 @@ are terminal except `408` and `429`. Exact `409` `not_assigned` with
 facts for that experiment. `409` `version_mismatch`, `variant_mismatch`, and
 `unit_not_recordable` drop the refused fact and refetch current targeting unless
 a newer host fetch or assignment already supersedes the request. Offline, timeout, malformed responses,
-redirects, `408`, `429` and `5xx` retry with backoff and delta-seconds
-`Retry-After`. Redirects are never followed. Analytics per-event rejection stays
+redirects, `408`, `429` and `5xx` retry with backoff and `Retry-After`
+(delta-seconds or an HTTP date). Redirects are never followed. Analytics per-event rejection stays
 terminal and visible through the rejection ring.
 
 Unsealed applications are memory-only. `persist()` starts no network request and
@@ -541,9 +541,9 @@ a subtree at or beyond that depth is dropped (`nil`) rather than rejected — a
 payload nested 16+ deep arrives silently truncated. Keep variant payloads
 shallow; they are configuration, not a document tree.
 
-**`Retry-After` is honored in its delta-seconds form only.** An HTTP-date
-`Retry-After` is not parsed and is ignored; the client falls back to its own
-jittered backoff.
+**`Retry-After` is a floor, capped at 24 hours.** It is read as
+delta-seconds or an HTTP date. An unreadable value is ignored, and the client
+falls back to its own jittered backoff.
 
 **Serving a cached assignment through a failure is attribute-fenced.** On a
 transient failure the cached variant is only returned when the failing fetch
@@ -762,8 +762,10 @@ Counts are also available on `snapshot()` (`accepted`, `dropped`, `last_error`,
 the spool counters `spooled`, `spool_resent`, `spool_evicted`, `spool_expired`,
 `spool_persist_failed` and the consent-outbox counters
 `consent_outbox_evicted`, `consent_outbox_persist_failed`). The
-SDK honors a `429` `Retry-After` header by deferring the next publish, and
-falls back to exponential backoff with jitter when no header is present —
+SDK retries a batch answered `408`, `429` or `5xx`. It honors a `429` or
+`5xx` `Retry-After` header (delta-seconds or an HTTP date, capped at 24 hours)
+by deferring the next publish, and falls back to exponential backoff with
+jitter when no header is present —
 consent-receipt retries pace themselves the same way, on their own
 consent-plane deferral.
 

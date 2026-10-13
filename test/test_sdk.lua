@@ -17127,6 +17127,124 @@ end)()
  print("sdk header: PASS")
 end)()
 
+-- Retry classes and Retry-After: a 408 is retried like a 429 or a 5xx on the
+-- batch and consent routes, and Retry-After may be delta-seconds or an HTTP
+-- date, capped at 24 hours.
+;(function()
+ local saved_socket=socket
+ local passed,failed=0,0
+ local function scene(name,run)
+  reset();storage.reset()
+  local real_request=http.request
+  socket={now=1791763200,gettime=function()return socket.now end}
+  local ok,err=pcall(run)
+  socket=saved_socket;http.request=real_request
+  storage.reset()
+  if ok then passed=passed+1 else failed=failed+1 end
+  print("retry-status "..name..": "..(ok and "PASS" or "FAIL "..tostring(err)))
+ end
+ local function http_date(seconds,format)
+  return os.date(format or "!%a, %d %b %Y %H:%M:%S GMT",seconds)
+ end
+
+ scene("the parser reads delta-seconds and all three HTTP-date forms",function()
+  local retry_after=require "shardpilot.retry_after"
+  local now=socket.now
+  local function at(value) return retry_after.seconds({headers={["retry-after"]=value}}) end
+  assert_equal(at("120"),120);assert_equal(at(" 120 "),120);assert_equal(at(7),7)
+  assert_equal(retry_after.seconds({headers={["Retry-After"]="9"}}),9,"either header spelling")
+  assert_equal(at(http_date(now+120)),120,"IMF-fixdate")
+  assert_equal(at(http_date(now+120,"!%A, %d-%b-%y %H:%M:%S GMT")),120,"RFC 850")
+  assert_equal(at(http_date(now+120,"!%a %b %e %H:%M:%S %Y")),120,"asctime")
+  assert_equal(at(http_date(now-60)),0,"a past date asks for no wait")
+  assert_equal(at("172800"),86400,"capped at 24 hours");assert_equal(at(http_date(now+3*86400)),86400)
+  for _,bad in ipairs({"-1","1.5","soon","",string.rep("1",129),"Fri, 31 Feb 2026 00:00:00 GMT",
+   "Xyz, 01 Jan 2026 00:00:00 GMT","Thu, 01 Jan 2026 24:00:00 GMT",-3,0/0,true})do
+   assert_equal(at(bad),nil,"refused "..tostring(bad))
+  end
+  assert_equal(retry_after.seconds(nil),nil);assert_equal(retry_after.seconds({}),nil)
+ end)
+
+ scene("a 408 batch is kept and sent again",function()
+  seed_granted_consent()
+  local client=assert(sdk.new(config_mode_a({flush_interval_seconds=9999})))
+  assert_true(client:identify("user-example"))
+  assert_true(client:track("timed_out"))
+  next_status=408
+  client:flush()
+  assert_equal(#requests,1)
+  assert_true(client.in_flight_batch~=nil,"a 408 keeps the batch")
+  assert_equal(client:snapshot().dropped,0)
+  assert_equal(client:snapshot().last_error,"transient_408")
+  local age=require("shardpilot.analytics_retry").get(client.in_flight_batch[1])
+  assert_equal(age.ambiguous_ms,0,"a 408 was not processed, so the attempt is not an ambiguous delivery")
+  next_status=202
+  socket.now=socket.now+600
+  client:flush()
+  assert_equal(#requests,2,"the kept batch is sent again")
+  assert_contains(requests[2].body,'"event_name":"timed_out"')
+  assert_equal(client.in_flight_batch,nil)
+ end)
+
+ scene("a 408 consent receipt is kept and sent again",function()
+  next_status=408
+  local client=assert(sdk.new(config({flush_interval_seconds=9999})))
+  assert_true(client:set_consent(true))
+  assert_equal(#requests,1)
+  assert_equal(#client.consent_outbox,1,"a 408 keeps the receipt")
+  assert_equal(client:snapshot().last_consent_error,"transient_408")
+  next_status=202
+  socket.now=socket.now+600
+  client:update(0)
+  assert_equal(#requests,2,"the kept receipt is sent again")
+  assert_equal(requests[2].url,"http://localhost:8080/v1/consent")
+  assert_equal(#client.consent_outbox,0)
+ end)
+
+ scene("an HTTP-date Retry-After holds the batch",function()
+  seed_granted_consent()
+  local client=assert(sdk.new(config_mode_a({flush_interval_seconds=9999})))
+  assert_true(client:identify("user-example"))
+  assert_true(client:track("held"))
+  next_status=429;next_response_headers={["retry-after"]=http_date(socket.now+120)}
+  client:flush()
+  assert_equal(client.publish_server_retry_after_ms,(socket.now+120)*1000,"the date is the server's floor")
+ end)
+
+ scene("an HTTP-date Retry-After beyond 24 hours holds the batch for 24 hours",function()
+  seed_granted_consent()
+  local client=assert(sdk.new(config_mode_a({flush_interval_seconds=9999})))
+  assert_true(client:identify("user-example"))
+  assert_true(client:track("held"))
+  next_status=503;next_response_headers={["Retry-After"]=http_date(socket.now+3*86400)}
+  client:flush()
+  assert_equal(client.publish_server_retry_after_ms,(socket.now+86400)*1000)
+ end)
+
+ scene("an HTTP-date Retry-After holds a consent receipt",function()
+  next_status=503;next_response_headers={["retry-after"]=http_date(socket.now+300)}
+  local client=assert(sdk.new(config({flush_interval_seconds=9999})))
+  assert_true(client:set_consent(true))
+  assert_equal(#client.consent_outbox,1)
+  assert_equal(client.consent_retry_after_ms,(socket.now+300)*1000,"the date is the receipt's floor")
+ end)
+
+ scene("an unreadable Retry-After falls back to the SDK's own backoff",function()
+  seed_granted_consent()
+  local client=assert(sdk.new(config_mode_a({flush_interval_seconds=9999})))
+  assert_true(client:identify("user-example"))
+  assert_true(client:track("held"))
+  next_status=429;next_response_headers={["retry-after"]="soon"}
+  client:flush()
+  assert_equal(client.publish_server_retry_after_ms,nil,"no server floor from an unreadable value")
+  assert_true(client.publish_retry_after_ms~=nil,"the SDK's backoff still paces the retry")
+  assert_true(client.in_flight_batch~=nil)
+ end)
+
+ print(string.format("retry status: %d pass, %d fail",passed,failed))
+ assert_equal(failed,0,"retry status scenes")
+end)()
+
 -- Bounded shutdown: shutdown(timeout_seconds, callback) ends the open session,
 -- drains what is held like flush(), and tears the client down once that
 -- settles, or at the deadline whatever is left, answering every caller once.

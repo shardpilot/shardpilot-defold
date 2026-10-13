@@ -742,7 +742,7 @@ per-app spool and re-sends them on a later launch. Enabled by default
 **What is spooled, and when.**
 
 - A batch whose publish failed for a **transient** reason — network
-  unreachable, timeout, `429`, or `5xx` (the same classification that already
+  unreachable, timeout, `408`, `429`, or `5xx` (the same classification that already
   retains a batch for in-process retry; a Mode B `401` is included since a
   fresh token can be minted, a Mode A `401` is terminal and never spooled).
 - The **undelivered remnant at `shutdown()`** (queue, the batch on the wire,
@@ -1320,9 +1320,9 @@ the id is never host-settable: there is no supported way to pin it yourself.
 - **Transient** (`429`, `5xx`, `408`, offline, timeout, malformed body) — the
   cached assignment is served with `from_cache = true` and `error` carrying
   the reason (`transient_429`, `transient_<5xx>`, `transient_408`, `http_0`,
-  `malformed_response`); `Retry-After` is honored on `429` and `5xx` — **in
-  its delta-seconds form only.** A `Retry-After` sent as an HTTP-date is not
-  parsed and is ignored, and the client falls back to its own jittered
+  `malformed_response`); `Retry-After` is honored on `429` and `5xx`, as
+  delta-seconds or an HTTP date, capped at 24 hours. An unreadable
+  `Retry-After` is ignored, and the client falls back to its own jittered
   backoff. **Serving stale is attribute-fenced:** the
   cached assignment comes back only when the failing fetch asked with the
   same normalized targeting attributes it was evaluated under. Fetch the same
@@ -1488,7 +1488,7 @@ game has to handle specially.
   facts. `409` `version_mismatch`, `variant_mismatch`, or `unit_not_recordable`
   drops the refused fact and refetches assignment with current targeting,
   unless a newer host request or assignment already supersedes that request. Offline, timeout, malformed responses, `3xx`, `408`, `429` and `5xx`
-  keep the occurrence and retry with backoff and delta-seconds `Retry-After`.
+  keep the occurrence and retry with backoff and `Retry-After` (delta-seconds or an HTTP date).
   Redirects are refused, including HTML5's browser transport. Queue overflow
   and terminal apply responses report `fact_skipped`; deferred failures report
   `fact_deferred`. Analytics per-event rejections remain terminal and visible
