@@ -1182,9 +1182,8 @@ Names and calls change hard, with no aliases. Update host code as follows:
   matrix, and the engine-real bob-build harness now requires
   `shardpilot.experiments` so the module is compiled by the library build.
 
-- **CI gained an engine-real `bob-build` leg** (fleet-audit gap: the
-  contract core was interpreter-tested only, with no proof the tree still
-  works as an actual Defold library). On every PR and push to `main`,
+- **CI gained an engine-real `bob-build` leg** to validate the tree as
+  an actual Defold library. On every PR and push to `main`,
   `scripts/ci_bob_build.sh` packages the WORKING TREE with
   `scripts/package_release.sh`, serves that ZIP over localhost as the
   dependency URL of a minimal committed consumer project
@@ -1286,8 +1285,8 @@ Names and calls change hard, with no aliases. Update host code as follows:
 
 ## v0.8.1 — 2026-07-18 — early alpha
 
-- **`Retry-After` is now honored on 5xx responses, not only 429** (SDK
-  strict-consent audit follow-up). The transport parsed the `Retry-After`
+- **`Retry-After` is now honored on 5xx responses, not only 429.**
+  The transport parsed the `Retry-After`
   header on every response but passed it to the client only in the 429
   branch; a retryable 5xx fell back to the client's own full-jitter
   exponential backoff. The ingest service's strict-consent
@@ -1297,7 +1296,7 @@ Names and calls change hard, with no aliases. Update host code as follows:
   clamp) works exactly as it already did for 429, on both the events plane
   and the consent-receipt outbox. No behavior change for responses without
   the header.
-- **Receipt-before-batch flush ordering pinned** (audit item 3a). Within one
+- **Receipt-before-batch flush ordering pinned.** Within one
   flush cycle the consent-receipt outbox was already handed to the transport
   strictly before the event batch at every dispatch point
   (init/update/flush/shutdown); this ordering is now documented as

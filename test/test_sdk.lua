@@ -2397,7 +2397,7 @@ local function test_503_retry_after_defers_next_publish()
 	storage.reset()
 end
 
--- Strict-consent receipt-lag hardening (audit 2026-07-18, item 3a): within one
+-- Within one
 -- flush cycle the consent-receipt outbox is handed to the transport BEFORE the
 -- event batch, so a retained grant receipt is on the wire ahead of the first
 -- post-grant events. Sequencing only — the batch must not wait on the
@@ -2436,7 +2436,7 @@ local function test_flush_sends_consent_receipt_before_event_batch()
 	storage.reset()
 end
 
--- Audit 3a follow-up: an undispatched GRANT receipt holds the event-batch leg
+-- An undispatched GRANT receipt holds the event-batch leg
 -- of flush — a grant parked in a server Retry-After window (or the client's
 -- own jittered backoff) has not been handed to the transport, so a batch
 -- published meanwhile would overtake it and reach a strict-enforce workspace
@@ -2527,7 +2527,7 @@ local function test_grant_behind_deferred_head_receipt_holds_events()
 	storage.reset()
 end
 
--- Audit 3a follow-up (async transport): the real Defold http.request is
+-- The real Defold http.request is
 -- asynchronous, so a flush after the head's window elapses only STARTS the
 -- head receipt — a grant queued behind it is still undispatched, and the
 -- batch must stay held until the chained drain hands the grant itself to the
@@ -3908,7 +3908,7 @@ local function test_persist_snapshots_queue_while_running()
 	storage.reset()
 end
 
--- Review fix: persist() must make owed summaries durable. A
+-- persist() must make owed summaries durable. A
 -- full-queue refusal turns a built perf/network summary into an owed entry
 -- whose sampler window is already consumed; a focus-loss persist() that
 -- snapshots only the queue/in-flight tail would report the tail durable
@@ -3996,7 +3996,7 @@ local function test_persist_captures_owed_summaries_across_relaunch()
 	storage.reset()
 end
 
--- Review fix: an owed summary replays under the identity it
+-- An owed summary replays under the identity it
 -- was BUILT with. Mode A (no per-session credential): identify() after the
 -- refusal proceeds, and the drained summary lands attributed to the
 -- original user and session while post-switch events carry the new user.
@@ -4065,7 +4065,7 @@ local function test_owed_summary_preserves_actor_across_identify_mode_a()
 	storage.reset()
 end
 
--- Review fix, Mode B arm: an owed summary snapshotted to
+-- With a verified user, an owed summary snapshotted to
 -- another verified user is undrained event work a credential minted for
 -- the incoming user cannot vouch for — identify() refuses (events_pending,
 -- the same pending-work family as queued/in-flight/spooled events) until
@@ -4118,7 +4118,7 @@ local function test_identify_refused_while_owed_summary_pending_mode_b()
 	storage.reset()
 end
 
--- Review fix, Mode B rotation arm: owed summaries are pending
+-- With a verified user, owed summaries are pending
 -- old-anon work that sits outside the queue (their built envelopes carry
 -- the old anon verbatim), so set_anonymous_id refuses like it does for
 -- queued/in-flight/spooled work until they drain.
@@ -4167,7 +4167,7 @@ local function test_set_anonymous_id_rejected_while_owed_summary_pending_mode_b(
 	storage.reset()
 end
 
--- Review fix: flush() treats newly owed summaries as ITS OWN
+-- flush() treats newly owed summaries as ITS OWN
 -- pending work. Building summaries against a full queue used to park them
 -- owed while the same flush drained the queue and returned true — a Mode B
 -- caller following the documented flush-then-re-identify recourse hit
@@ -4236,7 +4236,7 @@ local function test_flush_drains_owed_summaries_within_same_call()
 	storage.reset()
 end
 
--- Review fix: persist() captures the WHOLE remnant in one
+-- persist() captures the WHOLE remnant in one
 -- durable write. Direct-spooling still-owed summaries in a second append
 -- used to evict just-captured queue/in-flight envelopes on a near-full
 -- spool (oldest first) while only the second write's own batch was
@@ -5806,7 +5806,7 @@ local function test_shutdown_completes_with_durable_outbox_and_next_launch_deliv
 	storage.reset()
 end
 
--- Gate scoping (audit 3a follow-up): a durably retained grant receipt parked
+-- A durably retained grant receipt parked
 -- in a server-requested Retry-After window must NOT block teardown when there
 -- is nothing to publish — the receipt is safe on disk and re-sends at the
 -- next launch, exactly like any other durably retained receipt.
@@ -5833,7 +5833,7 @@ local function test_shutdown_completes_with_only_deferred_grant_receipt()
 	storage.reset()
 end
 
--- Audit 3a follow-up (toggling): an in-flight head grant releases the gate
+-- An in-flight head grant releases the gate
 -- only for itself. With grant→deny→grant queued before the first receipt
 -- settles, the LATER grant is still undispatched — events tracked under the
 -- second grant must wait until that receipt's own handoff, or they would
@@ -5887,7 +5887,7 @@ local function test_toggled_grant_behind_in_flight_head_still_holds_events()
 	storage.reset()
 end
 
--- Audit 3a follow-up (restart): a relaunch mid-window reloads the durable
+-- A relaunch mid-window reloads the durable
 -- outbox but no deferral state — the gate needs none: the retained
 -- verified-keyed grant is handed to the transport the moment the session
 -- vouches for its actor again (identify() is that dispatch point; until
@@ -6146,7 +6146,7 @@ end
 -- A malformed outbox record on disk is fail-safe: garbled entries are dropped
 -- at load — never sent, never a crash into game code — and they never block
 -- the deliverable receipts stored around them.
--- Load-order pin (fleet audit, from the Unreal SDK): the outbox load-side
+-- The outbox load-side
 -- drops — the sanitizer inside load_consent_outbox and the M.new
 -- identity/vouch drop — run BEFORE any cap enforcement, which lives only in
 -- save_consent_outbox. Were the 32-cap applied to the loaded file first, the
@@ -6904,7 +6904,7 @@ local function test_receipt_parking_in_flight_settles_without_arming_window()
 	storage.reset()
 end
 
--- Review fix: identify() REFUSES a Mode B identity CHANGE while
+-- identify() REFUSES a Mode B identity CHANGE while
 -- event work snapshotted to another verified user is still undrained —
 -- queued in this process, or reloaded on the durable spool. Events snapshot
 -- their user at enqueue time, so accepting the switch would drop the token
@@ -6999,7 +6999,7 @@ local function test_identify_refused_while_other_user_events_pending()
 	storage.reset()
 end
 
--- Head-of-queue audit: with parking, the dispatch head can sit BEHIND the
+-- With parking, the dispatch head can sit BEHIND the
 -- queue front, so every piece of dispatch bookkeeping must key to the
 -- ACTUAL dispatch-head receipt, never to index 1 — the dispatch selection
 -- skips the parked front, the grant-dispatch gate holds for an
@@ -7247,7 +7247,7 @@ local function test_legacy_kindless_receipt_backfills_anon_and_invalid_kind_drop
 	storage.reset()
 end
 
--- Review fix: a receipt NO configured credential can vouch for
+-- A receipt NO configured credential can vouch for
 -- must never ride the minted token. The concrete case: a legacy kindless
 -- receipt that stored v0.9.1's user-first ACTOR backfills to kind="anon"
 -- at load with its retained anon snapshot still matching the current anon

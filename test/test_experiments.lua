@@ -3124,7 +3124,7 @@ local function test_shutdown_completes_with_active_session_and_full_queue()
 		"the deferred session end rides a shutdown batch")
 end
 
--- ── regressions, part 9 (post-merge audit absorption) ─────────────────────────
+-- ── stale answers, durable state and spool recovery ─────────────────────────
 
 local function test_stale_auth_refusal_does_not_latch()
 	reset()
@@ -7715,9 +7715,9 @@ function extra_tests.test_backend_explicit_exposure_after_end_opens_no_session()
 	end
 end
 
--- Golden responses: experiment_age_eligibility_routes_test.go:36 and
--- experiment_fact_apply_routes_test.go:219; capture/projection hashes are
--- recorded in test/fixtures/experiment-age/contract.md.
+-- Golden responses cover refused age bands and an adult assignment.
+-- Capture/projection hashes are recorded in
+-- test/fixtures/experiment-age/contract.md.
 function extra_tests.test_age_golden_hashes()
 	local status = os.execute("python3 test/test_experiment_age_golden.py")
 	assert_true(status == 0 or status == true, "golden fixture SHA-256 must match; re-review scanner pins")

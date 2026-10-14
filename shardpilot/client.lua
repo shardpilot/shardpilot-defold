@@ -6951,7 +6951,7 @@ function Client:flush(options)
 		return true
 	end
 
-	-- Strict-enforce hardening (audit 3a follow-up): the event-batch leg of
+	-- The event-batch leg of
 	-- this flush is held while the outbox retains a DISPATCHABLE analytics
 	-- GRANT receipt that has not yet been HANDED TO THE TRANSPORT (the
 	-- dispatch above may have started only one receipt, and http.request is
