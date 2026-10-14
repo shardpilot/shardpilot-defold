@@ -236,9 +236,9 @@ local sdk = require "shardpilot.sdk"
 local function config()
 	return {
 		ingest_url = "http://localhost:8080",
-		workspace_id = "workspace-bench",
-		app_id = "app-bench",
-		environment_id = "develop",
+		workspace_key = "workspace-bench",
+		app_key = "app-bench",
+		environment_key = "develop",
 		app_version = "0.1.0",
 		app_build = "100",
 		token_provider = function(callback)

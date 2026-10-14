@@ -23,8 +23,8 @@ return function(c)
 		ingest_url = c.ingest_url, anonymous_id = c.anonymous_id,
 		-- The owner supplies this credential; the example never mints or refreshes it.
 		token_provider = function(callback) callback(c.ingest_token, nil, nil) end,
-		workspace_id = c.workspace_id, app_id = c.app_id,
-		environment_id = c.environment_id, platform = "linux", source = "client",
+		workspace_key = c.workspace_id, app_key = c.app_id,
+		environment_key = c.environment_id, platform = "linux", source = "client",
 		batch_size = 100, spool_enabled = false,
 		request_compression_enabled = false, http_timeout_seconds = 15,
 		-- The caller's documented view of a per-event rejection: the

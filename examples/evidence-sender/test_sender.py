@@ -125,6 +125,8 @@ class SenderTest(unittest.TestCase):
         # Opaque per-run transport marker; never a signed or usable credential.
         verified_marker = os.urandom(32).hex()
 
+        self_test = self
+
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
@@ -185,6 +187,12 @@ class SenderTest(unittest.TestCase):
                         registered = tuple(name for name in registered if name != "app.session_ended")
                     unregistered = set() if mode == "legacy" else {
                         index for index, event in enumerate(body["events"]) if event["event_name"] not in registered}
+                    for event in body["events"]:
+                        self_test.assertEqual(event["workspace_key"], "senderworkspace")
+                        self_test.assertEqual(event["app_key"], "senderapp")
+                        self_test.assertEqual(event["environment_key"], "test")
+                        for retired in ("workspace_id", "app_id", "environment_id"):
+                            self_test.assertNotIn(retired, event)
                     for index in unregistered:
                         rows[index].update(status="rejected", code="schema_not_found")
                     if mode == "suppressed_row" and rows:

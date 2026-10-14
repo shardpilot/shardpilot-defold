@@ -241,7 +241,21 @@ local function assert_not_initialized(label, fn)
 	assert_equal(err, "not_initialized", label)
 end
 
-local function config(overrides)
+-- Direct private-record fixtures keep their stored scope names.
+local function record_scope(raw)
+	if type(raw) ~= "table" or (rawget(raw, "workspace_key") == nil and rawget(raw, "app_key") == nil) then
+		return raw
+	end
+	local out = {}
+	for key, value in next, raw do out[key] = value end
+	for _, axis in ipairs({ "workspace", "app", "environment" }) do
+		out[axis .. "_id"] = out[axis .. "_key"]
+		out[axis .. "_key"] = nil
+	end
+	return out
+end
+
+local function private_config(overrides)
 	local out = {
 		ingest_url = "http://localhost:8080",
 		workspace_id = "workspace-example",
@@ -258,6 +272,15 @@ local function config(overrides)
 	for key, value in pairs(overrides or {}) do
 		out[key] = value
 	end
+	return out
+end
+
+-- Public constructor input is distinct from the unchanged private record scope.
+local function config(overrides)
+	local out = private_config()
+	out.workspace_key, out.app_key, out.environment_key = out.workspace_id, out.app_id, out.environment_id
+	out.workspace_id, out.app_id, out.environment_id = nil, nil, nil
+	for key, value in pairs(overrides or {}) do out[key] = value end
 	return out
 end
 
@@ -316,10 +339,105 @@ local identity_scope = { workspace_id = "workspace-example", app_id = "app-examp
 -- a pre-seeded decision. The read-modify-write preserves any anonymous_id a
 -- previous client persisted.
 local function seed_granted_consent(scope)
-	scope = scope or identity_scope
+	scope = record_scope(scope or identity_scope)
 	local record = storage.load(scope) or {}
 	record.consent_analytics = "granted"
 	assert_true(storage.save(scope, record), "seeding the consent grant must succeed")
+end
+
+-- Public root scope names and complete ordinary HTTP envelopes.
+do
+	local passed, failed = 0, 0
+	local function scope_scene(name, fn)
+		reset()
+		local ok, err = pcall(fn)
+		if ok then
+			passed = passed + 1
+		else
+			failed = failed + 1
+			print("scope keys FAIL " .. name .. ": " .. tostring(err))
+		end
+	end
+	local function canonical_config()
+		local raw = config({ flush_interval_seconds = 9999, request_compression_enabled = false })
+		raw.workspace_key, raw.app_key, raw.environment_key = "workspace-example", "app-example", "develop"
+		raw.workspace_id, raw.app_id, raw.environment_id = nil, nil, nil
+		return raw
+	end
+	scope_scene("canonical constructor", function()
+		local raw = canonical_config()
+		local client, err = sdk.new(raw)
+		assert_true(client, err)
+		assert_equal(client.config.workspace_id, "workspace-example", "private scope value stays stable")
+		assert_equal(client.config.app_id, "app-example", "private app namespace stays stable")
+		assert_equal(client.config.environment_id, "develop", "private environment stays stable")
+		assert_equal(raw.workspace_key, "workspace-example", "caller config is unchanged")
+		assert_equal(raw.workspace_id, nil, "no retired public alias is added")
+	end)
+	scope_scene("retired-only constructor", function()
+		local client, err = sdk.new({
+			ingest_url = "http://localhost:8080", workspace_id = "workspace-example",
+			app_id = "app-example", environment_id = "develop",
+			publishable_key = "sp_ingest_publishable_key",
+		})
+		assert_equal(client, nil)
+		assert_equal(err, "unknown_config_key")
+		assert_equal(#requests, 0, "no request before config admission")
+	end)
+	for _, axis in ipairs({ "workspace", "app", "environment" }) do
+		scope_scene("mixed retired " .. axis, function()
+			local raw = canonical_config()
+			raw[axis .. "_id"] = false
+			local load, save = storage.load, storage.save
+			local effects = 0
+			storage.load = function(...) effects = effects + 1; return load(...) end
+			storage.save = function(...) effects = effects + 1; return save(...) end
+			local client, err = sdk.new(raw)
+			storage.load, storage.save = load, save
+			assert_equal(client, nil)
+			assert_equal(err, "unknown_config_key")
+			assert_equal(effects, 0, "retired config refused before private persistence")
+			assert_equal(#requests, 0)
+		end)
+	end
+	for _, axis in ipairs({ "workspace", "app", "environment" }) do
+		scope_scene("required canonical " .. axis, function()
+			local raw = canonical_config()
+			raw[axis .. "_key"] = nil
+			local client, err = sdk.new(raw)
+			assert_equal(client, nil)
+			assert_equal(err, axis .. "_key_required")
+			assert_equal(#requests, 0)
+		end)
+	end
+	scope_scene("actual ordinary HTTP batch", function()
+		seed_granted_consent()
+		-- On the old implementation, use its admitted input to reach the actual
+		-- send boundary as well; an init refusal must not hide the wire witness.
+		local client = sdk.new(canonical_config())
+		if not client then client = assert(sdk.new(private_config({ request_compression_enabled = false }))) end
+		assert_true(client:track("scope.probe", { workspace_id = "customer-property" }, nil, { schema_version = 7 }))
+		assert_true(client:flush())
+		local found
+		for _, request in ipairs(requests) do
+			if request.url:find("/v1/events:batch", 1, true) then
+				for _, event in ipairs(json.decode(request.body).events) do
+					if event.event_name == "scope.probe" then found = event end
+				end
+			end
+		end
+		assert_true(found, "the real transport sent the generated event")
+		assert_equal(found.workspace_key, "workspace-example")
+		assert_equal(found.app_key, "app-example")
+		assert_equal(found.environment_key, "develop")
+		assert_equal(found.workspace_id, nil)
+		assert_equal(found.app_id, nil)
+		assert_equal(found.environment_id, nil)
+		assert_equal(found.schema_version, 7, "selected major is unchanged")
+		assert_equal(found.props.workspace_id, "customer-property", "nested property remains opaque")
+	end)
+	print(string.format("scope keys: %d pass, %d fail", passed, failed))
+	assert_equal(failed, 0, "public scope and wire scenes")
 end
 
 local function test_config_validation()
@@ -329,9 +447,9 @@ local function test_config_validation()
 
 	local invalid_cases = {
 		{ { ingest_url = 42 }, "invalid_ingest_url" },
-		{ { workspace_id = 42 }, "invalid_workspace_id" },
-		{ { app_id = false }, "invalid_app_id" },
-		{ { environment_id = {} }, "invalid_environment_id" },
+		{ { workspace_key = 42 }, "invalid_workspace_key" },
+		{ { app_key = false }, "invalid_app_key" },
+		{ { environment_key = {} }, "invalid_environment_key" },
 		{ { ingest_url = "https:///" }, "invalid_ingest_url" },
 		{ { ingest_url = "https://?x" }, "invalid_ingest_url" },
 		{ { ingest_url = "https://#fragment" }, "invalid_ingest_url" },
@@ -448,9 +566,9 @@ local function test_app_first_payload()
 	assert_equal(request.headers["X-ShardPilot-SDK"], "defold/" .. require("shardpilot.version").VERSION,
 		"the event batch names this SDK")
 	assert_equal(request.options.timeout, 2)
-	assert_contains(request.body, '"workspace_id":"workspace-example"')
-	assert_contains(request.body, '"app_id":"app-example"')
-	assert_contains(request.body, '"environment_id":"develop"')
+	assert_contains(request.body, '"workspace_key":"workspace-example"')
+	assert_contains(request.body, '"app_key":"app-example"')
+	assert_contains(request.body, '"environment_key":"develop"')
 	assert_contains(request.body, '"event_ts":')
 	assert_contains(request.body, '"session_sequence":')
 	assert_contains(request.body, '"event_name":"app.session_started"')
@@ -1774,7 +1892,7 @@ local function test_storage_namespace_varies_with_app_config()
 	reset()
 	storage.reset()
 	local first = assert(sdk.new(config()))
-	local other = assert(sdk.new(config({ app_id = "app-other" })))
+	local other = assert(sdk.new(config({ app_key = "app-other" })))
 	assert_not_equal(other.anonymous_id, first.anonymous_id, "different apps must not share an anonymous id")
 	local sibling = assert(sdk.new(config()))
 	assert_equal(sibling.anonymous_id, first.anonymous_id)
@@ -1783,7 +1901,7 @@ local function test_storage_namespace_varies_with_app_config()
 	assert_true(first:set_consent(false))
 	local denied_follower = assert(sdk.new(config()))
 	assert_equal(denied_follower.consent_state, "denied")
-	local other_follower = assert(sdk.new(config({ app_id = "app-other" })))
+	local other_follower = assert(sdk.new(config({ app_key = "app-other" })))
 	assert_equal(other_follower.consent_state, "unknown", "another app must not inherit the denial")
 	storage.reset()
 end
@@ -1806,13 +1924,13 @@ local function test_storage_uses_app_scoped_save_file()
 	end
 
 	local client = assert(sdk.new(config()))
-	storage.load(config()) -- observe the selected durable path
+	storage.load(private_config()) -- observe the selected durable path
 	local record = stores[namespaces[#namespaces] .. "/identity"]
 	assert_equal(type(record), "table", "identity must persist under the app-scoped namespace")
 	assert_equal(record.anonymous_id, client.anonymous_id)
 
-	local other = assert(sdk.new(config({ app_id = "app-other" })))
-	storage.load(config({ app_id = "app-other" }))
+	local other = assert(sdk.new(config({ app_key = "app-other" })))
+	storage.load(private_config({ app_id = "app-other" }))
 	local other_record = stores[namespaces[#namespaces] .. "/identity"]
 	assert_equal(type(other_record), "table")
 	assert_equal(other_record.anonymous_id, other.anonymous_id)
@@ -1823,7 +1941,7 @@ local function test_storage_uses_app_scoped_save_file()
 	assert_equal(sibling.anonymous_id, client.anonymous_id)
 
 	-- scope segments are encoded before reaching sys.get_save_file
-	assert(sdk.new(config({ workspace_id = "ws/../evil", app_id = "app one" })))
+	assert(sdk.new(config({ workspace_key = "ws/../evil", app_key = "app one" })))
 	storage.load({ workspace_id = "ws/../evil", app_id = "app one" })
 	assert_equal(type(stores[namespaces[#namespaces] .. "/identity"]), "table")
 	for _, application_id in ipairs(namespaces) do
@@ -14139,7 +14257,7 @@ end)()
 		local real_new = core.new
 		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local function cfg(app, hook)
-			return config({ app_id = app, anonymous_id = app .. "-actor", diagnostics = hook })
+			return config({ app_key = app, anonymous_id = app .. "-actor", diagnostics = hook })
 		end
 		sys.get_save_file = function(app, name)
 			paths[name] = app .. "/" .. name
@@ -14158,9 +14276,9 @@ end)()
 			assert_true(facade.init(cfg("boot-previous")))
 			if not keep_previous then assert_true(facade.shutdown()) end
 			local outer = cfg("boot-outer")
-			assert_true(storage.save(outer, { anonymous_id = outer.anonymous_id, consent_analytics = "granted" }))
+			assert_true(storage.save(record_scope(outer), { anonymous_id = outer.anonymous_id, consent_analytics = "granted" }))
 			if kind == "legacy" or kind == "both" then
-				assert_true(storage.spool_is_durable(outer))
+				assert_true(storage.spool_is_durable(record_scope(outer)))
 				stores[paths.spool] = {
 					events = { { event_id = "boot-obsolete", event_name = "tutorial_start" } },
 				}
@@ -14597,7 +14715,7 @@ end)()
 		assert_true(ok, err)
 	end
 	local function cfg(actor)
-		return config({ app_id = "synthetic-init", anonymous_id = actor })
+		return config({ app_key = "synthetic-init", anonymous_id = actor })
 	end
 	scene("identity getter has a nullable value shape", function()
 		fresh(function(facade)
@@ -14695,7 +14813,7 @@ end)()
 	scene("standalone construction does not replace the facade", function()
 		fresh(function(facade)
 			assert_true(facade.init(cfg("synthetic-default")))
-			local other = assert(facade.new(config({ app_id = "synthetic-other", anonymous_id = "synthetic-independent" })))
+			local other = assert(facade.new(config({ app_key = "synthetic-other", anonymous_id = "synthetic-independent" })))
 			assert_equal(other:get_anonymous_id(), "synthetic-independent")
 			assert_equal(facade.get_anonymous_id(), "synthetic-default")
 		end)
@@ -14717,7 +14835,7 @@ end)()
 	local function fresh(run)
 		reset(); storage.reset()
 		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
-		local options = config({ app_id = "synthetic-consent-getter", anonymous_id = "synthetic-reader" })
+		local options = config({ app_key = "synthetic-consent-getter", anonymous_id = "synthetic-reader" })
 		local ok, err = pcall(run, facade, options)
 		storage.reset()
 		assert_true(ok, err)
@@ -14767,7 +14885,7 @@ end)()
 		scene(api .. " restored decisions", function()
 			for _, state in ipairs({ "unknown", "granted", "denied", "denied_forced_minor" }) do
 				fresh(function(facade, options)
-					assert_true(storage.save(options, { anonymous_id = options.anonymous_id, consent_analytics = state }))
+					assert_true(storage.save(record_scope(options), { anonymous_id = options.anonymous_id, consent_analytics = state }))
 					local client
 					if api == "instance" then client = assert(facade.new(options))
 					else assert_true(facade.init(options)) end
@@ -14835,7 +14953,7 @@ end)()
 			saved[key] = storage[key]
 		end
 		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
-		local options = config({ app_id = "synthetic-consent-results", anonymous_id = "synthetic-actor" })
+		local options = config({ app_key = "synthetic-consent-results", anonymous_id = "synthetic-actor" })
 		if mode == "publishable" then options.token_provider = nil; options.publishable_key = "sp_ingest_synthetic" end
 		local ok, err = pcall(function()
 			local client
@@ -14905,7 +15023,7 @@ end)()
 				assert_true(#requests > 0, "actual receipt delivery attempted")
 				sys.save = plain_save
 				call("persist")
-				assert_true(#storage.load_consent_outbox(options) > 0, "owed receipt becomes durable")
+				assert_true(#storage.load_consent_outbox(record_scope(options)) > 0, "owed receipt becomes durable")
 				no_analytics()
 			end)
 		end)
@@ -14951,7 +15069,7 @@ end)()
 				result(call, true, false, "consent_forced_minor")
 				result(call, false, true)
 				assert_equal(call("get_consent_state"), "denied_forced_minor")
-				assert_equal(storage.load(options).consent_analytics, "denied_forced_minor", "ordinary denial keeps persisted state")
+				assert_equal(storage.load(record_scope(options)).consent_analytics, "denied_forced_minor", "ordinary denial keeps persisted state")
 				result(call, true, false, "consent_forced_minor")
 				no_analytics()
 			end)
@@ -15003,7 +15121,7 @@ end)()
 			storage.reset(); reset()
 			local restored = assert(facade.new(options))
 			assert_equal(restored:set_consent(true), false)
-			assert_equal(#storage.load_consent_outbox(options), 0, "real receipt acknowledgement retired outbox")
+			assert_equal(#storage.load_consent_outbox(record_scope(options)), 0, "real receipt acknowledgement retired outbox")
 			storage.save = saved.save
 			storage.reset(); reset()
 			local again = assert(facade.new(options))
@@ -15031,7 +15149,7 @@ end)()
 						if ordinary_denial then result(call, false, true) end
 						assert_equal(#client.consent_outbox, 0, "A's receipt drained before rotation")
 						assert_true(call("set_anonymous_id", "synthetic-actor-b"))
-						local record = storage.load(options)
+						local record = storage.load(record_scope(options))
 						assert_equal(record.anonymous_id, "synthetic-actor-b")
 						assert_equal(record.consent_analytics, nil, "A's state is not written under B")
 						if reboot then
@@ -15055,7 +15173,7 @@ end)()
 				local ok, code = call("set_anonymous_id", "")
 				assert_equal(ok, false); assert_equal(code, "invalid_anonymous_id")
 				result(call, true, false, "consent_forced_minor")
-				assert_equal(storage.load(options).consent_analytics, "denied_forced_minor")
+				assert_equal(storage.load(record_scope(options)).consent_analytics, "denied_forced_minor")
 			end, mode)
 		end)
 	end
@@ -15067,7 +15185,7 @@ end)()
 			assert_equal(ok, false); assert_equal(code, "events_pending")
 			assert_equal(call("get_anonymous_id"), options.anonymous_id)
 			result(call, true, false, "consent_forced_minor")
-			assert_equal(storage.load(options).consent_analytics, "denied_forced_minor")
+			assert_equal(storage.load(record_scope(options)).consent_analytics, "denied_forced_minor")
 		end)
 	end)
 	for _, mode in ipairs({ "token", "publishable" }) do
@@ -15077,13 +15195,13 @@ end)()
 					fresh(api, function(call, options, facade)
 						next_status = pending and 500 or 202
 						result(call, "denied_forced_minor", true)
-						local record = storage.load(options)
-						local count, sent = #storage.load_consent_outbox(options), #requests
+						local record = storage.load(record_scope(options))
+						local count, sent = #storage.load_consent_outbox(record_scope(options)), #requests
 						result(call, false, true)
 						assert_equal(call("get_consent_state"), "denied_forced_minor")
-						assert_equal(#storage.load_consent_outbox(options), count, "no new receipt retained")
+						assert_equal(#storage.load_consent_outbox(record_scope(options)), count, "no new receipt retained")
 						assert_equal(#requests, sent, "no new receipt dispatched")
-						assert_equal(storage.load(options).consent_decision_seq, record.consent_decision_seq, "no new decision")
+						assert_equal(storage.load(record_scope(options)).consent_decision_seq, record.consent_decision_seq, "no new decision")
 						result(call, true, false, "consent_forced_minor")
 						storage.reset(); reset()
 						local restored = assert(facade.new(options))
@@ -15132,7 +15250,7 @@ end)()
 	end
 	local function options(kind, counts)
 		if kind == "analytics" then
-			return config({ app_id = "synthetic-config", anonymous_id = "synthetic-actor", token_provider = function(cb)
+			return config({ app_key = "synthetic-config", anonymous_id = "synthetic-actor", token_provider = function(cb)
 				counts.tokens = counts.tokens + 1; cb("synthetic-fixture", nil, nil)
 			end })
 		end
@@ -15355,7 +15473,7 @@ end)()
 		reset(); storage.reset()
 		local _, restore = install_stub_sys_storage()
 		next_status = 200; next_response_body = '{"recorded":true,"replayed":false}'
-		local opts = config({ app_id = "synthetic-notice", anonymous_id = "synthetic-actor" })
+		local opts = config({ app_key = "synthetic-notice", anonymous_id = "synthetic-actor" })
 		if mode == "publishable" then opts.token_provider = nil; opts.publishable_key = "sp_ingest_synthetic" end
 		local mod = dofile("shardpilot/sdk.lua")
 		local client = assert(mod[api](opts))
@@ -15397,13 +15515,13 @@ end)()
 				for _, invalid in ipairs(malformed) do
 					scene(api .. " " .. mode .. " " .. tostring(decision) .. " malformed " .. invalid[1], function()
 						fresh(api, mode, function(call, opts)
-							local before = storage.load(opts); local wire_before = #requests
+							local before = storage.load(record_scope(opts)); local wire_before = #requests
 							local ok, code, warning = call("set_consent", decision, invalid[2])
 							if decision == true then
 								assert_equal(ok, false); assert_equal(code, "consent_notice_invalid"); assert_equal(warning, nil)
 								assert_equal(call("get_consent_state"), "unknown")
 								assert_equal(#requests, wire_before, "refused grant emits nothing")
-								assert_equal(encode_value(storage.load(opts)), encode_value(before), "refused grant preserves identity")
+								assert_equal(encode_value(storage.load(record_scope(opts))), encode_value(before), "refused grant preserves identity")
 							else
 								assert_equal(ok, true); assert_equal(code, nil); assert_equal(warning, "consent_notice_invalid")
 								assert_equal(call("get_consent_state"), decision == false and "denied" or decision)
@@ -15434,10 +15552,10 @@ end)()
 				next_status = 500; next_response_body = "{}"
 				assert_true(call("set_consent", "denied_forced_minor", notice()))
 				tuple_equal(receipt(), notice())
-				local before = encode_value(storage.load_consent_outbox(opts)); local wire_before = #requests
+				local before = encode_value(storage.load_consent_outbox(record_scope(opts))); local wire_before = #requests
 				assert_true(call("set_consent", false, { notice_version = "invalid-partial" }))
 				assert_equal(#requests, wire_before); assert_equal(call("get_consent_state"), "denied_forced_minor")
-				assert_equal(encode_value(storage.load_consent_outbox(opts)), before)
+				assert_equal(encode_value(storage.load_consent_outbox(record_scope(opts))), before)
 			end)
 		end)
 	end
@@ -15500,7 +15618,7 @@ end)()
 			assert_true(call("set_consent", false, notice()))
 			local next_notice = notice(); next_notice.notice_version = "synthetic-next"
 			assert_true(call("set_consent", false, next_notice))
-			local retained = storage.load_consent_outbox(opts)
+			local retained = storage.load_consent_outbox(record_scope(opts))
 			assert_equal(#retained, 2); tuple_equal(retained[1], notice()); tuple_equal(retained[2], next_notice)
 			assert_not_equal(retained[1].idempotency_key, retained[2].idempotency_key)
 		end)
@@ -15534,7 +15652,7 @@ end)()
 			id.uuid_v7 = function() return payload.idempotency_key end
 			local ok, err = pcall(function()
 				local client = assert(dofile("shardpilot/sdk.lua").new(config({
-					workspace_id = payload.workspace_id, app_id = payload.app_id, environment_id = payload.environment_id,
+					workspace_key = payload.workspace_id, app_key = payload.app_id, environment_key = payload.environment_id,
 					anonymous_id = payload.actor_identifier, consent_kind_emission_enabled = false,
 				})))
 				next_status = 200; next_response_body = read("test/golden/consent-notice-response.json")
@@ -15958,8 +16076,8 @@ end)()
 			crash_url = "http://localhost:8086", crash_key = "synthetic-crash-key",
 			app_id = "synthetic-app", previous_crash_capture_enabled = false,
 		} end
-		return { ingest_url = "http://localhost:8080", workspace_id = "synthetic-ws",
-			app_id = "synthetic-app", environment_id = "develop", publishable_key = "sp_ingest_synthetic" }
+		return { ingest_url = "http://localhost:8080", workspace_key = "synthetic-ws",
+			app_key = "synthetic-app", environment_key = "develop", publishable_key = "sp_ingest_synthetic" }
 	end
 	local function fresh(kind, api, opts, run)
 		local mod = kind == "crash" and public_crash or public_sdk
@@ -16455,6 +16573,17 @@ end)()
    else refused(c,ok,err,"event_too_large",0,0)end
   end)
  end
+ scene("canonical scope member names spend three more bytes",function()
+  local c=fresh();local props=sized_props(c,2049)
+  local value=envelope.build(c.config,c,event(c,props))
+  local canonical=wire(c,event(c,props))
+  for _,axis in ipairs({"workspace","app","environment"})do
+   value[axis.."_id"]=value[axis.."_key"];value[axis.."_key"]=nil
+  end
+  assert_equal(#canonical,#facts.encode_event(value)+3,"three longer member names count")
+  assert_equal(#facts.encode_event(value),2046,"old spelling would fit")
+  local ok,err=c:track("limit_probe",props);refused(c,ok,err,"event_too_large",0,0)
+ end)
  scene("envelope overhead counts",function()
   local c=fresh();local props={pad=string.rep("x",1800)}
   assert_true(#encode_value(props)<2048);assert_true(#wire(c,event(c,props))>2048)

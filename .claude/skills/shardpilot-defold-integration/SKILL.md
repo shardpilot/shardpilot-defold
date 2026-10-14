@@ -348,9 +348,9 @@ local function start_analytics(granted, decision, newly_answered, notice)
 	-- drive.
 	local started_ok, start_err = shardpilot.init({
 		ingest_url = "http://localhost:8080",
-		workspace_id = "workspace-example",
-		app_id = "app-example",
-		environment_id = "develop",
+		workspace_key = "workspace-example",
+		app_key = "app-example",
+		environment_key = "develop",
 		token_provider = function(callback)
 			callback("client-token-placeholder", nil, nil)
 		end,
@@ -800,9 +800,9 @@ The configuration itself:
 ```lua
 local ok, err = shardpilot.init({
   ingest_url     = "<YOUR-INGEST-BASE-URL>",   -- https required outside localhost; no path/query
-  workspace_id   = "<YOUR-WORKSPACE-ID>",
-  app_id         = "<YOUR-APP-ID>",
-  environment_id = "develop",
+  workspace_key   = "<YOUR-WORKSPACE-KEY>",
+  app_key         = "<YOUR-APP-KEY>",
+  environment_key = "develop",
   publishable_key        = "<YOUR-PUBLISHABLE-INGEST-KEY>", -- Mode A (or token_provider for Mode B)
   -- app_url = "<YOUR-APPLICATION-ORIGIN>", -- optional; requires publishable_key
   -- remote_config_enabled = true, -- explicit opt-in
@@ -811,7 +811,7 @@ local ok, err = shardpilot.init({
 })
 ```
 
-Required: `ingest_url`, `workspace_id`, `app_id`, `environment_id`, and one
+Required: `ingest_url`, `workspace_key`, `app_key`, `environment_key`, and one
 auth credential. `init` returns `true`, or `false, err` with a specific code
 (`ingest_url_required`, `invalid_ingest_url`, `auth_required`,
 `auth_mode_conflict`, `remote_config_publishable_key_required`, …). Useful defaults:
@@ -1257,8 +1257,8 @@ this is not a verification of a deployed service.
   hosted documentation availability are not verified by this source check.
   Use the endpoint supplied for your environment and the in-repo `docs/`
   for the SDK contract.
-- **One live client per configured app.** Clients sharing `workspace_id`
-  and `app_id` use the same persisted records but separate in-memory state;
+- **One live client per configured app.** Clients sharing `workspace_key`
+  and `app_key` use the same persisted records but separate in-memory state;
   one client's age refusal does not stop the other's serving or delivery.
   Follow the replacement lifecycle in
   [configuration](../../../docs/configuration.md#one-client-per-app).

@@ -253,7 +253,7 @@ end
 
 -- A Mode A (publishable-key) config with remote config enabled — the default
 -- shape for these tests.
-local function config(overrides)
+local function private_config(overrides)
 	local out = {
 		ingest_url = "http://localhost:8080",
 		app_url = "http://localhost:18081", remote_config_enabled = true,
@@ -268,6 +268,15 @@ local function config(overrides)
 	for key, value in pairs(overrides or {}) do
 		out[key] = value
 	end
+	return out
+end
+
+-- Public constructor input is distinct from the unchanged private record scope.
+local function config(overrides)
+	local out = private_config()
+	out.workspace_key, out.app_key, out.environment_key = out.workspace_id, out.app_id, out.environment_id
+	out.workspace_id, out.app_id, out.environment_id = nil, nil, nil
+	for key, value in pairs(overrides or {}) do out[key] = value end
 	return out
 end
 
@@ -1479,7 +1488,7 @@ local function test_cache_from_another_scope_is_a_miss_and_gets_overwritten()
 
 	-- Another environment must not read this scope's cache: no snapshot at
 	-- construction, no ETag on its fetch.
-	local other = assert(sdk.new(config({ environment_id = "production" })))
+	local other = assert(sdk.new(config({ environment_key = "production" })))
 	assert_nil(other:remote_config_values(), "another scope must not serve this cache")
 	next_status = 200
 	next_response_body = values_body({ b = 2 })
@@ -1508,7 +1517,7 @@ local function test_transient_failure_never_serves_another_scopes_cache()
 	next_response_body = values_body({ a = 1 })
 	fetch(original)
 
-	local other = assert(sdk.new(config({ environment_id = "production" })))
+	local other = assert(sdk.new(config({ environment_key = "production" })))
 	next_status = 0
 	next_response_body = nil
 	local result = fetch(other)

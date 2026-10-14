@@ -333,7 +333,7 @@ local fixture_subject_fact_key = "sfk1_" .. string.rep("b", 64)
 -- The default config: Mode A with remote config AND experiments enabled.
 -- The flush cadence is parked far away so queued facts stay inspectable and
 -- update()-driven ticks never flush mid-test.
-local function config(overrides)
+local function private_config(overrides)
 	local out = {
 		ingest_url = "http://localhost:8080",
 		app_url = "http://localhost:18081", remote_config_enabled = true,
@@ -350,6 +350,15 @@ local function config(overrides)
 	for key, value in pairs(overrides or {}) do
 		out[key] = value
 	end
+	return out
+end
+
+-- Public constructor input is distinct from the unchanged private record scope.
+local function config(overrides)
+	local out = private_config()
+	out.workspace_key, out.app_key, out.environment_key = out.workspace_id, out.app_id, out.environment_id
+	out.workspace_id, out.app_id, out.environment_id = nil, nil, nil
+	for key, value in pairs(overrides or {}) do out[key] = value end
 	return out
 end
 
@@ -3645,7 +3654,7 @@ local function test_restored_attributes_renormalize_before_revalidation()
 	-- Poison the stored attributes the way a corrupt or older-build record
 	-- could: a reserved name, an out-of-vocabulary name, and an overlong
 	-- value. Only the vocabulary-valid pair may ride the revalidation.
-	local record = storage.load_experiments(config())
+	local record = storage.load_experiments(private_config())
 	record.entries["exp-checkout"].attributes = {
 		{ name = "experiment_key", value = "evil-key" },
 		{ name = "not_in_vocabulary", value = "x" },
@@ -3653,7 +3662,7 @@ local function test_restored_attributes_renormalize_before_revalidation()
 		{ name = "age_band", value = "adult" },
 		{ name = "user_segment", value = string.rep("v", 600) },
 	}
-	assert_true(storage.save_experiments(config(), record))
+	assert_true(storage.save_experiments(private_config(), record))
 
 	next_status = 200
 	local relaunch = assert(sdk.new(config()))
@@ -3884,7 +3893,7 @@ local function test_persist_reports_uncaptured_experiment_state()
 	state.fail_save = nil
 	assert_true(client:persist(),
 		"the recovered store lands the drop and the snapshot is safe")
-	local record = storage.load_experiments(config())
+	local record = storage.load_experiments(private_config())
 	assert_true(record == nil or record.entries["exp-checkout"] == nil,
 		"the kill drop reached the disk")
 	restore()
@@ -3917,14 +3926,14 @@ local function test_owed_clear_retry_preserves_sibling_fresh_write()
 	fetch(b, "exp-onboarding")
 
 	a:update(0.016)
-	local record = storage.load_experiments(config())
+	local record = storage.load_experiments(private_config())
 	assert_true(record ~= nil, "the sibling's record must survive the retry")
 	assert_true(record.entries["exp-onboarding"] ~= nil,
 		"the sibling's post-sentinel assignment survives the owed clear")
 	assert_nil(record.entries["exp-checkout"],
 		"the state the sentinel withdrew is gone")
 	a:update(0.016)
-	record = storage.load_experiments(config())
+	record = storage.load_experiments(private_config())
 	assert_true(record ~= nil and record.entries["exp-onboarding"] ~= nil,
 		"the settled clear must not re-run against the sibling's record")
 	restore()
@@ -3958,13 +3967,13 @@ local function test_owed_clear_demotion_preserves_fresh_disk_entry()
 
 	next_response_body = assignment_body()
 	fetch(a, "exp-checkout")
-	local record = storage.load_experiments(config())
+	local record = storage.load_experiments(private_config())
 	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
 		"the reinstalled assignment is on disk")
 	assert_true(record.entries["exp-onboarding"] ~= nil,
 		"the demotion must not drop the sibling's fresher entry")
 	a:update(0.016)
-	record = storage.load_experiments(config())
+	record = storage.load_experiments(private_config())
 	assert_true(record.entries["exp-onboarding"] ~= nil,
 		"no owed drop may linger against the sibling's fresher entry")
 	restore()
@@ -4032,7 +4041,7 @@ local function test_stale_inflight_sentinel_preserves_sibling_write()
 	held(nil, nil, { status = 403, response = json.encode({
 		error = { code = "real_subjects_disabled", message = "synthetic feature refusal" },
 	}) })
-	local record = storage.load_experiments(config())
+	local record = storage.load_experiments(private_config())
 	assert_true(record ~= nil,
 		"the successful clear must not wipe the whole shared record")
 	assert_true(record.entries["exp-onboarding"] ~= nil,
@@ -4071,10 +4080,10 @@ local function test_condemned_record_refused_after_restart()
 	next_status = 200
 	state.fail_save = nil
 	b:update(0.016)
-	local record = storage.load_experiments(config())
+	local record = storage.load_experiments(private_config())
 	assert_true(record == nil or record.entries["exp-checkout"] == nil,
 		"the recovered store lands the owed clear")
-	assert_nil(storage.load_experiments_clear(config()),
+	assert_nil(storage.load_experiments_clear(private_config()),
 		"the landed clear retires its condemnation marker")
 	restore()
 	storage.reset()
@@ -4109,12 +4118,12 @@ local function test_condemned_survivor_restores_and_converges()
 	next_status = 200
 	next_response_body = assignment_body({ experiment_key = "exp-onboarding" })
 	fetch(b, "exp-onboarding", { age_band = "adult" })
-	local record = storage.load_experiments(config())
+	local record = storage.load_experiments(private_config())
 	assert_true(record ~= nil and record.entries["exp-onboarding"] ~= nil,
 		"the fresh authorized install persists")
 	assert_nil(record.entries["exp-checkout"],
 		"the covered key converges out with the demoted clear")
-	assert_nil(storage.load_experiments_clear(config()),
+	assert_nil(storage.load_experiments_clear(private_config()),
 		"the authorized install disproves the sentinel state and retires the marker")
 	local c = assert(sdk.new(config()))
 	next_status = 503
@@ -4349,7 +4358,7 @@ local function test_sentinel_clear_never_condemns_foreign_scope()
 	-- shared per app, but the sentinel condemns ONLY the scope it was
 	-- decided for — the staging entries (older-stamped by definition)
 	-- must survive both the immediate clear and any later condemnation.
-	local b = assert(sdk.new(config({ environment_id = "staging" })))
+	local b = assert(sdk.new(config({ environment_key = "staging" })))
 	next_response_body = assignment_body({ environment_key = "staging" })
 	fetch(b, "exp-checkout", { age_band = "adult" })
 	local a = assert(sdk.new(config()))
@@ -4359,10 +4368,10 @@ local function test_sentinel_clear_never_condemns_foreign_scope()
 	})
 	fetch(a, "exp-checkout", { age_band = "adult" })
 	next_status = 200
-	local record = storage.load_experiments(config({ environment_id = "staging" }))
+	local record = storage.load_experiments(private_config({ environment_id = "staging" }))
 	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
 		"another scope's record must survive the sentinel's clear")
-	assert_nil(storage.load_experiments_clear(config()),
+	assert_nil(storage.load_experiments_clear(private_config()),
 		"the foreign-scope clear settles without leaving a marker")
 
 	-- Same collision with the record store FAILING: the scope check must
@@ -4376,9 +4385,9 @@ local function test_sentinel_clear_never_condemns_foreign_scope()
 	fetch(a, "exp-checkout", { age_band = "adult" })
 	next_status = 200
 	state.fail_save = nil
-	assert_nil(storage.load_experiments_clear(config()),
+	assert_nil(storage.load_experiments_clear(private_config()),
 		"no marker may condemn a record the clear's scope does not own")
-	local b2 = assert(sdk.new(config({ environment_id = "staging" })))
+	local b2 = assert(sdk.new(config({ environment_key = "staging" })))
 	next_status = 503
 	next_response_body = nil
 	local stale = fetch(b2, "exp-checkout", { age_band = "adult" })
@@ -4414,7 +4423,7 @@ local function test_marker_survives_demotion_until_drops_durable()
 	next_status = 200
 	next_response_body = assignment_body()
 	fetch(a, "exp-checkout")
-	assert_true(storage.load_experiments_clear(config()) ~= nil,
+	assert_true(storage.load_experiments_clear(private_config()) ~= nil,
 		"the marker must outlive the demotion while the drops are not durable")
 	local b = assert(sdk.new(config()))
 	next_status = 503
@@ -4425,10 +4434,10 @@ local function test_marker_survives_demotion_until_drops_durable()
 	next_status = 200
 	state.fail_save = nil
 	b:update(0.016)
-	local record = storage.load_experiments(config())
+	local record = storage.load_experiments(private_config())
 	assert_true(record == nil or record.entries["exp-onboarding"] == nil,
 		"the recovered store lands the owed refusal")
-	assert_nil(storage.load_experiments_clear(config()),
+	assert_nil(storage.load_experiments_clear(private_config()),
 		"the marker retires once nothing it condemns remains durable")
 	restore()
 	storage.reset()
@@ -4454,7 +4463,7 @@ local function test_shutdown_stays_retryable_while_cache_sync_owed()
 	state.fail_save = nil
 	assert_true(client:shutdown(),
 		"the recovered store lands the drop and shutdown completes")
-	local record = storage.load_experiments(config())
+	local record = storage.load_experiments(private_config())
 	assert_true(record == nil or record.entries["exp-checkout"] == nil)
 	restore()
 	storage.reset()
@@ -5208,7 +5217,7 @@ local function test_stale_marker_does_not_condemn_new_scope_spool()
 	-- develop-scope marker cannot retire (sidecar store failing) while
 	-- this scope installs, exposes, and spools its own valid facts.
 	storage.reset()
-	local second = assert(sdk.new(config({ environment_id = "prod" })))
+	local second = assert(sdk.new(config({ environment_key = "prod" })))
 	state.fail_save = function(path)
 		return path:match("/experiments$") ~= nil
 			or path:match("/experiments%-clear$") ~= nil
@@ -5234,7 +5243,7 @@ local function test_stale_marker_does_not_condemn_new_scope_spool()
 	-- STALE develop-scope marker condemn its spooled facts: the marker
 	-- condemns only its own scope and settles via the normal retire path.
 	storage.reset()
-	local relaunch = assert(sdk.new(config({ environment_id = "prod" })))
+	local relaunch = assert(sdk.new(config({ environment_key = "prod" })))
 	next_status = 200
 	next_response_body = nil
 	local requests_before = #requests
@@ -7748,7 +7757,7 @@ end
 function extra_tests.age_refusal(band)
 	reset()
 	local restore = install_fake_sys_storage()
-	local client = granted_client({ app_id = "exposure-app" })
+	local client = granted_client({ app_key = "exposure-app" })
 	client:set_consent(true)
 	next_response_body = extra_tests.served_age_golden()
 	client:fetch_experiment_assignment("exposure-banner", { age_band = "adult" })
@@ -7769,7 +7778,7 @@ function extra_tests.age_refusal(band)
 	assert_equal(#assignment_requests(), before, "refusal must stop revalidation")
 	client:shutdown()
 	storage.reset()
-	local restarted = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local restarted = assert(sdk.new(config({ app_key = "exposure-app" })))
 	restarted:set_consent(true)
 	assert_nil(restarted:experiment_variant("exposure-banner"), "durable assignment withdrawn")
 	restarted:shutdown()
@@ -7788,7 +7797,7 @@ end
 
 function extra_tests.test_age_future_reason_clears_assignment()
 	reset()
-	local client = granted_client({ app_id = "exposure-app" })
+	local client = granted_client({ app_key = "exposure-app" })
 	client:set_consent(true)
 	next_response_body = extra_tests.served_age_golden()
 	client:fetch_experiment_assignment("exposure-banner", {})
@@ -7805,7 +7814,7 @@ end
 function extra_tests.test_age_api_contract()
 	for _, band in ipairs({ "adult", "unknown", "under_threshold" }) do
 		reset()
-		local client = granted_client({ app_id = "exposure-app" })
+		local client = granted_client({ app_key = "exposure-app" })
 		client:set_consent(true)
 		local attrs = { geo = "DE" }
 		next_response_body = extra_tests.age_golden(band)
@@ -7865,13 +7874,13 @@ end
 function extra_tests.test_age_restart_keeps_declarations()
 	reset()
 	local restore = install_fake_sys_storage()
-	local client = granted_client({ app_id = "exposure-app" })
+	local client = granted_client({ app_key = "exposure-app" })
 	client:set_consent(true)
 	next_response_body = extra_tests.served_age_golden()
 	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", { geo = "DE" })
 	client:shutdown()
 	storage.reset()
-	local restarted = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local restarted = assert(sdk.new(config({ app_key = "exposure-app" })))
 	restarted:set_consent(true)
 	assert_equal(restarted:experiment_variant("exposure-banner"), "control", "durable positive control")
 	restarted:update(0) -- restore arms its first cadence on the first tick
@@ -7888,7 +7897,7 @@ function extra_tests.test_age_restored_refusal_never_promoted()
 	for _, refusal in ipairs({ "", " adult ", string.rep("x", 513) }) do
 		reset()
 		local restore = install_fake_sys_storage()
-		local client = granted_client({ app_id = "exposure-app" })
+		local client = granted_client({ app_key = "exposure-app" })
 		client:set_consent(true)
 		next_response_body = extra_tests.served_age_golden()
 		client:fetch_experiment_assignment("exposure-banner", { custom_attribute_age_band = "adult" })
@@ -7901,7 +7910,7 @@ function extra_tests.test_age_restored_refusal_never_promoted()
 		end
 		storage.save_experiments(client.config, record)
 		storage.reset()
-		local restarted = assert(sdk.new(config({ app_id = "exposure-app" })))
+		local restarted = assert(sdk.new(config({ app_key = "exposure-app" })))
 		restarted:set_consent(true)
 		restarted:update(0)
 		advance_seconds(1000)
@@ -7981,7 +7990,7 @@ function extra_tests.test_age_module_facade()
 	assert_equal(err, "not_initialized")
 	assert_equal(rejected.error, err)
 	assert_equal(calls, 1)
-	local cfg = config({ app_id = "exposure-app" })
+	local cfg = config({ app_key = "exposure-app" })
 	assert(sdk.init(cfg))
 	sdk.set_consent(true)
 	next_response_body = extra_tests.served_age_golden()
@@ -8160,7 +8169,7 @@ end
 function extra_tests.age_client(overrides)
 	reset()
 	local restore = install_fake_sys_storage()
-	local settings = { app_id = "exposure-app" }
+	local settings = { app_key = "exposure-app" }
 	for key, value in pairs(overrides or {}) do
 		settings[key] = value
 	end
@@ -8277,7 +8286,7 @@ function extra_tests.test_age_refusal_leaves_nothing_to_replay()
 	local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
 	assert_equal(exposures + outcomes, 0, "the refusal wrote no durable copy of the owed exposure")
 	storage.reset() -- SIMULATED PROCESS DEATH: memory dies, the fake disk survives
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	assert_nil(relaunch:experiment_variant("exposure-banner"), "the withdrawal landed durably")
 	assert_nil(relaunch.experiments.pending_exposure["exposure-banner"], "nothing re-arms at relaunch")
 	assert_true(relaunch:track("host-after-relaunch"))
@@ -8307,7 +8316,7 @@ function extra_tests.test_age_refusal_leaves_nothing_to_replay()
 	exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
 	assert_equal(exposures + outcomes, 0, "the refusal rewrote the persisted copies away")
 	storage.reset() -- SIMULATED PROCESS DEATH
-	relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	from = #requests
 	assert_true(relaunch:flush({ include_summaries = false }))
 	relaunch:update(0.016)
@@ -8341,7 +8350,7 @@ function extra_tests.test_kill_switch_keeps_owed_applications()
 
 	client, restore = extra_tests.owed_scene("kill_switch", false)
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	assert_true(relaunch:spool_pending(), "the durable capture survived the death")
 	from = #requests
 	assert_true(relaunch:flush({ include_summaries = false }))
@@ -8460,7 +8469,7 @@ function extra_tests.test_age_refusal_filters_restored_spool_chunks()
 	responder = nil
 	storage.reset() -- SIMULATED PROCESS DEATH
 
-	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local second = assert(sdk.new(config({ app_key = "exposure-app" })))
 	assert_true(second:spool_pending(), "the spooled batch awaits re-send")
 	assert_equal(second:experiment_variant("exposure-banner"), "control", "the declared assignment restored")
 	local exposures, outcomes = extra_tests.chunk_facts(second, "exposure-banner")
@@ -8733,7 +8742,7 @@ function extra_tests.test_age_readmission_exposure_survives_withdrawn_batch_ack(
 	assert_true(durable, "the old batch's acknowledgment left the readmission's durable copy")
 
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	local from = #requests
 	assert_true(relaunch:flush({ include_summaries = false }))
 	relaunch:update(0.016)
@@ -8786,7 +8795,7 @@ function extra_tests.test_age_readmission_kill_capture_keeps_fresh_id()
 	assert_true(captured[1] ~= withdrawn.event_id, "the capture keeps the readmission's fresh ID")
 
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	local from = #requests
 	assert_true(relaunch:flush({ include_summaries = false }))
 	relaunch:update(0.016)
@@ -8814,7 +8823,7 @@ function extra_tests.test_age_refusal_withdraws_restored_entry_without_subject_k
 	record.entries["exposure-banner"].subject_key = nil
 	assert_true(storage.save_experiments(first.config, record))
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local second = assert(sdk.new(config({ app_key = "exposure-app" })))
 	assert_equal(second:apply_experiment_variant("exposure-banner"), "control")
 	local owed = second.experiments.pending_exposure["exposure-banner"]
 	assert_true(owed ~= nil and #owed == 1, "the restore owes the exposure")
@@ -8843,7 +8852,7 @@ function extra_tests.test_age_refusal_withdraws_restored_entry_without_subject_k
 	record.entries["exposure-banner"].subject_key = nil
 	assert_true(storage.save_experiments(first.config, record))
 	storage.reset() -- SIMULATED PROCESS DEATH
-	second = assert(sdk.new(config({ app_id = "exposure-app", buffer_size = 1 })))
+	second = assert(sdk.new(config({ app_key = "exposure-app", buffer_size = 1 })))
 	assert_true(second:track("filler-host-event"))
 	assert_equal(second:apply_experiment_variant("exposure-banner"), "control")
 	extra_tests.admit(second)
@@ -8986,7 +8995,7 @@ function extra_tests.test_age_refusal_withdraws_republished_facts_after_relaunch
 
 	-- The republish lands on a launch that RESTORED version 1's entry: only
 	-- the durable record knew A when version 2 replaced it.
-	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local second = assert(sdk.new(config({ app_key = "exposure-app" })))
 	assert_equal(second:experiment_variant("exposure-banner"), "control", "version 1's entry restored")
 	assert_true(second:session_start())
 	extra_tests.admit_republished(second)
@@ -8994,7 +9003,7 @@ function extra_tests.test_age_refusal_withdraws_republished_facts_after_relaunch
 	second:persist()
 	storage.reset() -- SIMULATED PROCESS DEATH: A's and B's facts are spooled
 
-	local third = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local third = assert(sdk.new(config({ app_key = "exposure-app" })))
 	local exposures, outcomes = extra_tests.chunk_facts(third, "exposure-banner", key_a)
 	assert_true(exposures >= 1 and outcomes == 1, "the relaunch restored facts under A")
 	exposures, outcomes = extra_tests.chunk_facts(third, "exposure-banner", key_b)
@@ -9074,7 +9083,7 @@ function extra_tests.test_fact_key_history_keeps_a_spooled_key_across_relaunch()
 		"the persisted record holds A")
 	storage.reset() -- SIMULATED PROCESS DEATH
 
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	exposures, outcomes = extra_tests.chunk_facts(relaunch, "exposure-banner", key_a)
 	assert_true(exposures == 1 and outcomes == 1, "the relaunch restored A's facts")
 	local memory = extra_tests.memory_history(relaunch, "exposure-banner")
@@ -9268,7 +9277,7 @@ function extra_tests.test_age_refusal_after_kill_withdraws_captured_facts_after_
 	extra_tests.kill_and_emit_owed(client)
 	client:persist()
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	assert_nil(relaunch:experiment_variant("exposure-banner"), "the kill landed durably")
 	local exposures, outcomes = extra_tests.chunk_facts(relaunch, "exposure-banner", key_a)
 	assert_true(exposures == 1 and outcomes == 1, "the capture and the outcome replay from the spool")
@@ -9287,7 +9296,7 @@ function extra_tests.test_fact_key_retired_when_its_entry_never_reached_disk()
 	local key_a, key_b = extra_tests.age_fact_key(), extra_tests.republished_fact_key
 	reset()
 	local restore, _, state = install_fake_sys_storage()
-	local client = granted_client({ app_id = "exposure-app" })
+	local client = granted_client({ app_key = "exposure-app" })
 	client:set_consent(true)
 	assert_true(client:session_start())
 	-- Version 1's entry write fails: the disk never holds A.
@@ -9321,7 +9330,7 @@ function extra_tests.test_fact_key_retired_by_dropping_an_unwritten_entry_surviv
 	local key_a = extra_tests.age_fact_key()
 	reset()
 	local restore, _, state = install_fake_sys_storage()
-	local client = granted_client({ app_id = "exposure-app" })
+	local client = granted_client({ app_key = "exposure-app" })
 	client:set_consent(true)
 	assert_true(client:session_start())
 	state.fail_save = fail_experiment_saves
@@ -9337,7 +9346,7 @@ function extra_tests.test_fact_key_retired_by_dropping_an_unwritten_entry_surviv
 	local disk = extra_tests.disk_history(client, "exposure-banner")
 	client:persist()
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	exposures, outcomes = extra_tests.chunk_facts(relaunch, "exposure-banner", key_a)
 	assert_true(exposures == 1 and outcomes == 1, "A's facts replay from the spool")
 	extra_tests.refuse_with(relaunch, 1, false)
@@ -9365,7 +9374,7 @@ function extra_tests.test_restored_key_retires_when_the_disk_no_longer_shows_it(
 	assert_true(first:persist())
 	storage.reset() -- SIMULATED PROCESS DEATH: version 1's facts are spooled under A
 
-	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local second = assert(sdk.new(config({ app_key = "exposure-app" })))
 	assert_equal(second:experiment_variant("exposure-banner"), "control", "version 1's entry restored")
 	assert_true(second:session_start())
 	-- The restored exposure drains into the pipeline; the batch fails, so
@@ -9428,7 +9437,7 @@ function extra_tests.test_cap_evicted_entry_key_survives_relaunch()
 	assert_true(record ~= nil and record.entries["exposure-banner"] == nil, "the cap evicted the entry under A")
 	local disk = extra_tests.disk_history(client, "exposure-banner")
 	storage.reset() -- SIMULATED PROCESS DEATH right after the evicting save
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	local exposures, outcomes = extra_tests.chunk_facts(relaunch, "exposure-banner", key_a)
 	assert_true(exposures == 1 and outcomes == 1, "A's facts replay from the spool")
 	extra_tests.refuse_with(relaunch, 1, false)
@@ -9644,7 +9653,7 @@ function extra_tests.test_age_unconfirmed_declaration_withdraws_spooled_facts()
 	assert_true(not first:flush({ include_summaries = false }), "setup: the 503 spools the batch")
 	responder = nil
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local second = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local second = assert(sdk.new(config({ app_key = "exposure-app" })))
 	assert_equal(second:experiment_variant("exposure-banner"), "control", "setup: the adult assignment restored")
 	exposures, outcomes = extra_tests.chunk_facts(second, "exposure-banner")
 	assert_true(exposures == 1 and outcomes == 1, "setup: the loaded chunks carry the facts")
@@ -9830,7 +9839,7 @@ function extra_tests.test_age_declaration_in_flight_at_shutdown_withdraws()
 		"the adult assignment is still in the durable record")
 	held[1](nil, nil, { status = 200, response = extra_tests.served_age_golden() })
 	storage.reset() -- relaunch
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	check(relaunch:experiment_variant("exposure-banner") == nil, "the relaunch serves the declared experiment")
 	from = #requests
 	relaunch:update(0.016)
@@ -9897,7 +9906,7 @@ function extra_tests.test_age_declaration_answered_by_auth_latch_withdraws()
 	extra_tests.assert_declaration_withdrew(client, check, dropped, 2, 2)
 	client:shutdown()
 	storage.reset() -- relaunch
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	check(relaunch:experiment_variant("exposure-banner") == nil, "the relaunch serves the latched assignment again")
 	check(relaunch:experiment_variant("exposure-other") == "treatment", "the relaunch keeps the other experiment")
 	verify("auth latch")
@@ -10142,7 +10151,7 @@ function extra_tests.test_age_declaration_blocks_stale_grammar_retry()
 	check(extra_tests.durable_entry(client, "exposure-banner") == nil, "the adult assignment is in the durable record")
 	client:shutdown()
 	storage.reset() -- relaunch
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	check(relaunch:experiment_variant("exposure-banner") == nil, "the relaunch serves the experiment")
 	verify("grammar retry while pending")
 	relaunch:shutdown()
@@ -10561,7 +10570,7 @@ function extra_tests.test_age_adult_answer_in_flight_loses_to_later_refusal()
 	assert_nil(extra_tests.durable_entry(client, "exposure-banner"), "the late adult response persisted the assignment")
 	client:shutdown()
 	storage.reset() -- relaunch
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	assert_nil(relaunch:experiment_variant("exposure-banner"), "the late adult response restored at relaunch")
 	relaunch:shutdown()
 	restore()
@@ -10597,7 +10606,7 @@ function extra_tests.test_age_revalidation_in_flight_loses_to_later_refusal()
 	assert_nil(extra_tests.durable_entry(client, "exposure-banner"), "the in-flight revalidation persisted the assignment")
 	client:shutdown()
 	storage.reset() -- relaunch
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	assert_nil(relaunch:experiment_variant("exposure-banner"), "the in-flight revalidation restored at relaunch")
 	relaunch:shutdown()
 	restore()
@@ -10635,7 +10644,7 @@ end
 function extra_tests.spooled_debt_scene()
 	reset()
 	local restore, stores, state = install_fake_sys_storage()
-	local client = granted_client({ app_id = "exposure-app" })
+	local client = granted_client({ app_key = "exposure-app" })
 	client:set_consent(true)
 	assert_true(client:session_start())
 	extra_tests.admit(client)
@@ -10662,7 +10671,7 @@ end
 function extra_tests.relaunch_after(state, overrides)
 	storage.reset() -- SIMULATED PROCESS DEATH
 	state.fail_save = nil
-	local settings = { app_id = "exposure-app" }
+	local settings = { app_key = "exposure-app" }
 	for key, value in pairs(overrides or {}) do
 		settings[key] = value
 	end
@@ -10889,7 +10898,7 @@ function extra_tests.test_age_refusal_debt_spent_by_a_denied_launch()
 	local identity = storage.load(scope)
 	identity.consent_analytics = "denied"
 	assert_true(storage.save(scope, identity), "setup: the denial is persisted")
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	local exposures, outcomes = extra_tests.disk_facts(relaunch, "exposure-banner")
 	assert_equal(exposures + outcomes, 0, "setup: the launch purged the spool")
 	local observed = ("debt=%d after the denied launch=%d"):format(
@@ -10907,7 +10916,7 @@ end
 function extra_tests.test_spool_purges_without_a_debt_create_no_debt_file()
 	reset()
 	local restore, stores, state = install_fake_sys_storage()
-	local client = granted_client({ app_id = "exposure-app" })
+	local client = granted_client({ app_key = "exposure-app" })
 	client:set_consent(true)
 	assert_true(client:session_start())
 	extra_tests.admit(client)
@@ -10920,7 +10929,7 @@ function extra_tests.test_spool_purges_without_a_debt_create_no_debt_file()
 	assert_true(not client.spool_purge_pending, "setup: the retried purge lands")
 	client:shutdown()
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	local files = 0
 	for path in pairs(stores) do
 		if path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn" then
@@ -10944,7 +10953,7 @@ function extra_tests.test_failed_history_save_of_a_dropped_unwritten_entry_is_ow
 	local key_a = extra_tests.age_fact_key()
 	reset()
 	local restore, _, state = install_fake_sys_storage()
-	local client = granted_client({ app_id = "exposure-app" })
+	local client = granted_client({ app_key = "exposure-app" })
 	client:set_consent(true)
 	assert_true(client:session_start())
 	state.fail_save = fail_experiment_saves
@@ -10959,7 +10968,7 @@ function extra_tests.test_failed_history_save_of_a_dropped_unwritten_entry_is_ow
 	client:persist()
 	local disk = extra_tests.named_keys(extra_tests.disk_history(client, "exposure-banner"))
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local relaunch = assert(sdk.new(config({ app_id = "exposure-app" })))
+	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	extra_tests.refuse_with(relaunch, 1, false)
 	local from = extra_tests.deliver_all(relaunch)
 	local a = extra_tests.delivered_count(from, "exposure-banner", key_a)
@@ -10981,7 +10990,7 @@ end
 function extra_tests.test_declaration_end_after_auth_latch_withdraws_by_captured_key()
 	reset()
 	local restore, _, state = install_fake_sys_storage()
-	local client = granted_client({ app_id = "exposure-app" })
+	local client = granted_client({ app_key = "exposure-app" })
 	client:set_consent(true)
 	assert_true(client:session_start())
 	state.fail_save = fail_experiment_saves
@@ -11015,7 +11024,7 @@ function extra_tests.test_declaration_end_after_auth_latch_withdraws_under_an_ol
 	local key_a, key_b = extra_tests.age_fact_key(), extra_tests.republished_fact_key
 	reset()
 	local restore, _, state = install_fake_sys_storage()
-	local client = granted_client({ app_id = "exposure-app" })
+	local client = granted_client({ app_key = "exposure-app" })
 	client:set_consent(true)
 	assert_true(client:session_start())
 	extra_tests.admit(client)
@@ -11116,7 +11125,7 @@ function extra_tests.spool_with_deadline(with_host, spool_max_events)
 	assert_true(storage.save_spool(first.config, kept, first.config.spool_max_events,
 		first.config.spool_max_bytes, math.floor(socket.now * 1000) + 600000), "setup: the spool is rewritten")
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local second = assert(sdk.new(config({ app_id = "exposure-app", spool_max_events = spool_max_events })))
+	local second = assert(sdk.new(config({ app_key = "exposure-app", spool_max_events = spool_max_events })))
 	assert_true(second:spool_pending(), "setup: the spooled envelopes await re-send")
 	assert_true(second:publish_server_deferred(), "setup: the restored deadline defers the re-send")
 	return second, restore
@@ -11201,7 +11210,7 @@ function extra_tests.test_age_refusal_keeps_a_retained_batchs_deadline()
 	assert_true(storage.save_spool(first.config, kept, first.config.spool_max_events,
 		first.config.spool_max_bytes, nil), "setup: the spool is rewritten")
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local client = assert(sdk.new(config({ app_id = "exposure-app", batch_size = 1 })))
+	local client = assert(sdk.new(config({ app_key = "exposure-app", batch_size = 1 })))
 	responder = function(url, _, callback)
 		if url:find("/v1/events:batch", 1, true) then
 			callback(nil, nil, { status = 429, response = "{}", headers = { ["Retry-After"] = "600" } })
@@ -11248,7 +11257,7 @@ function extra_tests.deadline_of_a_record_without_restored_facts(label, withdraw
 	assert_equal(#client.spool_batches, 0, "setup: the withdrawal emptied the restored chunk")
 	local _, at_exit = storage.load_spool(client.config)
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local relaunched = assert(sdk.new(config({ app_id = "exposure-app", spool_max_events = 1 })))
+	local relaunched = assert(sdk.new(config({ app_key = "exposure-app", spool_max_events = 1 })))
 	local from = #requests
 	relaunched:flush({ include_summaries = false })
 	local _, _, delivered = extra_tests.delivered_facts(from, "exposure-banner")

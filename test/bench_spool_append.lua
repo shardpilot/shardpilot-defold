@@ -74,9 +74,9 @@ assert(storage.save(identity_scope, seed), "seeding the consent grant must succe
 
 local client = assert(sdk.new({
 	ingest_url = "http://localhost:8080",
-	workspace_id = "workspace-example",
-	app_id = "app-example",
-	environment_id = "develop",
+	workspace_key = "workspace-example",
+	app_key = "app-example",
+	environment_key = "develop",
 	app_version = "0.1.0",
 	app_build = "100",
 	token_provider = function(callback) callback("client-token-placeholder", nil, nil) end,

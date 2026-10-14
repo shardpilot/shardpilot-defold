@@ -176,9 +176,9 @@ local function start_analytics(granted, decision, newly_answered, notice)
 	-- drive.
 	local started_ok, start_err = shardpilot.init({
 		ingest_url = "http://localhost:8080",
-		workspace_id = "workspace-example",
-		app_id = "app-example",
-		environment_id = "develop",
+		workspace_key = "workspace-example",
+		app_key = "app-example",
+		environment_key = "develop",
 		token_provider = function(callback)
 			callback("client-token-placeholder", nil, nil)
 		end,

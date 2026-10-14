@@ -529,13 +529,13 @@ local config_keys = {
 	anonymous_id = true,
 	publishable_key = true,
 	app_build = true,
-	app_id = true,
+	app_key = true,
 	app_version = true,
 	batch_size = true,
 	buffer_size = true,
 	consent_kind_emission_enabled = true,
 	diagnostics = true,
-	environment_id = true,
+	environment_key = true,
 	experiments_enabled = true,
 	flush_interval_seconds = true,
 	ingest_url = true,
@@ -555,7 +555,7 @@ local config_keys = {
 	token_refresh_lead_seconds = true,
 	transport = true,
 	user_id = true,
-	workspace_id = true,
+	workspace_key = true,
 }
 
 local function snapshot_config(config)
@@ -576,7 +576,7 @@ local function validate_config(config, diagnostics)
 	if config.transport ~= nil and type(config.transport) ~= "string" then
 		return nil, "invalid_transport"
 	end
-	local required = { "ingest_url", "workspace_id", "app_id", "environment_id" }
+	local required = { "ingest_url", "workspace_key", "app_key", "environment_key" }
 	for _, key in ipairs(required) do
 		if config[key] == nil or config[key] == "" then
 			return nil, key .. "_required"
@@ -751,9 +751,9 @@ local function validate_config(config, diagnostics)
 		ingest_url = trim_slash(config.ingest_url),
 		app_url = has_app_url and trim_slash(config.app_url) or nil,
 		remote_config_enabled = remote_config_enabled,
-		workspace_id = config.workspace_id,
-		app_id = config.app_id,
-		environment_id = config.environment_id,
+		workspace_id = config.workspace_key,
+		app_id = config.app_key,
+		environment_id = config.environment_key,
 		app_version = config.app_version,
 		app_build = config.app_build,
 		source = source,

@@ -1,5 +1,8 @@
 # Events
 
+New ordinary events in this unreleased source use canonical scope keys and
+require an updated ingest consumer. The selected event version is unchanged.
+
 All events use app-first ShardPilot ingest fields:
 
 - `event_id`
@@ -7,9 +10,9 @@ All events use app-first ShardPilot ingest fields:
 - `event_name`
 - `source`
 - `event_ts`
-- `workspace_id`
-- `app_id`
-- `environment_id`
+- `workspace_key`
+- `app_key`
+- `environment_key`
 - `session_id`
 - `session_sequence`
 - `platform`
