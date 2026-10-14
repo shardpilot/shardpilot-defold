@@ -333,7 +333,8 @@ local fixture_subject_fact_key = "sfk1_" .. string.rep("b", 64)
 -- The default config: Mode A with remote config AND experiments enabled.
 -- The flush cadence is parked far away so queued facts stay inspectable and
 -- update()-driven ticks never flush mid-test.
-local function private_config(overrides)
+-- Direct storage fixtures keep private scope names via the second argument.
+local function config(overrides, private_scope)
 	local out = {
 		ingest_url = "http://localhost:8080",
 		app_url = "http://localhost:18081", remote_config_enabled = true,
@@ -347,18 +348,13 @@ local function private_config(overrides)
 		flush_interval_seconds = 3600,
 		http_timeout_seconds = 2,
 	}
+	if not private_scope then
+		out.workspace_key, out.app_key, out.environment_key = out.workspace_id, out.app_id, out.environment_id
+		out.workspace_id, out.app_id, out.environment_id = nil, nil, nil
+	end
 	for key, value in pairs(overrides or {}) do
 		out[key] = value
 	end
-	return out
-end
-
--- Public constructor input is distinct from the unchanged private record scope.
-local function config(overrides)
-	local out = private_config()
-	out.workspace_key, out.app_key, out.environment_key = out.workspace_id, out.app_id, out.environment_id
-	out.workspace_id, out.app_id, out.environment_id = nil, nil, nil
-	for key, value in pairs(overrides or {}) do out[key] = value end
 	return out
 end
 
@@ -3654,7 +3650,7 @@ local function test_restored_attributes_renormalize_before_revalidation()
 	-- Poison the stored attributes the way a corrupt or older-build record
 	-- could: a reserved name, an out-of-vocabulary name, and an overlong
 	-- value. Only the vocabulary-valid pair may ride the revalidation.
-	local record = storage.load_experiments(private_config())
+	local record = storage.load_experiments(config(nil, true))
 	record.entries["exp-checkout"].attributes = {
 		{ name = "experiment_key", value = "evil-key" },
 		{ name = "not_in_vocabulary", value = "x" },
@@ -3662,7 +3658,7 @@ local function test_restored_attributes_renormalize_before_revalidation()
 		{ name = "age_band", value = "adult" },
 		{ name = "user_segment", value = string.rep("v", 600) },
 	}
-	assert_true(storage.save_experiments(private_config(), record))
+	assert_true(storage.save_experiments(config(nil, true), record))
 
 	next_status = 200
 	local relaunch = assert(sdk.new(config()))
@@ -3893,7 +3889,7 @@ local function test_persist_reports_uncaptured_experiment_state()
 	state.fail_save = nil
 	assert_true(client:persist(),
 		"the recovered store lands the drop and the snapshot is safe")
-	local record = storage.load_experiments(private_config())
+	local record = storage.load_experiments(config(nil, true))
 	assert_true(record == nil or record.entries["exp-checkout"] == nil,
 		"the kill drop reached the disk")
 	restore()
@@ -3926,14 +3922,14 @@ local function test_owed_clear_retry_preserves_sibling_fresh_write()
 	fetch(b, "exp-onboarding")
 
 	a:update(0.016)
-	local record = storage.load_experiments(private_config())
+	local record = storage.load_experiments(config(nil, true))
 	assert_true(record ~= nil, "the sibling's record must survive the retry")
 	assert_true(record.entries["exp-onboarding"] ~= nil,
 		"the sibling's post-sentinel assignment survives the owed clear")
 	assert_nil(record.entries["exp-checkout"],
 		"the state the sentinel withdrew is gone")
 	a:update(0.016)
-	record = storage.load_experiments(private_config())
+	record = storage.load_experiments(config(nil, true))
 	assert_true(record ~= nil and record.entries["exp-onboarding"] ~= nil,
 		"the settled clear must not re-run against the sibling's record")
 	restore()
@@ -3967,13 +3963,13 @@ local function test_owed_clear_demotion_preserves_fresh_disk_entry()
 
 	next_response_body = assignment_body()
 	fetch(a, "exp-checkout")
-	local record = storage.load_experiments(private_config())
+	local record = storage.load_experiments(config(nil, true))
 	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
 		"the reinstalled assignment is on disk")
 	assert_true(record.entries["exp-onboarding"] ~= nil,
 		"the demotion must not drop the sibling's fresher entry")
 	a:update(0.016)
-	record = storage.load_experiments(private_config())
+	record = storage.load_experiments(config(nil, true))
 	assert_true(record.entries["exp-onboarding"] ~= nil,
 		"no owed drop may linger against the sibling's fresher entry")
 	restore()
@@ -4041,7 +4037,7 @@ local function test_stale_inflight_sentinel_preserves_sibling_write()
 	held(nil, nil, { status = 403, response = json.encode({
 		error = { code = "real_subjects_disabled", message = "synthetic feature refusal" },
 	}) })
-	local record = storage.load_experiments(private_config())
+	local record = storage.load_experiments(config(nil, true))
 	assert_true(record ~= nil,
 		"the successful clear must not wipe the whole shared record")
 	assert_true(record.entries["exp-onboarding"] ~= nil,
@@ -4080,10 +4076,10 @@ local function test_condemned_record_refused_after_restart()
 	next_status = 200
 	state.fail_save = nil
 	b:update(0.016)
-	local record = storage.load_experiments(private_config())
+	local record = storage.load_experiments(config(nil, true))
 	assert_true(record == nil or record.entries["exp-checkout"] == nil,
 		"the recovered store lands the owed clear")
-	assert_nil(storage.load_experiments_clear(private_config()),
+	assert_nil(storage.load_experiments_clear(config(nil, true)),
 		"the landed clear retires its condemnation marker")
 	restore()
 	storage.reset()
@@ -4118,12 +4114,12 @@ local function test_condemned_survivor_restores_and_converges()
 	next_status = 200
 	next_response_body = assignment_body({ experiment_key = "exp-onboarding" })
 	fetch(b, "exp-onboarding", { age_band = "adult" })
-	local record = storage.load_experiments(private_config())
+	local record = storage.load_experiments(config(nil, true))
 	assert_true(record ~= nil and record.entries["exp-onboarding"] ~= nil,
 		"the fresh authorized install persists")
 	assert_nil(record.entries["exp-checkout"],
 		"the covered key converges out with the demoted clear")
-	assert_nil(storage.load_experiments_clear(private_config()),
+	assert_nil(storage.load_experiments_clear(config(nil, true)),
 		"the authorized install disproves the sentinel state and retires the marker")
 	local c = assert(sdk.new(config()))
 	next_status = 503
@@ -4368,10 +4364,10 @@ local function test_sentinel_clear_never_condemns_foreign_scope()
 	})
 	fetch(a, "exp-checkout", { age_band = "adult" })
 	next_status = 200
-	local record = storage.load_experiments(private_config({ environment_id = "staging" }))
+	local record = storage.load_experiments(config({ environment_id = "staging" }, true))
 	assert_true(record ~= nil and record.entries["exp-checkout"] ~= nil,
 		"another scope's record must survive the sentinel's clear")
-	assert_nil(storage.load_experiments_clear(private_config()),
+	assert_nil(storage.load_experiments_clear(config(nil, true)),
 		"the foreign-scope clear settles without leaving a marker")
 
 	-- Same collision with the record store FAILING: the scope check must
@@ -4385,7 +4381,7 @@ local function test_sentinel_clear_never_condemns_foreign_scope()
 	fetch(a, "exp-checkout", { age_band = "adult" })
 	next_status = 200
 	state.fail_save = nil
-	assert_nil(storage.load_experiments_clear(private_config()),
+	assert_nil(storage.load_experiments_clear(config(nil, true)),
 		"no marker may condemn a record the clear's scope does not own")
 	local b2 = assert(sdk.new(config({ environment_key = "staging" })))
 	next_status = 503
@@ -4423,7 +4419,7 @@ local function test_marker_survives_demotion_until_drops_durable()
 	next_status = 200
 	next_response_body = assignment_body()
 	fetch(a, "exp-checkout")
-	assert_true(storage.load_experiments_clear(private_config()) ~= nil,
+	assert_true(storage.load_experiments_clear(config(nil, true)) ~= nil,
 		"the marker must outlive the demotion while the drops are not durable")
 	local b = assert(sdk.new(config()))
 	next_status = 503
@@ -4434,10 +4430,10 @@ local function test_marker_survives_demotion_until_drops_durable()
 	next_status = 200
 	state.fail_save = nil
 	b:update(0.016)
-	local record = storage.load_experiments(private_config())
+	local record = storage.load_experiments(config(nil, true))
 	assert_true(record == nil or record.entries["exp-onboarding"] == nil,
 		"the recovered store lands the owed refusal")
-	assert_nil(storage.load_experiments_clear(private_config()),
+	assert_nil(storage.load_experiments_clear(config(nil, true)),
 		"the marker retires once nothing it condemns remains durable")
 	restore()
 	storage.reset()
@@ -4463,7 +4459,7 @@ local function test_shutdown_stays_retryable_while_cache_sync_owed()
 	state.fail_save = nil
 	assert_true(client:shutdown(),
 		"the recovered store lands the drop and shutdown completes")
-	local record = storage.load_experiments(private_config())
+	local record = storage.load_experiments(config(nil, true))
 	assert_true(record == nil or record.entries["exp-checkout"] == nil)
 	restore()
 	storage.reset()
