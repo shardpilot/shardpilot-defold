@@ -1,8 +1,8 @@
 # Headless SDK evidence sender
 
-The checked-in sender uses the unreleased canonical analytics configuration and
-requires an updated ingest consumer. Its existing environment variable names
-carry keys, not database row IDs.
+The checked-in sender uses the canonical analytics configuration in `v0.13.0`
+and requires an updated ingest consumer. Publication waits for owner tagging.
+Its existing environment variable names carry keys, not database row IDs.
 
 Runs the checked-in Lua SDK through Lupa's Lua 5.1 runtime, with Python providing
 JSON, HTTP and wall-clock time. It emits synthetic data to endpoints you supply.
