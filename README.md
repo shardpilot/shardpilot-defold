@@ -18,8 +18,8 @@ not the platform boundary.
   a local stack you run yourself. Which endpoints are available today is stated
   under Configuration below and in [`docs/configuration.md`](docs/configuration.md);
   read that before configuring a hosted deployment.
-- **Version `0.12.0`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.12.0`; the `v0.12.0` tag
+- **Version `0.13.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.13.0`; the `v0.13.0` tag
   is created by the owner after the version-bump merge (pending until then).
 
 ## What it does
@@ -78,7 +78,7 @@ not the platform boundary.
   SDK abilities before `init()` — `"consent_receipt_outbox"`,
   `"consent_state_denied_forced_minor"`,
   `"experiments_assignment"`, `"experiments_age_band"` (New in `v0.11.0`), and
-  `"event_schema_version"` (unreleased; `track()`'s fourth options argument, see
+  `"event_schema_version"` (since `v0.13.0`; `track()`'s fourth options argument, see
   [the events guide](docs/events.md#event-schema-version)); unknown names return `false` on older and
   newer SDKs alike, so integrations can gate new call shapes safely.
   `"schema_revision_declaration"` returns `false`.
@@ -133,11 +133,11 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — after owner tagging, the latest tag is `v0.12.0`:
+published tag's source archive — after owner tagging, the latest tag is `v0.13.0`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.12.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.13.0.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
@@ -592,9 +592,9 @@ README, `docs/`, and the skill above are the reference.
 
 ## Configuration
 
-The key-named configuration below is unreleased source and requires an ingest
-consumer that accepts canonical scope keys. This does not change an existing
-release or install tag. Supply workspace, app and environment keys; database row
+The key-named configuration below belongs to `v0.13.0` and requires an ingest
+consumer that accepts canonical scope keys. The new tag is pending until owner
+tagging; earlier tags retain their own contract. Supply workspace, app and environment keys; database row
 IDs are not substitutes. The old configuration names are refused, including
 when mixed with the canonical names.
 

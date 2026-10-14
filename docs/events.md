@@ -1,6 +1,6 @@
 # Events
 
-New ordinary events in this unreleased source use canonical scope keys and
+New ordinary events in `v0.13.0` use canonical scope keys and
 require an updated ingest consumer. The selected event version is unchanged.
 
 All events use app-first ShardPilot ingest fields:
