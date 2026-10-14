@@ -5181,8 +5181,8 @@ local function test_pass_stops_on_concurrent_fatal_throttle()
 	storage.reset()
 end
 
--- Fleet queued-past-gate audit pin (2026-07-21): dispatch_pending's enabled
--- recheck. A set_enabled(false) landing while a serial resend pass has a
+-- Queued reports recheck dispatch_pending's enabled
+-- state. A set_enabled(false) landing while a serial resend pass has a
 -- report in flight (the transport is async in the real runtime) must stop
 -- the pass at the NEXT dispatch gate — the egress gate holds at every
 -- dispatch point, not only at pass start. The recheck exists; this pins the

@@ -913,14 +913,13 @@ bugs.
   whose deadline passes meanwhile answers `false, "consent_receipt_pending"`
   in its callback — expected and self-resolving on the next dispatch; do not
   treat it as an error.
-- **AC-8 / `denied_forced_minor`.** For age-gate-forced denials (under-age
+- **Forced-minor denial.** For age-gate-forced denials (under-age
   players), record `set_consent("denied_forced_minor")`. Analytics-wise it is
   identical to `denied` (drop + purge + zero analytics egress); the receipt
   alone carries `reason = "denied_forced_minor"` so the backend can tell a
   band-forced denial from a chosen one. In a forced-minor session the **only**
-  analytics-plane wire request is that denial receipt. This Defold SDK is
-  currently the only ShardPilot SDK implementing AC-8 — do not assume it on
-  the other SDKs.
+  analytics-plane wire request is that denial receipt. Check the SDK
+  version and its advertised capabilities before relying on this behaviour.
 - **Feature detection.** `shardpilot.supports(capability)` works before
   `init()` and returns `false` for unknown names on older and newer SDKs
   alike. Keys today: `"consent_receipt_outbox"`,

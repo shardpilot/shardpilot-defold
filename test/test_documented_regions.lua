@@ -4,11 +4,8 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 --
 -- The flow was written three times: examples/minimal/main.script, which is
 -- executable and has a test suite behind it; the README's quick start; and the
--- packaged skill's Init section. One review round found five findings that
--- were the same flow drifting — an ordering fixed in the skill and not the
--- README, retry state removed from the example and not the README, a fallback
--- rejected in the skill that the example accepts, a crash flag set in the
--- README without reading the result the example reads.
+-- packaged skill's Init section. The same flow must preserve ordering, retry
+-- state, fallback handling and crash-result handling in every published copy.
 --
 -- Reviewing three hand-kept copies will never converge, so there is one copy.
 -- The example carries `-- doc-region: <name>` markers; the documents carry the
