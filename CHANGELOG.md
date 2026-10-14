@@ -2,6 +2,11 @@
 
 ### Unreleased
 
+- Analytics configuration uses `workspace_key`, `app_key` and `environment_key`;
+  the three earlier configuration names are refused. Ordinary event envelopes
+  use the canonical scope names at the selected event version. This source
+  requires the updated ingest consumer. Private storage scope values and
+  other transport formats keep their existing contracts.
 - `track(name, props, context, options)` takes an optional options table whose
   one key, `schema_version`, selects the event's contract version: an integer
   from 1 through 65535, sent as the event's `schema_version`; 1 when absent.

@@ -143,9 +143,9 @@ end
 local function base_config(overrides)
 	local config = {
 		ingest_url = "https://ingest.example.com",
-		workspace_id = "ws_1",
-		app_id = "app_1",
-		environment_id = "develop",
+		workspace_key = "ws_1",
+		app_key = "app_1",
+		environment_key = "develop",
 		source = "client",
 		app_version = "1.0.0",
 		publishable_key = "sp_ingest_publishable_key",
@@ -208,7 +208,7 @@ do
 	invalid, err = crash_client.new(shared)
 	check(invalid == nil and err == "unknown_config_key", "crash accepted analytics-only keys")
 	local analytics_options = base_config({ platform = shared.platform })
-	local crash_options = { platform = shared.platform, app_id = shared.app_id,
+	local crash_options = { platform = shared.platform, app_id = shared.app_key,
 		crash_url = shared.crash_url, crash_key = shared.crash_key }
 	local analytics = assert(client_mod.new(analytics_options))
 	local crash = assert(crash_client.new(crash_options))

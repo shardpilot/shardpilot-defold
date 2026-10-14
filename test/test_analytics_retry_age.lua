@@ -61,7 +61,7 @@ local function eq(actual, expected, message)
 end
 local config = {
 	publishable_key = "sp_test_retry_age", ingest_url = "https://ingest.example.invalid",
-	workspace_id = "workspace-test", app_id = "app-test", environment_id = "test",
+	workspace_key = "workspace-test", app_key = "app-test", environment_key = "test",
 	source = "backend", batch_size = 25, flush_interval_seconds = 3600,
 	diagnostics = function(issue) issues[#issues + 1] = issue end,
 }

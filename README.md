@@ -592,8 +592,14 @@ README, `docs/`, and the skill above are the reference.
 
 ## Configuration
 
+The key-named configuration below is unreleased source and requires an ingest
+consumer that accepts canonical scope keys. This does not change an existing
+release or install tag. Supply workspace, app and environment keys; database row
+IDs are not substitutes. The old configuration names are refused, including
+when mixed with the canonical names.
+
 `init(config)` / `new(config)` take a Lua table. Required: `ingest_url`,
-`workspace_id`, `app_id`, `environment_id`, and **exactly one** of
+`workspace_key`, `app_key`, `environment_key`, and **exactly one** of
 `token_provider` (Mode B) or `publishable_key` (Mode A) — see [Authentication](#authentication).
 
 Unsupported keys return `unknown_config_key`, including misspellings and keys
@@ -620,9 +626,9 @@ initialization attempt. `new(config)` creates an independent client instance.
 | `remote_config_enabled` | `false` | Enables remote config; requires `app_url`. Setting an address alone does not enable fetches. Experiments have their own switch. |
 | `remote_config_attributes_enabled` | `false` (dark) | Opt-in: fetches carry the attributes stored via `set_remote_config_attributes` as query parameters — only while consent is **granted** (unknown/denied fetch without identity or attributes). Requires `app_url` — see [Remote config](#remote-config) |
 | `experiments_enabled` | `false` (off) | Opts into the experiment-assignment consumer. Requires **both** `app_url` and `publishable_key` — see [Experiments](#experiments) |
-| `workspace_id` | — (required) | Tenant key |
-| `app_id` | — (required) | Product key |
-| `environment_id` | — (required) | Environment scope (e.g. `local` / `develop` / `stage` / `prod`); any non-empty string is accepted |
+| `workspace_key` | — (required) | Tenant key |
+| `app_key` | — (required) | Product key |
+| `environment_key` | — (required) | Environment scope (e.g. `local` / `develop` / `stage` / `prod`); any non-empty string is accepted |
 | `token_provider` | — | **Mode B** (one of `token_provider`/`publishable_key` required): `function(callback)` → `callback(token, expires_at_unix_ms, err)` |
 | `publishable_key` | — | **Mode A** (one of `token_provider`/`publishable_key` required): non-secret publishable `sp_ingest_…` key used directly as the `Bearer` |
 | `source` | `"client"` | One of `client`, `server`, `backend` |
@@ -645,7 +651,7 @@ initialization attempt. `new(config)` creates an independent client instance.
 | `spool_max_bytes` | `262144` | Approx. spool size budget (1024–393216); oldest evicted first |
 
 **One client per app.** Keep one live client per configured app
-(`workspace_id` and `app_id`) in a process. The identity and consent record,
+(`workspace_key` and `app_key`) in a process. The identity and consent record,
 the event spool and the experiment records are stored per app, and each client
 works from its own in-memory copy of them. Two live clients of one app do not
 see each other's changes: an `age_ineligible` refusal received by one does not
@@ -710,7 +716,7 @@ is always sent on the wire in both modes.
 
 The SDK sends `POST {ingest_url}/v1/events:batch` with app-first fields:
 `event_id`, `schema_version`, `event_name`, `source`, `event_ts`,
-`workspace_id`, `app_id`, `environment_id`, `session_id`, `session_sequence`,
+`workspace_key`, `app_key`, `environment_key`, `session_id`, `session_sequence`,
 `platform`, `app_version`, `app_build`, and optional `props` and `context`.
 Empty or absent event properties are omitted from new envelopes, so their wire
 shape does not depend on how the host JSON encoder treats an empty Lua table.
@@ -1168,9 +1174,9 @@ shardpilot.init({
   ingest_url = "https://…",
   app_url = "https://…", -- required by experiments_enabled
   publishable_key = "sp_ingest_…",         -- required by app_url
-  workspace_id = "workspace-example",
-  app_id = "app-example",
-  environment_id = "develop",
+  workspace_key = "workspace-example",
+  app_key = "app-example",
+  environment_key = "develop",
   experiments_enabled = true,
 })
 ```

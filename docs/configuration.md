@@ -28,9 +28,9 @@ not select the SDK's HTTP transport. A non-string value returns
   -- Optional: enables experiments (default false = off). Requires BOTH
   -- app_url and publishable_key — see "Experiments" below.
   -- experiments_enabled = true,
-  workspace_id = "workspace",
-  app_id = "app",
-  environment_id = "production",
+  workspace_key = "workspace",
+  app_key = "app",
+  environment_key = "production",
   app_version = "1.0.0",
   app_build = "100",
   source = "client",
@@ -65,7 +65,13 @@ not select the SDK's HTTP transport. A non-string value returns
 in this release. Use non-production endpoints for source evaluation until a later
 release explicitly publishes production infrastructure.
 
-Required fields are `ingest_url`, `workspace_id`, `app_id`, `environment_id`,
+The canonical scope configuration below is unreleased source and requires an
+ingest consumer that accepts it. Its values retain the same private storage
+namespace; other transport formats retain their existing contracts. Do not use
+database row IDs in place of public keys. The earlier configuration names are
+refused even when mixed with canonical names.
+
+Required fields are `ingest_url`, `workspace_key`, `app_key`, `environment_key`,
 and exactly one auth source (`token_provider` OR `publishable_key`). A UUIDv7 anonymous
 ID is generated and persisted automatically (config `anonymous_id` or
 `set_anonymous_id` override it); `identify(user_id)` upgrades attribution to a
@@ -204,7 +210,7 @@ the next launch may still restore the earlier grant.
 ## One client per app
 
 The SDK supports **one live client per app** in a process. An app is the
-storage scope that `workspace_id` and `app_id` name. Every durable record is
+storage scope that `workspace_key` and `app_key` name. Every durable record is
 kept per app: the identity and consent record, the offline event spool, the
 consent-receipt outbox and, with `experiments_enabled`, the experiment
 records. A client loads them when it is created and works from its own
@@ -223,7 +229,7 @@ keeps serving the experiment from memory, and delivers the facts it holds.
   still cached and its callback still runs, so wait for every such callback
   of the old client first
   ([#149](https://github.com/shardpilot/shardpilot-defold/issues/149)).
-- Clients of different apps (another `app_id`, or another `workspace_id`) are
+- Clients of different apps (another `app_key`, or another `workspace_key`) are
   independent and may run side by side. Create each with `new(config)` and
   keep every instance: `init(config)` holds one default client, and a second
   `init` returns `false, "already_initialized"` while that client remains live
@@ -356,9 +362,9 @@ alongside `app_url` **and** `publishable_key`:
   ingest_url = "https://…",
   app_url = "https://…", -- required by experiments_enabled
   publishable_key = "sp_ingest_…",         -- required by app_url
-  workspace_id = "workspace",
-  app_id = "app",
-  environment_id = "production",
+  workspace_key = "workspace",
+  app_key = "app",
+  environment_key = "production",
   experiments_enabled = true,
 }
 ```
