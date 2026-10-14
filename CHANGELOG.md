@@ -2,9 +2,13 @@
 
 ### Unreleased
 
+## v0.13.0 — 2026-10-14
+
+Prepare the next alpha source release; publication follows owner tagging.
+
 - Analytics configuration uses `workspace_key`, `app_key` and `environment_key`;
   the three earlier configuration names are refused. Ordinary event envelopes
-  use the canonical scope names at the selected event version. This source
+  use the canonical scope names at the selected event version. This release
   requires the updated ingest consumer. Private storage scope values and
   other transport formats keep their existing contracts.
 - `track(name, props, context, options)` takes an optional options table whose
@@ -54,6 +58,9 @@
   A `server_attested` fact, a fact that carries the raw subject, and a fact
   with a top-level member the SDK owns on the analytics envelope are still
   refused.
+
+- Clarify that shutdown deadlines advance while the host calls `update()`,
+  and use a custom event in the per-event schema-version example.
 
 ## v0.12.0 — 2026-10-12
 
