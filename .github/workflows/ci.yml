@@ -46,7 +46,7 @@ jobs:
   # workflow.
   secret-scan:
     name: gitleaks
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64"]') }}
+    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
 
     steps:
@@ -92,7 +92,7 @@ jobs:
   # applies only within scripts/** and .github/workflows/**;
   # structural refusals (exit 2) and all other failed checks remain blockers.
   gate-integrity:
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64"]') }}
+    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -112,7 +112,7 @@ jobs:
         run: python3 scripts/check_gate_integrity.py
 
   static:
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64"]') }}
+    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
 
     steps:
@@ -346,7 +346,7 @@ jobs:
   # HEAD, so a CI-provided base ref could only replace a target the harness
   # built on purpose. It needs no network and no history depth.
   surface-ratchet-controls:
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64"]') }}
+    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 65
 
     steps:
@@ -371,7 +371,7 @@ jobs:
   # live in scripts/ci_bob_build.sh; the cache key hashes that script, so a
   # pin bump automatically refreshes the cached bob.jar.
   bob-build:
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64"]') }}
+    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     concurrency:
       # ⚠ A LITERAL JOB NAME, NOT `github.job`. That context is not populated
       # when the group is evaluated, so every job sharing an event and a ref
@@ -410,7 +410,7 @@ jobs:
   # legs. Lua 5.4 stays as an extra host leg only to catch accidental
   # reliance on 5.1-only quirks — it is NOT a runtime the SDK targets.
   lua-tests:
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64"]') }}
+    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
       # ⚠ THE MATRIX AXIS IS PART OF THE GROUP. Without it every leg of the
       # matrix shares one group, and `cancel-in-progress` has the legs cancel
       # each other as they start — leaving one runtime tested and the others
