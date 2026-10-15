@@ -65,8 +65,8 @@ not select the SDK's HTTP transport. A non-string value returns
 in this release. Use non-production endpoints for source evaluation until a later
 release explicitly publishes production infrastructure.
 
-The canonical scope configuration below belongs to `v0.13.0` and requires an
-ingest consumer that accepts it. Publication waits for owner tagging. Its values
+Canonical analytics scope configuration was introduced in `v0.13.0` and requires an
+ingest consumer that accepts it. Source releases are published after owner tagging. Its values
 retain the same private storage namespace; other transport formats retain their existing contracts. Do not use
 database row IDs in place of public keys. The earlier configuration names are
 refused even when mixed with canonical names.

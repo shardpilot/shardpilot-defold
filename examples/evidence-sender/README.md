@@ -1,7 +1,7 @@
 # Headless SDK evidence sender
 
-The checked-in sender uses the canonical analytics configuration in `v0.13.0`
-and requires an updated ingest consumer. Publication waits for owner tagging.
+The checked-in sender uses canonical analytics configuration, introduced in
+`v0.13.0`, and requires an updated ingest consumer. Source releases are published after owner tagging.
 Its existing environment variable names carry keys, not database row IDs.
 
 Runs the checked-in Lua SDK through Lupa's Lua 5.1 runtime, with Python providing
