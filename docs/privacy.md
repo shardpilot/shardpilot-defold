@@ -501,7 +501,7 @@ offline launch still gets the previously fetched values. This cache:
   successful fetch;
 - is **one bounded record**, overwritten in place — it cannot accumulate;
 - remains **available in every consent state**: unknown and both denied states
-  omit the anonymous ID path segment and targeting attributes. The anonymous
+  omit the anonymous ID header and targeting attributes. The anonymous
   ID is sent only with granted consent; the host user ID is never sent and
   the request has no body. Identifier-free requests use an empty client cache
   component, so identified cache values and ETags are not loaded for them,

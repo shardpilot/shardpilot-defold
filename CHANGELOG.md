@@ -2,6 +2,11 @@
 
 ### Unreleased
 
+- Remote Config uses the two-key route and sends the anonymous ID only in
+  `X-ShardPilot-Anonymous-Id` under granted consent. Anonymous-ID setters and
+  nonempty configured overrides reject unsafe header bytes; fetches validate
+  the selected header identity before dispatch.
+
 - Consent requests use literal `workspace_key`, `app_key` and `environment_key`
   scope fields while retaining private records, actor values and decision identity.
 

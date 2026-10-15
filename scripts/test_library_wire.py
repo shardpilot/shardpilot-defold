@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix="library-wire-") as directory:
     original = readme.read_text()
     for contract, witness in [
         ("POST {crash_url}/api/v1/crashes/ingest", "README missing crash wire contract"),
-        ("GET {app_url}/config/v1/{workspace_id}/{environment_id}/{client_id}", "README missing remote-config wire contract"),
+        ("GET {app_url}/config/v1/{workspace_key}/{environment_key}", "README missing remote-config wire contract"),
     ]:
         assert contract in original
         readme.write_text(original.replace(contract, "synthetic missing route"))

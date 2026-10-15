@@ -65,6 +65,7 @@ local experiments = require "shardpilot.experiments"
 local retry_after = require "shardpilot.retry_after"
 local storage = require "shardpilot.storage"
 local sdk_header = require "shardpilot.sdk_header"
+local header_identity = require "shardpilot.header_identity"
 
 local M = {}
 
@@ -93,13 +94,10 @@ end
 -- path segments, so a value containing "&", "=", or "#" cannot restructure
 -- the query. Absent/empty leaves the URL byte-identical to the
 -- attribute-less path.
-function M.build_url(base_url, workspace_id, environment_id, client_id, attributes)
+function M.build_url(base_url, workspace_id, environment_id, attributes)
 	local url = trim_slash(base_url) .. config_route_prefix
 		.. escape_segment(workspace_id) .. "/"
 		.. escape_segment(environment_id)
-	if client_id and client_id ~= "" then
-		url = url .. "/" .. escape_segment(client_id)
-	end
 	if type(attributes) == "table" and #attributes > 0 then
 		local parts = {}
 		for i = 1, #attributes do
@@ -862,6 +860,10 @@ function RemoteConfig:fetch(callback)
 		finish({ ok = false, from_cache = false, error = "client_id_unavailable" })
 		return false, "client_id_unavailable"
 	end
+	if client_id ~= "" and not header_identity.valid(client_id) then
+		finish({ ok = false, from_cache = false, error = "invalid_anonymous_id" })
+		return false, "invalid_anonymous_id"
+	end
 	local scope = self:scope_for(client_id)
 	try_owed_clear(self, scope)
 	if not json or type(json.decode) ~= "function" then
@@ -874,7 +876,7 @@ function RemoteConfig:fetch(callback)
 	self.fetch_seq = self.fetch_seq + 1
 	local seq = self.fetch_seq
 
-	-- Capture the identity ONCE per fetch: the URL, the ETag revalidation,
+	-- Capture the identity ONCE per fetch: the header, the ETag revalidation,
 	-- and the scope stamped on the resulting cache all describe the same
 	-- client id even if the identity rotates while the request is in flight.
 	local cache = self:load_cache(client_id)
@@ -904,6 +906,7 @@ function RemoteConfig:fetch(callback)
 		["Authorization"] = "Bearer " .. self.config.publishable_key,
 		[sdk_header.NAME] = sdk_header.VALUE,
 	}
+	if client_id ~= "" then headers[header_identity.NAME] = client_id end
 	if cache and cache.etag ~= "" then
 		headers["If-None-Match"] = cache.etag
 	end
@@ -911,7 +914,6 @@ function RemoteConfig:fetch(callback)
 		self.config.app_url,
 		self.config.workspace_id,
 		self.config.environment_id,
-		client_id,
 		attribute_pairs_for(self))
 	local options = {
 		timeout = self.config.http_timeout_seconds,

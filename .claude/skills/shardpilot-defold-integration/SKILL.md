@@ -1023,11 +1023,11 @@ shardpilot.observe_ping_ms(42)                  -- feeds network_summary
 Set `app_url` and `remote_config_enabled = true` to construct this consumer;
 the switch defaults to false. Experiments can use `app_url` independently.
 Explicit fetch only — the SDK never fetches on its own; there is no automatic
-or interval refresh. With granted consent the fetch is
-`GET {app_url}/config/v1/{workspace_id}/{environment_id}/{client_id}`,
-where `client_id` is the persisted anonymous ID. Unknown and both denied states
-omit that final segment and all targeting attributes. The host user ID is never
-sent and there is no request body. Both routes authenticate with the publishable
+or interval refresh. The fetch is
+`GET {app_url}/config/v1/{workspace_key}/{environment_key}` in every consent state.
+Granted consent permits the persisted anonymous ID in `X-ShardPilot-Anonymous-Id`.
+Unknown and both denied states omit that header and all targeting attributes.
+The host user ID is never sent and there is no request body. Fetches authenticate with the publishable
 `publishable_key`. Identifier-free requests use an empty client cache component and
 never reuse identified values or ETags, including on restart. Responses retain
 the scope selected at dispatch, even when consent changes before they arrive.

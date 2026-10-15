@@ -1022,11 +1022,11 @@ local motd = shardpilot.remote_config_string("motd", "")
 local hard_mode = shardpilot.remote_config_boolean("hard_mode", false)
 ```
 
-The fetch uses the publishable `publishable_key` as the `Bearer`. With granted consent,
-its URL is `GET {app_url}/config/v1/{workspace_id}/{environment_id}/{client_id}`,
-where `client_id` is the persisted anonymous ID used for per-client bucketing.
-With unknown, denied or forced-minor consent, it omits that final path segment
-and all targeting attributes: `GET {app_url}/config/v1/{workspace_id}/{environment_id}`.
+The fetch uses the publishable `publishable_key` as the `Bearer` and the URL
+`GET {app_url}/config/v1/{workspace_key}/{environment_key}` in every consent state.
+With granted consent, `X-ShardPilot-Anonymous-Id` carries the persisted anonymous
+ID for per-client bucketing. Unknown, denied and forced-minor consent omit the
+identity header and all targeting attributes.
 The host user ID is never sent; config requests have no body. The endpoint answers
 `{ "version": <number>, "values": { key: value } }` with an `ETag`; the getters
 serve the `values` map, and `remote_config_version()` reads the wrapper's
@@ -1997,7 +1997,7 @@ separate prerequisites; the client does not prove the notice was displayed.
   [`docs/crash.md`](docs/crash.md#privacy).
 - **Remote config remains available without a grant.** Unknown and both denied
   states omit the anonymous ID and targeting attributes. Only granted consent
-  permits the ID in the URL; the host user ID is never sent. The cached record
+  permits the ID in its header; the host user ID is never sent. The cached record
   holds the served body, ETag, scope and fetch timestamp, with an empty client
   component for identifier-free requests.
 - The SDK does not log tokens or full payloads, and makes no
@@ -2014,6 +2014,7 @@ separate prerequisites; the client does not prove the notice was displayed.
 | `shardpilot/queue.lua` | Bounded in-memory event queue |
 | `shardpilot/transport.lua` | Batch/consent dispatch (`/v1/events:batch`, `/v1/consent`) |
 | `shardpilot/remote_config.lua` | Remote-config fetch (`GET /config/v1/...`), ETag cache, typed getters |
+| `shardpilot/header_identity.lua` | Anonymous-ID validation for HTTP headers |
 | `shardpilot/experiments.lua` | Experiment-assignment consumer (off by default): assignment fetch, explicit application, signed exposure/outcome forwarding |
 | `shardpilot/storage.lua` | The **only** module allowed to call `sys.save`/`sys.load` |
 | `shardpilot/clock.lua` · `id.lua` · `platform.lua` · `sampling.lua` | Time, UUIDv7, platform detect, runtime sampling |
