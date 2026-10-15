@@ -1913,6 +1913,8 @@ separate prerequisites; the client does not prove the notice was displayed.
   spool purge, then consent-outbox persistence.
 - Explicit consent decisions are reported to `POST {ingest_url}/v1/consent` over
   the same authenticated transport; consent never rides the event envelope.
+  The body uses literal `workspace_key`, `app_key` and `environment_key` scope
+  fields. Actor values, decision timestamps and idempotency keys stay unchanged.
   Every new decision becomes exactly one receipt (with its own `idempotency_key`);
   ordinary denial under `denied_forced_minor` preserves the existing decision. Receipts
   are keyed to the **canonical actor** at decision time — the verified `user_id`

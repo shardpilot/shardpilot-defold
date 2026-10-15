@@ -122,12 +122,15 @@ applying the requested state. Healthy decisions return `true`.
 
 Explicit decisions are reported to `POST {ingest_url}/v1/consent` and never
 ride the event envelope. Each new decision becomes exactly one receipt —
-workspace/app/environment, the actor identifier and its `kind`,
+literal `workspace_key`, `app_key` and `environment_key` fields, the actor identifier and its `kind`,
 `categories{analytics}`, a `decided_at` stamp, an `idempotency_key`, and
 (forced-minor only) the `reason` — retained in the **durable
 consent-receipt outbox** (see below) until the server acknowledges it:
 receipts survive process death, re-send on later launches, and retry with
 backoff until delivered, in decision order.
+
+The private outbox keeps its existing scope names and values. Retries preserve
+the actor, decision time, notice and idempotency key; no identity is reminted.
 
 **The receipt's actor is the canonical actor**, chosen at
 decision time exactly like the event plane binds identity: the verified

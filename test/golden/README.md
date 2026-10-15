@@ -89,12 +89,12 @@ moves, the golden scene is what says so.
 ## Consent notice acceptance
 
 `consent-notice-request.json` and `consent-notice-response.json` are byte-for-byte
-copies of the accepted consent-notice contract request/response at
-`b4baa8258258c286df8ed36e1e09e2a0dd8477da`, with server producer head
-`09c13dac19d66ea5050b931aed115beb3fba7dae` (`internal/ingest/testdata/consent_notice`).
+copies of the consent-notice contract request/response verified at source head
+`00b3ab62f95bf61e935905904599b9a89c576a93`. The request carries literal scope
+keys and `kind = "anon"`; the receiving handler uses its default kind mode.
 The response retains the captured newline. SHA-256:
 
-- request: `fb88987ab60fd3836d86428e74e7ea3674c6905e56485c9b5c37cc177d47153b`
+- request: `87f337aa10ad76ffcc60424e8f3a996b9b5548df57e62a4decbd13a1e886f233`
 - response: `8add729673ccd76ee0baee7352dccff01efebc6387439a56c03c523ed34f2e0b`
 
 The scene runs the real setter and serializer with synthetic identifiers and

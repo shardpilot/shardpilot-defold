@@ -2,6 +2,9 @@
 
 ### Unreleased
 
+- Consent requests use literal `workspace_key`, `app_key` and `environment_key`
+  scope fields while retaining private records, actor values and decision identity.
+
 - Standalone crash configuration takes `app_key`; the earlier `app_id` setting
   is refused, including mixed spellings. New crash requests use `app.key` and
   preserve the configured scope, native identities and private storage names.
