@@ -2979,12 +2979,12 @@ end
 function Experiments:begin_host_declaration(experiment_key, attributes)
 	if declares_non_adult_age(attributes) then
 		local declaration = { fence_seq = self.fetch_seq, seq = nil, decided = false }
-		-- The subject's fact key as the live entry carries it now. The end
+		-- Only an age-gated entry's key can name facts to withdraw. The end
 		-- may find neither the entry (an auth latch clears it) nor the key
 		-- in the durable record (the entry's own write failed, or an older
 		-- entry is stored), while facts under it are still queued.
 		local live = self.entries[experiment_key]
-		if live and type(live.subject_fact_key) == "string" then
+		if live and not age_exempt(live) and type(live.subject_fact_key) == "string" then
 			declaration.fact_key = live.subject_fact_key
 			declaration.subject = self:current_subject_id()
 		end
@@ -3042,7 +3042,7 @@ function Experiments:end_non_adult_declaration(experiment_key, declaration)
 		local stored = self:durable_record_for(scope).entries[experiment_key]
 		if type(stored) == "table" then
 			entry = stored
-			if type(stored.subject_fact_key) == "string" then
+			if not age_exempt(stored) and type(stored.subject_fact_key) == "string" then
 				fact_key = stored.subject_fact_key
 			end
 		end
@@ -3059,7 +3059,7 @@ function Experiments:end_non_adult_declaration(experiment_key, declaration)
 		-- A synthetic-subject assignment has no age gate: it keeps serving.
 		-- The client-id applications the subject still owes for the
 		-- experiment from before it are withdrawn all the same.
-		self:apply_age_withdrawal(scope, experiment_key, clock.unix_ms(), nil, true)
+		self:apply_age_withdrawal(scope, experiment_key, clock.unix_ms(), fact_key, true)
 		return false
 	end
 	self:apply_age_withdrawal(scope, experiment_key, clock.unix_ms(), fact_key)

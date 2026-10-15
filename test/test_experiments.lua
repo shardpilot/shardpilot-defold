@@ -12227,7 +12227,117 @@ function extra_tests.test_stale_terminal_answer_cannot_close_the_key()
 		"an answer older than a settled one does not close the key")
 end
 
+function extra_tests.test_unanswered_age_declaration_keeps_synthetic_fact_keys()
+	local failures = {}
+	for _, status in ipairs({ 401, 403 }) do
+		for _, source in ipairs({ "stored", "unwritten" }) do
+			reset()
+			local restore, _, state = install_fake_sys_storage()
+			local client
+			local ok, err = pcall(function()
+				client = granted_client({ app_key = "exposure-app" })
+				client:set_consent(true)
+				assert_true(client:session_start())
+				next_response_body = extra_tests.synthetic_body(source == "stored", 1)
+				client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil, function() end)
+				if source == "unwritten" then
+					state.fail_save = fail_experiment_saves
+					next_response_body = extra_tests.synthetic_body(true, 2)
+					client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil, function() end)
+				end
+				extra_tests.apply(client, "exposure-banner")
+				assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
+				state.fail_save = nil
+				local stored = extra_tests.durable_entry(client, "exposure-banner")
+				assert_true(stored and stored.assignment_unit == "synthetic_subject_key" and stored.version == 1,
+					"the older synthetic assignment is stored")
+				assert_true((stored.subject_fact_key ~= nil) == (source == "stored"),
+					"only the stored-key control persists its fact key")
+				local fact_key = extra_tests.age_fact_key()
+				local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", fact_key)
+				assert_true(exposures == 1 and outcomes == 1, "the synthetic application has two queued facts")
+				next_status = status
+				next_response_body = json.encode({ error = "unauthorized" })
+				client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+				next_status = 200
+				assert_true(client.experiments.auth_blocked, "the declaration ends through its auth latch")
+				exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", fact_key)
+				print(("synthetic-age-control status=%d source=%s setup=PASS queued-before=2 queued-after=%d")
+					:format(status, source, exposures + outcomes))
+				assert_equal(exposures + outcomes, 2, "the synthetic application's facts must remain")
+			end)
+			if client then client:shutdown() end
+			restore()
+			storage.reset()
+			if not ok then failures[#failures + 1] = tostring(err) end
+		end
+	end
+	assert_equal(#failures, 0, table.concat(failures, "\n"))
+end
+
+function extra_tests.test_unanswered_age_declaration_keeps_captured_key_over_stored_synthetic()
+	local failures = {}
+	for _, status in ipairs({ 401, 403 }) do
+		reset()
+		local restore, _, state = install_fake_sys_storage()
+		local client
+		local ok, err = pcall(function()
+			client = granted_client({ app_key = "exposure-app" })
+			client:set_consent(true)
+			assert_true(client:session_start())
+			next_response_body = extra_tests.synthetic_body(false, 1)
+			local result
+			client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+				function(value) result = value end)
+			assert_true(result and result.assigned, "the synthetic assignment installs")
+			local stored = extra_tests.durable_entry(client, "exposure-banner")
+			assert_true(stored and stored.assignment_unit == "synthetic_subject_key"
+				and stored.subject_fact_key == nil, "the stored synthetic entry has no fact key")
+			extra_tests.admit(client, "exposure-other")
+			assert_true(extra_tests.outcome(client, "exposure-other", "score", 1))
+			state.fail_save = fail_experiment_saves
+			extra_tests.admit_republished(client)
+			assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
+			state.fail_save = nil
+			local fact_key = extra_tests.republished_fact_key
+			local exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", fact_key)
+			assert_true(exposures == 1 and outcomes == 1, "the unpersisted client-id assignment has two queued facts")
+			stored = extra_tests.durable_entry(client, "exposure-banner")
+			assert_true(stored and stored.assignment_unit == "synthetic_subject_key" and stored.version == 1,
+				"the failed write leaves the older synthetic entry stored")
+			assert_true(not extra_tests.disk_history(client, "exposure-banner")[fact_key],
+				"the captured key is not in durable history")
+			assert_equal(extra_tests.owed_count(client, "exposure-banner"), 0,
+				"no owed exposure snapshot carries the captured key")
+			next_status = status
+			next_response_body = json.encode({ error = "unauthorized" })
+			client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+				function(value) result = value end)
+			next_status = 200
+			assert_true(result and not result.ok and client.experiments.auth_blocked,
+				"the declaring request closes through its auth latch")
+			assert_nil(client.experiments.entries["exposure-banner"], "the live client-id entry is gone")
+			stored = extra_tests.durable_entry(client, "exposure-banner")
+			assert_true(stored and stored.assignment_unit == "synthetic_subject_key" and stored.version == 1,
+				"the synthetic assignment remains stored")
+			local other_exposures, other_outcomes = extra_tests.count_facts(client.queue.items, "exposure-other")
+			assert_true(other_exposures == 1 and other_outcomes == 1, "another experiment's facts remain queued")
+			exposures, outcomes = extra_tests.count_facts(client.queue.items, "exposure-banner", fact_key)
+			print(("captured-age-key status=%d setup=PASS synthetic-kept=PASS other-facts=2 queued-before=2 queued-after=%d")
+				:format(status, exposures + outcomes))
+			assert_equal(exposures + outcomes, 0, "captured client-id facts survive the unanswered declaration")
+		end)
+		if client then client:shutdown() end
+		restore()
+		storage.reset()
+		if not ok then failures[#failures + 1] = tostring(err) end
+	end
+	assert_equal(#failures, 0, table.concat(failures, "\n"))
+end
+
 local tests = {
+	extra_tests.test_unanswered_age_declaration_keeps_synthetic_fact_keys,
+	extra_tests.test_unanswered_age_declaration_keeps_captured_key_over_stored_synthetic,
 	extra_tests.test_terminal_assignment_answer_closes_the_key,
 	extra_tests.test_closed_key_records_no_outcome,
 	extra_tests.test_closed_key_serves_no_stale_assignment,
