@@ -88,8 +88,7 @@ empty or non-string input — never truncated, since truncation could collide
 distinct identities: `identify` returns `false, "invalid_user_id"` and
 `set_anonymous_id` returns `false, "invalid_anonymous_id"`, each keeping the
 previous identity, while an out-of-bounds config `anonymous_id`/`user_id` is
-ignored in favor of the stored or freshly generated identity (the same
-fallback as any other invalid config identity value). The bound is a
+ignored in favor of the stored or freshly generated identity. The bound is a
 persistence budget: identifiers are persisted verbatim in the durable identity
 record and in every retained consent receipt (`actor_identifier` plus the
 decision-time `anonymous_id` snapshot), and the clamp keeps those records far
@@ -99,6 +98,13 @@ under Defold's ~512 KB save-file record cap even at the consent outbox's
 existed self-heal at load: an oversized stored anonymous ID is replaced by a
 fresh one, and outbox receipts carrying oversized identifiers are dropped by
 the load-time sanitizer like any other malformed entry.
+
+Anonymous-ID setters and nonempty configured overrides also reject CR, LF, NUL,
+other ASCII control bytes (including DEL), and leading or trailing spaces or
+tabs with `invalid_anonymous_id`. An unsafe override refuses initialization
+before identity storage is read or written; a refused setter keeps the prior
+identity. A Remote Config fetch independently refuses an unsafe selected header
+identity with the same error code.
 
 ### Malformed UTF-8 in new analytics
 
@@ -298,9 +304,10 @@ the `publishable_key` authenticates only the remote-config fetch.
   always an explicit call (the SDK never fetches configuration on its own),
   responses are cached in one durable per-app record, and getters serve the
   last-known-good snapshot across restarts (the caller's default until any
-  configuration is available). Granted consent permits the anonymous ID in the
-  URL; unknown and both denied states use `/config/v1/{workspace_id}/{environment_id}`
-  without identity or targeting attributes. Their empty client cache scope
+  configuration is available). Every state uses `/config/v1/{workspace_key}/{environment_key}`.
+  Granted consent permits the anonymous ID in `X-ShardPilot-Anonymous-Id`;
+  unknown and both denied states omit that header and targeting attributes.
+  Their empty client cache scope
   prevents reuse of identified values or validators, including on restart.
   Full semantics — ETag revalidation, offline
   fallback, the `401`/`403` fail-closed rule, and the cache's scope check —

@@ -305,8 +305,8 @@ end
 
 local function test_build_url_joins_and_escapes_segments()
 	assert_equal(
-		remote_config.build_url("http://localhost:18081/", "ws 1", "env/dev", "anon+id"),
-		"http://localhost:18081/config/v1/ws%201/env%2Fdev/anon%2Bid")
+		remote_config.build_url("http://localhost:18081/", "ws 1", "env/dev"),
+		"http://localhost:18081/config/v1/ws%201/env%2Fdev")
 end
 
 local function test_build_scope_keeps_distinct_tuples_distinct()
@@ -1689,12 +1689,13 @@ local function test_anonymous_id_rotation_moves_the_scope()
 	fetch(client)
 
 	-- Rotating the identity re-scopes the NEXT fetch: new client id in the
-	-- URL, and the old identity's cache is a scope miss (no revalidation).
+	-- header, and the old identity's cache is a scope miss (no revalidation).
 	assert_true(client:set_anonymous_id("anon-other"))
 	next_response_headers = nil
 	fetch(client)
 	local request = last_request()
-	assert_equal(request.url, "http://localhost:18081/config/v1/workspace-test/develop/anon-other")
+	assert_equal(request.url, anonymous_fetch_url)
+	assert_equal(request.headers["X-ShardPilot-Anonymous-Id"], "anon-other")
 	assert_nil(request.headers["If-None-Match"],
 		"the previous identity's ETag must not ride a rotated fetch")
 end
@@ -1782,25 +1783,24 @@ end
 
 -- ── targeting attributes (dark opt-in) ──────────────────────────────
 
-local attributeless_fetch_url =
-	"http://localhost:18081/config/v1/workspace-test/develop/anon-client"
+local attributeless_fetch_url = anonymous_fetch_url
 
 local function test_build_url_appends_escaped_attribute_query()
 	assert_equal(
-		remote_config.build_url("http://localhost:18081", "ws", "env", "anon", {
+		remote_config.build_url("http://localhost:18081", "ws", "env", {
 			{ name = "geo", value = "U S" },
 			{ name = "custom_attribute_x", value = "a&b=c" },
 		}),
-		"http://localhost:18081/config/v1/ws/env/anon?geo=U%20S&custom_attribute_x=a%26b%3Dc",
+		"http://localhost:18081/config/v1/ws/env?geo=U%20S&custom_attribute_x=a%26b%3Dc",
 		"both query sides must ride the injective escaper")
 	-- Absent and empty attribute lists leave the URL byte-identical to the
 	-- attribute-less path — the dark posture's whole claim.
 	assert_equal(
-		remote_config.build_url("http://localhost:18081", "ws", "env", "anon"),
-		"http://localhost:18081/config/v1/ws/env/anon")
+		remote_config.build_url("http://localhost:18081", "ws", "env"),
+		"http://localhost:18081/config/v1/ws/env")
 	assert_equal(
-		remote_config.build_url("http://localhost:18081", "ws", "env", "anon", {}),
-		"http://localhost:18081/config/v1/ws/env/anon")
+		remote_config.build_url("http://localhost:18081", "ws", "env", {}),
+		"http://localhost:18081/config/v1/ws/env")
 end
 
 local function test_attributes_config_validation()
@@ -2064,8 +2064,10 @@ local function test_config_identity_requires_granted_consent()
 			assert_true(fetch(client).ok)
 			local request = last_request()
 			local expected = anonymous_fetch_url
-			if state == "granted" then expected = expected .. "/anon-client?geo=US" end
+			if state == "granted" then expected = expected .. "?geo=US" end
 			assert_equal(request.url, expected, state .. " complete request URL")
+			assert_equal(request.headers["X-ShardPilot-Anonymous-Id"],
+				state == "granted" and "anon-client" or nil)
 			assert_equal(request.method, "GET")
 			assert_nil(request.body, state .. " config body")
 			assert_equal(request.headers.Authorization, "Bearer sp_ingest_publishable_key")
@@ -2114,7 +2116,8 @@ local function test_anonymous_config_cache_is_separate_across_restart_and_regran
 	next_status = 200
 	next_response_body = values_body({ v = 3 })
 	assert_true(fetch(anonymous).ok)
-	assert_equal(last_request().url, anonymous_fetch_url .. "/anon-client")
+	assert_equal(last_request().url, anonymous_fetch_url)
+	assert_equal(last_request().headers["X-ShardPilot-Anonymous-Id"], "anon-client")
 	assert_nil(last_request().headers["If-None-Match"], "anonymous validator must not ride identified fetch")
 	restore()
 end
@@ -2252,7 +2255,8 @@ local function test_retry_after_window_is_per_scope()
 	next_response_body = values_body({ a = 1 })
 	fetch(client)
 	assert_equal(#requests, before + 1, "another scope is not paced")
-	assert_equal(last_request().url, "http://localhost:18081/config/v1/workspace-test/develop/anon-other")
+	assert_equal(last_request().url, anonymous_fetch_url)
+	assert_equal(last_request().headers["X-ShardPilot-Anonymous-Id"], "anon-other")
 end
 
 local function test_retry_after_for_a_rotated_identity_does_not_pace()
@@ -2913,3 +2917,126 @@ for _, test in ipairs(tests) do
 end
 
 print("shardpilot defold remote-config tests passed")
+
+-- Header identity uses the public facade; the final case probes the component boundary.
+;(function()
+	local public = require "shardpilot.sdk"
+	local passed, failed = 0, 0
+	local bad = {}
+	for byte = 0, 31 do bad[#bad + 1] = "before" .. string.char(byte) .. "after" end
+	bad[#bad + 1] = "before" .. string.char(127) .. "after"
+	for _, value in ipairs({ " leading", "trailing ", "\tleading", "trailing\t" }) do
+		bad[#bad + 1] = value
+	end
+	local function scene(name, run)
+		reset()
+		local restore = install_fake_sys_storage()
+		local ok, err = pcall(run)
+		restore(); storage.reset()
+		if ok then passed = passed + 1 else failed = failed + 1 end
+		print("config header " .. name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	local function endpoint(raw)
+		return raw.app_url .. "/config/v1/" .. raw.workspace_key .. "/" .. raw.environment_key
+	end
+	for _, state in ipairs({ "unknown", "granted", "denied", "denied_forced_minor" }) do
+		scene("public wire " .. state, function()
+			local raw = config({ remote_config_attributes_enabled = true })
+			local client = assert(public.new(raw))
+			if state ~= "unknown" then
+				assert_true(client:set_consent(state == "granted" and true
+					or state == "denied_forced_minor" and state or false))
+			end
+			assert_true(client:set_remote_config_attributes({ custom_attribute_band = "blue+band" }))
+			requests = {}; next_response_body = values_body({ enabled = true })
+			assert_true(fetch(client).ok)
+			assert_equal(#requests, 1)
+			local request = last_request()
+			local query = state == "granted" and "?custom_attribute_band=blue%2Bband" or ""
+			assert_equal(request.url, endpoint(raw) .. query, "two literal key segments")
+			assert_equal(request.headers["X-ShardPilot-Anonymous-Id"],
+				state == "granted" and client:get_anonymous_id() or nil, "consent-scoped identity header")
+			assert_equal(request.headers["Authorization"], "Bearer " .. raw.publishable_key)
+			assert_equal(request.method, "GET"); assert_nil(request.body)
+		end)
+	end
+	scene("setter rejects unsafe bytes before effects", function()
+		local client = assert(public.new(config()))
+		local original = client:get_anonymous_id()
+		local writes, save = 0, sys.save
+		sys.save = function(...) writes = writes + 1; return save(...) end
+		for index, value in ipairs(bad) do
+			local ok, err = client:set_anonymous_id(value)
+			assert_equal(ok, false, "unsafe setter value " .. index)
+			assert_equal(err, "invalid_anonymous_id")
+			assert_equal(client:get_anonymous_id(), original)
+			assert_equal(client:get_consent_state(), "unknown")
+		end
+		assert_equal(writes, 0); assert_equal(#requests, 0)
+	end)
+	for _, api in ipairs({ "new", "init" }) do
+		scene(api .. " rejects unsafe configured identity before effects", function()
+			local reads, writes, load, save = 0, 0, sys.load, sys.save
+			sys.load = function(...) reads = reads + 1; return load(...) end
+			sys.save = function(...) writes = writes + 1; return save(...) end
+			for index, value in ipairs(bad) do
+				local module = dofile("shardpilot/sdk.lua")
+				local result, err = module[api](config({ anonymous_id = value }))
+				if api == "new" then assert_nil(result, "unsafe constructor value " .. index)
+				else assert_equal(result, false, "unsafe singleton value " .. index) end
+				assert_equal(err, "invalid_anonymous_id")
+			end
+			assert_equal(reads, 0); assert_equal(writes, 0); assert_equal(#requests, 0)
+		end)
+	end
+	scene("safe header identities remain literal", function()
+		local raw = config()
+		local client = assert(public.new(raw))
+		for _, value in ipairs({ "safe+identity", "two words", "percent%2Fvalue" }) do
+			assert_true(client:set_anonymous_id(value)); assert_true(client:set_consent(true))
+			requests = {}; next_response_body = values_body({ enabled = true })
+			assert_true(fetch(client).ok)
+			assert_equal(last_request().url, endpoint(raw))
+			assert_equal(last_request().headers["X-ShardPilot-Anonymous-Id"], value)
+			assert_equal(client:get_anonymous_id(), value)
+		end
+	end)
+	scene("same URL keeps identity and consent cache scopes separate", function()
+		local raw = config()
+		local client = assert(public.new(raw)); assert_true(client:set_consent(true))
+		requests = {}; next_response_body = values_body({ personalized = true })
+		next_response_headers = { ETag = '"identity-a"' }
+		assert_true(fetch(client).ok)
+		assert_equal(last_request().headers["X-ShardPilot-Anonymous-Id"], client:get_anonymous_id())
+		assert_true(client:set_anonymous_id("other-identity")); assert_true(client:set_consent(true))
+		requests = {}; next_status = 500; next_response_body = "{}"; next_response_headers = nil
+		local result = fetch(client)
+		assert_equal(result.from_cache, false, "another identity cannot read the first cache")
+		assert_equal(last_request().url, endpoint(raw))
+		assert_equal(last_request().headers["X-ShardPilot-Anonymous-Id"], "other-identity")
+		assert_nil(last_request().headers["If-None-Match"])
+		assert_true(client:set_consent(false))
+		requests = {}; next_status = 500
+		result = fetch(client)
+		assert_equal(result.from_cache, false, "identifier-free fetch cannot read the identified cache")
+		assert_equal(last_request().url, endpoint(raw))
+		assert_nil(last_request().headers["X-ShardPilot-Anonymous-Id"])
+		assert_nil(last_request().headers["If-None-Match"])
+	end)
+	-- Fault injection at the internal consumer boundary independently tests its defense.
+	scene("header builder rejects unsafe identity", function()
+		for index, value in ipairs(bad) do
+			requests = {}
+			local component = remote_config.new(private_config(), function() return value end,
+				function() return "granted" end)
+			local result, calls = nil, 0
+			local ok, err = component:fetch(function(out) result = out; calls = calls + 1 end)
+			assert_equal(ok, false, "unsafe builder identity " .. index)
+			assert_equal(err, "invalid_anonymous_id")
+			assert_equal(calls, 1); assert_equal(result.error, err)
+			assert_equal(result.from_cache, false); assert_equal(#requests, 0)
+		end
+	end)
+	print("config header total: " .. passed .. " pass, " .. failed .. " fail")
+	assert_equal(failed, 0, "config header contract scenes")
+end)()

@@ -5,6 +5,7 @@ local clock = require "shardpilot.clock"
 local compression = require "shardpilot.compression"
 local consent_notice = require "shardpilot.consent_notice"
 local experiments_mod = require "shardpilot.experiments"
+local header_identity = require "shardpilot.header_identity"
 local id = require "shardpilot.id"
 local random = require "shardpilot.random"
 local platform = require "shardpilot.platform"
@@ -584,6 +585,10 @@ local function validate_config(config, diagnostics)
 		if type(config[key]) ~= "string" then
 			return nil, "invalid_" .. key
 		end
+	end
+	if type(config.anonymous_id) == "string" and config.anonymous_id ~= ""
+		and not header_identity.valid(config.anonymous_id) then
+		return nil, "invalid_anonymous_id"
 	end
 	if not valid_ingest_url(config.ingest_url) then
 		return nil, "invalid_ingest_url"
@@ -2336,7 +2341,7 @@ function Client:identify(user_id)
 end
 
 function Client:set_anonymous_id(anonymous_id)
-	if not valid_identity(anonymous_id) then
+	if not valid_identity(anonymous_id) or not header_identity.valid(anonymous_id) then
 		return false, "invalid_anonymous_id"
 	end
 	if self.consent_unreadable_imposed and anonymous_id ~= self.anonymous_id then
@@ -2541,7 +2546,7 @@ end
 -- present only when `remote_config_enabled` is true. The fetch is always an
 -- explicit game-triggered call — the SDK never fetches configuration on its
 -- own. Every consent state can fetch, but only granted consent permits the
--- anonymous ID in the URL. Other states omit identity and attributes.
+-- anonymous ID in its header. Other states omit identity and attributes.
 -- The typed getters never fail: without configuration (or without remote
 -- config at all) they serve the caller's default.
 
