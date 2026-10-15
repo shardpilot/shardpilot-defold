@@ -1,7 +1,7 @@
 # Release
 
 The ShardPilot Defold SDK is published as the latest release git tag plus a
-GitHub Release (currently `v0.13.0` for both). This is an early alpha
+GitHub Release (currently `v0.14.0` for both). This is an early alpha
 pre-release: the API is unstable and may change before v1.
 
 **Tag lag is normal, and the version above leads the tag.** In-tree version
@@ -35,6 +35,14 @@ cd /tmp/tagcheck && ./scripts/check_public_surface.sh   # must exit 0
 
 This is a procedure, not a gate, and it is written down here because that is
 the honest description of it — the run before the push is the whole control.
+
+## v0.14.0 release notes
+
+This release prepares literal consent scope keys, standalone crash `app_key`
+configuration with `app.key` requests, and the two-key Remote Config route with
+a Granted-only anonymous-ID header. Unsafe configured or selected header
+identities receive a typed refusal. See the [changelog](../CHANGELOG.md) for
+the complete notes. The release archive remains pending until owner tagging.
 
 Release ordering: merge the version-bump commit — it moves every in-tree
 version claim together, which `./scripts/check_versions.sh` enforces — then

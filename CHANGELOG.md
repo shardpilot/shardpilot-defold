@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+## v0.14.0 — 2026-10-15
+
+Prepare the next alpha source release; publication follows owner tagging.
+
 - Remote Config uses the two-key route and sends the anonymous ID only in
   `X-ShardPilot-Anonymous-Id` under granted consent. Anonymous-ID setters and
   nonempty configured overrides reject unsafe header bytes; fetches validate
