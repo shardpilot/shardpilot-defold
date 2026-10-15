@@ -455,7 +455,7 @@ local function start_crash()
 	local ok, err = crash.init({
 		crash_url = "http://localhost:8080",
 		crash_key = "sp_crash_write_placeholder",
-		app_id = "app-example",
+		app_key = "app-example",
 		crash_component = "game-client",
 		-- crash_hooks_enabled = true, -- opt-in Lua error auto-capture
 	})
@@ -1079,7 +1079,7 @@ local crash = require "shardpilot.crash"
 crash.init({
   crash_url = "<YOUR-CRASH-INGEST-BASE-URL>", -- base URL only; route appended by the SDK
   crash_key    = "<YOUR-CRASH-WRITE-KEY>",       -- crash:write scope
-  app_id           = "<YOUR-APP-ID>",
+  app_key           = "<YOUR-APP-KEY>",
   app_version      = "1.2.3",
   -- platform = "windows", -- auto-detected in-engine; outside Defold an
   --                       -- unrecognised runtime is sent as "other"

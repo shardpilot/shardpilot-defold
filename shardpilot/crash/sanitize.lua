@@ -414,7 +414,7 @@ end
 --       bare symbol ("user_id_from_token" as a whole function name) may blank,
 --       which only drops THAT frame (sibling frames / raw_text keep the crash
 --       alive and the server re-scrubs), never the whole report.
--- `apply_bare_id` is deliberately OFF for the operator-scope app.id field, where a
+-- `apply_bare_id` is deliberately OFF for the operator-scope app.key field, where a
 -- legitimate product scope ("user_app", "customer_portal") must survive.
 -- It deliberately does NOT apply the aggressive digit-free embeds-anywhere raw-id
 -- rule or the loose dotted-token rule, both of which blank legitimate symbols.
@@ -567,10 +567,10 @@ end
 -- carry a user-home path (e.g. a closure described as "callback in
 -- /Users/<name>/x.lua"), so the username segment is redacted in place first — the
 -- OS account name must never reach the wire, but the rest of the value survives.
--- The OPERATOR-SCOPE structured tier (app.id). It does NOT apply the whole-value
+-- The OPERATOR-SCOPE structured tier (app.key). It does NOT apply the whole-value
 -- bare-raw-id rule: a legitimate product scope whose slug begins with an
 -- actor-style prefix ("user_app", "customer_portal") must survive, or blanking it
--- would fail app_id_required and DROP every report (including a fatal).
+-- would fail app_key_required and DROP every report (including a fatal).
 function M.sanitize_structured(value)
 	if type(value) ~= "string" then
 		return ""

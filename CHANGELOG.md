@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- Standalone crash configuration takes `app_key`; the earlier `app_id` setting
+  is refused, including mixed spellings. New crash requests use `app.key` and
+  preserve the configured scope, native identities and private storage names.
+
 ## v0.13.0 — 2026-10-14
 
 Prepare the next alpha source release; publication follows owner tagging.

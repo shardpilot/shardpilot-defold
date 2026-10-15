@@ -15254,7 +15254,7 @@ end)()
 				counts.tokens = counts.tokens + 1; cb("synthetic-fixture", nil, nil)
 			end })
 		end
-		return { crash_url = "http://localhost:8080", app_id = "synthetic-config-crash", crash_key = "synthetic-fixture", previous_crash_capture_enabled = false }
+		return { crash_url = "http://localhost:8080", app_key = "synthetic-config-crash", crash_key = "synthetic-fixture", previous_crash_capture_enabled = false }
 	end
 	local function facade(kind) return dofile(kind == "analytics" and "shardpilot/sdk.lua" or "shardpilot/crash.lua") end
 	local function refused(module, api, opts, code, counts)
@@ -16074,7 +16074,7 @@ end)()
 	local function options(kind)
 		if kind == "crash" then return {
 			crash_url = "http://localhost:8086", crash_key = "synthetic-crash-key",
-			app_id = "synthetic-app", previous_crash_capture_enabled = false,
+			app_key = "synthetic-app", previous_crash_capture_enabled = false,
 		} end
 		return { ingest_url = "http://localhost:8080", workspace_key = "synthetic-ws",
 			app_key = "synthetic-app", environment_key = "develop", publishable_key = "sp_ingest_synthetic" }
@@ -16323,7 +16323,7 @@ end)()
   scene(kind.." public handle", function()
    local public = require(kind=="analytics" and "shardpilot.sdk" or "shardpilot.crash")
    local cfg = kind=="analytics" and config() or {
-    crash_url="http://localhost:8086", crash_key="synthetic-crash-key", app_id="synthetic"}
+    crash_url="http://localhost:8086", crash_key="synthetic-crash-key", app_key="synthetic"}
    local client=assert(public.new(cfg))
    assert_true(client.config==nil and client.stats==nil and client.remote_config==nil and client.experiments==nil,
     "implementation state must not escape")
@@ -16365,7 +16365,7 @@ end)()
  for _, kind in ipairs({"analytics", "crash"}) do
   scene(kind.." unknown-key control", function()
    local module=require(kind=="analytics" and "shardpilot.sdk" or "shardpilot.crash")
-   local cfg=kind=="analytics" and config() or {crash_url="http://localhost:8086",crash_key="synthetic-crash-key",app_id="synthetic"}
+   local cfg=kind=="analytics" and config() or {crash_url="http://localhost:8086",crash_key="synthetic-crash-key",app_key="synthetic"}
    cfg.synthetic_unknown=true
    local client,err=module.new(cfg);assert_equal(client,nil);assert_equal(err,"unknown_config_key")
   end)
