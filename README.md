@@ -2004,6 +2004,14 @@ separate prerequisites; the client does not prove the notice was displayed.
   provider/model/GitHub/billing/account-management write calls. See
   [`docs/privacy.md`](docs/privacy.md) and [`SECURITY.md`](SECURITY.md).
 
+## Continuous integration
+
+### CI runner routing
+
+CI jobs on `main` use the organization's restricted `public-sdks` self-hosted Linux x64 runner group. All pull requests, other branch pushes, and tag pushes use GitHub-hosted Ubuntu runners. The runner group permits only this repository's `ci.yml` on `main`; changing a PR's runner selector cannot grant it self-hosted access.
+
+Changes to CI or validation scripts intentionally fail `gate-integrity` and require explicit maintainer review under the gate-change procedure. Every other CI check must pass. After a reviewed workflow change lands, verify the complete CI run on `main`, including the Lua matrix and Bob build.
+
 ## Project layout
 
 | Path | Purpose |
