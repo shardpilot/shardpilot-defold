@@ -248,7 +248,7 @@ local function config(overrides)
 	local out = {
 		crash_url = "http://localhost:8080",
 		crash_key = "sp_crash_write_key",
-		app_id = "app-example",
+		app_key = "app-example",
 		app_version = "0.1.0",
 		app_build = "100",
 		crash_http_timeout_seconds = 5,
@@ -305,7 +305,7 @@ local function test_config_validation()
 		{ { crash_url = "http://example.com" }, "invalid_crash_url" },
 		{ { crash_url = "https://ingest.example.com/path" }, "invalid_crash_url" },
 		{ { crash_url = "https://ingest.example.com?x=1" }, "invalid_crash_url" },
-		{ { app_id = false }, "invalid_app_id" },
+		{ { app_key = false }, "invalid_app_key" },
 		{ { crash_sample_every = -1 }, "invalid_crash_sample_every" },
 		{ { crash_sample_every = 1.5 }, "invalid_crash_sample_every" },
 		{ { crash_http_timeout_seconds = -1 }, "invalid_crash_http_timeout_seconds" },
@@ -438,7 +438,7 @@ local function test_routes_to_dedicated_crash_endpoint()
 	assert_contains(request.body, '"crash_id":')
 	assert_contains(request.body, '"occurred_at":')
 	assert_contains(request.body, '"app":{')
-	assert_contains(request.body, '"id":"app-example"')
+	assert_contains(request.body, '"key":"app-example"')
 	assert_contains(request.body, '"version":"0.1.0"')
 	assert_contains(request.body, '"build_id":"100"')
 	assert_contains(request.body, '"platform":"linux"')
@@ -2947,52 +2947,52 @@ local function test_crashed_thread_frames_prioritized()
 	assert_equal(client:snapshot().dropped, 0)
 end
 
--- ── app_id is operator scope: an actor-prefixed slug survives, real PII rejected ─
+-- ── app_key is operator scope: an actor-prefixed slug survives, real PII rejected ─
 
--- LOAD-BEARING. app_id is operator-set product scope, NOT a raw actor id. A
+-- LOAD-BEARING. app_key is operator-set product scope, NOT a raw actor id. A
 -- legitimate scope whose slug begins with an actor-style prefix ("user_app",
 -- "customer_portal") must NOT be blanked at emit — blanking it fails
--- app_id_required and DROPS every report, including a FATAL. It is scrubbed with
+-- app_key_required and DROPS every report, including a FATAL. It is scrubbed with
 -- the structured tier (so the scope survives) and validated at init time (so a
 -- value that carries real PII is rejected up front, never reaching emit).
-local function test_app_id_actor_prefix_scope_survives()
+local function test_app_key_actor_prefix_scope_survives()
 	reset()
-	local client = assert(crash.new(config({ crash_sample_every = 1, app_id = "user_app" })))
+	local client = assert(crash.new(config({ crash_sample_every = 1, app_key = "user_app" })))
 	-- a FATAL crash must reach the wire with the scope intact, not be dropped over it
 	local ok = client:emit_fatal(presymbolicated_event())
-	assert_equal(ok, true, "a fatal crash must not be dropped over an actor-prefixed app_id scope")
+	assert_equal(ok, true, "a fatal crash must not be dropped over an actor-prefixed app_key scope")
 	assert_equal(#requests, 1, "the fatal crash must reach the wire")
-	assert_contains(requests[1].body, '"id":"user_app"')
+	assert_contains(requests[1].body, '"key":"user_app"')
 	assert_equal(client:snapshot().dropped, 0)
 
 	-- a second actor-style scope (customer_portal) survives identically
 	reset()
-	local client2 = assert(crash.new(config({ crash_sample_every = 1, app_id = "customer_portal" })))
+	local client2 = assert(crash.new(config({ crash_sample_every = 1, app_key = "customer_portal" })))
 	assert_true(client2:emit_fatal(presymbolicated_event()))
-	assert_contains(requests[1].body, '"id":"customer_portal"')
+	assert_contains(requests[1].body, '"key":"customer_portal"')
 end
 
 -- App identity comes ONLY from the trusted client config. A caller-provided
--- event.app.id must be IGNORED and overridden with the configured app_id: the
+-- event.app.key must be IGNORED and overridden with the configured app_key: the
 -- crash key is scoped to the configured app, so a stale/mismatched per-report app
 -- id would send under the wrong scope or be rejected.
-local function test_caller_app_id_overridden_by_config()
+local function test_caller_app_key_overridden_by_config()
 	reset()
-	local client = assert(crash.new(config({ crash_sample_every = 1, app_id = "app-example" })))
+	local client = assert(crash.new(config({ crash_sample_every = 1, app_key = "app-example" })))
 	-- the caller tries to set a DIFFERENT app id on the event
-	local ok = client:emit_fatal(presymbolicated_event({ app = { id = "some-other-app" } }))
+	local ok = client:emit_fatal(presymbolicated_event({ app = { key = "some-other-app" } }))
 	assert_equal(ok, true)
 	assert_equal(#requests, 1)
 	-- the configured scope wins; the caller value never reaches the wire
-	assert_contains(requests[1].body, '"id":"app-example"')
+	assert_contains(requests[1].body, '"key":"app-example"')
 	assert_not_contains(requests[1].body, "some-other-app")
 
 	-- a caller app id carrying PII is likewise overridden (never sent, never used
-	-- to drop the crash): the trusted config app_id is stamped instead
+	-- to drop the crash): the trusted config app_key is stamped instead
 	reset()
-	local ok2 = client:emit_fatal(presymbolicated_event({ app = { id = "user_4242" } }))
+	local ok2 = client:emit_fatal(presymbolicated_event({ app = { key = "user_4242" } }))
 	assert_equal(ok2, true, "a fatal crash must not be dropped over a caller-provided app id")
-	assert_contains(requests[1].body, '"id":"app-example"')
+	assert_contains(requests[1].body, '"key":"app-example"')
 	assert_not_contains(requests[1].body, "user_4242")
 end
 
@@ -3284,10 +3284,10 @@ local function test_address_frames_for_filtered_module_dropped_before_budget()
 	assert_not_contains(body, "0x4abc")
 end
 
--- An app_id that carries REAL PII (an email, an IP, a digit-bearing raw actor id,
+-- An app_key that carries REAL PII (an email, an IP, a digit-bearing raw actor id,
 -- a token) is rejected at crash.new() with a clear config error — surfaced at init
 -- time, never silently dropping reports later.
-local function test_config_app_id_rejects_pii()
+local function test_config_app_key_rejects_pii()
 	local cases = {
 		"ops@example.com",
 		"10.0.0.5",
@@ -3295,12 +3295,12 @@ local function test_config_app_id_rejects_pii()
 		"aaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbb.cccccccccccccccc",
 	}
 	for _, bad in ipairs(cases) do
-		local client, err = crash.new(config({ app_id = bad }))
-		assert_equal(client, nil, "a PII-bearing app_id must be rejected at init: " .. bad)
-		assert_equal(err, "invalid_app_id", "the reject reason is a clear config error: " .. bad)
+		local client, err = crash.new(config({ app_key = bad }))
+		assert_equal(client, nil, "a PII-bearing app_key must be rejected at init: " .. bad)
+		assert_equal(err, "invalid_app_key", "the reject reason is a clear config error: " .. bad)
 	end
 	-- a digit-free actor-prefixed scope is NOT PII and is accepted
-	assert_true(crash.new(config({ app_id = "user_app" })), "an actor-prefixed scope must be accepted")
+	assert_true(crash.new(config({ app_key = "user_app" })), "an actor-prefixed scope must be accepted")
 end
 
 -- ── a crash client is never refused for its platform (A8) ────────────────────
@@ -3462,7 +3462,7 @@ local function test_dump_persisted_before_dispatch()
 		end
 	end
 
-	local client = assert(crash.new(config({ app_id = "inflight-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "inflight-app", crash_sample_every = 1 })))
 	local ok, sent = client:capture_previous(fake_crash_module({
 		handle = 9,
 		signum = 11,
@@ -3512,7 +3512,7 @@ local function test_dump_retryable_failure_persists_and_resends()
 	-- LAUNCH 1: the server is unreachable (status 0 == retryable). The dump is
 	-- consumed on read, so the prepared report MUST be persisted, not dropped.
 	next_status = 0
-	local client = assert(crash.new(config({ app_id = "persist-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "persist-app", crash_sample_every = 1 })))
 	local ok, sent = client:capture_previous(fresh_dump_module())
 	assert_equal(ok, true)
 	assert_equal(sent, true, "the dump was dispatched")
@@ -3526,7 +3526,7 @@ local function test_dump_retryable_failure_persists_and_resends()
 	-- pending list is cleared.
 	reset()
 	next_status = 202
-	local client2 = assert(crash.new(config({ app_id = "persist-app", crash_sample_every = 1 })))
+	local client2 = assert(crash.new(config({ app_key = "persist-app", crash_sample_every = 1 })))
 	-- no new native dump this launch
 	local ok2, sent2 = client2:capture_previous(fake_crash_module({ handle = nil }))
 	assert_equal(ok2, true)
@@ -3556,7 +3556,7 @@ local function test_dump_non_retryable_reject_not_persisted()
 	local restore = install_fake_sys_storage()
 
 	next_status = 400
-	local client = assert(crash.new(config({ app_id = "terminal-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "terminal-app", crash_sample_every = 1 })))
 	local ok, sent = client:capture_previous(fake_crash_module({
 		handle = 5,
 		signum = 6,
@@ -3754,7 +3754,7 @@ local function test_pending_persistence_safe_without_sys_api()
 	storage.reset()
 	-- no fake sys storage installed: sys.save/load/get_save_file are absent here
 	next_status = 0
-	local client = assert(crash.new(config({ app_id = "no-disk-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "no-disk-app", crash_sample_every = 1 })))
 	local ok = client:capture_previous(fake_crash_module({
 		handle = 3,
 		signum = 11,
@@ -4203,7 +4203,7 @@ local function test_dump_persist_failure_falls_back_to_in_memory_pending()
 	-- on read, so the prepared report MUST survive the failed persist via the
 	-- in-memory fallback, not be dropped.
 	next_status = 0
-	local client = assert(crash.new(config({ app_id = "mem-fallback-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "mem-fallback-app", crash_sample_every = 1 })))
 	local ok, sent = client:capture_previous(fake_crash_module({
 		handle = 9,
 		signum = 11,
@@ -4272,7 +4272,7 @@ local function test_in_memory_pending_terminal_reject_cleared()
 	end
 
 	next_status = 400
-	local client = assert(crash.new(config({ app_id = "mem-terminal-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "mem-terminal-app", crash_sample_every = 1 })))
 	local ok = client:capture_previous(fake_crash_module({
 		handle = 5,
 		signum = 6,
@@ -4477,7 +4477,7 @@ local function test_live_fatal_emit_persisted_before_dispatch()
 		end
 	end
 
-	local client = assert(crash.new(config({ app_id = "live-writeahead-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "live-writeahead-app", crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event()))
 	assert_equal(#requests, 1, "the live send was dispatched")
 
@@ -4511,7 +4511,7 @@ local function test_sampling_gates_write_ahead_persist()
 	local restore = install_fake_sys_storage()
 	next_status = 500
 
-	local client = assert(crash.new(config({ app_id = "sampling-app", crash_sample_every = 2 })))
+	local client = assert(crash.new(config({ app_key = "sampling-app", crash_sample_every = 2 })))
 	assert_true(client:emit(presymbolicated_event()))
 	assert_equal(client:snapshot().sampled_out, 1, "the first non-fatal is sampled out (1-in-2)")
 	assert_equal(#storage.load_pending_crashes({ app_id = "sampling-app" }), 0,
@@ -4536,7 +4536,7 @@ local function test_resend_sequential_429_stops_pass_and_defers()
 
 	-- Seed three pending fatals (oldest first: S1, S2, S3), all failing 500.
 	next_status = 500
-	local seeder = assert(crash.new(config({ app_id = "seq-app", crash_sample_every = 1 })))
+	local seeder = assert(crash.new(config({ app_key = "seq-app", crash_sample_every = 1 })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "S1" } })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "S2" } })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "S3" } })))
@@ -4549,7 +4549,7 @@ local function test_resend_sequential_429_stops_pass_and_defers()
 		{ status = 202 },
 		{ status = 429, headers = { ["retry-after"] = "7200" } },
 	})
-	local client = assert(crash.new(config({ app_id = "seq-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "seq-app", crash_sample_every = 1 })))
 	client:resend_pending()
 	assert_equal(#requests, 2, "the 429 stops the pass: strictly one request at a time, S3 never raced out")
 	assert_contains(requests[1].body, '"S1"')
@@ -4565,7 +4565,7 @@ local function test_resend_sequential_429_stops_pass_and_defers()
 	-- While the stored window holds, another pass DEFERS (nothing is sent).
 	reset()
 	next_status = 202
-	local deferred = assert(crash.new(config({ app_id = "seq-app", crash_sample_every = 1 })))
+	local deferred = assert(crash.new(config({ app_key = "seq-app", crash_sample_every = 1 })))
 	deferred:resend_pending()
 	assert_equal(#requests, 0, "the persisted backpressure window defers the whole pass")
 	assert_true(type(deferred:snapshot().resend_deferred_until_ms) == "number",
@@ -4576,7 +4576,7 @@ local function test_resend_sequential_429_stops_pass_and_defers()
 	assert_true(storage.set_pending_crash_retry_after(scope, nil))
 	reset()
 	next_status = 202
-	local resumed = assert(crash.new(config({ app_id = "seq-app", crash_sample_every = 1 })))
+	local resumed = assert(crash.new(config({ app_key = "seq-app", crash_sample_every = 1 })))
 	resumed:resend_pending()
 	assert_equal(#requests, 2, "the resumed pass delivers the remainder")
 	assert_contains(requests[1].body, '"S2"')
@@ -4600,7 +4600,7 @@ local function test_retry_after_window_cleared_on_accept_and_absurd_dropped()
 	local _, armed = storage.load_pending_entries(scope)
 	assert_true(type(armed) == "number", "the window is stored")
 	next_status = 202
-	local client = assert(crash.new(config({ app_id = "window-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "window-app", crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event()))
 	local _, after_accept = storage.load_pending_entries(scope)
 	assert_equal(after_accept, nil, "an accepted send clears the stored backpressure window")
@@ -4716,7 +4716,7 @@ local function test_legacy_report_table_entry_resent_and_settled()
 	-- carry the encoded body under the same token.
 	reset()
 	next_status = 500
-	local client = assert(crash.new(config({ app_id = "legacy-entry-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "legacy-entry-app", crash_sample_every = 1 })))
 	client:resend_pending()
 	assert_equal(#requests, 1, "the legacy entry was attempted")
 	local first_body = requests[1].body
@@ -4729,7 +4729,7 @@ local function test_legacy_report_table_entry_resent_and_settled()
 	-- The next pass re-sends those SAME bytes and settles.
 	reset()
 	next_status = 202
-	local client2 = assert(crash.new(config({ app_id = "legacy-entry-app", crash_sample_every = 1 })))
+	local client2 = assert(crash.new(config({ app_key = "legacy-entry-app", crash_sample_every = 1 })))
 	client2:resend_pending()
 	assert_equal(#requests, 1, "the adopted entry is resent")
 	assert_equal(requests[1].body, first_body, "byte-identical to the first attempt")
@@ -4750,7 +4750,7 @@ local function test_dump_forward_queues_behind_pending_pass()
 
 	-- Seed one older pending report (S1).
 	next_status = 500
-	local seeder = assert(crash.new(config({ app_id = "order-app", crash_sample_every = 1 })))
+	local seeder = assert(crash.new(config({ app_key = "order-app", crash_sample_every = 1 })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "S1" } })))
 	assert_equal(#storage.load_pending_crashes(scope), 1)
 
@@ -4763,7 +4763,7 @@ local function test_dump_forward_queues_behind_pending_pass()
 		held[#held + 1] = callback
 	end
 
-	local client = assert(crash.new(config({ app_id = "order-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "order-app", crash_sample_every = 1 })))
 	local ok, sent = client:capture_previous(fake_crash_module({
 		handle = 9,
 		signum = 11,
@@ -4822,7 +4822,7 @@ local function test_memory_fallback_bounded_and_fatal_shielded()
 	storage.reset()
 	-- No sys storage: every persist fails over to the memory fallback.
 	next_status = 500
-	local client = assert(crash.new(config({ app_id = "mem-bound-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "mem-bound-app", crash_sample_every = 1 })))
 	for i = 1, 12 do
 		assert_true(client:emit(presymbolicated_event({ exception = { type = "lua_error", reason = "NF" .. i } })))
 	end
@@ -4855,7 +4855,7 @@ local function test_memory_fallback_honors_byte_caps()
 	reset()
 	storage.reset()
 	next_status = 500
-	local client = assert(crash.new(config({ app_id = "mem-bytes-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "mem-bytes-app", crash_sample_every = 1 })))
 
 	local oversized = { body = string.rep("x", 65 * 1024), crash_id = "big", fatal = true }
 	assert_equal(client:retain_in_memory_pending(oversized), nil,
@@ -4882,7 +4882,7 @@ local function test_memory_fallback_resends_oldest_first()
 	storage.reset()
 	-- No sys storage: every persist fails over to the memory fallback.
 	next_status = 500
-	local client = assert(crash.new(config({ app_id = "mem-order-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "mem-order-app", crash_sample_every = 1 })))
 	for i = 1, 12 do
 		assert_true(client:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "NF" .. i .. "x" } })))
 	end
@@ -4907,7 +4907,7 @@ local function test_tokenless_accept_clears_retry_after_window()
 	-- with fatal entries so a non-fatal emit retains NOTHING (token nil).
 	local scope = { app_id = "tokenless-app" }
 	next_status = 202
-	local client = assert(crash.new(config({ app_id = "tokenless-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "tokenless-app", crash_sample_every = 1 })))
 	for i = 1, 8 do
 		assert_true(client:retain_in_memory_pending(
 			{ body = '{"crash_id":"f' .. i .. '"}', crash_id = "f" .. i, fatal = true }) ~= nil)
@@ -4990,7 +4990,7 @@ local function test_resend_merges_memory_and_disk_by_age()
 	local restore = install_fake_sys_storage()
 
 	next_status = 500
-	local client = assert(crash.new(config({ app_id = "age-merge-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "age-merge-app", crash_sample_every = 1 })))
 	-- OLDER report: force its durable save to fail (memory retention).
 	local saved_save = sys.save
 	sys.save = function()
@@ -5025,7 +5025,7 @@ local function test_live_non_fatal_defers_into_stored_window()
 
 	assert_true(storage.set_pending_crash_retry_after(scope, 3600))
 	next_status = 202
-	local client = assert(crash.new(config({ app_id = "window-defer-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "window-defer-app", crash_sample_every = 1 })))
 
 	assert_true(client:emit(presymbolicated_event({ exception = { type = "lua_error", reason = "HELDx" } })))
 	assert_equal(#requests, 0, "a non-fatal live report defers into the stored window")
@@ -5050,7 +5050,7 @@ local function test_live_non_fatal_queues_behind_active_pass()
 
 	-- Seed one older pending report.
 	next_status = 500
-	local seeder = assert(crash.new(config({ app_id = "pass-queue-app", crash_sample_every = 1 })))
+	local seeder = assert(crash.new(config({ app_key = "pass-queue-app", crash_sample_every = 1 })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "OLDpass" } })))
 	assert_equal(#storage.load_pending_crashes(scope), 1)
 
@@ -5063,7 +5063,7 @@ local function test_live_non_fatal_queues_behind_active_pass()
 		held[#held + 1] = callback
 	end
 
-	local client = assert(crash.new(config({ app_id = "pass-queue-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "pass-queue-app", crash_sample_every = 1 })))
 	client:resend_pending()
 	assert_equal(#requests, 1, "the pass has the older report in flight")
 
@@ -5094,7 +5094,7 @@ local function test_deferral_stat_clears_with_window()
 
 	assert_true(storage.set_pending_crash_retry_after(scope, 3600))
 	next_status = 202
-	local client = assert(crash.new(config({ app_id = "stat-clear-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "stat-clear-app", crash_sample_every = 1 })))
 	assert_true(client:emit(presymbolicated_event()), "the non-fatal defers into the window")
 	assert_true(type(client:snapshot().resend_deferred_until_ms) == "number", "the deferral is surfaced")
 
@@ -5120,7 +5120,7 @@ local function test_resend_skips_tokens_in_flight()
 		held[#held + 1] = callback
 	end
 
-	local client = assert(crash.new(config({ app_id = "inflight-skip-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "inflight-skip-app", crash_sample_every = 1 })))
 	assert_true(client:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "INFLIGHTx" } })))
 	assert_equal(#requests, 1, "the live send is on the wire")
 	assert_equal(#storage.load_pending_crashes(scope), 1, "its write-ahead copy is pending")
@@ -5146,7 +5146,7 @@ local function test_pass_stops_on_concurrent_fatal_throttle()
 
 	-- Seed two pending reports.
 	next_status = 500
-	local seeder = assert(crash.new(config({ app_id = "concurrent-throttle-app", crash_sample_every = 1 })))
+	local seeder = assert(crash.new(config({ app_key = "concurrent-throttle-app", crash_sample_every = 1 })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "R1x" } })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "R2x" } })))
 	assert_equal(#storage.load_pending_crashes(scope), 2)
@@ -5159,7 +5159,7 @@ local function test_pass_stops_on_concurrent_fatal_throttle()
 		held[#held + 1] = callback
 	end
 
-	local client = assert(crash.new(config({ app_id = "concurrent-throttle-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "concurrent-throttle-app", crash_sample_every = 1 })))
 	client:resend_pending()
 	assert_equal(#requests, 1, "the pass has R1 in flight")
 
@@ -5194,7 +5194,7 @@ local function test_mid_pass_disable_stops_pass_before_next_dispatch()
 
 	-- Seed three pending reports.
 	next_status = 500
-	local seeder = assert(crash.new(config({ app_id = "midpass-disable-app", crash_sample_every = 1 })))
+	local seeder = assert(crash.new(config({ app_key = "midpass-disable-app", crash_sample_every = 1 })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "D1x" } })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "D2x" } })))
 	assert_true(seeder:emit_fatal(presymbolicated_event({ exception = { type = "lua_error", reason = "D3x" } })))
@@ -5208,7 +5208,7 @@ local function test_mid_pass_disable_stops_pass_before_next_dispatch()
 		held[#held + 1] = callback
 	end
 
-	local client = assert(crash.new(config({ app_id = "midpass-disable-app", crash_sample_every = 1 })))
+	local client = assert(crash.new(config({ app_key = "midpass-disable-app", crash_sample_every = 1 })))
 	client:resend_pending()
 	assert_equal(#requests, 1, "the pass has D1 in flight")
 	assert_contains(requests[1].body, '"D1x"')
@@ -5887,8 +5887,8 @@ local tests = {
 	test_frame_file_path_username_redacted_on_wire,
 	test_frame_address_alias_normalized,
 	test_crashed_thread_frames_prioritized,
-	test_app_id_actor_prefix_scope_survives,
-	test_caller_app_id_overridden_by_config,
+	test_app_key_actor_prefix_scope_survives,
+	test_caller_app_key_overridden_by_config,
 	test_non_number_frame_index_normalized,
 	test_invalid_numeric_frame_index_normalized,
 	test_oversized_fingerprint_components_capped_fatal_not_dropped,
@@ -5897,7 +5897,7 @@ local tests = {
 	test_invalid_module_entry_dropped_fatal_not_dropped,
 	test_dropped_referenced_module_drops_frame_address_keeps_clean_frame,
 	test_unresolvable_address_frame_dropped_clean_sibling_keeps_fatal,
-	test_config_app_id_rejects_pii,
+	test_config_app_key_rejects_pii,
 	test_platform_required_at_init,
 	test_per_report_invalid_scrubbed_source,
 	test_dump_persisted_before_dispatch,
@@ -6282,4 +6282,97 @@ end)()
  end
  print("crash-retry total: "..passed.." pass, "..failed.." fail")
  assert_equal(failed,0,"crash retry scenes")
+end)()
+
+
+-- Crash scope key contract scenes reach the public constructors and HTTP sender.
+;(function()
+	local passed, failed = 0, 0
+	local restore_storage
+	local function canonical()
+		local raw = config()
+		raw.app_id = nil
+		raw.app_key = "app-example"
+		return raw
+	end
+	local function scene(name, run)
+		reset()
+		local ok, err = pcall(run)
+		if restore_storage then restore_storage(); restore_storage = nil end
+		storage.reset()
+		if ok then passed = passed + 1 else failed = failed + 1 end
+		print("crash scope " .. name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	scene("canonical setting and literal key", function()
+		for _, key in ipairs({ "app-example", "prj_019a1a00-0000-7000-8000-000000000002" }) do
+			local raw = canonical()
+			raw.app_key = key
+			local c, err = crash.new(raw)
+			assert_true(c ~= nil, "canonical app_key accepted: " .. tostring(err))
+			assert_equal(c.config.app_id, key, "private scope value is unchanged")
+			assert_true(c:emit_fatal(presymbolicated_event()))
+			local body = json.decode(requests[#requests].body)
+			assert_equal(body.app.key, key, "literal app key reaches HTTP")
+			assert_equal(body.app.id, nil, "no retired app selector")
+		end
+	end)
+	scene("retired and mixed settings refused", function()
+		local old = canonical()
+		old.app_key = nil
+		old.app_id = "app-example"
+		local c, err = crash.new(old)
+		assert_equal(c, nil, "retired setting has no alias")
+		assert_equal(err, "unknown_config_key")
+		for _, value in ipairs({ "app-example", false, {} }) do
+			local mixed = canonical()
+			mixed.app_id = value
+			c, err = crash.new(mixed)
+			assert_equal(c, nil, "mixed setting is refused")
+			assert_equal(err, "unknown_config_key")
+		end
+		assert_equal(#requests, 0, "refused settings send nothing")
+	end)
+	scene("actual sender uses configured app key", function()
+		local c = assert(crash.new(config()))
+		local caller = presymbolicated_event({
+			app = { key = "other-app", id = "retired-input", version = "2.3.4", build_id = "build-7" },
+		})
+		assert_true(c:emit_fatal(caller))
+		assert_equal(#requests, 1, "subject reached HTTP")
+		local report = json.decode(requests[1].body)
+		assert_equal(report.app.key, "app-example", "configured scope overrides caller data")
+		assert_equal(report.app.id, nil, "retired selector never reaches HTTP")
+		assert_equal(report.app.version, "2.3.4")
+		assert_equal(report.app.build_id, "build-7")
+		assert_equal(report.threads[1].id, "main", "thread identity is not scope")
+		assert_equal(caller.app.key, "other-app", "caller object is unchanged")
+		assert_equal(caller.app.id, "retired-input")
+	end)
+	scene("fresh pending record replays exact key body", function()
+		restore_storage = install_fake_sys_storage()
+		next_status = 503
+		local producer = assert(crash.new(config()))
+		producer:emit_fatal(presymbolicated_event())
+		assert_equal(#requests, 1, "subject reached HTTP before restart")
+		local first = requests[1].body
+		assert_equal(json.decode(first).app.key, "app-example")
+		assert_equal(json.decode(first).app.id, nil)
+		local scope = producer:pending_scope()
+		assert_equal(scope.app_id, "app-example", "private record scope is unchanged")
+		reset()
+		socket.now = socket.now + 60
+		local consumer = assert(crash.new(config()))
+		assert_true(consumer:resend_pending())
+		assert_equal(#requests, 1, "fresh durable record reached HTTP")
+		assert_equal(requests[1].body, first, "retry bytes are not relabeled")
+	end)
+	scene("singleton accepts canonical setting", function()
+		assert_true(crash.init(canonical()))
+		assert_true(crash.emit_fatal(presymbolicated_event()))
+		assert_equal(#requests, 1)
+		assert_equal(json.decode(requests[1].body).app.key, "app-example")
+		assert_true(crash.shutdown())
+	end)
+	print("crash scope total: " .. passed .. " pass, " .. failed .. " fail")
+	assert_equal(failed, 0, "crash scope contract scenes")
 end)()

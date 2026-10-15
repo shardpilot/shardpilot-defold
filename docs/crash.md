@@ -32,7 +32,7 @@ local crash = require "shardpilot.crash"
 crash.init({
   crash_url = "https://crashes.example.com", -- crash ingest base URL
   crash_key    = "sp_crash_...",                -- a crash:write API key
-  app_id           = "app-example",                  -- must match the key's app scope
+  app_key           = "app-example",                  -- must match the key's app scope
   app_version      = "1.4.2",
   app_build        = "4201",
   crash_component  = "game-client",                  -- component slug (optional)
@@ -49,7 +49,7 @@ crash.init({
 | --- | --- | --- |
 | `crash_url` | yes | The crash ingest **base** URL (no path/query/fragment). `https` is required outside loopback. The `/api/v1/crashes/ingest` route is appended by the SDK. |
 | `crash_key` | yes | A `crash:write` API key, used directly as the `Bearer` credential. |
-| `app_id` | yes | App/project scope; must match the API key's app scope. A product slug such as `user_app` or `customer_portal` is fine; a value carrying real PII (an email, an IP, a token, a digit-bearing raw actor id) fails `crash.init` with `invalid_app_id`. |
+| `app_key` | yes | App/project scope; must match the API key's app scope. A product slug such as `user_app` or `customer_portal` is fine; a value carrying real PII (an email, an IP, a token, a digit-bearing raw actor id) fails `crash.init` with `invalid_app_key`. |
 | `app_version`, `app_build` | no | Defaulted onto every report. |
 | `platform` | no | One of `windows`, `macos`, `linux`, `android`, `ios`, `tvos`, `web`, `ps4`, `ps5`, `xbox`, `switch` or `other`. Auto-detected from `sys.get_sys_info`; an unrecognized system is `other`. A configured value is folded through the same table as analytics (`Mac` is `macos`, `html5` is `web`); one it cannot map is sent as `other` and reported once as `{ scope = "config", status = "ignored", code = "platform_unmapped" }`. A per-report `platform` is folded the same way and falls back to the configured one; a module's `platform` that cannot be mapped is omitted, so the module takes the crash's own. A crash client is never refused for its platform. |
 | `crash_component` | no | Component slug (see below); no fallback configuration alias. |
@@ -387,7 +387,7 @@ local crash = require "shardpilot.crash"
 crash.init({
     crash_url = "https://crash.example.com",
     crash_key = "<crash:write key>",
-    app_id = "your-app-id",
+    app_key = "your-app-key",
     anonymous_id = shardpilot.get_anonymous_id,  -- resolved per report
     session_id = shardpilot.get_session_id,      -- optional; nil until a session opens
 })

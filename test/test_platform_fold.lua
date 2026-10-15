@@ -208,7 +208,7 @@ do
 	invalid, err = crash_client.new(shared)
 	check(invalid == nil and err == "unknown_config_key", "crash accepted analytics-only keys")
 	local analytics_options = base_config({ platform = shared.platform })
-	local crash_options = { platform = shared.platform, app_id = shared.app_key,
+	local crash_options = { platform = shared.platform, app_key = shared.app_key,
 		crash_url = shared.crash_url, crash_key = shared.crash_key }
 	local analytics = assert(client_mod.new(analytics_options))
 	local crash = assert(crash_client.new(crash_options))

@@ -269,7 +269,7 @@ local function clone_event(event)
 	}
 	out.app = {}
 	if type(event.app) == "table" then
-		out.app.id = event.app.id
+		out.app.key = event.app.key
 		out.app.version = event.app.version
 		out.app.build_id = event.app.build_id
 	end
@@ -885,15 +885,15 @@ function M.sanitize_event(event, trusted_frame_functions, fatal)
 	-- material), replace it with a generated UUIDv7. A fatal crash is NEVER
 	-- dropped over a bad crash_id.
 	event.crash_id = M.normalize_crash_id(event.crash_id)
-	-- app.id is operator-set product scope from the trusted config, NOT a raw
+	-- app.key is operator-set product scope from the trusted config, NOT a raw
 	-- actor id. The full free-text scrub would blank a legitimate product scope
 	-- whose slug happens to begin with an actor-style prefix ("user_app",
-	-- "customer_portal") — which fails app_id_required and DROPS every report,
+	-- "customer_portal") — which fails app_key_required and DROPS every report,
 	-- including a fatal. Scrub it with the structured tier so such a scope
 	-- survives, while an embedded email / IP / token / digit-bearing raw id is
-	-- still removed. An app_id that would still scrub empty is rejected up front at
+	-- still removed. An app_key that would still scrub empty is rejected up front at
 	-- config time (crash.new), so a fatal is never dropped over it here.
-	event.app.id = sanitize.sanitize_structured(event.app.id)
+	event.app.key = sanitize.sanitize_structured(event.app.key)
 	-- app.version / app.build come from the trusted config, not caller free-text:
 	-- scrub them with the version-aware rule so a common 4-part version like
 	-- "1.2.3.4" survives instead of being blanked as an IP literal, while an
@@ -1214,7 +1214,7 @@ local function compact_event(event)
 	event.anonymous_id = blank_to_nil(event.anonymous_id)
 	event.session_id = blank_to_nil(event.session_id)
 	if type(event.app) == "table" then
-		event.app.id = blank_to_nil(event.app.id)
+		event.app.key = blank_to_nil(event.app.key)
 		event.app.version = blank_to_nil(event.app.version)
 		event.app.build_id = blank_to_nil(event.app.build_id)
 	end
@@ -1280,8 +1280,8 @@ function M.validate_event(event)
 	if not non_empty(event.occurred_at) then
 		return false, "occurred_at_required"
 	end
-	if type(event.app) ~= "table" or not non_empty(event.app.id) then
-		return false, "app_id_required"
+	if type(event.app) ~= "table" or not non_empty(event.app.key) then
+		return false, "app_key_required"
 	end
 	if not non_empty(event.platform) then
 		return false, "platform_required"
@@ -1410,10 +1410,10 @@ function M.prepare(client, event, trusted_frame_functions, options)
 	event.crash_id = trim(event.crash_id)
 
 	-- App identity is product scope from the TRUSTED client config, never caller
-	-- free-text. Always stamp the configured app_id, overriding any caller-provided
-	-- event.app.id: the crash key is scoped to the configured app, so a stale or
+	-- free-text. Always stamp the configured app key, overriding any caller-provided
+	-- event.app.key: the crash key is scoped to the configured app, so a stale or
 	-- mismatched per-report app id would send under the wrong scope or be rejected.
-	event.app.id = client.config.app_id
+	event.app.key = client.config.app_id
 	if not non_empty(event.app.version) then
 		event.app.version = client.config.app_version
 	end

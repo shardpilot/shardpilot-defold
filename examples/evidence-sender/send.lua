@@ -38,7 +38,7 @@ return function(c)
 	assert(client:identify(c.user_id))
 	local crashes = assert(crash.new({
 		crash_url = c.crash_url, crash_key = c.crash_key,
-		app_id = c.crash_app_id, platform = "linux",
+		app_key = c.crash_app_id, platform = "linux",
 		app_version = "synthetic-sender", app_build = "synthetic-build",
 		crash_component = "sdk-evidence-sender", crash_sample_every = 1,
 		previous_crash_capture_enabled = false, crash_http_timeout_seconds = 15,

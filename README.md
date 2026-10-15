@@ -1551,10 +1551,10 @@ game has to handle specially.
 ## Crash wire contract
 
 Crashes use a **separate** module and endpoint. The crash client
-(`require "shardpilot.crash"`) sends one report per crash as
+(`require "shardpilot.crash"`) takes the literal `app_key` setting and sends one report per crash as
 `POST {crash_url}/api/v1/crashes/ingest` with a `crash:write` API key as
 the `Bearer`, carrying the crash report JSON body: `crash_id`
-(UUIDv7), `occurred_at`, `app{id,version,build_id}`, a component-slug `component`,
+(UUIDv7), `occurred_at`, `app{key,version,build_id}`, a component-slug `component`,
 `platform`, `os`, `exception`, `modules[]`, `threads[]`/`frames[]`,
 `breadcrumbs[]`, `fingerprint_components[]`, and `metadata`. A crash is **never**
 wrapped as a `mobile_crash` analytics event on `/v1/events:batch`. Fatal reports

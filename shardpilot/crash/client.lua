@@ -124,7 +124,7 @@ end
 local config_keys = {
 	anonymous_id = true,
 	app_build = true,
-	app_id = true,
+	app_key = true,
 	app_version = true,
 	previous_crash_capture_enabled = true,
 	crash_key = true,
@@ -154,7 +154,7 @@ local function snapshot_config(config)
 end
 
 local function validate_config(config)
-	local required = { "crash_url", "app_id" }
+	local required = { "crash_url", "app_key" }
 	for _, key in ipairs(required) do
 		if config[key] == nil or config[key] == "" then
 			return nil, key .. "_required"
@@ -166,15 +166,15 @@ local function validate_config(config)
 	if not valid_ingest_url(config.crash_url) then
 		return nil, "invalid_crash_url"
 	end
-	-- app_id is operator-set product scope, validated here at init time so a
+	-- app_key is operator-set product scope, validated here at init time so a
 	-- misconfiguration is surfaced as a clear config error instead of silently
 	-- dropping every report later. A legitimate scope whose slug begins with an
 	-- actor-style prefix ("user_app", "customer_portal") survives the structured
 	-- scrub; a value that carries real PII/secret content (an email, an IP, a
 	-- token, a digit-bearing raw actor id like "user_4242") scrubs empty and is
 	-- rejected NOW, so it can never reach emit and drop a fatal crash.
-	if sanitize.sanitize_structured(config.app_id) == "" then
-		return nil, "invalid_app_id"
+	if sanitize.sanitize_structured(config.app_key) == "" then
+		return nil, "invalid_app_key"
 	end
 	-- Crash ingest authenticates with a STATIC `crash:write` API key. There is no
 	-- token_provider / dual-mode here: the key is the standing Bearer.
@@ -262,7 +262,7 @@ local function validate_config(config)
 	return {
 		crash_url = trim_slash(config.crash_url),
 		crash_key = config.crash_key,
-		app_id = config.app_id,
+		app_id = config.app_key,
 		app_version = config.app_version,
 		app_build = config.app_build,
 		crash_component = crash_component ~= "" and crash_component or nil,
