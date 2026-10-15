@@ -5347,9 +5347,9 @@ function Client:try_send_consent_outbox()
 	-- field for deployments whose ingest still strict-decodes the
 	-- pre-amendment schema (see validate_config).
 	local wire = {
-		workspace_id = payload.workspace_id,
-		app_id = payload.app_id,
-		environment_id = payload.environment_id,
+		workspace_key = payload.workspace_id,
+		app_key = payload.app_id,
+		environment_key = payload.environment_id,
 		actor_identifier = payload.actor_identifier,
 		kind = self.config.consent_kind_emission_enabled and payload.kind or nil,
 		categories = payload.categories,

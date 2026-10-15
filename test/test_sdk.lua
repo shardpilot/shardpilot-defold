@@ -1261,9 +1261,9 @@ local function test_consent_tri_state_gating_and_queue_clear()
 	assert_equal(consent_request.headers["Authorization"], "Bearer client-token-placeholder")
 	assert_equal(consent_request.headers["X-ShardPilot-SDK"], "defold/" .. require("shardpilot.version").VERSION,
 		"the consent receipt names this SDK")
-	assert_contains(consent_request.body, '"workspace_id":"workspace-example"')
-	assert_contains(consent_request.body, '"app_id":"app-example"')
-	assert_contains(consent_request.body, '"environment_id":"develop"')
+	assert_contains(consent_request.body, '"workspace_key":"workspace-example"')
+	assert_contains(consent_request.body, '"app_key":"app-example"')
+	assert_contains(consent_request.body, '"environment_key":"develop"')
 	assert_contains(consent_request.body, '"actor_identifier":"user-example"')
 	-- Mode B + identify(): the canonical actor is the verified user id, and
 	-- its kind rides the wire by default.
@@ -15652,8 +15652,8 @@ end)()
 			id.uuid_v7 = function() return payload.idempotency_key end
 			local ok, err = pcall(function()
 				local client = assert(dofile("shardpilot/sdk.lua").new(config({
-					workspace_key = payload.workspace_id, app_key = payload.app_id, environment_key = payload.environment_id,
-					anonymous_id = payload.actor_identifier, consent_kind_emission_enabled = false,
+					workspace_key = payload.workspace_key, app_key = payload.app_key, environment_key = payload.environment_key,
+					anonymous_id = payload.actor_identifier, consent_kind_emission_enabled = true,
 				})))
 				next_status = 200; next_response_body = read("test/golden/consent-notice-response.json")
 				assert_true(client:set_consent(false, notice()))
@@ -17804,4 +17804,102 @@ end)()
 
  print(string.format("bounded shutdown: %d pass, %d fail",passed,failed))
  assert_equal(failed,0,"bounded shutdown scenes")
+end)()
+
+-- Consent scope keys pass through public handles without changing private records.
+;(function()
+	local public = require "shardpilot.sdk"
+	local passed, failed = 0, 0
+	local notice = { notice_version = "notice-7", notice_locale = "en", policy_version = "policy-9" }
+	local function options()
+		return config({ workspace_key = "literal-workspace", app_key = "literal-app",
+			environment_key = "release-blue", flush_interval_seconds = 9999 })
+	end
+	local function scene(name, run)
+		reset(); storage.reset()
+		local stores, restore = install_stub_sys_storage()
+		local ok, err = pcall(run, stores)
+		restore(); storage.reset()
+		if ok then passed = passed + 1 else failed = failed + 1 end
+		print("consent scope " .. name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	local function wire(request, raw)
+		assert_true(request.url:sub(-11) == "/v1/consent", "actual consent HTTP request")
+		local body = json.decode(request.body)
+		for _, axis in ipairs({ "workspace", "app", "environment" }) do
+			assert_equal(body[axis .. "_key"], raw[axis .. "_key"], axis .. " literal key")
+			assert_equal(body[axis .. "_id"], nil, axis .. " retired selector absent")
+		end
+		assert_equal(body.anonymous_id, nil, "private retention identity stays private")
+		assert_equal(body.decision_seq, nil, "private ordering metadata stays private")
+		assert_true(type(body.idempotency_key) == "string" and #body.idempotency_key > 0)
+		return body
+	end
+	for _, decision in ipairs({ true, false, "denied_forced_minor" }) do
+		scene("verified decision " .. tostring(decision), function()
+			local raw = options()
+			local client = assert(public.new(raw))
+			assert_true(client:identify("user-example"))
+			assert_equal(client:track("blocked_before_decision"), false)
+			assert_equal(#requests, 0, "undecided client sends nothing")
+			assert_true(client:set_consent(decision, notice))
+			assert_equal(#requests, 1)
+			local body = wire(requests[1], raw)
+			assert_equal(body.actor_identifier, "user-example")
+			assert_equal(body.kind, "user_verified")
+			assert_equal(body.categories.analytics, decision == true)
+			assert_equal(body.reason, decision == "denied_forced_minor" and decision or nil)
+			for key, value in pairs(notice) do assert_equal(body[key], value) end
+		end)
+	end
+	for _, carrying in ipairs({ true, false }) do
+		scene("anonymous denial kind=" .. tostring(carrying), function()
+			local raw = options()
+			raw.token_provider = nil; raw.publishable_key = "sp_ingest_publishable_key"
+			raw.consent_kind_emission_enabled = carrying
+			local client = assert(public.new(raw))
+			local actor = client:get_anonymous_id()
+			assert_true(client:set_consent(false, notice))
+			assert_equal(#requests, 1)
+			local body = wire(requests[1], raw)
+			assert_equal(body.actor_identifier, actor, "anonymous actor value is unchanged")
+			assert_equal(body.kind, carrying and "anon" or nil)
+			assert_equal(body.categories.analytics, false)
+		end)
+	end
+	scene("fresh durable decisions keep values and order after restart", function()
+		local raw = options()
+		local client = assert(public.new(raw))
+		assert_true(client:identify("user-example"))
+		next_status = 503
+		assert_true(client:set_consent(true, notice))
+		assert_equal(#requests, 1)
+		local first = requests[1].body
+		wire(requests[1], raw)
+		assert_true(client:set_consent(false, notice))
+		local retained = storage.load_consent_outbox(record_scope(raw))
+		assert_equal(#retained, 2, "both fresh decisions are durable")
+		for _, receipt in ipairs(retained) do
+			for _, axis in ipairs({ "workspace", "app", "environment" }) do
+				assert_equal(receipt[axis .. "_id"], raw[axis .. "_key"], "private scope value")
+				assert_equal(receipt[axis .. "_key"], nil, "private record name is unchanged")
+			end
+		end
+		storage.reset(); reset(); socket.now = socket.now + 60
+		local restored = assert(public.new(raw))
+		assert_true(restored:identify("user-example"))
+		restored:update(0)
+		assert_equal(#requests, 2, "both decisions reach HTTP in order")
+		assert_equal(requests[1].body, first, "retry bytes are identical")
+		for index, request in ipairs(requests) do
+			local body = wire(request, raw)
+			assert_equal(body.idempotency_key, retained[index].idempotency_key)
+			assert_equal(body.decided_at, retained[index].decided_at)
+			assert_equal(body.actor_identifier, retained[index].actor_identifier)
+			assert_equal(body.categories.analytics, retained[index].categories.analytics)
+		end
+		assert_equal(#storage.load_consent_outbox(record_scope(raw)), 0, "acknowledged records retire")
+	end)
+	print("consent scope total: " .. passed .. " pass, " .. failed .. " fail")
+	assert_equal(failed, 0, "consent scope key scenes")
 end)()
