@@ -311,6 +311,13 @@ default — off under `STRICT_OPT_IN`, on under `SOFT_OPT_OUT` — which is what
 player who closes it without touching the switch does. It answers from
 `update()` rather than synchronously, because a real screen does.
 
+The screen calls `callback(granted, explicitly_decided)`. Pass `true` as the
+second value when the player deliberately chooses On or Off; pass `false` for
+the untouched default. Explicit Off is persisted as a denial under every
+regime. Explicit On is recorded as a grant; an untouched SOFT default writes no
+grant or receipt and needs the host's separate non-objection recording path.
+This callback does not establish policy authority or enable SOFT processing.
+
 <!-- doc-region: present-notice -->
 ```lua
 -- ⚠ YOUR CONSENT UI GOES HERE. It is a GLOBAL so you can replace it with your
@@ -324,7 +331,7 @@ player who closes it without touching the switch does. It answers from
 local pending_notice = nil
 function present_consent_notice(decision, callback)
 	pending_notice = function()
-		callback(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_ON)
+		callback(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_ON, false)
 	end
 end
 ```
@@ -385,7 +392,7 @@ reconcile = function(fresh)
 	-- the strict regime, and it requires an explicit grant just as a strict
 	-- plan does. A grant given explicitly survives a fallback; a non-objection
 	-- does not.
-	if answered and fresh.explicit_grant_required and not answered.grant_required then
+	if answered and fresh.explicit_grant_required and not answered.explicit_decision then
 		suspend_analytics("explicit_grant_now_required")
 		answered = nil
 	end
@@ -475,7 +482,7 @@ reconcile = function(fresh)
 		return
 	elseif not analytics_running then
 		if answered then
-			if start_analytics(answered.granted, fresh, answered.fresh_answer == true, answered.notice) then
+			if start_analytics(answered.granted, fresh, answered.fresh_answer == true, answered.notice, answered.explicit_decision) then
 				answered.fresh_answer = nil
 			end
 		elseif not notice_open then
@@ -489,7 +496,7 @@ reconcile = function(fresh)
 					policy_version = fresh.policy_version,
 				}
 			end
-			present_consent_notice(fresh, function(granted)
+			present_consent_notice(fresh, function(granted, explicitly_decided)
 				if generation ~= notice_generation then
 					-- The band was corrected while this screen was open. The
 					-- answer belongs to a question no longer being asked, and
@@ -504,10 +511,11 @@ reconcile = function(fresh)
 					language = fresh.presented_language,
 					notice = presented_notice,
 					granted = granted,
-					-- The BASIS the answer was given under. A non-objection
-					-- does not satisfy a regime that requires an explicit
-					-- grant, so the two are not interchangeable later.
-					grant_required = fresh.explicit_grant_required,
+					-- Keep what the player did, rather than the old regime.
+					-- Off is always a decision; SOFT On needs the host's
+					-- explicit-choice signal to differ from its default.
+					-- A strict answer retains its existing decision semantics.
+					explicit_decision = explicitly_decided == true or granted == false or fresh.explicit_grant_required,
 					fresh_answer = true,
 				}
 				-- Re-resolve after the answer and fence responses dispatched

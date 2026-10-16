@@ -266,10 +266,17 @@ end
 local pending_notice = nil
 function present_consent_notice(decision, callback)
 	pending_notice = function()
-		callback(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_ON)
+		callback(decision.analytics_choice_default == consent_policy.CHOICE_DEFAULT_ON, false)
 	end
 end
 ```
+
+The host screen calls `callback(granted, explicitly_decided)`. Mark an actual
+On/Off choice with `true`, and the untouched default with `false`. Explicit Off
+persists a denial in every regime; explicit On persists a grant. An untouched
+SOFT default creates no grant or receipt and needs the host's separate
+non-objection recording path. This signal grants no policy authority and does
+not make SOFT processing available.
 
 **Closing a lane is not a player decision.** A lane the policy closes is
 stopped with `shutdown()` — never `set_consent(false)` or
@@ -342,7 +349,7 @@ host-requirements list:
 -- trail as a player changing their mind.
 -- Returns whether the fresh answer was CONSUMED — false means the write is
 -- owed and the caller must keep it pending.
-local function start_analytics(granted, decision, newly_answered, notice)
+local function start_analytics(granted, decision, newly_answered, notice, explicit_decision)
 	-- ⚠ init CAN FAIL, and a lane marked running on a client that was never
 	-- built is a lane final() will try to shut down and update() will try to
 	-- drive.
@@ -397,13 +404,12 @@ local function start_analytics(granted, decision, newly_answered, notice)
 	-- way — or set_consent("denied_forced_minor") when your age gate forces it
 	-- (feature-detect with
 	-- shardpilot.supports("consent_state_denied_forced_minor")).
-	-- ⚠ UNDER A SOFT PLAN THE BASIS IS NOTICE AND NON-OBJECTION, WHICH IS NOT
-	-- A CLICK. set_consent records a player's explicit decision, so using it
-	-- for a non-objection would write down a grant nobody gave. This SDK has no
-	-- API for that basis and this quick start does not invent one; the
-	-- resolver cannot emit SOFT in this release, and a host that meets one must
-	-- record the basis through its own path.
-	if not decision.explicit_grant_required then
+	-- Only an untouched SOFT default is notice/non-objection. An explicit
+	-- Off or On is a decision under every regime and must reach set_consent.
+	-- This SDK has no API for the non-objection basis; the host must record
+	-- it through its own path. The current resolver still cannot authorize
+	-- this later flow, and this example supplies no independent authority.
+	if not decision.explicit_grant_required and granted == true and not explicit_decision then
 		print("shardpilot: SOFT regime — record the notice/non-objection basis yourself; " ..
 			"set_consent is for an explicit decision")
 		return true
@@ -522,7 +528,7 @@ reconcile = function(fresh)
 	-- the strict regime, and it requires an explicit grant just as a strict
 	-- plan does. A grant given explicitly survives a fallback; a non-objection
 	-- does not.
-	if answered and fresh.explicit_grant_required and not answered.grant_required then
+	if answered and fresh.explicit_grant_required and not answered.explicit_decision then
 		suspend_analytics("explicit_grant_now_required")
 		answered = nil
 	end
@@ -612,7 +618,7 @@ reconcile = function(fresh)
 		return
 	elseif not analytics_running then
 		if answered then
-			if start_analytics(answered.granted, fresh, answered.fresh_answer == true, answered.notice) then
+			if start_analytics(answered.granted, fresh, answered.fresh_answer == true, answered.notice, answered.explicit_decision) then
 				answered.fresh_answer = nil
 			end
 		elseif not notice_open then
@@ -626,7 +632,7 @@ reconcile = function(fresh)
 					policy_version = fresh.policy_version,
 				}
 			end
-			present_consent_notice(fresh, function(granted)
+			present_consent_notice(fresh, function(granted, explicitly_decided)
 				if generation ~= notice_generation then
 					-- The band was corrected while this screen was open. The
 					-- answer belongs to a question no longer being asked, and
@@ -641,10 +647,11 @@ reconcile = function(fresh)
 					language = fresh.presented_language,
 					notice = presented_notice,
 					granted = granted,
-					-- The BASIS the answer was given under. A non-objection
-					-- does not satisfy a regime that requires an explicit
-					-- grant, so the two are not interchangeable later.
-					grant_required = fresh.explicit_grant_required,
+					-- Keep what the player did, rather than the old regime.
+					-- Off is always a decision; SOFT On needs the host's
+					-- explicit-choice signal to differ from its default.
+					-- A strict answer retains its existing decision semantics.
+					explicit_decision = explicitly_decided == true or granted == false or fresh.explicit_grant_required,
 					fresh_answer = true,
 				}
 				-- Re-resolve after the answer and fence responses dispatched
