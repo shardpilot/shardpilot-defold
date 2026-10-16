@@ -1719,6 +1719,10 @@ function M.new(config, defer_init_diagnostics)
 				-- verbatim and must not egress on a later flush.
 				return client:purge_experiment_facts()
 			end,
+			withdrawal_persist_pending = function()
+				return client.withdrawn_debt_save_owed == true or client.declaration_spool_pending == true
+					or client.spool_purge_pending == true
+			end,
 			withdraw_facts = function(experiment_key, fact_keys)
 				-- An age refusal withdrew ONE experiment's owed
 				-- applications for the refused subject: its facts already
@@ -1785,6 +1789,7 @@ function M.new(config, defer_init_diagnostics)
 	else
 		local spooled, stored_deadline, spool_miss, spool_migrated, spool_dropped =
 			storage.load_spool(normalized)
+		client.declaration_spool_pending = spool_miss == "unreadable"
 		for _, event in ipairs(spooled) do client.delivery_clocks[event.event_id] = analytics_retry.get(event) end
 		local expired = client:expire_delivery_batch(spooled)
 		-- Server-requested backpressure survives a relaunch: when the record
@@ -1883,8 +1888,10 @@ function M.new(config, defer_init_diagnostics)
 				-- machinery can do — a marker whose facts are all
 				-- post-stamp condemns nothing below and retires in the
 				-- next ENABLED launch's first tick.
-				local marker_stamp, _, marker_miss =
+				local marker_stamp, _, marker_miss, declarations =
 					storage.load_experiments_clear(normalized)
+				client.declaration_recovery_records = declarations
+				client.declaration_prune_pending = declarations and next(declarations) ~= nil
 				if marker_stamp then
 					condemnation_covers = true
 					condemnation_stamp_iso = clock.iso_utc(marker_stamp)
@@ -2087,6 +2094,25 @@ function M.new(config, defer_init_diagnostics)
 		-- fact-key history prune, since a restored chunk under a retired key
 		-- keeps that key.
 		client.experiments:on_spool_restored()
+	elseif client.declaration_recovery_records then
+		local recovery_scope
+		if experiments_mod.valid_subject_id(client.experiments_client_id) then
+			recovery_scope = experiments_mod.build_scope(normalized.workspace_id, normalized.environment_id,
+				client.experiments_client_id, normalized.app_url, normalized.publishable_key)
+		end
+		for scope, experiments in pairs(client.declaration_recovery_records) do
+			if recovery_scope == nil or scope == recovery_scope then
+				for key, marker in pairs(experiments) do
+					local fact_keys = {}
+					for _, fact_key in ipairs(marker.fact_keys) do fact_keys[fact_key] = true end
+					client:withdraw_experiment_facts(key, fact_keys, true)
+				end
+			end
+		end
+		-- A known foreign scope cannot own this client's facts. Retain its
+		-- witness until the actual cache and live fact references settle.
+		client.declaration_recovery_records = nil
+		client:prune_declaration_markers()
 	end
 	-- The retained receipts (reloaded above, before the spool) get their
 	-- delivery attempt after the whole init settled — the same dispatch
@@ -2836,6 +2862,7 @@ function Client:set_consent(decision, notice)
 		self.spool_rewrite_pending = false
 		self.spool_retry_after_ms = nil
 		if storage.clear_spool(self.config) then
+			self.declaration_spool_pending = false
 			self.spool_purge_pending = false
 			self.spool_disk_deadline_ms = nil
 			-- An emptied durable spool proves cleanliness exactly like a
@@ -5746,7 +5773,7 @@ end
 -- durable spool record, converging through the settled/rewrite machinery
 -- when the store is down (the storage-down-through-exit residual family, as
 -- for the sentinel purge). Returns the number withdrawn.
-function Client:withdraw_experiment_facts(experiment_key, fact_keys)
+function Client:withdraw_experiment_facts(experiment_key, fact_keys, durable_witness)
 	local matches = refused_fact_matcher(experiment_key, fact_keys)
 	local withdrawn = queue.remove_matching(self.queue, matches)
 	if self.in_flight_batch then
@@ -5803,7 +5830,11 @@ function Client:withdraw_experiment_facts(experiment_key, fact_keys)
 		-- that keep them from re-sending die with the process: owe them
 		-- durably, so an exit before a later write lands does not replay
 		-- them at the next launch.
-		self:owe_withdrawn_facts(marked)
+		-- A rollback launch already has the declaration witness in the
+		-- existing clear record. Keep using it instead of creating an
+		-- experimental debt file while the feature is disabled.
+		if durable_witness then self.declaration_spool_pending = true
+		else self:owe_withdrawn_facts(marked) end
 	end
 	if deadline_cleared and #marked == 0 then
 		self:drop_cleared_spool_deadline()
@@ -5855,9 +5886,21 @@ function Client:live_experiment_fact_keys(experiment_key)
 	return live
 end
 
--- A publish settled: the experiments fact-key history drops the keys no fact
--- carries any more (a no-op while the history is empty).
+-- Retire declaration witnesses only after their actual durable references settle.
+function Client:prune_declaration_markers()
+	if self.experiments or not self.declaration_prune_pending then return end
+	if self.declaration_spool_pending or self.withdrawn_debt_save_owed or self.spool_purge_pending then return end
+	local records, changed = experiments_mod.settled_declarations(self.config, function(key)
+		return self:live_experiment_fact_keys(key)
+	end)
+	if not records then return end
+	self.declaration_prune_owed = changed and not storage.save_experiment_declarations(self.config, records) or false
+	self.declaration_prune_pending = next(records) ~= nil or self.declaration_prune_owed
+end
+
+-- A publish settled: drop history keys no fact carries any more.
 function Client:prune_fact_key_history()
+	self:prune_declaration_markers()
 	if self.experiments then
 		self.experiments:prune_fact_key_history()
 	end
@@ -6022,6 +6065,7 @@ function Client:write_spool_record(events)
 	end
 	self.spool_settled = {}
 	self.spool_rewrite_pending = false
+	self.declaration_spool_pending = false
 	-- The whole file was just rewritten from the filtered state: no
 	-- condemned content can remain on disk.
 	self.condemned_spool_pending = false
@@ -6087,6 +6131,7 @@ function Client:retry_spool_purge()
 		-- Nothing can be owed beneath a completed purge.
 		self.spool_settled = {}
 		self.spool_rewrite_pending = false
+		self.declaration_spool_pending = false
 		self.spool_disk_deadline_ms = nil
 		-- The emptied spool also settles any condemnation debt: an empty
 		-- durable record proves cleanliness exactly like a successful
@@ -6423,7 +6468,7 @@ function Client:persist()
 		-- "unknown" client never queued anything to capture. A still-owed
 		-- durable cache sync is the one exception worth reporting: it is
 		-- consent-independent disk state an app death would leave stale.
-		if self.experiments and self.experiments:has_owed_durable_sync() then
+		if self.declaration_prune_owed or (self.experiments and self.experiments:has_owed_durable_sync()) then
 			return false, "experiments_pending"
 		end
 		return true
@@ -6470,8 +6515,10 @@ function Client:persist()
 	if not self:spool_undelivered(owed_direct) then
 		return false, "spool_persist_failed"
 	end
-	if self.experiments and (self.experiments:has_owed_exposures()
-		or self.experiments:has_owed_durable_sync()) then
+	if self.experiments then self.experiments:prune_declaration_markers()
+	else self:prune_declaration_markers() end
+	if self.declaration_prune_owed or (self.experiments and (self.experiments:has_owed_exposures()
+		or self.experiments:has_owed_durable_sync())) then
 		-- Something owed was NOT captured (a full queue denied a swept
 		-- fact, or the cache write is still failing): an OS kill right
 		-- now would lose it, so the app-may-die snapshot must not claim
@@ -6931,6 +6978,7 @@ function Client:flush(options)
 	-- storage recovers. Both ride the flush cadence (update-driven).
 	self:retry_spool_purge()
 	self:retry_spool_rewrite()
+	self:prune_declaration_markers()
 	-- Retained consent receipts (the durable outbox) ride the same dispatch
 	-- cadence as queued events and are handed to the transport strictly
 	-- BEFORE this cycle's event batch; their outcome never affects the flush

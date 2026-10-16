@@ -348,7 +348,15 @@ the `publishable_key` authenticates only the remote-config fetch.
   that run left behind: `init()` still reads the small clear marker and
   filters any matching experiment facts out of the offline spool, so a
   rollback launch cannot replay withdrawn assignment data. The
-  assignment-cache record written by that earlier run also stays on disk. A
+  assignment-cache record written by that earlier run also stays on disk.
+  Pending non-adult declarations share that existing clear record: recovery
+  treats a process death before the assignment callback as unconfirmed and
+  filters the recorded subject-fact keys before replay. The witness uses the
+  full assignment scope, preserves synthetic-unit assignments and other known
+  scopes, and remains until its cache and facts are durably settled. Failed
+  witness writes remain owed (`persist()` reports `experiments_pending`);
+  storage failing through process death before the first successful write
+  cannot supply a durable witness. No eleventh record is introduced. A
   build that has never had the flag on has no such state and this path does
   nothing — but for a storage or privacy audit the rule is: the flag gates
   the *creation* of the experiment records, not their continued existence or

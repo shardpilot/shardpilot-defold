@@ -12335,7 +12335,437 @@ function extra_tests.test_unanswered_age_declaration_keeps_captured_key_over_sto
 	assert_equal(#failures, 0, table.concat(failures, "\n"))
 end
 
+function extra_tests.test_pending_age_declaration_survives_process_death()
+	local passed, failed, errors = 0, 0, {}
+	for _, case in ipairs({
+		{ name = "adult crash control", age = "adult", keep = true },
+		{ name = "synthetic crash control", age = "under_threshold", keep = true, synthetic = true },
+		{ name = "foreign cache owner control", age = "under_threshold", foreign = true },
+		{ name = "under-threshold graceful control", age = "under_threshold", graceful = true },
+		{ name = "under-threshold process death", age = "under_threshold" },
+		{ name = "unknown process death", age = "unknown" },
+	}) do
+		local restore
+		local ok, err = pcall(function()
+			local client
+			if case.synthetic then
+				client, restore = extra_tests.age_client({ spool_enabled = true })
+				assert_true(client:session_start())
+				next_response_body = extra_tests.served_age_golden():gsub('"assignment_unit":"client_id"', '"assignment_unit":"synthetic_subject_key"', 1)
+				local admitted
+				client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function(value) admitted = value end)
+				assert_true(admitted and admitted.assigned, "setup: synthetic assignment admitted")
+				extra_tests.apply(client, "exposure-banner")
+				assert_true(extra_tests.outcome(client, "exposure-banner", "score", 1))
+			else
+				client, restore = extra_tests.applied_scene({ spool_enabled = true })
+			end
+			assert_true(client:persist(), "setup: accepted facts persist before declaration")
+			local disk_exposures, disk_outcomes = extra_tests.disk_facts(client, "exposure-banner")
+			assert_equal(disk_exposures + disk_outcomes, 2, "setup: two durable accepted facts")
+			local cached = extra_tests.durable_entry(client, "exposure-banner")
+			assert_true(cached ~= nil and cached.assignment_unit == (case.synthetic and "synthetic_subject_key" or "client_id"), "setup: durable assignment kind")
+			assert_true(client:experiment_variant("exposure-banner") ~= nil, "setup: adult serves before declaration")
+			local foreign_scope
+			if case.foreign then
+				local record = storage.load_experiments(client.config)
+				foreign_scope = require("shardpilot.experiments").build_scope(client.config.workspace_id, "other-environment", client.experiments:current_subject_id(), client.config.app_url, client.config.publishable_key)
+				record.scope = foreign_scope
+				assert_true(storage.save_experiments(client.config, record), "setup: another context owns durable cache")
+			end
+			local callbacks, held = 0, {}
+			responder = function(url, _, callback)
+				if url:find("/runtime/experiments/assignment", 1, true) then held[#held + 1] = callback; return true end
+				return false
+			end
+			client:fetch_experiment_assignment_with_age_band("exposure-banner", case.age, nil, function() callbacks = callbacks + 1 end)
+			assert_equal(#held, 1, "setup: real assignment fetch held")
+			assert_equal(callbacks, 0, "setup: no assignment answer")
+			if case.foreign then
+				local record = storage.load_experiments(client.config)
+				assert_equal(record and record.scope, foreign_scope, "arming a declaration must preserve foreign cache ownership")
+			end
+			if not case.keep then assert_nil(client:experiment_variant("exposure-banner"), "non-adult in-flight stops serving") end
+			if case.graceful then assert_true(client:shutdown(), "control: graceful shutdown completes") end
+			-- Discard the process without invoking any callback or shutdown in crash cases.
+			client = nil; held = nil; responder = nil; storage.reset()
+			local relaunch = assert(sdk.new(config({ app_key = "exposure-app", spool_enabled = true })))
+			local variant = relaunch:experiment_variant("exposure-banner")
+			print("pending declaration scene: " .. case.name .. " restored=" .. tostring(variant))
+			if case.keep then assert_true(variant ~= nil, "adult pending declaration must preserve adult cache")
+			else assert_nil(variant, "unanswered non-adult declaration must survive process death") end
+			disk_exposures, disk_outcomes = extra_tests.disk_facts(relaunch, "exposure-banner")
+			assert_equal(disk_exposures + disk_outcomes, case.keep and 2 or 0, "restart durable facts follow the declaration")
+		end)
+		responder = nil
+		if restore then restore() end
+		storage.reset()
+		if ok then passed = passed + 1 else failed = failed + 1; errors[#errors + 1] = case.name .. ": " .. tostring(err) end
+	end
+	print(string.format("pending declaration total: %d pass, %d fail", passed, failed))
+	assert_equal(failed, 0, table.concat(errors, "\n"))
+end
+
+function extra_tests.test_pending_declaration_marker_read_fails_closed()
+	local passed, failed, errors = 0, 0, {}
+	for _, mode in ipairs({ "unreadable", "invalid", "empty", "disabled" }) do
+		local restore
+		local ok, err = pcall(function()
+			local prior
+			if mode == "disabled" then
+				reset(); restore = install_fake_sys_storage(); seed_granted_consent()
+			else
+				prior, restore = extra_tests.applied_scene({ spool_enabled = true })
+				assert_true(prior:persist(), "setup: accepted adult facts persist")
+				if mode ~= "empty" then
+					local held = {}
+					responder = function(url, _, callback)
+						if url:find("/runtime/experiments/assignment", 1, true) then held[#held + 1] = callback; return true end
+						return false
+					end
+					prior:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+					assert_equal(#held, 1, "setup: unanswered declaration witness")
+					responder = nil
+				end
+			end
+			local original_load, reads = sys.load, 0
+			sys.load = function(path)
+				if path:sub(-#"/experiments-clear") == "/experiments-clear" then
+					reads = reads + 1
+					if mode == "unreadable" or mode == "disabled" then error("synthetic marker read failure") end
+					if mode == "invalid" then return { declarations = { version = "invalid" } } end
+					return {}
+				end
+				return original_load(path)
+			end
+			prior = nil; storage.reset()
+			local client = assert(sdk.new(config({ app_key = "exposure-app", experiments_enabled = mode ~= "disabled", spool_enabled = true })))
+			if mode == "unreadable" or mode == "invalid" then
+				assert_nil(client:experiment_variant("exposure-banner"), "ambiguous witness cannot restore an adult assignment")
+				local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+				assert_equal(exposures + outcomes, 0, "ambiguous witness cannot replay accepted experiment facts")
+				assert_true(reads > 0, "real marker read ran")
+			elseif mode == "empty" then
+				assert_true(client:experiment_variant("exposure-banner") ~= nil, "empty marker preserves a healthy adult cache")
+				local exposures, outcomes = extra_tests.disk_facts(client, "exposure-banner")
+				assert_equal(exposures + outcomes, 2, "empty marker preserves healthy accepted facts")
+			else
+				assert_nil(client.experiments, "disabled consumer remains dark")
+				assert_equal(reads, 0, "a fresh disabled launch never reads experimental state")
+			end
+		end)
+		responder = nil
+		if restore then restore() end
+		storage.reset()
+		if ok then passed = passed + 1 else failed = failed + 1; errors[#errors + 1] = mode .. ": " .. tostring(err) end
+	end
+	print(string.format("declaration marker-read total: %d pass, %d fail", passed, failed))
+	assert_equal(failed, 0, table.concat(errors, "\n"))
+end
+
+function extra_tests.test_pending_declaration_cache_drop_failure_keeps_witness()
+	local client, restore = extra_tests.applied_scene({ spool_enabled = true })
+	local ok, err = pcall(function()
+		assert_true(client:persist(), "setup: accepted facts persist")
+		local save = sys.save
+		sys.save = function(path, record)
+			if path:sub(-#"/experiments") == "/experiments" then return false end
+			return save(path, record)
+		end
+		local answer = extra_tests.declare_unconfirmed(client)
+		assert_true(answer ~= nil, "setup: unanswered declaration completes")
+		assert_true(client.experiments:has_owed_durable_sync(), "cache drop is still owed")
+		assert_true(extra_tests.durable_entry(client, "exposure-banner") ~= nil, "setup: failed drop leaves the old cached assignment")
+		sys.save = save
+		client = nil; storage.reset()
+		local relaunch = assert(sdk.new(config({ app_key = "exposure-app", spool_enabled = true })))
+		assert_nil(relaunch:experiment_variant("exposure-banner"), "healed relaunch must not revive the old adult cache")
+	end)
+	restore(); storage.reset()
+	assert_true(ok, tostring(err))
+	print("declaration cache-drop-failure control: PASS")
+end
+
+function extra_tests.test_pending_declaration_disabled_relaunch_filters_facts()
+	local client, restore = extra_tests.applied_scene({ spool_enabled = true })
+	local ok, err = pcall(function()
+		assert_true(client:track("declaration_host_control", { fixture = true }))
+		assert_true(client:persist(), "setup: accepted facts and unrelated host event persist")
+		local held = {}
+		responder = function(url, _, callback)
+			if url:find("/runtime/experiments/assignment", 1, true) then held[#held + 1] = callback; return true end
+			return false
+		end
+		client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+		assert_equal(#held, 1, "setup: declaration remains unanswered")
+		client = nil; held = nil; responder = nil; storage.reset()
+		local relaunch = assert(sdk.new(config({ app_key = "exposure-app", spool_enabled = true, experiments_enabled = false })))
+		assert_nil(relaunch.experiments, "disabled launch must not construct the experiment consumer")
+		local exposures, outcomes = extra_tests.disk_facts(relaunch, "exposure-banner")
+		assert_equal(exposures + outcomes, 0, "disabled relaunch must not replay facts withdrawn by the pending declaration")
+		local hosts = 0
+		for _, event in ipairs(storage.load_spool(relaunch.config) or {}) do
+			if event.event_name == "declaration_host_control" then hosts = hosts + 1 end
+		end
+		assert_equal(hosts, 1, "unrelated host event remains durable")
+	end)
+	responder = nil; restore(); storage.reset()
+	assert_true(ok, tostring(err))
+	print("declaration disabled-relaunch control: PASS")
+end
+
+function extra_tests.test_pending_declaration_marker_sections_are_independent()
+	local passed, failed, errors = 0, 0, {}
+	for _, mode in ipairs({ "save_global", "retire_global", "save_declaration" }) do
+		local client, restore = extra_tests.applied_scene({ spool_enabled = true })
+		local ok, err = pcall(function()
+			assert_true(client:persist(), "setup: adult facts persist")
+			local scope = client.experiments:scope_for(client.experiments:current_subject_id())
+			local foreign_scope = require("shardpilot.experiments").build_scope(client.config.workspace_id,
+				"other-environment", client.experiments:current_subject_id(), client.config.app_url, client.config.publishable_key)
+			local stamp = require("shardpilot.clock").unix_ms() + 10000
+			if mode == "save_declaration" then assert_true(storage.save_experiments_clear(client.config, stamp, scope)) end
+			local held = {}
+			responder = function(url, _, callback)
+				if url:find("/runtime/experiments/assignment", 1, true) then held[#held + 1] = callback; return true end
+				return false
+			end
+			client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+			assert_equal(#held, 1, "setup: non-adult declaration remains pending")
+			if mode == "save_declaration" then
+				client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil, function() end)
+				assert_equal(#held, 2, "setup: explicit adult declaration retires only its witness")
+			else
+				assert_true(storage.save_experiments_clear(client.config, stamp, foreign_scope))
+				if mode == "retire_global" then assert_true(storage.clear_experiments_clear(client.config)) end
+			end
+			responder = nil; client = nil; held = nil; storage.reset()
+			local relaunched = assert(sdk.new(config({ app_key = "exposure-app", spool_enabled = true })))
+			assert_nil(relaunched:experiment_variant("exposure-banner"), "the independent surviving witness must block the old cache")
+			local exposures, outcomes = extra_tests.disk_facts(relaunched, "exposure-banner")
+			assert_equal(exposures + outcomes, 0, "the independent surviving witness must block old accepted facts")
+		end)
+		responder = nil; restore(); storage.reset()
+		if ok then passed = passed + 1 else failed = failed + 1; errors[#errors + 1] = mode .. ": " .. tostring(err) end
+	end
+	print(string.format("declaration record-section total: %d pass, %d fail", passed, failed))
+	assert_equal(failed, 0, table.concat(errors, "\n"))
+end
+
+function extra_tests.test_pending_declaration_disabled_relaunch_keeps_retired_subject_facts()
+	for _, fail_retirement in ipairs({ false, true }) do
+	local client, restore = extra_tests.applied_scene({ spool_enabled = true })
+	local ok, err = pcall(function()
+		assert_true(client:persist())
+		local original = client.experiments:current_subject_id()
+		local original_scope = client.experiments:scope_for(original)
+		local requests_seen, held = 0, {}
+		responder = function(url, _, callback)
+			if not url:find("/runtime/experiments/assignment", 1, true) then return false end
+			requests_seen = requests_seen + 1
+			if requests_seen == 1 then
+				callback(nil, nil, { status = 400, response = json.encode({ error = { code = "subject_id_invalid", message = "synthetic subject refusal" } }) })
+			else held[#held + 1] = callback end
+			return true
+		end
+		client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+		assert_equal(requests_seen, 2, "setup: real grammar rejection re-mints and retries")
+		assert_equal(#held, 1, "setup: retry has no answer")
+		assert_true(client.experiments:current_subject_id() ~= original, "setup: current subject changed")
+		assert_true(client:persist(), "setup: persist lands the remint's old-scope drops")
+		responder = nil; client = nil; held = nil; storage.reset()
+		local relaunched = assert(sdk.new(config({ app_key = "exposure-app", spool_enabled = true, experiments_enabled = false })))
+		assert_true(relaunched.experiments_client_id ~= original, "setup: the new subject was durably adopted")
+		local exposures, outcomes = extra_tests.disk_facts(relaunched, "exposure-banner")
+		assert_equal(exposures + outcomes, 2, "the retired subject's legitimate facts must remain")
+		local before = assert(storage.load_experiment_declarations(relaunched.config))
+		assert_true(before[original_scope] ~= nil, "setup: old witness remains while its facts are live")
+		local cached = storage.load_experiments(relaunched.config)
+		assert_true(not cached or cached.scope ~= original_scope or cached.entries["exposure-banner"] == nil,
+			"setup: the actual remint removed the retired cached assignment")
+		local save = sys.save
+		sys.save = function(path, record)
+			if fail_retirement and path:sub(-#"/experiments-clear") == "/experiments-clear" then return false end
+			return save(path, record)
+		end
+		local from = #requests
+		assert_true(relaunched:flush({ include_summaries = false }))
+		exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+		assert_equal(exposures + outcomes, 2, "the legitimate old facts really reach the scripted transport")
+		if fail_retirement then
+			local saved, reason = relaunched:persist()
+			assert_true(not saved and reason == "experiments_pending", "a failed retirement remains owed")
+			assert_true(storage.load_experiment_declarations(relaunched.config)[original_scope] ~= nil,
+				"failed cleanup leaves the durable witness intact")
+			sys.save = save
+			assert_true(relaunched:persist(), "healed cleanup is retried by persist")
+		end
+		local after = assert(storage.load_experiment_declarations(relaunched.config))
+		assert_nil(after[original_scope], "the retired witness must leave after its last fact and cached assignment are gone")
+	end)
+	responder = nil; restore(); storage.reset()
+	assert_true(ok, tostring(err))
+	end
+	print("declaration retired-subject rollback controls: 2 PASS")
+end
+
+function extra_tests.test_pending_declaration_disabled_rewrite_creates_no_new_record()
+	local client, restore = extra_tests.applied_scene({ spool_enabled = true })
+	local ok, err = pcall(function()
+		assert_true(client:persist())
+		local held = {}
+		responder = function(url, _, callback)
+			if url:find("/runtime/experiments/assignment", 1, true) then held[#held + 1] = callback; return true end
+			return false
+		end
+		client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+		assert_equal(#held, 1, "setup: real pending declaration")
+		local save, debt_writes = sys.save, 0
+		sys.save = function(path, record)
+			if path:sub(-#"/spool") == "/spool" then return false end
+			if path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn" then debt_writes = debt_writes + 1 end
+			return save(path, record)
+		end
+		responder = nil; client = nil; held = nil; storage.reset()
+		local relaunched = assert(sdk.new(config({ app_key = "exposure-app", spool_enabled = true, experiments_enabled = false })))
+		assert_nil(relaunched.experiments, "rollback remains dark")
+		assert_true(relaunched.spool_rewrite_pending, "setup: durable rewrite really failed")
+		local from = #requests
+		relaunched:flush({ include_summaries = false })
+		local exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+		assert_equal(exposures + outcomes, 0, "withdrawn facts cannot escape a failed rollback rewrite")
+		assert_equal(debt_writes, 0, "a disabled launch must use its existing witness without creating a debt record")
+		sys.save = save
+		relaunched:flush({ include_summaries = false })
+		assert_true(relaunched:persist(), "healed rollback rewrite converges on its flush cadence")
+		exposures, outcomes = extra_tests.disk_facts(relaunched, "exposure-banner")
+		assert_equal(exposures + outcomes, 0, "healed file contains no withdrawn facts")
+	end)
+	responder = nil; restore(); storage.reset()
+	assert_true(ok, tostring(err))
+	print("declaration rollback rewrite allocation control: PASS")
+end
+
+function extra_tests.test_pending_declaration_failed_marker_writes_stay_owed()
+	local passed, failed, errors = 0, 0, {}
+	for _, mode in ipairs({ "arm", "retire" }) do
+		local client, restore = extra_tests.applied_scene({ spool_enabled = true })
+		local ok, err = pcall(function()
+			assert_true(client:persist())
+			local save, fail_marker = sys.save, mode == "arm"
+			sys.save = function(path, record)
+				if fail_marker and path:sub(-#"/experiments-clear") == "/experiments-clear" then return false end
+				return save(path, record)
+			end
+			local held = {}
+			responder = function(url, _, callback)
+				if url:find("/runtime/experiments/assignment", 1, true) then held[#held + 1] = callback; return true end
+				return false
+			end
+			client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+			assert_equal(#held, 1, "setup: real declaration in flight")
+			if mode == "retire" then
+				fail_marker = true
+				held[1](nil, nil, { status = 503, response = extra_tests.unavailable_body })
+			end
+			local saved, reason = client:persist()
+			assert_true(not saved and reason == "experiments_pending", "failed witness writes cannot report a safe persist")
+			fail_marker = false
+			assert_true(client:persist(), "healed witness write converges")
+			responder = nil; client = nil; held = nil; storage.reset()
+			local relaunched = assert(sdk.new(config({ app_key = "exposure-app", spool_enabled = true })))
+			assert_nil(relaunched:experiment_variant("exposure-banner"), "healed recovery must not revive the old adult cache")
+		end)
+		responder = nil; restore(); storage.reset()
+		if ok then passed = passed + 1 else failed = failed + 1; errors[#errors + 1] = mode .. ": " .. tostring(err) end
+	end
+	print(string.format("declaration write-failure total: %d pass, %d fail", passed, failed))
+	assert_equal(failed, 0, table.concat(errors, "\n"))
+end
+
+function extra_tests.test_pending_declaration_disabled_relaunch_keeps_foreign_scope_facts()
+	for _, component in ipairs({ "workspace", "environment", "origin", "credential" }) do
+		local client, restore = extra_tests.applied_scene({ spool_enabled = true })
+		local ok, err = pcall(function()
+			assert_true(client:persist())
+			local c, subject = client.config, client.experiments:current_subject_id()
+			local scope = experiments.build_scope(
+				component == "workspace" and "other-workspace" or c.workspace_id,
+				component == "environment" and "other-environment" or c.environment_id,
+				subject, component == "origin" and "http://localhost:18082" or c.app_url,
+				component == "credential" and "synthetic-other-credential" or c.publishable_key)
+			assert_true(scope ~= client.experiments:scope_for(subject), "setup: actual foreign cache scope")
+			local entry = assert(extra_tests.durable_entry(client, "exposure-banner"))
+			assert_true(storage.save_experiment_declarations(c, {
+				[scope] = { ["exposure-banner"] = { fact_keys = { entry.subject_fact_key } } }
+			}))
+			client = nil; storage.reset()
+			local relaunched = assert(sdk.new(config({ app_key = "exposure-app", spool_enabled = true, experiments_enabled = false })))
+			local exposures, outcomes = extra_tests.disk_facts(relaunched, "exposure-banner")
+			assert_equal(exposures + outcomes, 2, "a foreign " .. component .. " witness cannot withdraw this scope's facts")
+			local from = #requests
+			assert_true(relaunched:flush({ include_summaries = false }))
+			exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+			assert_equal(exposures + outcomes, 2, "the preserved facts actually reach the transport")
+		end)
+		responder = nil; restore(); storage.reset()
+		assert_true(ok, tostring(err))
+	end
+	print("declaration foreign-scope rollback controls: 4 PASS")
+end
+
+function extra_tests.test_pending_declaration_unreadable_spool_keeps_witness()
+	for _, enabled in ipairs({ true, false }) do
+		local client, restore = extra_tests.applied_scene({ spool_enabled = true })
+		local ok, err = pcall(function()
+			assert_true(client:persist())
+			local scope = client.experiments:scope_for(client.experiments:current_subject_id())
+			local held = {}
+			responder = function(url, _, callback)
+				if url:find("/runtime/experiments/assignment", 1, true) then held[#held + 1] = callback; return true end
+				return false
+			end
+			client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+			assert_equal(#held, 1, "setup: real pending fetch")
+			local load, blocked_reads = sys.load, 0
+			sys.load = function(path)
+				if path:sub(-#"/spool") == "/spool" then blocked_reads = blocked_reads + 1; error("synthetic spool read failure") end
+				return load(path)
+			end
+			responder = nil; client = nil; held = nil; storage.reset()
+			local blind = assert(sdk.new(config({ app_key = "exposure-app", spool_enabled = true, experiments_enabled = enabled })))
+			assert_true(blocked_reads > 0, "setup: the actual spool read failed")
+			assert_true(storage.load_experiment_declarations(blind.config)[scope] ~= nil,
+				"an unreadable spool cannot prove the witness settled")
+			sys.load = load; blind = nil; storage.reset()
+			local healed = assert(sdk.new(config({ app_key = "exposure-app", spool_enabled = true, experiments_enabled = enabled })))
+			assert_nil(healed:experiment_variant("exposure-banner"))
+			local exposures, outcomes = extra_tests.disk_facts(healed, "exposure-banner")
+			assert_equal(exposures + outcomes, 0, "the retained witness withdraws facts once the spool is readable")
+			local from = #requests
+			healed:flush({ include_summaries = false })
+			exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+			assert_equal(exposures + outcomes, 0, "nothing withdrawn escapes the healed launch")
+		end)
+		responder = nil; restore(); storage.reset()
+		assert_true(ok, tostring(err))
+	end
+	print("declaration unreadable-spool recovery controls: 2 PASS")
+end
+
 local tests = {
+	extra_tests.test_pending_declaration_unreadable_spool_keeps_witness,
+	extra_tests.test_pending_declaration_disabled_relaunch_keeps_foreign_scope_facts,
+	extra_tests.test_pending_declaration_marker_sections_are_independent,
+	extra_tests.test_pending_declaration_disabled_relaunch_keeps_retired_subject_facts,
+	extra_tests.test_pending_declaration_disabled_rewrite_creates_no_new_record,
+	extra_tests.test_pending_declaration_failed_marker_writes_stay_owed,
+
+	extra_tests.test_pending_age_declaration_survives_process_death,
+	extra_tests.test_pending_declaration_marker_read_fails_closed,
+	extra_tests.test_pending_declaration_cache_drop_failure_keeps_witness,
+	extra_tests.test_pending_declaration_disabled_relaunch_filters_facts,
+
 	extra_tests.test_unanswered_age_declaration_keeps_synthetic_fact_keys,
 	extra_tests.test_unanswered_age_declaration_keeps_captured_key_over_stored_synthetic,
 	extra_tests.test_terminal_assignment_answer_closes_the_key,
