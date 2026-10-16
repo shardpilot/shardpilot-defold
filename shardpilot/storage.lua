@@ -2413,13 +2413,21 @@ end
 -- either section must preserve the other section.
 local experiments_clear_memory = {}
 
+function M.experiment_scope_components(value)
+	if type(value) ~= "string" then return nil end
+	local workspace, environment, subject, url, fingerprint = value:match(
+		"^([^\31]*)\31([^\31]*)\31([^\31]*)\31([^\31]*)\31([^\31]*)$")
+	if not workspace or #fingerprint ~= 8 or not fingerprint:match("^%x+$") then return nil end
+	return { workspace, environment, subject, url, fingerprint }
+end
+
 local function copy_experiment_declarations(record)
 	if record == nil then return {} end
 	if type(record) ~= "table" then return nil end
 	if record.version ~= 1 or type(record.scopes) ~= "table" then return nil end
 	local scopes = {}
 	for scope, experiments in pairs(record.scopes) do
-		if type(scope) ~= "string" or scope == "" or type(experiments) ~= "table" then return nil end
+		if not M.experiment_scope_components(scope) or type(experiments) ~= "table" then return nil end
 		local entries = {}
 		for key, marker in pairs(experiments) do
 			if type(key) ~= "string" or key == "" or type(marker) ~= "table" then return nil end

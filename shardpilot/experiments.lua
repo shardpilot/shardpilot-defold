@@ -248,6 +248,26 @@ function M.build_scope(workspace_id, environment_id, subject_id, base_url, crede
 		.. M.credential_fingerprint(credential)
 end
 
+-- A rollback can omit the assignment endpoint and credential. Compare the
+-- complete stored tuple against every component still known; an unknown
+-- component cannot disprove the recorded withdrawal.
+function M.declaration_covers_scope(config, subject, scope)
+	local parts = storage.experiment_scope_components(scope)
+	if not parts then return true end
+	local expected = {
+		config.workspace_id and escape_component(config.workspace_id),
+		config.environment_id and escape_component(config.environment_id),
+		M.valid_subject_id(subject) and escape_component(subject) or nil,
+		type(config.app_url) == "string" and config.app_url ~= "" and trim_slash(config.app_url) or nil,
+		type(config.publishable_key) == "string" and config.publishable_key ~= ""
+			and M.credential_fingerprint(config.publishable_key) or nil,
+	}
+	for i = 1, 5 do
+		if expected[i] ~= nil and expected[i] ~= parts[i] then return false end
+	end
+	return true
+end
+
 local function trim(value)
 	return (value:gsub("^%s+", ""):gsub("%s+$", ""))
 end

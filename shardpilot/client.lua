@@ -2095,13 +2095,8 @@ function M.new(config, defer_init_diagnostics)
 		-- keeps that key.
 		client.experiments:on_spool_restored()
 	elseif client.declaration_recovery_records then
-		local recovery_scope
-		if experiments_mod.valid_subject_id(client.experiments_client_id) then
-			recovery_scope = experiments_mod.build_scope(normalized.workspace_id, normalized.environment_id,
-				client.experiments_client_id, normalized.app_url, normalized.publishable_key)
-		end
 		for scope, experiments in pairs(client.declaration_recovery_records) do
-			if recovery_scope == nil or scope == recovery_scope then
+			if experiments_mod.declaration_covers_scope(normalized, client.experiments_client_id, scope) then
 				for key, marker in pairs(experiments) do
 					local fact_keys = {}
 					for _, fact_key in ipairs(marker.fact_keys) do fact_keys[fact_key] = true end

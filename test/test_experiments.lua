@@ -12684,34 +12684,41 @@ function extra_tests.test_pending_declaration_failed_marker_writes_stay_owed()
 end
 
 function extra_tests.test_pending_declaration_disabled_relaunch_keeps_foreign_scope_facts()
-	for _, component in ipairs({ "workspace", "environment", "origin", "credential" }) do
-		local client, restore = extra_tests.applied_scene({ spool_enabled = true })
-		local ok, err = pcall(function()
-			assert_true(client:persist())
-			local c, subject = client.config, client.experiments:current_subject_id()
-			local scope = experiments.build_scope(
-				component == "workspace" and "other-workspace" or c.workspace_id,
-				component == "environment" and "other-environment" or c.environment_id,
-				subject, component == "origin" and "http://localhost:18082" or c.app_url,
-				component == "credential" and "synthetic-other-credential" or c.publishable_key)
-			assert_true(scope ~= client.experiments:scope_for(subject), "setup: actual foreign cache scope")
-			local entry = assert(extra_tests.durable_entry(client, "exposure-banner"))
-			assert_true(storage.save_experiment_declarations(c, {
-				[scope] = { ["exposure-banner"] = { fact_keys = { entry.subject_fact_key } } }
-			}))
-			client = nil; storage.reset()
-			local relaunched = assert(sdk.new(config({ app_key = "exposure-app", spool_enabled = true, experiments_enabled = false })))
-			local exposures, outcomes = extra_tests.disk_facts(relaunched, "exposure-banner")
-			assert_equal(exposures + outcomes, 2, "a foreign " .. component .. " witness cannot withdraw this scope's facts")
-			local from = #requests
-			assert_true(relaunched:flush({ include_summaries = false }))
-			exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
-			assert_equal(exposures + outcomes, 2, "the preserved facts actually reach the transport")
-		end)
-		responder = nil; restore(); storage.reset()
-		assert_true(ok, tostring(err))
+	for _, missing_url in ipairs({ false, true }) do
+		for _, component in ipairs({ "workspace", "environment", "origin", "credential" }) do
+			local client, restore = extra_tests.applied_scene({ spool_enabled = true })
+			local ok, err = pcall(function()
+				assert_true(client:persist())
+				local c, subject = client.config, client.experiments:current_subject_id()
+				local scope = experiments.build_scope(
+					component == "workspace" and "other-workspace" or c.workspace_id,
+					component == "environment" and "other-environment" or c.environment_id,
+					subject, component == "origin" and "http://localhost:18082" or c.app_url,
+					component == "credential" and "synthetic-other-credential" or c.publishable_key)
+				assert_true(scope ~= client.experiments:scope_for(subject), "setup: actual foreign cache scope")
+				local entry = assert(extra_tests.durable_entry(client, "exposure-banner"))
+				assert_true(storage.save_experiment_declarations(c, {
+					[scope] = { ["exposure-banner"] = { fact_keys = { entry.subject_fact_key } } }
+				}))
+				client = nil; storage.reset()
+				local rollback = config({ app_key = "exposure-app", spool_enabled = true, experiments_enabled = false, remote_config_enabled = false })
+				if missing_url then rollback.app_url = nil end
+				local relaunched = assert(sdk.new(rollback))
+				local expected = missing_url and component == "origin" and 0 or 2
+				local exposures, outcomes = extra_tests.disk_facts(relaunched, "exposure-banner")
+				assert_equal(exposures + outcomes, expected, expected == 2
+					and "a foreign " .. component .. " witness cannot withdraw this scope's facts"
+					or "an omitted assignment origin cannot disprove its witness")
+				local from = #requests
+				assert_true(relaunched:flush({ include_summaries = false }))
+				exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+				assert_equal(exposures + outcomes, expected, "only facts outside the matching known scope reach the transport")
+			end)
+			responder = nil; restore(); storage.reset()
+			assert_true(ok, tostring(err))
+		end
 	end
-	print("declaration foreign-scope rollback controls: 4 PASS")
+	print("declaration foreign-scope rollback controls: 8 PASS")
 end
 
 function extra_tests.test_pending_declaration_unreadable_spool_keeps_witness()
@@ -12753,7 +12760,36 @@ function extra_tests.test_pending_declaration_unreadable_spool_keeps_witness()
 	print("declaration unreadable-spool recovery controls: 2 PASS")
 end
 
+function extra_tests.test_pending_declaration_disabled_without_assignment_configuration()
+	local client, restore = extra_tests.applied_scene({ spool_enabled = true })
+	local ok, err = pcall(function()
+		assert_true(client:persist())
+		local held = {}
+		responder = function(url, _, callback)
+			if url:find("/runtime/experiments/assignment", 1, true) then held[#held + 1] = callback; return true end
+			return false
+		end
+		client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+		assert_equal(#held, 1, "setup: the declaration is really in flight")
+		local rollback = config({ app_key = "exposure-app", spool_enabled = true, experiments_enabled = false, remote_config_enabled = false })
+		rollback.app_url = nil
+		responder = nil; client = nil; held = nil; storage.reset()
+		local relaunched = assert(sdk.new(rollback))
+		assert_nil(relaunched.experiments, "rollback has no experiment consumer")
+		local exposures, outcomes = extra_tests.disk_facts(relaunched, "exposure-banner")
+		assert_equal(exposures + outcomes, 0, "rollback without an assignment URL must still honor the durable witness")
+		local from = #requests
+		relaunched:flush({ include_summaries = false })
+		exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
+		assert_equal(exposures + outcomes, 0, "the withdrawn facts must not reach the transport")
+	end)
+	responder = nil; restore(); storage.reset()
+	assert_true(ok, tostring(err))
+	print("declaration unconfigured rollback control: PASS")
+end
+
 local tests = {
+	extra_tests.test_pending_declaration_disabled_without_assignment_configuration,
 	extra_tests.test_pending_declaration_unreadable_spool_keeps_witness,
 	extra_tests.test_pending_declaration_disabled_relaunch_keeps_foreign_scope_facts,
 	extra_tests.test_pending_declaration_marker_sections_are_independent,

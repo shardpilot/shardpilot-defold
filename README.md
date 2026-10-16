@@ -1451,6 +1451,7 @@ the spool. Synthetic-unit assignments remain exempt. A rollback launch with
 experiments disabled filters those facts too, without constructing the consumer
 or creating an additional experiment record. Witnesses use the full assignment
 scope; a known different subject, environment, endpoint or credential is preserved.
+Omitting the assignment endpoint or credential on rollback does not disprove a witness.
 A witness stays while its covered cache or facts remain, or their durable cleanup
 cannot be proved, and is removed once those references settle. The shared clear
 record is bounded to 393216 estimated bytes; an oversized update fails whole,

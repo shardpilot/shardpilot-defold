@@ -353,7 +353,9 @@ the `publishable_key` authenticates only the remote-config fetch.
   treats a process death before the assignment callback as unconfirmed and
   filters the recorded subject-fact keys before replay. The witness uses the
   full assignment scope, preserves synthetic-unit assignments and other known
-  scopes, and remains until its cache and facts are durably settled. Failed
+  scopes, and remains until its cache and facts are durably settled. A rollback
+  may omit the assignment endpoint or credential; recovery compares every
+  component still known instead of treating an omitted value as a different scope. Failed
   witness writes remain owed (`persist()` reports `experiments_pending`);
   storage failing through process death before the first successful write
   cannot supply a durable witness. No eleventh record is introduced. A
