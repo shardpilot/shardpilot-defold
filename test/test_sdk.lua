@@ -18040,3 +18040,99 @@ end)()
 	print(string.format("SOFT consent total: %d pass, %d fail", passed, failed))
 	assert_equal(failed, 0, table.concat(errors, "\n"))
 end)()
+
+-- Actual public shutdown, transport acknowledgement and storage adapter; the
+-- sys persistence backend is the existing table-backed test fixture.
+;(function()
+ local passed, failed = 0, 0
+ for _, mode in ipairs({ "healthy", "recover", "deadline" }) do
+  reset(); storage.reset()
+  local previous_socket, previous_http = socket, http.request
+  local _, restore = install_stub_sys_storage()
+  socket = { now = 1000, gettime = function() return socket.now end }
+  local handle, state, detail
+  local ok, err = pcall(function()
+   seed_granted_consent()
+   local issues, calls = {}, {}
+   local public = require("shardpilot.sdk")
+   handle = assert(public.new(config({ flush_interval_seconds = 9999,
+    diagnostics = function(issue) issues[#issues + 1] = issue end })))
+   state = require("test.inspect_client").state(handle)
+   assert_true(handle:identify("user-example"))
+   assert_true(handle:track("shutdown_ack_fixture", { synthetic = true }))
+   local held = hold_http_requests()
+   assert_true(handle:shutdown(1, function(value, code)
+    calls[#calls + 1] = { value = value, code = code }
+   end))
+   assert_equal(#calls, 0, "setup: shutdown really waits for the held HTTP response")
+   local target
+   for _, event in ipairs(storage.load_spool(identity_scope)) do
+    if event.event_name == "shutdown_ack_fixture" then target = event.event_id end
+   end
+   assert_true(target ~= nil, "setup: the actual shutdown captured the target before acknowledgement")
+   local writable, writes = mode == "healthy", 0
+   local save = sys.save
+   sys.save = function(path, record)
+    if path:sub(-6) == "/spool" and not writable then writes = writes + 1; return false end
+    return save(path, record)
+   end
+   while held[1] do release_held_request(held); handle:update(0) end
+   assert_true(handle:snapshot().published > 0, "setup: the actual SDK processed an acknowledgement")
+   local function retained()
+    for _, event in ipairs(storage.load_spool(identity_scope)) do
+     if event.event_id == target then return true end
+    end
+    return false
+   end
+   detail = string.format("mode=%s callbacks=%d live=%s rewrite=%s retained=%s writes=%d",
+    mode, #calls, tostring(state.initialized), tostring(state.spool_rewrite_pending), tostring(retained()), writes)
+   if mode ~= "healthy" then
+    assert_true(writes > 0, "setup: the acknowledged-copy removal rewrite really failed")
+    assert_true(state.spool_rewrite_pending and retained(), "setup: the acknowledged copy remains in the persisted fixture")
+    assert_equal(#calls, 0, "shutdown must wait for acknowledged-copy cleanup")
+    assert_true(state.initialized, "the close must stay alive while cleanup is owed")
+    local attempts = writes
+    handle:update(0)
+    assert_true(writes > attempts, "closing retries storage even before the batching cadence")
+    assert_equal(#calls, 0, "a failed retry still cannot complete shutdown")
+    if mode == "recover" then
+     writable = true; socket.now = socket.now + 0.25; handle:update(0)
+    else
+     socket.now = socket.now + 1; handle:update(0)
+    end
+   end
+   assert_equal(#calls, 1, "the close answers once")
+   assert_equal(calls[1].value, mode ~= "deadline", "the answer reflects completed cleanup")
+   assert_equal(calls[1].code, mode == "deadline" and "spool_persist_failed" or nil, "cleanup deadline code")
+   assert_equal(state.initialized, false, "every completed or expired close tears down")
+   if mode == "deadline" then
+    assert_true(retained(), "a failed cleanup is reported rather than pretending the stale copy is gone")
+    local shutdown_issues = 0
+    for _, issue in ipairs(issues) do
+     if issue.scope == "shutdown" and issue.code == "spool_persist_failed" then shutdown_issues = shutdown_issues + 1 end
+    end
+    assert_equal(shutdown_issues, 1, "the deadline produces one shutdown storage diagnostic")
+   else
+    assert_equal(state.spool_rewrite_pending, false, "successful shutdown has no acknowledged-copy debt")
+    assert_equal(retained(), false, "successful cleanup removed the persisted target")
+    storage.reset(); http.request = previous_http
+    local replacement = assert(public.new(config({ flush_interval_seconds = 9999 })))
+    local replacement_state = require("test.inspect_client").state(replacement)
+    assert_equal(replacement_state:spool_pending(), false, "a replacement cannot replay the acknowledged target")
+    local replacement_calls = {}
+    assert_true(replacement:shutdown(1, function(value, code) replacement_calls[#replacement_calls + 1] = { value, code } end))
+    assert_equal(#replacement_calls, 1); assert_equal(replacement_calls[1][1], true); assert_equal(replacement_calls[1][2], nil)
+   end
+   socket.now = socket.now + 2; handle:update(0)
+   assert_equal(#calls, 1, "later ticks do not answer again")
+   print("shutdown ack result " .. mode .. " value=" .. tostring(calls[1].value) .. " code=" .. tostring(calls[1].code))
+  end)
+  if state and state.initialized then state:finish_teardown() end
+  http.request, socket = previous_http, previous_socket
+  restore(); storage.reset()
+  print("shutdown ack scene " .. (detail or mode) .. ": " .. (ok and "PASS" or "FAIL " .. tostring(err)))
+  if ok then passed = passed + 1 else failed = failed + 1 end
+ end
+ print(string.format("shutdown ack total: %d pass, %d fail", passed, failed))
+ assert_equal(failed, 0, "acknowledged-copy shutdown scenes")
+end)()

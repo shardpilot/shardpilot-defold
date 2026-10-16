@@ -7305,9 +7305,9 @@ end
 -- The callback runs once, on the main loop, with (true) or (false, code):
 --   pending               the deadline passed; the remnant is in the durable
 --                         spool for the next launch
---   spool_persist_failed  at the deadline storage could not keep everything:
---                         the remnant, a consent receipt or decision, or
---                         experiment state (a diagnostic names which)
+--   spool_persist_failed  at the deadline storage could not finish required
+--                         persistence or acknowledged-copy cleanup (a
+--                         diagnostic names what remains owed)
 --   <error code>          the server refused events of the final flush
 --                         terminally
 --   shutdown              the client was already shut down
@@ -7324,6 +7324,7 @@ local DEADLINE_CODES = {
 local RETRY_CODES = {
 	consent_pending = true,
 	experiments_pending = true,
+	spool_persist_failed = true,
 	queue_full = true,
 	pending = true,
 }
@@ -7708,6 +7709,12 @@ function Client:shutdown()
 		if self.experiments:has_owed_durable_sync() then
 			return false, "experiments_pending"
 		end
+	end
+	-- Delivery can finish while its acknowledged copy still needs a removal
+	-- rewrite. Keep the close retryable until that final storage work lands;
+	-- the bounded close reports the failure if its deadline arrives first.
+	if self.spool_rewrite_pending then
+		return false, "spool_persist_failed"
 	end
 	self:finish_teardown()
 	return true
