@@ -17903,3 +17903,140 @@ end)()
 	print("consent scope total: " .. passed .. " pass, " .. failed .. " fail")
 	assert_equal(failed, 0, "consent scope key scenes")
 end)()
+
+-- The policy fixture supplies authority only for this later integration flow;
+-- the real resolver's unknown-restriction barrier remains covered separately.
+;(function()
+	local passed, failed, errors = 0, 0, {}
+	for _, case in ipairs({
+		{ name = "SOFT explicit Off after restored grant", choice = false, explicit = true, seed = true, state = "denied", receipt = false },
+		{ name = "SOFT untouched default", state = "unknown" },
+		{ name = "SOFT explicit On", choice = true, explicit = true, state = "granted", receipt = true },
+		{ name = "SOFT explicit On survives STRICT", choice = true, explicit = true, state = "granted", receipt = true, strict = true },
+	}) do
+		reset(); storage.reset()
+		local stores, restore = install_stub_sys_storage()
+		local modules, globals = {}, {}
+		for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform", "shardpilot.consent_policy" }) do modules[name] = package.loaded[name] end
+		for _, name in ipairs({ "init", "update", "final", "on_message", "on_input", "host_age_band", "present_consent_notice", "window", "print" }) do globals[name] = _G[name] end
+		local request, actual = http.request, nil
+		local result
+		local ok, err = pcall(function()
+			http.request = function(url, method, callback, headers, body)
+				requests[#requests + 1] = { url = url, method = method, body = body }
+				local consent = url:find("/v1/consent", 1, true) ~= nil
+				callback(nil, nil, { status = consent and 200 or 202,
+					response = consent and '{"recorded":true,"replayed":false}' or '{"accepted":1}' })
+			end
+			if case.seed then
+				local seed = dofile("shardpilot/sdk.lua")
+				assert_true(seed.init(config()), "setup: actual SDK initializes")
+				assert_true(seed.identify("user-example"))
+				assert_true(seed.set_consent(true), "setup: actual grant is recorded")
+				assert_equal(storage.load(identity_scope).consent_analytics, "granted", "setup: durable grant")
+				local closed = false
+				seed.shutdown(nil, function(value) closed = value end)
+				assert_true(closed, "setup: the seed client fully closes")
+				storage.reset(); requests = {}
+			end
+			local policy = require("shardpilot.consent_policy")
+			local decision = {
+				regime = policy.SOFT_OPT_OUT, plan_used = true,
+				consent_text_version = "fixture-notice", presented_language = "en", policy_version = "fixture-policy",
+				explicit_grant_required = false, analytics_choice_default = policy.CHOICE_DEFAULT_ON,
+				crash_profile = policy.CRASH_OFF, valid_for_seconds = 1000, operation_blocks = {},
+			}
+			package.loaded["shardpilot.consent_policy"] = setmetatable({
+				prepare = function(_, callback) callback(decision) end, invalidate = function() end,
+			}, { __index = policy })
+			actual = dofile("shardpilot/sdk.lua")
+			local initialize, init_calls, restored = actual.init, 0, nil
+			actual.init = function(...)
+				init_calls = init_calls + 1
+				local value, reason = initialize(...)
+				restored = actual.get_consent_state()
+				return value, reason
+			end
+			package.loaded["shardpilot.sdk"] = actual
+			package.loaded["shardpilot.platform"] = { detect = function() return "windows" end }
+			package.loaded["shardpilot.crash"] = { shutdown = function() return true end }
+			local listener, notices, pending_answer = nil, 0, nil
+			window = { WINDOW_EVENT_FOCUS_GAINED = "focus_gained", set_listener = function(value) listener = value end }
+			print = function() end
+			assert(loadfile("examples/minimal/main.script"))()
+			host_age_band = function() return "adult" end
+			if case.explicit then
+				present_consent_notice = function(_, callback)
+					notices = notices + 1
+					pending_answer = function() callback(case.choice, true) end
+				end
+			end
+			init(nil)
+			assert_equal(init_calls, 0, "setup: no real SDK client before the screen's final answer")
+			if pending_answer then
+				local deliver = pending_answer
+				pending_answer = nil
+				deliver()
+			end
+			update(nil, 0)
+			assert_equal(init_calls, 1, "setup: real example initializes the actual SDK exactly once")
+			assert_equal(restored, case.seed and "granted" or "unknown", "setup: persisted decision really restores")
+			local state = actual.get_consent_state()
+			local persisted = storage.load(identity_scope).consent_analytics
+			local receipts = {}
+			for _, sent in ipairs(requests) do
+				if sent.url:find("/v1/consent", 1, true) then receipts[#receipts + 1] = json.decode(sent.body) end
+			end
+			local from = #requests
+			local tracked, reason = actual.track("soft_consent_fixture", { synthetic = true })
+			local flushed, flush_reason
+			local flush_started, start_reason = actual.flush(1, function(value, code)
+				flushed, flush_reason = value, code
+			end)
+			assert_true(flush_started, "setup: the public bounded flush starts: " .. tostring(start_reason))
+			actual.update(0)
+			local batches = 0
+			for i = from + 1, #requests do if requests[i].url:find("events:batch", 1, true) then batches = batches + 1 end end
+			result = string.format("%s restored=%s state=%s durable=%s receipts=%d event_batches=%d tracked=%s/%s flush=%s/%s",
+				case.name, tostring(restored), tostring(state), tostring(persisted), #receipts, batches,
+				tostring(tracked), tostring(reason), tostring(flushed), tostring(flush_reason))
+			assert_equal(state, case.state, "the actual SDK follows the player's SOFT choice")
+			if case.state == "unknown" then
+				assert_true(persisted ~= "granted", "the untouched default cannot write a grant")
+			else
+				assert_equal(persisted, case.state, "the decision is durable")
+			end
+			assert_equal(#receipts, case.receipt ~= nil and 1 or 0, "only an explicit decision creates a receipt")
+			if case.receipt ~= nil then assert_equal(receipts[1].categories.analytics, case.receipt) end
+			if case.state == "granted" then
+				assert_true(tracked and batches > 0, "explicit On really opens transmission")
+			else
+				assert_true(not tracked and batches == 0, "Off/default cannot open transmission")
+				assert_equal(reason, case.state == "denied" and "consent_denied" or "consent_unknown")
+			end
+			if case.strict then
+				decision.regime = policy.STRICT_OPT_IN
+				decision.explicit_grant_required = true
+				decision.analytics_choice_default = policy.CHOICE_DEFAULT_OFF
+				assert_true(listener ~= nil, "setup: the real example installs its lifecycle listener")
+				listener(nil, window.WINDOW_EVENT_FOCUS_GAINED, nil)
+				update(nil, 0); update(nil, 0)
+				assert_equal(notices, 1, "an explicit SOFT grant already satisfies the later strict choice")
+				assert_equal(init_calls, 1, "the explicit grant's client is not needlessly replaced")
+				assert_equal(actual.get_consent_state(), "granted")
+				local count = 0
+				for _, sent in ipairs(requests) do if sent.url:find("/v1/consent", 1, true) then count = count + 1 end end
+				assert_equal(count, 1, "the same explicit grant must not be recorded twice")
+			end
+		end)
+		if actual then actual.shutdown(nil, function() end) end
+		http.request = request
+		for _, name in ipairs({ "shardpilot.sdk", "shardpilot.crash", "shardpilot.platform", "shardpilot.consent_policy" }) do package.loaded[name] = modules[name] end
+		for _, name in ipairs({ "init", "update", "final", "on_message", "on_input", "host_age_band", "present_consent_notice", "window", "print" }) do _G[name] = globals[name] end
+		restore(); storage.reset()
+		print("SOFT consent scene " .. (result or case.name) .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+		if ok then passed = passed + 1 else failed = failed + 1; errors[#errors + 1] = case.name .. ": " .. tostring(err) end
+	end
+	print(string.format("SOFT consent total: %d pass, %d fail", passed, failed))
+	assert_equal(failed, 0, table.concat(errors, "\n"))
+end)()

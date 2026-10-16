@@ -34,5 +34,11 @@ Drop `main.script` into a Defold collection. Set the consent-policy context's
 to your ingest origin and `app_url` to your application origin; the example
 also sets `remote_config_enabled = true`. Set the crash configuration's
 `crash_url` to your crash origin. Replace
-`present_consent_notice` — the placeholder declines immediately, so the example
-runs with every plan-dependent lane closed while it cannot authenticate a plan.
+`present_consent_notice` with your screen. Its callback takes
+`(granted, explicitly_decided)`: distinguish an explicit On/Off choice from an
+untouched default. Explicit Off persists a denial even under SOFT, explicit On
+persists a grant, and the untouched SOFT default writes neither. The placeholder
+answers the regime's default later from `update()`, marked as untouched. The
+example keeps every plan-dependent lane closed while it cannot authenticate a
+plan; the callback does not supply that authority or a non-objection admission
+path.
