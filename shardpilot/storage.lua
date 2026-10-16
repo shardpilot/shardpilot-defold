@@ -2408,84 +2408,129 @@ end
 -- possible durable mark (a per-file failure of the record must not take the
 -- condemnation down with it; if the whole store is down, both writes fail
 -- and the documented storage-down-through-exit residual applies).
+-- The existing clear record also witnesses pending host declarations. The
+-- global clear and per-scope declarations share one bounded record; changing
+-- either section must preserve the other section.
 local experiments_clear_memory = {}
 
--- The marker carries BOTH the clear's stamp and the assignment SCOPE it was
--- decided for: the record file is shared across every assignment scope in
--- this per-app namespace, and a sentinel for one environment/credential
--- must never condemn another scope's entries just because their stamps are
--- older. Returns (stamp, clear_scope); clear_scope may be nil only for a
--- legacy/degenerate record, which consumers treat conservatively.
-function M.load_experiments_clear(scope)
-	local ns = spool_namespace(scope)
-	local record = nil
-	local read_failed = false
+function M.experiment_scope_components(value)
+	if type(value) ~= "string" then return nil end
+	local workspace, environment, subject, url, fingerprint = value:match(
+		"^([^\31]*)\31([^\31]*)\31([^\31]*)\31([^\31]*)\31([^\31]*)$")
+	if not workspace or #fingerprint ~= 8 or not fingerprint:match("^%x+$") then return nil end
+	return { workspace, environment, subject, url, fingerprint }
+end
+
+local function copy_experiment_declarations(record)
+	if record == nil then return {} end
+	if type(record) ~= "table" then return nil end
+	if record.version ~= 1 or type(record.scopes) ~= "table" then return nil end
+	local scopes = {}
+	for scope, experiments in pairs(record.scopes) do
+		if not M.experiment_scope_components(scope) or type(experiments) ~= "table" then return nil end
+		local entries = {}
+		for key, marker in pairs(experiments) do
+			if type(key) ~= "string" or key == "" or type(marker) ~= "table" then return nil end
+			if type(marker.fact_keys) ~= "table" then return nil end
+			local keys, seen, count, maximum = {}, {}, 0, 0
+			for index, fact_key in pairs(marker.fact_keys) do
+				if type(index) ~= "number" or index % 1 ~= 0 or index < 1
+					or not valid_subject_fact_key(fact_key) then return nil end
+				count = count + 1
+				maximum = math.max(maximum, index)
+				if not seen[fact_key] then seen[fact_key] = true; keys[#keys + 1] = fact_key end
+			end
+			if maximum ~= count then return nil end
+			table.sort(keys)
+			entries[key] = { fact_keys = keys }
+		end
+		if next(entries) ~= nil then scopes[scope] = entries end
+	end
+	return scopes
+end
+
+local function read_experiment_marker(config)
+	local ns = spool_namespace(config)
+	local record
 	local path = save_path(ns, "experiments-clear")
 	if path then
 		local ok, loaded = pcall(sys.load, path)
-		if ok and type(loaded) == "table" then
-			record = loaded
+		if ok and type(loaded) == "table" then record = loaded
 		elseif not ok then
-			read_failed = true
+			-- Preserve the existing armed-shadow rule. Without a successfully saved
+			-- shadow, an unreadable marker is unknown and consumers fail closed.
+			if experiments_clear_memory[ns] then return experiments_clear_memory[ns], nil, true end
+			return nil, "unreadable"
 		end
 	end
-	if record == nil then
-		record = experiments_clear_memory[ns]
-	end
-	if type(record) ~= "table" or type(record.stamp) ~= "number" then
-		if read_failed and record == nil then
-			-- The sidecar READ errored and no in-process shadow backs it:
-			-- an armed condemnation may be sitting in the unreadable file,
-			-- and reading that as "no marker" would let a perfectly
-			-- readable spool replay condemned facts after a restart (the
-			-- shadow is empty then by construction). The third return
-			-- lets consumers fail CLOSED — treat the marker as armed with
-			-- unknown stamp/scope — until a readable pass decides it. A
-			-- readable-but-garbled record still reads as absent (the
-			-- corrupt-is-a-miss canon), and a present shadow (a marker
-			-- this process saved) is served as armed like always.
-			return nil, nil, "unreadable"
-		end
-		return nil
-	end
-	local clear_scope = type(record.scope) == "string" and record.scope ~= ""
-		and record.scope or nil
-	return record.stamp, clear_scope
+	return record or experiments_clear_memory[ns] or {}
 end
 
-function M.save_experiments_clear(scope, stamp, clear_scope)
-	if type(stamp) ~= "number" or type(clear_scope) ~= "string"
-		or clear_scope == "" then
-		return false
-	end
-	local ns = spool_namespace(scope)
-	local stored = { stamp = stamp, scope = clear_scope }
+local function write_experiment_marker(config, stamp, clear_scope, declarations)
+	local stored = {}
+	if type(stamp) == "number" then stored.stamp, stored.scope = stamp, clear_scope end
+	if next(declarations) ~= nil then stored.declarations = { version = 1, scopes = declarations } end
+	-- Use the assignment cache's existing allocation budget. Refuse an
+	-- oversized witness whole: truncating it could authorize a restart.
+	if approx_record_bytes(stored) > max_experiments_record_bytes then return false end
+	local ns = spool_namespace(config)
 	local path = save_path(ns, "experiments-clear")
-	if not path then
-		experiments_clear_memory[ns] = stored
-		return true
+	if path then
+		local ok, saved = pcall(sys.save, path, stored)
+		if not (ok and saved == true) then return false end
 	end
-	local ok, saved = pcall(sys.save, path, stored)
-	if not (ok and saved == true) then
-		return false
-	end
-	experiments_clear_memory[ns] = stored
+	experiments_clear_memory[ns] = next(stored) ~= nil and stored or nil
 	return true
 end
 
-function M.clear_experiments_clear(scope)
-	local ns = spool_namespace(scope)
-	local path = save_path(ns, "experiments-clear")
-	if not path then
-		experiments_clear_memory[ns] = nil
-		return true
-	end
-	local ok, saved = pcall(sys.save, path, {})
-	if not (ok and saved == true) then
-		return false
-	end
-	experiments_clear_memory[ns] = nil
-	return true
+-- The fourth result is independent of the legacy whole-record clear. A
+-- declaration-only record has no global condemnation stamp. An invalid new
+-- section is unknown, not permission to restore its covered assignments.
+function M.load_experiments_clear(config)
+	local record, miss = read_experiment_marker(config)
+	if miss then return nil, nil, miss, {} end
+	local declarations = copy_experiment_declarations(record.declarations)
+	if not declarations then return nil, nil, "unreadable", {} end
+	local stamp = type(record.stamp) == "number" and record.stamp or nil
+	local clear_scope = stamp ~= nil and type(record.scope) == "string" and record.scope ~= "" and record.scope or nil
+	return stamp, clear_scope, nil, declarations
+end
+
+function M.save_experiments_clear(config, stamp, clear_scope)
+	if type(stamp) ~= "number" or type(clear_scope) ~= "string" or clear_scope == "" then return false end
+	local record, miss = read_experiment_marker(config)
+	if miss then return false end
+	local declarations = copy_experiment_declarations(record.declarations)
+	if not declarations then return false end
+	return write_experiment_marker(config, stamp, clear_scope, declarations)
+end
+
+function M.clear_experiments_clear(config)
+	local record, miss = read_experiment_marker(config)
+	if miss then return false end
+	-- The caller has proved the unknown global condemnation clean before
+	-- retiring it; malformed declaration metadata has no remaining data to
+	-- guard then. Valid declarations still retain their independent witness.
+	local declarations = copy_experiment_declarations(record.declarations) or {}
+	return write_experiment_marker(config, nil, nil, declarations)
+end
+
+function M.load_experiment_declarations(config)
+	local record, miss, shadow = read_experiment_marker(config)
+	if miss or shadow then return nil, "unreadable" end
+	local declarations = copy_experiment_declarations(record.declarations)
+	return declarations, declarations == nil and "unreadable" or nil
+end
+
+function M.save_experiment_declarations(config, declarations)
+	local copied = copy_experiment_declarations({ version = 1, scopes = declarations })
+	if not copied then return false end
+	local record, miss, shadow = read_experiment_marker(config)
+	if miss or shadow then return false end
+	if not copy_experiment_declarations(record.declarations) then return false end
+	local stamp = type(record.stamp) == "number" and record.stamp or nil
+	local clear_scope = type(record.scope) == "string" and record.scope ~= "" and record.scope or nil
+	return write_experiment_marker(config, stamp, clear_scope, copied)
 end
 
 -- Durable age-withdrawal debt: the spooled experiment facts an age

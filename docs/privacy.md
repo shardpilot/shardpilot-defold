@@ -260,7 +260,22 @@ them.
   **and the record scope**. That scope is a derived string over the workspace
   id, environment id, the SDK-minted subject id, the remote-config base URL,
   and a short non-secret fingerprint of the API key (a hash — the key itself
-  is never written to disk).
+  is never written to disk). The same file also holds a versioned
+  `declarations` section: pending non-adult declarations indexed by full scope
+  and experiment key, with the server-minted subject-fact keys they cover.
+  This section holds no targeting attributes or event payloads. It is saved
+  before dispatch so process death cannot restore the previous adult assignment
+  as though the declaration never happened. Recovery withholds that assignment
+  and filters the covered undelivered facts, even on a rollback launch with
+  experiments disabled. Synthetic-unit assignments are exempt. Independent
+  whole-cache clears and declaration updates preserve each other's sections.
+  Witnesses remain while their covered assignment or facts survive, or storage
+  cannot prove their cleanup, and leave once those references settle. The file
+  is capped at 393216 estimated bytes; an oversized update fails without
+  discarding existing witnesses. Failed writes remain owed and surface as
+  `experiments_pending` from `persist()`. A process death before any successful
+  witness write retains the storage-down-through-exit limitation. This extends
+  the existing clear record; the durable inventory remains ten records.
 - **Experiment age-withdrawal record** (`experiments-withdrawn`) — written
   only when an age withdrawal (an `age_ineligible` refusal, or a non-adult
   declaration that ends unanswered) cannot rewrite the offline spool to

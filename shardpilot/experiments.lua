@@ -248,6 +248,26 @@ function M.build_scope(workspace_id, environment_id, subject_id, base_url, crede
 		.. M.credential_fingerprint(credential)
 end
 
+-- A rollback can omit the assignment endpoint and credential. Compare the
+-- complete stored tuple against every component still known; an unknown
+-- component cannot disprove the recorded withdrawal.
+function M.declaration_covers_scope(config, subject, scope)
+	local parts = storage.experiment_scope_components(scope)
+	if not parts then return true end
+	local expected = {
+		config.workspace_id and escape_component(config.workspace_id),
+		config.environment_id and escape_component(config.environment_id),
+		M.valid_subject_id(subject) and escape_component(subject) or nil,
+		type(config.app_url) == "string" and config.app_url ~= "" and trim_slash(config.app_url) or nil,
+		type(config.publishable_key) == "string" and config.publishable_key ~= ""
+			and M.credential_fingerprint(config.publishable_key) or nil,
+	}
+	for i = 1, 5 do
+		if expected[i] ~= nil and expected[i] ~= parts[i] then return false end
+	end
+	return true
+end
+
 local function trim(value)
 	return (value:gsub("^%s+", ""):gsub("%s+$", ""))
 end
@@ -1035,6 +1055,7 @@ end
 --                             facts on the analytics pipeline still carry
 --                             (the fact-key history's liveness question).
 function M.new(config, deps)
+	local condemned_stamp, condemned_scope, condemned_miss, declarations = storage.load_experiments_clear(config)
 	local ex = setmetatable({
 		config = config,
 		deps = deps,
@@ -1121,6 +1142,9 @@ function M.new(config, deps)
 		-- ends without the server's answer applied withdraws the experiment
 		-- (end_non_adult_declaration). A later host declaration replaces it.
 		declaring = {},
+		declaration_writes = {},
+		recovered_declarations = {},
+		declaration_prune_pending = next(declarations) ~= nil,
 		-- experiment_key → true for an experiment a terminal 3xx or 4xx
 		-- closed: it is not served and the cadence leaves it alone until an
 		-- answered fetch for it installs, drops or withdraws its entry. In
@@ -1179,8 +1203,6 @@ function M.new(config, deps)
 	-- post-sentinel authorized state and restore normally (the same
 	-- survivor partition the clear itself applies); the first tick lands
 	-- the clear.
-	local condemned_stamp, condemned_scope, condemned_miss =
-		storage.load_experiments_clear(config)
 	if condemned_stamp then
 		ex.durable_clear_pending = condemned_stamp
 		ex.durable_clear_scope = condemned_scope
@@ -1201,6 +1223,7 @@ function M.new(config, deps)
 		ex.clear_marker = { unreadable = true }
 	end
 	local subject = ex:current_subject_id()
+	if subject then ex.recovered_declarations = declarations[ex:scope_for(subject)] or {} end
 	if subject then
 		local record = storage.load_experiments(config)
 		if record and record.scope == ex:scope_for(subject) then
@@ -1231,7 +1254,11 @@ function M.new(config, deps)
 				-- assignments have no age gate and restore.
 				local undeclared = entry.assignment_unit == "client_id"
 					and not has_age_declaration(entry.attributes)
-				if not undeclared and (not record_condemned
+				local pending = ex.recovered_declarations[key]
+				if pending and not age_exempt(entry) and entry.subject_fact_key then
+					pending.fact_keys[#pending.fact_keys + 1] = entry.subject_fact_key
+				end
+				if not undeclared and (not pending or age_exempt(entry)) and (not record_condemned
 					or (type(condemned_stamp) == "number"
 						and stored_at > condemned_stamp)) then
 					-- Restored attributes re-validate against the live
@@ -1561,6 +1588,54 @@ function Experiments:save_fact_key_history(record)
 	return true
 end
 
+-- Return the journal justified by the actual cache and live fact references.
+-- This also runs for a rollback without constructing an experiment consumer.
+function M.settled_declarations(config, live_fact_keys, active)
+	local records, miss = storage.load_experiment_declarations(config)
+	if miss then return nil, false, miss end
+	if next(records) == nil then return records, false end
+	local cached, cache_miss = storage.load_experiments(config)
+	if cache_miss == "unreadable" then return nil, false, cache_miss end
+	local changed = false
+	for scope, experiments in pairs(records) do
+		for key, marker in pairs(experiments) do
+			if not (active and active(scope, key)) then
+				local entry = cached and cached.scope == scope and cached.entries[key]
+				local guarded = entry and not age_exempt(entry)
+				local live = live_fact_keys(key) or {}
+				local kept = {}
+				for _, fact_key in ipairs(marker.fact_keys) do
+					if live[fact_key] or (guarded and entry.subject_fact_key == fact_key) then kept[#kept + 1] = fact_key end
+				end
+				if not guarded and #kept == 0 then experiments[key] = nil; changed = true
+				elseif #kept ~= #marker.fact_keys then marker.fact_keys = kept; changed = true end
+			end
+		end
+		if next(experiments) == nil then records[scope] = nil end
+	end
+	return records, changed
+end
+
+function Experiments:prune_declaration_markers()
+	if not self.declaration_prune_pending or not self.fact_keys_restored or not self.deps.live_fact_keys then return end
+	if self.deps.withdrawal_persist_pending and self.deps.withdrawal_persist_pending() then return end
+	local records, changed = M.settled_declarations(self.config, function(key)
+		local live = self.deps.live_fact_keys(key) or {}
+		for _, owed in ipairs(self.pending_exposure[key] or {}) do
+			local entry = owed.entry
+			if entry and type(entry.subject_fact_key) == "string" then live[entry.subject_fact_key] = true end
+		end
+		return live
+	end, function(scope, key)
+		local declaration = self.declaring[key]
+		return self.declaration_writes[scope .. scope_separator .. key] ~= nil
+			or (declaration and declaration.scope == scope)
+	end)
+	if not records then return end
+	self.declaration_prune_owed = changed and not storage.save_experiment_declarations(self.config, records) or false
+	self.declaration_prune_pending = next(records) ~= nil or self.declaration_prune_owed
+end
+
 -- Prune the current subject's history, and rewrite the durable section when
 -- it changed. Runs after a publish settles, after an age withdrawal, at load
 -- once the spool is restored, and on the tick after a cap eviction or a
@@ -1568,6 +1643,7 @@ end
 -- or prune removes, and nothing is owed. Only an existing record of this
 -- scope is rewritten; creating one is the durable write's business.
 function Experiments:prune_fact_key_history()
+	self:prune_declaration_markers()
 	self.fact_key_prune_owed = false
 	if next(self.fact_key_history) == nil then
 		-- The common case, answered without a read: memory holds every key
@@ -1596,6 +1672,18 @@ end
 -- from here on, and the history loaded with the record prunes now.
 function Experiments:on_spool_restored()
 	self.fact_keys_restored = true
+	local subject = self:current_subject_id()
+	if subject then
+		local scope = self:scope_for(subject)
+		for key, marker in pairs(self.recovered_declarations) do
+			-- The spool now exists, so the normal withdrawal reaches durable
+			-- accepted facts as well as the withheld assignment and history.
+			self:apply_age_withdrawal(scope, key, clock.unix_ms(), marker.fact_keys,
+				age_exempt(self.entries[key]))
+			self:write_declaration_marker(scope, key, nil, age_exempt(self.entries[key]))
+		end
+	end
+	self.recovered_declarations = {}
 	self:prune_fact_key_history()
 end
 
@@ -1926,6 +2014,15 @@ end
 -- no serving decisions, so it runs regardless of the consent state — a
 -- kill drop decided under grant must land durably even if consent flips.
 function Experiments:retry_durable_sync()
+	self:prune_declaration_markers()
+	local writes = {}
+	for composite, pending in pairs(self.declaration_writes) do
+		writes[#writes + 1] = { composite = composite, pending = pending }
+	end
+	for i = 1, #writes do
+		local pending = writes[i].pending
+		self:write_declaration_marker(pending.scope, pending.key, pending.marker, pending.keep_assignment)
+	end
 	if self.durable_clear_pending == true then
 		-- The clear is armed in its UNKNOWN form (the sidecar was
 		-- unreadable at construction): re-read it each pass. A healed read
@@ -2589,7 +2686,7 @@ end
 -- owed: the disk does not yet reflect a decided state, so an app death now
 -- would revive a revoked assignment (or lose a refresh) at the next launch.
 function Experiments:has_owed_durable_sync()
-	if self.durable_clear_pending then
+	if self.durable_clear_pending or self.declaration_prune_owed or next(self.declaration_writes) ~= nil then
 		return true
 	end
 	return next(self.durable_pending) ~= nil
@@ -2965,6 +3062,37 @@ function Experiments:apply_destructive_outcome(seq, scope, experiment_key, outco
 	self:apply_entry_drop(scope, experiment_key, resolved_at_ms)
 end
 
+function Experiments:write_declaration_marker(scope, experiment_key, marker, keep_assignment)
+	self.declaration_prune_pending = true
+	local composite = scope .. scope_separator .. experiment_key
+	local records, miss = storage.load_experiment_declarations(self.config)
+	if not miss then
+		local pending = records[scope] or {}
+		if marker == nil and not pending[experiment_key] then
+			self.declaration_writes[composite] = nil
+			return true
+		end
+		local blocked = marker == nil and (self.durable_pending[composite] ~= nil
+			or (self.deps.withdrawal_persist_pending and self.deps.withdrawal_persist_pending()))
+		if marker == nil and not keep_assignment then
+			local record, record_miss = storage.load_experiments(self.config)
+			local stored = record and record.scope == scope and record.entries[experiment_key]
+			blocked = blocked or record_miss == "unreadable" or (stored and not age_exempt(stored))
+		end
+		if not blocked then
+			pending[experiment_key] = marker
+			records[scope] = next(pending) ~= nil and pending or nil
+			if storage.save_experiment_declarations(self.config, records) then
+				self.declaration_writes[composite] = nil
+				return true
+			end
+		end
+	end
+	self.declaration_writes[composite] = { scope = scope, key = experiment_key, marker = marker, keep_assignment = keep_assignment }
+	self:diagnose("persist_failed", "pending_declaration")
+	return false
+end
+
 -- Record a HOST fetch's age declaration for one experiment, before any
 -- consent gate. A non-adult declaration stops the experiment serving at
 -- once (served_entry) and keeps the revalidation cadence from re-sending the
@@ -2989,10 +3117,34 @@ function Experiments:begin_host_declaration(experiment_key, attributes)
 			declaration.subject = self:current_subject_id()
 		end
 		self.declaring[experiment_key] = declaration
+		local subject = self:current_subject_id()
+		if subject then
+			declaration.scope = self:scope_for(subject)
+			local keys, seen = {}, {}
+			local function note(value)
+				if type(value) == "string" and not seen[value] then
+					seen[value] = true
+					keys[#keys + 1] = value
+				end
+			end
+			if live and not age_exempt(live) then note(live.subject_fact_key) end
+			for key in pairs(self:history_of(declaration.scope)[experiment_key] or {}) do note(key) end
+			for _, owed in ipairs(self.pending_exposure[experiment_key] or {}) do
+				local entry = owed.entry
+				if entry and entry.subject_key == subject and not age_exempt(entry) then note(entry.subject_fact_key) end
+			end
+			local record = storage.load_experiments(self.config)
+			local stored = record and record.scope == declaration.scope and record.entries[experiment_key]
+			if stored and not age_exempt(stored) then note(stored.subject_fact_key) end
+			table.sort(keys)
+			self:write_declaration_marker(declaration.scope, experiment_key, { fact_keys = keys })
+		end
 		return declaration
 	end
 	if declares_adult_age(attributes) then
 		self.declaring[experiment_key] = nil
+		local subject = self:current_subject_id()
+		if subject then self:write_declaration_marker(self:scope_for(subject), experiment_key, nil, true) end
 	end
 	return nil
 end
@@ -3022,6 +3174,9 @@ function Experiments:end_non_adult_declaration(experiment_key, declaration)
 	end
 	self.declaring[experiment_key] = nil
 	if declaration.decided or self.torn_down then
+		if declaration.decided and declaration.scope then
+			self:write_declaration_marker(declaration.scope, experiment_key, nil, true)
+		end
 		return false
 	end
 	local subject = self:current_subject_id()
@@ -3060,9 +3215,11 @@ function Experiments:end_non_adult_declaration(experiment_key, declaration)
 		-- The client-id applications the subject still owes for the
 		-- experiment from before it are withdrawn all the same.
 		self:apply_age_withdrawal(scope, experiment_key, clock.unix_ms(), fact_key, true)
+		if declaration.scope then self:write_declaration_marker(declaration.scope, experiment_key, nil, true) end
 		return false
 	end
 	self:apply_age_withdrawal(scope, experiment_key, clock.unix_ms(), fact_key)
+	if declaration.scope then self:write_declaration_marker(declaration.scope, experiment_key, nil) end
 	return true
 end
 

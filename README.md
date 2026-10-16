@@ -1441,7 +1441,25 @@ while it is in flight), the experiment is withdrawn as for
 player owes for it is withdrawn. A response to an earlier fetch of that
 experiment that arrives afterwards installs nothing. The `diagnostics` hook
 reports this withdrawal as `status = "withdrawn"` with
-`code = "age_declaration_unconfirmed"`. An `adult` declaration made while a
+`code = "age_declaration_unconfirmed"`.
+
+Before dispatch, the SDK also saves a pending-declaration witness in its existing
+`experiments-clear` record. If the process dies without a callback or `shutdown()`,
+the next launch treats that declaration as unconfirmed: it withholds the old
+age-gated assignment and withdraws the recorded subject-fact keys before replaying
+the spool. Synthetic-unit assignments remain exempt. A rollback launch with
+experiments disabled filters those facts too, without constructing the consumer
+or creating an additional experiment record. Witnesses use the full assignment
+scope; a known different subject, environment, endpoint or credential is preserved.
+Omitting the assignment endpoint or credential on rollback does not disprove a witness.
+A witness stays while its covered cache or facts remain, or their durable cleanup
+cannot be proved, and is removed once those references settle. The shared clear
+record is bounded to 393216 estimated bytes; an oversized update fails whole,
+without truncating an existing witness. Failed witness writes are retried and make
+`persist()` return `false, "experiments_pending"`. If storage remains unwritable
+through process death before the witness can be saved, recovery cannot establish
+the declaration; this is the same storage-down-through-exit limitation as the
+other privacy markers. An `adult` declaration made while a
 non-adult one is pending replaces it and is decided by its own fetch; a fetch
 that declares no age leaves it pending. A synthetic-subject assignment has no
 age gate and keeps serving (while the declaration is pending, `track_outcome`
@@ -1836,9 +1854,10 @@ separate prerequisites; the client does not prove the notice was displayed.
   undelivered fact still carries one), the variant payload, **and the normalized
   targeting attributes the assignment was evaluated under** — so
   user-specific values your game passes to `fetch_experiment_assignment` are
-  written to disk; the clear marker holds a timestamp plus the record scope
-  (workspace, environment, subject id, base URL, and a non-secret hash
-  fingerprint of the API key — never the key). See
+  written to disk; the clear marker holds a whole-cache clear timestamp and scope,
+  and pending declaration witnesses with their experiment and subject-fact keys. Each scope
+  contains workspace, environment, subject id, base URL, and a non-secret hash
+  fingerprint of the API key — never the key. See
   [docs/privacy.md](docs/privacy.md) for the full at-rest inventory. The identity
   record is written through
   `sys.get_save_file("shardpilot.w<workspace-hex>.a<app-hex>", "identity")` with
