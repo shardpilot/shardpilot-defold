@@ -187,9 +187,9 @@ The callback runs once, on the main loop, with `true` or `false` and a code:
 
 | Answer | Meaning |
 |---|---|
-| `true` | Everything the client held was delivered, or removed locally. |
+| `true` | Everything the client held was delivered or removed locally, including cleanup of acknowledged spool copies. |
 | `false, "pending"` | The deadline passed. The remnant is in the durable spool and is sent on the next launch. |
-| `false, "spool_persist_failed"` | At the deadline, storage could not keep everything: the remnant, a consent receipt or decision, or experiment state. A diagnostic with `scope = "shutdown"` names what was lost. |
+| `false, "spool_persist_failed"` | At the deadline, storage could not finish required persistence or cleanup: the remnant, a consent receipt or decision, experiment state, or acknowledged spool copies. A diagnostic with `scope = "shutdown"` names what remains owed. |
 | `false, "http_<status>"` or `false, "unauthorized"` | The server refused events of the final flush terminally. |
 | `false, "shutdown"` | The client was already shut down. |
 | `false, "not_initialized"` | The module-level `shutdown` has no client. |
@@ -198,6 +198,13 @@ The callback runs once, on the main loop, with `true` or `false` and a code:
 A second call on the same client, during the close or after it, gets the
 first call's answer. The module releases its client when the close ends, so a
 later module-level `shutdown` answers `not_initialized`.
+
+A failed acknowledgement-removal rewrite keeps the close pending even after
+delivery succeeds. Keep calling `update()` so storage is retried on every tick,
+without waiting for the normal flush interval. Recovery before the deadline
+allows success; otherwise the close answers `spool_persist_failed` and tears
+down at the deadline. An acknowledged copy that could not be removed can still
+be replayed on the next launch after that failure.
 
 From the call on, the client admits nothing new: `track` and the other event
 calls, `session_start`, `track_exposure`, `track_outcome`,
