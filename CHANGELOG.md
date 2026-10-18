@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- A bounded `flush()` stops starting event batches when its deadline is reached,
+  including on synchronous HTTP bridges. Unsent events remain available for a
+  later dispatch.
+
 ## v0.14.0 — 2026-10-15
 
 Prepare the next alpha source release; publication follows owner tagging.

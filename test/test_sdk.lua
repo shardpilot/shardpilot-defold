@@ -17172,6 +17172,70 @@ end)()
   assert_equal(batches(),sent,"nothing is dispatched for an expired call")
  end)
 
+ for _, elapsed in ipairs({ 1, 1.25 }) do
+  scene("a synchronous bridge stops dispatching at "..elapsed.." seconds",function()
+   local client=client_with({batch_size=1})
+   for i=1,3 do assert_true(client:track("sync_deadline_"..i))end
+   local request=http.request
+   http.request=function(...)
+    socket.now=socket.now+elapsed
+    return request(...)
+   end
+   local calls,cb=answers()
+   assert_true(client:bounded_flush(1,cb))
+   answered(calls,false,"pending","the first response reaches the deadline")
+   assert_equal(batches(),1,"no later batch starts after the deadline")
+   assert_equal(#client.queue.items,2,"unsent events stay queued")
+  end)
+ end
+
+ for _, driver in ipairs({ "update", "pump_flush_drains" }) do
+  scene(driver.." dispatch stops when synchronous responses reach the deadline",function()
+   local client=client_with({batch_size=2})
+   for i=1,7 do assert_true(client:track("sync_tick_"..i))end
+   local held=hold_http_requests()
+   local calls,cb=answers()
+   assert_true(client:bounded_flush(1,cb))
+   release_held_request(held)
+   http.request=function(url,method,callback,headers,body,options)
+    socket.now=socket.now+1
+    requests[#requests+1]={url=url,body=body}
+    callback(nil,nil,{status=202,response='{"accepted":2}'})
+   end
+   client[driver](client,0)
+   answered(calls,false,"pending","the update reaches the deadline")
+   assert_equal(batches(),2,"only one additional batch starts on the update")
+   assert_equal(#client.queue.items,3,"the rest stays queued")
+  end)
+ end
+
+ for _, retained in ipairs({ false, true }) do
+  scene("a synchronous token provider expires before "..(retained and "retry" or "queue").." dispatch",function()
+   local armed=false
+   local client=client_with({token_provider=function(callback)
+    if armed then socket.now=socket.now+1 end
+    callback("client-token-placeholder",nil,nil)
+   end})
+   assert_true(client:track("token_deadline"))
+   if retained then
+    next_status=503
+    assert_equal(client:flush(),false)
+    assert_true(client.in_flight_batch~=nil,"the failed batch is retained")
+    next_status=202
+   end
+   client.token=nil
+   armed=true
+   local sent=batches()
+   local calls,cb=answers()
+   assert_true(client:bounded_flush(1,cb))
+   answered(calls,false,"pending","token acquisition reached the deadline")
+   assert_equal(batches(),sent,"the batch must not start after token acquisition")
+   if not retained then
+    assert_equal(#client.queue.items,1,"the unsent event stays in the queue")
+   end
+  end)
+ end
+
  scene("a response after the deadline does not turn the call into success",function()
   local client=client_with()
   assert_true(client:track("late_response"))

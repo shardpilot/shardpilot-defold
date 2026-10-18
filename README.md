@@ -585,6 +585,11 @@ client:shutdown(10, function(ok, code) print("shutdown", ok, code) end)
 Most methods return `ok, err` so callers can branch on failures (e.g.
 `not_initialized`, `consent_pending`).
 
+[`flush(timeout_seconds, callback)`](docs/configuration.md#flush) starts no further
+event batch once its deadline is reached, including on synchronous HTTP bridges.
+Time spent acquiring a token counts toward that deadline. Unsent events remain
+queued or spooled for a later dispatch.
+
 ## AI-assisted integration
 
 Integrating with an AI coding tool (Claude Code or similar)? This repo ships a
