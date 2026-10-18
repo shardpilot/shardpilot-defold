@@ -3031,9 +3031,8 @@ end
 -- cache for re-grant), so the next init or re-grant would restore and
 -- serve what the platform already killed. Nothing here unlatches,
 -- installs, arms exposures, paces, or reaches the public callback — the
--- fence canon for constructive results is untouched — and the scope and
--- per-key sequence fences still discard whole: another subject's or an
--- out-of-order directive stays discarded.
+-- constructive fences are untouched. Scope still fences every directive;
+-- key order fences per-key drops, while plane-wide withdrawal remains effective.
 function Experiments:apply_destructive_outcome(seq, scope, experiment_key, outcome, resolved_at_ms, dispatched_at_ms)
 	if not (outcome.drop_all
 		or (outcome.authoritative and outcome.drop_entry)) then
@@ -3044,10 +3043,11 @@ function Experiments:apply_destructive_outcome(seq, scope, experiment_key, outco
 		return
 	end
 	local fence_key = scope .. scope_separator .. experiment_key
-	if seq <= (self.settled[fence_key] or 0) then
+	local settled = self.settled[fence_key] or 0
+	if seq <= settled and not outcome.drop_all then
 		return
 	end
-	self.settled[fence_key] = seq
+	self.settled[fence_key] = math.max(settled, seq)
 	if outcome.drop_all then
 		self:apply_sentinel_withdrawal(scope, resolved_at_ms, dispatched_at_ms)
 		return
@@ -3288,7 +3288,7 @@ end
 -- discarded outright — it must neither unlatch nor reinstall revoked
 -- assignments), the scope must still be current (a subject re-minted while
 -- the response was in flight makes it another subject's assignment), then
--- the per-key sequence fence, then the outcome's own directives.
+-- key order fences local results; authorization still governs the whole plane.
 function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, resolved_at_ms, dispatched_at_ms)
 	if auth_epoch ~= self.auth_epoch then
 		-- A stale-epoch response is discarded from CONSTRUCTIVE state — no
@@ -3306,10 +3306,12 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 		return
 	end
 	local fence_key = scope .. scope_separator .. experiment_key
-	if seq <= (self.settled[fence_key] or 0) then
+	local settled = self.settled[fence_key] or 0
+	-- Authorization governs the plane even when this key has a newer answer.
+	if seq <= settled and not outcome.auth_blocked then
 		return
 	end
-	if outcome.authoritative then
+	if outcome.authoritative and seq > settled then
 		self.settled[fence_key] = seq
 	end
 	if outcome.auth_blocked then
@@ -3388,6 +3390,11 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 		return
 	end
 	if outcome.new_entry then
+		local declaration = self.declaring[experiment_key]
+		if declaration and seq <= declaration.fence_seq and not age_exempt(outcome.new_entry) then
+			-- Keep exempt serving state until the declaring fetch decides.
+			return
+		end
 		local entry = outcome.new_entry
 		entry.subject_key = subject
 		entry.attributes = outcome.attributes
@@ -3502,7 +3509,7 @@ end
 -- (false, error_code) with the callback already invoked when it could not be.
 -- `carried_declaration` is internal: the grammar re-mint retry carries the
 -- rejected request's pending non-adult declaration, so it ends with the retry.
-function Experiments:fetch(experiment_key, attributes, callback, is_revalidation, preset_attributes, carried_declaration)
+function Experiments:fetch(experiment_key, attributes, callback, is_revalidation, preset_attributes, carried_declaration, original_seq)
 	local function finish(result)
 		if type(callback) == "function" then
 			-- The callback is game code; never let it break the SDK.
@@ -3569,11 +3576,12 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 
 	local subject = self:ensure_subject_id()
 	self.fetch_seq = self.fetch_seq + 1
-	local seq = self.fetch_seq
-	self.fetch_started[experiment_key] = seq
+	-- A retry is still its original call, behind any later host declaration.
+	local seq = original_seq or self.fetch_seq
+	self.fetch_started[experiment_key] = math.max(self.fetch_started[experiment_key] or 0, seq)
 	if not is_revalidation then
 		host_seq = seq
-		self.host_fetch[experiment_key] = seq
+		self.host_fetch[experiment_key] = math.max(self.host_fetch[experiment_key] or 0, seq)
 	end
 	if own_declaration and self.declaring[experiment_key] == declaration then
 		declaration.seq = seq
@@ -3756,7 +3764,7 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 				-- entry, so the cadence path could no longer recover its
 				-- saved attributes on its own.
 				self:fetch(experiment_key, attributes, callback,
-					is_revalidation, normalized_attributes, declaration)
+					is_revalidation, normalized_attributes, declaration, seq)
 				return
 			end
 		end

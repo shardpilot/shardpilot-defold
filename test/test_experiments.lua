@@ -3143,7 +3143,7 @@ end
 
 -- ── stale answers, durable state and spool recovery ─────────────────────────
 
-local function test_stale_auth_refusal_does_not_latch()
+local function test_stale_auth_refusal_latches_and_halts_revalidation()
 	reset()
 	local client = granted_client()
 	local held = {}
@@ -3171,26 +3171,23 @@ local function test_stale_auth_refusal_does_not_latch()
 	fetch(client, "exp-checkout")
 	responder = nil
 
-	-- The DELAYED STALE 401 lands: the per-key fence discards it BEFORE the
-	-- latch branch — a fence-losing refusal must not halt the lane. (A
-	-- fence-WINNING refusal still latches: pinned by
-	-- test_unauthorized_fails_closed_and_halts_revalidation.)
+	-- Authorization governs the plane even after a newer same-key answer.
 	held[1](nil, nil, {
 		status = 401,
 		response = json.encode({ error = "invalid runtime token" }),
 	})
-	assert_true(stale.ok and stale.from_cache,
-		"the stale caller receives the settled state")
-	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
-		"a fence-losing 401 must not stop serving")
+	assert_true(not stale.ok and stale.error == "unauthorized",
+		"the delayed authorization refusal reaches its caller")
+	assert_nil(client:experiment_variant("exp-checkout"), "the plane stops serving")
 
-	-- And the revalidation cadence still runs.
+	-- Revalidation stays halted until a fresh authorized host fetch.
 	local before = #assignment_requests()
 	next_response_body = assignment_body()
 	advance_seconds(400)
 	client:update(0.016)
-	assert_true(#assignment_requests() > before,
-		"a fence-losing 401 must not halt the revalidation cadence")
+	assert_equal(#assignment_requests(), before, "the authorization latch halts cadence")
+	assert_true(fetch(client, "exp-checkout").assigned)
+	assert_equal(client:experiment_variant("exp-checkout"), "treatment", "a fresh answer reauthorizes")
 end
 
 local function test_credential_swap_scopes_the_cache()
@@ -12783,7 +12780,123 @@ function extra_tests.test_pending_declaration_disabled_without_assignment_config
 	print("declaration unconfigured rollback control: PASS")
 end
 
+-- Controlled assignment replies exercise original host-call order.
+function extra_tests.hold_assignments()
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) then
+			held[#held + 1] = callback; return true
+		end
+		return false
+	end
+	return held
+end
+function extra_tests.reply_assignment(held, index, status, body)
+	assert_true(held[index] ~= nil, "the request reached transport")
+	held[index](nil, nil, { status = status, response = body })
+end
+
+function extra_tests.test_host_grammar_retry_keeps_original_order()
+	local check, verify = extra_tests.checklist()
+	for _, late_refusal in ipairs({ false, true }) do
+		local client, restore = extra_tests.age_client()
+		extra_tests.admit(client)
+		local held = extra_tests.hold_assignments()
+		client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil, function() end)
+		client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+		assert_equal(#held, 2)
+		local latest_host = client.experiments.host_fetch["exposure-banner"]
+		if late_refusal then extra_tests.reply_assignment(held, 2, 503, extra_tests.unavailable_body) end
+		extra_tests.reply_assignment(held, 1, 400, json.encode({ error = { code = "subject_id_invalid" } }))
+		if not late_refusal then
+			assert_equal(#held, 3, "the grammar retry was dispatched")
+			local kept_host = client.experiments.host_fetch["exposure-banner"] == latest_host
+			extra_tests.reply_assignment(held, 2, 503, extra_tests.unavailable_body)
+			assert_nil(client:experiment_variant("exposure-banner"), "the declaration withdrew")
+			extra_tests.reply_assignment(held, 3, 200, extra_tests.served_age_golden())
+			check(client:experiment_variant("exposure-banner") == nil, "an older adult retry revived the assignment")
+			check(kept_host, "an older retry replaced the newer host request's ownership")
+		else
+			check(#held == 2 and not client.experiments.reminted, "a fenced grammar refusal retried")
+		end
+		responder = nil; client:finish_teardown(); restore(); storage.reset()
+	end
+	verify("host grammar retry order")
+end
+
+function extra_tests.test_pending_declaration_preserves_synthetic_against_older_adult()
+	local client, restore = extra_tests.age_client()
+	next_response_body = extra_tests.synthetic_body()
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+	assert_equal(client:experiment_variant("exposure-banner"), "control")
+	local held = extra_tests.hold_assignments()
+	local adult
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil, function(result) adult = result end)
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+	extra_tests.reply_assignment(held, 1, 200, extra_tests.served_age_golden())
+	assert_equal(adult.error, "superseded", "the older answer cannot serve its age-gated assignment")
+	extra_tests.reply_assignment(held, 2, 503, extra_tests.unavailable_body)
+	local variant = client:experiment_variant("exposure-banner")
+	responder = nil; client:finish_teardown(); restore(); storage.reset()
+	assert_equal(variant, "control", "the exempt assignment survives the unanswered declaration")
+end
+
+function extra_tests.test_plane_authority_outlives_key_fence()
+	local check, verify = extra_tests.checklist()
+	for _, kind in ipairs({ "401", "403", "sentinel", "stale_epoch" }) do
+		reset()
+		local restore = install_fake_sys_storage()
+		local client = granted_client()
+		for _, key in ipairs({ "plane-k", "plane-other" }) do
+			next_response_body = assignment_body({ experiment_key = key })
+			assert_true(fetch(client, key, { age_band = "adult" }).assigned)
+		end
+		local held = extra_tests.hold_assignments()
+		client:fetch_experiment_assignment("plane-k", { age_band = "adult" }, function() end)
+		if kind == "stale_epoch" then
+			client:fetch_experiment_assignment("plane-other", nil, function() end)
+			extra_tests.reply_assignment(held, 2, 401, "{}")
+			assert_true(client.experiments.auth_blocked, "the intermediate response latches")
+		end
+		client:fetch_experiment_assignment("plane-k", { age_band = "adult" }, function() end)
+		extra_tests.reply_assignment(held, #held, 200, assignment_body({ experiment_key = "plane-k", version = 4 }))
+		assert_equal(client.experiments.entries["plane-k"].version, 4, "newer same-key success settled")
+		assert_true(not client.experiments.auth_blocked, "the fresh answer authorizes again")
+		local sentinel = kind == "sentinel" or kind == "stale_epoch"
+		local status = kind == "401" and 401 or 403
+		local body = sentinel and json.encode({ error = { code = "real_subjects_disabled" } }) or "{}"
+		extra_tests.reply_assignment(held, 1, status, body)
+		if kind == "stale_epoch" then
+			local record = storage.load_experiments(client.config)
+			check(not record or not record.entries["plane-other"], "stale-epoch sentinel left the covered durable entry")
+			check(record and record.entries["plane-k"].version == 4, "sentinel clobbered the post-dispatch record")
+		else
+			check(client.experiments.auth_blocked, kind .. " did not latch the plane")
+			check(client:experiment_variant("plane-other") == nil, kind .. " left another key serving")
+		end
+		responder = nil; client:finish_teardown(); restore(); storage.reset()
+	end
+	verify("plane authority after key settlement")
+end
+
+function extra_tests.test_adult_call_waits_for_authoritative_answer()
+	local client, restore = extra_tests.age_client()
+	extra_tests.admit(client)
+	local held = extra_tests.hold_assignments()
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil, function() end)
+	extra_tests.reply_assignment(held, 1, 200, extra_tests.refusal_body("age_ineligible"))
+	assert_nil(client:experiment_variant("exposure-banner"), "an unconfirmed adult call cannot cancel an authoritative refusal")
+	extra_tests.reply_assignment(held, 2, 200, extra_tests.served_age_golden())
+	assert_equal(client:experiment_variant("exposure-banner"), "control", "a newer authoritative answer restores serving")
+	responder = nil; client:finish_teardown(); restore(); storage.reset()
+end
+
 local tests = {
+	extra_tests.test_host_grammar_retry_keeps_original_order,
+	extra_tests.test_pending_declaration_preserves_synthetic_against_older_adult,
+	extra_tests.test_plane_authority_outlives_key_fence,
+	extra_tests.test_adult_call_waits_for_authoritative_answer,
 	extra_tests.test_pending_declaration_disabled_without_assignment_configuration,
 	extra_tests.test_pending_declaration_unreadable_spool_keeps_witness,
 	extra_tests.test_pending_declaration_disabled_relaunch_keeps_foreign_scope_facts,
@@ -12955,7 +13068,7 @@ local tests = {
 	test_restored_exposure_migrates_to_first_session,
 	test_permanent_400_drops_cached_assignment,
 	test_shutdown_captures_deferred_session_end_when_flush_cannot_send,
-	test_stale_auth_refusal_does_not_latch,
+	test_stale_auth_refusal_latches_and_halts_revalidation,
 	test_credential_swap_scopes_the_cache,
 	test_mismatched_experiment_key_is_malformed,
 	test_unknown_not_assigned_reason_clears_assignment,

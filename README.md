@@ -1355,9 +1355,11 @@ the id is never host-settable: there is no supported way to pin it yourself.
   `unauthorized`. The durable record is retained except for exact `403`
   `real_subjects_disabled`, which withdraws every cached assignment and owed
   experiment fact.
+  Per-experiment response ordering does not suppress these plane-wide refusals.
 - **Subject refusals** — exact `400` `subject_id_invalid` or
   `subject_pii_marker` remints the SDK's subject once per process and retries
-  with the same targeting attributes. Other `400` codes never remint;
+  with the same targeting attributes and original host-call order, including
+  against a later age declaration. Other `400` codes never remint;
   `500` `definition_invalid` keeps the transient/stale policy.
 - **Error envelope** — assignment and apply use status plus exact,
   case-sensitive `error.code`. Human messages, retired flat error strings,
@@ -1457,6 +1459,8 @@ player owes for it is withdrawn. A response to an earlier fetch of that
 experiment that arrives afterwards installs nothing. The `diagnostics` hook
 reports this withdrawal as `status = "withdrawn"` with
 `code = "age_declaration_unconfirmed"`.
+Grammar retries keep that earlier call's order too. While a non-adult declaration
+is pending, an older age-gated answer cannot replace an exempt synthetic assignment.
 
 Before dispatch, the SDK also saves a pending-declaration witness in its existing
 `experiments-clear` record. If the process dies without a callback or `shutdown()`,
