@@ -681,6 +681,10 @@ README's "Offline durability" section and [`docs/events.md`](events.md)):
   save-file API's documented 512 KB per-record limit. The OLDEST entries are
   evicted first over budget.
 
+A failed clear of the spent experiment-withdrawal record is retried at dispatch,
+`persist()` and `shutdown()` even while consent is denied or spooling is disabled.
+A newer withdrawal keeps its debt until its own spool removal succeeds.
+
 Both caps are re-applied to a previously persisted record at load: a
 configuration that lowered the budgets trims an over-budget old record
 (oldest first, counted in `spool_evicted`) before anything re-sends.

@@ -13160,7 +13160,62 @@ function extra_tests.test_live_history_cap_does_not_rewrite_every_update()
 	assert_equal(extra, 0, "unchanged live history caused a cache write on every update")
 end
 
+function extra_tests.test_withdrawal_debt_clear_retries_after_spool_purge()
+	local check, verify = extra_tests.checklist()
+	for _, mode in ipairs({ "denied", "disabled" }) do
+		for _, driver in ipairs({ "update", "persist", "shutdown" }) do
+			local client, restore, stores, state = extra_tests.spooled_debt_scene()
+			extra_tests.refuse_through_failing_spool(client, state)
+			assert_equal(extra_tests.armed_debts(stores), 1, "actual refused spooled facts created the debt")
+			local failed_clears = 0
+			state.fail_save = function(path, record)
+				if path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn" and next(record) == nil then
+					failed_clears = failed_clears + 1; return true
+				end
+				return false
+			end
+			if mode == "denied" then assert_true(client:set_consent(false))
+			else client = assert(sdk.restart(client, config({ app_key = "exposure-app", spool_enabled = false }))) end
+			assert_true(not client.spool_purge_pending and #(storage.load_spool(client.config) or {}) == 0, "the spool purge really landed")
+			assert_true(failed_clears > 0 and extra_tests.armed_debts(stores) == 1, "only the debt clear failed")
+			state.fail_save = nil
+			if driver == "update" then client:update(client.config.flush_interval_seconds)
+			elseif driver == "persist" then client:persist()
+			else client:bounded_shutdown(30, function() end) end
+			check(storage.load_withdrawn_facts(client.config) == nil, mode .. " " .. driver .. " retained spent event ids and timestamps")
+			client:finish_teardown(); restore(); storage.reset()
+		end
+	end
+	verify("withdrawal-debt clear recovery")
+end
+
+function extra_tests.test_new_withdrawal_cancels_a_spent_clear_retry()
+	local client, restore, stores, state = extra_tests.spooled_debt_scene()
+	extra_tests.refuse_through_failing_spool(client, state)
+	state.fail_save = function(path, record)
+		return path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn" and next(record) == nil
+	end
+	assert_true(client:set_consent(false))
+	assert_equal(extra_tests.armed_debts(stores), 1, "the old spent clear remains blocked")
+	assert_true(client:set_consent(true)); extra_tests.admit(client)
+	local newer = assert(queued_events(client, "experiment_exposure")[1]).event_id
+	assert_true(client:persist(), "the new application's actual fact is spooled")
+	state.fail_save = extra_tests.fail_spool_saves
+	extra_tests.refuse(client, "age_ineligible")
+	assert_true(storage.load_withdrawn_facts(client.config)[newer] ~= nil, "new withdrawal debt was written")
+	client:flush({ include_summaries = false })
+	local retained = storage.load_withdrawn_facts(client.config)
+	local protected = retained and retained[newer] ~= nil
+	state.fail_save = nil; client:flush({ include_summaries = false })
+	local spent = storage.load_withdrawn_facts(client.config) == nil
+	client:finish_teardown(); restore(); storage.reset()
+	assert_true(protected, "an older clear retry erased debt for a newer failed spool rewrite")
+	assert_true(spent, "the newer debt clears after its own rewrite lands")
+end
+
 local tests = {
+	extra_tests.test_new_withdrawal_cancels_a_spent_clear_retry,
+	extra_tests.test_withdrawal_debt_clear_retries_after_spool_purge,
 	extra_tests.test_live_history_cap_does_not_rewrite_every_update,
 	extra_tests.test_history_cap_preserves_memory_retirements,
 	extra_tests.test_cap_retired_fact_key_prunes_without_another_write,

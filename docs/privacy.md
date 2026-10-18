@@ -286,7 +286,10 @@ them.
   write that lands and by any spool purge that lands (a consent denial, or a
   launch without a persisted grant or with the spool disabled). A launch that
   cannot read it drops every restored experiment fact instead, and keeps it
-  for a launch that can.
+  for a launch that can. A failed clear after a successful spool write or purge
+  remains owed at later dispatch, persist and shutdown points, even while
+  consent is denied or spooling is disabled. New withdrawal debt revokes the
+  older clear until its own removal rewrite lands.
 
 - **The identity record also holds a copy of the subject id.** Once minted it
   is stored as `experiments_client_id` in the identity record described at the
