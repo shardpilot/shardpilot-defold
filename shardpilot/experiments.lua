@@ -3211,17 +3211,18 @@ function Experiments:end_non_adult_declaration(experiment_key, declaration)
 		and declaration.subject == subject and declaration.fact_key ~= fact_key then
 		fact_key = fact_key and { fact_key, declaration.fact_key } or declaration.fact_key
 	end
-	self:diagnose("withdrawn", "age_declaration_unconfirmed")
 	if age_exempt(entry) then
 		-- A synthetic-subject assignment has no age gate: it keeps serving.
 		-- The client-id applications the subject still owes for the
 		-- experiment from before it are withdrawn all the same.
 		self:apply_age_withdrawal(scope, experiment_key, clock.unix_ms(), fact_key, true)
 		if declaration.scope then self:write_declaration_marker(declaration.scope, experiment_key, nil, true) end
+		self:diagnose("withdrawn", "age_declaration_unconfirmed")
 		return false
 	end
 	self:apply_age_withdrawal(scope, experiment_key, clock.unix_ms(), fact_key)
 	if declaration.scope then self:write_declaration_marker(declaration.scope, experiment_key, nil) end
+	self:diagnose("withdrawn", "age_declaration_unconfirmed")
 	return true
 end
 
@@ -3891,7 +3892,8 @@ function Experiments:tick(_)
 	-- emissions, and later explicit applications all
 	-- drain here, in per-experiment order, while consent is granted.
 	self:sweep_owed(true)
-	if self.auth_blocked or not next(self.entries) then
+	if self.auth_blocked or not next(self.entries)
+		or (self.deps.closing and self.deps.closing()) then
 		return
 	end
 	local now = clock.unix_ms()
@@ -3936,7 +3938,8 @@ function Experiments:tick(_)
 		-- remaining pre-remint keys must not dispatch as revalidations
 		-- for the fresh subject — assignments the host never requested,
 		-- with no restored attributes.
-		if self.auth_blocked or self.cache_generation ~= generation then
+		if self.auth_blocked or self.cache_generation ~= generation
+			or (self.deps.closing and self.deps.closing()) then
 			break
 		end
 		self:fetch(keys[i], nil, nil, true)

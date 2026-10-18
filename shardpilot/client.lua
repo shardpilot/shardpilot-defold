@@ -1620,6 +1620,7 @@ local function construct(config, normalized)
 	-- experiments subject id).
 	if normalized.experiments_enabled then
 		client.experiments = experiments_mod.new(normalized, {
+			closing = function() return client.closing ~= nil or not client.initialized end,
 			subject_id = function()
 				if not experiments_mod.valid_subject_id(client.experiments_client_id) then
 					-- No USABLE captured subject — nil, or a stored value
@@ -3852,6 +3853,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event, opti
 		end
 	end
 	self:register_delivery(event)
+	if fact and fact.flush_ids then fact.flush_ids[event.event_id] = true end
 	if fact and fact.stage then return true, nil, { event = event, stream = stream, now_ms = now_ms } end
 	local ok = commit_event(self, event, stream, now_ms)
 	if not ok then
@@ -4048,7 +4050,7 @@ function Client:drain_owed_summaries()
 	return drained
 end
 
-function Client:enqueue_summaries()
+function Client:enqueue_summaries(flush_ids)
 	-- Summary events ride the same consent gate as track(). While the
 	-- pipeline is closed the accumulated samples are DROPPED, not held — the
 	-- samplers are reset so runtime signals observed before a grant (or
@@ -4094,7 +4096,7 @@ function Client:enqueue_summaries()
 	local perf = sampling.perf_summary(self.perf)
 	if perf then
 		local ok, err, refused, stream = self:enqueue_event("perf_summary", perf, nil,
-			{ retryable = true, retained_errors = queue_only_refusals })
+			{ retryable = true, retained_errors = queue_only_refusals, flush_ids = flush_ids })
 		if not ok and err == "queue_full" and refused then
 			self:owe_summary("perf_summary", refused, stream)
 		end
@@ -4102,7 +4104,7 @@ function Client:enqueue_summaries()
 	local network = sampling.network_summary(self.network, self.config.transport)
 	if network then
 		local ok, err, refused, stream = self:enqueue_event("network_summary", network,
-			nil, { retryable = true, retained_errors = queue_only_refusals })
+			nil, { retryable = true, retained_errors = queue_only_refusals, flush_ids = flush_ids })
 		if not ok and err == "queue_full" and refused then
 			self:owe_summary("network_summary", refused, stream)
 		end
@@ -7000,7 +7002,7 @@ function Client:flush(options)
 	-- acknowledgment.
 	self:try_send_consent_outbox()
 	if options.include_summaries ~= false then
-		self:enqueue_summaries()
+		self:enqueue_summaries(options.summary_ids)
 	end
 	self.flush_elapsed_seconds = 0
 	if self.publish_in_flight then
@@ -7157,10 +7159,6 @@ end
 -- done: success means nothing from the call is still held.
 local DEFAULT_FLUSH_TIMEOUT_SECONDS = 10
 
--- The summaries a flush builds itself: the only events that join a bounded
--- flush after its call.
-local CALL_SUMMARIES = { perf_summary = true, network_summary = true }
-
 -- Every event id this client still holds for delivery, mapped to its event
 -- name (or true when the held copy carries none).
 function Client:pending_delivery_ids()
@@ -7193,13 +7191,11 @@ function Client:pending_delivery_ids()
 end
 
 -- A batch the server refused terminally: every waiting drain that holds one
--- of its events (or is still registering, when everything dispatched belongs
--- to it) ends with that refusal once its other events settle.
+-- of its exact event ids ends with that refusal once its other events settle.
 function Client:note_terminal_drop(events, code)
 	for _, drain in ipairs(self.flush_drains) do
 		for i = 1, #events do
-			if drain.ids[events[i].event_id]
-				or (drain.registering and CALL_SUMMARIES[events[i].event_name]) then
+			if drain.ids[events[i].event_id] then
 				drain.failed = drain.failed or tostring(code or "rejected")
 				break
 			end
@@ -7238,12 +7234,8 @@ function Client:bounded_flush(timeout_seconds, callback)
 	-- and an explicit caller outranks this client's own backoff, as before.
 	-- Anything else that appeared meanwhile (a host hook tracking from inside
 	-- the dispatch) was not held at the call and is not part of it.
-	self:flush({ deadline_ms = drain.deadline_ms })
-	for id, name in pairs(self:pending_delivery_ids()) do
-		if not drain.ids[id] and CALL_SUMMARIES[name] then
-			drain.ids[id] = true
-		end
-	end
+	-- The summary builder registers its exact ids before dispatch can re-enter.
+	self:flush({ deadline_ms = drain.deadline_ms, summary_ids = drain.ids })
 	drain.registering = nil
 	self:settle_flush_drains()
 	return true
