@@ -129,7 +129,7 @@ The complete storage, receipt and configuration rules remain in
 [`privacy.md`](privacy.md), [`configuration.md`](configuration.md) and
 [`crash.md`](crash.md). Analytics denial is not a global network-off switch.
 
-## Engine APIs and the unused IDFV read
+## Engine APIs and system-information minimization
 
 The traced SDK storage calls use Defold's Application Support paths and ordinary
 file load/save operations. The clock path uses wall-clock time; frame samples
@@ -145,15 +145,15 @@ actual reasons in the game manifest. This source trace is not a whole-binary
 API audit; later native SDK use needs its own accurate reasons under Apple's
 [required-reason rules](https://developer.apple.com/documentation/bundleresources/describing-use-of-required-reason-api).
 
-There is an unused identifier read: [`platform.lua`](../shardpilot/platform.lua)
-calls `sys.get_sys_info()` without `ignore_secure`. In the pinned engine,
-[`script_sys.cpp`](https://github.com/defold/defold/blob/f735c12192bf95684e6ae1ae27c400b8170fc6d8/engine/script/src/script_sys.cpp#L791)
-therefore requests secure info and
-[`sys_apple.mm`](https://github.com/defold/defold/blob/f735c12192bf95684e6ae1ae27c400b8170fc6d8/engine/dlib/src/dlib/sys_apple.mm#L315)
-reads IDFV. The SDK consumes only the platform name and **discards IDFV**; it
-does not transmit that value or use it as its anonymous ID. This fragment does
-not change that runtime behavior. The local IDFV read, off-device data collection
-and required-reason API classification are separate findings.
+The SDK's [platform](../shardpilot/platform.lua) and
+[experiment-transport](../shardpilot/experiment_http.lua) probes request
+`sys.get_sys_info({ ignore_secure = true })` and consume the platform name.
+In the pinned [Defold 1.13.0 implementation](https://github.com/defold/defold/blob/f735c12192bf95684e6ae1ae27c400b8170fc6d8/engine/script/src/script_sys.cpp#L798),
+this option skips the secure-information branch. The iOS
+[`GetSecureInfo` implementation](https://github.com/defold/defold/blob/f735c12192bf95684e6ae1ae27c400b8170fc6d8/engine/dlib/src/dlib/sys_apple.mm#L315)
+contains the IDFV access, so these probes request no IDFV read. The SDK's
+anonymous ID remains SDK-generated. This is source-level verification of the
+probe contract; the final game/archive evidence remains the next section's task.
 
 ## Archive evidence still required
 

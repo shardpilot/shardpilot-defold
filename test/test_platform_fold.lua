@@ -345,6 +345,46 @@ do
 	end
 end
 
+-- The actual engine probes request only non-secure system information.
+do
+	local previous = sys
+	local detector = require "shardpilot.platform"
+	local experiment_http = require "shardpilot.experiment_http"
+	local function secure_options(options)
+		check(type(options) == "table" and options.ignore_secure == true,
+			"secure sys_info option required")
+	end
+	for _, case in ipairs({ { "Android", "android" }, { "iPhone OS", "ios" },
+		{ "Windows", "windows" }, { "Darwin", "macos" }, { "Linux", "linux" },
+		{ "HTML5", "web" }, { "unknown", "other" } }) do
+		local calls = 0
+		sys = { get_sys_info = function(options)
+			calls = calls + 1; secure_options(options)
+			return { system_name = case[1], device_ident = "synthetic-unused-identifier" }
+		end }
+		check(detector.detect() == case[2], "detector preserves " .. case[1])
+		check(experiment_http.new().browser == (case[1] == "HTML5"), "transport preserves " .. case[1])
+		check(calls == 2, "each engine probe calls once without an unflagged retry")
+	end
+	sys = { get_sys_info = function(options) secure_options(options); return { system = "Darwin" } end }
+	check(detector.detect() == "macos", "detector preserves the system-field fallback")
+	for _, kind in ipairs({ "throws", "nil", "false", "number", "string", "table" }) do
+		local calls = 0
+		sys = { get_sys_info = function(options)
+			calls = calls + 1; secure_options(options)
+			if kind == "throws" then error("synthetic system-info failure") end
+			return ({ ["false"] = false, number = 42, string = "malformed", ["table"] = {} })[kind]
+		end }
+		check(detector.detect() == "other", "detector fails safely for " .. kind)
+		check(calls == 1, "a failed probe is not retried without secure-value suppression")
+	end
+	sys = nil; check(detector.detect() == "other", "absent sys keeps the detector fallback")
+	sys = {}; check(detector.detect() == "other", "absent API keeps the detector fallback")
+	check(experiment_http.new().browser == false, "absent API keeps native transport selection")
+	sys = previous
+	print("system-info probes: platform maps, browser selection and failure controls exercised")
+end
+
 if failures > 0 then
 	print(string.format("shardpilot defold platform-fold tests: %d failure(s)", failures))
 	os.exit(1)

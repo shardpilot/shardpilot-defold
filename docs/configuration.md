@@ -617,6 +617,9 @@ value explicitly. Analytics accepts the canonical values `windows`, `macos`,
 `other`. Existing aliases such as `WIN32`, `OSX`, `html5`, `browser` and
 `steamdeck` are folded, ignoring case and surrounding whitespace. Human-supplied
 build suffixes are not inferred.
+Both platform and experiment-transport probes request `{ ignore_secure = true }`
+so engine-protected identifiers are omitted. The protected platform probe still
+uses `other` when the API is absent, throws or returns malformed information.
 
 A missing or unrecognized detected value uses `other` silently. A configured
 unknown value also uses `other`, and retains the existing diagnostic:

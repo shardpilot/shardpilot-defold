@@ -23,7 +23,7 @@ function M.detect()
 	if not sys or not sys.get_sys_info then
 		return "other"
 	end
-	local ok, info = pcall(sys.get_sys_info)
+	local ok, info = pcall(sys.get_sys_info, { ignore_secure = true })
 	if not ok or type(info) ~= "table" then
 		return "other"
 	end

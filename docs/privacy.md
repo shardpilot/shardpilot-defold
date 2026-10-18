@@ -2,7 +2,7 @@
 
 For iOS, explicitly merge the SDK's `v0.11.0` manifest fragment into the
 game-owned manifest. The [iOS privacy guide](ios-privacy.md) maps data types,
-consent defaults and linkage, records the unused engine IDFV read, and describes
+consent defaults and linkage, documents system-information minimization, and describes
 the final archive/report evidence still required.
 
 ShardPilot Defold SDK v0 keeps tokens in memory only. Client tokens are
