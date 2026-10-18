@@ -804,30 +804,7 @@ local function new_session(session_id)
 	}
 end
 
-function M.new(config, defer_init_diagnostics)
-	local snapshot, snapshot_err = snapshot_config(config)
-	if not snapshot then return nil, snapshot_err end
-	config = snapshot
-	-- Buffer the shared hook before validation: configuration warnings and all
-	-- constructor/subcomponent diagnostics must cross the same adoption boundary.
-	-- Keep the caller's configuration and the synchronous stats latches intact.
-	local pending = {}
-	local constructing = true
-	local hook = type(config) == "table" and config.diagnostics or nil
-	local diagnostics
-	if type(hook) == "function" then
-		diagnostics = function(issue)
-			if constructing then
-				pending[#pending + 1] = issue
-			else
-				hook(issue)
-			end
-		end
-	end
-	local normalized, err = validate_config(config, diagnostics)
-	if not normalized then
-		return nil, err
-	end
+local function construct(config, normalized)
 	local stored = storage.load(normalized) or {}
 	local anonymous_id
 	-- A configured anonymous_id override that REPLACES a different valid
@@ -2113,6 +2090,34 @@ function M.new(config, defer_init_diagnostics)
 	-- delivery attempt after the whole init settled — the same dispatch
 	-- timing the load-at-the-end shape always had.
 	client:try_send_consent_outbox()
+	return client
+end
+
+function M.new(config, defer_init_diagnostics)
+	local snapshot, snapshot_err = snapshot_config(config)
+	if not snapshot then return nil, snapshot_err end
+	config = snapshot
+	-- Constructor diagnostics wait until scope ownership is adopted too.
+	local pending = {}
+	local constructing = true
+	local hook = type(config) == "table" and config.diagnostics or nil
+	local diagnostics
+	if type(hook) == "function" then
+		diagnostics = function(issue)
+			if constructing then pending[#pending + 1] = issue else hook(issue) end
+		end
+	end
+	local normalized, err = validate_config(config, diagnostics)
+	if not normalized then return nil, err end
+	local claim, claim_err = storage.claim_scope(normalized)
+	if not claim then return nil, claim_err end
+	local ok, client, build_err = pcall(construct, config, normalized)
+	if not ok or not client then
+		storage.release_scope(claim)
+		if not ok then error(client, 0) end
+		return nil, build_err
+	end
+	storage.adopt_scope(claim, client)
 	constructing = false
 	local function flush_init_diagnostics(is_current)
 		local issues = pending
@@ -7752,6 +7757,8 @@ function Client:finish_teardown()
 		self.experiments:teardown()
 	end
 	self.initialized = false
+	storage.release_scope(self.storage_claim)
+	self.storage_claim = nil
 	self:settle_flush_drains("shutdown")
 end
 

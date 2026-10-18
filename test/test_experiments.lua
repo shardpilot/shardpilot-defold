@@ -246,7 +246,7 @@ json = {
 
 local sdk = require("test.inspect_client").wrap(require "shardpilot.sdk")
 local experiments = require "shardpilot.experiments"
-local storage = require "shardpilot.storage"
+local storage = require("test.inspect_client").storage()
 
 local function assert_true(value, message)
 	if not value then
@@ -393,6 +393,22 @@ local function assignment_body(overrides)
 	return json.encode(out)
 end
 
+-- Model another process writing the SDK's real record shape through storage.
+function extra_tests.external_assignment(client, key, overrides)
+	local cfg = client.config
+	local subject = client.experiments:current_subject_id()
+	local scope = client.experiments:scope_for(subject)
+	local _, outcome = experiments.apply(nil, { status = 200,
+		response = assignment_body(overrides) }, require("shardpilot.clock").unix_ms(),
+		key, cfg.app_id, cfg.environment_id)
+	local entry = assert(outcome.new_entry)
+	entry.subject_key, entry.attributes = subject, {}
+	local record = storage.load_experiments(cfg)
+	if not record or record.scope ~= scope then record = { scope = scope, entries = {} } end
+	record.entries[key] = entry
+	assert_true(storage.save_experiments(cfg, record))
+end
+
 local function not_assigned_body(reason)
 	local out = {
 		version = 3,
@@ -510,7 +526,7 @@ local function test_config_validation()
 	client = assert(sdk.new(off))
 	assert_nil(client.experiments, "the consumer must not exist while the flag is off")
 
-	client = assert(sdk.new(config()))
+	client = assert(sdk.restart(client, config()))
 	assert_true(client.experiments ~= nil, "the consumer must exist when the flag is on")
 end
 
@@ -651,7 +667,7 @@ local function test_subject_id_persists_and_reloads()
 		"the minted subject id must persist in the identity record")
 
 	-- A later launch reuses the persisted id verbatim (stickiness).
-	local second = assert(sdk.new(config()))
+	local second = assert(sdk.restart(first, config()))
 	fetch(second, "exp-checkout")
 	assert_equal(query_params(last_assignment_request().url).subject_key, minted,
 		"a relaunch must reuse the persisted subject id")
@@ -802,7 +818,7 @@ local function test_kill_switch_drops_durably_and_never_exposes()
 
 	-- The kill survives the process: a relaunch restores nothing, serves
 	-- nothing, exposes nothing.
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_nil(relaunch:experiment_variant("exp-checkout"),
 		"a killed assignment must not be revived by a relaunch")
 	relaunch:update(0.016)
@@ -1220,7 +1236,7 @@ local function test_restart_restores_cache_serves_offline_and_exposes_once()
 
 	-- A relaunch serves the persisted assignment before (and without) any
 	-- fetch, even offline.
-	local second = assert(sdk.new(config()))
+	local second = assert(sdk.restart(first, config()))
 	assert_equal(second:experiment_variant("exp-checkout"), "treatment",
 		"the restored cache serves before any fetch")
 	next_status = 0
@@ -1262,7 +1278,7 @@ local function test_corrupt_cache_record_is_a_miss()
 	end
 	assert_true(path ~= nil, "the durable record must exist")
 	stores[path] = { scope = 42, entries = "garbled" }
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_nil(relaunch:experiment_variant("exp-checkout"),
 		"a corrupt cache record reads as a miss")
 	restore()
@@ -1626,7 +1642,7 @@ local function test_permanent_drop_reaches_disk_after_latch_wipe()
 		"installing one experiment must keep the sibling's durable entry")
 
 	-- The disk state is what a relaunch serves.
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_equal(relaunch:experiment_variant("exp-a"), "treatment")
 	assert_equal(relaunch:experiment_variant("exp-b"), "beta",
 		"the retained sibling survives to the next launch")
@@ -2055,7 +2071,7 @@ local function test_failed_refresh_write_never_leaves_superseded_variant()
 	record = storage.load_experiments(client.config)
 	assert_equal(record.entries["exp-checkout"].variant_key, "control",
 		"the owed refresh write must land at the next tick")
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_equal(relaunch:experiment_variant("exp-checkout"), "control")
 	restore()
 end
@@ -2085,7 +2101,7 @@ local function test_failed_kill_drop_retried_until_durable()
 	record = storage.load_experiments(client.config)
 	assert_true(record == nil or record.entries["exp-checkout"] == nil,
 		"the owed kill drop must land at the next tick")
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_nil(relaunch:experiment_variant("exp-checkout"),
 		"a relaunch must not revive the killed assignment")
 	restore()
@@ -2127,7 +2143,7 @@ local function test_stale_sibling_write_does_not_clobber_fresher_record()
 	local restore, _, state = install_fake_sys_storage()
 	local first = granted_client()
 	-- The first client's cache write fails (identity still persists, so a
-	-- sibling shares the same subject id) and stays OWED with an old stamp.
+	-- external writer shares the same subject id) and stays OWED with an old stamp.
 	state.fail_save = function(path)
 		return fail_experiment_saves(path)
 	end
@@ -2135,12 +2151,10 @@ local function test_stale_sibling_write_does_not_clobber_fresher_record()
 	fetch(first, "exp-checkout")
 	state.fail_save = nil
 
-	-- A sibling client fetches FRESHER state and persists it.
+	-- An external writer persists FRESHER state.
 	advance_seconds(10)
-	local second = assert(sdk.new(config()))
-	next_response_body = assignment_body({ version = 4, variant_key = "beta" })
-	fetch(second, "exp-checkout")
-	local record = storage.load_experiments(second.config)
+	extra_tests.external_assignment(first, "exp-checkout", { version = 4, variant_key = "beta" })
+	local record = storage.load_experiments(first.config)
 	assert_equal(record.entries["exp-checkout"].variant_key, "beta")
 
 	-- The first client's owed retry fires — and must NOT roll the shared
@@ -2210,7 +2224,7 @@ local function test_clock_rollback_cannot_revive_killed_variant()
 	record = storage.load_experiments(client.config)
 	assert_true(record == nil or record.entries["exp-checkout"] == nil,
 		"a clock rollback must not fence the kill drop off the disk")
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_nil(relaunch:experiment_variant("exp-checkout"),
 		"a relaunch must not revive the killed variant")
 	restore()
@@ -2413,7 +2427,7 @@ local function test_ordinary_auth_failure_keeps_durable_cache_despite_owed_write
 
 	next_status = 200
 	next_response_body = nil
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_equal(relaunch:experiment_variant("exp-checkout"), "treatment",
 		"a relaunch serves the retained last-known assignment")
 	restore()
@@ -2490,13 +2504,11 @@ local function test_owed_drop_retry_yields_to_fresher_sibling_write()
 	assert_nil(first:experiment_variant("exp-checkout"))
 	state.fail_save = nil
 
-	-- A sibling client then persists a genuinely NEWER assignment for the
+	-- An external writer then persists a NEWER assignment for the
 	-- same subject and experiment.
 	advance_seconds(30)
-	local second = assert(sdk.new(config()))
-	next_response_body = assignment_body({ version = 9, variant_key = "beta" })
-	fetch(second, "exp-checkout")
-	local record = storage.load_experiments(second.config)
+	extra_tests.external_assignment(first, "exp-checkout", { version = 9, variant_key = "beta" })
+	local record = storage.load_experiments(first.config)
 	assert_equal(record.entries["exp-checkout"].variant_key, "beta")
 
 	-- The first client's owed drop retries — and must YIELD to the fresher
@@ -2670,7 +2682,7 @@ local function test_clock_rollback_does_not_fence_refresh_write()
 	local record = storage.load_experiments(client.config)
 	assert_equal(record.entries["exp-checkout"].variant_key, "control",
 		"a clock rollback must not fence the refresh off the disk")
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_equal(relaunch:experiment_variant("exp-checkout"), "control",
 		"a relaunch serves the refreshed variant")
 	restore()
@@ -3198,12 +3210,12 @@ local function test_credential_swap_scopes_the_cache()
 	-- An IN-PLACE key swap (same workspace/app/environment) is another
 	-- tenant's plane: the previous tenant's cached assignment and its
 	-- subject-fact key must be a safe scope-miss, never served.
-	local swapped = assert(sdk.new(config({ publishable_key = "sp_ingest_publishable_key_b" })))
+	local swapped = assert(sdk.restart(first, config({ publishable_key = "sp_ingest_publishable_key_b" })))
 	assert_nil(swapped:experiment_variant("exp-checkout"),
 		"a swapped credential must not serve the previous tenant's cache")
 
 	-- The ORIGINAL credential still restores its own record.
-	local back = assert(sdk.new(config()))
+	local back = assert(sdk.restart(swapped, config()))
 	assert_equal(back:experiment_variant("exp-checkout"), "treatment")
 	restore()
 end
@@ -3285,7 +3297,7 @@ local function test_failed_sentinel_clear_never_resurrects_serving()
 	client:update(0.016)
 	next_status = 200
 	next_response_body = nil
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_nil(relaunch:experiment_variant("exp-checkout"),
 		"the landed clear leaves nothing to restore")
 	restore()
@@ -3355,7 +3367,7 @@ local function test_sibling_write_lands_owed_drops()
 	assert_equal(record.entries["exp-b"].variant_key, "beta")
 
 	-- The swept drop SETTLED: a relaunch serves only the sibling.
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_nil(relaunch:experiment_variant("exp-a"))
 	assert_equal(relaunch:experiment_variant("exp-b"), "beta")
 	restore()
@@ -3592,7 +3604,7 @@ local function test_sibling_save_folds_owed_writes()
 	assert_equal(record.entries["exp-a"].variant_key, "fresh",
 		"a successful sibling save must fold the owed refreshed write")
 	assert_nil(record.entries["exp-b"])
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_equal(relaunch:experiment_variant("exp-a"), "fresh")
 	restore()
 end
@@ -3772,21 +3784,17 @@ end
 
 local function test_sibling_client_adopts_persisted_subject()
 	reset()
-	-- Two clients constructed BEFORE the first fetch both capture a nil
-	-- subject id: after the first client mints and persists, the second
-	-- must adopt the persisted subject instead of re-minting over it.
+	-- This client predates an external process's subject mint and must adopt it.
 	seed_granted_consent()
-	local a = assert(sdk.new(config()))
 	local b = assert(sdk.new(config()))
-	next_response_body = assignment_body()
-	fetch(a, "exp-checkout")
-	local minted = query_params(last_assignment_request().url).subject_key
+	local minted = experiments.mint_subject_id()
+	assert_true(storage.save(storage_scope, { consent_analytics = "granted", experiments_client_id = minted }))
 	assert_match(minted, subject_grammar)
 	next_response_body = assignment_body()
 	fetch(b, "exp-checkout")
 	local adopted = query_params(last_assignment_request().url).subject_key
 	assert_equal(adopted, minted,
-		"the sibling client must fetch under the already-persisted subject")
+		"the client must fetch under the externally persisted subject")
 	assert_equal(storage.load(storage_scope).experiments_client_id, minted,
 		"one install converges on one persisted subject id")
 end
@@ -3917,9 +3925,7 @@ local function test_owed_clear_retry_preserves_sibling_fresh_write()
 	state.fail_save = nil
 	next_status = 200
 	advance_seconds(5)
-	local b = assert(sdk.new(config()))
-	next_response_body = assignment_body({ experiment_key = "exp-onboarding" })
-	fetch(b, "exp-onboarding")
+	extra_tests.external_assignment(a, "exp-onboarding", { experiment_key = "exp-onboarding" })
 
 	a:update(0.016)
 	local record = storage.load_experiments(config(nil, true))
@@ -3957,9 +3963,7 @@ local function test_owed_clear_demotion_preserves_fresh_disk_entry()
 	state.fail_save = nil
 	next_status = 200
 	advance_seconds(5)
-	local b = assert(sdk.new(config()))
-	next_response_body = assignment_body({ experiment_key = "exp-onboarding" })
-	fetch(b, "exp-onboarding")
+	extra_tests.external_assignment(a, "exp-onboarding", { experiment_key = "exp-onboarding" })
 
 	next_response_body = assignment_body()
 	fetch(a, "exp-checkout")
@@ -4030,9 +4034,7 @@ local function test_stale_inflight_sentinel_preserves_sibling_write()
 	assert_true(held ~= nil, "the sentinel response must be held in flight")
 	responder = nil
 	advance_seconds(5)
-	local b = assert(sdk.new(config()))
-	next_response_body = assignment_body({ experiment_key = "exp-onboarding" })
-	fetch(b, "exp-onboarding")
+	extra_tests.external_assignment(a, "exp-onboarding", { experiment_key = "exp-onboarding" })
 
 	held(nil, nil, { status = 403, response = json.encode({
 		error = { code = "real_subjects_disabled", message = "synthetic feature refusal" },
@@ -4066,7 +4068,7 @@ local function test_condemned_record_refused_after_restart()
 	})
 	fetch(a, "exp-checkout")
 	next_status = 200
-	local b = assert(sdk.new(config()))
+	local b = assert(sdk.restart(a, config()))
 	next_status = 503
 	next_response_body = nil
 	local stale = fetch(b, "exp-checkout")
@@ -4106,7 +4108,7 @@ local function test_condemned_survivor_restores_and_converges()
 	-- and a fresh authorized install then supersedes the whole-record form
 	-- — the demotion retires the marker and the combined save converges
 	-- the covered key out while the fresh entry stays.
-	local b = assert(sdk.new(config()))
+	local b = assert(sdk.restart(a, config()))
 	next_status = 503
 	next_response_body = nil
 	local stale = fetch(b, "exp-checkout", { age_band = "adult" })
@@ -4121,7 +4123,7 @@ local function test_condemned_survivor_restores_and_converges()
 		"the covered key converges out with the demoted clear")
 	assert_nil(storage.load_experiments_clear(config(nil, true)),
 		"the authorized install disproves the sentinel state and retires the marker")
-	local c = assert(sdk.new(config()))
+	local c = assert(sdk.restart(b, config()))
 	next_status = 503
 	next_response_body = nil
 	local kept = fetch(c, "exp-onboarding", { age_band = "adult" })
@@ -4134,26 +4136,17 @@ end
 
 local function test_sibling_adopts_after_corrupt_subject_heals()
 	reset()
-	-- BOTH clients are constructed from an identity record whose stored
-	-- subject id fails the wire grammar. The first fetch heals it (re-mint
-	-- + persist); the second client's captured value is non-nil but
-	-- INVALID — the reload gate must fire on validity, not nilness, so it
-	-- adopts the healed subject instead of minting again over it.
-	storage.save(storage_scope, {
-		consent_analytics = "granted",
-		experiments_client_id = "not-wire-valid",
-	})
-	local a = assert(sdk.new(config()))
+	-- The captured subject is invalid; an external writer heals it before fetch.
+	storage.save(storage_scope, { consent_analytics = "granted", experiments_client_id = "not-wire-valid" })
 	local b = assert(sdk.new(config()))
-	next_response_body = assignment_body()
-	fetch(a, "exp-checkout")
-	local healed = query_params(last_assignment_request().url).subject_key
+	local healed = experiments.mint_subject_id()
+	assert_true(storage.save(storage_scope, { consent_analytics = "granted", experiments_client_id = healed }))
 	assert_match(healed, subject_grammar)
 	next_response_body = assignment_body()
 	fetch(b, "exp-checkout")
 	local adopted = query_params(last_assignment_request().url).subject_key
 	assert_equal(adopted, healed,
-		"the sibling must adopt the healed subject, not re-mint over it")
+		"the client must adopt the externally healed subject, not re-mint over it")
 	assert_equal(storage.load(storage_scope).experiments_client_id, healed)
 end
 
@@ -4166,7 +4159,7 @@ local function test_migrated_snapshot_keeps_apply_identity_through_session_start
 
 	local clock_mod = require "shardpilot.clock"
 	local ts_low = clock_mod.iso_utc()
-	local client = assert(sdk.new(config()))
+	local client = assert(sdk.restart(seed_client, config()))
 	assert_equal(client:apply_experiment_variant("exp-checkout"), "treatment")
 	local applied_session = client.session_id
 	local ts_high = clock_mod.iso_utc()
@@ -4293,7 +4286,7 @@ local function test_denied_restore_arms_intent_and_exposes_at_grant_identity()
 	identity.consent_analytics = "denied"
 	storage.save(storage_scope, identity)
 	local clock_mod = require "shardpilot.clock"
-	local client = assert(sdk.new(config()))
+	local client = assert(sdk.restart(seed_client, config()))
 	advance_seconds(120)
 	assert_true(client:set_anonymous_id("anon-rotated"))
 	local ts_low = clock_mod.iso_utc()
@@ -4357,7 +4350,7 @@ local function test_sentinel_clear_never_condemns_foreign_scope()
 	local b = assert(sdk.new(config({ environment_key = "staging" })))
 	next_response_body = assignment_body({ environment_key = "staging" })
 	fetch(b, "exp-checkout", { age_band = "adult" })
-	local a = assert(sdk.new(config()))
+	local a = assert(sdk.restart(b, config()))
 	next_status = 403
 	next_response_body = json.encode({
 		error = { code = "real_subjects_disabled", message = "synthetic feature refusal" },
@@ -4383,7 +4376,7 @@ local function test_sentinel_clear_never_condemns_foreign_scope()
 	state.fail_save = nil
 	assert_nil(storage.load_experiments_clear(config(nil, true)),
 		"no marker may condemn a record the clear's scope does not own")
-	local b2 = assert(sdk.new(config({ environment_key = "staging" })))
+	local b2 = assert(sdk.restart(a, config({ environment_key = "staging" })))
 	next_status = 503
 	next_response_body = nil
 	local stale = fetch(b2, "exp-checkout", { age_band = "adult" })
@@ -4421,7 +4414,7 @@ local function test_marker_survives_demotion_until_drops_durable()
 	fetch(a, "exp-checkout")
 	assert_true(storage.load_experiments_clear(config(nil, true)) ~= nil,
 		"the marker must outlive the demotion while the drops are not durable")
-	local b = assert(sdk.new(config()))
+	local b = assert(sdk.restart(a, config()))
 	next_status = 503
 	next_response_body = nil
 	local stale = fetch(b, "exp-onboarding")
@@ -4554,7 +4547,7 @@ local function test_retry_after_arms_cadence_before_first_tick()
 	-- A transient fetch with a SHORT Retry-After must arm the cadence
 	-- from the pacing window (the min rule applies from birth) — not
 	-- leave it nil for the first tick to arm a fresh full interval.
-	local client = assert(sdk.new(config()))
+	local client = assert(sdk.restart(seed_client, config()))
 	next_status = 503
 	next_response_body = nil
 	next_response_headers = { ["retry-after"] = "5" }
@@ -4600,7 +4593,7 @@ local function test_fresh_install_outranks_pending_clear_marker()
 	assert_true(result.ok, "the post-sentinel authorized fetch installs")
 	assert_equal(client:experiment_variant("exp-checkout"), "fresh")
 
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_equal(relaunch:experiment_variant("exp-checkout"), "fresh",
 		"the fresh assignment restores — the rolled-back install outranks the retired clear")
 	restore()
@@ -4691,7 +4684,7 @@ local function test_oversized_record_write_settles_terminally()
 			.. tostring(err) .. ")")
 	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
 		"serving is non-durable but intact")
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_nil(relaunch:experiment_variant("exp-checkout"),
 		"the evicted entry is absent durably — the next launch refetches")
 	restore()
@@ -4750,7 +4743,7 @@ local function test_stale_sentinel_stamp_ignores_post_dispatch_install()
 	assert_nil(stores[record_path].entries["exp-checkout"],
 		"while the sentinel's own key is withdrawn")
 
-	local relaunch = assert(sdk.new(config()))
+	local relaunch = assert(sdk.restart(client, config()))
 	assert_equal(relaunch:experiment_variant("exp-two"), "beta-2",
 		"and restores on the next launch")
 	assert_nil(relaunch:experiment_variant("exp-checkout"))
@@ -4895,7 +4888,7 @@ local function test_sentinel_purges_spooled_facts_from_prior_launch()
 	-- BEFORE the re-send window. The spooled exposure fact carries the
 	-- withdrawn subject-fact key: it must leave both the loaded chunks and
 	-- the durable record, or the relaunch ships it.
-	local second = assert(sdk.new(config()))
+	local second = assert(sdk.restart(first, config()))
 	assert_true(second:spool_pending(), "the spooled envelopes await re-send")
 	next_status = 403
 	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
@@ -4927,7 +4920,7 @@ local function test_presession_exposure_attributes_to_lazy_first_session()
 	next_response_body = assignment_body()
 	fetch(seed_client, "exp-checkout", { age_band = "adult" })
 
-	local second = assert(sdk.new(config()))
+	local second = assert(sdk.restart(seed_client, config()))
 	assert_true(second:track("boot-event"))
 	assert_equal(second:apply_experiment_variant("exp-checkout"), "treatment")
 	local lazy_session = second.session_id
@@ -6060,6 +6053,8 @@ local function test_client_id_assignment_requires_fact_key()
 		"the cached variant stands — the keyless variant never serves")
 
 	-- With no cache to fall back on, the same answer fails closed.
+	client:finish_teardown()
+	assert_true(storage.clear_experiments(client.config))
 	local cold = granted_client()
 	local miss = fetch(cold, "exp-checkout")
 	assert_equal(miss.ok, false)
@@ -6957,7 +6952,7 @@ function extra_tests.test_spool_shadow_never_masks_unreadable()
 		end
 		return saved_load(path)
 	end
-	local second = assert(sdk.new(config()))
+	local second = assert(sdk.restart(client, config()))
 	second:update(0.016)
 	second:update(0.016)
 	local marker_path = nil
@@ -7480,7 +7475,7 @@ function extra_tests.test_ended_session_background_tick_opens_no_session()
 	next_response_body = assignment_body()
 	fetch(first, "exp-checkout", { age_band = "adult" })
 
-	local second = assert(sdk.new(config()))
+	local second = assert(sdk.restart(first, config()))
 	assert_true(second:track("host_event"))
 	assert_equal(second:apply_experiment_variant("exp-checkout"), "treatment")
 	local ended = second.session_id
@@ -7591,7 +7586,7 @@ function extra_tests.test_snapshot_that_lived_through_an_ended_session_is_expose
 	next_response_body = assignment_body()
 	fetch(first, "exp-checkout", { age_band = "adult" })
 
-	local second = assert(sdk.new(config()))
+	local second = assert(sdk.restart(first, config()))
 	assert_true(second:track("host_event"))
 	assert_equal(second:apply_experiment_variant("exp-checkout"), "treatment")
 	local lived = second.session_id
@@ -7619,7 +7614,7 @@ function extra_tests.test_ended_and_next_session_snapshots_stay_apart()
 	next_response_body = assignment_body()
 	fetch(first, "exp-checkout", { age_band = "adult" })
 
-	local second = assert(sdk.new(config({ buffer_size = 3 })))
+	local second = assert(sdk.restart(first, config({ buffer_size = 3 })))
 	assert_true(second:track("host_event"))
 	assert_equal(second:apply_experiment_variant("exp-checkout"), "treatment")
 	local lived = second.session_id
@@ -11456,7 +11451,7 @@ function extra_tests.test_fetch_getter_and_restore_never_apply()
 	client:update(0)
 	assert_equal(#queued_events(client, "experiment_exposure"), 0, "fetch/getter emitted exposure")
 	assert_true(not client.experiments:has_owed_exposures(), "fetch armed application")
-	local restored = assert(sdk.new(config()))
+	local restored = assert(sdk.restart(client, config()))
 	assert_equal(restored:experiment_variant("exp-checkout"), "treatment")
 	assert_true(not restored.experiments:has_owed_exposures(), "restore armed application")
 	assert_equal(#requests, 1, "read-only operations added an HTTP hop")
@@ -12191,7 +12186,7 @@ function extra_tests.test_closure_lasts_for_the_session()
 	next_response_body = "{}"
 	fetch(client, "exp-checkout", { age_band = "adult" })
 	assert_nil(client:experiment_variant("exp-checkout"))
-	local next_session = assert(sdk.new(config()))
+	local next_session = assert(sdk.restart(client, config()))
 	restore()
 	assert_equal(next_session:experiment_variant("exp-checkout"), "treatment",
 		"the record is kept, so the next session serves it again")
@@ -13122,6 +13117,7 @@ local tests = {
 
 for _, test in ipairs(tests) do
 	test()
+	require("test.inspect_client").finish_all()
 end
 
 print("shardpilot defold experiments tests passed")

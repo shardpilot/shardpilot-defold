@@ -198,7 +198,7 @@ json = {
 
 local sdk = require("test.inspect_client").wrap(require "shardpilot.sdk")
 local remote_config = require "shardpilot.remote_config"
-local storage = require "shardpilot.storage"
+local storage = require("test.inspect_client").storage()
 
 local function assert_true(value, message)
 	if not value then
@@ -329,6 +329,15 @@ local function test_build_scope_keeps_distinct_tuples_distinct()
 end
 
 -- ── configuration validation ──────────────────────────────────────────────────
+
+-- Another process can publish this same per-app save-file shape.
+local function external_config(client, values, version)
+	local _, record = remote_config.apply(nil, { status = 200,
+		response = values_body(values, version), headers = { etag = '"v' .. version .. '"' } },
+		require("shardpilot.clock").unix_ms())
+	record.scope = client.remote_config:scope_for(client.remote_config:request_client_id())
+	assert_true(storage.save_remote_config(client.config, record))
+end
 
 local function test_config_validation()
 	reset()
@@ -1003,7 +1012,6 @@ end
 local function test_newer_durable_record_from_sibling_client_is_preferred()
 	reset()
 	local first = assert(sdk.new(config()))
-	local second = assert(sdk.new(config()))
 
 	next_status = 200
 	next_response_body = values_body({ v = 1 }, 1)
@@ -1011,11 +1019,9 @@ local function test_newer_durable_record_from_sibling_client_is_preferred()
 	fetch(first)
 	assert_equal(first:remote_config_number("v", 0), 1)
 
-	-- A sibling client for the same scope fetches and persists a newer
+	-- An external writer for the same scope persists a newer
 	-- configuration...
-	next_response_body = values_body({ v = 2 }, 2)
-	next_response_headers = { etag = '"v2"' }
-	fetch(second)
+	external_config(first, { v = 2 }, 2)
 
 	-- ...so the first client's next offline fetch serves the per-app
 	-- FRESHEST record, not the older one it still holds in-process.
@@ -1075,16 +1081,12 @@ end
 
 local function test_cache_discovered_at_fetch_time_is_adopted()
 	reset()
-	-- Two same-app clients exist before any configuration is cached...
-	local writer = assert(sdk.new(config()))
+	-- This client exists before another process writes the configuration...
 	local reader = assert(sdk.new(config()))
 	assert_nil(reader:remote_config_values())
 
 	-- ...one fetches fresh and persists the record...
-	next_status = 200
-	next_response_body = values_body({ a = 5 }, 5)
-	next_response_headers = { etag = '"v5"' }
-	fetch(writer)
+	external_config(reader, { a = 5 }, 5)
 
 	-- ...and the other's next fetch discovers that record: the 304 serves
 	-- it, and the getters must agree with what the callback just reported.
@@ -1134,7 +1136,6 @@ local function test_delayed_304_does_not_restamp_over_a_newer_body()
 	reset()
 	local restore = install_fake_sys_storage()
 	local first = assert(sdk.new(config()))
-	local second = assert(sdk.new(config()))
 	next_status = 200
 	next_response_body = values_body({ v = 1 }, 1)
 	next_response_headers = { etag = '"v1"' }
@@ -1154,10 +1155,8 @@ local function test_delayed_304_does_not_restamp_over_a_newer_body()
 	http.request = saved_request
 	assert_equal(last_request().headers["If-None-Match"], '"v1"')
 
-	-- ...while a sibling client fetches and persists a DIFFERENT body...
-	next_response_body = values_body({ v = 2 }, 2)
-	next_response_headers = { etag = '"v2"' }
-	fetch(second)
+	-- ...while an external writer persists a DIFFERENT body...
+	external_config(first, { v = 2 }, 2)
 
 	-- ...and the held 304 then arrives late. It validated the OLD body at
 	-- server handling time — possibly BEFORE the sibling's fetch was served
@@ -1172,7 +1171,7 @@ local function test_delayed_304_does_not_restamp_over_a_newer_body()
 	local durable = storage.load_remote_config(first.config)
 	assert_equal(durable.etag, '"v2"',
 		"a delayed revalidation must not displace a fresher different-body record")
-	local relaunched = assert(sdk.new(config()))
+	local relaunched = assert(sdk.restart(first, config()))
 	assert_equal(relaunched:remote_config_number("v", 0), 2,
 		"a restart keeps the freshest different-body configuration")
 
@@ -1210,7 +1209,7 @@ local function test_failed_304_restamp_keeps_the_same_body_durable()
 	assert_equal(result.from_cache, true)
 	assert_true(storage.load_remote_config(client.config) ~= nil,
 		"a failed restamp must not delete the record whose body was just confirmed")
-	local relaunched = assert(sdk.new(config()))
+	local relaunched = assert(sdk.restart(client, config()))
 	assert_equal(relaunched:remote_config_number("v", 0), 1)
 
 	restore()
@@ -1256,7 +1255,7 @@ local function test_failed_304_restamp_clears_a_lingering_stale_body()
 	assert_equal(result.from_cache, true)
 	assert_nil(storage.load_remote_config(client.config),
 		"a lingering stale body must not survive the revalidation that outdated it")
-	local relaunched = assert(sdk.new(config()))
+	local relaunched = assert(sdk.restart(client, config()))
 	assert_nil(relaunched:remote_config_values(),
 		"a restart starts from the game's defaults, not the rolled-back configuration")
 
@@ -1306,7 +1305,6 @@ local function test_failed_write_tombstone_spares_a_fresher_sibling_record()
 	reset()
 	local restore = install_fake_sys_storage()
 	local first = assert(sdk.new(config()))
-	local second = assert(sdk.new(config()))
 	next_status = 200
 	next_response_body = values_body({ v = 1 }, 1)
 	next_response_headers = { etag = '"v1"' }
@@ -1324,10 +1322,8 @@ local function test_failed_write_tombstone_spares_a_fresher_sibling_record()
 	end)
 	http.request = saved_request
 
-	-- ...while a sibling client persists a FRESHER configuration...
-	next_response_body = values_body({ v = 2 }, 2)
-	next_response_headers = { etag = '"v2"' }
-	fetch(second)
+	-- ...while an external writer persists a FRESHER configuration...
+	external_config(first, { v = 2 }, 2)
 
 	-- ...and the held fetch then lands fresh values too large for the
 	-- save-file budget: served, but they cannot persist.
@@ -1346,7 +1342,7 @@ local function test_failed_write_tombstone_spares_a_fresher_sibling_record()
 	local durable = storage.load_remote_config(first.config)
 	assert_true(durable ~= nil, "the sibling's fresher record must survive the failed write")
 	assert_equal(durable.etag, '"v2"')
-	local relaunched = assert(sdk.new(config()))
+	local relaunched = assert(sdk.restart(first, config()))
 	assert_equal(relaunched:remote_config_number("v", 0), 2,
 		"a restart falls back to the freshest persisted record, not to defaults")
 
@@ -1488,7 +1484,7 @@ local function test_cache_from_another_scope_is_a_miss_and_gets_overwritten()
 
 	-- Another environment must not read this scope's cache: no snapshot at
 	-- construction, no ETag on its fetch.
-	local other = assert(sdk.new(config({ environment_key = "production" })))
+	local other = assert(sdk.restart(original, config({ environment_key = "production" })))
 	assert_nil(other:remote_config_values(), "another scope must not serve this cache")
 	next_status = 200
 	next_response_body = values_body({ b = 2 })
@@ -1501,7 +1497,7 @@ local function test_cache_from_another_scope_is_a_miss_and_gets_overwritten()
 
 	-- The successful fetch overwrote the record with the new scope, so the
 	-- original scope now misses it.
-	local reborn = assert(sdk.new(config()))
+	local reborn = assert(sdk.restart(other, config()))
 	assert_nil(reborn:remote_config_values(),
 		"the original scope must miss the overwritten cache")
 
@@ -1517,7 +1513,7 @@ local function test_transient_failure_never_serves_another_scopes_cache()
 	next_response_body = values_body({ a = 1 })
 	fetch(original)
 
-	local other = assert(sdk.new(config({ environment_key = "production" })))
+	local other = assert(sdk.restart(original, config({ environment_key = "production" })))
 	next_status = 0
 	next_response_body = nil
 	local result = fetch(other)
@@ -1540,7 +1536,7 @@ local function test_restart_serves_last_known_good_and_offline_fetch_uses_it()
 
 	-- "Restart": a new client for the same scope serves the persisted
 	-- snapshot immediately, before any fetch...
-	local second_launch = assert(sdk.new(config()))
+	local second_launch = assert(sdk.restart(first_launch, config()))
 	assert_equal(second_launch:remote_config_number("spawn_rate", 1.0), 2.5,
 		"the cached snapshot must survive a restart")
 	assert_equal(second_launch:remote_config_version(), 4)
@@ -1673,7 +1669,7 @@ local function test_unpersistable_fresh_config_clears_stale_durable_record()
 
 	-- After a restart there is nothing to revive: getters serve defaults (an
 	-- honest miss) rather than the rolled-back configuration.
-	local relaunched = assert(sdk.new(config()))
+	local relaunched = assert(sdk.restart(client, config()))
 	assert_nil(relaunched:remote_config_values())
 
 	restore()
@@ -2039,7 +2035,7 @@ local function test_facade_delegates_to_the_default_client()
 
 	next_status = 202
 	next_response_body = '{"accepted":1}'
-	sdk.shutdown("test_teardown")
+	assert_true(sdk.shutdown(1))
 end
 
 -- Every consent state still fetches configuration. Inspect the entire request,
@@ -2455,7 +2451,7 @@ local function test_next_session_preloads_the_kept_record()
 	next_response_body = nil
 	fetch(client)
 	assert_equal(client:remote_config_number("a", 0), 0)
-	local next_session = assert(sdk.new(config()))
+	local next_session = assert(sdk.restart(client, config()))
 	assert_equal(next_session:remote_config_number("a", 0), 1,
 		"closure lasts for the session; the next one preloads the kept record")
 end
@@ -2498,7 +2494,7 @@ local function test_not_published_clears_the_cache()
 	assert_equal(after.ok, false)
 	assert_nil(last_request().headers["If-None-Match"],
 		"the in-memory record is cleared too, so nothing is revalidated")
-	local next_session = assert(sdk.new(config()))
+	local next_session = assert(sdk.restart(client, config()))
 	assert_equal(next_session:remote_config_number("a", 0), 0,
 		"the next session starts from the host defaults")
 end
@@ -2936,13 +2932,14 @@ local tests = {
 
 for _, test in ipairs(tests) do
 	test()
+	require("test.inspect_client").finish_all()
 end
 
 print("shardpilot defold remote-config tests passed")
 
 -- Retired clients must not apply a response over a replacement's durable cache.
 ;(function()
-	local public = require "shardpilot.sdk"
+	local public = require("test.inspect_client").wrap(require "shardpilot.sdk", true)
 	local passed, failed = 0, 0
 	for _, with_callback in ipairs({ true, false }) do
 		for _, status in ipairs({ 200, 401 }) do
@@ -2986,7 +2983,7 @@ end)()
 
 -- Header identity uses the public facade; the final case probes the component boundary.
 ;(function()
-	local public = require "shardpilot.sdk"
+	local public = require("test.inspect_client").wrap(require "shardpilot.sdk", true)
 	local passed, failed = 0, 0
 	local bad = {}
 	for byte = 0, 31 do bad[#bad + 1] = "before" .. string.char(byte) .. "after" end

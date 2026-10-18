@@ -51,6 +51,23 @@ local function namespace(scope)
 	return "shardpilot.w" .. workspace .. ".a" .. app
 end
 
+-- Weak ownership survives cache resets but not an unreachable client.
+local client_scopes = setmetatable({}, { __mode = "v" })
+function M.claim_scope(scope)
+	local key = namespace(scope)
+	if client_scopes[key] then return nil, "storage_scope_in_use" end
+	local claim = { key = key }
+	client_scopes[key] = claim
+	return claim
+end
+function M.adopt_scope(claim, client)
+	claim.owner = client
+	client.storage_claim = claim
+end
+function M.release_scope(claim)
+	if claim and client_scopes[claim.key] == claim then client_scopes[claim.key] = nil end
+end
+
 local function save_path(ns, file_name)
 	if type(sys) ~= "table" then
 		return nil

@@ -8,3 +8,5 @@
   and Lua 5.4, plus the library, version and public-surface checks in `scripts/`.
 - Update the README, configuration guide and changelog when delivery behavior changes.
 - Client teardown must fence remote-config responses before cache writes or callbacks.
+- Reserve app storage ownership before persistence. Release it on completed teardown,
+  failed construction and collection; keep external-writer freshness tests effective.

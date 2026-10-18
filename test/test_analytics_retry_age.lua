@@ -54,8 +54,8 @@ http = { request = function(url, method, callback, headers, body)
 		callback(nil, nil, { status = 403, response = body })
 	else callback(nil, nil, { status = 202, response = "{}" }) end
 end }
-local clients = require "shardpilot.client"
-local storage = require "shardpilot.storage"
+local clients = require("test.inspect_client").wrap(require "shardpilot.client")
+local storage = require("test.inspect_client").storage()
 local function eq(actual, expected, message)
 	assert(actual == expected, message .. ": expected " .. tostring(expected) .. ", got " .. tostring(actual))
 end
