@@ -11,4 +11,5 @@
 - Reserve app storage ownership before persistence. Release it on completed teardown,
   failed construction and collection; keep external-writer freshness tests effective.
 - Preserve host-call order through experiment retries. Key fences must retain
-  plane-wide authority and synthetic exemptions during pending declarations.
+  plane-wide authority; older per-key refusals, closures and age-gated installs
+  must preserve synthetic exemptions during pending declarations.

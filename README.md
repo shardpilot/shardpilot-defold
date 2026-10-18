@@ -1460,7 +1460,9 @@ experiment that arrives afterwards installs nothing. The `diagnostics` hook
 reports this withdrawal as `status = "withdrawn"` with
 `code = "age_declaration_unconfirmed"`.
 Grammar retries keep that earlier call's order too. While a non-adult declaration
-is pending, an older age-gated answer cannot replace an exempt synthetic assignment.
+is pending, older per-key refusals and age-gated assignments cannot remove, close
+or replace an exempt synthetic assignment. Plane-wide authorization and withdrawal
+still apply.
 
 Before dispatch, the SDK also saves a pending-declaration witness in its existing
 `experiments-clear` record. If the process dies without a callback or `shutdown()`,

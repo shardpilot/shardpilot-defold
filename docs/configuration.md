@@ -518,8 +518,8 @@ withdraws every cached assignment and owed experiment fact.
 Per-experiment ordering fences do not suppress plane-wide authorization or
 withdrawal. Grammar retries retain their original host-call order; a pending
 non-adult declaration preserves its exempt synthetic assignment against older
-age-gated answers. A later adult call still needs an authoritative answer to
-supersede an authoritative age refusal.
+per-key refusals and age-gated assignments. A later adult call still needs an
+authoritative answer to supersede an authoritative age refusal.
 
 Assignment and apply actions use exact, case-sensitive `error.code`, never
 human messages. Unknown codes, malformed/ambiguous envelopes, and older flat

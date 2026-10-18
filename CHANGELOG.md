@@ -4,8 +4,9 @@
 
 - Experiment grammar retries retain their original host-call order across later
   age declarations. Pending declarations preserve exempt synthetic assignments
-  against older age-gated answers. Plane-wide authorization refusals and
-  withdrawals remain effective after a newer answer settles for one experiment.
+  against older age-gated assignments or per-key refusals. Plane-wide authorization
+  refusals and withdrawals remain effective after a newer answer settles for one
+  experiment.
 
 - A second live analytics client for the same workspace/app returns
   `storage_scope_in_use` before storage access. Ownership lasts through shutdown

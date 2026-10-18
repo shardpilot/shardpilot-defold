@@ -12825,20 +12825,42 @@ function extra_tests.test_host_grammar_retry_keeps_original_order()
 end
 
 function extra_tests.test_pending_declaration_preserves_synthetic_against_older_adult()
-	local client, restore = extra_tests.age_client()
-	next_response_body = extra_tests.synthetic_body()
-	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
-	assert_equal(client:experiment_variant("exposure-banner"), "control")
-	local held = extra_tests.hold_assignments()
-	local adult
-	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil, function(result) adult = result end)
-	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
-	extra_tests.reply_assignment(held, 1, 200, extra_tests.served_age_golden())
-	assert_equal(adult.error, "superseded", "the older answer cannot serve its age-gated assignment")
-	extra_tests.reply_assignment(held, 2, 503, extra_tests.unavailable_body)
-	local variant = client:experiment_variant("exposure-banner")
-	responder = nil; client:finish_teardown(); restore(); storage.reset()
-	assert_equal(variant, "control", "the exempt assignment survives the unanswered declaration")
+	local check, verify = extra_tests.checklist()
+	for _, latched in ipairs({ false, true }) do
+		for _, kind in ipairs({ "adult", "age_ineligible", "kill_switch", "404", "terminal" }) do
+			local client, restore = extra_tests.age_client()
+			next_response_body = extra_tests.synthetic_body()
+			client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+			assert_equal(client:experiment_variant("exposure-banner"), "control")
+			local held = extra_tests.hold_assignments()
+			local adult
+			client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil, function(result) adult = result end)
+			client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
+			if latched then
+				client:fetch_experiment_assignment("other", nil, function() end)
+				extra_tests.reply_assignment(held, 3, 401, "{}")
+				assert_true(client.experiments.auth_blocked, "plane-wide authority still latches")
+			end
+			local status = kind == "404" and 404 or kind == "terminal" and 409 or 200
+			local body = kind == "adult" and extra_tests.served_age_golden()
+				or (kind == "404" or kind == "terminal") and "{}" or extra_tests.refusal_body(kind)
+			extra_tests.reply_assignment(held, 1, status, body)
+			if kind == "adult" and not latched then assert_equal(adult.error, "superseded") end
+			check(latched and client.experiments.auth_blocked
+				or client:experiment_variant("exposure-banner") == "control",
+				kind .. " removed the pending synthetic assignment")
+			extra_tests.reply_assignment(held, 2, 503, extra_tests.unavailable_body)
+			check(latched and client:experiment_variant("exposure-banner") == nil
+				or not latched and client:experiment_variant("exposure-banner") == "control",
+				kind .. " lost serving state after transient")
+			local record = storage.load_experiments(client.config)
+			check(record and record.entries["exposure-banner"]
+				and record.entries["exposure-banner"].assignment_unit == "synthetic_subject_key",
+				kind .. " removed the durable synthetic assignment")
+			responder = nil; client:finish_teardown(); restore(); storage.reset()
+		end
+	end
+	verify("synthetic assignment survives older per-key answers")
 end
 
 function extra_tests.test_plane_authority_outlives_key_fence()

@@ -3047,6 +3047,8 @@ function Experiments:apply_destructive_outcome(seq, scope, experiment_key, outco
 	if seq <= settled and not outcome.drop_all then
 		return
 	end
+	local declaration = self.declaring[experiment_key]
+	if not outcome.drop_all and declaration and seq <= declaration.fence_seq then return end
 	self.settled[fence_key] = math.max(settled, seq)
 	if outcome.drop_all then
 		self:apply_sentinel_withdrawal(scope, resolved_at_ms, dispatched_at_ms)
@@ -3365,6 +3367,11 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 	if outcome.transient then
 		return
 	end
+	local declaration = self.declaring[experiment_key]
+	if declaration and seq <= declaration.fence_seq and not age_exempt(outcome.new_entry) then
+		-- Older per-key answers cannot replace, drop or close exempt serving state.
+		return
+	end
 	-- A settled authoritative answer resets the consecutive-failure counter.
 	-- A server-set Retry-After deadline is deliberately NOT cleared here:
 	-- the pacing is shared by every cached entry, and one admitted request
@@ -3390,11 +3397,6 @@ function Experiments:install(seq, scope, experiment_key, outcome, auth_epoch, re
 		return
 	end
 	if outcome.new_entry then
-		local declaration = self.declaring[experiment_key]
-		if declaration and seq <= declaration.fence_seq and not age_exempt(outcome.new_entry) then
-			-- Keep exempt serving state until the declaring fetch decides.
-			return
-		end
 		local entry = outcome.new_entry
 		entry.subject_key = subject
 		entry.attributes = outcome.attributes
