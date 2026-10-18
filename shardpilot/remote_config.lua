@@ -772,8 +772,8 @@ function RemoteConfig:install(seq, result, new_cache, scope, authoritative, serv
 	else
 		return
 	end
-	-- Diagnostics invoke host code, which may settle a newer answer.
-	if not self:scope_is_current(scope) or seq < (self.settled[scope] or 0) then return end
+	-- Diagnostics invoke host code, which may shut down or settle a newer answer.
+	if self.torn_down or not self:scope_is_current(scope) or seq < (self.settled[scope] or 0) then return end
 	self.values = copy_value(result.values, 0)
 	self.version = result.version
 end

@@ -2762,6 +2762,27 @@ local function test_cache_persist_diagnostic_cannot_revive_closed_scope()
 	end)
 end
 
+local function test_cache_persist_diagnostic_shutdown_keeps_retired_getters()
+	with_clear_store(function()
+		local client, closed
+		client = primed_client({ diagnostics = function(issue)
+			if issue.status == "cache_persist_failed" then closed = client:shutdown() end
+		end })
+		local save = sys.save
+		sys.save = function(path, value)
+			if path:find("remote-config", 1, true) then return false end
+			return save(path, value)
+		end
+		next_status, next_response_body = 200, values_body({ a = 2 }, 4)
+		local callbacks = 0
+		client:fetch_remote_config(function() callbacks = callbacks + 1 end)
+		assert_equal(closed, true, "the diagnostic completed shutdown")
+		assert_equal(client:remote_config_number("a", 0), 1, "shutdown freezes the retired getter snapshot")
+		assert_equal(client:remote_config_version(), 3)
+		assert_equal(callbacks, 0, "the fetch callback stays cancelled")
+	end)
+end
+
 local function test_failed_overwrite_clear_recovers_without_rolling_back()
 	with_clear_store(function()
 		local client = primed_client()
@@ -2827,6 +2848,7 @@ local tests = {
 	test_failed_overwrite_clear_recovers_without_rolling_back,
 	test_failed_overwrite_never_clears_a_read_shadow,
 	test_cache_persist_diagnostic_cannot_revive_closed_scope,
+	test_cache_persist_diagnostic_shutdown_keeps_retired_getters,
 	test_failed_unpublished_clear_recovers_and_diagnoses_once,
 	test_clear_retry_precedes_pacing_and_missing_transport,
 	test_unpublished_clear_preserves_unordered_records,
