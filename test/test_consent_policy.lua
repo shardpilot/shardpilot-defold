@@ -2918,7 +2918,7 @@ local function test_scope_key_wire_contract()
 	assert_equal(failed, 0, "scope wire contract")
 end
 
--- The request platform is one of the twelve the resolver accepts (A8). A host
+-- The request platform is one of the twelve the resolver accepts. A host
 -- spelling is folded through the SDK's one platform table; a string it cannot
 -- map is sent as "other"; only a missing or non-string platform is refused.
 local function test_the_request_platform_is_folded_to_the_twelve()

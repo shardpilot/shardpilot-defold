@@ -192,7 +192,7 @@ for _, case in ipairs({
 	end
 end
 
--- 8. THE CRASH PLATFORM IS THIS FIELD (A8).
+-- 8. THE CRASH PLATFORM IS THIS FIELD.
 --
 -- Each constructor owns its key set. A mixed table is refused; carrying the
 -- same platform into valid per-client tables folds it the same way on both
