@@ -596,6 +596,11 @@ revalidation stops, including mismatch correction fetches, grammar retries and
 work between keys when a host hook starts shutdown. Grammar recovery also leaves
 the current subject intact while closing.
 
+Platform and experiment-transport detection request system information with
+`ignore_secure = true`, omitting engine-protected identifiers. Platform names and
+the `other` fallback retain their existing behavior; see the
+[iOS privacy guide](docs/ios-privacy.md#engine-apis-and-system-information-minimization).
+
 ## AI-assisted integration
 
 Integrating with an AI coding tool (Claude Code or similar)? This repo ships a

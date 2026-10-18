@@ -2,6 +2,9 @@
 
 ### Unreleased
 
+- Platform and experiment-transport detection request non-secure system info,
+  avoiding the unused protected identifier read while preserving platform mapping.
+
 - Size-cap evictions retain keys in memory even when durable history cannot fit.
   Unchanged live history is not rewritten every update. Apply mismatches skip
   refetches when the occurrence's version, variant or assignment key was superseded before dispatch.

@@ -38,7 +38,7 @@ local launch = [=[
 })(]=]
 
 function M.new()
-	local info = sys and sys.get_sys_info and sys.get_sys_info() or {}
+	local info = sys and sys.get_sys_info and sys.get_sys_info({ ignore_secure = true }) or {}
 	return setmetatable({ browser = info.system_name == "HTML5", jobs = {} }, Transport)
 end
 

@@ -20,3 +20,4 @@
 - Adopt all cap retirements before diagnostics, even when durable history is evicted.
 - Apply mismatch correction compares the occurrence's version, variant and assignment key.
 - Schedule cap-history pruning for newly adopted keys; retain unchanged live keys.
+- System-information probes must request ignore_secure; preserve protected fallbacks.
