@@ -6967,6 +6967,16 @@ function Client:flush(options)
 	if type(options) ~= "table" then
 		options = {}
 	end
+	-- Keep the dispatch budget even if a synchronous response settles and
+	-- removes its drain. Automatic dispatch can serve every still-live drain.
+	local deadline_ms = options.deadline_ms
+	if not deadline_ms then
+		for _, drain in ipairs(self.flush_drains) do
+			if not deadline_ms or drain.deadline_ms > deadline_ms then
+				deadline_ms = drain.deadline_ms
+			end
+		end
+	end
 	-- Retry deferred durable-spool work first — before any other spool
 	-- operation: a failed denied/disabled purge keeps the spool fail-closed
 	-- until it lands, and a failed ack-removal rewrite must settle as soon as
@@ -7050,6 +7060,9 @@ function Client:flush(options)
 	end
 
 	while true do
+		if deadline_ms and clock.unix_ms() >= deadline_ms then
+			return false, "pending"
+		end
 		local token_ready = false
 		if not self.in_flight_batch then
 			local resend_spool = self:spool_pending()
@@ -7213,7 +7226,7 @@ function Client:bounded_flush(timeout_seconds, callback)
 	-- and an explicit caller outranks this client's own backoff, as before.
 	-- Anything else that appeared meanwhile (a host hook tracking from inside
 	-- the dispatch) was not held at the call and is not part of it.
-	self:flush()
+	self:flush({ deadline_ms = drain.deadline_ms })
 	for id, name in pairs(self:pending_delivery_ids()) do
 		if not drain.ids[id] and CALL_SUMMARIES[name] then
 			drain.ids[id] = true

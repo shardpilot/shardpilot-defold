@@ -147,6 +147,10 @@ sends batch after batch from `update()`, without waiting for
 `flush_interval_seconds`, until all of it is settled or `timeout_seconds`
 (default `10`) passes. Events tracked after the call are not part of it.
 
+The deadline also bounds consecutive dispatches on a synchronous HTTP bridge:
+once it is reached, the dispatch step starts no further event batch. A request
+already in progress can finish afterwards; unsent events remain queued or spooled.
+
 The callback runs once, on the main loop: inside the call when everything
 settles at once, otherwise from `update()`. It receives `true`, or `false` and
 a code:
