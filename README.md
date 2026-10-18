@@ -664,19 +664,16 @@ initialization attempt. `new(config)` creates an independent client instance.
 | `spool_max_bytes` | `262144` | Approx. spool size budget (1024–393216); oldest evicted first |
 
 **One client per app.** Keep one live client per configured app
-(`workspace_key` and `app_key`) in a process. The identity and consent record,
-the event spool and the experiment records are stored per app, and each client
-works from its own in-memory copy of them. Two live clients of one app do not
-see each other's changes: an `age_ineligible` refusal received by one does not
-stop the other serving that experiment or delivering its queued and spooled
-facts. To replace a client, call `shutdown()` and wait for its callback, then
-create the next one. Teardown discards remote-config responses still in flight
-and cancels their callbacks. Clients of different apps are independent; create
-each with
-`new(config)` and keep every instance (`init` holds one default client). Ids
-that differ only in characters other than letters, digits, `-` and `_` count
-as one app. `new(config)` does not yet refuse a second client of a live app
-([#146](https://github.com/shardpilot/shardpilot-defold/issues/146)); see
+(`workspace_key` and `app_key`) in a process. A second `new(config)` returns
+`nil, "storage_scope_in_use"` before reading or writing storage; `init(config)`
+returns `false` with that error when a `new` instance already owns its app. Changing
+the environment does not create a separate storage scope. To replace a client,
+call `shutdown()` and wait for its callback, then create the next one. Teardown
+discards remote-config responses still in flight and cancels their callbacks.
+Failed construction and collection of an unreachable client also release ownership.
+Different raw workspace/app keys have distinct scopes, including punctuation and
+case differences. Clients of different apps are independent; create each with
+`new(config)` and keep every instance (`init` holds one default client). See
 [`docs/configuration.md`](docs/configuration.md#one-client-per-app).
 
 > `ingest.shardpilot.com` is a **planned** public domain and is not provisioned.

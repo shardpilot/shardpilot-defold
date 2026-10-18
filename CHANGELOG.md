@@ -2,6 +2,11 @@
 
 ### Unreleased
 
+- A second live analytics client for the same workspace/app returns
+  `storage_scope_in_use` before storage access. Ownership lasts through shutdown
+  and releases after teardown, failed construction or collection of an unreachable
+  client. Different apps can run side by side.
+
 - Client teardown cancels remote-config fetches still in flight: late responses
   cannot change the cache or getters and their callbacks do not run. Replace a
   client after its shutdown callback without waiting separately for those fetches.

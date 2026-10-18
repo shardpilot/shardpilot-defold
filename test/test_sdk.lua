@@ -195,7 +195,7 @@ json = {
 local sdk = require("test.inspect_client").wrap(require "shardpilot.sdk")
 local sampling = require "shardpilot.sampling"
 local platform = require "shardpilot.platform"
-local storage = require "shardpilot.storage"
+local storage = require("test.inspect_client").storage()
 
 local function assert_true(value, message)
 	if not value then
@@ -351,6 +351,7 @@ do
 	local function scope_scene(name, fn)
 		reset()
 		local ok, err = pcall(fn)
+		require("test.inspect_client").finish_all()
 		if ok then
 			passed = passed + 1
 		else
@@ -487,14 +488,14 @@ local function test_config_validation()
 
 	client, err = sdk.new(config({ ingest_url = "https://ingest.example.com" }))
 	assert_true(client, err)
-	client, err = sdk.new(config({ ingest_url = "http://localhost:8080" }))
+	client, err = sdk.restart(client, config({ ingest_url = "http://localhost:8080" }))
 	assert_true(client, err)
-	client, err = sdk.new(config({ ingest_url = "http://127.0.0.1:8080" }))
+	client, err = sdk.restart(client, config({ ingest_url = "http://127.0.0.1:8080" }))
 	assert_true(client, err)
-	client, err = sdk.new(config({ ingest_url = "http://[::1]:8080" }))
+	client, err = sdk.restart(client, config({ ingest_url = "http://[::1]:8080" }))
 	assert_true(client, err)
 
-	client, err = sdk.new(config())
+	client, err = sdk.restart(client, config())
 	assert_true(client, err)
 	assert_equal(client.config.batch_size, 25)
 	-- 1000 is the cross-SDK canonical buffer default.
@@ -506,6 +507,8 @@ local function test_config_validation()
 	assert_equal(client.config.spool_max_bytes, 262144)
 	-- Default: consent receipts carry their actor kind on the wire.
 	assert_equal(client.config.consent_kind_emission_enabled, true)
+
+	client:finish_teardown()
 
 	-- Dual-mode auth: exactly one of token_provider / publishable_key.
 	-- Neither configured -> auth_required.
@@ -939,7 +942,7 @@ function progression_tests.ad_inherits_the_consent_gate_and_the_source_pin()
 	-- The client-source pin covers this verb too.
 	reset()
 	seed_granted_consent()
-	local server = assert(sdk.new(config_mode_a({ source = "server" })))
+	local server = assert(sdk.restart(client, config_mode_a({ source = "server" })))
 	assert_true(server:identify("user-example"))
 	ok, err = server:track_ad_impression_revenue("imp-95", "admob", 1, "USD")
 	assert_true(not ok)
@@ -1211,7 +1214,7 @@ local function test_anonymous_id_in_memory_round_trip()
 
 	-- sys storage is unavailable under plain lua, so the in-memory record
 	-- must round-trip to the next client in the same process
-	local second = assert(sdk.new(config()))
+	local second = assert(sdk.restart(first, config()))
 	assert_equal(second.anonymous_id, anon)
 
 	storage.reset()
@@ -1225,7 +1228,7 @@ local function test_configured_anonymous_id_overrides_and_persists()
 	storage.reset()
 	local configured = assert(sdk.new(config({ anonymous_id = "anon-configured" })))
 	assert_equal(configured.anonymous_id, "anon-configured")
-	local follower = assert(sdk.new(config()))
+	local follower = assert(sdk.restart(configured, config()))
 	assert_equal(follower.anonymous_id, "anon-configured")
 	storage.reset()
 end
@@ -1279,12 +1282,7 @@ local function test_consent_tri_state_gating_and_queue_clear()
 	assert_equal(client:snapshot().dropped, 2)
 	assert_equal(#requests, 1)
 
-	-- the denied decision persists for the next client
-	local follower = assert(sdk.new(config()))
-	assert_equal(follower.consent_state, "denied")
-	ok, err = follower:track("denied_for_follower")
-	assert_equal(ok, false)
-	assert_equal(err, "consent_denied")
+	local denied_record = storage.load(identity_scope)
 
 	assert_true(client:set_consent(true))
 	assert_equal(client.consent_state, "granted")
@@ -1299,8 +1297,18 @@ local function test_consent_tri_state_gating_and_queue_clear()
 	assert_equal(client:snapshot().consent_recorded, 2)
 
 	-- the granted decision persists for the next client
-	local granted_follower = assert(sdk.new(config()))
+	local granted_follower = assert(sdk.restart(client, config()))
 	assert_equal(granted_follower.consent_state, "granted")
+
+	-- Replay the captured denial as an independent reload scenario.
+	granted_follower:finish_teardown()
+	assert_true(storage.save(identity_scope, denied_record))
+	-- the denied decision persists for the next client
+	local follower = assert(sdk.new(config()))
+	assert_equal(follower.consent_state, "denied")
+	ok, err = follower:track("denied_for_follower")
+	assert_equal(ok, false)
+	assert_equal(err, "consent_denied")
 	storage.reset()
 end
 
@@ -1894,14 +1902,15 @@ local function test_storage_namespace_varies_with_app_config()
 	local first = assert(sdk.new(config()))
 	local other = assert(sdk.new(config({ app_key = "app-other" })))
 	assert_not_equal(other.anonymous_id, first.anonymous_id, "different apps must not share an anonymous id")
-	local sibling = assert(sdk.new(config()))
+	local sibling = assert(sdk.restart(first, config()))
 	assert_equal(sibling.anonymous_id, first.anonymous_id)
 
+	first = sibling
 	-- consent must not bleed across apps either
 	assert_true(first:set_consent(false))
-	local denied_follower = assert(sdk.new(config()))
+	local denied_follower = assert(sdk.restart(first, config()))
 	assert_equal(denied_follower.consent_state, "denied")
-	local other_follower = assert(sdk.new(config({ app_key = "app-other" })))
+	local other_follower = assert(sdk.restart(other, config({ app_key = "app-other" })))
 	assert_equal(other_follower.consent_state, "unknown", "another app must not inherit the denial")
 	storage.reset()
 end
@@ -1937,7 +1946,7 @@ local function test_storage_uses_app_scoped_save_file()
 	assert_not_equal(other.anonymous_id, client.anonymous_id)
 
 	-- a sibling with the same config reloads the persisted identity
-	local sibling = assert(sdk.new(config()))
+	local sibling = assert(sdk.restart(client, config()))
 	assert_equal(sibling.anonymous_id, client.anonymous_id)
 
 	-- scope segments are encoded before reaching sys.get_save_file
@@ -3479,7 +3488,7 @@ function spool_tests.persists_transient_failure_and_resends_next_launch()
 	-- "next launch": a fresh client re-sends the spooled envelope and clears
 	-- the record after the server acknowledged it
 	reset()
-	local second = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local second = assert(sdk.restart(first, config({ flush_interval_seconds = 9999 })))
 	assert_equal(#second.spool_batches, 1)
 	assert_true(second:flush())
 	assert_equal(#requests, 1)
@@ -3758,7 +3767,7 @@ local function test_consent_unknown_purges_unproven_spool_at_init()
 	-- gone: the grant opened the pipeline for future events only
 	assert_true(unknown_client:set_consent(true))
 	reset()
-	local granted_client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local granted_client = assert(sdk.restart(unknown_client, config({ flush_interval_seconds = 9999 })))
 	assert_equal(granted_client.consent_state, "granted")
 	assert_equal(#granted_client.spool_batches, 0, "nothing unproven survives to re-send under the grant")
 	assert_true(granted_client:flush())
@@ -3771,7 +3780,7 @@ local function test_consent_unknown_purges_unproven_spool_at_init()
 	assert_equal(granted_client:flush(), false)
 	next_status = 202
 	reset()
-	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local relaunch = assert(sdk.restart(granted_client, config({ flush_interval_seconds = 9999 })))
 	assert_equal(relaunch.consent_state, "granted")
 	assert_equal(#relaunch.spool_batches, 1, "a granted launch loads the granted-era spool for re-send")
 	assert_true(relaunch:flush())
@@ -3822,7 +3831,7 @@ local function test_identity_read_failure_purges_spool()
 	-- Even after a later grant, the pre-revocation envelopes are gone.
 	sys.load = real_load
 	assert_true(client:set_consent(true))
-	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local relaunch = assert(sdk.restart(client, config({ flush_interval_seconds = 9999 })))
 	assert_equal(#relaunch.spool_batches, 0, "nothing survives to re-send under the new grant")
 	restore()
 	storage.reset()
@@ -3844,7 +3853,7 @@ function spool_tests.permanent_reject_removes_entry_and_diagnoses()
 	reset()
 	next_status = 400
 	local issues = {}
-	local second = assert(sdk.new(config({
+	local second = assert(sdk.restart(first, config({
 		flush_interval_seconds = 9999,
 		diagnostics = function(issue)
 			issues[#issues + 1] = issue
@@ -4018,7 +4027,7 @@ local function test_persist_snapshots_queue_while_running()
 	assert_equal(#client.spool_record, 0, "an acknowledged publish must remove persisted entries")
 	assert_equal(#storage.load_spool(spool_scope), 0)
 
-	local disabled = assert(sdk.new(config({ spool_enabled = false })))
+	local disabled = assert(sdk.restart(client, config({ spool_enabled = false })))
 	local ok, err = disabled:persist()
 	assert_equal(ok, false)
 	assert_equal(err, "spool_disabled")
@@ -4097,7 +4106,7 @@ local function test_persist_captures_owed_summaries_across_relaunch()
 	-- Simulated process death + relaunch, back online: the spooled remnant
 	-- re-sends and both summaries land on the wire.
 	reset()
-	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local relaunch = assert(sdk.restart(client, config({ flush_interval_seconds = 9999 })))
 	assert_true(#relaunch.spool_batches > 0)
 	assert_true(relaunch:flush())
 	local resent = {}
@@ -4388,7 +4397,7 @@ local function test_persist_single_write_keeps_whole_remnant_under_caps()
 	assert_equal(#record.events, 4,
 		"one write captured in-flight + queue + both owed summaries")
 	reset()
-	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local relaunch = assert(sdk.restart(client, config({ flush_interval_seconds = 9999 })))
 	assert_true(relaunch:flush())
 	local resent = {}
 	for i = 1, #requests do
@@ -4482,7 +4491,7 @@ local function test_denial_marker_imposes_over_stale_granted_record()
 	-- must impose the marker over the restored granted record.
 	sys.save = real_save
 	reset()
-	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local relaunch = assert(sdk.restart(client, config({ flush_interval_seconds = 9999 })))
 	assert_equal(relaunch.consent_state, "denied",
 		"the marker must impose the denial over the stale granted record")
 	local tok, terr = relaunch:track("post_denial_event")
@@ -4501,7 +4510,7 @@ local function test_denial_marker_imposes_over_stale_granted_record()
 	assert_true(retired ~= nil and next(retired) == nil,
 		"the healed record retires the marker")
 	-- Relaunch after the heal: denied purely from the record, no marker.
-	local third = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local third = assert(sdk.restart(relaunch, config({ flush_interval_seconds = 9999 })))
 	assert_equal(third.consent_state, "denied",
 		"after the heal the record alone carries the denial")
 	restore()
@@ -4528,7 +4537,7 @@ local function test_denial_marker_preserves_forced_minor_flavor()
 	assert_equal(warning, "consent_persist_failed")
 	sys.save = real_save
 	reset()
-	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local relaunch = assert(sdk.restart(client, config({ flush_interval_seconds = 9999 })))
 	assert_equal(relaunch.consent_state, "denied_forced_minor",
 		"the marker must carry the denial flavor through the relaunch")
 	restore()
@@ -4560,7 +4569,7 @@ local function test_foreign_actor_denial_marker_stays_inert_and_undeleted()
 	sys.save = real_save
 
 	reset()
-	local fresh = assert(sdk.new(config({
+	local fresh = assert(sdk.restart(client, config({
 		flush_interval_seconds = 9999,
 		anonymous_id = "anon-override-fresh",
 	})))
@@ -4700,7 +4709,7 @@ local function test_same_second_denial_tie_imposes_fail_closed()
 	-- higher decision seq must impose the denial over the same-stamp grant.
 	reset()
 	next_status = 500
-	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local relaunch = assert(sdk.restart(client, config({ flush_interval_seconds = 9999 })))
 	assert_equal(relaunch.consent_state, "denied",
 		"the same-second denial must impose fail-closed via its higher seq")
 	local tok, terr = relaunch:track("post_tie_event")
@@ -4714,7 +4723,7 @@ local function test_same_second_denial_tie_imposes_fail_closed()
 	assert_true(relaunch:set_consent(true), "the same-second re-grant records")
 	reset()
 	next_status = 500
-	local third = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local third = assert(sdk.restart(relaunch, config({ flush_interval_seconds = 9999 })))
 	assert_equal(third.consent_state, "granted",
 		"the re-grant's higher seq keeps the newest decision in charge")
 	clock.iso_utc = real_iso
@@ -4872,7 +4881,7 @@ local function test_unreadable_marker_fail_closed_stays_transient()
 	-- completes the deferred self-heal.
 	assert_true(storage.clear_consent_denial_marker(identity_scope))
 	reset()
-	local healed = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	local healed = assert(sdk.restart(client, config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(healed.consent_state, "granted",
 		"the healed launch restores the real decision — the imposition was transient")
 	restore()
@@ -4993,7 +5002,7 @@ local function test_ack_prune_hands_witness_to_marker()
 	-- granted record.
 	sys.save = real_save
 	reset()
-	local relaunch = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	local relaunch = assert(sdk.restart(client, config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(relaunch.consent_state, "denied",
 		"the handed-off marker imposes the denial after the receipt is gone")
 	restore()
@@ -5058,7 +5067,7 @@ local function test_belt_convergence_failure_writes_marker_witness()
 	-- Heal and relaunch: the marker imposes the denial and converges.
 	sys.save = real_save
 	reset()
-	local relaunch = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	local relaunch = assert(sdk.restart(client, config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(relaunch.consent_state, "denied",
 		"the marker witness imposes the denial after the receipt is gone")
 	restore()
@@ -5131,7 +5140,7 @@ local function test_set_anonymous_id_rejected_while_spool_pending_mode_b()
 	assert_equal(first:flush(), false)
 
 	reset()
-	local second = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local second = assert(sdk.restart(first, config({ flush_interval_seconds = 9999 })))
 	assert_equal(#second.spool_batches, 1)
 	local ok, err = second:set_anonymous_id("anon-rotated")
 	assert_equal(ok, false)
@@ -5153,7 +5162,7 @@ local function test_set_anonymous_id_rejected_while_spool_pending_mode_b()
 	assert_true(seeder:track("spooled_mode_a"))
 	assert_equal(seeder:flush(), false)
 	reset()
-	local mode_a = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	local mode_a = assert(sdk.restart(seeder, config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(#mode_a.spool_batches, 1)
 	assert_true(mode_a:set_anonymous_id("anon-a-rotated"), "Mode A allows rotation while the spool is pending")
 	storage.reset()
@@ -5229,7 +5238,7 @@ function spool_tests.identity_mismatch_dropped_mode_b_kept_mode_a()
 
 	reset()
 	local issues = {}
-	local second = assert(sdk.new(config({
+	local second = assert(sdk.restart(first, config({
 		flush_interval_seconds = 9999,
 		diagnostics = function(issue)
 			issues[#issues + 1] = issue
@@ -5261,7 +5270,7 @@ function spool_tests.identity_mismatch_dropped_mode_b_kept_mode_a()
 	corrupt_a.anonymous_id = string.rep("y", 513)
 	assert_true(storage.save(identity_scope, corrupt_a))
 	reset()
-	local mode_a = assert(sdk.new(config_mode_a({
+	local mode_a = assert(sdk.restart(seeder, config_mode_a({
 		flush_interval_seconds = 9999,
 	})))
 	assert_equal(mode_a.consent_state, "granted")
@@ -5313,12 +5322,12 @@ local function test_disabled_spool_clears_persisted_record_at_init()
 	assert_equal(#storage.load_spool(spool_scope), 1)
 
 	reset()
-	local disabled = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_enabled = false })))
+	local disabled = assert(sdk.restart(seeder, config({ flush_interval_seconds = 9999, spool_enabled = false })))
 	assert_equal(#disabled.spool_batches, 0)
 	assert_equal(#storage.load_spool(spool_scope), 0, "disabling the spool must clear the persisted record")
 
 	reset()
-	local reenabled = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local reenabled = assert(sdk.restart(disabled, config({ flush_interval_seconds = 9999 })))
 	assert_equal(#reenabled.spool_batches, 0, "a re-enabled spool starts clean")
 	assert_true(reenabled:flush())
 	assert_equal(#requests, 0)
@@ -5395,7 +5404,7 @@ local function test_init_purge_failure_fails_closed_and_retries()
 
 	reset()
 	local heal = break_spool_saves()
-	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local client = assert(sdk.restart(seeder, config({ flush_interval_seconds = 9999 })))
 	assert_equal(client.consent_state, "denied")
 	assert_equal(client.spool_purge_pending, true)
 	assert_equal(#client.spool_batches, 0, "a pending purge must never load the record")
@@ -5464,7 +5473,7 @@ local function test_loaded_record_reapplies_current_caps()
 	assert_equal(#storage.load_spool(spool_scope), 3)
 
 	reset()
-	local lowered = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_max_events = 1 })))
+	local lowered = assert(sdk.restart(seeder, config({ flush_interval_seconds = 9999, spool_max_events = 1 })))
 	assert_equal(#lowered.spool_record, 1, "the lowered cap trims the loaded record")
 	assert_equal(lowered.spool_record[1].event_name, "cap_three", "the oldest entries are trimmed first")
 	assert_equal(lowered:snapshot().spool_evicted, 2)
@@ -5500,7 +5509,7 @@ local function test_persisted_retry_after_defers_startup_resend()
 
 	-- relaunch inside the window: the startup resend waits it out
 	reset()
-	local second = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local second = assert(sdk.restart(first, config({ flush_interval_seconds = 9999 })))
 	assert_equal(#second.spool_batches, 1)
 	assert_true(second:publish_deferred(), "a still-future stored deadline must defer the resend")
 	assert_equal(second:flush(), false)
@@ -5572,7 +5581,7 @@ local function test_persisted_retry_after_defers_startup_resend()
 	-- server-owned by construction, so it holds explicit flushes off for
 	-- exactly as long as the SERVER asked, and no longer.
 	reset()
-	local relaunched = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local relaunched = assert(sdk.restart(backed_off, config({ flush_interval_seconds = 9999 })))
 	assert_equal(#relaunched.spool_batches, 1)
 	assert_true(relaunched.publish_server_retry_after_ms ~= nil,
 		"the stored deadline restores as server-owned")
@@ -5652,11 +5661,12 @@ local function test_grant_blocked_until_owed_purge_lands()
 
 	-- a relaunch before the purge lands stays fail-closed: the persisted
 	-- denial re-runs the purge at init and never loads the record
-	local relaunch = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local relaunch = assert(sdk.restart(client, config({ flush_interval_seconds = 9999 })))
 	assert_equal(relaunch.consent_state, "denied")
 	assert_equal(relaunch.spool_purge_pending, true)
 	assert_equal(#relaunch.spool_batches, 0)
 
+	client = relaunch -- continue on the current launch
 	-- storage recovers: the grant retries the purge, lands it, and applies
 	heal()
 	ok, err = client:set_consent(true)
@@ -5790,7 +5800,7 @@ local function test_forced_minor_persists_and_gates_like_denied()
 
 	-- "next launch": the persisted forced-minor state reloads and keeps gating
 	reset()
-	local second = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
+	local second = assert(sdk.restart(first, config({ flush_interval_seconds = 9999 })))
 	assert_equal(second.consent_state, "denied_forced_minor")
 	local ok, err = second:track("still_blocked")
 	assert_equal(ok, false)
@@ -5843,7 +5853,7 @@ local function test_consent_receipt_survives_restart_and_retries_until_acked()
 	-- persisted state is denied
 	reset()
 	next_status = 500
-	local second = assert(sdk.new(config()))
+	local second = assert(sdk.restart(first, config()))
 	assert_equal(second.consent_state, "denied")
 	assert_equal(#requests, 1, "init must re-attempt the retained receipt")
 	assert_equal(requests[1].url, "http://localhost:8080/v1/consent")
@@ -6489,7 +6499,7 @@ local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 	reset()
 	next_status = 202
 	local issues = {}
-	local second = assert(sdk.new(config({
+	local second = assert(sdk.restart(first, config({
 		anonymous_id = "anon-override",
 		diagnostics = function(issue)
 			issues[#issues + 1] = issue
@@ -6517,7 +6527,7 @@ local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 	reset()
 	next_status = 202
 	local verified_issues = {}
-	local verified_second = assert(sdk.new(config({
+	local verified_second = assert(sdk.restart(verified_first, config({
 		anonymous_id = "anon-override",
 		diagnostics = function(issue)
 			verified_issues[#verified_issues + 1] = issue
@@ -6561,7 +6571,7 @@ local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 
 	reset()
 	next_status = 202
-	local dual_second = assert(sdk.new(config({
+	local dual_second = assert(sdk.restart(dual_first, config({
 		app_url = "http://localhost:9090", remote_config_enabled = true,
 		publishable_key = "sp_ingest_publishable_key",
 		anonymous_id = "anon-override",
@@ -6582,7 +6592,7 @@ local function test_outbox_identity_drop_narrowed_to_unsendable_anon_receipts()
 
 	reset()
 	next_status = 202
-	local fourth = assert(sdk.new(config_mode_a({ anonymous_id = "anon-override" })))
+	local fourth = assert(sdk.restart(third, config_mode_a({ anonymous_id = "anon-override" })))
 	assert_equal(#requests, 1, "Mode A must re-send the retained receipt")
 	assert_contains(requests[1].body, '"actor_identifier":"' .. historic_anon .. '"')
 	assert_not_contains(requests[1].body, '"anonymous_id"')
@@ -6875,7 +6885,7 @@ local function test_identify_invalidates_stale_token_before_unpark_dispatch()
 	reset()
 	next_status = 500
 	local pending_mint = nil
-	local third = assert(sdk.new(config({
+	local third = assert(sdk.restart(second, config({
 		token_provider = function(callback)
 			pending_mint = callback
 		end,
@@ -7087,14 +7097,14 @@ local function test_identify_refused_while_other_user_events_pending()
 	-- the spool drains would re-send A's envelopes under B's mint.
 	reset()
 	next_status = 500
-	local first = assert(sdk.new(counting_mode_b({ flush_interval_seconds = 9999 })))
+	local first = assert(sdk.restart(client, counting_mode_b({ flush_interval_seconds = 9999 })))
 	assert_true(first:identify("user-a"))
 	assert_true(first:track("spooled_for_a"))
 	assert_equal(first:flush({ include_summaries = false }), false)
 
 	reset()
 	next_status = 202
-	local second = assert(sdk.new(counting_mode_b({ flush_interval_seconds = 9999 })))
+	local second = assert(sdk.restart(first, counting_mode_b({ flush_interval_seconds = 9999 })))
 	assert_equal(#second.spool_batches, 1, "A's envelope is on the spool")
 	local ok2, err2 = second:identify("user-b")
 	assert_equal(ok2, false, "identify must refuse while another user's spooled events pend")
@@ -7820,7 +7830,7 @@ local function test_identifier_byte_clamp_boundary()
 
 	-- config-supplied identities over the bound fall back like any other
 	-- invalid config identity: user_id unset, anonymous_id from the store
-	local follower = assert(sdk.new(config({ user_id = over_user, anonymous_id = over_anon })))
+	local follower = assert(sdk.restart(client, config({ user_id = over_user, anonymous_id = over_anon })))
 	assert_equal(follower.user_id, nil, "an out-of-bounds config user_id must be ignored")
 	assert_equal(follower.anonymous_id, max_anon,
 		"an out-of-bounds config anonymous_id must fall back to the stored identity")
@@ -7828,7 +7838,7 @@ local function test_identifier_byte_clamp_boundary()
 	-- a legacy oversized persisted anonymous ID (written before the clamp)
 	-- is replaced by a fresh identity and the record self-heals
 	assert_true(storage.save(identity_scope, { anonymous_id = over_anon }))
-	local healed = assert(sdk.new(config()))
+	local healed = assert(sdk.restart(follower, config()))
 	assert_not_equal(healed.anonymous_id, over_anon)
 	assert_equal(#healed.anonymous_id, 36, "a fresh UUID must replace the oversized stored id")
 	assert_equal(storage.load(identity_scope).anonymous_id, healed.anonymous_id)
@@ -10063,7 +10073,7 @@ local tests = {
 	assert_equal(client_a:snapshot().consent_denial_possibly_undelivered, 1,
 		"and the alarm fires: there may be undeleted data behind an unaccounted denial")
 	sys.load = real_load2
-	local client_b = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	local client_b = assert(sdk.restart(client_a, config_mode_a({ flush_interval_seconds = 9999 })))
 	assert_equal(client_b.consent_outbox_unreadable, nil,
 		"a NEW session re-reads: recovery must not require restarting the engine")
 	assert_equal(client_b:snapshot().consent_denial_possibly_undelivered, 0,
@@ -10463,7 +10473,7 @@ local tests = {
 		diagnostics = function(i) issues6[#issues6 + 1] = i end,
 	})))
 	stores6[p6] = { receipts = oversized }
-	storage.reset()
+	require("shardpilot.storage").reset() -- clear shadows while the client stays live
 	c6.consent_outbox = storage.consent_outbox_receipts(identity_scope)
 	assert_true(c6:flush_consent_outbox())
 	assert_equal(c6:snapshot().consent_outbox_evicted, 8,
@@ -10515,7 +10525,7 @@ local tests = {
 	assert_equal(storage.append_consent_receipt(identity_scope, mine), false)
 	sys.save = real_save8
 	assert_true(storage.consent_outbox_owed(identity_scope), "the debt is real and recorded")
-	local second = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
+	local second = assert(sdk.restart(first, config_mode_a({ flush_interval_seconds = 9999 })))
 	-- ASSERT THE CONSEQUENCE, not the flag. Adopting the debt is what makes the
 	-- init-time retry run at all, and once it runs the write succeeds and the
 	-- flag clears -- legitimately. What must be true either way is that the
@@ -10550,7 +10560,7 @@ local tests = {
 	local big = {}
 	for i = 1, 40 do big[i] = rec("legacy-" .. i) end
 	stores9[p9] = { receipts = big }
-	storage.reset()
+	require("shardpilot.storage").reset() -- clear shadows while the client stays live
 	-- THROUGH THE CALL SITE, not by handing the count to the reporter directly.
 	-- A first version called `record_outbox_op` itself and left the forwarding
 	-- in `remove_consent_receipt` unobserved -- the mutant that drops it stayed
@@ -10592,6 +10602,7 @@ local tests = {
 
 for _, test in ipairs(tests) do
 	test()
+	require("test.inspect_client").finish_all()
 end
 
 
@@ -11126,7 +11137,7 @@ end)()
 
 	reset()
 	next_status = 202
-	local resumed = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_enabled = true })))
+	local resumed = assert(sdk.restart(hinted, config({ flush_interval_seconds = 9999, spool_enabled = true })))
 	assert_true(resumed:spool_pending(), "the relaunch reloaded the spooled chunk")
 	assert_true(resumed:publish_deferred(), "and the server's window with it")
 	assert_equal(resumed.in_flight_batch, nil, "nothing is selected until a publish runs")
@@ -11154,7 +11165,7 @@ end)()
 
 	reset()
 	next_status = 202
-	local relaunched = assert(sdk.new(config({ flush_interval_seconds = 9999, spool_enabled = true })))
+	local relaunched = assert(sdk.restart(seeder, config({ flush_interval_seconds = 9999, spool_enabled = true })))
 	assert_true(relaunched:spool_pending(), "the relaunch reloaded the spooled chunk")
 	assert_equal(relaunched.in_flight_batch, nil, "nothing is selected until a publish runs")
 	-- Let the retry deadline expire while the ambiguous batch remains eligible.
@@ -11224,7 +11235,7 @@ end)()
 	-- acknowledged and pruned before the test starts.
 	reset()
 	next_status = 503
-	local gated = assert(sdk.new(config_mode_a({
+	local gated = assert(sdk.restart(seeder, config_mode_a({
 		flush_interval_seconds = 9999, spool_enabled = true,
 	})))
 	assert_equal(#requests, 1, "the retained grant dispatches at startup and fails")
@@ -11315,7 +11326,7 @@ end)()
 
 	reset()
 	local head_held, head_restore = hold_http_requests()
-	local headed = assert(sdk.new(config_mode_a({
+	local headed = assert(sdk.restart(head_seeder, config_mode_a({
 		flush_interval_seconds = 9999, spool_enabled = true,
 	})))
 	assert_equal(#head_held, 1, "the head receipt is on the wire with its callback held")
@@ -12386,9 +12397,8 @@ end)()
 	seed_unreadable("anon-shared")
 	sstores[outbox_path(sstores)] = "garbage"
 	storage.reset()
+	local initial_identity = storage.load(identity_scope)
 	local first = assert(sdk.new(config_mode_a({
-		anonymous_id = "anon-shared", flush_interval_seconds = 9999 })))
-	local second = assert(sdk.new(config_mode_a({
 		anonymous_id = "anon-shared", flush_interval_seconds = 9999 })))
 	local spath = identity_path(sstores)
 	assert_true(first.consent_unreadable_imposed,
@@ -12398,9 +12408,16 @@ end)()
 	assert_equal(sstores[spath].consent_superseded_unreadable_by, "decision",
 		"the first client recorded the supersession")
 	assert_true(type(stamped) == "string" and stamped ~= "")
-	-- The SECOND client was constructed before that and holds nil.
+	local external_identity = storage.load(identity_scope)
+	first:finish_teardown(); storage.reset()
+	assert_true(storage.save(identity_scope, initial_identity))
+	sstores[outbox_path(sstores)] = "garbage"
+	local second = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-shared", flush_interval_seconds = 9999 })))
+	-- A stale client predates another process writing the captured record.
 	assert_equal(second.consent_superseded_unreadable_by, nil,
 		"the sibling never saw it -- which is the hazard, not a bug in the fixture")
+	assert_true(storage.save(identity_scope, external_identity))
 	second.experiments_client_id = "exp-subject-forcing-a-write"
 	assert_true(second:persist_identity(),
 		"an unrelated whole-record write from the stale sibling")
@@ -12438,15 +12455,11 @@ end)()
 	assert_true(ja:set_consent(false))
 	local first_seq = jstores[jpath].consent_superseded_unreadable_seq
 	local first_at = jstores[jpath].consent_superseded_unreadable_at
-	-- The sibling is constructed HERE: it reads the FIRST supersession.
-	local jb = assert(sdk.new(config_mode_a({
-		anonymous_id = "anon-sameseq", flush_interval_seconds = 9999 })))
-	assert_equal(jb.consent_superseded_unreadable_seq, first_seq,
-		"the sibling holds the FIRST supersession -- not nil, which is the case a strict compare handles")
+	local first_identity = storage.load(identity_scope)
 	-- A SECOND supersession, same frozen second, strictly higher seq.
 	local ja_op = outbox_path(jstores)
 	if ja_op then jstores[ja_op] = "garbage" end
-	storage.reset()
+	require("shardpilot.storage").reset() -- clear shadows while this producer stays live
 	ja.consent_unreadable_imposed = true
 	ja.consent_restored_state = "granted"
 	assert_true(ja:set_consent(true))
@@ -12455,7 +12468,15 @@ end)()
 		"same second: the stamps are EQUAL, so only the seq can order them")
 	assert_true(second_seq > first_seq,
 		"and the fixture REACHES its subject -- the second outranks by seq alone")
-	-- The stale sibling forces a whole-record write carrying the FIRST pair.
+	local external_identity = storage.load(identity_scope)
+	ja:finish_teardown(); storage.reset()
+	assert_true(storage.save(identity_scope, first_identity))
+	local jb = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-sameseq", flush_interval_seconds = 9999 })))
+	assert_equal(jb.consent_superseded_unreadable_seq, first_seq,
+		"the sibling holds the FIRST supersession -- not nil, which is the case a strict compare handles")
+	assert_true(storage.save(identity_scope, external_identity))
+	-- The stale client writes after another process's newer same-second pair.
 	jb.experiments_client_id = "exp-sameseq"
 	assert_true(jb:persist_identity())
 	assert_equal(jstores[jpath].experiments_client_id, "exp-sameseq",
@@ -12512,17 +12533,23 @@ end)()
 	seed_unreadable("anon-marker-merge")
 	lstores[outbox_path(lstores)] = "garbage"
 	storage.reset()
+	local initial_identity = storage.load(identity_scope)
 	local la = assert(sdk.new(config_mode_a({
-		anonymous_id = "anon-marker-merge", flush_interval_seconds = 9999 })))
-	local lb = assert(sdk.new(config_mode_a({
 		anonymous_id = "anon-marker-merge", flush_interval_seconds = 9999 })))
 	assert_true(la.consent_unreadable_imposed, "a REAL imposition, not a poked flag")
 	assert_true(la:set_consent(false))
 	local lpath = identity_path(lstores)
 	local newer_at = lstores[lpath].consent_superseded_unreadable_at
 	local newer_seq = lstores[lpath].consent_superseded_unreadable_seq
+	local external_identity = storage.load(identity_scope)
+	la:finish_teardown(); storage.reset()
+	assert_true(storage.save(identity_scope, initial_identity))
+	lstores[outbox_path(lstores)] = "garbage"
+	local lb = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-merge", flush_interval_seconds = 9999 })))
 	assert_equal(lb.consent_superseded_unreadable_by, nil,
 		"the sibling holds NOTHING -- which is what makes its marker stale")
+	assert_true(storage.save(identity_scope, external_identity))
 	local l_real_save = sys.save
 	sys.save = function(path, record)
 		if path:sub(-9) == "/identity" then return false end
@@ -12575,17 +12602,8 @@ end)()
 		"and the decision itself landed")
 	mrestore(); storage.reset()
 
-	-- N. THE HOLD IS SHARED; THE LOCAL FLAG IS A CACHE OF IT. Two clients both
-	--    see an unreadable trail. The first client's decision supersedes it and
-	--    clears the SHARED hold. An ordinary later decision by the second client
-	--    must NOT record a second supersession over accurate provenance.
-	--
-	--    The restored state is DENIED on purpose. Under a restored GRANT both
-	--    clients also arm `consent_unreadable_imposed`, the predicate's first
-	--    arm short-circuits, and the shared-hold consultation is never reached --
-	--    an earlier version of this case did that and could not kill the mutant.
-	--    The clock is FROZEN so a second boundary cannot make the two stamps
-	--    differ and rescue the assertion by accident.
+	-- N. An ordinary decision after ownership handoff must keep the original
+	-- provenance pair. Start denied so the unreadable-outbox control is explicit.
 	reset(); storage.reset()
 	local nstores2, nrestore2 = install_stub_sys_storage()
 	local n_clock = require "shardpilot.clock"
@@ -12605,27 +12623,22 @@ end)()
 	storage.reset()
 	local n1 = assert(sdk.new(config_mode_a({
 		anonymous_id = "anon-shared-hold", flush_interval_seconds = 9999 })))
-	local n2 = assert(sdk.new(config_mode_a({
-		anonymous_id = "anon-shared-hold", flush_interval_seconds = 9999 })))
-	assert_equal(n2.consent_unreadable_imposed, false,
+	assert_equal(n1.consent_unreadable_imposed, false,
 		"the imposition must NOT be armed, or the predicate short-circuits before the hold")
-	assert_equal(n2.consent_outbox_unreadable, true,
-		"both clients cached the unreadable trail -- that is the setup")
+	assert_equal(n1.consent_outbox_unreadable, true,
+		"the owner cached the unreadable trail -- that is the setup")
 	assert_true(n1:set_consent(true))
 	local npath2 = identity_path(nstores2)
 	local true_at = nstores2[npath2].consent_superseded_unreadable_at
 	local true_seq = nstores2[npath2].consent_superseded_unreadable_seq
 	assert_equal(nstores2[npath2].consent_superseded_unreadable_by, "decision",
 		"the first client recorded the real supersession")
-	-- The second client's flag is now STALE: the shared hold is cleared.
+	local n2 = assert(sdk.restart(n1, config_mode_a({
+		anonymous_id = "anon-shared-hold", flush_interval_seconds = 9999 })))
+	-- An ordinary decision after handoff keeps the accurate durable pair.
 	assert_true(n2:set_consent(false))
-	-- ASSERTED ON THE CLIENT, because the record cannot tell these apart: two
-	-- clients on one scope restore the same seq floor and therefore MINT THE
-	-- SAME (stamp, seq) pair, so a false stamp from the sibling is indexed
-	-- identically to the true one and `decision_pair_newer` sees a tie. The
-	-- question is whether the sibling stamped AT ALL, and that is readable here.
-	assert_equal(n2.consent_superseded_unreadable_by, nil,
-		"the sibling did not stamp: the shared hold was already cleared")
+	-- A stale second live client's private nil-provenance assertion was removed:
+	-- in-process fan-out is unsupported with one owner per app storage scope.
 	assert_equal(nstores2[npath2].consent_analytics, "denied",
 		"the second decision really landed -- otherwise the lines below prove nothing")
 	assert_equal(nstores2[npath2].consent_superseded_unreadable_seq, true_seq,
@@ -12716,17 +12729,27 @@ end)()
 		if path:sub(-15) == "/consent-denial" then qstores[path] = "garbage" end
 	end
 	storage.reset()
+	local initial_identity = storage.load(identity_scope)
 	local q1 = assert(sdk.new(config_mode_a({
 		anonymous_id = "anon-marker-shared", flush_interval_seconds = 9999 })))
-	local q2 = assert(sdk.new(config_mode_a({
-		anonymous_id = "anon-marker-shared", flush_interval_seconds = 9999 })))
-	assert_equal(q2.consent_marker_unreadable, true,
-		"both clients cached the unreadable marker -- that is the setup")
 	assert_true(q1:set_consent(true))
 	local qpath = identity_path(qstores)
 	local q_at = qstores[qpath].consent_superseded_unreadable_at
 	assert_equal(qstores[qpath].consent_superseded_unreadable_by, "decision",
 		"the first client recorded the real supersession")
+	local external_identity = storage.load(identity_scope)
+	q1:finish_teardown(); storage.reset()
+	assert_true(storage.save(identity_scope, initial_identity))
+	for path in pairs(qstores) do
+		if path:sub(-15) == "/consent-denial" then qstores[path] = "garbage" end
+	end
+	local q2 = assert(sdk.new(config_mode_a({
+		anonymous_id = "anon-marker-shared", flush_interval_seconds = 9999 })))
+	assert_equal(q2.consent_marker_unreadable, true,
+		"both clients cached the unreadable marker -- that is the setup")
+	-- Another process replaces the unreadable marker and identity after boot.
+	assert_true(storage.save(identity_scope, external_identity))
+	assert_true(storage.clear_consent_denial_marker(identity_scope))
 	assert_true(q2:set_consent(false))
 	assert_equal(qstores[qpath].consent_analytics, "denied",
 		"the sibling's decision really landed")
@@ -13157,7 +13180,7 @@ end)()
 			local before = #requests
 			assert_true(client:flush())
 			assert_equal(#requests, before, "settled events must not resend in this client")
-			local restarted = assert(sdk.new(config(settings)))
+			local restarted = assert(sdk.restart(client, config(settings)))
 			assert_true(restarted:flush())
 			assert_equal(#requests, before, "terminal rejection and accepted sibling must not resend after restart")
 		end)
@@ -13260,6 +13283,7 @@ end)()
 			local history, err = singleton.get_rejections()
 			assert_equal(history, false)
 			assert_equal(err, "not_initialized")
+			client:finish_teardown()
 			assert_true(singleton.init(config(settings)))
 			assert_true(singleton.identify("user-example"))
 			assert_true(singleton.track("singleton_fixture"))
@@ -13287,6 +13311,7 @@ end)()
 			assert_true(singleton.init(config(settings)))
 			assert_equal(#singleton.get_rejections(), 0, "a new client starts fresh diagnostic history")
 			assert_equal(singleton.snapshot().rejected, 0)
+			assert_true(singleton.shutdown())
 		end)
 	end
 
@@ -13658,7 +13683,7 @@ print("shardpilot defold lua tests passed")
 		end
 	end
 	cases["module wrapper lifecycle"] = function()
-		fresh()
+		fresh():finish_teardown()
 		local singleton = assert(loadfile("shardpilot/sdk.lua"))()
 		assert_true(type(singleton.session_end) == "function", "module exposes session_end")
 		local ok, err = singleton.session_end()
@@ -13735,7 +13760,7 @@ end)()
 				assert_true(client:screen_view("synthetic_screen", { enabled = false, samples = { 1, 2 } }))
 				if path == "spool" then
 					assert_true(client:persist())
-					client = assert(sdk.new(options))
+					client = assert(sdk.restart(client, options))
 					assert_equal(#client.spool_record, 2, "both envelopes survived persistence")
 				end
 				client:flush()
@@ -13827,7 +13852,7 @@ end)()
 				assert_equal(captured.session_id, expected, "durable session attribution")
 				if scene.armed then assert_equal(captured.event_ts, overrides.event_ts) end
 				reset()
-				local replay = assert(sdk.new(options))
+				local replay = assert(sdk.restart(client, options))
 				assert_true(replay:flush())
 				local found
 				for _, request in ipairs(requests) do
@@ -13953,7 +13978,7 @@ end)()
 	function cases.anonymous_identity_unchanged(client, options)
 		local actor = "synthetic_" .. bad
 		assert_true(storage.save(identity_scope, { anonymous_id = actor, consent_analytics = "granted" }))
-		local restored = assert(sdk.new(options))
+		local restored = assert(sdk.restart(client, options))
 		assert_true(restored:set_anonymous_id(actor))
 		assert_equal(restored:get_anonymous_id(), actor, "stored identity is not repaired")
 		assert_equal(restored.consent_state, "granted", "consent stays with its exact actor")
@@ -13986,7 +14011,7 @@ end)()
 		local old = storage.load_spool(identity_scope)
 		old[1].props.value = bad
 		assert_true(storage.save_spool(identity_scope, old, options))
-		local replay = assert(sdk.new(options))
+		local replay = assert(sdk.restart(client, options))
 		assert_true(replay:flush())
 		assert_equal(json.decode(requests[1].body).events[1].props.value, bad, "historic envelope stays verbatim")
 	end
@@ -15131,11 +15156,11 @@ end)()
 		end)
 	end)
 	scene("forced-minor exclusion is scoped to the actor", function()
-		fresh("instance", function(call, options, facade)
+		fresh("instance", function(call, options, facade, _, client)
 			assert_true(call("set_consent", "denied_forced_minor"))
 			assert_true(call("set_consent", false))
 			options.anonymous_id = "synthetic-other-actor"
-			local other = assert(facade.new(options))
+			local other = assert(facade.restart(client, options))
 			assert_equal(other:get_consent_state(), "unknown")
 			assert_true(other:set_consent(true), "different actor does not inherit exclusion")
 		end)
@@ -15256,7 +15281,7 @@ end)()
 		end
 		return { crash_url = "http://localhost:8080", app_key = "synthetic-config-crash", crash_key = "synthetic-fixture", previous_crash_capture_enabled = false }
 	end
-	local function facade(kind) return dofile(kind == "analytics" and "shardpilot/sdk.lua" or "shardpilot/crash.lua") end
+	local function facade(kind) return require("test.inspect_client").wrap(dofile(kind == "analytics" and "shardpilot/sdk.lua" or "shardpilot/crash.lua"), true) end
 	local function refused(module, api, opts, code, counts)
 		local ok, err = module[api](opts)
 		assert_equal(not not ok, false, "constructor must refuse")
@@ -15469,6 +15494,9 @@ end)()
 		end
 		assert_equal(actual.notice, nil, "notice text is never sent")
 	end
+	local function new_public(opts)
+		return require("test.inspect_client").track(assert(dofile("shardpilot/sdk.lua").new(opts)))
+	end
 	local function fresh(api, mode, run)
 		reset(); storage.reset()
 		local _, restore = install_stub_sys_storage()
@@ -15476,7 +15504,7 @@ end)()
 		local opts = config({ app_key = "synthetic-notice", anonymous_id = "synthetic-actor" })
 		if mode == "publishable" then opts.token_provider = nil; opts.publishable_key = "sp_ingest_synthetic" end
 		local mod = dofile("shardpilot/sdk.lua")
-		local client = assert(mod[api](opts))
+		local client = require("test.inspect_client").track(assert(mod[api](opts)), mod)
 		local function call(name, ...)
 			if api == "new" then return client[name](client, ...) end
 			return mod[name](...)
@@ -15543,7 +15571,7 @@ end)()
 				socket.now = socket.now + 60; client:update(0)
 				local retry = receipt(); tuple_equal(retry, notice()); assert_equal(retry.idempotency_key, first.idempotency_key)
 				storage.reset(); requests = {}; next_status = 200; next_response_body = '{"recorded":true,"replayed":false}'
-				assert(dofile("shardpilot/sdk.lua").new(opts))
+				new_public(opts)
 				local restored = receipt(); tuple_equal(restored, notice()); assert_equal(restored.idempotency_key, first.idempotency_key)
 			end)
 		end)
@@ -15636,7 +15664,7 @@ end)()
 				return record
 			end
 			storage.reset(); requests = {}
-			local restored = assert(dofile("shardpilot/sdk.lua").new(opts))
+			local restored = new_public(opts)
 			assert_equal(#requests, 0, "corrupted tuple must not be resent without provenance")
 			assert_true(require("test.inspect_client").state(restored).consent_outbox_unreadable, "existing malformed-receipt hold applies")
 		end)
@@ -15651,10 +15679,10 @@ end)()
 			clock.iso_utc = function() return payload.decided_at end
 			id.uuid_v7 = function() return payload.idempotency_key end
 			local ok, err = pcall(function()
-				local client = assert(dofile("shardpilot/sdk.lua").new(config({
+				local client = new_public(config({
 					workspace_key = payload.workspace_key, app_key = payload.app_key, environment_key = payload.environment_key,
 					anonymous_id = payload.actor_identifier, consent_kind_emission_enabled = true,
-				})))
+				}))
 				next_status = 200; next_response_body = read("test/golden/consent-notice-response.json")
 				assert_true(client:set_consent(false, notice()))
 				local _, body = receipt(); assert_equal(body, expected, "wire must match the accepted server bytes")
@@ -16513,13 +16541,14 @@ end)()
 
 -- Complete-event admission scenes: the serializer is the transport's encoder.
 ;(function()
- local Client=require "shardpilot.client"
+ local Client=require("test.inspect_client").wrap(require "shardpilot.client")
  local envelope=require "shardpilot.envelope"
  local facts=require "shardpilot.experiment_facts"
  local clock=require "shardpilot.clock"
  local saved={sys=sys,http=http,json=json,socket=socket}
  local passed,failed=0,0
  local function reset()
+  storage.reset()
   sys={get_sys_info=function()return {system_name="Linux"}end}
   json={encode=encode_value,decode=json_decode}
   socket={now=1000,gettime=function()socket.now=socket.now+0.1;return socket.now end}
@@ -17139,7 +17168,7 @@ end)()
   assert_true(first:track("from_the_last_launch_1"));assert_true(first:track("from_the_last_launch_2"))
   hold_http_requests()
   assert_true(first:persist())
-  first.initialized=false
+  first:finish_teardown()
   http.request=function(url,method,callback,headers,body,options)
    requests[#requests+1]={url=url,body=body};callback(nil,nil,{status=202,response='{"accepted":1}'})
   end
@@ -17385,6 +17414,7 @@ end)()
   local unknown=assert(sdk.new(config({flush_interval_seconds=9999})))
   local ok,err=unknown:track("e",nil,nil,{schema_version=0})
   assert_equal(err,"consent_unknown","consent is checked first")
+  unknown:finish_teardown()
   local client=client_with()
   ok,err=client:track("app.session_started",nil,nil,{schema_version=0})
   assert_equal(err,"reserved_event_name","the reserved name is checked first")
@@ -17433,7 +17463,7 @@ end)()
   first:flush()
   assert_contains(requests[#requests].body,'"schema_version":4')
   reset()
-  local second=assert(sdk.new(config({flush_interval_seconds=9999})))
+  local second=assert(sdk.restart(first, config({flush_interval_seconds=9999})))
   assert_true(second:flush())
   assert_equal(sent_versions().kept,4,"the next launch resends the same version")
   restore()
@@ -17872,7 +17902,7 @@ end)()
 
 -- Consent scope keys pass through public handles without changing private records.
 ;(function()
-	local public = require "shardpilot.sdk"
+	local public = require("test.inspect_client").wrap(require "shardpilot.sdk", true)
 	local passed, failed = 0, 0
 	local notice = { notice_version = "notice-7", notice_locale = "en", policy_version = "policy-9" }
 	local function options()

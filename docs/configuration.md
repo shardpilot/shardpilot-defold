@@ -234,11 +234,11 @@ consent-receipt outbox and, with `experiments_enabled`, the experiment
 records. A client loads them when it is created and works from its own
 in-memory copy afterwards.
 
-A second live client of the same app does not coordinate with the first. Each
-client's changes reach the shared records, but not the other client's
-memory. For example, an `age_ineligible` refusal received by one client
-withdraws that client's facts and its cached assignment. The other client
-keeps serving the experiment from memory, and delivers the facts it holds.
+A second `new(config)` for an owned app returns `nil, "storage_scope_in_use"`
+before any storage read or write. `init(config)` returns `false` with the same
+error when a `new` instance already owns that app. The reservation starts before
+construction accesses persistence, so reentrant storage hooks cannot create
+another owner. Changing `environment_key` still uses the same app storage scope.
 
 - Create one client with `init(config)` (or `new(config)`) and keep it.
 - To replace it, call `shutdown()` and wait for its callback, then create the
@@ -251,13 +251,14 @@ keeps serving the experiment from memory, and delivers the facts it holds.
   `init` returns `false, "already_initialized"` while that client remains live
   or is being constructed. A completed shutdown releases the default client;
   a later `init` can then create its replacement.
+- A failed constructor releases its reservation. An unreachable client releases
+  ownership when it is garbage collected; callbacks or other references that
+  retain the client keep it live. Use completed shutdown for a predictable handoff.
 - Raw workspace/app identifiers remain distinct in storage: `com.game` and
   `com_game`, or `Game` and `game`, have separate identity and consent records.
   All record categories share the same byte-encoded scope base; see
   [durable storage](privacy.md).
 
-`new(config)` does not yet refuse a second client of a live app; that guard is
-tracked in [#146](https://github.com/shardpilot/shardpilot-defold/issues/146).
 The decision to support one client per app, instead of coordinating several,
 is recorded in [#145](https://github.com/shardpilot/shardpilot-defold/issues/145).
 

@@ -190,6 +190,7 @@ for _, case in ipairs({
 		check(reports[1].scope == "config",
 			case.name .. ": report scope is " .. tostring(reports[1].scope))
 	end
+	client:finish_teardown()
 end
 
 -- 8. THE CRASH PLATFORM IS THIS FIELD.
@@ -220,6 +221,7 @@ do
 		.. tostring(crash.config.platform))
 	check(analytics.config.platform == "other",
 		"an unmapped value did not use the fallback")
+	analytics:finish_teardown()
 end
 
 -- 9. THE OFFLINE BACKLOG IS FOLDED AT LOAD.
@@ -277,6 +279,7 @@ do
 	end
 
 	reports = {}
+	probe:finish_teardown()
 	local client = assert(client_mod.new(config))
 	local loaded = client.spool_record or {}
 	local by_id = {}
@@ -319,6 +322,7 @@ do
 	check(reported == 1, string.format(
 		"the unfoldable spooled platform was reported %d time(s), want 1", reported))
 
+	client:finish_teardown()
 	sys.get_save_file, sys.save, sys.load = nil, nil, nil
 end
 
