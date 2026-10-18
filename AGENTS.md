@@ -17,3 +17,5 @@
 - Emit withdrawal diagnostics after state changes; host hooks can fetch or close.
 - Closing clients keep experiment housekeeping but start no assignment revalidation,
   including mismatch corrections and grammar retries; do not remint while closing.
+- Adopt size-cap fact-key retirements before pruning or host diagnostics.
+- Apply mismatch correction compares the occurrence's version, variant and assignment key.

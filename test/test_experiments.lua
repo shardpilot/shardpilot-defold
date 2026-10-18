@@ -13045,7 +13045,72 @@ function extra_tests.test_close_fences_internal_assignment_refetches()
 	verify("internal assignment corrections during close")
 end
 
+function extra_tests.test_cap_retired_fact_key_prunes_without_another_write()
+	for _, live in ipairs({ true, false }) do
+		reset()
+		local restore = install_fake_sys_storage()
+		local client = granted_client()
+		local fact = "sfk1_" .. string.rep("a", 64)
+		next_response_body = assignment_body({ experiment_key = "cap-a", subject_fact_key = fact,
+			variant_payload = { blob = string.rep("x", 230000) } })
+		assert_true(fetch(client, "cap-a", { age_band = "adult" }).assigned)
+		if live then
+			assert_true(extra_tests.apply(client, "cap-a"))
+			assert_true(client.experiments.deps.live_fact_keys("cap-a")[fact], "a real fact is held")
+		end
+		advance_seconds(2)
+		next_response_body = assignment_body({ experiment_key = "cap-b",
+			variant_payload = { blob = string.rep("y", 230000) } })
+		assert_true(fetch(client, "cap-b", { age_band = "adult" }).assigned)
+		local evicted = storage.load_experiments(client.config)
+		assert_nil(evicted.entries["cap-a"], "the actual size cap evicted the older entry")
+		assert_equal(evicted.fact_key_history["cap-a"][1], fact, "the same save retired its key")
+		if live then
+			assert_true(client:flush({ include_summaries = false }))
+			assert_true(next(client.experiments.deps.live_fact_keys("cap-a")) == nil, "the last fact delivered")
+		else
+			client.experiments.revalidate_at_ms = socket.now * 1000 + 600000
+			client:update(0)
+		end
+		local after = storage.load_experiments(client.config)
+		local retained = after.fact_key_history["cap-a"]
+		client:finish_teardown(); restore(); storage.reset()
+		assert_nil(retained, "a cap-retired key leaves disk without an unrelated record write")
+	end
+end
+
+function extra_tests.test_mismatch_refetch_compares_occurrence_pins()
+	local check, verify = extra_tests.checklist()
+	for _, code in ipairs({ "version_mismatch", "variant_mismatch", "unit_not_recordable" }) do
+		for _, field in ipairs({ "version", "variant_key", "assignment_key", "same" }) do
+			reset()
+			local client = granted_client()
+			next_response_body = assignment_body()
+			assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).assigned)
+			assert_true(client:apply_experiment_variant("exp-checkout"))
+			local changed = { version = 4, variant_key = "newer", assignment_key = "asgn_" .. string.rep("b", 32) }
+			next_response_body = assignment_body(field ~= "same" and { [field] = changed[field] } or {})
+			assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).assigned)
+			local before, applies = #assignment_requests(), 0
+			responder = function(url, _, callback)
+				if url:find("/experiments/exposures", 1, true) then
+					applies = applies + 1
+					callback(nil, nil, { status = 409, response = json.encode({ error = { code = code } }) }); return true
+				end
+				return false
+			end
+			client.experiments:sweep_owed(true)
+			assert_equal(applies, 1, "the original occurrence reached apply after the newer install")
+			check(#assignment_requests() - before == (field == "same" and 1 or 0), code .. " refetch used dispatch state instead of " .. field .. " occurrence pins")
+			responder = nil; client:finish_teardown(); storage.reset()
+		end
+	end
+	verify("mismatch occurrence pins")
+end
+
 local tests = {
+	extra_tests.test_cap_retired_fact_key_prunes_without_another_write,
+	extra_tests.test_mismatch_refetch_compares_occurrence_pins,
 	extra_tests.test_close_fences_internal_assignment_refetches,
 	extra_tests.test_revalidation_rechecks_close_between_keys,
 	extra_tests.test_declaration_diagnostic_reentry,

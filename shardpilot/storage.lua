@@ -2333,7 +2333,8 @@ end
 -- fact_key_history = { [experiment_key] = { fact_key, ... } } }`). Returns
 -- true when stored — in the durable save file, or in the in-memory fallback
 -- on hosts without the save-file API (which then lasts only for the process
--- lifetime).
+-- lifetime). Successful saves also return the final retired-key history as
+-- the third value, including keys retired by the size cap.
 function M.save_experiments(scope, record)
 	if type(record) ~= "table"
 		or type(record.scope) ~= "string" or record.scope == "" then
@@ -2406,14 +2407,14 @@ function M.save_experiments(scope, record)
 	local path = save_path(ns, "experiments")
 	if not path then
 		experiments_memory[ns] = stored
-		return true, evicted
+		return true, evicted, stored.fact_key_history
 	end
 	local ok, saved = pcall(sys.save, path, stored)
 	if not (ok and saved == true) then
 		return false, evicted
 	end
 	experiments_memory[ns] = stored
-	return true, evicted
+	return true, evicted, stored.fact_key_history
 end
 
 -- Durable condemnation marker for the experiment cache: when the

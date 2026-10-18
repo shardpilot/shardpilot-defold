@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- Size-cap evictions retire fact keys into live bookkeeping for timely durable
+  pruning. Apply mismatches skip assignment refetches when the occurrence's
+  version, variant or assignment key was superseded before dispatch.
+
 - Bounded flushes exclude summaries created by host hooks during dispatch.
   Unconfirmed-age diagnostics run after withdrawal, so reentrant fetches and
   shutdown cannot be followed by stale withdrawal writes. Closing clients keep
