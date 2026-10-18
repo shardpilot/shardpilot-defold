@@ -3303,7 +3303,7 @@ local function test_config_app_key_rejects_pii()
 	assert_true(crash.new(config({ app_key = "user_app" })), "an actor-prefixed scope must be accepted")
 end
 
--- ── a crash client is never refused for its platform (A8) ────────────────────
+-- ── a crash client is never refused for its platform ────────────────────
 
 -- The platform is one of the twelve the crash service accepts. An unknown
 -- runtime is "other"; an explicit platform is folded; a configured value the
@@ -5670,12 +5670,12 @@ local function test_component_wire_rejects_retired_key()
 	assert_equal(next(expected), nil, "all expected golden keys reached wire")
 end
 
--- ── the closed twelve-value platform (A8) ─────────────────────────────────────
+-- ── the closed twelve-value platform ─────────────────────────────────────
 
 -- Every crash platform is one of windows, macos, linux, android, ios, tvos, web,
 -- ps4, ps5, xbox, switch, other: never empty, never a raw host spelling. One
 -- closure keeps these scenes inside the main chunk's local-variable limit.
-local a8_platform_tests = (function()
+local platform_vocabulary_tests = (function()
 	local function sent_platform(body)
 		return body:match('"platform":"([^"]*)"')
 	end
@@ -5791,10 +5791,10 @@ local a8_platform_tests = (function()
 end)()
 
 local tests = {
-	a8_platform_tests[1],
-	a8_platform_tests[2],
-	a8_platform_tests[3],
-	a8_platform_tests[4],
+	platform_vocabulary_tests[1],
+	platform_vocabulary_tests[2],
+	platform_vocabulary_tests[3],
+	platform_vocabulary_tests[4],
 	test_component_replay_structural_keys,
 	test_component_option_precedence,
 	test_legacy_component_replay_and_ambiguity,
