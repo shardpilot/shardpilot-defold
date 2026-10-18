@@ -2,9 +2,9 @@
 
 ### Unreleased
 
-- Size-cap evictions retire fact keys into live bookkeeping for timely durable
-  pruning. Apply mismatches skip assignment refetches when the occurrence's
-  version, variant or assignment key was superseded before dispatch.
+- Size-cap evictions retain keys in memory even when durable history cannot fit.
+  Settled facts prune their history. Apply mismatches skip refetches when the
+  occurrence's version, variant or assignment key was superseded before dispatch.
 
 - Bounded flushes exclude summaries created by host hooks during dispatch.
   Unconfirmed-age diagnostics run after withdrawal, so reentrant fetches and

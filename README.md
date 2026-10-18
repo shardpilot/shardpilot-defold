@@ -1439,8 +1439,8 @@ experiment, the player's earlier keys while facts under them are still queued,
 being sent or spooled: a refusal after a republish, or after a kill switch
 removed the cached assignment, withdraws those facts too, in the same process
 and after a restart. A key is forgotten once its last fact is delivered,
-dropped or withdrawn, including keys retired by a cache size-cap eviction.
-A batch
+dropped or withdrawn, including cap-retired keys. Memory retains keys even when
+the durable history exceeds its cap. A batch
 that is already being sent when the response arrives cannot be recalled: it
 is not retried if that send fails, and a `persist()` before it settles does
 not write its facts to disk. If the offline spool cannot be rewritten

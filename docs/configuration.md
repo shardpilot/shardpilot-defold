@@ -506,8 +506,8 @@ redirects, `408`, `429` and `5xx` retry with backoff and `Retry-After`
 (delta-seconds or an HTTP date). Redirects are never followed. Analytics per-event rejection stays
 terminal and visible through the rejection ring.
 
-Keys retired by cache size-cap evictions join the same history as replaced keys:
-they leave durable history once no queued, in-flight, spooled or owed fact uses them.
+Cap-retired keys join memory history even when durable history cannot fit.
+Their durable history ends once no queued, in-flight, spooled or owed fact uses them.
 
 Unsealed applications are memory-only. `persist()` starts no network request and
 reports incomplete capture while they remain; sealed facts use the existing

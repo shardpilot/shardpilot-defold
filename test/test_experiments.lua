@@ -13108,7 +13108,22 @@ function extra_tests.test_mismatch_refetch_compares_occurrence_pins()
 	verify("mismatch occurrence pins")
 end
 
+function extra_tests.test_history_cap_preserves_memory_retirements()
+	reset(); local client = granted_client(); next_response_body = assignment_body()
+	assert_true(extra_tests.fetch_apply(client, "exp-checkout").assigned)
+	assert_true(client.experiments.deps.live_fact_keys("exp-checkout")[fixture_subject_fact_key], "a real fact is live")
+	local record = storage.load_experiments(client.config); record.fact_key_history = {}
+	for i = 1, 4000 do record.fact_key_history["cap-history-" .. i] = { fixture_subject_fact_key } end
+	local saved, evicted = client.experiments:save_experiments(record)
+	local stored = storage.load_experiments(client.config)
+	local remembered = (client.experiments.fact_key_history["exp-checkout"] or {})[fixture_subject_fact_key]
+	client:finish_teardown(); storage.reset()
+	assert_true(saved and evicted > 1 and next(stored.entries) == nil and next(stored.fact_key_history) == nil, "the actual cap removed entries and history")
+	assert_true(remembered, "whole-history eviction lost the generated entry retirement in memory")
+end
+
 local tests = {
+	extra_tests.test_history_cap_preserves_memory_retirements,
 	extra_tests.test_cap_retired_fact_key_prunes_without_another_write,
 	extra_tests.test_mismatch_refetch_compares_occurrence_pins,
 	extra_tests.test_close_fences_internal_assignment_refetches,
