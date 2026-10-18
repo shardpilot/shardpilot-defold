@@ -592,7 +592,9 @@ queued or spooled for a later dispatch.
 The call owns the exact summaries its own step builds. A summary created by a
 synchronous host hook during dispatch does not extend the call or supply its refusal.
 While shutdown drains, experiment persistence and owed facts continue; assignment
-revalidation stops, including between keys when a host hook starts shutdown.
+revalidation stops, including mismatch correction fetches, grammar retries and
+work between keys when a host hook starts shutdown. Grammar recovery also leaves
+the current subject intact while closing.
 
 ## AI-assisted integration
 

@@ -193,7 +193,8 @@ host that stops calling `update()` gets no answer.
 
 During the close, experiment cache writes and owed facts continue draining, while
 assignment revalidation starts no further request. Each key rechecks this state if
-a synchronous host hook begins shutdown during a revalidation tick.
+a synchronous host hook begins shutdown during a revalidation tick. Mismatch
+corrections and grammar retries are fenced too; closing never remints for a retry.
 
 The callback runs once, on the main loop, with `true` or `false` and a code:
 

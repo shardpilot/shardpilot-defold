@@ -3525,6 +3525,10 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		finish({ ok = false, from_cache = false, error = "experiment_key_required" })
 		return false, "experiment_key_required"
 	end
+	if self.deps.closing and self.deps.closing() then
+		finish({ ok = false, from_cache = false, error = "shutdown" })
+		return false, "shutdown"
+	end
 	-- A HOST fetch's age declaration is recorded before any consent gate: a
 	-- non-adult declaration made while the plane refuses still withdraws when
 	-- its fetch ends, or a re-grant would serve the assignment the host has
@@ -3743,7 +3747,8 @@ function Experiments:fetch(experiment_key, attributes, callback, is_revalidation
 		local fenced_out =
 			seq <= (self.settled[scope .. scope_separator .. experiment_key] or 0)
 		if outcome.remint and not self.reminted
-			and not fenced_out and auth_epoch == self.auth_epoch then
+			and not fenced_out and auth_epoch == self.auth_epoch
+			and not (self.deps.closing and self.deps.closing()) then
 			-- The persisted subject id failed the wire grammar (storage
 			-- corruption this client could not detect locally): re-mint
 			-- once per process and retry as a fresh subject — from the

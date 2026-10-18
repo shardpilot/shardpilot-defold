@@ -15,4 +15,5 @@
   must preserve synthetic exemptions during pending declarations.
 - Bounded flushes own exact call-built summary IDs, including terminal refusals.
 - Emit withdrawal diagnostics after state changes; host hooks can fetch or close.
-- Closing clients keep experiment housekeeping but start no assignment revalidation.
+- Closing clients keep experiment housekeeping but start no assignment revalidation,
+  including mismatch corrections and grammar retries; do not remint while closing.

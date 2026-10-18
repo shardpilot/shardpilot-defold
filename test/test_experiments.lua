@@ -13008,7 +13008,45 @@ function extra_tests.test_revalidation_rechecks_close_between_keys()
 	assert_equal(dispatches, 1, "the second key cannot start revalidation after the host closes")
 end
 
+function extra_tests.test_close_fences_internal_assignment_refetches()
+	local check, verify = extra_tests.checklist()
+	for _, kind in ipairs({ "version_mismatch", "variant_mismatch", "unit_not_recordable", "cadence_remint", "host_remint" }) do
+		reset()
+		local restore = install_fake_sys_storage()
+		local client = granted_client()
+		next_response_body = assignment_body()
+		assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).assigned)
+		local remint = kind:find("remint", 1, true) ~= nil
+		if not remint then assert_true(client:apply_experiment_variant("exp-checkout")) end
+		assert_true(client:track("held_for_internal_correction"))
+		local assignment, batches, applies = nil, 0, 0
+		responder = function(url, _, callback)
+			if is_assignment_request({ url = url }) then assignment = callback; return true end
+			if url:find("/v1/events:batch", 1, true) then batches = batches + 1; return true end
+			if url:find("/experiments/exposures", 1, true) then
+				applies = applies + 1
+				callback(nil, nil, { status = 409, response = json.encode({ error = { code = kind } }) }); return true
+			end
+			return false
+		end
+		if kind == "cadence_remint" then client.experiments.revalidate_at_ms = 0; client:update(0)
+		elseif kind == "host_remint" then client:fetch_experiment_assignment("exp-checkout", nil, function() end) end
+		if remint then assert_true(assignment ~= nil, "the original request really left before close") end
+		local answer
+		assert_true(client:bounded_shutdown(30, function(ok) answer = ok end))
+		assert_true(client.closing and client.initialized and batches > 0 and answer == nil, "a real analytics batch keeps close live")
+		local before, subject = #assignment_requests(), client.experiments_client_id
+		if remint then assignment(nil, nil, { status = 400, response = json.encode({ error = { code = "subject_id_invalid" } }) })
+		else client:update(0); assert_equal(applies, 1, "owed apply housekeeping still ran") end
+		check(#assignment_requests() == before, kind .. " started a new assignment request while closing")
+		check(client.experiments_client_id == subject, kind .. " reminted the subject while closing")
+		responder = nil; client:finish_teardown(); restore(); storage.reset()
+	end
+	verify("internal assignment corrections during close")
+end
+
 local tests = {
+	extra_tests.test_close_fences_internal_assignment_refetches,
 	extra_tests.test_revalidation_rechecks_close_between_keys,
 	extra_tests.test_declaration_diagnostic_reentry,
 	extra_tests.test_close_keeps_housekeeping_without_revalidation,

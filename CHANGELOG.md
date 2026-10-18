@@ -5,7 +5,8 @@
 - Bounded flushes exclude summaries created by host hooks during dispatch.
   Unconfirmed-age diagnostics run after withdrawal, so reentrant fetches and
   shutdown cannot be followed by stale withdrawal writes. Closing clients keep
-  experiment housekeeping active while stopping assignment revalidation.
+  experiment housekeeping active while stopping assignment revalidation, including
+  mismatch corrections and grammar retries; grammar recovery keeps the subject intact.
 
 - Experiment grammar retries retain their original host-call order across later
   age declarations. Pending declarations preserve exempt synthetic assignments
