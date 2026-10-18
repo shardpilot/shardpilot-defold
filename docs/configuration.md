@@ -499,10 +499,16 @@ are terminal except `408` and `429`. Exact `409` `not_assigned` with
 `details:[{"field":"reason","code":"age_ineligible"}]` withdraws the subject's
 facts for that experiment. `409` `version_mismatch`, `variant_mismatch`, and
 `unit_not_recordable` drop the refused fact and refetch current targeting unless
-a newer host fetch or assignment already supersedes the request. Offline, timeout, malformed responses,
+a newer host fetch or assignment already supersedes the occurrence, including a
+changed version, variant or assignment key installed before apply dispatch.
+Offline, timeout, malformed responses,
 redirects, `408`, `429` and `5xx` retry with backoff and `Retry-After`
 (delta-seconds or an HTTP date). Redirects are never followed. Analytics per-event rejection stays
 terminal and visible through the rejection ring.
+
+Cap-retired keys join memory history even when durable history cannot fit.
+Their durable history ends once no queued, in-flight, spooled or owed fact uses them.
+Unchanged live history that exceeds the cap stays in memory without repeated writes.
 
 Unsealed applications are memory-only. `persist()` starts no network request and
 reports incomplete capture while they remain; sealed facts use the existing

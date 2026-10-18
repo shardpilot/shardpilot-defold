@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- Size-cap evictions retain keys in memory even when durable history cannot fit.
+  Unchanged live history is not rewritten every update. Apply mismatches skip
+  refetches when the occurrence's version, variant or assignment key was superseded before dispatch.
+
 - Bounded flushes exclude summaries created by host hooks during dispatch.
   Unconfirmed-age diagnostics run after withdrawal, so reentrant fetches and
   shutdown cannot be followed by stale withdrawal writes. Closing clients keep

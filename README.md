@@ -1439,7 +1439,9 @@ experiment, the player's earlier keys while facts under them are still queued,
 being sent or spooled: a refusal after a republish, or after a kill switch
 removed the cached assignment, withdraws those facts too, in the same process
 and after a restart. A key is forgotten once its last fact is delivered,
-dropped or withdrawn. A batch
+dropped or withdrawn, including cap-retired keys. Memory retains keys even when
+the durable history exceeds its cap. Unchanged live history is not rewritten every
+update. A batch
 that is already being sent when the response arrives cannot be recalled: it
 is not retried if that send fails, and a `persist()` before it settles does
 not write its facts to disk. If the offline spool cannot be rewritten
@@ -1577,7 +1579,9 @@ game has to handle specially.
   `reason` and `code` is `age_ineligible` withdraws that subject's experiment
   facts. `409` `version_mismatch`, `variant_mismatch`, or `unit_not_recordable`
   drops the refused fact and refetches assignment with current targeting,
-  unless a newer host request or assignment already supersedes that request. Offline, timeout, malformed responses, `3xx`, `408`, `429` and `5xx`
+  unless a newer host request or assignment already supersedes the occurrence.
+  This includes changes to version, variant or assignment key before apply dispatch.
+  Offline, timeout, malformed responses, `3xx`, `408`, `429` and `5xx`
   keep the occurrence and retry with backoff and `Retry-After` (delta-seconds or an HTTP date).
   Redirects are refused, including HTML5's browser transport. Queue overflow
   and terminal apply responses report `fact_skipped`; deferred failures report

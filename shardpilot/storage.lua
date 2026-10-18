@@ -2333,13 +2333,15 @@ end
 -- fact_key_history = { [experiment_key] = { fact_key, ... } } }`). Returns
 -- true when stored — in the durable save file, or in the in-memory fallback
 -- on hosts without the save-file API (which then lasts only for the process
--- lifetime).
+-- lifetime). Successful saves also return all retirements as the third value,
+-- even when their durable history section cannot fit.
 function M.save_experiments(scope, record)
 	if type(record) ~= "table"
 		or type(record.scope) ~= "string" or record.scope == "" then
 		return false
 	end
 	local stored = sanitize_experiments_record(record)
+	local retirements = stored.fact_key_history or {}
 	-- The size cap is a DETERMINISTIC bound, so an oversized record must
 	-- never surface as a retryable failure: the caller would record an owed
 	-- durable sync that can never land and persist()/shutdown() would wedge
@@ -2375,7 +2377,7 @@ function M.save_experiments(scope, record)
 				and evicted_entry.subject_fact_key or nil
 			stored.entries[oldest_key] = nil
 			if valid_subject_fact_key(fact_key) then
-				local history = stored.fact_key_history or {}
+				local history = retirements
 				local keys = history[oldest_key] or {}
 				local known = false
 				for i = 1, #keys do
@@ -2406,14 +2408,14 @@ function M.save_experiments(scope, record)
 	local path = save_path(ns, "experiments")
 	if not path then
 		experiments_memory[ns] = stored
-		return true, evicted
+		return true, evicted, retirements
 	end
 	local ok, saved = pcall(sys.save, path, stored)
 	if not (ok and saved == true) then
 		return false, evicted
 	end
 	experiments_memory[ns] = stored
-	return true, evicted
+	return true, evicted, retirements
 end
 
 -- Durable condemnation marker for the experiment cache: when the

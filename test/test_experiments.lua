@@ -13045,7 +13045,126 @@ function extra_tests.test_close_fences_internal_assignment_refetches()
 	verify("internal assignment corrections during close")
 end
 
+function extra_tests.test_cap_retired_fact_key_prunes_without_another_write()
+	for _, live in ipairs({ true, false }) do
+		reset()
+		local restore = install_fake_sys_storage()
+		local client = granted_client()
+		local fact = "sfk1_" .. string.rep("a", 64)
+		next_response_body = assignment_body({ experiment_key = "cap-a", subject_fact_key = fact,
+			variant_payload = { blob = string.rep("x", 230000) } })
+		assert_true(fetch(client, "cap-a", { age_band = "adult" }).assigned)
+		if live then
+			assert_true(extra_tests.apply(client, "cap-a"))
+			assert_true(client.experiments.deps.live_fact_keys("cap-a")[fact], "a real fact is held")
+		end
+		advance_seconds(2)
+		next_response_body = assignment_body({ experiment_key = "cap-b",
+			variant_payload = { blob = string.rep("y", 230000) } })
+		assert_true(fetch(client, "cap-b", { age_band = "adult" }).assigned)
+		local evicted = storage.load_experiments(client.config)
+		assert_nil(evicted.entries["cap-a"], "the actual size cap evicted the older entry")
+		assert_equal(evicted.fact_key_history["cap-a"][1], fact, "the same save retired its key")
+		if live then
+			assert_true(client:flush({ include_summaries = false }))
+			assert_true(next(client.experiments.deps.live_fact_keys("cap-a")) == nil, "the last fact delivered")
+		else
+			client.experiments.revalidate_at_ms = socket.now * 1000 + 600000
+			client:update(0)
+		end
+		local after = storage.load_experiments(client.config)
+		local retained = after.fact_key_history["cap-a"]
+		client:finish_teardown(); restore(); storage.reset()
+		assert_nil(retained, "a cap-retired key leaves disk without an unrelated record write")
+	end
+end
+
+function extra_tests.test_mismatch_refetch_compares_occurrence_pins()
+	local check, verify = extra_tests.checklist()
+	for _, code in ipairs({ "version_mismatch", "variant_mismatch", "unit_not_recordable" }) do
+		for _, field in ipairs({ "version", "variant_key", "assignment_key", "same" }) do
+			reset()
+			local client = granted_client()
+			next_response_body = assignment_body()
+			assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).assigned)
+			assert_true(client:apply_experiment_variant("exp-checkout"))
+			local changed = { version = 4, variant_key = "newer", assignment_key = "asgn_" .. string.rep("b", 32) }
+			next_response_body = assignment_body(field ~= "same" and { [field] = changed[field] } or {})
+			assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).assigned)
+			local before, applies = #assignment_requests(), 0
+			responder = function(url, _, callback)
+				if url:find("/experiments/exposures", 1, true) then
+					applies = applies + 1
+					callback(nil, nil, { status = 409, response = json.encode({ error = { code = code } }) }); return true
+				end
+				return false
+			end
+			client.experiments:sweep_owed(true)
+			assert_equal(applies, 1, "the original occurrence reached apply after the newer install")
+			check(#assignment_requests() - before == (field == "same" and 1 or 0), code .. " refetch used dispatch state instead of " .. field .. " occurrence pins")
+			responder = nil; client:finish_teardown(); storage.reset()
+		end
+	end
+	verify("mismatch occurrence pins")
+end
+
+function extra_tests.test_history_cap_preserves_memory_retirements()
+	reset(); local client = granted_client(); next_response_body = assignment_body()
+	assert_true(extra_tests.fetch_apply(client, "exp-checkout").assigned)
+	assert_true(client.experiments.deps.live_fact_keys("exp-checkout")[fixture_subject_fact_key], "a real fact is live")
+	local record = storage.load_experiments(client.config); record.fact_key_history = {}
+	for i = 1, 4000 do record.fact_key_history["cap-history-" .. i] = { fixture_subject_fact_key } end
+	local saved, evicted = client.experiments:save_experiments(record)
+	local stored = storage.load_experiments(client.config)
+	local remembered = (client.experiments.fact_key_history["exp-checkout"] or {})[fixture_subject_fact_key]
+	client:finish_teardown(); storage.reset()
+	assert_true(saved and evicted > 1 and next(stored.entries) == nil and next(stored.fact_key_history) == nil, "the actual cap removed entries and history")
+	assert_true(remembered, "whole-history eviction lost the generated entry retirement in memory")
+end
+
+function extra_tests.test_live_history_cap_does_not_rewrite_every_update()
+	reset(); local restore = install_fake_sys_storage()
+	local client = granted_client({ buffer_size = 7000, batch_size = 100 })
+	local gettime = socket.gettime; socket.gettime = function() return socket.now end
+	next_response_body = assignment_body(); assert_true(extra_tests.fetch_apply(client, "exp-checkout").assigned)
+	local record = storage.load_experiments(client.config); record.fact_key_history = { ["exp-checkout"] = {} }
+	for i = 1, 6000 do
+		local key = "sfk1_" .. string.format("%064x", i)
+		record.fact_key_history["exp-checkout"][i] = key
+		assert_true(client.experiments.deps.emit("experiment_exposure", { experiment_key = "exp-checkout", assignment_key = key }))
+	end
+	local saved, evicted = client.experiments:save_experiments(record)
+	assert_true(saved and evicted > 1, "actual live history exceeds the record cap")
+	local live = client.experiments.deps.live_fact_keys("exp-checkout"); local count = 0
+	for _ in pairs(live) do count = count + 1 end
+	assert_equal(count, 6001, "actual queued facts keep every key live")
+	local save, writes, held, held_count, delivering = sys.save, 0, nil, nil, false
+	sys.save = function(path, value) if fail_experiment_saves(path) then writes = writes + 1 end; return save(path, value) end
+	responder = function(url, _, callback)
+		if not url:find("/v1/events:batch", 1, true) then return false end
+		local n = #json.decode(requests[#requests].body).events
+		if delivering then callback(nil, nil, { status = 202, response = json.encode({ accepted = n }) })
+		else held, held_count = callback, n end
+		return true
+	end
+	client.experiments.revalidate_at_ms = socket.now * 1000 + 600000
+	client:update(0); assert_true(held ~= nil, "a real in-flight batch keeps facts pending")
+	local first = writes; assert_true(first > 0, "the first prune actually wrote"); for _ = 1, 3 do client:update(0) end
+	local extra = writes - first
+	delivering = true; held(nil, nil, { status = 202, response = json.encode({ accepted = held_count }) })
+	assert_true(client:flush({ include_summaries = false }))
+	assert_true(next(client.experiments.fact_key_history) == nil, "settlement still prunes memory")
+	assert_true(next(storage.load_experiments(client.config).fact_key_history) == nil, "settlement still prunes disk")
+	sys.save, socket.gettime, responder = save, gettime, nil; client:finish_teardown(); restore(); storage.reset()
+	print("live history cap: 6001 held facts, repeated writes=" .. extra)
+	assert_equal(extra, 0, "unchanged live history caused a cache write on every update")
+end
+
 local tests = {
+	extra_tests.test_live_history_cap_does_not_rewrite_every_update,
+	extra_tests.test_history_cap_preserves_memory_retirements,
+	extra_tests.test_cap_retired_fact_key_prunes_without_another_write,
+	extra_tests.test_mismatch_refetch_compares_occurrence_pins,
 	extra_tests.test_close_fences_internal_assignment_refetches,
 	extra_tests.test_revalidation_rechecks_close_between_keys,
 	extra_tests.test_declaration_diagnostic_reentry,

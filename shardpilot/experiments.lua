@@ -988,13 +988,15 @@ local function add_fact_keys(history, lists)
 	if type(lists) ~= "table" then
 		return
 	end
+	local changed = false
 	for experiment_key, keys in pairs(lists) do
 		for i = 1, #keys do
 			local set = history[experiment_key] or {}
-			set[keys[i]] = true
+			if not set[keys[i]] then set[keys[i]] = true; changed = true end
 			history[experiment_key] = set
 		end
 	end
+	return changed
 end
 
 -- Memory's history in the durable shape: sorted lists, empty sets left out.
@@ -1573,6 +1575,20 @@ function Experiments:settle_fact_key_history(scope, on_disk)
 	return listed_fact_keys(history)
 end
 
+-- Adopt retirements made by the size cap before any host diagnostic can reenter.
+function Experiments:save_experiments(record)
+	local saved, evicted, history = storage.save_experiments(self.config, record)
+	if saved and type(evicted) == "number" and evicted > 0 then
+		local subject = self:current_subject_id()
+		if subject and record.scope == self:scope_for(subject) then
+			if add_fact_keys(self:history_of(record.scope), history) then
+				self.fact_key_prune_owed = true
+			end
+		end
+	end
+	return saved, evicted
+end
+
 -- Write `record` (the durable record of the history's scope, or a fresh
 -- stub for it) when its section differs from the settled history. A stub
 -- is written only when a history remains to carry. Returns false when that
@@ -1583,7 +1599,7 @@ function Experiments:save_fact_key_history(record)
 	local settled = self:settle_fact_key_history(record.scope, on_disk)
 	if not same_fact_keys(settled, on_disk) then
 		record.fact_key_history = settled
-		return (storage.save_experiments(self.config, record))
+		return (self:save_experiments(record))
 	end
 	return true
 end
@@ -1664,7 +1680,7 @@ function Experiments:prune_fact_key_history()
 	local settled = self:settle_fact_key_history(scope, on_disk)
 	if on_disk and not same_fact_keys(settled, on_disk) then
 		record.fact_key_history = settled
-		storage.save_experiments(self.config, record)
+		self:save_experiments(record)
 	end
 end
 
@@ -1888,7 +1904,7 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 	end
 	record.fact_key_history = self:settle_fact_key_history(scope,
 		record.fact_key_history)
-	local record_saved, cap_evicted = storage.save_experiments(self.config, record)
+	local record_saved, cap_evicted = self:save_experiments(record)
 	if record_saved then
 		if type(cap_evicted) == "number" and cap_evicted > 0 then
 			-- Cap-evicted entries are terminally non-durable: the size
@@ -1913,7 +1929,7 @@ function Experiments:sync_durable_entry(scope, experiment_key, as_of_ms, is_retr
 		-- serving the variant memory already replaced. The owed retry below
 		-- still converges the disk to the full entry when storage recovers.
 		record.entries[experiment_key] = nil
-		storage.save_experiments(self.config, record)
+		self:save_experiments(record)
 	end
 	self.durable_pending[composite] = {
 		key = experiment_key,
@@ -2208,7 +2224,7 @@ function Experiments:retry_owed_clear()
 		return
 	end
 	record.entries = survivors
-	if storage.save_experiments(self.config, record) then
+	if self:save_experiments(record) then
 		-- The covered keys are gone; the sibling's post-sentinel state
 		-- stays. Per-key owed intents are NOT wiped with the settled
 		-- clear — drops for covered keys settle on their own retries
@@ -2314,7 +2330,7 @@ function Experiments:retry_foreign_scope_drop(composite, pending)
 		return
 	end
 	record.entries[pending.key] = nil
-	if storage.save_experiments(self.config, record) then
+	if self:save_experiments(record) then
 		self.durable_pending[composite] = nil
 	end
 end
@@ -2490,12 +2506,14 @@ function Experiments:seal_application(experiment_key, record)
 				if not list[1] then self.pending_exposure[experiment_key] = nil end
 				if status == 409 and (code == "version_mismatch" or code == "variant_mismatch" or code == "unit_not_recordable")
 					and scope == self:scope_for(self:current_subject_id())
-					and self.entries[experiment_key] == assignment_at_dispatch then
-					-- The refused occurrence's assignment is still the
-					-- installed one: no newer assignment, host or cadence,
-					-- has superseded it. A cadence attempt that failed or is
-					-- still in flight supersedes nothing, so it never
-					-- suppresses this refetch. Reuse current targeting.
+					and self.entries[experiment_key] == assignment_at_dispatch
+					and assignment_at_dispatch
+					and assignment_at_dispatch.version_wire == entry.version_wire
+					and assignment_at_dispatch.variant_key == entry.variant_key
+					and assignment_at_dispatch.assignment_key == entry.assignment_key then
+					-- Only the assignment that produced the occurrence needs
+					-- correction. A change before or during dispatch supersedes
+					-- it; a failed or unanswered fetch does not. Reuse targeting.
 					self:refetch_stale_assignment(scope, experiment_key, assignment_at_dispatch,
 						(assignment_at_dispatch or entry).attributes)
 				end
