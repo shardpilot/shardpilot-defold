@@ -13122,7 +13122,46 @@ function extra_tests.test_history_cap_preserves_memory_retirements()
 	assert_true(remembered, "whole-history eviction lost the generated entry retirement in memory")
 end
 
+function extra_tests.test_live_history_cap_does_not_rewrite_every_update()
+	reset(); local restore = install_fake_sys_storage()
+	local client = granted_client({ buffer_size = 7000, batch_size = 100 })
+	local gettime = socket.gettime; socket.gettime = function() return socket.now end
+	next_response_body = assignment_body(); assert_true(extra_tests.fetch_apply(client, "exp-checkout").assigned)
+	local record = storage.load_experiments(client.config); record.fact_key_history = { ["exp-checkout"] = {} }
+	for i = 1, 6000 do
+		local key = "sfk1_" .. string.format("%064x", i)
+		record.fact_key_history["exp-checkout"][i] = key
+		assert_true(client.experiments.deps.emit("experiment_exposure", { experiment_key = "exp-checkout", assignment_key = key }))
+	end
+	local saved, evicted = client.experiments:save_experiments(record)
+	assert_true(saved and evicted > 1, "actual live history exceeds the record cap")
+	local live = client.experiments.deps.live_fact_keys("exp-checkout"); local count = 0
+	for _ in pairs(live) do count = count + 1 end
+	assert_equal(count, 6001, "actual queued facts keep every key live")
+	local save, writes, held, held_count, delivering = sys.save, 0, nil, nil, false
+	sys.save = function(path, value) if fail_experiment_saves(path) then writes = writes + 1 end; return save(path, value) end
+	responder = function(url, _, callback)
+		if not url:find("/v1/events:batch", 1, true) then return false end
+		local n = #json.decode(requests[#requests].body).events
+		if delivering then callback(nil, nil, { status = 202, response = json.encode({ accepted = n }) })
+		else held, held_count = callback, n end
+		return true
+	end
+	client.experiments.revalidate_at_ms = socket.now * 1000 + 600000
+	client:update(0); assert_true(held ~= nil, "a real in-flight batch keeps facts pending")
+	local first = writes; assert_true(first > 0, "the first prune actually wrote"); for _ = 1, 3 do client:update(0) end
+	local extra = writes - first
+	delivering = true; held(nil, nil, { status = 202, response = json.encode({ accepted = held_count }) })
+	assert_true(client:flush({ include_summaries = false }))
+	assert_true(next(client.experiments.fact_key_history) == nil, "settlement still prunes memory")
+	assert_true(next(storage.load_experiments(client.config).fact_key_history) == nil, "settlement still prunes disk")
+	sys.save, socket.gettime, responder = save, gettime, nil; client:finish_teardown(); restore(); storage.reset()
+	print("live history cap: 6001 held facts, repeated writes=" .. extra)
+	assert_equal(extra, 0, "unchanged live history caused a cache write on every update")
+end
+
 local tests = {
+	extra_tests.test_live_history_cap_does_not_rewrite_every_update,
 	extra_tests.test_history_cap_preserves_memory_retirements,
 	extra_tests.test_cap_retired_fact_key_prunes_without_another_write,
 	extra_tests.test_mismatch_refetch_compares_occurrence_pins,

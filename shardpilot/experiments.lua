@@ -988,13 +988,15 @@ local function add_fact_keys(history, lists)
 	if type(lists) ~= "table" then
 		return
 	end
+	local changed = false
 	for experiment_key, keys in pairs(lists) do
 		for i = 1, #keys do
 			local set = history[experiment_key] or {}
-			set[keys[i]] = true
+			if not set[keys[i]] then set[keys[i]] = true; changed = true end
 			history[experiment_key] = set
 		end
 	end
+	return changed
 end
 
 -- Memory's history in the durable shape: sorted lists, empty sets left out.
@@ -1579,8 +1581,9 @@ function Experiments:save_experiments(record)
 	if saved and type(evicted) == "number" and evicted > 0 then
 		local subject = self:current_subject_id()
 		if subject and record.scope == self:scope_for(subject) then
-			add_fact_keys(self:history_of(record.scope), history)
-			self.fact_key_prune_owed = true
+			if add_fact_keys(self:history_of(record.scope), history) then
+				self.fact_key_prune_owed = true
+			end
 		end
 	end
 	return saved, evicted

@@ -508,6 +508,7 @@ terminal and visible through the rejection ring.
 
 Cap-retired keys join memory history even when durable history cannot fit.
 Their durable history ends once no queued, in-flight, spooled or owed fact uses them.
+Unchanged live history that exceeds the cap stays in memory without repeated writes.
 
 Unsealed applications are memory-only. `persist()` starts no network request and
 reports incomplete capture while they remain; sealed facts use the existing
