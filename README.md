@@ -587,7 +587,8 @@ Most methods return `ok, err` so callers can branch on failures (e.g.
 
 [`flush(timeout_seconds, callback)`](docs/configuration.md#flush) starts no further
 event batch once its deadline is reached, including on synchronous HTTP bridges.
-Unsent events remain queued or spooled for a later dispatch.
+Time spent acquiring a token counts toward that deadline. Unsent events remain
+queued or spooled for a later dispatch.
 
 ## AI-assisted integration
 

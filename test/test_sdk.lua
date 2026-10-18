@@ -17209,6 +17209,33 @@ end)()
   end)
  end
 
+ for _, retained in ipairs({ false, true }) do
+  scene("a synchronous token provider expires before "..(retained and "retry" or "queue").." dispatch",function()
+   local armed=false
+   local client=client_with({token_provider=function(callback)
+    if armed then socket.now=socket.now+1 end
+    callback("client-token-placeholder",nil,nil)
+   end})
+   assert_true(client:track("token_deadline"))
+   if retained then
+    next_status=503
+    assert_equal(client:flush(),false)
+    assert_true(client.in_flight_batch~=nil,"the failed batch is retained")
+    next_status=202
+   end
+   client.token=nil
+   armed=true
+   local sent=batches()
+   local calls,cb=answers()
+   assert_true(client:bounded_flush(1,cb))
+   answered(calls,false,"pending","token acquisition reached the deadline")
+   assert_equal(batches(),sent,"the batch must not start after token acquisition")
+   if not retained then
+    assert_equal(#client.queue.items,1,"the unsent event stays in the queue")
+   end
+  end)
+ end
+
  scene("a response after the deadline does not turn the call into success",function()
   local client=client_with()
   assert_true(client:track("late_response"))

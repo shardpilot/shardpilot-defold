@@ -7091,6 +7091,10 @@ function Client:flush(options)
 				self:owe_publish_bypass(options.automatic == true)
 				return false
 			end
+			-- A synchronous host token provider can consume the remaining budget.
+			if deadline_ms and clock.unix_ms() >= deadline_ms then
+				return false, "pending"
+			end
 			token_ready = true
 			if resend_spool then
 				-- Envelopes spooled by an earlier launch re-send BEFORE the
@@ -7112,6 +7116,9 @@ function Client:flush(options)
 		if not token_ready and not self:can_publish() then
 			self:owe_publish_bypass(options.automatic == true)
 			return false
+		end
+		if deadline_ms and clock.unix_ms() >= deadline_ms then
+			return false, "pending"
 		end
 		local dispatched, completed, succeeded = self:start_publish_batch(options.automatic == true)
 		-- Preflight expiry can complete a successful local drain without HTTP.
