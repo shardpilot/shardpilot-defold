@@ -669,9 +669,10 @@ the event spool and the experiment records are stored per app, and each client
 works from its own in-memory copy of them. Two live clients of one app do not
 see each other's changes: an `age_ineligible` refusal received by one does not
 stop the other serving that experiment or delivering its queued and spooled
-facts. To replace a client, call `shutdown()` and wait for its callback, and
-let any `fetch_remote_config()` callback of the old client run, then create
-the next one. Clients of different apps are independent; create each with
+facts. To replace a client, call `shutdown()` and wait for its callback, then
+create the next one. Teardown discards remote-config responses still in flight
+and cancels their callbacks. Clients of different apps are independent; create
+each with
 `new(config)` and keep every instance (`init` holds one default client). Ids
 that differ only in characters other than letters, digits, `-` and `_` count
 as one app. `new(config)` does not yet refuse a second client of a live app
@@ -1017,6 +1018,10 @@ Three things worth knowing:
 Set `request_compression_enabled = false` to opt out entirely.
 
 ## Remote config
+
+Teardown cancels in-flight fetch callbacks and discards their responses without
+changing the cache or getters. Do not keep host state waiting on such a callback
+across shutdown; use the shutdown callback to know when replacement is safe.
 
 Set `remote_config_enabled = true` together with `app_url` and
 `publishable_key` before fetching. The switch defaults to `false`; an address

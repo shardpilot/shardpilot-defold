@@ -7,3 +7,4 @@
 - For delivery changes, run every `test/test_*.lua` suite under Lua 5.1, LuaJIT
   and Lua 5.4, plus the library, version and public-surface checks in `scripts/`.
 - Update the README, configuration guide and changelog when delivery behavior changes.
+- Client teardown must fence remote-config responses before cache writes or callbacks.

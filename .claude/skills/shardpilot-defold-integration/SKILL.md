@@ -1060,6 +1060,9 @@ available; the last-known-good snapshot survives restarts and offline
 launches. `remote_config_version()` reads the response wrapper's `version`
 metadata.
 
+Client teardown discards remote-config responses still in flight and cancels
+their callbacks. Use the shutdown callback before creating a replacement client.
+
 Targeting attributes are a dark opt-in and — unlike the fetch —
 granted-consent-only. They do not enable remote config: the consumer needs
 `remote_config_enabled = true` first. Then `remote_config_attributes_enabled = true` plus

@@ -2762,6 +2762,27 @@ local function test_cache_persist_diagnostic_cannot_revive_closed_scope()
 	end)
 end
 
+local function test_cache_persist_diagnostic_shutdown_keeps_retired_getters()
+	with_clear_store(function()
+		local client, closed
+		client = primed_client({ diagnostics = function(issue)
+			if issue.status == "cache_persist_failed" then closed = client:shutdown() end
+		end })
+		local save = sys.save
+		sys.save = function(path, value)
+			if path:find("remote-config", 1, true) then return false end
+			return save(path, value)
+		end
+		next_status, next_response_body = 200, values_body({ a = 2 }, 4)
+		local callbacks = 0
+		client:fetch_remote_config(function() callbacks = callbacks + 1 end)
+		assert_equal(closed, true, "the diagnostic completed shutdown")
+		assert_equal(client:remote_config_number("a", 0), 1, "shutdown freezes the retired getter snapshot")
+		assert_equal(client:remote_config_version(), 3)
+		assert_equal(callbacks, 0, "the fetch callback stays cancelled")
+	end)
+end
+
 local function test_failed_overwrite_clear_recovers_without_rolling_back()
 	with_clear_store(function()
 		local client = primed_client()
@@ -2827,6 +2848,7 @@ local tests = {
 	test_failed_overwrite_clear_recovers_without_rolling_back,
 	test_failed_overwrite_never_clears_a_read_shadow,
 	test_cache_persist_diagnostic_cannot_revive_closed_scope,
+	test_cache_persist_diagnostic_shutdown_keeps_retired_getters,
 	test_failed_unpublished_clear_recovers_and_diagnoses_once,
 	test_clear_retry_precedes_pacing_and_missing_transport,
 	test_unpublished_clear_preserves_unordered_records,
@@ -2917,6 +2939,50 @@ for _, test in ipairs(tests) do
 end
 
 print("shardpilot defold remote-config tests passed")
+
+-- Retired clients must not apply a response over a replacement's durable cache.
+;(function()
+	local public = require "shardpilot.sdk"
+	local passed, failed = 0, 0
+	for _, with_callback in ipairs({ true, false }) do
+		for _, status in ipairs({ 200, 401 }) do
+			reset()
+			local restore = install_fake_sys_storage()
+			local request = http.request
+			local ok, err = pcall(function()
+				next_response_body = values_body({ a = 1 })
+				local old = assert(public.new(config()))
+				fetch(old)
+				local held, callbacks = nil, 0
+				http.request = function(_, _, callback) held = callback end
+				assert_true(old:fetch_remote_config(with_callback and function()
+					callbacks = callbacks + 1
+				end or nil))
+				local closed
+				assert_true(old:shutdown(10, function(done) closed = done end))
+				assert_equal(closed, true, "shutdown completes without waiting for the fetch")
+				http.request = request
+				next_response_body = values_body({ a = 2 })
+				local replacement = assert(public.new(config()))
+				fetch(replacement)
+				local body = assert(storage.load_remote_config(private_config())).body
+				held(nil, nil, { status = status, response = values_body({ a = 9 }) })
+				assert_equal(callbacks, 0, "the retired fetch callback is cancelled")
+				assert_equal(storage.load_remote_config(private_config()).body, body,
+					"the replacement's durable cache survives the late response")
+				assert_equal(old:remote_config_number("a", 0), 1, "the retired snapshot is unchanged")
+				assert_equal(replacement:remote_config_number("a", 0), 2)
+			end)
+			http.request = request
+			restore()
+			storage.reset()
+			if ok then passed = passed + 1 else failed = failed + 1 end
+			print("remote-config shutdown " .. tostring(status) .. " callback=" .. tostring(with_callback)
+				.. ": " .. (ok and "PASS" or "FAIL " .. tostring(err)))
+		end
+	end
+	assert_equal(failed, 0, "remote-config shutdown scenes")
+end)()
 
 -- Header identity uses the public facade; the final case probes the component boundary.
 ;(function()

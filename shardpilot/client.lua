@@ -7740,11 +7740,14 @@ function Client:shutdown()
 	return true
 end
 
--- Stop the client. The experiments consumer stops with it (an assignment
+-- Stop the client. Both configuration consumers stop with it (a
 -- response still in flight must not install, persist, or call back into game
 -- code from now on), and a bounded flush still waiting ends with it: its
 -- events were delivered, refused, or left to the spool by the final flush.
 function Client:finish_teardown()
+	if self.remote_config then
+		self.remote_config:teardown()
+	end
 	if self.experiments then
 		self.experiments:teardown()
 	end
