@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- Failed removal of a withdrawn restored spool's Retry-After deadline retries
+  at flush, persist and shutdown, even when every remaining event is already
+  spooled. A recovered store no longer carries that stale delay into relaunch.
+
 - Failed clears of spent experiment withdrawal debt retry on dispatch, persist
   and shutdown, including denied or spool-disabled clients. New withdrawals
   retain their debt until their own spool rewrite succeeds.
