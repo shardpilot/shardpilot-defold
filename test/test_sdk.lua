@@ -18230,3 +18230,46 @@ end)()
  print(string.format("shutdown ack total: %d pass, %d fail", passed, failed))
  assert_equal(failed, 0, "acknowledged-copy shutdown scenes")
 end)()
+
+-- A bounded flush owns exact summaries built by its step, across host reentry.
+;(function()
+ local failures = {}
+ for _, rejected in ipairs({ false, true }) do
+  reset(); storage.reset(); seed_granted_consent()
+  local _, restore = install_stub_sys_storage()
+  local client, post_id, hooks = nil, nil, 0
+  client = assert(sdk.new(config({ batch_size = 1, flush_interval_seconds = 9999,
+   request_compression_enabled = false, token_provider = function(callback)
+    hooks = hooks + 1
+    client:observe_ping_ms(37)
+    assert_true(client:session_end("hook_end"))
+    for _, event in ipairs(client.queue.items) do
+     if event.event_name == "network_summary" then post_id = event.event_id end
+    end
+    assert_true(post_id ~= nil, "the hook built its own summary")
+    callback("synthetic-provider-token", nil, nil)
+   end })))
+  assert_true(client:session_start()); assert_true(client:track("held_before_flush"))
+  local original = client:pending_delivery_ids()
+  local request, held = http.request, {}
+  http.request = function(url, method, callback, headers, body)
+   local payload = json.decode(body)
+   if body:find("network_summary", 1, true) then
+    if rejected then callback(nil, nil, { status = 400, response = "{}" })
+    else held[#held + 1] = callback end
+   else callback(nil, nil, { status = 202, response = json.encode({ accepted = #payload.events }) }) end
+  end
+  local calls = {}
+  assert_true(client:bounded_flush(60, function(ok, code) calls[#calls + 1] = { ok, code } end))
+  assert_equal(hooks, 1); assert_true(not original[post_id], "the summary was created after the call")
+  local pending = client:pending_delivery_ids()
+  for event_id in pairs(original) do assert_equal(pending[event_id], nil, "every call-time event delivered") end
+  local correct = #calls == 1 and calls[1][1] == true and calls[1][2] == nil
+  socket.now = socket.now + 61; client:update(0)
+  http.request = request; client:finish_teardown(); restore(); storage.reset()
+  if not correct then failures[#failures + 1] = rejected and "a host summary's rejection contaminated the call" or "the call waited for a host summary" end
+  assert_equal(#calls, 1, "the call answers exactly once")
+  print("bounded flush excludes host summary " .. tostring(rejected) .. ": " .. tostring(correct))
+ end
+ assert_equal(#failures, 0, table.concat(failures, "; "))
+end)()

@@ -146,6 +146,9 @@ spool chunks from an earlier launch, and the summaries the call builds. It
 sends batch after batch from `update()`, without waiting for
 `flush_interval_seconds`, until all of it is settled or `timeout_seconds`
 (default `10`) passes. Events tracked after the call are not part of it.
+Summaries are identified by the exact IDs built by this call. A synchronous host
+hook that creates another summary during dispatch cannot extend the drain or make
+its rejection the call's result.
 
 The deadline also bounds consecutive dispatches on a synchronous HTTP bridge:
 once it is reached, the dispatch step starts no further event batch. A request
@@ -187,6 +190,11 @@ host that stops calling `update()` gets no answer.
 3. It tears the client down once that settles, or at the deadline with
    whatever is left. The close advances from `update()`, so the client is
    torn down by its deadline only while the host keeps calling `update()`.
+
+During the close, experiment cache writes and owed facts continue draining, while
+assignment revalidation starts no further request. Each key rechecks this state if
+a synchronous host hook begins shutdown during a revalidation tick. Mismatch
+corrections and grammar retries are fenced too; closing never remints for a retry.
 
 The callback runs once, on the main loop, with `true` or `false` and a code:
 

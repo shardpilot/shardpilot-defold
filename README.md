@@ -589,6 +589,12 @@ Most methods return `ok, err` so callers can branch on failures (e.g.
 event batch once its deadline is reached, including on synchronous HTTP bridges.
 Time spent acquiring a token counts toward that deadline. Unsent events remain
 queued or spooled for a later dispatch.
+The call owns the exact summaries its own step builds. A summary created by a
+synchronous host hook during dispatch does not extend the call or supply its refusal.
+While shutdown drains, experiment persistence and owed facts continue; assignment
+revalidation stops, including mismatch correction fetches, grammar retries and
+work between keys when a host hook starts shutdown. Grammar recovery also leaves
+the current subject intact while closing.
 
 ## AI-assisted integration
 
@@ -1459,6 +1465,8 @@ player owes for it is withdrawn. A response to an earlier fetch of that
 experiment that arrives afterwards installs nothing. The `diagnostics` hook
 reports this withdrawal as `status = "withdrawn"` with
 `code = "age_declaration_unconfirmed"`.
+This diagnostic runs after withdrawal and persistence, so a synchronous hook can
+fetch a newer assignment or complete shutdown without the old withdrawal resuming.
 Grammar retries keep that earlier call's order too. While a non-adult declaration
 is pending, older per-key refusals and age-gated assignments cannot remove, close
 or replace an exempt synthetic assignment. Plane-wide authorization and withdrawal

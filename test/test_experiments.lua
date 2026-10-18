@@ -12914,7 +12914,142 @@ function extra_tests.test_adult_call_waits_for_authoritative_answer()
 	responder = nil; client:finish_teardown(); restore(); storage.reset()
 end
 
+function extra_tests.test_declaration_diagnostic_reentry()
+	local check, verify = extra_tests.checklist()
+	for _, close in ipairs({ false, true }) do
+		reset()
+		local restore = install_fake_sys_storage()
+		local client, entered, closed, after_close = nil, false, false, 0
+		client = granted_client({ diagnostics = function(issue)
+			if issue.code ~= "age_declaration_unconfirmed" or entered then return end
+			entered = true
+			if close then
+				assert_true(client:bounded_shutdown(30, function(ok) closed = ok and not client.initialized end))
+				assert_true(closed, "shutdown completed inside the diagnostic")
+			else
+				next_status, next_response_body = 200, assignment_body({ variant_key = "new-adult", version = 8 })
+				assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).assigned)
+			end
+		end })
+		next_response_body = assignment_body()
+		assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).assigned)
+		local save = sys.save
+		sys.save = function(...)
+			if closed then after_close = after_close + 1 end
+			return save(...)
+		end
+		next_status, next_response_body = 503, "{}"
+		fetch(client, "exp-checkout", { age_band = "under_threshold" })
+		assert_true(entered, "the actual withdrawal reached the host diagnostic")
+		if close then check(after_close == 0, "withdrawal persisted after completed teardown")
+		else check(client:experiment_variant("exp-checkout") == "new-adult", "withdrawal removed the hook's newer assignment") end
+		sys.save = save; client:finish_teardown(); restore(); storage.reset()
+	end
+	verify("declaration diagnostic reentry")
+end
+
+function extra_tests.test_close_keeps_housekeeping_without_revalidation()
+	reset()
+	local restore, _, state = install_fake_sys_storage()
+	local client = granted_client()
+	next_response_body = assignment_body()
+	assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).assigned)
+	state.fail_save = fail_experiment_saves
+	next_response_body = assignment_body({ version = 4, variant_key = "owed-refresh" })
+	assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).assigned)
+	assert_true(next(client.experiments.durable_pending) ~= nil, "an actual failed cache write is owed")
+	assert_true(client:track("held_at_close"))
+	local held, answer = {}, nil
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then held[#held + 1] = callback; return true end
+		return false
+	end
+	assert_true(client:bounded_shutdown(30, function(ok, code) answer = { ok, code } end))
+	assert_true(client.closing and client.initialized and #held > 0 and not answer, "a real held batch keeps the close live")
+	client.experiments.revalidate_at_ms = 0
+	state.fail_save = nil
+	next_response_body = assignment_body({ version = 5, variant_key = "during-close" })
+	local before = #assignment_requests()
+	client:update(0.01)
+	local added = #assignment_requests() - before
+	local record = storage.load_experiments(client.config)
+	local durable = record and record.entries["exp-checkout"]
+	local check, verify = extra_tests.checklist()
+	check(added == 0, "closing update started assignment revalidation")
+	check(durable and durable.variant_key == "owed-refresh", "closing update did not finish the owed cache write")
+	check(client.initialized and answer == nil, "housekeeping must leave the held close live")
+	responder = nil; client:finish_teardown(); restore(); storage.reset()
+	verify("closing experiment work")
+end
+
+function extra_tests.test_revalidation_rechecks_close_between_keys()
+	reset()
+	local restore = install_fake_sys_storage()
+	local client = granted_client()
+	for _, key in ipairs({ "first", "second" }) do
+		next_response_body = assignment_body({ experiment_key = key })
+		assert_true(fetch(client, key).assigned)
+	end
+	assert_true(client:track("held_during_tick"))
+	local dispatches, held = 0, {}
+	responder = function(url, _, callback)
+		if url:find("/v1/events:batch", 1, true) then held[#held + 1] = callback; return true end
+		if url:find("/runtime/experiments/assignment", 1, true) then
+			dispatches = dispatches + 1
+			if dispatches == 1 then assert_true(client:bounded_shutdown(30, function() end)) end
+		end
+		return false
+	end
+	next_response_body = assignment_body({ experiment_key = "first" })
+	client.experiments.revalidate_at_ms = 0
+	client:update(0)
+	assert_true(client.closing and #held > 0 and client.initialized, "shutdown reentered during the first assignment dispatch")
+	responder = nil; client:finish_teardown(); restore(); storage.reset()
+	assert_equal(dispatches, 1, "the second key cannot start revalidation after the host closes")
+end
+
+function extra_tests.test_close_fences_internal_assignment_refetches()
+	local check, verify = extra_tests.checklist()
+	for _, kind in ipairs({ "version_mismatch", "variant_mismatch", "unit_not_recordable", "cadence_remint", "host_remint" }) do
+		reset()
+		local restore = install_fake_sys_storage()
+		local client = granted_client()
+		next_response_body = assignment_body()
+		assert_true(fetch(client, "exp-checkout", { age_band = "adult" }).assigned)
+		local remint = kind:find("remint", 1, true) ~= nil
+		if not remint then assert_true(client:apply_experiment_variant("exp-checkout")) end
+		assert_true(client:track("held_for_internal_correction"))
+		local assignment, batches, applies = nil, 0, 0
+		responder = function(url, _, callback)
+			if is_assignment_request({ url = url }) then assignment = callback; return true end
+			if url:find("/v1/events:batch", 1, true) then batches = batches + 1; return true end
+			if url:find("/experiments/exposures", 1, true) then
+				applies = applies + 1
+				callback(nil, nil, { status = 409, response = json.encode({ error = { code = kind } }) }); return true
+			end
+			return false
+		end
+		if kind == "cadence_remint" then client.experiments.revalidate_at_ms = 0; client:update(0)
+		elseif kind == "host_remint" then client:fetch_experiment_assignment("exp-checkout", nil, function() end) end
+		if remint then assert_true(assignment ~= nil, "the original request really left before close") end
+		local answer
+		assert_true(client:bounded_shutdown(30, function(ok) answer = ok end))
+		assert_true(client.closing and client.initialized and batches > 0 and answer == nil, "a real analytics batch keeps close live")
+		local before, subject = #assignment_requests(), client.experiments_client_id
+		if remint then assignment(nil, nil, { status = 400, response = json.encode({ error = { code = "subject_id_invalid" } }) })
+		else client:update(0); assert_equal(applies, 1, "owed apply housekeeping still ran") end
+		check(#assignment_requests() == before, kind .. " started a new assignment request while closing")
+		check(client.experiments_client_id == subject, kind .. " reminted the subject while closing")
+		responder = nil; client:finish_teardown(); restore(); storage.reset()
+	end
+	verify("internal assignment corrections during close")
+end
+
 local tests = {
+	extra_tests.test_close_fences_internal_assignment_refetches,
+	extra_tests.test_revalidation_rechecks_close_between_keys,
+	extra_tests.test_declaration_diagnostic_reentry,
+	extra_tests.test_close_keeps_housekeeping_without_revalidation,
 	extra_tests.test_host_grammar_retry_keeps_original_order,
 	extra_tests.test_pending_declaration_preserves_synthetic_against_older_adult,
 	extra_tests.test_plane_authority_outlives_key_fence,
