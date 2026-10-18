@@ -11093,7 +11093,7 @@ end
 -- Writes that spool, then simulates the process death. With `with_host`, a
 -- host event rides the spool too (restored work that outlives the refusal).
 -- `spool_max_events` caps the relaunched client's spool.
-function extra_tests.spool_with_deadline(with_host, spool_max_events)
+function extra_tests.spool_with_deadline(with_host, spool_max_events, recovery)
 	local first, restore = extra_tests.age_client()
 	assert_true(first:session_start())
 	extra_tests.admit(first)
@@ -11113,7 +11113,11 @@ function extra_tests.spool_with_deadline(with_host, spool_max_events)
 	assert_true(storage.save_spool(first.config, kept, first.config.spool_max_events,
 		first.config.spool_max_bytes, math.floor(socket.now * 1000) + 600000), "setup: the spool is rewritten")
 	storage.reset() -- SIMULATED PROCESS DEATH
-	local second = assert(sdk.new(config({ app_key = "exposure-app", spool_max_events = spool_max_events })))
+	local settings = { app_key = "exposure-app", spool_max_events = spool_max_events }
+	if recovery then
+		settings.source, settings.token_provider = "backend", function() end
+	end
+	local second = assert(sdk.new(config(settings)))
 	assert_true(second:spool_pending(), "setup: the spooled envelopes await re-send")
 	assert_true(second:publish_server_deferred(), "setup: the restored deadline defers the re-send")
 	return second, restore
@@ -11226,11 +11230,12 @@ end
 -- host event, and the record kept the deadline. The withdrawal empties the
 -- restored chunk with no durable fact left to withdraw, and the process then
 -- exits. The next launch must not restore the deadline and hold that event.
-function extra_tests.deadline_of_a_record_without_restored_facts(label, withdraw)
-	local client, restore = extra_tests.spool_with_deadline(false, 1)
+function extra_tests.deadline_of_a_record_without_restored_facts(label, withdraw, recovery)
+	-- A sessionless producer isolates deadline recovery from lifecycle appends.
+	local client, restore = extra_tests.spool_with_deadline(false, 1, recovery)
 	-- The session's re-armed exposure is persisted first, so the host event
 	-- is the newest entry and the one the cap keeps.
-	assert_true(client:session_start())
+	if not recovery then assert_true(client:session_start()) end
 	client:persist()
 	assert_true(client:track("host-event-before-exit"))
 	client:persist()
@@ -11241,8 +11246,25 @@ function extra_tests.deadline_of_a_record_without_restored_facts(label, withdraw
 		"setup: the restored facts left the record, not the chunks")
 	assert_true(#stored_events == 1 and stored_events[1].event_name == "host-event-before-exit"
 		and stored ~= nil, "setup: the record keeps the host event and the deadline")
+	local save, failures = sys.save, 0
+	if recovery then
+		sys.save = function(path, record)
+			if path:sub(-#"/spool") == "/spool" then failures = failures + 1; return false end
+			return save(path, record)
+		end
+	end
 	withdraw(client)
+	sys.save = save
 	assert_equal(#client.spool_batches, 0, "setup: the withdrawal emptied the restored chunk")
+	if recovery then
+		local _, stale = storage.load_spool(client.config)
+		assert_true(failures > 0 and stale ~= nil, "only the deadline rewrite failed")
+		-- The host's asynchronous mint stays pending, so no publish-clock
+		-- write or acknowledgement can incidentally repair the record.
+		if recovery == "persist" then client:persist()
+		elseif recovery == "shutdown" then client:shutdown()
+		else client:flush({ include_summaries = false }) end
+	end
 	local _, at_exit = storage.load_spool(client.config)
 	storage.reset() -- SIMULATED PROCESS DEATH
 	local relaunched = assert(sdk.new(config({ app_key = "exposure-app", spool_max_events = 1 })))
@@ -11252,12 +11274,33 @@ function extra_tests.deadline_of_a_record_without_restored_facts(label, withdraw
 	local observed = string.format("stored deadline at exit=%s delivered on the first flush=%d",
 		at_exit ~= nil and "yes" or "none", #delivered)
 	print("  restored-spool deadline scene, facts evicted from the record, " .. label .. ": " .. observed)
-	assert_equal(observed, "stored deadline at exit=none delivered on the first flush=1",
-		"the " .. label .. " that empties restored chunks the record no longer holds")
-	assert_true(extra_tests.has_event(delivered, "host-event-before-exit"), "the host event is the one delivered")
+	local host_delivered = extra_tests.has_event(delivered, "host-event-before-exit")
 	relaunched:shutdown()
 	restore()
 	storage.reset()
+	assert_equal(observed, "stored deadline at exit=none delivered on the first flush=1",
+		"the " .. label .. " that empties restored chunks the record no longer holds")
+	assert_true(host_delivered, "the host event is the one delivered")
+end
+
+function extra_tests.test_deadline_only_rewrite_retries_after_storage_recovers()
+	local check, verify = extra_tests.checklist()
+	for _, withdrawal in ipairs({ "age", "sentinel" }) do
+		for _, driver in ipairs({ "flush", "persist", "shutdown" }) do
+			local ok, err = pcall(extra_tests.deadline_of_a_record_without_restored_facts,
+				withdrawal .. " " .. driver, function(client)
+					if withdrawal == "age" then extra_tests.refuse(client, "age_ineligible")
+					else
+						next_status = 403
+						next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic refusal" } })
+						fetch(client, "exposure-banner")
+						next_status, next_response_body = 200, nil
+					end
+				end, driver)
+			check(ok, tostring(err))
+		end
+	end
+	verify("deadline-only rewrite recovery")
 end
 
 function extra_tests.test_age_refusal_clears_the_deadline_of_a_record_without_restored_facts()
@@ -13214,6 +13257,7 @@ function extra_tests.test_new_withdrawal_cancels_a_spent_clear_retry()
 end
 
 local tests = {
+	extra_tests.test_deadline_only_rewrite_retries_after_storage_recovers,
 	extra_tests.test_new_withdrawal_cancels_a_spent_clear_retry,
 	extra_tests.test_withdrawal_debt_clear_retries_after_spool_purge,
 	extra_tests.test_live_history_cap_does_not_rewrite_every_update,

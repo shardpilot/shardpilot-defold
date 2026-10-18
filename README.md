@@ -855,6 +855,11 @@ deadline is stored with the record, and a launch inside that window waits out
 the remainder before re-sending (bounded by the same 24-hour clamp as the
 in-process deferral).
 
+When experiment withdrawal empties the restored work, its deadline is removed
+from the spool too. A failed deadline-only rewrite retries at `flush()`,
+`persist()` and `shutdown()`, even when no new event needs appending. Deadlines
+for remaining restored work or a retained batch stay effective.
+
 **Delivery age.** Each accepted event has a local intake clock, separate from
 `event_ts`. Events expire after seven days from intake, or fifteen minutes from
 the first HTTP attempt whose delivery may have occurred, whichever comes first.

@@ -5630,13 +5630,15 @@ end
 -- record keeps the deadline. Left there, the next launch restores it and
 -- holds what the record kept. The record is rewritten without it, under the
 -- append path's guards: never a disabled spool, a non-granted actor's, or one
--- whose purge is still owed (fail-closed). A failed write leaves it to the
--- next write that lands.
+-- whose purge is still owed (fail-closed). A failed write stays owed at
+-- flush, persist and shutdown, even when no new envelopes need appending.
 function Client:drop_cleared_spool_deadline()
 	if self.spool_disk_deadline_ms ~= nil and self.spool_retry_after_ms == nil
 		and self.config.spool_enabled and self.consent_state == "granted"
 		and not self.spool_purge_pending then
-		self:write_spool_record(self.spool_record)
+		if not self:write_spool_record(self.spool_record) then
+			self.spool_rewrite_pending = true
+		end
 	end
 end
 
@@ -6153,10 +6155,9 @@ function Client:retry_spool_purge()
 	return false
 end
 
--- Retry the removal rewrite for settled entries: the mirror still holds them
--- (a failed write never mutates it), and write_spool_record's settled filter
--- drops them from what reaches the disk — so the record converges as soon as
--- storage recovers instead of waiting for an unrelated write or a relaunch.
+-- Retry settled-entry removals and cleared deadlines. A failed write leaves
+-- the mirror unchanged; the next write filters settled entries and carries
+-- the current deadline, without waiting for a new append or a relaunch.
 function Client:retry_spool_rewrite()
 	if not self.spool_rewrite_pending then
 		return true
@@ -6522,7 +6523,7 @@ function Client:persist()
 			end
 		end
 	end
-	if not self:spool_undelivered(owed_direct) then
+	if not self:spool_undelivered(owed_direct) or not self:retry_spool_rewrite() then
 		return false, "spool_persist_failed"
 	end
 	if self.experiments then self.experiments:prune_declaration_markers()

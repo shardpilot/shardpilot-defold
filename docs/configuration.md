@@ -716,7 +716,10 @@ is evicted — until the outbox drains below the cap. Spooled
 envelopes are re-sent verbatim (stable `event_id`/`event_ts`), so the ingest
 service de-duplicates re-sends; when a `429` `Retry-After` arrives while a
 batch is spooled, the deadline is stored with the record and a relaunch
-inside the window waits out the remainder before re-sending. Under Mode B
+inside the window waits out the remainder before re-sending. When experiment
+withdrawal empties restored work, its deadline is cleared too. A failed
+deadline-only rewrite retries at `flush()`, `persist()` and `shutdown()` even
+without new events to append; deadlines for remaining work stay effective. Under Mode B
 auth, spooled envelopes whose
 `anonymous_id` no longer matches the client's (the stored anonymous id was
 replaced at load — the corrupt/oversized-record self-heal) are dropped from
