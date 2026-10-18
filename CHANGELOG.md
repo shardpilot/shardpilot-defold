@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- Client teardown cancels remote-config fetches still in flight: late responses
+  cannot change the cache or getters and their callbacks do not run. Replace a
+  client after its shutdown callback without waiting separately for those fetches.
+
 - A bounded `flush()` stops starting event batches when its deadline is reached,
   including on synchronous HTTP bridges. Unsent events remain available for a
   later dispatch.

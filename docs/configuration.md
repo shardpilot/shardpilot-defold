@@ -242,11 +242,9 @@ keeps serving the experiment from memory, and delivers the facts it holds.
 
 - Create one client with `init(config)` (or `new(config)`) and keep it.
 - To replace it, call `shutdown()` and wait for its callback, then create the
-  next client. A closing client is still live until then. `shutdown()`
-  does not stop a `fetch_remote_config()` still in flight: its response is
-  still cached and its callback still runs, so wait for every such callback
-  of the old client first
-  ([#149](https://github.com/shardpilot/shardpilot-defold/issues/149)).
+  next client. A closing client is still live until then. Teardown discards
+  in-flight remote-config responses and cancels their callbacks without changing
+  the cache or getters. No separate wait for those fetches is needed.
 - Clients of different apps (another `app_key`, or another `workspace_key`) are
   independent and may run side by side. Create each with `new(config)` and
   keep every instance: `init(config)` holds one default client, and a second

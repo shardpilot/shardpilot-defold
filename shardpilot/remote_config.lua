@@ -488,6 +488,11 @@ function M.new(config, identity, consent)
 	return rc
 end
 
+-- Retain the last served getters, but discard pending responses and callbacks.
+function RemoteConfig:teardown()
+	self.torn_down = true
+end
+
 function RemoteConfig:client_id()
 	local value = self.identity()
 	if type(value) ~= "string" or value == "" then
@@ -801,6 +806,7 @@ end
 -- Fetch the configuration. `callback(result)` receives
 -- { ok, from_cache, error?, values?, version? }; it is optional and — like
 -- every http.request callback — fires asynchronously on the real runtime.
+-- Teardown cancels a fetch still in flight without invoking its callback.
 -- Replace the targeting attribute set enabled fetches send.
 -- `nil` or an empty table clears it. The table is copied shallowly, so a
 -- caller mutating its table after the call cannot change what later fetches
@@ -848,7 +854,7 @@ end
 -- when it could not be.
 function RemoteConfig:fetch(callback)
 	local function finish(result)
-		if type(callback) == "function" then
+		if not self.torn_down and type(callback) == "function" then
 			-- The callback is game code; never let it break the SDK.
 			pcall(callback, result)
 		end
@@ -920,8 +926,11 @@ function RemoteConfig:fetch(callback)
 	}
 
 	http.request(url, "GET", function(_, _, response)
+		if self.torn_down then return end
 		local result, new_cache, authoritative, revalidated_cache, unpublished =
 			M.apply(cache, response, clock.unix_ms(), self.closed[scope])
+		-- Decoding is a host call and can reenter client shutdown too.
+		if self.torn_down then return end
 		self:pace(seq, scope, response)
 		self:install(seq, result, new_cache, scope, authoritative, cache, revalidated_cache, unpublished)
 		finish(result)
