@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- Failed clears of spent experiment withdrawal debt retry on dispatch, persist
+  and shutdown, including denied or spool-disabled clients. New withdrawals
+  retain their debt until their own spool rewrite succeeds.
+
 - Platform and experiment-transport detection request non-secure system info,
   avoiding the unused protected identifier read while preserving platform mapping.
 

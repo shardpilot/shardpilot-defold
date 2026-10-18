@@ -1454,7 +1454,9 @@ not write its facts to disk. If the offline spool cannot be rewritten
 the next launch drops them from the spool before anything is sent, whether or
 not experiments are enabled on it. Only when that file cannot be written
 either, and the app exits before a later write succeeds, can the next launch
-still send them.
+still send them. A debt-file clear that fails after a successful spool write or
+purge remains owed. Flush-cadence updates, `persist()` and `shutdown()` retry it
+even while consent is denied or event spooling is disabled.
 
 A declaration other than `adult` takes effect when it is made. From the moment
 a fetch declares `age_band` or `custom_attribute_age_band` as anything other

@@ -1163,6 +1163,8 @@ local function construct(config, normalized)
 		-- `withdrawn_debt_save_owed` marks a debt the file does not hold yet.
 		withdrawn_fact_debt = nil,
 		withdrawn_debt_save_owed = false,
+		-- A spent debt whose separate file clear still needs to land.
+		withdrawn_debt_clear_owed = false,
 		-- Server-requested backpressure deadline (epoch ms) stored with the
 		-- record; spool_disk_deadline_ms mirrors what the record carries.
 		spool_retry_after_ms = nil,
@@ -6088,17 +6090,20 @@ function Client:owe_withdrawn_facts(envelopes)
 		debt[env.event_id] = type(env.event_ts) == "string" and env.event_ts or ""
 	end
 	self.withdrawn_fact_debt = debt
+	-- New withdrawn copies revoke an older proof that the debt was spent.
+	self.withdrawn_debt_clear_owed = false
 	self.withdrawn_debt_save_owed = not storage.save_withdrawn_facts(self.config, debt)
 end
 
 -- A spool write landed, so the file no longer holds any withdrawn copy: clear
--- the debt file. A failed clear keeps the debt for the next write that lands;
--- a stale debt names nothing a relaunch restores, and that launch spends it.
+-- the debt file. A failed clear stays owed at dispatch and snapshot points,
+-- independently of whether another spool write or purge is needed.
 function Client:spend_withdrawn_facts()
 	if self.withdrawn_fact_debt == nil then
 		return
 	end
-	if storage.clear_withdrawn_facts(self.config) then
+	self.withdrawn_debt_clear_owed = not storage.clear_withdrawn_facts(self.config)
+	if not self.withdrawn_debt_clear_owed then
 		self.withdrawn_fact_debt = nil
 		self.withdrawn_debt_save_owed = false
 	end
@@ -6125,6 +6130,7 @@ end
 -- the flush cadence (update-driven), from persist()/shutdown(), and before
 -- any append.
 function Client:retry_spool_purge()
+	if self.withdrawn_debt_clear_owed then self:spend_withdrawn_facts() end
 	if not self.spool_purge_pending then
 		return true
 	end
@@ -6456,6 +6462,8 @@ function Client:persist()
 		-- so even a spool-less configuration converges its cache here.
 		self.experiments:retry_durable_sync()
 	end
+	-- A spent debt clear is independent of the disabled/denied snapshot gates.
+	if self.withdrawn_debt_clear_owed then self:spend_withdrawn_facts() end
 	if not self.config.spool_enabled then
 		return false, "spool_disabled"
 	end
