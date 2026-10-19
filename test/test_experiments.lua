@@ -10466,6 +10466,80 @@ function extra_tests.test_age_adult_declaration_after_unconfirmed_one_is_new_app
 	storage.reset()
 end
 
+-- A later adult declaration fences the experiment's older fetches. The host
+-- declares under_threshold for exposure-banner and, while that fetch is in
+-- flight, declares adult. The older fetch's age_ineligible refusal landing
+-- first withdraws nothing; the adult fetch's answer decides. Controls: the
+-- adult fetch's own age_ineligible refusal withdraws, and so does a non-adult
+-- refusal with no later adult call.
+function extra_tests.later_adult_scene(with_adult_call)
+	local client, restore = extra_tests.applied_scene()
+	local held = {}
+	responder = function(url, _, callback)
+		if url:find("/runtime/experiments/assignment", 1, true) then
+			held[#held + 1] = callback
+			return true
+		end
+		return false
+	end
+	local answers = {}
+	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil,
+		function(value) answers.older = value end)
+	if with_adult_call then
+		client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil,
+			function(value) answers.adult = value end)
+	end
+	responder = nil
+	assert_equal(#held, with_adult_call and 2 or 1, "setup: the fetches are in flight")
+	assert_equal(extra_tests.owed_total(client, "exposure-banner"), 2, "setup: the exposure and the outcome are owed")
+	return client, restore, held, answers
+end
+
+function extra_tests.test_age_later_adult_declaration_fences_older_non_adult_answer()
+	local client, restore, held, answers = extra_tests.later_adult_scene(true)
+	local check, verify = extra_tests.checklist()
+	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("under_threshold") })
+	local owed = extra_tests.owed_total(client, "exposure-banner")
+	check(owed == 2, "the older non-adult answer withdrew " .. (2 - owed)
+		.. " of the two owed facts after the adult call")
+	check(extra_tests.durable_entry(client, "exposure-banner") ~= nil,
+		"the older non-adult answer dropped the durable assignment after the adult call")
+	held[2](nil, nil, { status = 200, response = extra_tests.served_age_golden() })
+	check(answers.adult ~= nil and answers.adult.ok and answers.adult.assigned,
+		"the adult answer must decide, got " .. tostring(answers.adult and answers.adult.error))
+	check(client:experiment_variant("exposure-banner") ~= nil, "the adult answer must serve the assignment")
+	owed = extra_tests.owed_total(client, "exposure-banner")
+	check(owed == 2, "after the adult answer " .. owed .. " of the two owed facts remain")
+	verify("a later adult declaration fences the older non-adult answer")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_adult_fetchs_own_refusal_still_withdraws()
+	local client, restore, held = extra_tests.later_adult_scene(true)
+	held[2](nil, nil, { status = 200, response = extra_tests.age_golden("under_threshold") })
+	assert_equal(extra_tests.owed_total(client, "exposure-banner"), 0,
+		"the adult fetch's own age_ineligible refusal withdraws what the subject owes")
+	assert_nil(client:experiment_variant("exposure-banner"), "and nothing is served")
+	held[1](nil, nil, { status = 200, response = extra_tests.served_age_golden() })
+	assert_nil(client:experiment_variant("exposure-banner"), "the older answer installs nothing afterwards")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
+function extra_tests.test_age_non_adult_refusal_without_later_adult_call_withdraws()
+	local client, restore, held = extra_tests.later_adult_scene(false)
+	held[1](nil, nil, { status = 200, response = extra_tests.age_golden("under_threshold") })
+	assert_equal(extra_tests.owed_total(client, "exposure-banner"), 0,
+		"a non-adult refusal with no later adult call withdraws what the subject owes")
+	assert_nil(client:experiment_variant("exposure-banner"), "and nothing is served")
+	client:shutdown()
+	restore()
+	storage.reset()
+end
+
 -- A declaration made while consent refuses is not held for a re-grant: its
 -- fetch ends before the wire, unconfirmed, and the re-grant serves nothing.
 function extra_tests.test_age_declaration_under_refused_consent_withdraws()
@@ -12944,16 +13018,17 @@ function extra_tests.test_plane_authority_outlives_key_fence()
 	verify("plane authority after key settlement")
 end
 
-function extra_tests.test_adult_call_waits_for_authoritative_answer()
+function extra_tests.test_adult_call_fences_an_older_refusal()
 	local client, restore = extra_tests.age_client()
 	extra_tests.admit(client)
 	local held = extra_tests.hold_assignments()
 	client:fetch_experiment_assignment_with_age_band("exposure-banner", "under_threshold", nil, function() end)
 	client:fetch_experiment_assignment_with_age_band("exposure-banner", "adult", nil, function() end)
 	extra_tests.reply_assignment(held, 1, 200, extra_tests.refusal_body("age_ineligible"))
-	assert_nil(client:experiment_variant("exposure-banner"), "an unconfirmed adult call cannot cancel an authoritative refusal")
+	assert_equal(client:experiment_variant("exposure-banner"), "control",
+		"a refusal to a fetch older than the adult call is fenced")
 	extra_tests.reply_assignment(held, 2, 200, extra_tests.served_age_golden())
-	assert_equal(client:experiment_variant("exposure-banner"), "control", "a newer authoritative answer restores serving")
+	assert_equal(client:experiment_variant("exposure-banner"), "control", "the adult call's answer decides")
 	responder = nil; client:finish_teardown(); restore(); storage.reset()
 end
 
@@ -13271,7 +13346,7 @@ local tests = {
 	extra_tests.test_host_grammar_retry_keeps_original_order,
 	extra_tests.test_pending_declaration_preserves_synthetic_against_older_adult,
 	extra_tests.test_plane_authority_outlives_key_fence,
-	extra_tests.test_adult_call_waits_for_authoritative_answer,
+	extra_tests.test_adult_call_fences_an_older_refusal,
 	extra_tests.test_pending_declaration_disabled_without_assignment_configuration,
 	extra_tests.test_pending_declaration_unreadable_spool_keeps_witness,
 	extra_tests.test_pending_declaration_disabled_relaunch_keeps_foreign_scope_facts,
@@ -13573,6 +13648,9 @@ local tests = {
 	extra_tests.test_age_declaration_pending_refuses_synthetic_keyed_outcome,
 	extra_tests.test_age_declaration_answered_by_its_grammar_retry,
 	extra_tests.test_age_adult_declaration_after_unconfirmed_one_is_new_application,
+	extra_tests.test_age_later_adult_declaration_fences_older_non_adult_answer,
+	extra_tests.test_age_adult_fetchs_own_refusal_still_withdraws,
+	extra_tests.test_age_non_adult_refusal_without_later_adult_call_withdraws,
 	extra_tests.test_age_declaration_under_refused_consent_withdraws,
 	extra_tests.test_age_forced_minor_floor_closed_for_adult_declaration,
 	extra_tests.test_age_adult_answer_in_flight_loses_to_later_refusal,

@@ -2,6 +2,12 @@
 
 ### Unreleased
 
+- A later `adult` declaration fences the experiment's older fetches: an older
+  non-adult fetch's `age_ineligible` refusal that lands after the adult call
+  withdraws nothing and keeps the cached assignment serving, and the adult
+  fetch's answer decides. The adult fetch's own `age_ineligible` refusal still
+  withdraws what the player owes.
+
 - Failed removal of a withdrawn restored spool's Retry-After deadline retries
   at flush, persist and shutdown, even when every remaining event is already
   spooled. A recovered store no longer carries that stale delay into relaunch.

@@ -3122,7 +3122,8 @@ end
 -- with an earlier one. `seq` is the declaring fetch's own, once dispatched,
 -- and `decided` is set when the server's answer to it was applied. An adult
 -- declaration replaces a pending non-adult one (the later declaration
--- decides afresh); a fetch that declares no age changes nothing. Returns the
+-- decides afresh) and raises the key's fence past every fetch dispatched
+-- before it; a fetch that declares no age changes nothing. Returns the
 -- non-adult declaration, or nil.
 function Experiments:begin_host_declaration(experiment_key, attributes)
 	if declares_non_adult_age(attributes) then
@@ -3164,7 +3165,18 @@ function Experiments:begin_host_declaration(experiment_key, attributes)
 	if declares_adult_age(attributes) then
 		self.declaring[experiment_key] = nil
 		local subject = self:current_subject_id()
-		if subject then self:write_declaration_marker(self:scope_for(subject), experiment_key, nil, true) end
+		if subject then
+			local scope = self:scope_for(subject)
+			-- The later declaration decides: every fetch of the experiment
+			-- dispatched before it is fenced, so an older non-adult fetch's
+			-- age_ineligible refusal landing afterwards withdraws nothing.
+			-- This adult fetch's own refusal still withdraws.
+			local fence_key = scope .. scope_separator .. experiment_key
+			if (self.settled[fence_key] or 0) < self.fetch_seq then
+				self.settled[fence_key] = self.fetch_seq
+			end
+			self:write_declaration_marker(scope, experiment_key, nil, true)
+		end
 	end
 	return nil
 end
