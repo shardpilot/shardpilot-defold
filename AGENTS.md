@@ -13,6 +13,8 @@
 - Preserve host-call order through experiment retries. Key fences must retain
   plane-wide authority; older per-key refusals, closures and age-gated installs
   must preserve synthetic exemptions during pending declarations.
+- A later adult declaration fences the experiment's older fetches; its own
+  `age_ineligible` answer still withdraws.
 - Bounded flushes own exact call-built summary IDs, including terminal refusals.
 - Emit withdrawal diagnostics after state changes; host hooks can fetch or close.
 - Closing clients keep experiment housekeeping but start no assignment revalidation,

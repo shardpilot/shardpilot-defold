@@ -1504,7 +1504,10 @@ through process death before the witness can be saved, recovery cannot establish
 the declaration; this is the same storage-down-through-exit limitation as the
 other privacy markers. An `adult` declaration made while a
 non-adult one is pending replaces it and is decided by its own fetch; a fetch
-that declares no age leaves it pending. A synthetic-subject assignment has no
+that declares no age leaves it pending. An `adult` declaration also fences the
+experiment's older fetches: an `age_ineligible` refusal to a fetch sent before
+the adult call withdraws nothing, while the adult fetch's own refusal still
+withdraws. A synthetic-subject assignment has no
 age gate and keeps serving (while the declaration is pending, `track_outcome`
 records nothing under a server fact key it carries): an unanswered declaration
 keeps it and withdraws only the client-id applications still owed from before
