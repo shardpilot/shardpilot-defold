@@ -764,6 +764,8 @@ no `User-Agent`. An HTML5 build needs a server whose CORS allows this header.
 
 ## Offline durability (event spool)
 
+Spool replay preserves stored event names without conversion.
+
 Player devices go offline and games get killed mid-session. To keep those
 events, the SDK persists undeliverable event envelopes to a small durable
 per-app spool and re-sends them on a later launch. Enabled by default

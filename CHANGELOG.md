@@ -2,6 +2,8 @@
 
 ### Unreleased
 
+- Removed spool event-name conversions and the obsolete wire-name stamp. Replay preserves stored event names.
+
 - A later `adult` declaration fences the experiment's older fetches: an older
   non-adult fetch's `age_ineligible` refusal that lands after the adult call
   withdraws nothing and keeps the cached assignment serving, and the adult

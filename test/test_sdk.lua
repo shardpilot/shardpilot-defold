@@ -8196,237 +8196,29 @@ local tests = {
 	spool_tests.persists_transient_failure_and_resends_next_launch,
 	spool_tests.overflow_evicts_oldest_first,
 	spool_tests.corrupted_record_starts_clean,
-	-- ⚠ INLINE, not a `local function`, and that is load-bearing: this file sits
-	-- exactly at Lua 5.4's ceiling of 200 locals for a main chunk, so the NEXT
-	-- `local function test_*` added here fails to compile under lua5.4 while
-	-- passing under lua5.1 and LuaJIT. New tests go in this table as inline
-	-- functions until someone reclaims headroom.
-	--
-	-- An upgrade inherits a spool written by an OLDER RELEASE. The record is
-	-- PLANTED through a stubbed store rather than written with save_spool(),
-	-- because a record written by THIS version carries the current wire-name
-	-- epoch and is deliberately not migrated -- seeding through the public API
-	-- would exercise nothing and pass.
+	-- Inline to preserve the main chunk's Lua 5.4 local-variable headroom.
 	function()
-		reset()
-		storage.reset()
+		reset(); storage.reset()
+		local saved = { get_save_file = sys.get_save_file, save = sys.save, load = sys.load }
 		local stores = {}
-		-- One path per FILE NAME, so the plant below lands where load_spool reads
-		-- regardless of the namespace the scope hashes to.
-		sys.get_save_file = function(_, file_name) return "planted/" .. file_name end
+		sys.get_save_file = function(scope, name) return scope .. "/" .. name end
 		sys.save = function(path, record) stores[path] = record; return true end
 		sys.load = function(path) return stores[path] end
-		-- No `wire_names` key: this is what a pre-rename release wrote.
-		stores["planted/spool"] = {
-			events = {
-				{ event_id = "legacy-1", event_name = "session_end" },
-				{ event_id = "legacy-2", event_name = "tutorial_start" },
-				{ event_id = "legacy-3", event_name = "app.screen_view" },
-			},
-		}
-
-		local loaded, _, _, migrated = storage.load_spool(spool_scope)
-		-- CONTROL: two survive and the loader reports two changes, so the drop
-		-- below reads as a drop rather than as a load that returned nothing.
-		-- CONTROL: the innocent sibling survives, so the two absences read as
-		-- drops rather than as a load that returned nothing.
-		assert_equal(#loaded, 1, "both legacy names are DROPPED; only the sibling survives")
-		assert_equal(migrated, 2, "and the loader counts both drops")
-		local by_id = {}
-		for i = 1, #loaded do by_id[loaded[i].event_id] = loaded[i] end
-		assert_equal(by_id["legacy-3"].event_name, "app.screen_view")
-		assert_true(by_id["legacy-1"] == nil,
-			"a legacy session_end is dropped, never renamed: nothing tells the SDK's own from a caller's")
-		assert_true(by_id["legacy-2"] == nil, "a removed helper's event is dropped")
-
-		-- A record written by THIS version is never repaired: a game may call
-		-- track("session_end", ...) for its own custom event, and renaming it
-		-- would turn a customer event into a lifecycle event whose facts it
-		-- corrupts -- while dropping a custom "tutorial_start" deletes it.
-		stores["planted/spool"] = {
-			events = {
-				{ event_id = "mine-1", event_name = "session_end" },
-				{ event_id = "mine-2", event_name = "tutorial_start" },
-			},
-			wire_names = 1,
-		}
-		local fresh, _, _, fresh_migrated = storage.load_spool(spool_scope)
-		assert_equal(#fresh, 2, "a customer's events are never dropped")
-		assert_equal(fresh_migrated, 0, "and never rewritten")
-		assert_equal(fresh[1].event_name, "session_end")
-		assert_equal(fresh[2].event_name, "tutorial_start")
-
-		sys.get_save_file = nil; sys.save = nil; sys.load = nil
-	end,
-	-- INLINE for the 200-local ceiling.
-	--
-	-- An UNUSABLE stamp reads as epoch 0, not as itself. `tonumber` accepts
-	-- "-1", and a negative epoch fails `epoch >= rule.since` for every rule --
-	-- so a garbled header would skip the whole migration, and the boot rewrite
-	-- would then re-stamp the file at the current epoch, putting it permanently
-	-- beyond repair while its legacy events kept being refused. And the DROP is
-	-- reported: the migration rationale rests on the count making the loss
-	-- visible, and an earlier revision consumed the count only to decide whether
-	-- a rewrite was owed, so the deletion itself was silent.
-	function()
-		reset()
-		storage.reset()
-		local stores = {}
-		local issues = {}
-		sys.get_save_file = function(_, file_name) return "planted/" .. file_name end
-		sys.save = function(path, record) stores[path] = record; return true end
-		sys.load = function(path) return stores[path] end
-		stores["planted/spool"] = {
-			events = {
-				{ event_id = "garbled-1", event_name = "session_end" },
-				{ event_id = "garbled-2", event_name = "app.screen_view" },
-			},
-			wire_names = -1,
-		}
-
-		local loaded, _, _, migrated, dropped = storage.load_spool(spool_scope)
-		assert_equal(#loaded, 1, "a NEGATIVE stamp runs every rule, as epoch 0 does")
-		assert_equal(migrated, 1, "and the migration is counted")
-		assert_equal(dropped, 1, "and the drop is counted SEPARATELY from a rename")
-
-		-- CONTROL: a stamp at the current epoch is honoured, so the line above
-		-- reads as "invalid falls back to 0" rather than "every record runs".
-		stores["planted/spool"] = {
-			events = { { event_id = "mine-1", event_name = "session_end" } },
-			wire_names = 1,
-		}
-		local kept, _, _, _, kept_dropped = storage.load_spool(spool_scope)
-		assert_equal(#kept, 1, "a VALID current stamp still protects a caller's event")
-		assert_equal(kept_dropped or 0, 0, "and drops nothing")
-
-        -- The host is told. A migrated backlog and an empty spool are otherwise
-        -- indistinguishable to it.
-		stores["planted/spool"] = {
-			events = { { event_id = "gone-1", event_name = "tutorial_start" } },
-		}
-		seed_granted_consent()
-		assert(sdk.new(config({
-			diagnostics = function(issue) issues[#issues + 1] = issue end,
-		})))
-		local reported = nil
-		for i = 1, #issues do
-			if issues[i].code == "legacy_event_name" then reported = issues[i] end
-		end
-		assert_true(reported ~= nil, "the drop reaches the host as a diagnostic")
-		assert_equal(reported.scope, "spool")
-		assert_equal(reported.status, "dropped")
-		assert_equal(reported.count, 1, "carrying how many were lost")
-
-		sys.get_save_file = nil; sys.save = nil; sys.load = nil
-	end,
-	-- INLINE for the 200-local ceiling.
-	--
-	-- Both halves of the rule interval, exercised on rules that do not exist
-	-- yet. Every rule shipped today is `since = 0` -- SDK-owned from the
-	-- beginning -- which is exactly what hid the lower bound: an upper-bound
-	-- check looks correct while no rule needs the other end. The rules are
-	-- INJECTED INTO THE REAL WALKER through its upvalues (found by NAME, since
-	-- the index differs between LuaJIT and 5.5) rather than reimplemented here,
-	-- because a test that carries its own copy of the interval logic is testing
-	-- the copy.
-	function()
-		reset()
-		storage.reset()
-		local stores = {}
-		sys.get_save_file = function(_, file_name) return "planted/" .. file_name end
-		sys.save = function(path, record) stores[path] = record; return true end
-		sys.load = function(path) return stores[path] end
-
-		local function upvalue(fn, want)
-			local i = 1
-			while true do
-				local n, v = debug.getupvalue(fn, i)
-				if not n then return nil end
-				if n == want then return i, v end
-				i = i + 1
+		local ok, err = pcall(function()
+			local names = { "app.session_ended", "session_end", "tutorial_start", "tutorial_step_complete", "tutorial_complete" }
+			local events = {}
+			for i, name in ipairs(names) do events[i] = { event_id = "current-" .. i, event_name = name } end
+			assert_true(storage.save_spool(spool_scope, events, 100, 100000))
+			storage.reset()
+			local loaded = storage.load_spool(spool_scope)
+			assert_equal(#loaded, #events, "current writer envelopes survive reload")
+			for i, name in ipairs(names) do
+				assert_equal(loaded[i].event_name, name, "spool replay preserves caller event names")
+				assert_equal(loaded[i].event_id, "current-" .. i)
 			end
-		end
-		local _, walker = upvalue(storage.load_spool, "migrate_spool_events")
-		assert_true(walker ~= nil, "the walker is reachable, so the injection below lands on it")
-		local removed_at, removed_was = upvalue(walker, "spool_removed_events")
-		local renamed_at, renamed_was = upvalue(walker, "spool_renamed_events")
-		assert_true(removed_at ~= nil and renamed_at ~= nil, "both rule maps are reachable")
-
-		-- `late_name` becomes SDK-owned at epoch 1 and is retired at epoch 2.
-		-- `a` -> `b` at epoch 1, then `b` -> `c` at epoch 2: a chain.
-		debug.setupvalue(walker, removed_at, {
-			["late_name"] = { since = 1, changed = 2 },
-		})
-		debug.setupvalue(walker, renamed_at, {
-			["a"] = { to = "b", since = 0, changed = 1 },
-			["b"] = { to = "c", since = 1, changed = 2 },
-		})
-
-		stores["planted/spool"] = {
-			events = {
-				{ event_id = "callers", event_name = "late_name" },
-				{ event_id = "chained", event_name = "a" },
-			},
-		}
-		local loaded, _, _, migrated = storage.load_spool(spool_scope)
-		local by_id = {}
-		for i = 1, #loaded do by_id[loaded[i].event_id] = loaded[i] end
-
-		-- LOWER BOUND. At epoch 0 this name was the CALLER'S: the SDK did not
-		-- emit it until epoch 1. An upper-bound-only rule drops it on `0 < 2`.
-		assert_true(by_id["callers"] ~= nil,
-			"a name the SDK did not own yet at epoch 0 is a caller's event, and survives")
-		assert_equal(by_id["callers"].event_name, "late_name", "and is not rewritten either")
-
-		-- CHAIN. One lookup leaves this as `b`, a name no epoch registers --
-		-- resent under it, and poisoning its batch.
-		assert_true(by_id["chained"] ~= nil, "the renamed event is retained")
-		assert_equal(by_id["chained"].event_name, "c",
-			"the chain is WALKED to its final name, not stepped once to the obsolete middle")
-		assert_equal(migrated, 1, "and the walk counts the entry once, not once per hop")
-
-		-- The same `late_name` written at epoch 1 IS the SDK's own, and goes.
-		stores["planted/spool"] = {
-			events = { { event_id = "ours", event_name = "late_name" } },
-			wire_names = 1,
-		}
-		local after, _, _, after_migrated = storage.load_spool(spool_scope)
-		assert_equal(#after, 0, "inside its interval the same name is the SDK's own, and is dropped")
-		assert_equal(after_migrated, 1, "counted")
-
-		debug.setupvalue(walker, removed_at, removed_was)
-		debug.setupvalue(walker, renamed_at, renamed_was)
-		sys.get_save_file = nil; sys.save = nil; sys.load = nil
-	end,
-	-- INLINE for the 200-local ceiling.
-	--
-	-- When the migration rewrite FAILS and migration dropped everything, there
-	-- is no surviving event to resend and no acknowledgement that would ever
-	-- force another write -- so without recording the debt the stale file
-	-- survives every future launch, and a rollback to a release without the
-	-- migration replays those names.
-	function()
-		reset()
-		storage.reset()
-		local stores = {}
-		sys.get_save_file = function(_, file_name) return "planted/" .. file_name end
-		sys.save = function(path, record)
-			if path == "planted/spool" then return false end
-			stores[path] = record
-			return true
-		end
-		sys.load = function(path) return stores[path] end
-		stores["planted/spool"] = {
-			events = { { event_id = "gone-1", event_name = "tutorial_start" } },
-		}
-
-		seed_granted_consent()
-		local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
-		assert_equal(#client.spool_record, 0, "nothing survives the migration")
-		assert_true(client.spool_rewrite_pending,
-			"a FAILED migration rewrite records the debt, so it retries at the next dispatch")
-
-		sys.get_save_file = nil; sys.save = nil; sys.load = nil
+		end)
+		sys.get_save_file, sys.save, sys.load = saved.get_save_file, saved.save, saved.load
+		assert_true(ok, err)
 	end,
 	spool_tests.cleared_by_denied_consent,
 	test_consent_unknown_blocks_all_analytics_egress,
@@ -12529,6 +12321,9 @@ end)()
 	--    denial whose identity save fails would otherwise put its stale pair in
 	--    the marker, and the next boot would impose it over the newer one.
 	reset(); storage.reset()
+	-- Observe both siblings at one instant; decision ordering uses their sequences.
+	local l_clock = socket.gettime
+	socket.gettime = function() return socket.now end
 	local lstores, lrestore = install_stub_sys_storage()
 	seed_unreadable("anon-marker-merge")
 	lstores[outbox_path(lstores)] = "garbage"
@@ -12568,6 +12363,7 @@ end)()
 		"and it carries the NEWER durable provenance, not the sibling's absence")
 	assert_equal(lstores[lmpath].superseded_unreadable_seq, newer_seq)
 	lrestore(); storage.reset()
+	socket.gettime = l_clock
 
 	-- M. AN UNREADABLE DENIAL MARKER UNDER A NON-GRANTED RESTORE is the THIRD
 	--    member of the unreadable set. The fail-closed imposition is armed only
@@ -14277,17 +14073,14 @@ end)()
 	local function with_boot(kind, body, keep_previous)
 		reset(); storage.reset()
 		local saved = { get_save_file = sys.get_save_file, save = sys.save, load = sys.load }
-		local stores, clients, paths = {}, {}, {}
+		local stores, clients = {}, {}
 		local core = require "shardpilot.client"
 		local real_new = core.new
 		local facade = require("test.inspect_client").wrap(dofile("shardpilot/sdk.lua"))
 		local function cfg(app, hook)
 			return config({ app_key = app, anonymous_id = app .. "-actor", diagnostics = hook })
 		end
-		sys.get_save_file = function(app, name)
-			paths[name] = app .. "/" .. name
-			return paths[name]
-		end
+		sys.get_save_file = function(app, name) return app .. "/" .. name end
 		sys.save = function(path, value) stores[path] = value; return true end
 		sys.load = function(path) return stores[path] or {} end
 		-- Instrument only the returned instances; all construction and callbacks
@@ -14302,11 +14095,10 @@ end)()
 			if not keep_previous then assert_true(facade.shutdown()) end
 			local outer = cfg("boot-outer")
 			assert_true(storage.save(record_scope(outer), { anonymous_id = outer.anonymous_id, consent_analytics = "granted" }))
-			if kind == "legacy" or kind == "both" then
-				assert_true(storage.spool_is_durable(record_scope(outer)))
-				stores[paths.spool] = {
-					events = { { event_id = "boot-obsolete", event_name = "tutorial_start" } },
-				}
+			if kind == "identity" or kind == "both" then
+				local prior = { event_id = "boot-prior", event_name = "boot_activity", anonymous_id = "boot-prior-actor", platform = "other" }
+				require("shardpilot.analytics_retry").start(prior)
+				assert_true(storage.save_spool(record_scope(outer), { prior }, 100, 100000))
 			end
 			if kind == "platform" or kind == "both" then outer.platform = "synthetic-unmapped" end
 			body(facade, outer, clients, cfg)
@@ -14316,7 +14108,7 @@ end)()
 		storage.reset()
 		assert_true(ok, err)
 	end
-	for _, kind in ipairs({ "legacy", "platform", "both" }) do
+	for _, kind in ipairs({ "identity", "platform", "both" }) do
 		for _, action in ipairs({ "shutdown", "init" }) do
 			scene(kind .. " " .. action, function()
 				with_boot(kind, function(facade, outer, clients, cfg)
@@ -14369,12 +14161,12 @@ end)()
 				local original_hook = outer.diagnostics
 				assert_true(facade.init(outer))
 				assert_equal(#seen, 0, "all boot hooks are deferred")
-				assert_equal(facade.snapshot().last_event_issue, "dropped:legacy_event_name", "latch is immediate, not replayed by the drain")
+				assert_equal(facade.snapshot().last_event_issue, "dropped:identity_changed", "latch is immediate, not replayed by the drain")
 				facade.update(0)
 				local count = action == "diagnose" and 3 or 2
 				assert_equal(#seen, count, "deliver each queued issue once, including after a throwing or reentrant hook")
 				assert_equal(seen[1], "platform_unmapped")
-				assert_equal(seen[count], "legacy_event_name")
+				assert_equal(seen[count], "identity_changed")
 				if action == "diagnose" then
 					assert_equal(seen[2], "during-drain", "runtime diagnostics stay synchronous")
 					assert_equal(facade.snapshot().last_event_issue, "observed:during-drain", "queued hooks do not overwrite a newer latch")
@@ -14389,7 +14181,7 @@ end)()
 		end)
 	end
 	scene("runtime before tick control", function()
-		with_boot("legacy", function(facade, outer, clients)
+		with_boot("identity", function(facade, outer, clients)
 			local seen = {}
 			outer.diagnostics = function(issue) seen[#seen + 1] = issue.code end
 			assert_true(facade.init(outer))
@@ -14397,12 +14189,12 @@ end)()
 			assert_equal(#seen, 1, "runtime delivery does not wait for the boot drain")
 			assert_equal(seen[1], "before-tick")
 			facade.update(0)
-			assert_equal(seen[2], "legacy_event_name")
+			assert_equal(seen[2], "identity_changed")
 			assert_equal(facade.snapshot().last_event_issue, "observed:before-tick")
 		end)
 	end)
 	scene("failed reinit preserves pending", function()
-		with_boot("legacy", function(facade, outer)
+		with_boot("identity", function(facade, outer)
 			local calls = 0
 			outer.diagnostics = function() calls = calls + 1 end
 			assert_true(facade.init(outer))
@@ -14439,8 +14231,8 @@ end)()
 				else client = assert(require("shardpilot.client").new(outer)) end
 				assert_equal(#seen, 2, "standalone construction still delivers before returning")
 				assert_equal(seen[1], "platform_unmapped")
-				assert_equal(seen[2], "legacy_event_name")
-				assert_equal(client:snapshot().last_event_issue, "dropped:legacy_event_name")
+				assert_equal(seen[2], "identity_changed")
+				assert_equal(client:snapshot().last_event_issue, "dropped:identity_changed")
 				assert_equal(facade.get_anonymous_id(), "boot-previous-actor", "new never adopts the singleton")
 			end, true)
 		end)
@@ -14469,7 +14261,7 @@ end)()
 		end)
 	end)
 	scene("nested init keeps its pending hook", function()
-		with_boot("legacy", function(facade, outer, clients, cfg)
+		with_boot("identity", function(facade, outer, clients, cfg)
 			local seen = {}
 			outer.diagnostics = function(issue)
 				seen[#seen + 1] = issue.code
@@ -14490,7 +14282,7 @@ end)()
 		end)
 	end)
 	scene("shutdown callback cannot replace a closing client", function()
-		with_boot("legacy", function(facade, outer, clients, cfg)
+		with_boot("identity", function(facade, outer, clients, cfg)
 			local request = http.request
 			local attempted, shutdown_ok, nested_ok, nested_code = false, nil, nil, nil
 			http.request = function(url, method, callback, headers, body)
@@ -14503,7 +14295,7 @@ end)()
 			end
 			local ok, err = pcall(function()
 				outer.diagnostics = function(issue)
-					if issue.code == "legacy_event_name" then
+					if issue.code == "identity_changed" then
 						assert_true(facade.track("boot_activity", { synthetic = true }))
 						shutdown_ok = facade.shutdown()
 					elseif issue.code == "shutdown-reentry" and not attempted then
@@ -14546,7 +14338,7 @@ end)()
 			local at_second_hook, boot_calls = nil, 0
 			outer.diagnostics = function(issue)
 				if issue.code == "platform_unmapped" then boot_calls = boot_calls + 1; facade.update(1)
-				elseif issue.code == "legacy_event_name" then boot_calls = boot_calls + 1; at_second_hook = #requests end
+				elseif issue.code == "identity_changed" then boot_calls = boot_calls + 1; at_second_hook = #requests end
 			end
 			assert_true(facade.init(outer))
 			assert_true(facade.track("boot_publish", { synthetic = true }))
@@ -14562,7 +14354,7 @@ end)()
 		end)
 	end)
 	scene("nested update cannot drain replacement", function()
-		with_boot("legacy", function(facade, outer, clients, cfg)
+		with_boot("identity", function(facade, outer, clients, cfg)
 			local calls = 0
 			outer.diagnostics = function()
 				local nested = cfg("boot-nested", function() calls = calls + 1 end)
@@ -14586,7 +14378,7 @@ end)()
 				local save = sys.save
 				local boot_calls, first_ok, first_err, pending_after_failure = 0, nil, nil, false
 				outer.diagnostics = function(issue)
-					if issue.code == "platform_unmapped" or issue.code == "legacy_event_name" then
+					if issue.code == "platform_unmapped" or issue.code == "identity_changed" then
 						boot_calls = boot_calls + 1
 						if boot_calls == 1 then
 							next_status = 500

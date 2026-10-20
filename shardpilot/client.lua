@@ -1767,7 +1767,7 @@ local function construct(config, normalized)
 			client:purge_withdrawn_facts()
 		end
 	else
-		local spooled, stored_deadline, spool_miss, spool_migrated, spool_dropped =
+		local spooled, stored_deadline, spool_miss =
 			storage.load_spool(normalized)
 		client.declaration_spool_pending = spool_miss == "unreadable"
 		for _, event in ipairs(spooled) do client.delivery_clocks[event.event_id] = analytics_retry.get(event) end
@@ -1996,14 +1996,7 @@ local function construct(config, normalized)
 				})
 			end
 		end
-		-- spool_migrated counts entries the loader RENAMED or DROPPED for legacy
-		-- wire names. It belongs in this guard because it is the one repair the
-		-- surviving count cannot express: an all-removed backlog sanitizes to an
-		-- empty list, and without the rewrite the durable file keeps those names
-		-- -- re-filtered every launch, and replayed onto the wire by a rollback
-		-- to an SDK that has no migration.
-		if #spooled > 0 or mismatched > 0 or condemned > 0 or withdrawn > 0
-			or (spool_migrated or 0) > 0 or expired > 0 then
+		if #spooled > 0 or mismatched > 0 or condemned > 0 or withdrawn > 0 or expired > 0 then
 			if #spooled == 0 then
 				client.spool_retry_after_ms = nil
 			end
@@ -2028,21 +2021,6 @@ local function construct(config, normalized)
 		elseif client.withdrawn_fact_debt ~= nil and spool_miss ~= "unreadable" then
 			-- Nothing restored for the debt to name: a stale debt.
 			client:spend_withdrawn_facts()
-		end
-		if (spool_dropped or 0) > 0 then
-			-- ⚠ A DROP IS A LOSS AND IS REPORTED. The migration rationale rests
-			-- on the count making the deletion visible, and the count was
-			-- consumed only to decide whether a rewrite is owed -- so the
-			-- deletion itself was silent, and a host had no way to tell a
-			-- migrated backlog from an empty one. One diagnostic per
-			-- non-accepted outcome, as the identity-mismatch and overflow paths
-			-- alongside already do.
-			client:diagnose({
-				scope = "spool",
-				status = "dropped",
-				code = "legacy_event_name",
-				count = spool_dropped,
-			})
 		end
 		if #spooled > 0 then
 			client.spool_record = spooled
