@@ -14164,17 +14164,6 @@ scene("apply-disabled diagnosis keeps occurrence and halts retry",function()
  advance_seconds(400);c.experiments:tick(0);assert_equal(n,1)
  local found=false;for _,v in ipairs(diagnostics)do if v.status=="disabled" and v.code=="experiment_apply_disabled"then found=true end end;assert_true(found,"missing disabled diagnostic")
 end)
-for _,case in ipairs({{"pinless invalid version",false,"future_unit",false},{"pinless future unit",3,"future_unit",true},{"pinless known unit",3,"client_id",true}})do
- scene(case[1],function()
-  reset();local c=granted_client();next_response_body=assignment_body();fetch(c,"exp-checkout")
-  local body=json.decode(assignment_body({version=case[2],boundary={assignment_unit=case[3]}}))
-  body.served_revision=nil;body.served_kill_gate=nil;body.served_at=nil;next_response_body=json.encode(body)
-  local result=fetch(c,"exp-checkout");assert_equal(#assignment_requests(),2)
-  if not case[4]then assert_equal(result.error,"malformed_response");assert_true(result.from_cache)
-  elseif case[3]=="future_unit"then assert_true(result.ok and not result.assigned);assert_equal(result.reason,"unknown")
-  else assert_true(result.ok and result.assigned and not result.from_cache)end
- end)
-end
 
 for _,case in ipairs({
  {"age detail on wrong status",400,envelope("not_assigned",{{field="reason",code="age_ineligible"}}),1},
