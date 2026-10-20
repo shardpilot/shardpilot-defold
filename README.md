@@ -1064,6 +1064,8 @@ The host user ID is never sent; config requests have no body. The endpoint answe
 `{ "version": <number>, "values": { key: value } }` with an `ETag`; the getters
 serve the `values` map, and `remote_config_version()` reads the wrapper's
 `version` only — it is response metadata, never a configuration value.
+Replies and cached bodies require the `values` object wrapper. An unwrapped
+body is malformed and cannot replace a valid cached snapshot.
 Responses are cached in a durable per-app record
 (`{scope, etag, body, fetched_at_ms}`) through the same `sys.save` storage
 seam as the identity record and the spools.

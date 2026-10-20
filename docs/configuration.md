@@ -321,7 +321,8 @@ the `publishable_key` authenticates only the remote-config fetch.
   **`remote_config_enabled = true`** (default `false`), the client enables `fetch_remote_config(callback)` plus the typed getters
   (`remote_config_string/number/boolean/value/values/version`); fetching is
   always an explicit call (the SDK never fetches configuration on its own),
-  responses are cached in one durable per-app record, and getters serve the
+  responses and cached bodies require a wrapper with a keyed `values` object.
+  Responses are cached in one durable per-app record, and getters serve the
   last-known-good snapshot across restarts (the caller's default until any
   configuration is available). Every state uses `/config/v1/{workspace_key}/{environment_key}`.
   Granted consent permits the anonymous ID in `X-ShardPilot-Anonymous-Id`;
