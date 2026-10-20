@@ -769,6 +769,12 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 			-- decoders — the body scan restores its presence.
 			return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
 		end
+		local _, fields = facts.object(top_level_projection(body_text, "null"))
+		local revision_wire = fields and facts.integer(fields.served_revision, 0)
+		if not revision_wire or type(decoded.served_kill_gate) ~= "boolean"
+			or type(decoded.served_at) ~= "string" or decoded.served_at == "" then
+			return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
+		end
 		local boundary = type(decoded.boundary) == "table" and decoded.boundary or nil
 		local assignment_unit = boundary and boundary.assignment_unit or nil
 		if decoded.assigned == true
@@ -797,16 +803,8 @@ function M.apply(entry, response, now_ms, experiment_key, app_key, environment_k
 				return serve_entry_or_fail(entry, "malformed_response",
 					requested_attributes), { transient = true }
 			end
-			local _, fields = facts.object(top_level_projection(body_text, "null"))
-			if not fields then
-				return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
-			end
-			local has_pins = fields.served_revision or fields.served_kill_gate or fields.served_at
-			local version_wire = fields and facts.integer(fields.version, 1)
-			local revision_wire = fields and facts.integer(fields.served_revision, 0)
-			if has_pins and (not version_wire or not revision_wire
-				or type(decoded.served_kill_gate) ~= "boolean"
-				or type(decoded.served_at) ~= "string" or decoded.served_at == "") then
+			local version_wire = facts.integer(fields.version, 1)
+			if not version_wire then
 				return serve_entry_or_fail(entry, "malformed_response", requested_attributes), { transient = true }
 			end
 			if not enums.known_unit(assignment_unit) then
@@ -1198,8 +1196,8 @@ function M.new(config, deps)
 	-- the scope string STORED IN the marker — an identity record that
 	-- lost its subject field must not make the condemnation invisible
 	-- while spooled withdrawn facts await re-send. The condemnation
-	-- applies ONLY to the scope it was decided for (a legacy marker
-	-- without one condemns conservatively): another scope's record is
+	-- applies ONLY to the scope it was decided for; an unreadable marker
+	-- condemns conservatively. Another scope's record is
 	-- untouched, and the first tick settles such a stale marker. Entries
 	-- stamped strictly after the condemnation are a sibling's
 	-- post-sentinel authorized state and restore normally (the same
@@ -1236,7 +1234,7 @@ function M.new(config, deps)
 			ex:history_of(record.scope)
 			add_fact_keys(ex.fact_key_history, record.fact_key_history)
 			local record_condemned = (condemned_stamp ~= nil
-				and (condemned_scope == nil or condemned_scope == record.scope))
+				and condemned_scope == record.scope)
 				or condemned_miss == "unreadable"
 			for key, entry in pairs(record.entries) do
 				-- Memory's side of the retirement starts from the key the
@@ -1268,7 +1266,6 @@ function M.new(config, deps)
 					-- them; malformed age declarations remain refusals,
 					-- never a missing value beside an adult alias.
 					entry.attributes = sanitize_restored_attributes(entry.attributes)
-					entry.subject_key = entry.subject_key or subject
 					ex.entries[key] = entry
 
 				end
@@ -2641,8 +2638,8 @@ end
 -- the kill switch across the restart. Scope-gated like every other use of
 -- the marker: a STALE marker from a retired environment/credential/
 -- subject must not drop the current scope's valid facts at launch — it
--- settles through the normal retire path instead. A legacy marker without
--- a scope condemns conservatively (constructor parity). The old-scope
+-- settles through the normal retire path instead. An unreadable marker
+-- condemns conservatively (constructor parity). The old-scope
 -- facts corner — envelopes carry no scope, so facts spooled under the
 -- marker's own scope escape the load filter once the subject rotated —
 -- narrows to sentinel + failed rewrite + death + rotation-before-relaunch
@@ -2668,8 +2665,8 @@ function Experiments:condemnation_covers_current_scope()
 		-- NO provable current scope (the identity record lost its subject
 		-- field, or none was ever minted): the SDK cannot demonstrate the
 		-- marker stale, and envelopes carry no scope of their own — fail
-		-- CLOSED and condemn conservatively, exactly like the legacy
-		-- scope-less marker. After a sentinel + failed spool rewrite +
+		-- CLOSED and condemn conservatively, as for an unreadable marker.
+		-- After a sentinel + failed spool rewrite +
 		-- identity loss, the withdrawn keys must not replay just because
 		-- the comparator went blind; a later mint (a fresh subject = a
 		-- fresh scope) settles the stale marker through the normal retire

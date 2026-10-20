@@ -428,8 +428,12 @@ The public calls, verified against `shardpilot/sdk.lua`:
   and install not assigned. A future assignment-unit string also becomes
   `unknown` and installs not assigned, clearing the affected cache without
   creating an exposure; other boundary members remain available. Malformed
-  types and scope mismatches are still validated. Never treat a synchronous `true` as a resolved
-  assignment; branch on `result`. **One case produces no callback at all:** a
+  types and scope mismatches are still validated. Every `200` reply requires
+  `served_revision`, `served_kill_gate` and `served_at`; revision `0`, kill gate
+  `false` and the server's zero-time string are valid. Incomplete replies are
+  malformed. Cached assignments require these pins and a nonempty subject.
+  A numeric clear marker without a scope is unreadable; recovery fails closed.
+  Never treat a synchronous `true` as a resolved assignment; branch on `result`. **One case produces no callback at all:** a
   request still in flight when `shutdown()` succeeds is cancelled and never
   calls back, by design — so do not park state that only a callback can
   release across a shutdown.
@@ -459,8 +463,8 @@ The public calls, verified against `shardpilot/sdk.lua`:
   Fetches, getters, restores, session changes and consent re-grants record
   nothing. Deduplication is per experiment, version, subject and session.
   The call pins the served inputs and queues work; it performs no network I/O.
-  Returns `variant, err` or `nil, err`. Missing serving pins or a missing fact
-  key still return the variant, with `serving_pins_missing` or
+  Returns `variant, err` or `nil, err`. Corrupted in-memory serving pins or a
+  missing fact key still return the variant, with `serving_pins_missing` or
   `exposure_no_subject_fact_key`; neither records a fact. Other failures are
   `not_initialized`, `shutdown`, `experiments_not_configured`,
   `experiment_key_required`, `no_assignment`, `consent_unknown`,

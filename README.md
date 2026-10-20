@@ -1610,10 +1610,13 @@ game has to handle specially.
   can use the existing durable spool. `shutdown()` tries the network within its
   existing deadline, but an offline exit can lose unsealed records. A denial
   purges both stages and clears the last application; a re-grant requires a
-  fresh explicit application. A legacy cache entry without serving pins keeps
-  serving but returns `serving_pins_missing` when applied, recording nothing
-  until a fetch re-serves it. An entry without a server fact key likewise
-  serves with `exposure_no_subject_fact_key`. Both skips are diagnosed.
+  fresh explicit application. Assignment replies require serving revision,
+  kill-gate and timestamp fields, including not-assigned replies. Revision `0`,
+  kill gate `false` and the server's zero-time string are valid. Cached entries
+  require those pins and a nonempty subject; incomplete entries cannot restore.
+  A numeric clear marker without a scope is unreadable and recovery fails closed.
+  Corrupted in-memory pins return `serving_pins_missing` on application; a missing
+  server fact key returns `exposure_no_subject_fact_key`. Neither records a fact.
 
 
 ## Crash wire contract

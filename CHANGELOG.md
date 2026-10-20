@@ -2,6 +2,9 @@
 
 ### Unreleased
 
+- Assignment replies and cached entries require complete serving pins; revision zero and a false kill gate remain valid.
+- Removed subject backfill for cached assignments and scope-less numeric clear-marker handling; incomplete caches are dropped and unreadable markers fail closed.
+
 - Removed identifier upgrade fixtures and notes; current admission and receipt-write bounds remain shared.
 
 - Pending crash replay requires encoded bodies and their original token, timestamp and fatal marker.
