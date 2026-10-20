@@ -637,12 +637,9 @@ Here `ignored` refers to the unrecognized input, which is replaced by the
 fallback. A blank string means detection; whitespace-only input is reported
 as unrecognized. Known configured values remain silent.
 
-**Stored envelopes are normalized at load.** Every present platform is folded
-or replaced by `other`; historically absent fields remain absent. Unknown
-stored values retain the aggregate diagnostic
-`{ scope = "spool", status = "ignored", code = "platform_unmapped", count = N }`.
-`event_id` and `event_ts` remain unchanged. Source is `client` by default and
-country is omitted; platform normalization changes neither.
+**Stored envelopes retain their platform at replay.** The current client chooses
+the canonical value when building each envelope. Replay preserves that value,
+`event_id` and `event_ts`. Source is `client` by default and country is omitted.
 
 Crash reports and the consent-policy request use the same twelve values and
 the same folding. See `docs/crash.md`.

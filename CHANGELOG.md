@@ -2,6 +2,8 @@
 
 ### Unreleased
 
+- Removed replay-time platform conversion; stored envelopes retain the platform chosen when they were built.
+
 - Removed spool event-name conversions and the obsolete wire-name stamp. Replay preserves stored event names.
 
 - A later `adult` declaration fences the experiment's older fetches: an older

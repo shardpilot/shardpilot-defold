@@ -1817,28 +1817,6 @@ local function construct(config, normalized)
 				})
 			end
 		end
-		-- Normalize every present stored platform before replay. Unknown values use
-		-- the fallback and retain their diagnostic count. Absent historical fields,
-		-- event IDs and timestamps remain unchanged.
-		local unfoldable = 0
-		for i = 1, #spooled do
-			local raw = spooled[i].platform
-			if raw ~= nil then
-				local folded = envelope_platform.normalize(raw)
-				spooled[i].platform = folded or "other"
-				if not folded then
-					unfoldable = unfoldable + 1
-				end
-			end
-		end
-		if unfoldable > 0 then
-			client:diagnose({
-				scope = "spool",
-				status = "ignored",
-				code = "platform_unmapped",
-				count = unfoldable,
-			})
-		end
 		local condemned = 0
 		local condemnation_covers = false
 		local condemnation_stamp_iso = nil
