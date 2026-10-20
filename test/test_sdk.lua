@@ -14465,20 +14465,19 @@ end)()
 				assert_true(storage.save(identity_scope, {
 					anonymous_id = "synthetic-vocabulary-actor", consent_analytics = "granted",
 				}))
-				local event_id, event_ts = "synthetic-vocabulary-event", "2026-01-01T00:00:00Z"
-				if restored then
-					local eligible = {
-						event_id = event_id, event_ts = event_ts, event_name = "app.session_started",
-						anonymous_id = "synthetic-vocabulary-actor", source = "client", platform = row.platform,
-					}
-					require("shardpilot.analytics_retry").start(eligible)
-					assert_true(storage.save_spool(spool_scope, { eligible }, 500, 262144) ~= nil)
-				end
-				local client = assert(sdk.new(config_mode_a({
+				local options = config_mode_a({
 					ingest_url = "https://ingest.example.invalid", platform = row.platform,
 					flush_interval_seconds = 9999,
-				})))
-				if not restored then assert_true(client:session_start()) end
+				})
+				local client = assert(sdk.new(options))
+				assert_true(client:session_start())
+				local event_id, event_ts = client.queue.items[1].event_id, client.queue.items[1].event_ts
+				if restored then
+					assert_true(client:persist(), "current client writes the replay fixture")
+					client:finish_teardown()
+					storage.reset()
+					client = assert(sdk.new(options))
+				end
 				assert_true(client:flush())
 				assert_equal(#requests, 1, "real publisher called once")
 				assert_equal(requests[1].method, "POST", "real publisher method")
