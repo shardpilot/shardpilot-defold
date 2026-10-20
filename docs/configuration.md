@@ -94,10 +94,8 @@ record and in every retained consent receipt (`actor_identifier` plus the
 decision-time `anonymous_id` snapshot), and the clamp keeps those records far
 under Defold's ~512 KB save-file record cap even at the consent outbox's
 32-receipt worst case — while staying generous for legitimate identifiers
-(UUIDs, emails, opaque backend tokens). Records persisted before the bound
-existed self-heal at load: an oversized stored anonymous ID is replaced by a
-fresh one, and outbox receipts carrying oversized identifiers are dropped by
-the load-time sanitizer like any other malformed entry.
+(UUIDs, emails, opaque backend tokens). The same bound is checked before
+consent receipts are persisted.
 
 Anonymous-ID setters and nonempty configured overrides also reject CR, LF, NUL,
 other ASCII control bytes (including DEL), and leading or trailing spaces or

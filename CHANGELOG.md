@@ -2,6 +2,8 @@
 
 ### Unreleased
 
+- Removed identifier upgrade fixtures and notes; current admission and receipt-write bounds remain shared.
+
 - Pending crash replay requires encoded bodies and their original token, timestamp and fatal marker.
 - Removed replay conversion from root `source` to `component`; retries preserve the exact encoded report body.
 

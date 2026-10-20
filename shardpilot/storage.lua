@@ -1097,19 +1097,9 @@ local max_consent_outbox_entries = 32
 -- the SAME cap this store enforces, from one definition.
 M.max_consent_outbox_entries = max_consent_outbox_entries
 
--- Shared byte budget for host-supplied identifiers, exported so the client's
--- acceptance gate (valid_identity in client.lua) and this sanitizer enforce
--- the SAME bound from one definition. Receipts persist identifiers verbatim
--- and this record has no other byte budget, so the clamp is what keeps the
--- 32-entry worst case far under the engine's save-record cap. Enforcing it
--- here as well covers records written BEFORE the clamp existed: a legacy
--- receipt carrying a near-cap identifier reloads verbatim, and the next
--- decision's rewrite (old entries + new receipt) could exceed the save cap
--- again — a write this store deliberately never resolves by eviction — and
--- re-wedge shutdown() in consent_pending. Such an entry is dropped at
--- sanitize like any other malformed one: it can never be durably rewritten
--- alongside new decisions, and one bad record on disk must never block the
--- deliverable rest.
+-- Shared byte budget for client identity admission and consent-receipt writes.
+-- Receipts persist identifiers verbatim; this bound keeps the 32-entry worst
+-- case well below the engine's save-record cap.
 M.max_identifier_bytes = 512
 
 local function valid_receipt_field(value)
