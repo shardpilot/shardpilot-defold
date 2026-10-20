@@ -1945,16 +1945,15 @@ local function sanitize_experiment_entries(entries)
 			and type(entry.assignment_key) == "string" and entry.assignment_key ~= ""
 			and type(entry.variant_key) == "string" and entry.variant_key ~= ""
 			and valid_wire_version(entry.version)
-			and ((entry.served_revision_wire == nil and entry.served_kill_gate == nil and entry.served_at == nil)
-				or (experiment_facts.integer(entry.version_wire, 1)
-					and tonumber(entry.version_wire) == entry.version
-					and experiment_facts.integer(entry.served_revision_wire, 0)
-					and type(entry.served_kill_gate) == "boolean"
-					and type(entry.served_at) == "string" and entry.served_at ~= ""))
+			and experiment_facts.integer(entry.version_wire, 1)
+			and tonumber(entry.version_wire) == entry.version
+			and experiment_facts.integer(entry.served_revision_wire, 0)
+			and type(entry.served_kill_gate) == "boolean"
+			and type(entry.served_at) == "string" and entry.served_at ~= ""
 			and experiment_enums.known_unit(entry.assignment_unit)
 			and (entry.assignment_unit ~= "client_id"
 				or valid_subject_fact_key(entry.subject_fact_key))
-			and (entry.subject_key == nil or type(entry.subject_key) == "string")
+			and type(entry.subject_key) == "string" and entry.subject_key ~= ""
 			and type(entry.fetched_at_ms) == "number" then
 			out[key] = {
 				assignment_key = entry.assignment_key,
@@ -2242,7 +2241,7 @@ local function write_experiment_marker(config, stamp, clear_scope, declarations)
 	return true
 end
 
--- The fourth result is independent of the legacy whole-record clear. A
+-- The fourth result is independent of the whole-record clear. A
 -- declaration-only record has no global condemnation stamp. An invalid new
 -- section is unknown, not permission to restore its covered assignments.
 function M.load_experiments_clear(config)
@@ -2252,6 +2251,7 @@ function M.load_experiments_clear(config)
 	if not declarations then return nil, nil, "unreadable", {} end
 	local stamp = type(record.stamp) == "number" and record.stamp or nil
 	local clear_scope = stamp ~= nil and type(record.scope) == "string" and record.scope ~= "" and record.scope or nil
+	if stamp ~= nil and clear_scope == nil then return nil, nil, "unreadable", {} end
 	return stamp, clear_scope, nil, declarations
 end
 

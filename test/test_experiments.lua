@@ -409,9 +409,21 @@ function extra_tests.external_assignment(client, key, overrides)
 	assert_true(storage.save_experiments(cfg, record))
 end
 
+-- Stamp retained payload fixtures without re-encoding their tested JSON tokens.
+function extra_tests.served_body(body)
+	local opening = body:find("{", 1, true)
+	assert(opening and body:sub(1, opening - 1):match("^%s*$"))
+	local tail = body:sub(opening + 1)
+	local comma = tail:match("^%s*}") and "" or ","
+	return body:sub(1, opening)
+		.. '"served_revision":7,"served_kill_gate":false,"served_at":"1970-01-01T00:16:40Z"'
+		.. comma .. tail
+end
+
 local function not_assigned_body(reason)
 	local out = {
 		version = 3,
+		served_revision = 7, served_kill_gate = false, served_at = "1970-01-01T00:16:40Z",
 		assigned = false,
 		boundary = { assignment_unit = "client_id" },
 	}
@@ -1837,14 +1849,14 @@ local function test_missing_fact_key_skips_facts_and_subject_never_egresses()
 	-- subject-fact key): the assignment applies locally, but NO fact may be
 	-- emitted — the SDK-minted subject id never rides the analytics plane
 	-- and there is no server-safe key to send instead.
-	next_response_body = json.encode({
+	next_response_body = extra_tests.served_body(json.encode({
 		version = 3,
 		assigned = true,
 		assignment_key = fixture_assignment_key,
 		variant_key = "treatment",
 		variant_payload = { color = "blue" },
 		boundary = { assignment_unit = "synthetic_subject_key" },
-	})
+	}))
 	local result = fetch(client, "exp-checkout")
 	assert_true(result.ok and result.assigned)
 	assert_equal(client:experiment_variant("exp-checkout"), "treatment",
@@ -3310,12 +3322,12 @@ local function test_non_string_reason_is_malformed()
 
 	-- A PRESENT but non-string reason must not coerce into the "absent"
 	-- vocabulary entry and execute a drop: malformed serve-stale.
-	next_response_body = json.encode({
+	next_response_body = extra_tests.served_body(json.encode({
 		version = 3,
 		assigned = false,
 		reason = 123,
 		boundary = { assignment_unit = "client_id" },
-	})
+	}))
 	local result = fetch(client, "exp-checkout")
 	assert_true(result.ok and result.from_cache)
 	assert_equal(result.error, "malformed_response")
@@ -3454,14 +3466,14 @@ local function test_non_string_scope_echo_is_malformed()
 
 	-- A PRESENT but non-string scope echo must never "agree with the
 	-- request" by type accident: malformed serve-stale.
-	next_response_body = json.encode({
+	next_response_body = extra_tests.served_body(json.encode({
 		experiment_key = 123,
 		version = 9,
 		assigned = true,
 		assignment_key = "asgn_" .. string.rep("d", 32),
 		variant_key = "beta",
 		boundary = { assignment_unit = "client_id" },
-	})
+	}))
 	local result = fetch(client, "exp-checkout")
 	assert_true(result.ok and result.from_cache)
 	assert_equal(result.error, "malformed_response")
@@ -6033,7 +6045,7 @@ local function test_client_id_assignment_requires_fact_key()
 	-- users in a variant with zero exposure reporting. The key is
 	-- REQUIRED for client_id units: the response is malformed, nothing
 	-- installs, the cached assignment serves stale.
-	next_response_body = json.encode({
+	next_response_body = extra_tests.served_body(json.encode({
 		app_key = "app-test",
 		environment_key = "develop",
 		experiment_key = "exp-checkout",
@@ -6042,7 +6054,7 @@ local function test_client_id_assignment_requires_fact_key()
 		assignment_key = fixture_assignment_key,
 		variant_key = "keyless-variant",
 		boundary = { assignment_unit = "client_id" },
-	})
+	}))
 	local result = fetch(client, "exp-checkout")
 	assert_true(result.ok and result.from_cache,
 		"the keyless client_id answer serves stale, never installs")
@@ -6069,8 +6081,8 @@ local function test_present_null_reason_is_malformed()
 	-- absent traffic-gate miss: the raw-body presence scan must read it
 	-- as present-and-invalid — malformed serve-stale, never a drop
 	-- directive the client cannot distinguish.
-	next_response_body = '{"assigned":false,"reason":null,"version":3,'
-		.. '"boundary":{"assignment_unit":"client_id"}}'
+	next_response_body = extra_tests.served_body('{"assigned":false,"reason":null,"version":3,'
+		.. '"boundary":{"assignment_unit":"client_id"}}')
 	local result = fetch(client, "exp-checkout")
 	assert_true(result.ok and result.from_cache,
 		"a present-null reason is malformed and serves stale")
@@ -6078,11 +6090,11 @@ local function test_present_null_reason_is_malformed()
 		"the cached assignment survives the null-reason answer")
 
 	-- A present-null scope echo is the same class: present and wrong.
-	next_response_body = '{"assigned":true,"app_key":null,'
+	next_response_body = extra_tests.served_body('{"assigned":true,"app_key":null,'
 		.. '"assignment_key":"' .. fixture_assignment_key .. '",'
 		.. '"variant_key":"null-echo-variant","version":5,'
 		.. '"subject_fact_key":"' .. fixture_subject_fact_key .. '",'
-		.. '"boundary":{"assignment_unit":"client_id"}}'
+		.. '"boundary":{"assignment_unit":"client_id"}}')
 	local echoed = fetch(client, "exp-checkout")
 	assert_true(echoed.ok and echoed.from_cache,
 		"a present-null scope echo is malformed")
@@ -6261,23 +6273,23 @@ function extra_tests.test_nested_null_never_reads_as_scope_echo()
 	-- A legitimate variant payload carrying a NESTED "app_key": null must
 	-- not trip the top-level null-presence scan: the projection strips
 	-- everything below the root object before the pattern runs.
-	next_response_body = '{"assigned":true,"experiment_key":"exp-checkout",'
+	next_response_body = extra_tests.served_body('{"assigned":true,"experiment_key":"exp-checkout",'
 		.. '"assignment_key":"' .. fixture_assignment_key .. '",'
 		.. '"variant_key":"treatment","version":3,'
 		.. '"subject_fact_key":"' .. fixture_subject_fact_key .. '",'
 		.. '"variant_payload":{"app_key":null,"color":"blue"},'
-		.. '"boundary":{"assignment_unit":"client_id"}}'
+		.. '"boundary":{"assignment_unit":"client_id"}}')
 	local result = fetch(client, "exp-checkout")
 	assert_true(result.ok and result.assigned and not result.from_cache,
 		"a nested null inside the payload never reads as a scope echo")
 	assert_equal(client:experiment_variant("exp-checkout"), "treatment")
 
 	-- A REAL top-level present-null echo stays malformed.
-	next_response_body = '{"assigned":true,"app_key":null,'
+	next_response_body = extra_tests.served_body('{"assigned":true,"app_key":null,'
 		.. '"assignment_key":"' .. fixture_assignment_key .. '",'
 		.. '"variant_key":"null-echo","version":4,'
 		.. '"subject_fact_key":"' .. fixture_subject_fact_key .. '",'
-		.. '"boundary":{"assignment_unit":"client_id"}}'
+		.. '"boundary":{"assignment_unit":"client_id"}}')
 	local echoed = fetch(client, "exp-checkout")
 	assert_true(echoed.ok and echoed.from_cache,
 		"a top-level present-null echo is still malformed")
@@ -6650,6 +6662,10 @@ function extra_tests.test_shadow_never_masks_unreadable_record()
 				variant_key = "treatment-b",
 				variant_payload = held_entry.variant_payload,
 				version = held_entry.version,
+				version_wire = held_entry.version_wire,
+				served_revision_wire = held_entry.served_revision_wire,
+				served_kill_gate = held_entry.served_kill_gate,
+				served_at = held_entry.served_at,
 				assignment_unit = held_entry.assignment_unit,
 				subject_fact_key = held_entry.subject_fact_key,
 				subject_key = held_entry.subject_key,
@@ -6805,12 +6821,12 @@ function extra_tests.test_invalid_wire_version_is_malformed()
 	-- garbled answer: it must never execute the not-assigned path's
 	-- authoritative durable drop (the closed-vocabulary rule, applied to
 	-- the version field).
-	next_response_body = json.encode({
+	next_response_body = extra_tests.served_body(json.encode({
 		version = -3,
 		assigned = false,
 		reason = "kill_switch",
 		boundary = { assignment_unit = "client_id" },
-	})
+	}))
 	local result = fetch(client, "exp-checkout")
 	assert_true(result.ok and result.from_cache,
 		"a negative-version not-assigned is malformed, never a drop")
@@ -6991,9 +7007,9 @@ function extra_tests.test_null_not_assigned_version_is_malformed()
 	-- On null→nil decoders a PRESENT-NULL version is indistinguishable
 	-- from absent without the raw-body scan: it must read as malformed,
 	-- never as the authoritative drop path.
-	next_response_body = '{"assigned":false,"version":null,'
+	next_response_body = extra_tests.served_body('{"assigned":false,"version":null,'
 		.. '"reason":"kill_switch",'
-		.. '"boundary":{"assignment_unit":"client_id"}}'
+		.. '"boundary":{"assignment_unit":"client_id"}}')
 	local result = fetch(client, "exp-checkout")
 	assert_true(result.ok and result.from_cache,
 		"a present-null version is malformed, never a drop")
@@ -7350,8 +7366,8 @@ function extra_tests.test_escaped_null_presence_keys_are_malformed()
 	-- the decoder still yields reason == nil for a present null, but a
 	-- literal raw-body scan misses the escaped spelling — the present-null
 	-- must not slip to the ABSENT path's authoritative drop.
-	next_response_body = '{"assigned":false,"r\\u0065ason":null,'
-		.. '"boundary":{"assignment_unit":"client_id"}}'
+	next_response_body = extra_tests.served_body('{"assigned":false,"r\\u0065ason":null,'
+		.. '"boundary":{"assignment_unit":"client_id"}}')
 	local result = fetch(client, "exp-checkout")
 	assert_true(result.ok and result.from_cache,
 		"an escaped present-null reason is malformed, never the absent drop")
@@ -7359,9 +7375,9 @@ function extra_tests.test_escaped_null_presence_keys_are_malformed()
 		"the cached assignment survives the escaped-reason null")
 
 	-- The same class through the version scan.
-	next_response_body = '{"assigned":false,"v\\u0065rsion":null,'
+	next_response_body = extra_tests.served_body('{"assigned":false,"v\\u0065rsion":null,'
 		.. '"reason":"kill_switch",'
-		.. '"boundary":{"assignment_unit":"client_id"}}'
+		.. '"boundary":{"assignment_unit":"client_id"}}')
 	result = fetch(client, "exp-checkout")
 	assert_true(result.ok and result.from_cache,
 		"an escaped present-null version is malformed, never a drop")
@@ -8801,58 +8817,6 @@ function extra_tests.test_age_readmission_kill_capture_keeps_fresh_id()
 	storage.reset()
 end
 
-function extra_tests.test_age_refusal_withdraws_restored_entry_without_subject_key()
-	local first, restore = extra_tests.age_client()
-	extra_tests.admit(first)
-	-- A cached entry stored without its subject key (an older record):
-	-- sanitization keeps it, and the constructor restores it under the
-	-- record's scoped subject.
-	local record = storage.load_experiments(first.config)
-	record.entries["exposure-banner"].subject_key = nil
-	assert_true(storage.save_experiments(first.config, record))
-	storage.reset() -- SIMULATED PROCESS DEATH
-	local second = assert(sdk.new(config({ app_key = "exposure-app" })))
-	assert_equal(second:apply_experiment_variant("exposure-banner"), "control")
-	local owed = second.experiments.pending_exposure["exposure-banner"]
-	assert_true(owed ~= nil and #owed == 1, "the restore owes the exposure")
-	assert_equal(owed[1].entry.subject_key, second.experiments:current_subject_id(), "restore fills the scoped subject before application")
-
-	extra_tests.refuse(second, "age_ineligible")
-	assert_nil(second.experiments.pending_exposure["exposure-banner"], "the refusal withdrew the restored exposure")
-	local from = #requests
-	assert_true(second:session_start())
-	second:update(0.016)
-	assert_true(second:flush({ include_summaries = false }))
-	second:update(0.016)
-	second:flush({ include_summaries = false })
-	local exposures, outcomes = extra_tests.delivered_facts(from, "exposure-banner")
-	assert_equal(exposures + outcomes, 0, "the refused exposure is never delivered")
-	second:shutdown()
-	restore()
-	storage.reset()
-
-	-- A later admission replaced the restored entry while both exposures
-	-- are owed (full queue): the restored snapshot still carries the refused
-	-- subject's fact key.
-	first, restore = extra_tests.age_client()
-	extra_tests.admit(first)
-	record = storage.load_experiments(first.config)
-	record.entries["exposure-banner"].subject_key = nil
-	assert_true(storage.save_experiments(first.config, record))
-	storage.reset() -- SIMULATED PROCESS DEATH
-	second = assert(sdk.new(config({ app_key = "exposure-app", buffer_size = 1 })))
-	assert_true(second:track("filler-host-event"))
-	assert_equal(second:apply_experiment_variant("exposure-banner"), "control")
-	extra_tests.admit(second)
-	assert_true(second:track_exposure("exposure-banner"))
-	owed = second.experiments.pending_exposure["exposure-banner"]
-	assert_true(owed ~= nil and #owed == 2 and owed[1].entry.subject_key == nil, "both applications are owed")
-	extra_tests.refuse(second, "age_ineligible")
-	assert_nil(second.experiments.pending_exposure["exposure-banner"], "the refusal withdrew both")
-	second:shutdown()
-	restore()
-	storage.reset()
-end
 
 -- ── the fact-key history ─────────────────────────────────────────────────────
 --
@@ -9117,6 +9081,10 @@ function extra_tests.pre_history_record()
 					limit = 5,
 				},
 				version = 3,
+				version_wire = "3",
+				served_revision_wire = "7",
+				served_kill_gate = false,
+				served_at = "1970-01-01T00:16:40Z",
 			},
 		},
 		scope = "workspace-test\31develop\31spcid_" .. string.rep("e", 32)
@@ -11764,7 +11732,7 @@ function extra_tests.test_signed_apply_late_seal_cannot_restore_withdrawn_record
 	end
 end
 
-function extra_tests.test_signed_apply_legacy_and_corrupt_serving_pins()
+function extra_tests.test_signed_apply_corrupt_serving_pins()
 	local client = extra_tests.application_client()
 	local entry = client.experiments.entries["exp-checkout"]
 	entry.served_revision_wire, entry.served_kill_gate, entry.served_at = nil, nil, nil
@@ -11896,8 +11864,8 @@ function extra_tests.test_apply_returned_key_is_durable_before_forwarding()
 	storage.reset()
 	local second = assert(sdk.new(config()))
 	next_status = 200
-	next_response_body = json.encode({ assigned = false, version = 3, reason = "age_ineligible",
-		subject_fact_key = fixture_subject_fact_key, boundary = { assignment_unit = "client_id" } })
+	next_response_body = extra_tests.served_body(json.encode({ assigned = false, version = 3, reason = "age_ineligible",
+		subject_fact_key = fixture_subject_fact_key, boundary = { assignment_unit = "client_id" } }))
 	assert_true(fetch(second, "exp-checkout", { age_band = "under_threshold" }).ok)
 	local from = #requests
 	advance_seconds(60)
@@ -13331,7 +13299,100 @@ function extra_tests.test_new_withdrawal_cancels_a_spent_clear_retry()
 	assert_true(spent, "the newer debt clears after its own rewrite lands")
 end
 
+-- Current assignment records keep their subject and complete serving stamp.
+function extra_tests.test_current_record_requires_subject_and_pins()
+	local client, restore = extra_tests.age_client()
+	extra_tests.admit(client)
+	local record = assert(storage.load_experiments(client.config))
+	local entry = record.entries["exposure-banner"]
+	assert_true(entry ~= nil and type(entry.subject_key) == "string")
+	for _, field in ipairs({ "subject_key", "served_revision_wire", "served_kill_gate", "served_at" }) do
+		local previous = entry[field]
+		assert_true(previous ~= nil, "current writer supplies " .. field)
+		entry[field] = nil
+		assert_true(storage.save_experiments(client.config, record))
+		assert_nil(storage.load_experiments(client.config).entries["exposure-banner"], "incomplete " .. field .. " is dropped")
+		entry[field] = previous
+		assert_true(storage.save_experiments(client.config, record))
+		assert_true(storage.load_experiments(client.config).entries["exposure-banner"] ~= nil, "complete sibling remains readable")
+	end
+	local revision, gate, at = entry.served_revision_wire, entry.served_kill_gate, entry.served_at
+	entry.served_revision_wire, entry.served_kill_gate, entry.served_at = nil, nil, nil
+	assert_true(storage.save_experiments(client.config, record))
+	assert_nil(storage.load_experiments(client.config).entries["exposure-banner"], "serving stamp is required")
+	entry.served_revision_wire, entry.served_kill_gate, entry.served_at = revision, gate, at
+	assert_true(storage.save_experiments(client.config, record))
+	client:finish_teardown(); restore(); storage.reset()
+end
+
+function extra_tests.test_scope_less_clear_marker_is_unreadable()
+	local client, restore = extra_tests.age_client()
+	extra_tests.admit(client)
+	assert_true(storage.load_experiments(client.config).entries["exposure-banner"] ~= nil)
+	local scope = client.experiments:scope_for(client.experiments:current_subject_id())
+	local stamp = require("shardpilot.clock").unix_ms()
+	local path, real_get = nil, sys.get_save_file
+	sys.get_save_file = function(ns, name)
+		local value = real_get(ns, name)
+		if name == "experiments-clear" then path = value end
+		return value
+	end
+	assert_true(storage.save_experiments_clear(client.config, stamp, scope))
+	sys.get_save_file = real_get
+	local current_stamp, current_scope, miss = storage.load_experiments_clear(client.config)
+	assert_equal(current_stamp, stamp); assert_equal(current_scope, scope); assert_nil(miss)
+	assert_true(path ~= nil)
+	for _, form in ipairs({ "missing", "empty" }) do
+		local record = { stamp = stamp, scope = scope }
+		if form == "missing" then record.scope = nil else record.scope = "" end
+		assert_true(sys.save(path, record)); storage.reset()
+		local loaded_stamp, loaded_scope, err = storage.load_experiments_clear(client.config)
+		assert_nil(loaded_stamp, "scope-less marker has no usable stamp")
+		assert_nil(loaded_scope); assert_equal(err, "unreadable")
+	end
+	client:finish_teardown(); storage.reset()
+	local restarted = assert(sdk.new(config({ app_key = "exposure-app" })))
+	assert_nil(restarted.experiments.entries["exposure-banner"], "unknown condemnation refuses cached serving")
+	assert_equal(restarted.experiments.durable_clear_pending, true)
+	assert_true(restarted.experiments.clear_marker.unreadable)
+	restarted:finish_teardown(); restore(); storage.reset()
+end
+
+function extra_tests.test_serving_pins_required_for_responses()
+	for _, assigned in ipairs({ true, false }) do
+		local data = json.decode(assignment_body({ assigned = assigned,
+			served_revision = 0, served_kill_gate = false, served_at = "0001-01-01T00:00:00Z" }))
+		local result, outcome = experiments.apply(nil, { status = 200, response = json.encode(data) },
+			1000, "exp-checkout", "app-test", "develop")
+		assert_true(result.ok); assert_equal(result.assigned, assigned)
+		if assigned then
+			assert_equal(outcome.new_entry.served_revision_wire, "0")
+			assert_equal(outcome.new_entry.served_kill_gate, false)
+			assert_equal(outcome.new_entry.served_at, data.served_at)
+		end
+		local revision, gate, at = data.served_revision, data.served_kill_gate, data.served_at
+		data.served_revision, data.served_kill_gate, data.served_at = nil, nil, nil
+		local absent = experiments.apply(nil, { status = 200, response = json.encode(data) },
+			1000, "exp-checkout", "app-test", "develop")
+		assert_equal(absent.ok, false, "serving stamp is required on every 200")
+		assert_equal(absent.error, "malformed_response")
+		data.served_revision, data.served_kill_gate, data.served_at = revision, gate, at
+		for _, field in ipairs({ "served_revision", "served_kill_gate", "served_at" }) do
+			local previous = data[field]; data[field] = nil
+			result, outcome = experiments.apply(nil, { status = 200, response = json.encode(data) },
+				1000, "exp-checkout", "app-test", "develop")
+			assert_equal(result.ok, false, "missing " .. field .. " is malformed")
+			assert_equal(result.error, "malformed_response")
+			assert_true(not outcome.authoritative and not outcome.new_entry)
+			data[field] = previous
+		end
+	end
+end
+
 local tests = {
+	extra_tests.test_current_record_requires_subject_and_pins,
+	extra_tests.test_scope_less_clear_marker_is_unreadable,
+	extra_tests.test_serving_pins_required_for_responses,
 	extra_tests.test_deadline_only_rewrite_retries_after_storage_recovers,
 	extra_tests.test_new_withdrawal_cancels_a_spent_clear_retry,
 	extra_tests.test_withdrawal_debt_clear_retries_after_spool_purge,
@@ -13379,7 +13440,7 @@ local tests = {
 	extra_tests.test_sealed_response_open_keeps_its_refusals,
 	extra_tests.test_sealed_additive_members_reach_the_wire,
 	extra_tests.test_sealed_answer_naming_the_subject_is_not_forwarded,
-	extra_tests.test_signed_apply_legacy_and_corrupt_serving_pins,
+	extra_tests.test_signed_apply_corrupt_serving_pins,
 	extra_tests.test_signed_apply_int64_pins_survive_both_hops,
 	extra_tests.test_signed_apply_persist_never_starts_apply,
 	extra_tests.test_signed_apply_apply_auth_latch_resumes_on_new_fetch,
@@ -13423,7 +13484,6 @@ local tests = {
 	extra_tests.test_age_refusal_without_known_key_spares_other_subject,
 	extra_tests.test_age_readmission_exposure_survives_withdrawn_batch_ack,
 	extra_tests.test_age_readmission_kill_capture_keeps_fresh_id,
-	extra_tests.test_age_refusal_withdraws_restored_entry_without_subject_key,
 	extra_tests.test_age_refusal_withdraws_republished_facts_in_process,
 	extra_tests.test_age_refusal_withdraws_republished_facts_after_relaunch,
 	extra_tests.test_fact_key_history_prunes_after_the_last_fact,
@@ -13802,7 +13862,7 @@ print("shardpilot defold experiments tests passed")
  scene("unknown unit on not-assigned does not become age withdrawal",function()
   local c=granted_client();seed(c);c:apply_experiment_variant("exp-checkout")
   local owed=c.experiments.pending_exposure["exp-checkout"][1]
-  local r=get(c,json.encode({assigned=false,reason="age_ineligible",version=3,boundary={assignment_unit="future_unit"}}))
+  local r=get(c,extra_tests.served_body(json.encode({assigned=false,reason="age_ineligible",version=3,boundary={assignment_unit="future_unit"}})))
   assert_equal(r.reason,"unknown");assert_equal(r.boundary.assignment_unit,"unknown");assert_nil(c:experiment_variant("exp-checkout"))
   assert_equal(c.experiments.pending_exposure["exp-checkout"][1],owed)
  end)
