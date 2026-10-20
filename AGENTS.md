@@ -25,3 +25,4 @@
 - System-information probes must request ignore_secure; preserve protected fallbacks.
 - Retry spent withdrawal-debt clears after purge; new debt cancels old clear authority.
 - Failed deadline-only spool rewrites stay owed at flush, persist and shutdown.
+- Drive boot-diagnostic reentrancy cases with current records and configuration warnings.

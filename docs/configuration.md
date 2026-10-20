@@ -123,6 +123,8 @@ applications must supply valid UTF-8 when exact distinctions matter.
 This rule excludes envelope identity: actor, session, event and
 workspace/app/environment identifiers are never rewritten by UTF-8 repair, since changing identity could
 change attribution or move consent. Their existing validation remains in force.
+Spool replay preserves the event names written by the current client.
+
 Previously persisted envelopes/consent are not migrated or repaired, and crash
 and remote-config paths are outside this change. The rule therefore does not
 guarantee UTF-8 validity for every SDK request or repair an old corrupted identity.
