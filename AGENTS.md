@@ -27,3 +27,4 @@
 - Failed deadline-only spool rewrites stay owed at flush, persist and shutdown.
 - Drive boot-diagnostic reentrancy cases with current records and configuration warnings.
 - Build platform-replay fixtures through the current client persistence path.
+- Build crash replay fixtures through capture; keep fresh encoding failures settled.

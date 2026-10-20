@@ -314,87 +314,32 @@ local function approx_record_bytes(record)
 	return total
 end
 
--- The byte cost one pending entry charges against the caps: the exact
--- encoded-body length for a body entry, the string-scalar estimate for a
--- legacy prepared-report entry.
+-- Pending entries carry an already-encoded body, whose exact bytes count toward caps.
 local function pending_entry_bytes(entry)
-	if type(entry.body) == "string" then
-		return #entry.body
-	end
-	return approx_record_bytes(entry.report)
+	return #entry.body
 end
 
--- Normalize a stored items list to the wrapped
--- { token, body|report, crash_id?, fatal, created_at } shape and apply the
--- retention TTL. Returns (out, changed):
---   * The CURRENT shape stores the exact encoded wire body (`body`, a JSON
---     string) plus its `crash_id` and a `fatal` flag. An entry written by an
---     older build — a bare prepared report with no wrapper, or a wrapper
---     carrying a prepared `report` table — is adopted as-is (the resend path
---     encodes a legacy report once at dispatch) with a freshly minted token
---     (when absent), the current created-at stamp, and fatal=true (legacy
---     entries were dump-sourced fatal crashes), so it stays individually
---     addressable and TTL-bounded. `changed` is set so the caller writes the
---     adopted entry back — otherwise a later read would mint a DIFFERENT
---     token and remove_pending_crash could never match it (an endless
---     resend).
---   * An entry whose created_at is older than the TTL is discarded (a stale
---     retry); `changed` is set so the pruned list is written back.
+-- Keep complete current records and prune unreadable entries or expired retries.
 local function normalize_items(items, current_ms)
 	if type(items) ~= "table" then
 		return {}, false
 	end
-	local out = {}
-	local changed = false
+	local out, changed = {}, false
 	for i = 1, #items do
 		local entry = items[i]
-		if type(entry) == "table" then
-			local body, crash_id, report, token, created_at, fatal
-			if type(entry.body) == "string" and entry.body ~= "" then
-				body = entry.body
-				crash_id = type(entry.crash_id) == "string" and entry.crash_id or nil
-				token = entry.token
-				created_at = entry.created_at
-				fatal = entry.fatal
-			elseif type(entry.report) == "table" then
-				report = entry.report
-				token = entry.token
-				created_at = entry.created_at
-				fatal = entry.fatal
-			else
-				-- A bare (legacy) prepared report: wrap it.
-				report = entry
-			end
-			if body or type(report) == "table" then
-				if type(token) ~= "string" then
-					token = next_pending_token()
-					changed = true
-				end
-				if type(created_at) ~= "number" then
-					created_at = current_ms
-					changed = true
-				end
-				if type(fatal) ~= "boolean" then
-					-- Legacy entries predate the flag and were dump-sourced
-					-- fatal crashes; keeping them in the fatal tier means the
-					-- adoption can never demote their eviction priority.
-					fatal = true
-					changed = true
-				end
-				-- Discard a report older than the retention TTL.
-				if (current_ms - created_at) > pending_ttl_ms then
-					changed = true
-				else
-					out[#out + 1] = {
-						token = token,
-						body = body,
-						crash_id = crash_id,
-						report = report,
-						fatal = fatal,
-						created_at = created_at,
-					}
-				end
-			end
+		if type(entry) == "table" and type(entry.body) == "string" and entry.body ~= ""
+			and type(entry.token) == "string" and entry.token ~= ""
+			and type(entry.created_at) == "number" and type(entry.fatal) == "boolean"
+			and (current_ms - entry.created_at) <= pending_ttl_ms then
+			out[#out + 1] = {
+				token = entry.token,
+				body = entry.body,
+				crash_id = type(entry.crash_id) == "string" and entry.crash_id or nil,
+				fatal = entry.fatal,
+				created_at = entry.created_at,
+			}
+		else
+			changed = true
 		end
 	end
 	return out, changed
@@ -412,7 +357,7 @@ local function load_raw_record(ns)
 	return record
 end
 
--- forward declaration: read_pending_record writes back an adopted/pruned list.
+-- Forward declaration: read_pending_record writes back a pruned list.
 local write_pending_list
 
 local function read_pending_record(ns)
@@ -427,11 +372,8 @@ local function read_pending_record(ns)
 		changed = true
 	end
 	if changed then
-		-- Persist the adopted tokens / pruned TTL / cleaned deadline so a later
-		-- read sees stable tokens (a freshly minted token on every read would
-		-- defeat remove_pending_crash and cause an endless resend) and so the
-		-- stale entries stay gone. A write failure here is non-fatal: the
-		-- in-memory normalized view is still returned.
+		-- Persist pruned entries and the cleaned deadline. A write failure is
+		-- non-fatal: the normalized view is still returned.
 		write_pending_list(ns, items, deadline)
 	end
 	return items, deadline
@@ -501,16 +443,14 @@ end
 -- caller can remove exactly this entry once its send is accepted or
 -- terminally rejected), or nil when the entry is unusable or its body alone
 -- exceeds the per-record byte cap (an oversized report is rejected up front,
--- without evicting anything). If `token` is supplied and an entry with that
--- token already exists, the stored body is refreshed in place (idempotent
--- re-persist) rather than appended a second time. Once the count or
+-- without evicting anything). Once the count or
 -- total-bytes bound is exceeded, entries are evicted via evict_one_pending —
 -- oldest NON-fatal first, the just-added report never — so the list stays
 -- within max_pending_records / max_pending_total_bytes. Each entry is
 -- stamped with a created-at time (from the SDK clock by default;
 -- `created_at_ms` overrides it for tests) so the retention TTL can discard a
 -- stale report on read.
-function M.save_pending_crash(scope, entry, token, created_at_ms)
+function M.save_pending_crash(scope, entry, created_at_ms)
 	if type(entry) ~= "table" or type(entry.body) ~= "string" or entry.body == "" then
 		return nil
 	end
@@ -526,11 +466,7 @@ function M.save_pending_crash(scope, entry, token, created_at_ms)
 	if not save_path(ns) then
 		return nil
 	end
-	-- Read (and thereby ADOPT any legacy, un-stamped entries) BEFORE taking
-	-- the new report's timestamp: adoption stamps legacy entries with the
-	-- read-time clock, and the resend pass orders by created_at — a new
-	-- report stamped earlier than the older backlog it queues behind would
-	-- jump the line (and a 429 on it would strand the true oldest).
+	-- Read the backlog before assigning the new report's timestamp.
 	local items, deadline = read_pending_record(ns)
 	local stamp = type(created_at_ms) == "number" and created_at_ms or now_ms()
 	-- Defensive copy so a later caller mutation cannot reach the stored snapshot.
@@ -543,48 +479,22 @@ function M.save_pending_crash(scope, entry, token, created_at_ms)
 		crash_id = type(entry.crash_id) == "string" and entry.crash_id or nil,
 		fatal = entry.fatal == true,
 	}
-	local replaced = false
-	if token then
-		-- Idempotent re-persist: replace an existing entry with this token in
-		-- place. The refresh then runs through the SAME caps enforcement and
-		-- evict-and-retry write as an append — a legacy sidecar written
-		-- before the total-byte budget existed can already sit above it, and
-		-- adopting an entry must shrink toward the bound, not skip it.
+	local token
+	repeat
+		token = next_pending_token()
+		local clash = false
 		for i = 1, #stored do
 			if stored[i].token == token then
-				-- Refresh the body in place but PRESERVE the original created-at so a
-				-- re-persist cannot reset the retention TTL and keep a report alive
-				-- indefinitely.
-				new_entry.token = token
-				new_entry.created_at = type(stored[i].created_at) == "number" and stored[i].created_at or stamp
-				stored[i] = new_entry
-				replaced = true
+				clash = true
 				break
 			end
 		end
-	else
-		-- Mint a token that is not already present in the stored list, so a new
-		-- entry can never reuse a still-pending entry's token (which would let a
-		-- later remove delete the wrong report), including if two launches happen
-		-- to produce the same suffix.
-		repeat
-			token = next_pending_token()
-			local clash = false
-			for i = 1, #stored do
-				if stored[i].token == token then
-					clash = true
-					break
-				end
-			end
-		until not clash
-	end
-	if not replaced then
-		new_entry.token = token
-		new_entry.created_at = stamp
-		stored[#stored + 1] = new_entry
-	end
+	until not clash
+	new_entry.token = token
+	new_entry.created_at = stamp
+	stored[#stored + 1] = new_entry
 	-- Enforce the count AND total-bytes caps, never evicting the just-added
-	-- (or just-refreshed) report — its durability is the whole point of the
+	-- report — its durability is the whole point of the
 	-- write-ahead persist — and never a FATAL entry to admit a non-fatal one.
 	while (#stored > max_pending_records or pending_total_bytes(stored) > max_pending_total_bytes) and
 		evict_one_pending(stored, token, new_entry.fatal) do
@@ -661,21 +571,19 @@ function M.set_pending_crash_retry_after(scope, seconds)
 	return write_pending_list(ns, items, deadline)
 end
 
--- Return the list of pending crash report payloads for this app (possibly
--- empty): the encoded body string for current entries, the prepared report
--- table for legacy ones.
+-- Return the exact encoded pending crash bodies for this app (possibly empty).
 function M.load_pending_crashes(scope)
 	local ns = pending_namespace(scope)
 	local items = read_pending_record(ns)
 	local out = {}
 	for i = 1, #items do
-		out[i] = items[i].body or items[i].report
+		out[i] = items[i].body
 	end
 	return out
 end
 
 -- Return the pending entries as
--- { token, body|report, crash_id?, fatal, created_at } records — oldest
+-- { token, body, crash_id?, fatal, created_at } records — oldest
 -- first — so a resend can address (remove / re-persist) each entry
 -- individually and merge them by age with any session-only retained
 -- reports, plus the stored resend-backpressure deadline (ms epoch, or nil).
@@ -687,7 +595,6 @@ function M.load_pending_entries(scope)
 		out[i] = {
 			token = items[i].token,
 			body = items[i].body,
-			report = items[i].report,
 			crash_id = items[i].crash_id,
 			fatal = items[i].fatal,
 			created_at = items[i].created_at,

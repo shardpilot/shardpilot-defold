@@ -642,7 +642,8 @@ the canonical value when building each envelope. Replay preserves that value,
 `event_id` and `event_ts`. Source is `client` by default and country is omitted.
 
 Crash reports and the consent-policy request use the same twelve values and
-the same folding. See `docs/crash.md`.
+the same folding. See `docs/crash.md`. Pending crash retries replay the encoded
+body with its original token, timestamp and fatal marker.
 
 ## Schema-revision declaration
 

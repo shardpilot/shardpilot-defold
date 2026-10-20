@@ -1629,8 +1629,8 @@ wrapped as a `mobile_crash` analytics event on `/v1/events:batch`. Fatal reports
 bypass sampling; a previous-session native crash dump is forwarded on next launch
 via `crash.capture_previous()`, which first re-sends any reports whose earlier
 delivery was never confirmed — every dispatched report is persisted write-ahead
-to a bounded per-app sidecar (exact wire bytes, re-sent verbatim and
-de-duplicated by `crash_id`; a `429 Retry-After` window persists across
+to a bounded per-app sidecar (exact wire bytes, replayed without decoding or
+re-encoding and de-duplicated by `crash_id`; a `429 Retry-After` window persists across
 relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.md).
 
 ## Consent regime

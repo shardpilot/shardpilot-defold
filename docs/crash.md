@@ -85,10 +85,8 @@ Whitespace around `crash_component` is trimmed. An invalid nonblank value is
 rejected; an empty value omits the component. The event-table `source` override
 remains supported, but its wire key is `component`.
 
-Durable reports written by older versions rename only their root `source` key on
-replay. Values, nested keys and crash IDs are preserved. Records containing both
-root keys remain queued without dispatch rather than guessing attribution or
-losing the report.
+Pending reports replay their exact encoded body. The stored component, nested
+keys and crash ID remain unchanged.
 
 ## Manual emit
 
