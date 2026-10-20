@@ -7345,7 +7345,7 @@ function Client:bounded_shutdown(timeout_seconds, callback)
 	-- the finish step after the drain has made room.
 	self:session_end("app_final")
 	self:bounded_flush(timeout_seconds, function(ok, code)
-		closing.drained = { ok, code }
+		closing.drained = closing.drained or { ok, code }
 	end)
 	-- The process may end before the answer (a host closing from final()
 	-- gets no later update): what is still held goes to the durable spool
@@ -7367,6 +7367,12 @@ function Client:advance_close()
 	local expired = clock.unix_ms() >= closing.deadline_ms
 	if not closing.drained and not expired then
 		return
+	end
+	if not closing.drained then
+		-- The deadline passed before the drain answered (an untimed write can
+		-- outlast it): answer as the drain would at its deadline, before the
+		-- teardown below ends it with "shutdown".
+		closing.drained = { false, self:flush_deadline_code() }
 	end
 	local spooled_before = #self.spool_record
 	local ok, err = self:shutdown()

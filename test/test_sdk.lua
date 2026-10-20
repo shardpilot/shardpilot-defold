@@ -17386,6 +17386,24 @@ end)()
   assert_true(record~=nil and #record.events>0,"the remnant is kept for the next launch")
  end)
 
+ scene("a spool write that outlasts the deadline still answers pending",function()
+  local stores=install_stub_sys_storage()
+  local client=client_with()
+  assert_true(client:track("unsent"))
+  hold_http_requests()
+  local save=sys.save
+  sys.save=function(path,record)
+   if path:sub(-6)=="/spool" then socket.now=socket.now+2 end
+   return save(path,record)
+  end
+  local calls,cb=answers()
+  assert_true(client:bounded_shutdown(1,cb))
+  answered(calls,false,"pending","a write past the deadline")
+  assert_equal(client.initialized,false,"torn down at the deadline")
+  local record=stored_spool_record(stores)
+  assert_true(record~=nil and #record.events>0,"the remnant is kept for the next launch")
+ end)
+
  scene("what the close holds is on disk before any answer",function()
   local stores=install_stub_sys_storage()
   local client=client_with()
