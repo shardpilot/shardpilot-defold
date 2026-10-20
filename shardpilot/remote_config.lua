@@ -210,43 +210,16 @@ local function top_level_values_char(body)
 	return nil
 end
 
--- The endpoint answers `{ "version": <number>, "values": { key: value } }`.
--- The configuration map served to getters is the `values` object; a body that
--- is a JSON object WITHOUT a `values` member is served as the map itself, so
--- an unwrapped payload (fixtures, older servers) still works. A wrapper whose
--- `values` member is present but not a keyed object (a string, number,
--- boolean, null, or an array — e.g. after a server-side schema bug) is
--- MALFORMED: falling back to serving the wrapper would expose wrapper fields
--- as configuration and overwrite the last-known-good cache. The two shapes
--- the decoded value cannot settle on its own are re-checked on the body
--- text: an empty array (it decodes to the same Lua table as an empty
--- object) and a JSON null (commonly decoded to nil, identical to an absent
--- member). Returns (values, version) — the version read from the wrapper
--- only — or nil for a malformed wrapper.
+-- The endpoint answers a wrapper with a keyed `values` object. Inspect the
+-- body text too: empty arrays and objects can decode to the same Lua table,
+-- and JSON null can decode to nil. Wrapper fields never become config keys.
 local function extract(decoded, body)
 	local values = decoded.values
-	if values ~= nil then
-		-- Object-ness is decided on the body TEXT, not the decoded table: an
-		-- empty array decodes to the same table as an empty object, and a
-		-- sparse array (`[null, 1]` under a decoder that maps null to nil)
-		-- can dodge any positional-index probe. A JSON object can only carry
-		-- string keys, so the text check subsumes them all.
-		if type(values) ~= "table" or top_level_values_char(body) ~= "{" then
-			return nil
-		end
-		-- The published version is wrapper metadata, so it is read only
-		-- here: in an unwrapped payload a config key named "version" is
-		-- configuration, not a revision marker.
-		local version = type(decoded.version) == "number" and decoded.version or nil
-		return values, version
-	end
-	if top_level_values_char(body) ~= nil then
-		-- The body HAS a `values` member the decoder could not deliver as a
-		-- table (a JSON null, or a value the runtime maps to nil): malformed,
-		-- not an unwrapped payload.
+	if type(values) ~= "table" or top_level_values_char(body) ~= "{" then
 		return nil
 	end
-	return decoded, nil
+	local version = type(decoded.version) == "number" and decoded.version or nil
+	return values, version
 end
 
 -- Parse a configuration body end-to-end: a JSON object whose configuration
@@ -999,9 +972,8 @@ function RemoteConfig:get_values()
 	return copy_value(self.values, 0)
 end
 
--- The published configuration version from the last served payload, or nil
--- when unknown (no configuration yet, or an unwrapped payload — the version
--- is wrapper metadata, so an unwrapped payload never carries one).
+-- The published configuration version from the last served wrapper, or nil
+-- when no published version is known.
 function RemoteConfig:get_version()
 	return self.version
 end

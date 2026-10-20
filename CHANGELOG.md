@@ -2,6 +2,8 @@
 
 ### Unreleased
 
+- Removed unwrapped remote-config body acceptance for replies and cached records; malformed refreshes preserve the last valid wrapped snapshot.
+
 - Removed stored-receipt kind backfill and missing anonymous-snapshot acceptance; incomplete metadata keeps the trail unaccounted.
 
 - Removed over-capacity stored-receipt rewrites during removal and retry; fresh append bounds and eviction reporting remain.

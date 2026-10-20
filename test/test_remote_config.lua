@@ -1438,35 +1438,58 @@ local function test_callback_mutation_cannot_corrupt_the_snapshot()
 	assert_nil(client:remote_config_value("injected"))
 end
 
-local function test_unwrapped_payload_is_served_as_the_map()
-	reset()
-	local client = assert(sdk.new(config()))
-	next_status = 200
-	next_response_body = '{"flag_x":true,"limit":5}'
-	local result = fetch(client)
-
-	assert_true(result.ok, result.error)
-	assert_equal(result.values.flag_x, true)
-	assert_nil(result.version, "an unwrapped payload carries no version")
-	assert_equal(client:remote_config_number("limit", 0), 5)
+local function test_values_wrapper_required(mode)
+	for _, body in ipairs({ '{"flag_x":true,"limit":5}', '{}', '{"version":42,"flag_x":true}' }) do
+		reset(); storage.reset()
+		local restore, stores = install_fake_sys_storage()
+		local client = assert(sdk.new(config()))
+		local record, good_body = nil, values_body({ keep = true }, 7)
+		if mode ~= "cold" then
+			next_status, next_response_body = 200, good_body
+			next_response_headers = { etag = '"seed-v7"' }
+			assert_true(fetch(client).ok)
+			record = assert(storage.load_remote_config(client.config))
+			assert_equal(record.body, good_body, "cache preserves the server's exact wrapper")
+			assert_equal(record.etag, '"seed-v7"', "restore starts with a real validator")
+		end
+		if mode == "restore" then
+			client:finish_teardown()
+			local path = nil
+			for key in pairs(stores) do if key:find("remote-config", 1, true) then path = key end end
+			assert_true(path ~= nil)
+			record.body = body; stores[path] = record; storage.reset()
+			client = assert(sdk.new(config()))
+			assert_nil(client:remote_config_values(), "unwrapped cache is unusable")
+			next_status, next_response_body = 0, nil
+			assert_equal(fetch(client).ok, false)
+			assert_nil(last_request().headers["If-None-Match"], "unusable cache contributes no validator")
+		else
+			next_status, next_response_body = 200, body
+			local result = fetch(client)
+			assert_equal(result.error, "malformed_response", "a values wrapper is required")
+			assert_equal(result.ok, mode == "warm")
+			if mode == "warm" then
+				assert_true(result.from_cache); assert_true(result.values.keep)
+				assert_equal(storage.load_remote_config(client.config).body, good_body)
+			else
+				assert_nil(result.values); assert_nil(storage.load_remote_config(client.config))
+			end
+		end
+		assert_nil(client:remote_config_value("flag_x"), "unwrapped fields never become configuration")
+		client:finish_teardown(); restore(); storage.reset()
+	end
 end
 
-local function test_unwrapped_version_key_is_configuration_not_metadata()
+local function test_wrapped_version_key_is_configuration_and_metadata_stays_separate()
 	reset()
 	local client = assert(sdk.new(config()))
 	next_status = 200
-	next_response_body = '{"version":42,"flag_x":true}'
+	next_response_body = values_body({ version = 42, flag_x = true }, 7)
 	local result = fetch(client)
-
-	-- The published version is metadata of the `{version, values}` wrapper;
-	-- in an unwrapped payload a config key named "version" is ordinary
-	-- configuration and must not masquerade as a revision marker.
 	assert_true(result.ok, result.error)
-	assert_nil(result.version,
-		"an unwrapped payload's version key must not be read as wrapper metadata")
-	assert_nil(client:remote_config_version())
-	assert_equal(client:remote_config_number("version", 0), 42,
-		"an unwrapped config key named version is served as configuration")
+	assert_equal(result.version, 7)
+	assert_equal(client:remote_config_version(), 7)
+	assert_equal(client:remote_config_number("version", 0), 42)
 	assert_equal(client:remote_config_boolean("flag_x", false), true)
 end
 
@@ -2887,8 +2910,10 @@ local tests = {
 	test_empty_array_values_member_is_malformed,
 	test_fetch_after_shutdown_is_rejected,
 	test_callback_mutation_cannot_corrupt_the_snapshot,
-	test_unwrapped_payload_is_served_as_the_map,
-	test_unwrapped_version_key_is_configuration_not_metadata,
+	function() test_values_wrapper_required("cold") end,
+	function() test_values_wrapper_required("warm") end,
+	function() test_values_wrapper_required("restore") end,
+	test_wrapped_version_key_is_configuration_and_metadata_stays_separate,
 	test_cache_from_another_scope_is_a_miss_and_gets_overwritten,
 	test_transient_failure_never_serves_another_scopes_cache,
 	test_restart_serves_last_known_good_and_offline_fetch_uses_it,
