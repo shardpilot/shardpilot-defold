@@ -1484,33 +1484,6 @@ end
 -- receipt cannot be re-sent by this process, and a fresh decision applies now.
 -- Refusing both would leave the caller re-sending a receipt the server already
 -- accepted, forever, because its mirror can never lose it.
--- THE BOUND APPLIED TO A LIST NOBODY APPENDED TO. The loader keeps an over-cap
--- durable record on purpose so identity filtering runs over the whole of it, and
--- the whole-list write used to enforce the bound on the way out. A drop or a
--- flush writing its list straight through means a legacy or externally produced
--- oversized record never converges -- acknowledging some entries leaves it over
--- the bound forever, and the documented fixed cap becomes a number nothing
--- enforces. Denial-preferring, like every other eviction here: pure grants go
--- first, and only an all-denials overflow costs a denial.
---
--- Returns the list AND what it cost, because those are two answers and a caller
--- that surfaces evictions needs both.
-local function cap_existing(kept)
-	local removed = 0
-	while #kept > max_consent_outbox_entries do
-		local evict_index = 1
-		for i = 1, #kept do
-			if receipt_is_pure_grant(kept[i]) then
-				evict_index = i
-				break
-			end
-		end
-		table.remove(kept, evict_index)
-		removed = removed + 1
-	end
-	return kept, removed
-end
-
 local function outbox_write(ns, scope, receipts, withhold)
 	local durable = not withhold and write_consent_outbox(ns, receipts)
 	local r = outbox_resolution[ns]
@@ -1625,11 +1598,9 @@ function M.drop_consent_receipts(scope, keys)
 	for i = 1, #keys do
 		drop[keys[i]] = true
 	end
-	local kept, removed = {}, 0
+	local kept = {}
 	for i = 1, #r.receipts do
-		if drop[r.receipts[i].idempotency_key] then
-			removed = removed + 1
-		else
+		if not drop[r.receipts[i].idempotency_key] then
 			kept[#kept + 1] = r.receipts[i]
 		end
 	end
@@ -1641,11 +1612,10 @@ function M.drop_consent_receipts(scope, keys)
 	-- debt disappears -- so a process exit resurrects the old receipt from stale
 	-- disk and loses the new decision. The write costs one save and is the only
 	-- thing that makes the success it reports true.
-	local capped, over = cap_existing(kept)
-	if not outbox_write(ns, scope, capped, withhold) then
-		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed", over
+	if not outbox_write(ns, scope, kept, withhold) then
+		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed"
 	end
-	return true, nil, over
+	return true
 end
 
 -- Write what the resolution ALREADY HOLDS to disk. No list crosses the
@@ -1656,15 +1626,10 @@ function M.flush_consent_outbox(scope)
 	local ns = spool_namespace(scope)
 	local r = resolution_for(ns, scope)
 	local withhold = outbox_unaccounted(r)
-	-- THE COUNT RIDES OUT HERE TOO. Both paths that cap a list they did not
-	-- build must say what it cost: a client whose only pending action is an owed
-	-- write never calls drop, so evictions on this path are the only ones it
-	-- would ever see -- and returning nothing made them the ones it never does.
-	local capped, over = cap_existing(copy_outbox_entries(r.receipts))
-	if not outbox_write(ns, scope, capped, withhold) then
-		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed", over
+	if not outbox_write(ns, scope, copy_outbox_entries(r.receipts), withhold) then
+		return false, withhold and "consent_outbox_held" or "consent_outbox_write_failed"
 	end
-	return true, nil, over
+	return true
 end
 
 -- AN EXPLICIT DECISION ENDS THE HOLD. The client already does this to its own

@@ -30,3 +30,4 @@
 - Build crash replay fixtures through capture; keep fresh encoding failures settled.
 - Keep current identifier-boundary and receipt-write controls when trimming old fixtures.
 - Require serving pins on every assignment reply and cached entry; reject subjectless caches and treat scope-less numeric clear markers as unreadable.
+- Enforce consent-outbox capacity at append; preserve held and failed-write behavior for removal and retry.
