@@ -1446,9 +1446,11 @@ local function test_values_wrapper_required(mode)
 		local record, good_body = nil, values_body({ keep = true }, 7)
 		if mode ~= "cold" then
 			next_status, next_response_body = 200, good_body
+			next_response_headers = { etag = '"seed-v7"' }
 			assert_true(fetch(client).ok)
 			record = assert(storage.load_remote_config(client.config))
 			assert_equal(record.body, good_body, "cache preserves the server's exact wrapper")
+			assert_equal(record.etag, '"seed-v7"', "restore starts with a real validator")
 		end
 		if mode == "restore" then
 			client:finish_teardown()
