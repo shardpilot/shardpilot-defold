@@ -660,7 +660,7 @@ initialization attempt. `new(config)` creates an independent client instance.
 | `app_version` | `nil` | Sent in the envelope |
 | `app_build` | `nil` | Sent in the envelope |
 | `platform` | auto-detected | Analytics uses the detected or configured canonical value; missing or unknown values use `other`. See `docs/configuration.md`. |
-| `anonymous_id` | generated | UUIDv7 generated on first init if not provided |
+| `anonymous_id` | generated | UUIDv7 generated on first init if not provided Limited to 512 bytes before persistence. |
 | `user_id` | `nil` | Initial known-user attribution |
 | `batch_size` | `25` | Flush trigger, 1–100 |
 | `rejection_capacity` | `64` *(new in `v0.10.2`)* | Retained per-event rejection entries (positive integer); see [Batch verdicts](#batch-verdicts). |

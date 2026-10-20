@@ -147,10 +147,7 @@ end
 -- opaque backend tokens a few hundred. Oversized input is REJECTED (same
 -- surface as empty/non-string identity), never truncated — truncation could
 -- collide distinct identities and mis-attribute events or consent decisions.
--- The bound is defined once, in the storage layer next to the other
--- persistence budgets: storage's outbox sanitizer enforces it on records
--- written before the clamp existed (legacy oversized receipts are dropped at
--- load), and this acceptance gate keeps new identifiers inside it.
+-- Storage defines the shared bound for this acceptance gate and receipt writes.
 local max_identifier_bytes = storage.max_identifier_bytes
 
 -- Lexicographic ordering over a decision's (stamp, seq) pair. clock.iso_utc

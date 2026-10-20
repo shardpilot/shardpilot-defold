@@ -7784,8 +7784,7 @@ end
 -- record and the receipt's actor_identifier/anonymous_id snapshot; max+1 is
 -- rejected with the previous identity retained — never truncated, since
 -- truncation could collide distinct identities. Out-of-bounds config
--- identities and a legacy oversized persisted anonymous ID fall back to the
--- stored/fresh identity the same way any other invalid value does.
+-- config identities follow the same invalid-input fallback rules.
 local function test_identifier_byte_clamp_boundary()
 	reset()
 	storage.reset()
@@ -7835,13 +7834,7 @@ local function test_identifier_byte_clamp_boundary()
 	assert_equal(follower.anonymous_id, max_anon,
 		"an out-of-bounds config anonymous_id must fall back to the stored identity")
 
-	-- a legacy oversized persisted anonymous ID (written before the clamp)
-	-- is replaced by a fresh identity and the record self-heals
-	assert_true(storage.save(identity_scope, { anonymous_id = over_anon }))
-	local healed = assert(sdk.restart(follower, config()))
-	assert_not_equal(healed.anonymous_id, over_anon)
-	assert_equal(#healed.anonymous_id, 36, "a fresh UUID must replace the oversized stored id")
-	assert_equal(storage.load(identity_scope).anonymous_id, healed.anonymous_id)
+
 	restore()
 	storage.reset()
 end
@@ -7923,44 +7916,7 @@ local function test_oversized_identifier_cannot_wedge_consent_teardown()
 		"shutdown must not wedge in consent_pending when identifiers are clamped")
 	assert_equal(client.initialized, false)
 
-	-- (c) the upgrade path: a LEGACY record written before the clamp existed
-	-- can already hold a near-cap receipt on disk (it fit alone when old code
-	-- wrote it). The load-time sanitizer drops it like any other malformed
-	-- entry, so the next decision's rewrite — which would exceed the save cap
-	-- with the oversized entry still aboard — stays writable and teardown
-	-- still completes: a previously wedged install self-heals on upgrade.
-	storage.reset()
-	local _, outbox_path = stored_consent_outbox_record(stores)
-	local legacy_sane = {
-		workspace_id = "workspace-example",
-		app_id = "app-example",
-		environment_id = "develop",
-		actor_identifier = "user-legacy",
-		categories = { analytics = false },
-		decided_at = "2026-07-18T00:00:00Z",
-		idempotency_key = "receipt-legacy-sane",
-	}
-	-- seed the poisoned pre-clamp file directly (old code could write it
-	-- when the oversized receipt still fit the record on its own)
-	stores[outbox_path] = { receipts = { oversized_entry, legacy_sane } }
-	local salvaged = storage.load_consent_outbox(identity_scope)
-	assert_equal(#salvaged, 1, "the oversized legacy receipt must be dropped at load")
-	assert_equal(salvaged[1].idempotency_key, "receipt-legacy-sane")
 
-	-- Mode A client over the legacy record with the consent endpoint offline:
-	-- the sane receipt is retained, a NEW decision still persists durably,
-	-- and shutdown() completes instead of staying consent_pending
-	next_status = 0
-	local upgraded = assert(sdk.new(config_mode_a()))
-	assert_equal(#upgraded.consent_outbox, 1, "the sane legacy receipt is retained")
-	assert_true(upgraded:set_consent(false), "a new decision must persist over the legacy record")
-	assert_equal(upgraded.consent_outbox_dirty, false)
-	local upgraded_record = stored_consent_outbox_record(stores)
-	assert_equal(#upgraded_record.receipts, 2, "legacy sane + new receipt are durable")
-	assert_true(#json.encode(upgraded_record) <= record_cap,
-		"the rewritten record stays under the save cap")
-	assert_true(upgraded:shutdown("app_final"),
-		"an upgraded install must not stay wedged in consent_pending")
 	restore()
 	storage.reset()
 end

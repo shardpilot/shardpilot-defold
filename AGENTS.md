@@ -28,3 +28,4 @@
 - Drive boot-diagnostic reentrancy cases with current records and configuration warnings.
 - Build platform-replay fixtures through the current client persistence path.
 - Build crash replay fixtures through capture; keep fresh encoding failures settled.
+- Keep current identifier-boundary and receipt-write controls when trimming old fixtures.
