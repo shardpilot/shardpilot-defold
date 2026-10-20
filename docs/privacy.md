@@ -413,8 +413,9 @@ outbox:
   one);
 - is **fail-safe against corruption**: a malformed entry on disk is dropped
   at load — never sent, never a crash, never a blocker for well-formed
-  receipts (an entry with a non-allowlisted `kind` counts as malformed; a
-  legacy pre-kind entry is kept with `kind` backfilled to `"anon"`);
+  receipts. Every retained receipt requires an allowlisted `kind` and its
+  decision-time anonymous-ID snapshot. Missing or invalid metadata marks the
+  trail unaccounted; ordinary retries cannot overwrite that evidence;
 - **parks `user_verified` receipts while the current session cannot vouch
   for their actor** — no `token_provider` configured (a signed-out relaunch
   under the publishable key alone), no `identify()` yet, or a different

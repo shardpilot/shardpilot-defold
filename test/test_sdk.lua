@@ -6077,6 +6077,7 @@ local function cap_test_receipt(i)
 		environment_id = "develop",
 		actor_identifier = "user-example",
 		kind = "anon",
+		anonymous_id = "user-example",
 		categories = { analytics = (i % 2) == 0 },
 		decided_at = "2026-07-11T00:00:00Z",
 		idempotency_key = "receipt-" .. tostring(i),
@@ -6401,6 +6402,8 @@ local function test_malformed_consent_outbox_dropped_failsafe()
 			app_id = "a",
 			environment_id = "e",
 			actor_identifier = "u",
+			kind = "anon",
+			anonymous_id = "u",
 			decided_at = "2026-07-11T00:00:00Z",
 			categories = { analytics = "yes" },
 		},
@@ -7324,93 +7327,62 @@ local function test_most_vouching_credential_and_401_follows_credential_used()
 	storage.reset()
 end
 
--- Outbox upgrade path for kind: a LEGACY record written before kind existed
--- loads with kind backfilled to "anon" — the server before kind bound every
--- client write to the caller's anon scope, so anon is the class those
--- receipts were recorded under — while an entry carrying a non-allowlisted
--- kind ("user_unverified" included, which the SDK never produces) is
--- dropped fail-safe like any other malformed entry.
-local function test_legacy_kindless_receipt_backfills_anon_and_invalid_kind_drops()
-	reset()
-	storage.reset()
+-- Current receipts carry their actor class and decision-time anonymous snapshot.
+local function test_receipt_metadata_required(field)
+	reset(); storage.reset()
 	local stores, restore = install_stub_sys_storage()
-	-- seed a real record once to learn the outbox path, then replace it with
-	-- a hand-written legacy file
 	next_status = 500
 	local seeder = assert(sdk.new(config_mode_a()))
 	assert_true(seeder:set_consent(false))
-	local _, outbox_path = stored_consent_outbox_record(stores)
-	assert_true(outbox_path ~= nil)
-	local function legacy_entry(key, kind)
-		return {
-			workspace_id = "workspace-example",
-			app_id = "app-example",
-			environment_id = "develop",
-			actor_identifier = "anon-legacy",
-			kind = kind,
-			categories = { analytics = false },
-			decided_at = "2026-07-01T00:00:00Z",
-			idempotency_key = key,
-			anonymous_id = "anon-legacy",
-		}
+	local record, outbox_path = stored_consent_outbox_record(stores)
+	assert_true(record ~= nil and outbox_path ~= nil)
+	local current = record.receipts[1]
+	assert_equal(current.kind, "anon")
+	assert_equal(current.anonymous_id, seeder.anonymous_id)
+	seeder:finish_teardown()
+	local variants = field == "kind" and {
+		{}, { value = "user_unverified" }, { value = 42 }, { value = false },
+	} or { {} }
+	for _, variant in ipairs(variants) do
+		local malformed = {}
+		for key, value in pairs(current) do malformed[key] = value end
+		malformed.idempotency_key = "incomplete-receipt"
+		malformed[field] = variant.value
+		stores[outbox_path] = { receipts = { malformed, current } }
+		storage.reset()
+		local loaded, err = storage.load_consent_outbox(identity_scope)
+		assert_equal(#loaded, 1, "incomplete " .. field .. " cannot be restored")
+		assert_equal(loaded[1].idempotency_key, current.idempotency_key,
+			"the complete sibling stays readable")
+		assert_equal(err, "consent_outbox_read_failed",
+			"a refused receipt keeps the trail unaccounted")
+		local ok, reason = storage.flush_consent_outbox(identity_scope)
+		assert_equal(ok, false); assert_equal(reason, "consent_outbox_held")
+		assert_equal(#stores[outbox_path].receipts, 2,
+			"a normal retry cannot overwrite evidence of a possible denial")
 	end
-	stores[outbox_path] = { receipts = {
-		legacy_entry("receipt-legacy", nil),
-		legacy_entry("receipt-unverified", "user_unverified"),
-		legacy_entry("receipt-garbled-kind", 42),
-	} }
-	storage.reset() -- drop the in-memory shadow so the legacy FILE is what loads
-
-	local salvaged = storage.load_consent_outbox(identity_scope)
-	assert_equal(#salvaged, 1, "non-allowlisted kinds must drop; the kindless legacy entry stays")
-	assert_equal(salvaged[1].idempotency_key, "receipt-legacy")
-	assert_equal(salvaged[1].kind, "anon", "a pre-kind receipt must backfill kind anon")
-
-	-- and the backfilled receipt delivers with kind on the wire
-	reset()
-	next_status = 202
-	local upgraded = assert(sdk.new(config_mode_a()))
-	assert_equal(#requests, 1)
-	assert_contains(requests[1].body, '"idempotency_key":"receipt-legacy"')
-	assert_contains(requests[1].body, '"kind":"anon"')
-	assert_contains(requests[1].body, '"actor_identifier":"anon-legacy"')
-	assert_equal(upgraded:snapshot().consent_recorded, 1)
-	restore()
-	storage.reset()
+	restore(); storage.reset()
 end
 
--- A receipt NO configured credential can vouch for
--- must never ride the minted token. The concrete case: a legacy kindless
--- receipt that stored v0.9.1's user-first ACTOR backfills to kind="anon"
--- at load with its retained anon snapshot still matching the current anon
--- — in a Mode-B-ONLY configuration the token vouches only for the current
--- anon (or a verified user), no publishable key exists, and the old
--- fall-through sent the user-shaped actor under the token anyway: a
--- terminal auth failure or a wrong-actor write, and, anon-keyed as it is,
--- a standing events_pending wedge of the rotation guard. Such a receipt
--- now drops at the load-time could-never-send gate exactly like the
--- narrow identity_changed rule (counted, diagnosed, persisted), dispatch
--- selection skips it as a belt (never falling through to a non-vouching
--- credential, never head-blocking the trail), and in the dual
--- token_provider + publishable_key configuration the SAME receipt is retained and
--- delivered under the publishable key as today.
-local function test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual()
+-- A complete anon receipt with a foreign actor is still unvouchable in Mode B.
+local function test_foreign_actor_receipt_dropped_mode_b_only_kept_dual()
 	reset()
 	storage.reset()
 	local stores, restore = install_stub_sys_storage()
 	-- seed a real record once to learn the outbox path, then replace it
-	-- with a hand-written legacy file
+	-- with a complete current-shaped foreign-actor record
 	next_status = 500
 	local seeder = assert(sdk.new(config({ anonymous_id = "anon-current" })))
 	assert_true(seeder:set_consent(false))
 	local _, outbox_path = stored_consent_outbox_record(stores)
 	assert_true(outbox_path ~= nil)
-	local function legacy_user_entry(key)
+	local function foreign_actor_entry(key)
 		return {
 			workspace_id = "workspace-example",
 			app_id = "app-example",
 			environment_id = "develop",
-			actor_identifier = "user-legacy-example",
+			actor_identifier = "foreign-anon-example",
+			kind = "anon",
 			categories = { analytics = false },
 			decided_at = "2026-07-01T00:00:00Z",
 			idempotency_key = key,
@@ -7431,10 +7403,10 @@ local function test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual()
 		}
 	end
 	stores[outbox_path] = { receipts = {
-		legacy_user_entry("receipt-legacy-user"),
+		foreign_actor_entry("receipt-foreign-actor"),
 		current_anon_entry("receipt-current-anon"),
 	} }
-	storage.reset() -- drop the in-memory shadow so the legacy FILE is what loads
+	storage.reset() -- drop the in-memory shadow so the planted record is what loads
 
 	-- Mode-B-only: the user-actor entry drops at load; the current-anon
 	-- entry behind it still delivers under the mint — no wedge, and the
@@ -7450,7 +7422,7 @@ local function test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual()
 	})))
 	assert_equal(#requests, 1, "the deliverable current-anon receipt still dispatches")
 	assert_contains(requests[1].body, '"idempotency_key":"receipt-current-anon"')
-	assert_not_contains(requests[1].body, "user-legacy-example")
+	assert_not_contains(requests[1].body, "foreign-anon-example")
 	assert_equal(issues[1].scope, "consent")
 	assert_equal(issues[1].status, "dropped")
 	assert_equal(issues[1].code, "identity_changed")
@@ -7463,19 +7435,19 @@ local function test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual()
 	-- skipped by dispatch selection — never sent under the token — and the
 	-- receipt appended behind it still delivers.
 	upgraded.consent_outbox[#upgraded.consent_outbox + 1] =
-		legacy_user_entry("receipt-injected")
+		foreign_actor_entry("receipt-injected")
 	local wire_before = #requests
 	assert_true(upgraded:set_consent(false))
 	assert_equal(#requests, wire_before + 1, "the receipt behind the unvouchable one still delivers")
 	assert_contains(requests[#requests].body, '"actor_identifier":"anon-current"')
-	assert_not_contains(requests[#requests].body, "user-legacy-example")
+	assert_not_contains(requests[#requests].body, "foreign-anon-example")
 
-	-- Dual (token_provider + publishable_key): the SAME legacy receipt is retained
+	-- Dual (token_provider + publishable_key): the SAME complete receipt is retained
 	-- at load and delivers under the publishable key — the historic-actor
 	-- path, unchanged.
 	reset()
 	storage.reset()
-	stores[outbox_path] = { receipts = { legacy_user_entry("receipt-legacy-user-dual") } }
+	stores[outbox_path] = { receipts = { foreign_actor_entry("receipt-foreign-actor-dual") } }
 	storage.reset() -- the overwritten FILE is what the dual client loads
 	next_status = 202
 	local dual_issues = {}
@@ -7487,10 +7459,10 @@ local function test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual()
 			dual_issues[#dual_issues + 1] = issue
 		end,
 	})))
-	assert_equal(#dual_issues, 0, "with a publishable key the legacy receipt is NOT dropped")
-	assert_equal(#requests, 1, "the legacy receipt re-sends under the key")
+	assert_equal(#dual_issues, 0, "with a publishable key the foreign-actor receipt is NOT dropped")
+	assert_equal(#requests, 1, "the foreign-actor receipt re-sends under the key")
 	assert_equal(requests[1].headers["Authorization"], "Bearer sp_ingest_publishable_key")
-	assert_contains(requests[1].body, '"actor_identifier":"user-legacy-example"')
+	assert_contains(requests[1].body, '"actor_identifier":"foreign-anon-example"')
 	assert_contains(requests[1].body, '"kind":"anon"')
 	assert_equal(dual:snapshot().consent_recorded, 1)
 	restore()
@@ -7749,6 +7721,8 @@ local function test_transient_outbox_save_failure_never_evicts()
 		app_id = "app-example",
 		environment_id = "develop",
 		actor_identifier = "user-example",
+		kind = "anon",
+		anonymous_id = "user-example",
 		categories = { analytics = false },
 		decided_at = "2026-07-12T00:00:00Z",
 		idempotency_key = "receipt-transient",
@@ -7881,6 +7855,8 @@ local function test_oversized_identifier_cannot_wedge_consent_teardown()
 		app_id = "app-example",
 		environment_id = "develop",
 		actor_identifier = string.rep("x", record_cap),
+		kind = "anon",
+		anonymous_id = "anon-current",
 		categories = { analytics = true },
 		decided_at = "2026-07-19T00:00:00Z",
 		idempotency_key = "receipt-oversized",
@@ -8344,6 +8320,7 @@ local tests = {
 					app_id = "app",
 					environment_id = "env",
 					actor_identifier = "anon-outbox-hole",
+					kind = "anon",
 					decided_at = "2026-07-08T00:00:00Z",
 					decision_seq = 2,
 					categories = { analytics = true },
@@ -8525,6 +8502,7 @@ local tests = {
 					app_id = "app",
 					environment_id = "env",
 					actor_identifier = "anon-outbox-belt",
+					kind = "anon",
 					decided_at = "2026-07-08T00:00:00Z",
 					decision_seq = 2,
 					categories = { analytics = false },
@@ -8592,8 +8570,9 @@ local tests = {
 	test_identify_refused_while_other_user_events_pending,
 	test_gate_and_in_flight_release_key_to_dispatch_head_not_front,
 	test_most_vouching_credential_and_401_follows_credential_used,
-	test_legacy_kindless_receipt_backfills_anon_and_invalid_kind_drops,
-	test_unvouchable_legacy_receipt_dropped_mode_b_only_kept_dual,
+	function() test_receipt_metadata_required("kind") end,
+	function() test_receipt_metadata_required("anonymous_id") end,
+	test_foreign_actor_receipt_dropped_mode_b_only_kept_dual,
 	test_anonymous_override_mismatch_boots_fresh_identity,
 	test_anonymous_override_match_restores_unchanged,
 	test_override_mismatch_purge_failure_fails_closed,
@@ -9762,6 +9741,7 @@ local tests = {
 			idempotency_key = key,
 			workspace_id = "ws", app_id = "app", environment_id = "env",
 			actor_identifier = "anon-fv",
+			kind = "anon",
 			decided_at = "2026-07-09T00:00:00Z",
 			categories = { analytics = false },
 			anonymous_id = "anon-fv",
@@ -9869,6 +9849,7 @@ local tests = {
 			idempotency_key = key,
 			workspace_id = "ws", app_id = "app", environment_id = "env",
 			actor_identifier = "anon-op",
+			kind = "anon",
 			decided_at = "2026-07-09T00:00:00Z",
 			categories = { analytics = grant == true },
 			anonymous_id = "anon-op",
@@ -9971,6 +9952,7 @@ local tests = {
 			idempotency_key = key,
 			workspace_id = "ws", app_id = "app", environment_id = "env",
 			actor_identifier = "anon-un",
+			kind = "anon",
 			decided_at = "2026-07-09T00:00:00Z",
 			categories = { analytics = grant == true },
 			anonymous_id = "anon-un",
@@ -10062,6 +10044,7 @@ local tests = {
 			idempotency_key = key,
 			workspace_id = "ws", app_id = "app", environment_id = "env",
 			actor_identifier = "anon-3f",
+			kind = "anon",
 			decided_at = "2026-07-09T00:00:00Z",
 			categories = { analytics = grant == true },
 			anonymous_id = "anon-3f",
@@ -10225,7 +10208,7 @@ local tests = {
 	local mine = rec("memory-only")
 	mine.kind = "user_verified"
 	mine.actor_identifier = "user-example"
-	mine.anonymous_id = nil
+	mine.anonymous_id = first.anonymous_id
 	assert_equal(storage.append_consent_receipt(identity_scope, mine), false)
 	sys.save = real_save8
 	assert_true(storage.consent_outbox_owed(identity_scope), "the debt is real and recorded")

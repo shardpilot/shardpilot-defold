@@ -363,8 +363,7 @@ end
 -- is NEVER the receipt actor (that class is spoofable by any caller, and
 -- the server binds a publishable-key write to the caller's own anon
 -- scope regardless — a user-keyed receipt could misrecord the decision
--- under an actor the server never consults). This deliberately supersedes
--- the v0.9.1 user-first snapshot. Returns actor_identifier, kind — the
+-- under an actor the server never consults). Returns actor_identifier, kind — the
 -- only kinds the SDK ever produces are "anon" and "user_verified", never
 -- "user_unverified".
 local function receipt_actor(client)
@@ -1387,9 +1386,7 @@ local function construct(config, normalized)
 		-- itself: with no publishable key the minted token is the only
 		-- credential, and it vouches solely for the current anon (or a
 		-- user_verified receipt's verified user) — an anon-KIND receipt
-		-- whose actor_identifier is NOT the current anon (a legacy pre-kind
-		-- entry that stored v0.9.1's user-first actor and backfilled to
-		-- anon, its anon snapshot still current) has no credential that
+		-- whose actor_identifier is NOT the current anon has no credential that
 		-- could ever lawfully carry it: dispatched under the token it would
 		-- be terminally rejected on the actor/subject mismatch or land the
 		-- decision under the wrong actor, and retained it would hold
@@ -1482,10 +1479,8 @@ local function construct(config, normalized)
 	-- genuinely newer grant in charge — a same-pair or older denial receipt
 	-- (a deny-then-grant whose denial receipt is still undelivered) never
 	-- flips it; the seq half is what breaks a same-second stamp tie (see
-	-- decision_pair_newer). A legacy granted record with NO stamp cannot
-	-- prove it postdates the receipt, so it fails closed to the denial;
-	-- receipts without a decision-time anon snapshot (legacy entries) are
-	-- skipped — they cannot prove actor scope.
+	-- decision_pair_newer). A granted record without a provable decision
+	-- stamp fails closed to the denial. Receipt scope still has to match.
 	-- The belt runs against the RESTORED record even when an unreadable-
 	-- evidence arm has already imposed a denial over it. Comparing against
 	-- the imposed state would skip the belt entirely (it is no longer

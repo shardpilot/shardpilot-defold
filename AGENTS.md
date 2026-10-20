@@ -31,3 +31,4 @@
 - Keep current identifier-boundary and receipt-write controls when trimming old fixtures.
 - Require serving pins on every assignment reply and cached entry; reject subjectless caches and treat scope-less numeric clear markers as unreadable.
 - Enforce consent-outbox capacity at append; preserve held and failed-write behavior for removal and retry.
+- Require receipt kind and anonymous snapshot on restore; preserve unaccounted-trail holds, actor checks and malformed-sequence fallback.

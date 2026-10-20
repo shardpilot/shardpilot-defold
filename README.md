@@ -1994,7 +1994,9 @@ separate prerequisites; the client does not prove the notice was displayed.
   identified session; the SDK-managed `anonymous_id` with `kind = "anon"` in
   every other case (a Mode A self-asserted `user_id` is never the receipt
   actor) — and retained in the **durable consent-receipt outbox** until the
-  server acknowledges it, delivered serially, in decision order. The `kind`
+  server acknowledges it, delivered serially, in decision order. Stored receipts
+  require their `kind` and decision-time anonymous-ID snapshot; incomplete
+  entries are refused and keep the trail unaccounted. The `kind`
   rides the wire body by default (`consent_kind_emission_enabled = false` is
   the escape hatch for pre-amendment ingest deployments — see
   `docs/configuration.md`), and each receipt dispatches under the

@@ -1118,10 +1118,8 @@ end
 -- user id is a class any caller could spoof, and the ingest service rejects
 -- SDK writes carrying it) — and the sanitizer holds loaded records to the
 -- same closed set: an entry with any other kind is dropped fail-safe like
--- any malformed field, while a LEGACY entry with no kind at all (written
--- before kind existed) is kept and backfilled "anon" — the server before kind
--- existed bound every client write to the caller's anon scope, so anon is the class
--- those receipts were recorded under.
+-- any malformed field. Both the kind and decision-time anonymous snapshot
+-- are required on every persisted receipt.
 local valid_receipt_kinds = { anon = true, user_verified = true }
 
 -- Keep only entries that are complete, well-formed receipts, copied down to
@@ -1170,24 +1168,23 @@ local function sanitize_outbox_entries(entries)
 			and valid_receipt_field(entry.app_id)
 			and valid_receipt_field(entry.environment_id)
 			and valid_receipt_identifier(entry.actor_identifier)
-			and (entry.kind == nil or valid_receipt_kinds[entry.kind] == true)
+			and valid_receipt_kinds[entry.kind] == true
 			and valid_receipt_field(entry.decided_at)
 			and type(entry.categories) == "table"
 			and type(entry.categories.analytics) == "boolean"
 			and (entry.reason == nil or valid_receipt_field(entry.reason))
-			and (entry.anonymous_id == nil or valid_receipt_identifier(entry.anonymous_id)) then
+			and valid_receipt_identifier(entry.anonymous_id) then
 			out[#out + 1] = {
 				idempotency_key = entry.idempotency_key,
 				workspace_id = entry.workspace_id,
 				app_id = entry.app_id,
 				environment_id = entry.environment_id,
 				actor_identifier = entry.actor_identifier,
-				kind = entry.kind or "anon",
+				kind = entry.kind,
 				decided_at = entry.decided_at,
 				-- Retention-only tie-break metadata (never on the wire):
-				-- legacy or malformed values backfill 0, preserving the
-				-- pre-seq strict-stamp ordering for legacy entries rather
-				-- than dropping a receipt over metadata.
+				-- Missing or malformed sequence values use 0; comparison
+				-- still requires strict decision-timestamp ordering.
 				decision_seq = (type(entry.decision_seq) == "number"
 					and entry.decision_seq >= 0)
 					and math.floor(entry.decision_seq) or 0,
