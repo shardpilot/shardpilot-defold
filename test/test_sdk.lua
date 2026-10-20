@@ -7784,7 +7784,7 @@ end
 -- record and the receipt's actor_identifier/anonymous_id snapshot; max+1 is
 -- rejected with the previous identity retained — never truncated, since
 -- truncation could collide distinct identities. Out-of-bounds config
--- config identities follow the same invalid-input fallback rules.
+-- identities follow the same invalid-input fallback rules.
 local function test_identifier_byte_clamp_boundary()
 	reset()
 	storage.reset()
