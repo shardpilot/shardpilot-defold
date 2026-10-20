@@ -2,6 +2,8 @@
 
 ### Unreleased
 
+- A bounded shutdown whose own spool write outlasts its deadline answers `false, "pending"` with the remnant on disk, instead of `false, "shutdown"`.
+
 - Removed unwrapped remote-config body acceptance for replies and cached records; malformed refreshes preserve the last valid wrapped snapshot.
 
 - Removed stored-receipt kind backfill and missing anonymous-snapshot acceptance; incomplete metadata keeps the trail unaccounted.
