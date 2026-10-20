@@ -2,6 +2,9 @@
 
 ### Unreleased
 
+- Pending crash replay requires encoded bodies and their original token, timestamp and fatal marker.
+- Removed replay conversion from root `source` to `component`; retries preserve the exact encoded report body.
+
 - Removed replay-time platform conversion; stored envelopes retain the platform chosen when they were built.
 
 - Removed spool event-name conversions and the obsolete wire-name stamp. Replay preserves stored event names.

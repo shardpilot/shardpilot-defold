@@ -3792,7 +3792,7 @@ local function test_pending_ttl_discards_stale_report()
 
 	-- A report stamped well over the TTL ago (relative to the SDK clock's "now").
 	local stale_token = storage.save_pending_crash(scope, pending_body_entry("STALE"),
-		nil, clock.unix_ms() - (seven_days_ms + 60000))
+		clock.unix_ms() - (seven_days_ms + 60000))
 	assert_true(type(stale_token) == "string", "the stale report was persisted")
 	-- On read it is discarded as a stale retry.
 	assert_equal(#storage.load_pending_crashes(scope), 0,
@@ -3811,12 +3811,12 @@ local function test_pending_ttl_discards_stale_report()
 	local within_scope = { app_id = "ttl-within-app" }
 	-- a 10-minute margin inside the window absorbs the test clock's per-call drift
 	local within = storage.save_pending_crash(within_scope, pending_body_entry("WITHIN"),
-		nil, now - (seven_days_ms - 600000))
+		now - (seven_days_ms - 600000))
 	assert_true(type(within) == "string")
 	assert_equal(#storage.load_pending_crashes(within_scope), 1, "a report within the TTL window survives")
 	local past_scope = { app_id = "ttl-past-app" }
 	local just_past = storage.save_pending_crash(past_scope, pending_body_entry("PAST"),
-		nil, now - (seven_days_ms + 60000))
+		now - (seven_days_ms + 60000))
 	assert_true(type(just_past) == "string")
 	assert_equal(#storage.load_pending_crashes(past_scope), 0, "a report just past the TTL window is discarded")
 
@@ -3824,62 +3824,29 @@ local function test_pending_ttl_discards_stale_report()
 	storage.reset()
 end
 
--- A legacy bare-record entry (a prepared report written with no { token } wrapper
--- by an older build) is adopted with a freshly minted token that is WRITTEN BACK,
--- so a later read returns the SAME token and remove_pending_crash can settle it. A
--- read that minted a different token each time would never match and resend forever.
-local function test_legacy_bare_record_token_persisted()
-	reset()
-	storage.reset()
-	local stores = {}
-	local saved_get = sys.get_save_file
-	local saved_save = sys.save
-	local saved_load = sys.load
-	sys.get_save_file = function(application_id, file_name)
-		return application_id .. "/" .. file_name
+-- A current entry survives beside each unreadable shape without inferred metadata.
+local function test_pending_crash_requires_current_record_shape()
+	reset(); storage.reset()
+	local restore, stores = install_fake_sys_storage()
+	local scope = { app_id = "pending-shape-app" }
+	local token = assert(storage.save_pending_crash(scope, pending_body_entry("CURRENT")))
+	local path
+	for name in pairs(stores) do if name:find("pending%-crashes") then path = name end end
+	assert_true(path ~= nil, "current writer resolves the pending path")
+	local current = stores[path].items[1]
+	for _, field in ipairs({ "body", "token", "created_at", "fatal" }) do
+		local malformed = {}
+		for key, value in pairs(current) do malformed[key] = value end
+		malformed[field] = nil
+		stores[path] = { items = { current, malformed } }
+		storage.reset()
+		local loaded = storage.load_pending_entries(scope)
+		assert_equal(#loaded, 1, "missing " .. field .. " is unreadable")
+		assert_equal(loaded[1].token, token, "the current sibling stays addressable")
+		assert_equal(loaded[1].body, current.body, "the current body stays exact")
+		assert_equal(#stores[path].items, 1, "unreadable entry is pruned durably")
 	end
-	sys.save = function(path, record)
-		stores[path] = record
-		return true
-	end
-	sys.load = function(path)
-		return stores[path]
-	end
-
-	local scope = { app_id = "legacy-app" }
-	-- Seed a bare record at the actual path chosen by the store. This tests
-	-- entry-shape adoption within the current namespace, not a path migration.
-	local ns
-	sys.get_save_file = function(application_id, file_name)
-		ns = application_id
-		return application_id .. "/" .. file_name
-	end
-	storage.load_pending_entries(scope)
-	assert_true(type(ns) == "string", "real pending path was resolved")
-	stores[ns .. "/identity"] = { items = { { exception = { type = "LEGACY" } } } }
-
-	-- First read adopts a token and writes it back.
-	local entries1 = storage.load_pending_entries(scope)
-	assert_equal(#entries1, 1, "the legacy bare report is adopted")
-	local token1 = entries1[1].token
-	assert_true(type(token1) == "string", "the adopted entry has a token")
-	assert_equal(entries1[1].report.exception.type, "LEGACY")
-
-	-- A SECOND read must return the SAME token (it was persisted, not re-minted).
-	local entries2 = storage.load_pending_entries(scope)
-	assert_equal(#entries2, 1)
-	assert_equal(entries2[1].token, token1,
-		"a re-read must return the persisted token, not a freshly minted one")
-
-	-- Removing by that token actually settles the entry (no endless resend).
-	assert_true(storage.remove_pending_crash(scope, token1))
-	assert_equal(#storage.load_pending_entries(scope), 0,
-		"removing by the adopted token must settle the legacy entry")
-
-	sys.get_save_file = saved_get
-	sys.save = saved_save
-	sys.load = saved_load
-	storage.reset()
+	restore(); storage.reset()
 end
 
 -- ── dotted identity-key aliases are stripped from the wire ───────────────────
@@ -4682,61 +4649,27 @@ local function test_pending_total_bytes_budget_evicts()
 	storage.reset()
 end
 
--- A legacy pending entry that stored a prepared-report TABLE (written by an
--- older build) is still resent — encoded once at dispatch — and settles.
-local function test_legacy_report_table_entry_resent_and_settled()
-	reset()
-	local restore = install_fake_sys_storage()
-	local scope = { app_id = "legacy-entry-app" }
-
-	-- Plant a legacy-shaped record (a bare prepared report, no body) at the
-	-- exact namespace path the store resolves — probed through
-	-- sys.get_save_file so the test never guesses the hashing scheme.
-	local ns_probe = nil
-	local saved_get = sys.get_save_file
-	sys.get_save_file = function(application_id, file_name)
-		if application_id:find("pending%-crashes") then
-			ns_probe = application_id .. "/" .. (file_name or "identity")
-		end
-		return saved_get(application_id, file_name)
+-- A fresh encoding failure is accounted once and leaves no in-flight request.
+local function test_fresh_crash_encode_failure_settles()
+	for _, failure in ipairs({ "missing", "throws" }) do
+		reset(); storage.reset()
+		local client = assert(crash.new(config({ crash_sample_every = 1 })))
+		local previous = json
+		json = failure == "throws" and {
+			encode = function() error("synthetic encoder failure") end,
+			decode = previous.decode,
+		} or nil
+		local called, ok, err = pcall(client.emit_fatal, client, presymbolicated_event())
+		json = previous
+		assert_true(called, "encoder setup failure stays inside the client")
+		assert_equal(ok, false)
+		assert_equal(err, failure == "missing" and "json_unavailable" or "json_encode_failed")
+		assert_equal(#requests, 0, "no request starts without an encoded body")
+		assert_equal(client.in_flight, 0, "synchronous failure settles the request")
+		assert_equal(client:snapshot().emitted, 1)
+		assert_equal(client:snapshot().rejected, 1)
+		assert_true(client:shutdown())
 	end
-	storage.load_pending_entries(scope) -- resolves + records the namespace path
-	sys.get_save_file = saved_get
-	assert_true(ns_probe ~= nil, "the pending namespace path was resolved")
-	assert_true(sys.save(ns_probe, { items = {
-		{ exception = { type = "lua_error", reason = "LEGACY" }, platform = "linux",
-		  app = { id = "legacy-entry-app" }, crash_id = "legacy-1",
-		  threads = { { id = "main", crashed = true,
-			frames = { { index = 0, ["function"] = "game.update" } } } },
-		  occurred_at = "2026-01-01T00:00:00Z" },
-	} }), "the legacy record is planted")
-
-	-- The FIRST resend adopts the legacy entry into the byte-identical
-	-- contract: it fails retryably here, and the stored entry must now
-	-- carry the encoded body under the same token.
-	reset()
-	next_status = 500
-	local client = assert(crash.new(config({ app_key = "legacy-entry-app", crash_sample_every = 1 })))
-	client:resend_pending()
-	assert_equal(#requests, 1, "the legacy entry was attempted")
-	local first_body = requests[1].body
-	assert_contains(first_body, '"LEGACY"')
-	local adopted = storage.load_pending_entries(scope)
-	assert_equal(#adopted, 1, "the retryable failure kept the entry")
-	assert_equal(adopted[1].body, first_body,
-		"the adoption persisted the exact first-attempt bytes under the same token")
-
-	-- The next pass re-sends those SAME bytes and settles.
-	reset()
-	next_status = 202
-	local client2 = assert(crash.new(config({ app_key = "legacy-entry-app", crash_sample_every = 1 })))
-	client2:resend_pending()
-	assert_equal(#requests, 1, "the adopted entry is resent")
-	assert_equal(requests[1].body, first_body, "byte-identical to the first attempt")
-	assert_equal(#storage.load_pending_crashes(scope), 0, "the accepted entry settled")
-
-	restore()
-	storage.reset()
 end
 
 -- With Defold's ASYNC http callbacks, a fresh dump must never race the
@@ -4923,64 +4856,6 @@ local function test_tokenless_accept_clears_retry_after_window()
 	storage.reset()
 end
 
--- A token REFRESH (the legacy-entry adoption path) runs through the same
--- total-byte budget as an append: a pre-budget sidecar shrinks toward the
--- bound instead of skipping enforcement.
-local function test_token_refresh_enforces_byte_budget()
-	reset()
-	local restore = install_fake_sys_storage()
-	local scope = { app_id = "refresh-budget-app" }
-
-	-- Plant SEVEN wrapped legacy TABLE entries (~60 KB of string scalars
-	-- each — over the 384 KB budget in aggregate, which predates it).
-	local ns_probe = nil
-	local saved_get = sys.get_save_file
-	sys.get_save_file = function(application_id, file_name)
-		if application_id:find("pending%-crashes") then
-			ns_probe = application_id .. "/" .. (file_name or "identity")
-		end
-		return saved_get(application_id, file_name)
-	end
-	storage.load_pending_entries(scope)
-	sys.get_save_file = saved_get
-	assert_true(ns_probe ~= nil, "the pending namespace path was resolved")
-	local items = {}
-	for i = 1, 7 do
-		items[i] = {
-			token = "legacy-" .. i,
-			report = { crash_id = "L" .. i, blob = string.rep("z", 60 * 1024) },
-			created_at = require("shardpilot.clock").unix_ms(),
-		}
-	end
-	assert_true(sys.save(ns_probe, { items = items }), "the legacy over-budget sidecar is planted")
-
-	-- Refresh the OLDEST entry with an encoded body under its own token: the
-	-- shared enforcement must evict toward the budget rather than write the
-	-- still-over list back untouched.
-	local refreshed = storage.save_pending_crash(scope,
-		{ body = '{"crash_id":"L1","blob":"' .. string.rep("z", 60 * 1024) .. '"}', crash_id = "L1", fatal = true },
-		"legacy-1")
-	assert_equal(refreshed, "legacy-1", "the refresh persisted under the same token")
-	local entries = storage.load_pending_entries(scope)
-	local total = 0
-	local has_refreshed = false
-	for i = 1, #entries do
-		if entries[i].token == "legacy-1" then
-			has_refreshed = true
-		end
-		if type(entries[i].body) == "string" then
-			total = total + #entries[i].body
-		elseif type(entries[i].report) == "table" then
-			total = total + 60 * 1024 -- the planted blob dominates
-		end
-	end
-	assert_true(has_refreshed, "the refreshed entry survived enforcement")
-	assert_true(total <= 384 * 1024, "the refresh shrank the sidecar toward the byte budget")
-	assert_true(#entries < 7, "older entries were evicted to fit")
-
-	restore()
-	storage.reset()
-end
 
 -- The resend pass merges memory-retained and on-disk reports by ACTUAL age:
 -- an older report whose durable save failed must go out before a newer one
@@ -5535,10 +5410,10 @@ local function test_disabled_client_prunes_expired_pending_on_init()
 	local eight_days_ms = 8 * 24 * 60 * 60 * 1000
 	assert_true(storage.save_pending_crash(scope,
 		{ body = '{"crash_id":"stale-one"}', crash_id = "stale-one", fatal = true },
-		nil, now_ms - eight_days_ms) ~= nil)
+		now_ms - eight_days_ms) ~= nil)
 	assert_true(storage.save_pending_crash(scope,
 		{ body = '{"crash_id":"fresh-one"}', crash_id = "fresh-one", fatal = true },
-		nil, now_ms) ~= nil)
+		now_ms) ~= nil)
 	assert_true(storage.save_crash_settings(scope, { crash_enabled = false }))
 
 	local client = assert(crash.new(config({ crash_sample_every = 1 })))
@@ -5580,22 +5455,6 @@ local function test_singleton_set_enabled_flow()
 	assert_true(crash.shutdown())
 end
 
-local function test_component_replay_structural_keys()
-	local transport_mod = require("shardpilot.crash.transport")
-	for _, row in ipairs({
-		{ '{"metadata":{"source":"nested"},"source":"game-client"}', '{"metadata":{"source":"nested"},"component":"game-client"}' },
-		{ '{"so\\u0075rce":"game-client"}', '{"component":"game-client"}' },
-		{ '{"source":"game-client","component":"main-server"}', false },
-		{ '{"source":"game-client","so\\u0075rce":"main-server"}', false },
-		{ '{"source":null}', false },
-		{ '{"source":"Bad_Slug"}', false },
-		{ '{"component":"game-client"}', '{"component":"game-client"}' },
-		{ '{"source":"game-client","metadata":{"x":01}}', false },
-		{ '{"source":"game-client","metadata":{"x":1.25e-3}}', '{"component":"game-client","metadata":{"x":1.25e-3}}' },
-	}) do
-		assert_equal(transport_mod.migrate_component(row[1]), row[2] or nil)
-	end
-end
 
 local function test_component_option_precedence()
 	for _, row in ipairs({ { "game-client", "game-client" }, { "", nil }, { "  ", nil }, { " game-client ", "game-client" } }) do
@@ -5608,48 +5467,29 @@ local function test_component_option_precedence()
 	assert_equal(err, "invalid_crash_component")
 end
 
-local function test_legacy_component_replay_and_ambiguity()
-	for _, shape in ipairs({ "body", "report", "both" }) do
-		reset()
-		storage.reset()
+local function test_current_component_replay_preserves_body()
+	for _, component in ipairs({ "game-client", "main-server", "" }) do
+		reset(); storage.reset()
 		local restore = install_fake_sys_storage()
-		local producer = assert(crash.new(config({ crash_component = "game-client", crash_sample_every = 1 })))
+		next_status = 503
+		local producer = assert(crash.new(config({ crash_component = component, crash_sample_every = 1 })))
 		assert_true(producer:emit_fatal(presymbolicated_event({ metadata = { source = "nested-preserved" } })))
-		local fresh = requests[1].body
-		local legacy = fresh:gsub('"component":"game%-client"', '"source":"game-client"', 1)
-		if shape == "both" then legacy = legacy:gsub("^{", '{"component":"main-server",', 1) end
-		local record = { body = legacy, crash_id = json.decode(fresh).crash_id, fatal = true }
+		local body = requests[1].body
 		local scope = producer:pending_scope()
-		if shape == "report" then
-			local ns, saved_get = nil, sys.get_save_file
-			sys.get_save_file = function(application_id, file_name)
-				if application_id:find("pending%-crashes") then ns = application_id .. "/" .. (file_name or "identity") end
-				return saved_get(application_id, file_name)
-			end
-			storage.load_pending_entries(scope)
-			sys.get_save_file = saved_get
-			assert_true(ns ~= nil)
-			assert_true(sys.save(ns, { items = { json.decode(legacy) } }))
-		else
-			assert_true(storage.save_pending_crash(scope, record) ~= nil)
-		end
-		storage.reset()
-		requests = {}
-		local consumer = assert(crash.new(config({ crash_sample_every = 1 })))
+		local pending = storage.load_pending_entries(scope)
+		assert_equal(#pending, 1, "current capture writes before dispatch")
+		assert_equal(pending[1].body, body, "the pending body equals the first attempt")
+		storage.reset(); requests = {}; next_status = 202
+		local consumer = assert(crash.new(config({ crash_component = "different-component", crash_sample_every = 1 })))
 		assert_true(consumer:resend_pending())
-		if shape == "both" then
-			assert_equal(#requests, 0, "ambiguous record never dispatched")
-			local retained = storage.load_pending_entries(scope)
-			assert_equal(#retained, 1)
-			assert_equal(retained[1].body, legacy, "ambiguous body retained unchanged")
-		else
-			assert_equal(#requests, 1, "old record reached transport")
-			local expected = shape == "report" and json.encode(json.decode(legacy)):gsub('"source":"game%-client"', '"component":"game-client"', 1) or fresh
-			assert_equal(requests[1].body, expected, "legacy replay changes only root key")
-			assert_equal(#storage.load_pending_crashes(scope), 0, "accepted record drains")
-		end
-		restore()
-		storage.reset()
+		assert_equal(#requests, 1)
+		assert_equal(requests[1].body, body, "replay preserves the exact encoded body")
+		local decoded = json.decode(body)
+		assert_equal(decoded.source, nil)
+		assert_equal(decoded.component, component ~= "" and component or nil)
+		assert_equal(decoded.metadata.source, "nested-preserved")
+		assert_equal(#storage.load_pending_crashes(scope), 0, "accepted replay settles")
+		restore(); storage.reset()
 	end
 end
 
@@ -5795,9 +5635,8 @@ local tests = {
 	platform_vocabulary_tests[2],
 	platform_vocabulary_tests[3],
 	platform_vocabulary_tests[4],
-	test_component_replay_structural_keys,
 	test_component_option_precedence,
-	test_legacy_component_replay_and_ambiguity,
+	test_current_component_replay_preserves_body,
 	test_component_wire_rejects_retired_key,
 	test_config_validation,
 	test_source_stamped_on_every_report,
@@ -5908,7 +5747,7 @@ local tests = {
 	test_oversized_pending_list_evicts_until_write_succeeds,
 	test_pending_persistence_safe_without_sys_api,
 	test_pending_ttl_discards_stale_report,
-	test_legacy_bare_record_token_persisted,
+	test_pending_crash_requires_current_record_shape,
 	test_dotted_identity_key_aliases_stripped,
 	test_non_boolean_thread_crashed_normalized,
 	test_thread_id_pii_redefaulted_fatal_not_dropped,
@@ -5933,14 +5772,13 @@ local tests = {
 	test_retry_after_window_cleared_on_accept_and_absurd_dropped,
 	test_pending_eviction_prefers_non_fatal,
 	test_pending_total_bytes_budget_evicts,
-	test_legacy_report_table_entry_resent_and_settled,
+	test_fresh_crash_encode_failure_settles,
 	test_dump_forward_queues_behind_pending_pass,
 	test_non_fatal_save_never_displaces_fatal_backlog,
 	test_memory_fallback_bounded_and_fatal_shielded,
 	test_memory_fallback_honors_byte_caps,
 	test_memory_fallback_resends_oldest_first,
 	test_tokenless_accept_clears_retry_after_window,
-	test_token_refresh_enforces_byte_budget,
 	test_resend_merges_memory_and_disk_by_age,
 	test_live_non_fatal_defers_into_stored_window,
 	test_live_non_fatal_queues_behind_active_pass,

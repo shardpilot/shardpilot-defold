@@ -976,11 +976,10 @@ function Client:resend_pending()
 		for i, entry in ipairs(entries) do
 			if type(entry) == "table" and type(entry.token) == "string" and
 				not self.tokens_in_flight[entry.token] and
-				(type(entry.body) == "string" or type(entry.report) == "table") then
+				type(entry.body) == "string" and entry.body ~= "" then
 				queue[#queue + 1] = {
 					token = entry.token,
 					body = entry.body,
-					report = entry.report,
 					crash_id = entry.crash_id,
 					fatal = entry.fatal,
 					created_at = type(entry.created_at) == "number" and entry.created_at or 0,
@@ -1005,7 +1004,6 @@ function Client:resend_pending()
 			queue[#queue + 1] = {
 				token = token,
 				body = entry.body,
-				report = entry.report,
 				fatal = entry.fatal,
 				created_at = type(entry.created_at) == "number" and entry.created_at or 0,
 				store_rank = 1,
@@ -1087,9 +1085,8 @@ function Client:resend_pending()
 	return true
 end
 
--- Dispatch one pending entry — the exact persisted wire body when present
--- (byte-identical to the original attempt), or a legacy prepared-report
--- table encoded at dispatch. Mirrors the in-flight bookkeeping and stats of
+-- Dispatch an exact pending wire body, or account for a fresh encode failure.
+-- Mirrors the in-flight bookkeeping and stats of
 -- a fresh emit. `entry.token` (when set) addresses the pending copy: it is
 -- removed once the send is accepted (clearing any stored backpressure
 -- deadline — the endpoint is taking traffic again) or terminally rejected,
@@ -1119,37 +1116,6 @@ function Client:dispatch_pending(entry, on_settled)
 		return false, "crash_disabled"
 	end
 	local pending_token = entry.token
-	-- ADOPT a legacy entry (a prepared-report table persisted by an older
-	-- build) into the byte-identical contract at its FIRST resend: encode
-	-- once and refresh the stored entry in place under the same token, so a
-	-- retryable failure retries the SAME bytes on every later attempt
-	-- instead of re-encoding the table each time (table key order is not
-	-- guaranteed stable across encodes/runtimes). A failed refresh only
-	-- costs that guarantee for this entry — the dispatch below proceeds
-	-- with the just-encoded body either way.
-	if type(entry.body) ~= "string" and type(entry.report) == "table" then
-		local adopted = transport.encode(entry.report)
-		if adopted then
-			entry.body = adopted
-			local crash_id = entry.crash_id
-			if type(crash_id) ~= "string" then
-				crash_id = type(entry.report.crash_id) == "string" and entry.report.crash_id or nil
-			end
-			if type(pending_token) == "string" and pending_token:sub(1, 4) ~= "mem:" then
-				storage.save_pending_crash(self:pending_scope(),
-					{ body = adopted, crash_id = crash_id, fatal = entry.fatal == true },
-					pending_token)
-			end
-		end
-	end
-	if type(entry.body) == "string" then
-		local migrated = transport.migrate_component(entry.body)
-		if not migrated then
-			if on_settled then on_settled(false) end
-			return false, "ambiguous_crash_component"
-		end
-		entry.body = migrated
-	end
 	self.stats.emitted = self.stats.emitted + 1
 	self.in_flight = self.in_flight + 1
 	local epoch_at_dispatch = self.backpressure_epoch
@@ -1240,8 +1206,8 @@ function Client:dispatch_pending(entry, on_settled)
 	if type(entry.body) == "string" and entry.body ~= "" then
 		dispatched = transport.ingest_body(self.config, self.config.crash_key, entry.body, handle)
 	else
-		-- A legacy pending entry (or a fresh report whose encode failed —
-		-- the transport then reports the same setup failure it always did).
+		-- A fresh report whose first encode failed still settles through the
+		-- transport's synchronous setup-failure callback.
 		dispatched = transport.ingest(self.config, self.config.crash_key, entry.report, handle)
 	end
 	if not dispatched then
