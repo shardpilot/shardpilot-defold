@@ -6150,6 +6150,10 @@ local function test_consent_outbox_cap_evicts_oldest_pure_grants_first()
 	-- parameter could not carry: removing an acknowledged receipt is not an
 	-- overflow, and counting it as one would page on ordinary delivery.
 	local before = client:snapshot().consent_outbox_evicted
+	assert_true(client:flush_consent_outbox())
+	client:remove_consent_receipt(client.consent_outbox[1].idempotency_key)
+	assert_equal(#client.consent_outbox, 31)
+	assert_equal(client:snapshot().consent_outbox_evicted, before)
 	assert_true(client:record_outbox_op(true, nil, nil))
 	assert_equal(client:snapshot().consent_outbox_evicted, before,
 		"a drop is not an eviction")
@@ -10181,54 +10185,6 @@ local tests = {
 		"re-resolving still happens -- it is only withheld while a write is owed")
 	restore5(); storage.reset()
 
-	-- J. AN OVER-CAP RECORD CONVERGES ON THE NEXT WRITE. The loader keeps one on
-	--    purpose so identity filtering runs over the whole of it; a drop that
-	--    wrote its list straight through left it over the bound forever.
-	reset(); storage.reset()
-	local stores6, restore6 = install_stub_sys_storage()
-	assert_true(storage.append_consent_receipt(identity_scope, rec("seed")))
-	local p6
-	for p in pairs(stores6) do if p:sub(-15) == "/consent-outbox" then p6 = p end end
-	local oversized = {}
-	for i = 1, 40 do oversized[i] = rec("legacy-" .. i) end
-	stores6[p6] = { receipts = oversized }
-	storage.reset()
-	assert_equal(#storage.consent_outbox_receipts(identity_scope), 40,
-		"the loader keeps all forty -- filtering has to see them")
-	assert_true(storage.drop_consent_receipts(identity_scope, { "legacy-1" }))
-	assert_equal(#stores6[p6].receipts, 32,
-		"and the next write brings it to the documented bound rather than 39")
-
-	-- the FLUSH path converges it too, and needs its own case: a client whose
-	-- only pending action is an owed write never calls drop, so a cap enforced
-	-- on one path and not the other leaves that client over the bound forever.
-	stores6[p6] = { receipts = oversized }
-	storage.reset()
-	assert_equal(#storage.consent_outbox_receipts(identity_scope), 40)
-	local okf, _, capped_f = storage.flush_consent_outbox(identity_scope)
-	assert_true(okf)
-	assert_equal(#stores6[p6].receipts, 32,
-		"flush converges it as well -- the bound is a property of the record, not of one entry point")
-	assert_equal(capped_f, 8,
-		"and it SAYS what that cost: a client whose only pending action is an owed write never calls drop, so these are the only evictions it would ever see")
-
-	-- THROUGH THE CLIENT'S OWN FLUSH, so the forwarding is observed and not just
-	-- the storage return. A first version asserted the storage value alone and
-	-- the mutant that drops the forwarding stayed green.
-	local issues6 = {}
-	local c6 = assert(sdk.new(config_mode_a({
-		flush_interval_seconds = 9999,
-		diagnostics = function(i) issues6[#issues6 + 1] = i end,
-	})))
-	stores6[p6] = { receipts = oversized }
-	require("shardpilot.storage").reset() -- clear shadows while the client stays live
-	c6.consent_outbox = storage.consent_outbox_receipts(identity_scope)
-	assert_true(c6:flush_consent_outbox())
-	assert_equal(c6:snapshot().consent_outbox_evicted, 8,
-		"the client counts them, which is the only place an operator sees them")
-	assert_equal(issues6[#issues6].code, "outbox_overflow")
-	restore6(); storage.reset()
-
 	-- K. THE REASON A WRITE IS OUTSTANDING DECIDES WHAT A SESSION DOES. One
 	--    boolean answered two questions that come apart exactly where it
 	--    matters: a REFUSED write means disk is behind and re-reading loses
@@ -10291,34 +10247,6 @@ local tests = {
 		"the adopted debt was discharged: the receipt reached disk instead of dying with the process")
 	assert_true(first ~= nil)
 	restore8(); storage.reset()
-
-	-- M. A CAP EVICTION DURING A DROP IS STILL AN EVICTION. Acknowledging one
-	--    receipt can discard several others nobody asked to drop, and the
-	--    intentional removal count is a different number entirely.
-	reset(); storage.reset()
-	local issues2 = {}
-	local stores9, restore9 = install_stub_sys_storage()
-	local c9 = assert(sdk.new(config_mode_a({
-		flush_interval_seconds = 9999,
-		diagnostics = function(i) issues2[#issues2 + 1] = i end,
-	})))
-	local p9
-	assert_true(storage.append_consent_receipt(identity_scope, rec("seed9")))
-	for p in pairs(stores9) do if p:sub(-15) == "/consent-outbox" then p9 = p end end
-	local big = {}
-	for i = 1, 40 do big[i] = rec("legacy-" .. i) end
-	stores9[p9] = { receipts = big }
-	require("shardpilot.storage").reset() -- clear shadows while the client stays live
-	-- THROUGH THE CALL SITE, not by handing the count to the reporter directly.
-	-- A first version called `record_outbox_op` itself and left the forwarding
-	-- in `remove_consent_receipt` unobserved -- the mutant that drops it stayed
-	-- green, which by this repo's standard makes that fix a claim.
-	c9.consent_outbox = storage.consent_outbox_receipts(identity_scope)
-	c9:remove_consent_receipt("legacy-1")
-	assert_equal(c9:snapshot().consent_outbox_evicted, 7,
-		"capping 39 down to 32 discarded seven nobody asked to drop, and they are counted")
-	assert_equal(issues2[#issues2].code, "outbox_overflow")
-	restore9(); storage.reset()
 
 	-- N. THE HOLD BELONGS TO THE TRAIL, NOT TO A CLIENT. Two clients for one
 	--    scope share the resolution, so a hold taken from one client's flag let

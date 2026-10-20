@@ -2036,7 +2036,9 @@ separate prerequisites; the client does not prove the notice was displayed.
   never traded for a grant, and a grant receipt evicted before dispatch
   would open the local pipeline with no grant row ever reaching the
   server); retry once the outbox drains. Denial appends still apply at the
-  cap (an all-denials overflow evicts the oldest denial). `shutdown()` completes
+  cap (an all-denials overflow evicts the oldest denial). The append enforces
+  this bound; acknowledgment removals and owed-write retries preserve the retained
+  list. `shutdown()` completes
   over a durably retained receipt (it re-sends next launch — a receipt still
   in flight at teardown never chains further requests). A receipt that cannot
   be durably captured is retried until the deadline; then the client tears

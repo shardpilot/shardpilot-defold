@@ -1429,9 +1429,9 @@ local function construct(config, normalized)
 					dropped_keys[#dropped_keys + 1] = client.consent_outbox[i].idempotency_key
 				end
 			end
-			local ok, reason, capped_out = storage.drop_consent_receipts(client.config,
+			local ok, reason = storage.drop_consent_receipts(client.config,
 				dropped_keys)
-			client:record_outbox_op(ok, reason, capped_out)
+			client:record_outbox_op(ok, reason)
 			client:diagnose({
 				scope = "consent",
 				status = "dropped",
@@ -5111,8 +5111,8 @@ end
 -- salvageable subset over it destroys that evidence with an ordinary
 -- acknowledgment rather than with anything resembling a decision.
 function Client:flush_consent_outbox()
-	local ok, reason, capped_out = storage.flush_consent_outbox(self.config)
-	return self:record_outbox_op(ok, reason, capped_out)
+	local ok, reason = storage.flush_consent_outbox(self.config)
+	return self:record_outbox_op(ok, reason)
 end
 
 -- Drop one delivered (or terminally rejected) receipt from the mirror and
@@ -5126,12 +5126,9 @@ function Client:remove_consent_receipt(idempotency_key)
 	-- distinguish this deliberate removal from a receipt the caller simply had
 	-- not seen, so the storage layer had to guess -- and guessing wrong here
 	-- restores an acknowledged receipt and re-sends it forever.
-	-- THE THIRD RESULT IS CAP EVICTIONS, not the intentional removal count --
-	-- capping an over-cap legacy record can discard undelivered receipts that
-	-- nobody asked to drop, and passing nil here made that silent.
-	local ok, reason, capped_out = storage.drop_consent_receipts(self.config,
+	local ok, reason = storage.drop_consent_receipts(self.config,
 		{ idempotency_key })
-	self:record_outbox_op(ok, reason, capped_out)
+	self:record_outbox_op(ok, reason)
 end
 
 -- True when the durable consent outbox still RETAINS a denial-carrying

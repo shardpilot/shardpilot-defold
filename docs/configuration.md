@@ -752,7 +752,9 @@ The **consent-receipt outbox** is separate from the spool and has one
 configuration knob (below): undelivered `POST /v1/consent` receipts are
 always retained durably (fixed cap of 32, denial-preferring eviction —
 oldest pure grant first, denials only among denials — no TTL) and retried
-until acknowledged. `spool_enabled = false` does not affect it, and — unlike
+until acknowledged. The bound is enforced when receipts enter the outbox;
+acknowledgment removals and owed-write retries preserve the retained list.
+`spool_enabled = false` does not affect it, and — unlike
 the spool — it is never consent-purged: receipts deliver under denied and
 unknown states alike, because a receipt documents the decision itself. See
 `docs/privacy.md`.

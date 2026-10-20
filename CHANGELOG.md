@@ -2,6 +2,8 @@
 
 ### Unreleased
 
+- Removed over-capacity stored-receipt rewrites during removal and retry; fresh append bounds and eviction reporting remain.
+
 - Assignment replies and cached entries require complete serving pins; revision zero and a false kill gate remain valid.
 - Removed subject backfill for cached assignments and scope-less numeric clear-marker handling; incomplete caches are dropped and unreadable markers fail closed.
 
