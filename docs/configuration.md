@@ -757,7 +757,9 @@ acknowledgment removals and owed-write retries preserve the retained list.
 `spool_enabled = false` does not affect it, and — unlike
 the spool — it is never consent-purged: receipts deliver under denied and
 unknown states alike, because a receipt documents the decision itself. See
-`docs/privacy.md`.
+`docs/privacy.md`. Every persisted receipt requires its actor `kind` and
+decision-time anonymous-ID snapshot. Missing metadata is malformed and keeps
+the retained trail unaccounted; a normal retry cannot overwrite that evidence.
 
 - **`consent_kind_emission_enabled`** (default `true`, boolean;
   `invalid_consent_kind_emission_enabled` otherwise). Every `/v1/consent`

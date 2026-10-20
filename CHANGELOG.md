@@ -2,6 +2,8 @@
 
 ### Unreleased
 
+- Removed stored-receipt kind backfill and missing anonymous-snapshot acceptance; incomplete metadata keeps the trail unaccounted.
+
 - Removed over-capacity stored-receipt rewrites during removal and retry; fresh append bounds and eviction reporting remain.
 
 - Assignment replies and cached entries require complete serving pins; revision zero and a false kill gate remain valid.
