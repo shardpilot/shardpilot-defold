@@ -1,6 +1,7 @@
 # Contributor instructions
 
 - Keep SDK code compatible with Lua 5.1 and LuaJIT.
+- Keep non-objection snapshots separate from consent and policy authority. Assert the vendored contract profile and decoded goldens; local locale validation is structural, with registry membership decided by the server.
 - Consent advisory references are detached host data, never SDK authority or cache. Preserve validation and every strict fallback field.
 - Keep dispatch deadlines effective on asynchronous and synchronous HTTP bridges.
   Check time again after acquiring a token. Retain unsent events and answer each

@@ -2156,6 +2156,13 @@ Changes to CI or validation scripts intentionally fail `gate-integrity` and requ
   lua5.1 test/test_sdk.lua
   ```
 
+The non-objection contract scenes in `test/test_sdk.lua` read the exact bundle
+under `test/golden/` and assert its wire validation profile and decoded goldens.
+`shardpilot.non_objection` captures closed host attestations and acknowledgement
+shapes separately from consent. Its locale check is the structural BCP 47 subset;
+the server decides registry membership. A captured attestation supplies no policy
+authority or consent grant.
+
 ## Compatibility
 
 - **Engine:** Defold (uses `sys`, `http.request`); degrades to in-memory
