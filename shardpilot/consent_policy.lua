@@ -22,9 +22,10 @@
 --     outlive the session this contract scopes it to.
 --
 -- No authenticated plan means no plan authority. This build has no verifier
--- or trusted signing key, so every response is unused, including a well-formed
+-- or trusted signing key, so every plan is unused, including a well-formed
 -- plan with signature: null. Shape, scope and time validation still distinguish
--- malformed responses from well-formed unsigned ones.
+-- malformed responses from well-formed unsigned ones. A validated advisory
+-- is detached reference data for the host; it grants no SDK authority.
 --
 -- The local fallback is STRICT, default OFF, explicit grant required, crash
 -- OFF, server analytics denied and child handling minimised. Its operation
@@ -1505,7 +1506,10 @@ function M.prepare(context, callback)
 		-- Shape, scope and time checks do not authenticate a plan. No verifier
 		-- or trusted key exists in this build, so even an unsigned strict plan
 		-- must not supply restrictions or remove ones a host already enforces.
-		settle(fallback("plan_unsigned", "this build cannot authenticate a consent plan"))
+		local decision = fallback("plan_unsigned", "this build cannot authenticate a consent plan")
+		-- Read-only reference data: the host decides; the SDK never uses or caches it.
+		decision.advisory = copy_value(plan.advisory, 0)
+		settle(decision)
 	end, { ["Content-Type"] = "application/json", [sdk_header.NAME] = sdk_header.VALUE, }, encoded, { timeout = DEADLINE_SECONDS })
 end
 

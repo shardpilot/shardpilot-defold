@@ -49,7 +49,7 @@ the deeper reference.
 
 ## Install
 
-Version pin (CI-checked): this skill matches shardpilot-defold `v0.14.0`.
+Version pin (CI-checked): this skill matches shardpilot-defold `v0.15.0`.
 
 This version includes request compression, a 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history; these were absent from `v0.10.1`.
 
@@ -64,10 +64,10 @@ Two supported paths:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.14.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.15.0.zip
 ```
 
-`v0.14.0` is the version this skill matches, and it is the same pin the
+`v0.15.0` is the version this skill matches, and it is the same pin the
 README's Installation section carries.
 
 The earlier off-main `v0.10.1` tag still declares `0.10.0`; see the [changelog](../../../CHANGELOG.md).
@@ -796,8 +796,9 @@ end
 
 The local fallback is strict, default OFF, explicit grant required, crash OFF,
 server analytics denied and child handling minimised. A well-formed unsigned
-response reports `plan_unsigned`. No plan text, advisory, restriction list or
-validity window is forwarded or cached. Preserve independent host restrictions
+response reports `plan_unsigned`. A requested, validated advisory is detached
+reference data for the host, never applied or cached by the SDK. No plan text,
+restriction authority or authenticated validity window is forwarded. Preserve independent host restrictions
 and treat unknown operation blocks as closed, never as an empty authorized set.
 See the README's **Consent regime** section for the full contract.
 

@@ -510,6 +510,9 @@ jobs:
           done
           exit "$status"
 
+      - name: Consent advisory reference counterfactuals
+        run: python3 scripts/check_consent_advisory.py ${{ matrix.interpreter }}
+
       # Allocation bytes per track(), the metric that matters on a game
       # client — a per-frame allocation is somebody's GC pause, and it is the
       # one cost an engine integration cannot hide on a background thread.

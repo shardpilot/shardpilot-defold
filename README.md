@@ -18,8 +18,8 @@ not the platform boundary.
   a local stack you run yourself. Which endpoints are available today is stated
   under Configuration below and in [`docs/configuration.md`](docs/configuration.md);
   read that before configuring a hosted deployment.
-- **Version `0.14.0`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.14.0`; the `v0.14.0` tag
+- **Version `0.15.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.15.0`; the `v0.15.0` tag
   is created by the owner after the version-bump merge (pending until then).
 
 ## What it does
@@ -133,11 +133,11 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — after owner tagging, the latest tag is `v0.14.0`:
+published tag's source archive — after owner tagging, the latest tag is `v0.15.0`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.14.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.15.0.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
@@ -1647,6 +1647,9 @@ or trusted signing key. No response supplies plan authority.** A missing,
 null, empty, malformed, unknown-key or otherwise unverifiable signature keeps
 the plan unused. A well-formed plan with `signature: null` reaches the explicit
 `plan_unsigned` refusal; other validation failures retain their own reasons.
+A requested advisory may still be returned as read-only reference data after
+shape, scope and time validation. It is not cryptographically authenticated and
+changes none of the strict decision fields or the host’s existing restrictions.
 
 <!-- doc-region: none -- the consent-policy module surface, listed field by field below -->
 ```lua
@@ -1685,7 +1688,7 @@ The callback receives **exactly one decision, exactly once**:
 | `operation_blocks` | `nil`: the authenticated restriction set is unknown. **Do not coerce this to `{}` or authorize plan-dependent operations from it** |
 | `operation_blocks_source` | `none` |
 | `notice`, `policy_version`, `consent_text_version`, `presented_language`, `band_vocabulary`, `band_vocabulary_version` | `nil`; unsigned plan content is not forwarded as authority |
-| `advisory` | `nil`, including when requested; no unauthenticated estimate is forwarded |
+| `advisory` | Detached reference data when requested and fully validated; otherwise `nil`. The host decides how to use it; the SDK never applies or caches it. |
 | `valid_for_seconds` | `nil`; no authenticated plan lifetime was established |
 
 **Local strict fallback.** Missing, unreadable, out-of-scope, expired and

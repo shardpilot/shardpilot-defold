@@ -1,6 +1,7 @@
 # Contributor instructions
 
 - Keep SDK code compatible with Lua 5.1 and LuaJIT.
+- Consent advisory references are detached host data, never SDK authority or cache. Preserve validation and every strict fallback field.
 - Keep dispatch deadlines effective on asynchronous and synchronous HTTP bridges.
   Check time again after acquiring a token. Retain unsent events and answer each
   bounded flush callback once.
