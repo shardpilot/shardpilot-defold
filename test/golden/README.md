@@ -101,3 +101,13 @@ The scene runs the real setter and serializer with synthetic identifiers and
 controlled time/retry-key sources, matches the complete request bytes, and feeds
 the accepted response into the actual receipt acknowledgement path. The source
 capture used a synthetic service principal; the local fixture runs in process.
+
+## Non-objection contract
+
+`advisory-non-objection.v1.json` is an exact contract bundle with decoded
+request/response golden scenes and an asserted validation profile. SHA-256:
+`9463140ce26330158cee663fe2a11ffe1b601b88001c3562802af6c29cdaabe6`.
+Its `contract_only` status describes a wire contract, not deployed acceptance.
+The SDK snapshot covers the closed host attestation and notice/provenance fields.
+Locale validation is the structural BCP 47 subset; the server decides registry
+membership. The snapshot is separate from consent and supplies no policy authority.

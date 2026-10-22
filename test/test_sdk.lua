@@ -17949,3 +17949,137 @@ end)()
  end
  assert_equal(#failures, 0, table.concat(failures, "; "))
 end)()
+
+-- The bundle asserts the full wire profile; SDK capture deliberately checks
+-- the closed host fields and structural locale grammar, not registry membership.
+;(function()
+	local validator = require "shardpilot.non_objection"
+	local file = assert(io.open("test/golden/advisory-non-objection.v1.json", "rb"))
+	local bundle = json_decode(file:read("*a")); file:close()
+	local host_fields = { "advisory", "age_evidence_class", "attestation", "notice_version", "notice_locale", "policy_version" }
+	local host_set = {}; for _, key in ipairs(host_fields) do host_set[key] = true end
+	local passed, failures = 0, {}
+	local function scene(name, run)
+		local ok, err = pcall(run)
+		print("non-objection validation " .. name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+		if ok then passed = passed + 1 else failures[#failures + 1] = name .. ": " .. tostring(err) end
+	end
+	local function fresh()
+		local request, record = json_decode(bundle.golden.request), {}
+		for _, key in ipairs(host_fields) do record[key] = request[key] end
+		return record
+	end
+	local function at(record, path)
+		for i = 1, #path do record = record[path[i]] end
+		return record
+	end
+	local function refuse(record)
+		local copy, err = validator.snapshot(record)
+		assert_equal(copy, nil); assert_equal(err, "non_objection_invalid")
+	end
+	scene("exact profile and decoded goldens", function()
+		assert_equal(bundle.version, 1); assert_equal(bundle.status, "contract_only")
+		assert_equal(bundle.method, "POST"); assert_equal(bundle.path, "/v1/consent")
+		local expected = { assert_formats = true, required_formats = {
+			date = { kind = "date" }, ["date-time"] = { kind = "date-time" },
+			["utf8-bytes-512"] = { kind = "utf8_bytes", min_bytes = 1, max_bytes = 512 },
+			["utf8-bytes-128"] = { kind = "utf8_bytes", min_bytes = 1, max_bytes = 128 },
+			["bcp47-2-35-bytes"] = { kind = "bcp47", min_bytes = 2, max_bytes = 35 },
+		} }
+		assert_equal(encode_value(bundle.validation_profile), encode_value(expected))
+		local function formats(node)
+			if type(node) ~= "table" then return end
+			if node.format then assert_true(expected.required_formats[node.format] ~= nil, "known required format") end
+			for _, child in pairs(node) do formats(child) end
+		end
+		formats(bundle.request_schema); formats(bundle.response_schema)
+		assert_equal(bundle.request_schema.additionalProperties, false)
+		assert_equal(#bundle.request_schema.required, 15)
+		local request = json_decode(bundle.golden.request)
+		for _, key in ipairs(bundle.request_schema.required) do assert_true(request[key] ~= nil, "golden requires " .. key) end
+		assert_equal(request.admission_basis, "advisory_non_objection"); assert_equal(request.purpose, "analytics")
+		assert_equal(request.kind, "anon"); assert_equal(request.categories, nil)
+		assert_equal(encode_value(assert(validator.snapshot(fresh()))), encode_value(fresh()))
+		assert_equal(bundle.golden.response, '{"recorded":true,"replayed":false,"admission_basis":"advisory_non_objection"}\n')
+		assert_equal(encode_value(assert(validator.response(json_decode(bundle.golden.response)))), encode_value(json_decode(bundle.golden.response)))
+	end)
+	local function required(node, path)
+		for _, key in ipairs(node.required or {}) do
+			if #path > 0 or host_set[key] then
+				scene("missing " .. table.concat(path, ".") .. "." .. key, function()
+					local record = fresh(); at(record, path)[key] = nil; refuse(record)
+				end)
+				local next_path = {}; for i, part in ipairs(path) do next_path[i] = part end
+				next_path[#next_path + 1] = key
+				required(node.properties[key], next_path)
+			end
+		end
+	end
+	required(bundle.request_schema, {})
+	for _, path in ipairs({ {}, { "advisory" }, { "advisory", "matrix" }, { "attestation" } }) do
+		scene("unknown field in " .. table.concat(path, "."), function()
+			local record = fresh(); at(record, path).unexpected = true; refuse(record)
+		end)
+	end
+	for _, key in ipairs({ "workspace_key", "app_key", "environment_key", "actor_identifier", "kind", "decided_at", "idempotency_key", "purpose", "admission_basis", "categories" }) do
+		scene("host cannot supply " .. key, function() local record = fresh(); record[key] = "override"; refuse(record) end)
+	end
+	for _, key in ipairs(bundle.request_schema.properties.attestation.required) do
+		for _, value in ipairs({ false, 1, "true" }) do
+			scene("attestation " .. key .. "=" .. tostring(value), function()
+				local record = fresh(); record.attestation[key] = value; refuse(record)
+			end)
+		end
+	end
+	for case_index, case in ipairs({
+		{ { "age_evidence_class" }, "child" }, { { "age_evidence_class" }, "unknown" },
+		{ { "advisory", "jurisdiction" }, "gb" }, { { "advisory", "jurisdiction" }, "OTHER" },
+		{ { "advisory", "matrix", "docs_commit" }, string.rep("a", 39) },
+		{ { "advisory", "matrix", "file_sha256" }, string.rep("A", 64) },
+		{ { "advisory", "matrix", "date" }, "2026-02-30" }, { { "advisory", "matrix", "date" }, "1900-02-29" },
+		{ { "advisory", "row_id" }, "" }, { { "advisory", "row_id" }, string.char(255) },
+		{ { "notice_version" }, "invalid notice" }, { { "policy_version" }, string.rep("p", 65) },
+		{ { "notice_locale" }, "x" }, { { "notice_locale" }, "en_US" },
+		{ { "notice_locale" }, "en--US" }, { { "notice_locale" }, "en-a" },
+	}) do
+		scene("invalid " .. case_index .. " " .. table.concat(case[1], "."), function()
+			local record, path = fresh(), case[1]
+			local parent = {}; for i = 1, #path - 1 do parent[i] = path[i] end
+			at(record, parent)[path[#path]] = case[2]; refuse(record)
+		end)
+	end
+	scene("row bound counts Unicode scalars", function()
+		local record = fresh(); record.advisory.row_id = string.rep(string.char(240, 159, 152, 128), 64)
+		assert_true(validator.snapshot(record) ~= nil)
+		record.advisory.row_id = record.advisory.row_id .. "a"; refuse(record)
+	end)
+	scene("structural locale subset and valid leap date", function()
+		for _, locale in ipairs({ "zz", "zh-Hant-TW", "i-klingon", "x-abcdefgh-abcdefgh-abcdefgh-abcdef" }) do
+			local record = fresh(); record.notice_locale = locale; record.advisory.matrix.date = "2000-02-29"
+			assert_true(validator.snapshot(record) ~= nil, "registry membership remains a server decision")
+		end
+	end)
+	scene("snapshot is detached and validation sends nothing", function()
+		local count, record = #requests, fresh(); local captured = assert(validator.snapshot(record))
+		record.advisory.matrix.date = "bad"; record.attestation.did_not_object = false; record.notice_locale = "bad!"
+		assert_equal(captured.advisory.matrix.date, "2026-10-07"); assert_equal(captured.attestation.did_not_object, true)
+		assert_equal(captured.notice_locale, "en"); assert_equal(#requests, count)
+	end)
+	for _, field in ipairs({ "recorded", "replayed", "admission_basis" }) do
+		scene("acknowledgement requires " .. field, function()
+			local value = json_decode(bundle.golden.response); value[field] = nil
+			local copy, err = validator.response(value); assert_equal(copy, nil); assert_equal(err, "non_objection_response_invalid")
+		end)
+	end
+	for _, pair in ipairs({ { "recorded", false }, { "replayed", "false" }, { "admission_basis", "consent" }, { "categories", true } }) do
+		scene("invalid acknowledgement " .. pair[1], function()
+			local value = json_decode(bundle.golden.response); value[pair[1]] = pair[2]; assert_equal(validator.response(value), nil)
+		end)
+	end
+	scene("replay acknowledgement is accepted", function()
+		local value = json_decode(bundle.golden.response); value.replayed = true
+		assert_equal(assert(validator.response(value)).replayed, true)
+	end)
+	print(string.format("non-objection validation total: %d pass, %d fail", passed, #failures))
+	assert_equal(#failures, 0, table.concat(failures, "; "))
+end)()
