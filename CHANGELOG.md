@@ -1,6 +1,10 @@
 # Changelog
 
-### Unreleased
+## v0.15.0 — 2026-10-22
+
+- Consent preparation exposes a validated advisory reference to the host while its
+  strict defaults and unsigned-plan refusal remain unchanged. The SDK does not
+  apply or cache the estimate.
 
 - A bounded shutdown whose own spool write outlasts its deadline answers `false, "pending"` with the remnant on disk, instead of `false, "shutdown"`.
 

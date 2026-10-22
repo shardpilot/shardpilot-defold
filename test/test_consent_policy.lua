@@ -2605,7 +2605,15 @@ local function test_the_resolvers_advisory_bytes_are_understood()
 		next_response_body = advisory_body(nil, nil, form)
 		local decision = prepare(golden_advisory_context())
 		assert_unsigned(decision, "the advisory shape parses (" .. form .. ")")
-		assert_true(decision.advisory == nil, "unauthenticated advisory data is not forwarded")
+		print("advisory golden reached validation")
+		assert_true(decision.advisory ~= nil, "advisory golden reaches the host")
+		local expected = json.decode(next_response_body).advisory
+		for _, key in ipairs(ADVISORY_MEMBERS) do
+			if key ~= "matrix" then assert_equal(decision.advisory[key], expected[key], key) end
+		end
+		for _, key in ipairs(MATRIX_MEMBERS) do
+			assert_equal(decision.advisory.matrix[key], expected.matrix[key], "matrix." .. key)
+		end
 	end
 	reset()
 	next_response_body = golden("resolved")
@@ -2615,6 +2623,52 @@ end
 -- ⚠ IT NEVER CHANGES THE DECISION. The same plan with and without its advisory
 -- part — whatever the estimate — gives the same answer to every question a
 -- host branches on.
+local function test_advisory_reference_is_detached_and_not_cached()
+	reset()
+	local decode, original = json.decode, nil
+	json.decode = function(body)
+		local decoded = decode(body)
+		original = decoded.advisory
+		return decoded
+	end
+	next_response_body = golden("resolved-advisory")
+	local decision = prepare(golden_advisory_context())
+	json.decode = decode
+	assert_true(decision.advisory ~= original, "reference is detached")
+	assert_true(decision.advisory.matrix ~= original.matrix, "matrix is detached")
+	local digest = original.matrix.file_sha256
+	decision.advisory.matrix.file_sha256 = "host copy"
+	assert_equal(original.matrix.file_sha256, digest, "host mutation cannot change the response")
+	next_response_body = golden("resolved")
+	assert_true(prepare(golden_advisory_context()).advisory == nil, "reference is never cached")
+end
+
+local function test_advisory_scope_and_time_failures_stay_empty()
+	reset()
+	next_response_body = golden("resolved-advisory")
+	local ctx = golden_advisory_context()
+	ctx.app_key = "another"
+	assert_refused(prepare(ctx), "advisory scope mismatch")
+	reset()
+	local changed
+	next_response_body, changed = golden("resolved-advisory"):gsub(
+		"2026%-09%-20T12:05:00Z", "1970-01-01T00:00:00Z", 1)
+	assert_equal(changed, 1, "expiry edit applied")
+	assert_refused(prepare(golden_advisory_context()), "expired advisory")
+	for _, mode in ipairs({ "late", "invalidated" }) do
+		reset()
+		local request = http.request
+		http.request = function(...)
+			if mode == "late" then socket.now = socket.now + 3 else consent_policy.invalidate() end
+			return request(...)
+		end
+		next_response_body = golden("resolved-advisory")
+		local decision = prepare(golden_advisory_context())
+		http.request = request
+		assert_true(decision.advisory == nil, mode .. " response carries no advisory")
+	end
+end
+
 local function test_the_advisory_never_changes_the_decision()
 	reset()
 	next_response_body = golden("resolved")
@@ -2634,7 +2688,7 @@ local function test_the_advisory_never_changes_the_decision()
 		next_response_body = body
 		local with = prepare(golden_advisory_context())
 		assert_unsigned(with, variant[1] .. ": " .. tostring(with.detail))
-		assert_true(with.advisory == nil, variant[1] .. ": the advisory remains unauthenticated")
+		assert_true(with.advisory ~= nil, variant[1] .. ": the host receives reference data")
 		for _, field in ipairs({ "regime", "crash_profile", "server_analytics", "child_rules",
 			"analytics_choice_default", "explicit_grant_required", "plan_used", "reason",
 			"policy_version", "consent_text_version", "presented_language", "notice",
@@ -2682,7 +2736,7 @@ local function test_only_the_estimate_may_be_null()
 		local decision = prepare(golden_advisory_context())
 		if member == "estimate" then
 			assert_unsigned(decision, "a null estimate is the contract's own spelling: " .. tostring(decision.detail))
-			assert_true(decision.advisory == nil, "no unauthenticated advisory reaches the host")
+			assert_true(decision.advisory ~= nil and decision.advisory.estimate == nil, "null estimate retained")
 		else
 			assert_refused(decision, "a null advisory." .. member)
 			assert_true(decision.detail:find("advisory." .. member .. " is present and null", 1, true) ~= nil,
@@ -2720,7 +2774,8 @@ local function test_the_advisory_shapes_the_contract_permits()
 		next_response_body = case[2]
 		local decision = prepare(golden_advisory_context())
 		assert_unsigned(decision, case[1] .. ": " .. tostring(decision.detail))
-		assert_true(decision.advisory == nil, case[1] .. ": unauthenticated data stays unused")
+		assert_equal(decision.advisory.jurisdiction, case[3], case[1])
+		assert_equal(decision.advisory.estimate, case[4], case[1])
 	end
 end
 
@@ -3008,6 +3063,8 @@ local tests = {
 	test_the_advisory_is_asked_for_only_when_requested,
 	test_the_resolvers_advisory_bytes_are_understood,
 	test_the_advisory_never_changes_the_decision,
+	test_advisory_reference_is_detached_and_not_cached,
+	test_advisory_scope_and_time_failures_stay_empty,
 	test_every_advisory_member_is_required,
 	test_only_the_estimate_may_be_null,
 	test_the_advisory_shapes_the_contract_permits,

@@ -1,5 +1,11 @@
 # Configuration
 
+`consent_policy.prepare` can return `decision.advisory` when the request opted in
+and the response passed shape, scope and time checks. Treat its row, estimate and
+complete matrix version as read-only reference data for the host. It is not
+cryptographic plan authority: `plan_used` remains false and strict defaults remain.
+The SDK never applies or caches the advisory. Invalid or late responses carry none.
+
 ShardPilot Defold SDK v0 is configured with a Lua table. Unsupported keys,
 including misspellings, return `unknown_config_key`: `new()` returns `nil, code`
 and `init()` returns `false, code`. Validation happens before storage, token
