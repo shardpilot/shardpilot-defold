@@ -1,4 +1,4 @@
--- Trusted recording and process-local ordinary analytics admission, separate from consent.
+-- Recording and process-local ordinary analytics admission, separate from consent.
 local clock = require "shardpilot.clock"
 local id = require "shardpilot.id"
 local snapshot = require "shardpilot.non_objection"
@@ -7,7 +7,8 @@ local transport = require "shardpilot.transport"
 local M = {}
 
 local function actor(client)
-	return client.user_id or client.anonymous_id, client.user_id and "user_verified" or "anon"
+	if client.config.token_provider and client.user_id then return client.user_id, "user_verified" end
+	return client.anonymous_id, "anon"
 end
 
 local function eligible(client, operation, draining)
@@ -17,8 +18,8 @@ local function eligible(client, operation, draining)
 			and receipt.categories and receipt.categories.analytics == false then return false end
 	end
 	return client.initialized and (draining or (not client.closing and not client.non_objection_closing))
-		and client.config.token_provider ~= nil
 		and operation.generation == client.non_objection_generation
+		and operation.user_id == client.user_id
 		and client.consent_state == "unknown" and not client:outbox_write_held()
 		and not client.consent_marker_unreadable
 		and client.anonymous_id == operation.anonymous_id and who == operation.actor_identifier
@@ -110,7 +111,7 @@ function M.record(client, record, callback)
 	if generation ~= client.non_objection_generation then return refuse("non_objection_superseded") end
 	if client.non_objection then return refuse("non_objection_pending") end
 	local who, kind = actor(client)
-	local operation = { actor_identifier = who, kind = kind, anonymous_id = client.anonymous_id,
+	local operation = { actor_identifier = who, kind = kind, anonymous_id = client.anonymous_id, user_id = client.user_id,
 		workspace_id = client.config.workspace_id, app_id = client.config.app_id,
 		environment_id = client.config.environment_id, callback = callback, snapshot = captured, preparing = true,
 		generation = generation,
@@ -181,10 +182,11 @@ function M.send(client, receipt)
 		end
 		M.poll(client)
 		if client.non_objection ~= operation then return end
+		if unauthorized and not client.config.token_provider then retryable = false end
 		if ok or not retryable then
 			if ok then
 				local admission = {}
-				for _, key in ipairs({ "actor_identifier", "kind", "anonymous_id", "workspace_id", "app_id", "environment_id", "snapshot", "generation" }) do
+				for _, key in ipairs({ "actor_identifier", "kind", "anonymous_id", "user_id", "workspace_id", "app_id", "environment_id", "snapshot", "generation" }) do
 					admission[key] = operation[key]
 				end
 				client.non_objection_admission = admission

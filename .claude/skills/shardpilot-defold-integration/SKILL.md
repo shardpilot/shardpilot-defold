@@ -19,8 +19,10 @@ the deeper reference.
   `http.request`. JSON in, per-event outcomes surfaced back. No native
   extension — pure Lua source, written against Lua 5.1/LuaJIT (Defold's
   embedded runtime).
-- **Analytics admission**: an explicit grant or a fresh trusted non-objection
+- **Analytics admission**: an explicit grant or a fresh server non-objection
   ACK admits future ordinary analytics; consent stays unknown under this basis.
+  Recording uses the publishable key when no token provider is configured, with
+  an anonymous actor and server enablement, region and workspace acceptance gates.
   Basis-created events stay memory-only. See the [recording API](../../../docs/privacy.md#non-objection-recording);
   the quick start below keeps that path closed without independent host authority.
 - **Offline durability**: a bounded per-app durable event spool re-sends
@@ -51,7 +53,7 @@ the deeper reference.
 
 ## Install
 
-Version pin (CI-checked): this skill matches shardpilot-defold `v0.16.0`.
+Version pin (CI-checked): this skill matches shardpilot-defold `v0.17.0`.
 
 This version includes request compression, a 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history; these were absent from `v0.10.1`.
 
@@ -66,10 +68,10 @@ Two supported paths:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.16.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.17.0.zip
 ```
 
-`v0.16.0` is the version this skill matches, and it is the same pin the
+`v0.17.0` is the version this skill matches, and it is the same pin the
 README's Installation section carries.
 
 The earlier off-main `v0.10.1` tag still declares `0.10.0`; see the [changelog](../../../CHANGELOG.md).

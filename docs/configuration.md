@@ -876,8 +876,14 @@ an explicit host call with independently established eligibility. No init,
 prepare or tracking call enables it automatically. The SDK's advisory alone is
 insufficient; see [the closed record and callback contract](privacy.md#non-objection-recording).
 
-Configure `token_provider`: publishable-only callers are refused, and a dual
-configuration never falls back to the publishable key. The operation uses
+Without `token_provider`, recording uses `publishable_key` and the current
+anonymous actor (`kind = "anon"`), including after `identify()`. A configured
+`token_provider` keeps the trusted current-actor path; dual configuration never
+falls back to the publishable key if token acquisition fails. Device recording
+requires server enablement, a matching server-resolved `SOFT_OPT_OUT` country,
+and the workspace owner’s active acceptance. A publishable-key `401` settles
+the callback with `unauthorized` and removes the receipt; token providers retain
+refresh-and-retry behavior. The operation uses
 `http_timeout_seconds` as its deadline, including waiting for a token or an older
 receipt. Keep calling `update`; updates, dispatch points and network callbacks
 check the deadline and settle it. A transient retry retains its body/time/key. The callback

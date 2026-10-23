@@ -18084,13 +18084,15 @@ end)()
 	assert_equal(#failures, 0, table.concat(failures, "; "))
 end)()
 
--- Private engine: real client, transport and sys adapter; public admission stays closed.
+-- Real client, transport and storage scenes for separate non-objection admission.
 ;(function()
 	local file = assert(io.open("test/golden/advisory-non-objection.v1.json", "rb"))
 	local bundle = json_decode(file:read("*a")); file:close()
+	local profile_file = assert(io.open("test/golden/advisory-non-objection.publishable.v1.json", "rb"))
+	local publishable = json_decode(profile_file:read("*a")); profile_file:close()
 	local clock, ids = require "shardpilot.clock", require "shardpilot.id"
-	local function record()
-		local request, out = json_decode(bundle.golden.request), {}
+	local function record(source)
+		local request, out = json_decode((source or bundle).golden.request), {}
 		for _, key in ipairs({ "advisory", "age_evidence_class", "attestation", "notice_version", "notice_locale", "policy_version" }) do out[key] = request[key] end
 		return out
 	end
@@ -18138,21 +18140,17 @@ end)()
 		assert_equal(type(require("shardpilot.sdk").record_non_objection), "function")
 		assert_equal(#c.consent_outbox, 0)
 	end)
-	for _, mode in ipairs({ "publishable", "failed mint", "dual failed mint" }) do
+	for _, mode in ipairs({ "failed mint", "dual failed mint" }) do
 		scene(mode .. " cannot use a publishable fallback", function(start)
 			local mints = 0
 			local opts = config({ publishable_key = "sp_ingest_publishable_key", token_provider = function(cb) mints = mints + 1; cb(nil, nil, "unavailable") end })
-			if mode == "publishable" then opts.token_provider = nil end
 			if mode == "failed mint" then opts.publishable_key = nil end
 			if mode == "dual failed mint" then opts.app_url = "https://config.example.invalid" end
 			local c = new(opts); local calls, ok = start(c)
 			assert_equal(#requests, 0)
-			if mode == "publishable" then assert_equal(ok, false); settled(calls, false, "non_objection_ineligible")
-			else
-				assert_true(ok); assert_equal(mints, 1, "the real recording path attempted a trusted mint")
-				assert_true(c.non_objection ~= nil); assert_equal(#c.consent_outbox, 1)
-				socket.now = socket.now + 3; c:update(0); settled(calls, false, "non_objection_timeout")
-			end
+			assert_true(ok); assert_equal(mints, 1, "the real recording path attempted a trusted mint")
+			assert_true(c.non_objection ~= nil); assert_equal(#c.consent_outbox, 1)
+			socket.now = socket.now + 3; c:update(0); settled(calls, false, "non_objection_timeout")
 		end)
 	end
 	scene("transient retry preserves exact body and key", function(start, answer)
@@ -18368,6 +18366,104 @@ end)()
 		assert_contains(requests[index].url, "/v1/events:batch")
 		answer(index, 202, json.encode({ accepted = #json_decode(requests[index].body).events }))
 	end
+	scene("publishable contract profile and golden receipt", function()
+		assert_equal(publishable.profile, "advisory_non_objection_publishable"); assert_equal(publishable.version, 1)
+		assert_equal(publishable.base_contract.artifact, "advisory-non-objection.v1.json")
+		assert_equal(publishable.base_contract.sha256, "9463140ce26330158cee663fe2a11ffe1b601b88001c3562802af6c29cdaabe6")
+		assert_equal(publishable.method, bundle.method); assert_equal(publishable.path, bundle.path)
+		assert_equal(publishable.authentication.header, "Authorization"); assert_equal(publishable.authentication.scheme, "Bearer")
+		assert_equal(publishable.authentication.credential, "workspace_publishable_ingest_key")
+		assert_equal(publishable.actor.kind, "anon"); assert_equal(publishable.golden.response, bundle.golden.response)
+	end)
+	for _, identified in ipairs({ false, true }) do
+		scene("publishable golden ACK with identified=" .. tostring(identified), function(start, answer)
+			local golden = json_decode(publishable.golden.request)
+			local h, c = public_client(config_mode_a({ workspace_key = golden.workspace_key, app_key = golden.app_key,
+				environment_key = golden.environment_key, anonymous_id = golden.actor_identifier,
+				spool_enabled = true, flush_interval_seconds = 9999 }))
+			if identified then assert_true(h:identify("self-asserted-player")) end
+			clock.iso_utc = function() return golden.decided_at end
+			ids.uuid_v7 = function() return golden.idempotency_key end
+			local calls, accepted = start(h, record(publishable)); assert_true(accepted); assert_equal(#requests, 1)
+			assert_equal(requests[1].method, bundle.method); assert_contains(requests[1].url, bundle.path)
+			assert_equal(requests[1].headers.Authorization, "Bearer sp_ingest_publishable_key")
+			assert_equal(encode_value(json_decode(requests[1].body)), encode_value(golden))
+			assert_equal(h:track("before_device_ack"), false); assert_equal(#calls, 0)
+			answer(1); settled(calls, true); assert_equal(h:get_consent_state(), "unknown")
+			assert_equal(c:snapshot().consent_recorded, 0); assert_true(h:track("after_device_ack"))
+			local durable, code = h:persist(); assert_equal(durable, false); assert_equal(code, "non_objection_memory_only")
+			assert_equal(h:track_ad_impression_revenue("impression", "network", 1, "USD"), false)
+			assert_true(h:flush(2)); assert_equal(#requests, 2); event_ack(answer, 2); h:update(0)
+			assert_true(c:snapshot().published > 0)
+			assert_true(h:set_consent(false)); assert_equal(h:get_consent_state(), "denied")
+			assert_equal(h:track("after_device_denial"), false)
+			local denied, admitted = start(h, record(publishable)); assert_equal(admitted, false); settled(denied, false, "non_objection_ineligible")
+		end)
+	end
+	for _, response in ipairs({ { 403, "http_403" }, { 200, "non_objection_response_invalid" } }) do
+		scene("publishable refusal " .. response[2], function(start, answer)
+			local h, c = public_client(config_mode_a()); local calls, accepted = start(h, record(publishable)); assert_true(accepted)
+			answer(1, response[1], '{}'); settled(calls, false, response[2])
+			assert_equal(h:track("refused_basis"), false); assert_equal(#c.consent_outbox, 0)
+			assert_equal(h:get_consent_state(), "unknown")
+		end)
+	end
+	for _, mode in ipairs({ "publishable", "token", "dual" }) do
+		scene(mode .. " 401 follows credential refresh capability", function(start, answer)
+			local mints = 0
+			local opts = config({ http_timeout_seconds = 30, token_provider = function(cb)
+				mints = mints + 1; cb("client-token-placeholder-" .. mints)
+			end })
+			if mode == "publishable" then opts = config_mode_a({ http_timeout_seconds = 30 }) end
+			if mode == "dual" then opts.publishable_key = "sp_ingest_publishable_key"; opts.app_url = "https://config.example.invalid" end
+			local h, c = public_client(opts); local calls, accepted = start(h, record(publishable)); assert_true(accepted)
+			local body = requests[1].body; answer(1, 401)
+			if mode == "publishable" then
+				settled(calls, false, "unauthorized"); assert_equal(#c.consent_outbox, 0)
+				assert_equal(c.non_objection, nil); assert_equal(h:track("unauthorized_basis"), false)
+				socket.now = socket.now + 2; c:try_send_consent_outbox(); assert_equal(#requests, 1)
+				answer(1, 401); settled(calls, false, "unauthorized")
+			else
+				assert_equal(#calls, 0); assert_equal(#c.consent_outbox, 1)
+				assert_equal(requests[1].headers.Authorization, "Bearer client-token-placeholder-1")
+				socket.now = socket.now + 2; c:try_send_consent_outbox(); assert_equal(#requests, 2)
+				assert_equal(mints, 2); assert_equal(requests[2].headers.Authorization, "Bearer client-token-placeholder-2")
+				assert_equal(requests[2].body, body); answer(2); settled(calls, true)
+				assert_true(h:track("refreshed_basis"))
+			end
+			assert_equal(h:get_consent_state(), "unknown")
+		end)
+	end
+	scene("publishable retry and relaunch require a current ACK", function(start, answer)
+		local opts = config_mode_a({ http_timeout_seconds = 30, flush_interval_seconds = 9999 })
+		local h, c = public_client(opts); local old, accepted = start(h, record(publishable)); assert_true(accepted)
+		local body = requests[1].body; answer(1, 503); assert_equal(#old, 0)
+		socket.now = socket.now + 2; c:try_send_consent_outbox(); assert_equal(#requests, 2)
+		assert_equal(requests[2].body, body); c:finish_teardown(); settled(old, false, "shutdown"); storage.reset()
+		local fresh, state = public_client(opts); fresh:update(0); assert_equal(#requests, 2)
+		assert_equal(fresh:track("restored_without_ack"), false)
+		local current, admitted = start(fresh, record(publishable)); assert_true(admitted); assert_equal(#requests, 3)
+		assert_equal(requests[3].body, body); answer(2); assert_equal(#current, 0)
+		answer(3); settled(current, true); assert_true(fresh:track("fresh_device_ack"))
+		assert_equal(state.consent_state, "unknown")
+	end)
+	for _, acknowledged in ipairs({ false, true }) do
+		scene("publishable identity fence after ACK=" .. tostring(acknowledged), function(start, answer)
+			local h, c = public_client(config_mode_a()); local calls, accepted = start(h, record(publishable)); assert_true(accepted)
+			if acknowledged then answer(1); settled(calls, true); assert_true(h:track("before_identity_change")) end
+			assert_true(h:identify("another-self-asserted-player")); answer(1)
+			if not acknowledged then settled(calls, false, "non_objection_superseded") end
+			assert_equal(h:track("old_identity_ack"), false); assert_equal(c.non_objection_admission, nil)
+			assert_equal(require("shardpilot.queue").size(c.queue), 0)
+		end)
+	end
+	scene("publishable denial fences a pending ACK", function(start, answer)
+		local h, c = public_client(config_mode_a()); local calls, accepted = start(h, record(publishable)); assert_true(accepted)
+		assert_true(h:set_consent(false)); settled(calls, false, "non_objection_superseded")
+		answer(1); settled(calls, false, "non_objection_superseded")
+		assert_equal(h:track("late_device_ack"), false); assert_equal(c.non_objection_admission, nil)
+		assert_equal(json_decode(requests[2].body).categories.analytics, false)
+	end)
 	scene("public ACK precedes ordinary creation and delivery", function(start, answer)
 		local h, c = public_client(); local calls, from_callback = {}, nil
 		assert_true(h:record_non_objection(record(), function(value, err)

@@ -18,8 +18,8 @@ not the platform boundary.
   a local stack you run yourself. Which endpoints are available today is stated
   under Configuration below and in [`docs/configuration.md`](docs/configuration.md);
   read that before configuring a hosted deployment.
-- **Version `0.16.0`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.16.0`; the `v0.16.0` tag
+- **Version `0.17.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.17.0`; the `v0.17.0` tag
   is created by the owner after the version-bump merge (pending until then).
 
 ## What it does
@@ -135,11 +135,11 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — after owner tagging, the latest tag is `v0.16.0`:
+published tag's source archive — after owner tagging, the latest tag is `v0.17.0`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.16.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.17.0.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
@@ -1936,8 +1936,13 @@ separate prerequisites; the client does not prove the notice was displayed.
   not confirmation that its storage write or receipt delivery succeeded.
 `client:record_non_objection(record, callback)` and
 `shardpilot.record_non_objection(record, callback)` record an independently
-established host attestation through a trusted current-actor credential. They
-never fall back to a publishable key or infer eligibility from the SDK advisory.
+established host attestation using the configured credential. With no
+`token_provider`, the publishable key records the current anonymous actor, even
+after `identify()`. A configured token provider retains precedence and never
+falls back to that key. The SDK advisory alone does not establish eligibility.
+The server must enable device recording, resolve a matching `SOFT_OPT_OUT`
+country, and have the workspace owner’s active acceptance for this basis.
+A publishable-key `401` is terminal; a token-provider `401` refreshes and retries.
 Feature-detect admission support with `supports("analytics_non_objection")`.
 
 Only a valid recorded ACK opens future ordinary analytics in the current process.

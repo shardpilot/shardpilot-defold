@@ -48,7 +48,7 @@ shutdown; a still-held client instance reports that instance's last state.
 age-gate-forced denial) — over the consent states {unknown, granted, denied,
 denied_forced_minor}. An explicit **granted** decision opens the event pipeline. The separate
 [non-objection API](#non-objection-recording) can admit ordinary analytics after
-a trusted ACK while the actual consent state stays unknown.
+a server ACK while the actual consent state stays unknown.
 
 - **Unknown without an acknowledged non-objection** (the initial state on a
   fresh install — and what an unreadable identity record resolves to) transmits
@@ -575,6 +575,15 @@ kind, time and retry key come from the client. It writes the separate
 `advisory_non_objection` basis for analytics, with no categories or consent grant.
 Local locale validation is structural; a server locale refusal is terminal.
 
+With `publishable_key` and no `token_provider`, the current anonymous ID is the
+actor (`kind = "anon"`), including after `identify()`. A configured token provider
+keeps precedence and never falls back to the publishable key. Device recording
+requires server enablement, a matching server-resolved `SOFT_OPT_OUT` country,
+and the workspace owner’s active acceptance for this basis. The host cannot
+choose its region by copying an advisory reference. A recording ACK permits
+local creation of future ordinary analytics; it does not promise server event
+admission, which continues to check the basis and active acceptance.
+
 ```lua
 -- These values come from the host's independent eligibility and notice flow.
 local record = {
@@ -594,8 +603,8 @@ end)
 ```
 
 The return value reports acceptance for recording, not admission. The bounded
-callback reports `(true)` only after a valid trusted ACK for the same current
-host decision, identity and scope. Pending, failed or malformed replies keep the
+callback reports `(true, nil, acknowledgement)` only after a valid server ACK
+for the same current host decision, identity and scope. Pending, failed or malformed replies keep the
 basis closed. Events and runtime samples before ACK are dropped at creation;
 only future ordinary events, session lifecycle and perf/network samples open.
 Consent still reads `unknown` and no consent-grant result is counted. Experiment
