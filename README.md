@@ -68,8 +68,9 @@ not the platform boundary.
 - **Consent-first analytics.** Records an explicit consent decision over the
   states `unknown` / `granted` / `denied` / `denied_forced_minor` (the
   age-gate-forced denial, which gates exactly like `denied`) and transmits
-  **only under an explicit grant**: while consent is `unknown` (the default)
-  events are dropped at enqueue with `consent_unknown` — nothing queued,
+  under an explicit grant or a separately acknowledged non-objection for
+  ordinary analytics. Without either, the default `unknown` state
+  drops events at enqueue with `consent_unknown` — nothing queued,
   nothing spooled, zero wire traffic. Explicit decisions post a consent
   receipt retained in a **durable outbox** until the server acknowledges it,
   so a receipt survives process death and offline commits. See
@@ -81,6 +82,7 @@ not the platform boundary.
   `"event_schema_version"` (since `v0.13.0`; `track()`'s fourth options argument, see
   [the events guide](docs/events.md#event-schema-version)); unknown names return `false` on older and
   newer SDKs alike, so integrations can gate new call shapes safely.
+  `"analytics_non_objection"` identifies process-local ACK-based ordinary analytics.
   `"schema_revision_declaration"` returns `false`.
 - Samples basic runtime signals via `update(dt)`, `observe_ping_ms(ms)`, and
   `observe_disconnect(reason)`.
@@ -977,8 +979,8 @@ signal (and returns its result), and it drives the automatic session boundary:
   not ended by it. `session_end()` or `shutdown()` over an expired pause gives
   that single end, and opens no session only to end it. A `session_start()`
   over an expired pause ends the timed-out session first, then starts the one
-  next session. With consent not granted, it closes the session locally and
-  sends nothing.
+  next session. Without an analytics admission basis, it closes the session
+  locally and sends nothing.
 - **Elapsed time** is the larger of wall time and the summed `update(dt)`, so
   a backward clock correction is covered while frames run (a minimised desktop
   game).
@@ -1932,11 +1934,36 @@ separate prerequisites; the client does not prove the notice was displayed.
   before initialization and after shutdown completes. A retained instance still
   reports its last state after shutdown. This is the current in-memory decision,
   not confirmation that its storage write or receipt delivery succeeded.
+`client:record_non_objection(record, callback)` and
+`shardpilot.record_non_objection(record, callback)` record an independently
+established host attestation through a trusted current-actor credential. They
+never fall back to a publishable key or infer eligibility from the SDK advisory.
+Feature-detect admission support with `supports("analytics_non_objection")`.
+
+Only a valid recorded ACK opens future ordinary analytics in the current process.
+`get_consent_state()` remains `"unknown"`; experiments, ad revenue, remote-config
+targeting and durable event spooling retain their explicit-grant rules. Before
+ACK, events and samples are refused rather than retained. A new recording call,
+identity/scope change or denial closes the old basis; a denial purges its work.
+Shutdown immediately stops new host activity and drains already-admitted work
+within its bound. Teardown and relaunch require a fresh host call and ACK.
+
+While consent stays unknown, basis events remain memory-only even when
+`spool_enabled = true` and can be lost on
+crash or kill. The separate receipt outbox remains durable, retains retry keys,
+timestamps and payloads, protects denials at capacity, and parks restored
+requests until a fresh matching host attestation. The callback answers once
+within `http_timeout_seconds`, including token acquisition and encoding. A
+terminal refusal, including an unrecognized locale, drops that record. Without
+durable storage, shutdown retires pending records with a `shutdown_undurable`
+diagnostic and preserves denial receipts. See [the API contract](docs/privacy.md#non-objection-recording)
+and [configuration](docs/configuration.md#non-objection-recording).
+
 - **`set_consent(decision)`** records an explicit decision — `true`
   (granted), `false` (denied), or the string `"denied_forced_minor"` — over
   the states `unknown` (the default), `granted`, `denied`, and
-  `denied_forced_minor`; the pipeline is **consent-first**: only
-  `granted` transmits. While consent is `unknown`, `track`/`screen_view`/
+  `denied_forced_minor`; the default pipeline is **consent-first**. Without
+  a grant or a separate current non-objection ACK, `track`/`screen_view`/
   `session_start` return `false, "consent_unknown"` and the event is
   **dropped, not held** — nothing is queued or spooled, `flush`/`persist` are
   no-ops, no consent receipt goes out, and runtime samples
@@ -2163,17 +2190,6 @@ shapes separately from consent. Its locale check is the structural BCP 47 subset
 the server decides registry membership. A captured attestation supplies no policy
 authority or consent grant.
 
-The private recording engine uses the bounded receipt outbox with a trusted
-current-actor credential; it never falls back to a publishable key. It retains
-retry keys, timestamps and payloads, protects denials at capacity, and parks
-restored requests until a fresh matching host attestation. Its callback deadline
-uses `http_timeout_seconds`, including token acquisition and encoding. Identity,
-notice or scope changes, denial and shutdown fence old callbacks. A valid recorded
-ACK closes the request without setting consent or admitting events. A terminal
-server refusal, including an unrecognized locale, drops that record. Public API
-exposure and analytics admission are separate from this private preparation.
-Without durable storage, shutdown retires pending non-objection records with a
-`shutdown_undurable` drop diagnostic; denial receipts retain their delivery gate.
 
 ## Compatibility
 

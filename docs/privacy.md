@@ -46,11 +46,13 @@ shutdown; a still-held client instance reports that instance's last state.
 `set_consent(decision, notice)` records an explicit consent decision — `true`
 (granted), `false` (denied), or the string `"denied_forced_minor"` (an
 age-gate-forced denial) — over the consent states {unknown, granted, denied,
-denied_forced_minor}. The analytics client is **consent-first**: only an
-explicit **granted** decision opens the event pipeline.
+denied_forced_minor}. An explicit **granted** decision opens the event pipeline. The separate
+[non-objection API](#non-objection-recording) can admit ordinary analytics after
+a trusted ACK while the actual consent state stays unknown.
 
-- **Unknown** (the initial state on a fresh install — and what an unreadable
-  identity record resolves to) transmits **nothing**: `track`, `screen_view`,
+- **Unknown without an acknowledged non-objection** (the initial state on a
+  fresh install — and what an unreadable identity record resolves to) transmits
+  **no analytics events**: `track`, `screen_view`,
   and `session_start` return `false, "consent_unknown"` and the event is
   **dropped, not held** — nothing is queued, nothing is written to the
   offline event spool, `flush`/`update`/`persist` are clean no-ops, no
@@ -556,3 +558,63 @@ unsanitized stack/backtrace payloads.
 
 Use HTTPS for non-local production-like URLs. Public production readiness is not
 claimed by this source SDK wave.
+
+
+## Non-objection recording
+
+The host may call `client:record_non_objection(record, callback)` (or the same
+singleton method) only after independently establishing an eligible untouched
+opt-out default. This API does not make that decision, interpret the country
+matrix, or turn the SDK advisory into authority. Explicit On/Off still use
+`set_consent`; a prior denial or forced-minor denial refuses this path.
+
+The closed `record` contains `advisory` (matrix commit/hash/date, row and
+jurisdiction), `age_evidence_class = "eligible_adult"`, all four true attestations,
+and `notice_version`, `notice_locale`, `policy_version`. Scope, canonical actor,
+kind, time and retry key come from the client. It writes the separate
+`advisory_non_objection` basis for analytics, with no categories or consent grant.
+Local locale validation is structural; a server locale refusal is terminal.
+
+```lua
+-- These values come from the host's independent eligibility and notice flow.
+local record = {
+    advisory = host_reference,
+    age_evidence_class = "eligible_adult",
+    attestation = {
+        notice_provided = true, free_simple_objection_provided = true,
+        did_not_object = true, eligible = true,
+    },
+    notice_version = host_notice_version,
+    notice_locale = host_notice_locale,
+    policy_version = host_policy_version,
+}
+client:record_non_objection(record, function(ok, code)
+    if ok then client:track("optional_activity") end
+end)
+```
+
+The return value reports acceptance for recording, not admission. The bounded
+callback reports `(true)` only after a valid trusted ACK for the same current
+host decision, identity and scope. Pending, failed or malformed replies keep the
+basis closed. Events and runtime samples before ACK are dropped at creation;
+only future ordinary events, session lifecycle and perf/network samples open.
+Consent still reads `unknown` and no consent-grant result is counted. Experiment
+assignment/facts, ad revenue, remote-config identity/attributes and diagnostics
+keep their own existing rules. No record is written implicitly by init, prepare,
+rendering, tracking or a restored file.
+
+A new recording call withdraws the old episode until its own ACK. Identity,
+notice or scope changes fence old work; a denial purges it immediately. A later
+strict, fallback or expired plan uses the host's existing bounded shutdown to
+stop new activity and drain already-admitted work, without synthesizing a grant
+or denial. Teardown clears the episode. Relaunch requires a fresh matching host
+attestation and ACK, even when a pending receipt was restored.
+
+**Durability trade-off:** basis events stay in memory and may be lost on a crash
+or kill, by design. They never enter the durable event spool without an explicit
+grant, including when `spool_enabled` is true. `persist()` reports
+`false, "non_objection_memory_only"` with the spool enabled in this mode; an explicit grant enables
+normal spooling. The receipt outbox is separate:
+its bounded records retain their original payload, time and key across retries.
+A no-storage shutdown explicitly retires undurable non-objection receipts with
+`shutdown_undurable`; it preserves denial receipts and callback fences.

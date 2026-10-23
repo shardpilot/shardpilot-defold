@@ -758,12 +758,13 @@ record converges as soon as storage recovers.
 The **consent-receipt outbox** is separate from the spool and has one
 configuration knob (below): undelivered `POST /v1/consent` receipts are
 always retained durably (fixed cap of 32, denial-preferring eviction —
-oldest pure grant first, denials only among denials — no TTL) and retried
+oldest non-denial first, denials only among denials — no TTL) and retried
 until acknowledged. The bound is enforced when receipts enter the outbox;
 acknowledgment removals and owed-write retries preserve the retained list.
 `spool_enabled = false` does not affect it, and — unlike
-the spool — it is never consent-purged: receipts deliver under denied and
-unknown states alike, because a receipt documents the decision itself. See
+the spool — it is never consent-purged: ordinary consent receipts deliver under
+denied and unknown states alike. Separate non-objection records park until a
+fresh host eligibility call and require the trusted current-actor credential. See
 `docs/privacy.md`. Every persisted receipt requires its actor `kind` and
 decision-time anonymous-ID snapshot. Missing metadata is malformed and keeps
 the retained trail unaccounted; a normal retry cannot overwrite that evidence.
@@ -865,3 +866,32 @@ path (consent, properties, queue capacity or shutdown) is still counted once.
 `rejected` continues to describe server responses. A singleton with no client
 returns `not_initialized` and has no client counter to update. This change
 does not redefine experiment/session operations or other SDK refusal counters.
+
+
+## Non-objection recording
+
+The instance and singleton expose `record_non_objection(record, callback)`;
+`supports("analytics_non_objection")` identifies the admission behavior. This is
+an explicit host call with independently established eligibility. No init,
+prepare or tracking call enables it automatically. The SDK's advisory alone is
+insufficient; see [the closed record and callback contract](privacy.md#non-objection-recording).
+
+Configure `token_provider`: publishable-only callers are refused, and a dual
+configuration never falls back to the publishable key. The operation uses
+`http_timeout_seconds` as its deadline, including waiting for a token or an older
+receipt. Keep calling `update`; updates, dispatch points and network callbacks
+check the deadline and settle it. A transient retry retains its body/time/key. The callback
+runs once; terminal server refusal or invalid ACK closes this record. The basis
+opens future ordinary analytics only after the current operation's valid ACK.
+A new eligibility attempt, identity/notice/scope change, denial or completed
+teardown cannot inherit an older ACK. `get_consent_state()` stays unknown.
+
+`spool_enabled` applies to explicitly granted analytics only. Basis events stay
+memory-only and may be lost on crash or kill. While this is the active basis,
+`persist()` with the spool enabled returns `false, "non_objection_memory_only"` rather than claiming
+durable capture. An explicit grant enables the normal spool behavior. Receipt durability remains
+independent of the event spool; restored records park until a fresh matching
+host call. Bounded shutdown rejects new host activity while draining previously
+admitted work within its deadline. After relaunch a fresh host call and ACK are
+required. Experiments, ad revenue, remote-config targeting and diagnostics retain
+their existing controls.

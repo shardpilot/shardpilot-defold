@@ -4,7 +4,7 @@ set -euo pipefail
 # Verifies that the in-tree version declarations agree:
 #   1. shardpilot/version.lua  — M.VERSION = "X.Y.Z"
 #   2. game.project            — version = X.Y.Z
-#   3. CHANGELOG.md            — topmost "## vX.Y.Z — ..." heading
+#   3. CHANGELOG.md            — first release heading (after an optional "## Unreleased")
 #   4. README.md               — the "- **Version `X.Y.Z`.**" Status bullet, including its
 #                                 "all report `vX.Y.Z`; the `vX.Y.Z` tag" continuation line
 #   5. README.md               — the "the latest tag is `vX.Y.Z`:" mention
@@ -44,8 +44,8 @@ lua_version="$(sed -nE 's/^M\.VERSION = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' shardp
 project_version="$(sed -nE 's/^version = ([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' game.project)"
 [[ -n "$project_version" ]] || { echo "could not parse version from game.project" >&2; exit 1; }
 
-changelog_version="$(grep -m 1 -E '^## ' CHANGELOG.md | sed -nE 's/^## v([0-9]+\.[0-9]+\.[0-9]+)( —.*)?$/\1/p')"
-[[ -n "$changelog_version" ]] || { echo "topmost CHANGELOG.md heading is not '## vX.Y.Z — ...'" >&2; exit 1; }
+changelog_version="$(awk '/^## / { if (!unreleased && $0 == "## Unreleased") { unreleased = 1; next }; print; exit }' CHANGELOG.md | sed -nE 's/^## v([0-9]+\.[0-9]+\.[0-9]+)( —.*)?$/\1/p')"
+[[ -n "$changelog_version" ]] || { echo "first CHANGELOG.md release heading is not '## vX.Y.Z — ...'" >&2; exit 1; }
 
 readme_status_version="$(sed -nE 's/^- \*\*Version `([0-9]+\.[0-9]+\.[0-9]+)`\.\*\*.*$/\1/p' README.md)"
 [[ -n "$readme_status_version" ]] || { echo "README.md Status line is not '- **Version \`X.Y.Z\`.**'" >&2; exit 1; }

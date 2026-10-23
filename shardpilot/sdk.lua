@@ -39,6 +39,7 @@ local capabilities = {
 	-- track() takes a fourth options argument whose schema_version selects
 	-- the event's contract version, kept through serialization and retry.
 	event_schema_version = true,
+	analytics_non_objection = true,
 }
 
 function M.supports(capability)
@@ -52,6 +53,7 @@ local instance_methods = {
 	get_anonymous_id = 0,
 	get_consent_state = 0,
 	set_consent = 2,
+	record_non_objection = 2,
 	fetch_remote_config = 1,
 	set_remote_config_attributes = 1,
 	remote_config_value = 1,
@@ -165,6 +167,16 @@ end
 -- receipt records. See docs/privacy.md.
 function M.set_consent(decision, notice)
 	return with_default("set_consent", decision, notice)
+end
+
+-- The host independently establishes eligibility. Only a trusted ACK opens
+-- future ordinary analytics; the consent state and event-spool gate stay separate.
+function M.record_non_objection(record, callback)
+	if not default() then
+		if type(callback) == "function" then pcall(callback, false, "not_initialized") end
+		return false, "not_initialized"
+	end
+	return with_default("record_non_objection", record, callback)
 end
 
 -- Remote config stays available without a grant, omitting identity and
