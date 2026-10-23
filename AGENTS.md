@@ -1,6 +1,7 @@
 # Contributor instructions
 
 - Keep SDK code compatible with Lua 5.1 and LuaJIT.
+- Keep all checked release pins aligned; release notes must state the server enablement prerequisite for non-objection recording.
 - Keep non-objection snapshots separate from consent and policy authority. Assert the vendored contract profile and decoded goldens; local locale validation is structural, with registry membership decided by the server.
 - Consent advisory references are detached host data, never SDK authority or cache. Preserve validation and every strict fallback field.
 - Keep dispatch deadlines effective on asynchronous and synchronous HTTP bridges.

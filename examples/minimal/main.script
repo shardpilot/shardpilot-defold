@@ -227,8 +227,8 @@ local function start_analytics(granted, decision, newly_answered, notice, explic
 	-- shardpilot.supports("consent_state_denied_forced_minor")).
 	-- Only an untouched SOFT default is notice/non-objection. An explicit
 	-- Off or On is a decision under every regime and must reach set_consent.
-	-- This SDK has no API for the non-objection basis; the host must record
-	-- it through its own path. The current resolver still cannot authorize
+	-- Eligible hosts use record_non_objection with their own fresh evidence
+	-- and wait for its trusted ACK. The current resolver cannot authorize
 	-- this later flow, and this example supplies no independent authority.
 	if not decision.explicit_grant_required and granted == true and not explicit_decision then
 		print("shardpilot: SOFT regime — record the notice/non-objection basis yourself; " ..

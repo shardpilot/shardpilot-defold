@@ -19,8 +19,10 @@ the deeper reference.
   `http.request`. JSON in, per-event outcomes surfaced back. No native
   extension — pure Lua source, written against Lua 5.1/LuaJIT (Defold's
   embedded runtime).
-- **Consent-first pipeline**: nothing transmits until an explicit consent
-  grant; see the consent section — it is the part most integrations get wrong.
+- **Analytics admission**: an explicit grant or a fresh trusted non-objection
+  ACK admits future ordinary analytics; consent stays unknown under this basis.
+  Basis-created events stay memory-only. See the [recording API](../../../docs/privacy.md#non-objection-recording);
+  the quick start below keeps that path closed without independent host authority.
 - **Offline durability**: a bounded per-app durable event spool re-sends
   undelivered events on a later launch; consent receipts have their own
   durable outbox.
@@ -49,7 +51,7 @@ the deeper reference.
 
 ## Install
 
-Version pin (CI-checked): this skill matches shardpilot-defold `v0.15.0`.
+Version pin (CI-checked): this skill matches shardpilot-defold `v0.16.0`.
 
 This version includes request compression, a 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history; these were absent from `v0.10.1`.
 
@@ -64,10 +66,10 @@ Two supported paths:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.15.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.16.0.zip
 ```
 
-`v0.15.0` is the version this skill matches, and it is the same pin the
+`v0.16.0` is the version this skill matches, and it is the same pin the
 README's Installation section carries.
 
 The earlier off-main `v0.10.1` tag still declares `0.10.0`; see the [changelog](../../../CHANGELOG.md).
@@ -406,8 +408,8 @@ local function start_analytics(granted, decision, newly_answered, notice, explic
 	-- shardpilot.supports("consent_state_denied_forced_minor")).
 	-- Only an untouched SOFT default is notice/non-objection. An explicit
 	-- Off or On is a decision under every regime and must reach set_consent.
-	-- This SDK has no API for the non-objection basis; the host must record
-	-- it through its own path. The current resolver still cannot authorize
+	-- Eligible hosts use record_non_objection with their own fresh evidence
+	-- and wait for its trusted ACK. The current resolver cannot authorize
 	-- this later flow, and this example supplies no independent authority.
 	if not decision.explicit_grant_required and granted == true and not explicit_decision then
 		print("shardpilot: SOFT regime — record the notice/non-objection basis yourself; " ..
