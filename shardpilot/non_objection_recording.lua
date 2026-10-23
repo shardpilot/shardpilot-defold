@@ -1,4 +1,4 @@
--- Private recording engine. Acknowledgement does not grant consent or admit events.
+-- Trusted recording and process-local ordinary analytics admission, separate from consent.
 local clock = require "shardpilot.clock"
 local id = require "shardpilot.id"
 local snapshot = require "shardpilot.non_objection"
@@ -10,13 +10,15 @@ local function actor(client)
 	return client.user_id or client.anonymous_id, client.user_id and "user_verified" or "anon"
 end
 
-local function eligible(client, operation)
+local function eligible(client, operation, draining)
 	local who, kind = actor(client)
 	for _, receipt in ipairs(client.consent_outbox) do
 		if receipt.actor_identifier == who and receipt.kind == kind
 			and receipt.categories and receipt.categories.analytics == false then return false end
 	end
-	return client.initialized and not client.closing and not client.non_objection_closing and client.config.token_provider ~= nil
+	return client.initialized and (draining or (not client.closing and not client.non_objection_closing))
+		and client.config.token_provider ~= nil
+		and operation.generation == client.non_objection_generation
 		and client.consent_state == "unknown" and not client:outbox_write_held()
 		and not client.consent_marker_unreadable
 		and client.anonymous_id == operation.anonymous_id and who == operation.actor_identifier
@@ -40,9 +42,26 @@ local function finish(client, operation, ok, code, acknowledgement)
 	if operation.callback then pcall(operation.callback, ok, code, acknowledgement) end
 end
 
-function M.poll(client, reason)
+function M.revoke(client)
+	if not client.non_objection_admission then return end
+	client.non_objection_admission = nil
+	if client.consent_state ~= "granted" then client:discard_non_objection_events() end
+end
+
+function M.admitted(client)
+	local admission = client.non_objection_admission
+	return admission ~= nil and eligible(client, admission, true)
+end
+
+function M.poll(client, reason, teardown)
+	if client.non_objection_admission and (teardown or not M.admitted(client)) then M.revoke(client) end
 	local operation = client.non_objection
 	if not operation then return end
+	reason = reason or operation.cancel_reason
+	if operation.preparing then
+		operation.cancel_reason = reason
+		return
+	end
 	if not reason and not eligible(client, operation) then reason = "non_objection_superseded" end
 	if not reason and clock.unix_ms() >= operation.deadline_ms then reason = "non_objection_timeout" end
 	local retained = false
@@ -77,18 +96,24 @@ function M.record(client, record, callback)
 		return false, code
 	end
 	if callback ~= nil and type(callback) ~= "function" then return false, "invalid_callback" end
+	if not client.initialized or client.closing or client.non_objection_closing then return refuse("shutdown") end
+	M.revoke(client) -- A fresh host eligibility decision owns a fresh ACK episode.
+	client.non_objection_generation = (client.non_objection_generation or 0) + 1
+	local generation = client.non_objection_generation
+	if client.non_objection and client.non_objection.preparing then return refuse("non_objection_pending") end
 	local captured, err = snapshot.snapshot(record)
-	if not captured then return refuse(err) end
-	M.poll(client)
-	local previous = client.non_objection
-	if previous and not previous.preparing and not snapshot.equal(previous.snapshot, captured) then
-		finish(client, previous, false, "non_objection_superseded")
+	if not captured then
+		if client.non_objection then finish(client, client.non_objection, false, "non_objection_superseded") end
+		return refuse(err)
 	end
+	M.poll(client)
+	if generation ~= client.non_objection_generation then return refuse("non_objection_superseded") end
 	if client.non_objection then return refuse("non_objection_pending") end
 	local who, kind = actor(client)
 	local operation = { actor_identifier = who, kind = kind, anonymous_id = client.anonymous_id,
 		workspace_id = client.config.workspace_id, app_id = client.config.app_id,
 		environment_id = client.config.environment_id, callback = callback, snapshot = captured, preparing = true,
+		generation = generation,
 		deadline_ms = clock.unix_ms() + client.config.http_timeout_seconds * 1000 }
 	if not eligible(client, operation) then return refuse("non_objection_ineligible") end
 	client.non_objection = operation
@@ -154,7 +179,16 @@ function M.send(client, receipt)
 			acknowledgement = decoded_ok and snapshot.response(decoded) or nil
 			if not acknowledgement then ok, err, retryable = false, "non_objection_response_invalid", false end
 		end
+		M.poll(client)
+		if client.non_objection ~= operation then return end
 		if ok or not retryable then
+			if ok then
+				local admission = {}
+				for _, key in ipairs({ "actor_identifier", "kind", "anonymous_id", "workspace_id", "app_id", "environment_id", "snapshot", "generation" }) do
+					admission[key] = operation[key]
+				end
+				client.non_objection_admission = admission
+			end
 			client:remove_consent_receipt(receipt.idempotency_key)
 			finish(client, operation, ok, err, acknowledgement)
 			if not ok then client:diagnose({ scope = "non_objection", status = "dropped", code = err }) end

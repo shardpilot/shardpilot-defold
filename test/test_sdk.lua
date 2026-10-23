@@ -18121,7 +18121,7 @@ end)()
 	local function settled(calls, ok, code)
 		assert_equal(#calls, 1, "one bounded answer"); assert_equal(calls[1][1], ok); assert_equal(calls[1][2], code)
 	end
-	scene("decoded golden wire and ACK never grant or open event creation", function(start, answer)
+	scene("decoded golden wire and ACK open ordinary analytics without a grant", function(start, answer)
 		local golden = json_decode(bundle.golden.request)
 		local c = new(config({ workspace_key = golden.workspace_key, app_key = golden.app_key,
 			environment_key = golden.environment_key, anonymous_id = golden.actor_identifier,
@@ -18134,8 +18134,8 @@ end)()
 		answer(1); settled(calls, true)
 		assert_equal(c.consent_state, "unknown"); assert_equal(c.consent_decided_at, nil)
 		assert_equal(c:snapshot().consent_recorded, 0); assert_equal(c:snapshot().consent_failed, 0)
-		local accepted, code = c:track("still_closed"); assert_equal(accepted, false); assert_equal(code, "consent_unknown")
-		assert_equal(require("shardpilot.sdk").record_non_objection, nil, "facade is a separate activation")
+		assert_true(c:track("after_trusted_ack"))
+		assert_equal(type(require("shardpilot.sdk").record_non_objection), "function")
 		assert_equal(#c.consent_outbox, 0)
 	end)
 	for _, mode in ipairs({ "publishable", "failed mint", "dual failed mint" }) do
@@ -18171,6 +18171,7 @@ end)()
 			local calls = start(c, value); answer(1, response[2], response[3]); settled(calls, false, response[4])
 			socket.now = socket.now + 30; c:try_send_consent_outbox()
 			assert_equal(#requests, 1); assert_equal(#c.consent_outbox, 0); assert_equal(c.consent_state, "unknown")
+			assert_equal(c:track("terminal_record_stays_closed"), false)
 		end)
 	end
 	scene("restore parks until a fresh matching host call", function(start, answer)
@@ -18247,11 +18248,13 @@ end)()
 		assert_true(ok, calls); settled(calls, false, "non_objection_timeout"); assert_equal(#requests, 0)
 	end)
 	scene("completion reentrancy and duplicate transport answers", function(start, answer)
-		local c, calls = new(), {}
+		local c, calls, between = new(), {}, nil
 		assert_true(c:record_non_objection(record(), function(ok)
 			calls[#calls + 1] = ok; assert_true(c:record_non_objection(record(), function(value) calls[#calls + 1] = value end))
+			between = { c:track("between_ack_episodes") }
 		end))
 		answer(1); assert_equal(#requests, 2); answer(1); assert_equal(#calls, 1)
+		assert_equal(between[1], false); assert_equal(between[2], "consent_unknown")
 		answer(2); assert_equal(#calls, 2); assert_equal(calls[1], true); assert_equal(calls[2], true)
 	end)
 	scene("historic anonymous records never use the dual-mode key", function(start)
@@ -18357,6 +18360,301 @@ end)()
 		answer(1); assert_equal(c.consent_state, "denied"); assert_true(c.consent_send_in_flight)
 		settled(calls, false, "non_objection_superseded"); answer(2); assert_true(c:shutdown())
 	end)
+	local function public_client(options)
+		local handle = assert(require("test.inspect_client").wrap(require "shardpilot.sdk", true).new(options or config({ flush_interval_seconds = 9999 })))
+		return handle, require("test.inspect_client").state(handle)
+	end
+	local function event_ack(answer, index)
+		assert_contains(requests[index].url, "/v1/events:batch")
+		answer(index, 202, json.encode({ accepted = #json_decode(requests[index].body).events }))
+	end
+	scene("public ACK precedes ordinary creation and delivery", function(start, answer)
+		local h, c = public_client(); local calls, from_callback = {}, nil
+		assert_true(h:record_non_objection(record(), function(value, err)
+			calls[#calls + 1] = { value, err }; if value then from_callback = h:track("in_ack_callback") end
+		end))
+		local ok, code = h:track("before_ack"); assert_equal(ok, false); assert_equal(code, "consent_unknown")
+		assert_equal(h:session_start(), false); h:observe_ping_ms(100); h:observe_disconnect("before"); h:update(1)
+		assert_equal(c:snapshot().enqueued, 0); assert_equal(c.session, nil); assert_equal(#requests, 1)
+		assert_equal(#c.perf.frames, 0); assert_equal(#c.network.pings, 0); assert_equal(c.network.disconnect_count, 0)
+		answer(1); settled(calls, true); assert_true(from_callback); assert_true(h:track("after_ack")); assert_equal(h:get_consent_state(), "unknown")
+		h:observe_ping_ms(50); h:observe_disconnect("after"); h:update(0.1)
+		assert_equal(#c.perf.frames, 1); assert_equal(#c.network.pings, 1); assert_equal(c.network.disconnect_count, 1)
+		assert_equal(c:snapshot().consent_recorded, 0); assert_equal((storage.load(c.config) or {}).consent_analytics, nil)
+		local delivered = {}; assert_true(h:flush(2, function(value, err) delivered[#delivered + 1] = { value, err } end))
+		assert_equal(#requests, 2); event_ack(answer, 2); h:update(0); settled(delivered, true)
+		assert_true(c:snapshot().published > 0, "the real transport delivered admitted events")
+	end)
+	scene("singleton API and bounded shutdown drain", function(start, answer)
+		local api = require "shardpilot.sdk"; api.shutdown()
+		assert_true(api.supports("analytics_non_objection")); local missing = {}
+		local ok, code = api.record_non_objection(record(), function(value, err) missing[#missing + 1] = { value, err } end)
+		assert_equal(ok, false); assert_equal(code, "not_initialized"); settled(missing, false, code)
+		assert_true(sdk.init(config({ spool_enabled = true, flush_interval_seconds = 9999 })))
+		local calls = {}; assert_true(api.record_non_objection(record(), function(value, err) calls[#calls + 1] = { value, err } end))
+		answer(1); settled(calls, true); assert_true(api.track("singleton_basis"))
+		local closed = {}; assert_true(api.shutdown(2, function(value, err) closed[#closed + 1] = { value, err } end))
+		local allowed, reason = api.track("too_late"); assert_equal(allowed, false); assert_equal(reason, "shutdown")
+		assert_equal(#closed, 0); event_ack(answer, 2); api.update(0); settled(closed, true)
+		assert_equal(api.track("after_close"), false); assert_equal(api.get_consent_state(), "unknown")
+		assert_true(sdk.init(config())); assert_equal(api.track("relaunch_without_ack"), false); assert_equal(#requests, 2); api.shutdown()
+	end)
+	scene("basis events never spool without a grant", function(start, answer, held, stores)
+		local h, c = public_client(config({ spool_enabled = true, flush_interval_seconds = 9999 }))
+		start(h); answer(1); assert_true(h:track("basis_memory_probe"))
+		local stored, reason = h:persist(); assert_equal(stored, false); assert_equal(reason, "non_objection_memory_only")
+		assert_not_contains(encode_value(stored_spool_record(stores) or {}), "basis_memory_probe")
+		assert_true(h:set_consent(true)); assert_true(h:track("grant_spool_control")); assert_equal(h:persist(), false)
+		assert_not_contains(encode_value(stored_spool_record(stores) or {}), "basis_memory_probe")
+		assert_contains(encode_value(stored_spool_record(stores)), "grant_spool_control", "same store can retain granted events")
+		assert_equal(h:get_consent_state(), "granted")
+	end)
+	for _, cause in ipairs({ "identity", "notice", "invalid", "scope", "denial", "minor", "teardown" }) do
+		scene("admitted episode invalidation " .. cause, function(start, answer)
+			local h, c = public_client(); start(h); answer(1); assert_true(h:track("old_episode")); h:observe_ping_ms(20)
+			assert_true(require("shardpilot.queue").size(c.queue) > 0)
+			local expected = "consent_unknown"
+			if cause == "identity" then assert_true(h:identify("replacement-user"))
+			elseif cause == "notice" then local value = record(); value.notice_version = "notice-2"; start(h, value)
+			elseif cause == "invalid" then local value = record(); value.attestation.did_not_object = false; assert_equal(h:record_non_objection(value), false)
+			elseif cause == "scope" then c.config.environment_id = "replacement-scope"; h:update(0)
+			elseif cause == "denial" then assert_true(h:set_consent(false)); expected = "consent_denied"
+			elseif cause == "minor" then assert_true(h:set_consent("denied_forced_minor")); expected = "consent_denied"
+			else c:finish_teardown(); expected = "shutdown" end
+			local ok, code = h:track("blocked_episode"); assert_equal(ok, false); assert_equal(code, expected)
+			assert_equal(c.non_objection_admission, nil); assert_equal(require("shardpilot.queue").size(c.queue), 0)
+			assert_equal(#c.network.pings, 0); assert_equal(#c.perf.frames, 0)
+			if expected == "consent_unknown" then assert_equal(h:get_consent_state(), "unknown") end
+		end)
+	end
+	scene("new notice ACK fences the old response", function(start, answer)
+		local h, c = public_client(); local old = start(h)
+		local value = record(); value.notice_version = "notice-2"; local current = start(h, value)
+		settled(old, false, "non_objection_superseded"); answer(1); assert_equal(h:track("old_ack"), false)
+		assert_equal(c.non_objection_admission, nil); assert_equal(#current, 0)
+		answer(2); settled(current, true); assert_true(h:track("new_ack"))
+	end)
+	scene("invalid new attestation fences a pending ACK", function(start, answer)
+		local h, c = public_client(); local old = start(h); local value = record(); value.attestation.did_not_object = false
+		local failed, accepted, code = start(h, value); assert_equal(accepted, false); settled(failed, false, code)
+		settled(old, false, "non_objection_superseded"); answer(1)
+		assert_equal(h:track("late_invalidated_ack"), false); assert_equal(c.non_objection_admission, nil)
+	end)
+	scene("decoder reentrancy cannot install an older ACK", function(start, answer)
+		local h, c = public_client(); local old = start(h); local decode, current, entered = json.decode, nil, false
+		json.decode = function(body)
+			local decoded = decode(body)
+			if body == bundle.golden.response and not entered then
+				entered = true; local value = record(); value.notice_version = "notice-2"; current = start(h, value)
+			end
+			return decoded
+		end
+		local ok, err = pcall(answer, 1); json.decode = decode; assert_true(ok, err); assert_true(entered)
+		assert_equal(#requests, 2); settled(old, false, "non_objection_superseded")
+		assert_equal(h:track("decoder_old_ack"), false); assert_equal(c.non_objection_admission, nil)
+		answer(2); settled(current, true); assert_true(h:track("decoder_current_ack"))
+	end)
+	scene("protected consumers still need explicit consent", function(start, answer)
+		local h, c = public_client(config({ app_url = "https://config.example.invalid", publishable_key = "sp_ingest_publishable_key",
+			experiments_enabled = true, remote_config_enabled = true, flush_interval_seconds = 9999 }))
+		start(h); answer(1)
+		local ok, code = h:track_ad_impression_revenue("valid-impression", "valid-network", 1, "USD")
+		assert_equal(ok, false); assert_equal(code, "consent_unknown")
+		local fetched
+		h:fetch_experiment_assignment_with_age_band("basis_experiment", "adult", {}, function(result) fetched = result end)
+		assert_equal(fetched.error, "consent_unknown"); assert_equal(#requests, 1)
+		assert_true(h:track("ordinary_control"), "ordinary positive control reached its admission gate")
+		assert_true(h:set_consent(true)); assert_true(h:track_ad_impression_revenue("valid-impression", "valid-network", 1, "USD"))
+		h:fetch_experiment_assignment_with_age_band("basis_experiment", "adult", {}, function() end)
+		assert_true(#requests > 2, "same valid experiment inputs reach HTTP under a grant")
+		assert_equal(c.consent_state, "granted")
+	end)
+	scene("bounded shutdown deadline never reopens the episode", function(start, answer)
+		local h, c = public_client(config({ spool_enabled = true, flush_interval_seconds = 9999 }))
+		start(h); answer(1); assert_true(h:track("bounded_basis")); local closed = {}
+		assert_true(h:shutdown(1, function(value, code) closed[#closed + 1] = { value, code } end))
+		assert_equal(#requests, 2); assert_equal(h:record_non_objection(record()), false)
+		socket.now = socket.now + 2; h:update(0); assert_equal(#closed, 1); assert_equal(closed[1][1], false)
+		assert_equal(c.initialized, false); assert_equal(c.non_objection_admission, nil); event_ack(answer, 2)
+		assert_equal(#closed, 1); assert_equal(h:track("late_drain"), false); assert_equal(c.consent_state, "unknown")
+	end)
+	scene("ordinary admission before fixed inverse restored", function(start, answer)
+		local h, c = public_client(); start(h); answer(1); assert_true(c.non_objection_admission ~= nil)
+		local inspect = require "test.inspect_client"; local class = inspect.class(require("shardpilot.client").new)
+		local fixed = class.analytics_admitted
+		local file = assert(io.open("shardpilot/client.lua", "rb")); local source = file:read("*a"); file:close()
+		local tail = " or non_objection_recording.admitted(self)"; local first, last = source:find(tail, 1, true)
+		assert_true(first ~= nil and not source:find(tail, last + 1, true), "one separate admission branch")
+		local compiled = assert((loadstring or load)(source:sub(1, first - 1) .. source:sub(last + 1), "@ordinary-admission-inverse"))()
+		local before = inspect.class(compiled.new).analytics_admitted; local results = {}
+		for _, phase in ipairs({ "before", "fixed", "inverse", "restored" }) do
+			class.analytics_admitted = (phase == "before" or phase == "inverse") and before or fixed
+			results[#results + 1] = { h:track("admission_probe_" .. phase) }
+		end
+		class.analytics_admitted = fixed
+		for index, phase in ipairs({ "before", "fixed", "inverse", "restored" }) do
+			local expected = phase == "fixed" or phase == "restored"
+			print("ordinary admission " .. phase .. ": " .. tostring(results[index][1]) .. "/" .. tostring(results[index][2]))
+			assert_equal(results[index][1], expected)
+			if not expected then assert_equal(results[index][2], "consent_unknown") end
+		end
+		assert_equal(h:get_consent_state(), "unknown")
+	end)
+	scene("new eligibility during a receipt write invalidates the older generation", function(start, answer)
+		local h, c, entered, nested = nil, nil, false, nil
+		h, c = public_client(config({ diagnostics = function(issue)
+			if issue.code == "outbox_overflow" and not entered then
+				entered = true; local value = record(); value.notice_version = "notice-2"; nested = { h:record_non_objection(value) }
+			end
+		end }))
+		for index = 1, storage.max_consent_outbox_entries do
+			assert_true(storage.append_consent_receipt(c.config, { workspace_id = c.config.workspace_id,
+				app_id = c.config.app_id, environment_id = c.config.environment_id, actor_identifier = "foreign-" .. index,
+				kind = "anon", anonymous_id = "foreign-" .. index, decided_at = "2026-10-22T12:00:00Z",
+				idempotency_key = "evictable-" .. index, categories = { analytics = true } }))
+		end
+		c.consent_outbox = storage.consent_outbox_receipts(c.config)
+		local old, accepted = start(h); assert_true(entered); assert_equal(accepted, false)
+		assert_equal(nested[1], false); assert_equal(nested[2], "non_objection_pending")
+		settled(old, false, "non_objection_superseded"); assert_equal(#requests, 0); assert_equal(h:track("old_generation"), false)
+		local value = record(); value.notice_version = "notice-2"; local current = start(h, value)
+		assert_equal(#requests, 1); answer(1); settled(current, true); assert_true(h:track("fresh_generation"))
+	end)
+	scene("synchronous replacement completion keeps the newest host call", function(start, answer)
+		local h, c = public_client(); local old, newest = {}, {}
+		assert_true(h:record_non_objection(record(), function(ok, code)
+			old[#old + 1] = { ok, code }
+			local value = record(); value.notice_version = "notice-3"
+			h:record_non_objection(value, function(value, err) newest[#newest + 1] = { value, err } end)
+		end))
+		local request = http.request
+		http.request = function(url, method, callback, headers, body, options)
+			request(url, method, callback, headers, body, options)
+			if body and json_decode(body).notice_version == "notice-3" then
+				callback(nil, nil, { status = 200, response = bundle.golden.response })
+			end
+		end
+		local value = record(); value.notice_version = "notice-2"
+		local ok, replacement, accepted, code = pcall(start, h, value); http.request = request
+		assert_true(ok, replacement); assert_equal(accepted, false); assert_equal(code, "non_objection_superseded")
+		settled(replacement, false, code); settled(old, false, "non_objection_superseded"); settled(newest, true)
+		assert_equal(#requests, 2); assert_equal(c.non_objection_admission.snapshot.notice_version, "notice-3")
+		answer(1); assert_true(h:track("newest_generation")); assert_equal(c.non_objection_admission.snapshot.notice_version, "notice-3")
+	end)
+	scene("closing backend drains only samples admitted before shutdown", function(start, answer)
+		local h, c = public_client(config({ source = "backend", flush_interval_seconds = 9999 }))
+		start(h); answer(1); assert_true(c:sampling_open()); h:observe_ping_ms(10)
+		assert_equal(#c.network.pings, 1); assert_true(h:track("backend_before_close")); local closed = {}
+		assert_true(h:shutdown(2, function(value, code) closed[#closed + 1] = { value, code } end))
+		assert_equal(#requests, 2); assert_true(c:sampling_open(), "the backend window alone would still accept samples")
+		h:observe_ping_ms(999); h:observe_disconnect("after_close"); h:update(0)
+		assert_equal(#c.network.pings, 0); assert_equal(c.network.disconnect_count, 0)
+		assert_equal(h:screen_view("new_host_activity"), false); assert_equal(#closed, 0)
+		event_ack(answer, 2); h:update(0); settled(closed, true); assert_equal(#requests, 2)
+		assert_equal(h:get_consent_state(), "unknown")
+	end)
+	-- Compile the production source with exactly this repair reversed. Local
+	-- byte comparison proves this inverse equals the reviewed client source.
+	local inspect_basis = require "test.inspect_client"
+	local basis_class = inspect_basis.class(require("shardpilot.client").new)
+	local basis_methods = { "enqueue_event", "write_spool_record", "spool_envelopes", "report_spool_capture" }
+	local basis_fixed = {}; for _, name in ipairs(basis_methods) do basis_fixed[name] = basis_class[name] end
+	local basis_file = assert(io.open("shardpilot/client.lua", "rb"))
+	local basis_source = basis_file:read("*a"); basis_file:close()
+	local basis_edits = {
+		{ "\t-- A current grant cannot make earlier basis-created events durable.\n\t-- Their creation stamp survives batches, envelopes and owed re-queues.", "\t-- Only a granted actor's envelopes are ever written to disk: denied purges\n\t-- the record, and a consent-first \"unknown\" client never captured anything\n\t-- to spool in the first place." },
+		{ "\t\t\tand (analytics_retry.memory_only(env) or not self.spool_index[event_id]) then\n\t\t\treturn false", "\t\t\tand not self.spool_index[event_id] then\n\t\t\treturn false" },
+		{ "\t\treturn self:report_spool_capture(envelopes, {})\n\t\t\tand (not self.delivery_clock_write_owed or self:fence_delivery_clocks())", "\t\treturn not self.delivery_clock_write_owed or self:fence_delivery_clocks()" },
+		{ "\t\tif type(event_id) == \"string\" and event_id ~= \"\" and not analytics_retry.memory_only(env) then\n\t\t\tif self.spool_settled[event_id] then", "\t\tif type(event_id) == \"string\" and event_id ~= \"\" then\n\t\t\tif self.spool_settled[event_id] then" },
+		{ "\tlocal target = {}\n\tfor i = 1, #events do\n\t\tlocal event = events[i]\n\t\tif type(event) == \"table\" and not self.spool_settled[event.event_id]\n\t\t\tand not analytics_retry.memory_only(event) then\n\t\t\ttarget[#target + 1] = event\n\t\tend\n\tend", "\tlocal target = events\n\tif next(self.spool_settled) ~= nil then\n\t\ttarget = {}\n\t\tfor i = 1, #events do\n\t\t\tif not self.spool_settled[events[i].event_id] then\n\t\t\t\ttarget[#target + 1] = events[i]\n\t\t\tend\n\t\tend\n\tend" },
+		{ "\t\tschema_version = schema_version,\n\t}\n\tanalytics_retry.admit(event, admission_basis)\n\tlocal admission_err", "\t\tschema_version = schema_version,\n\t}\n\tlocal admission_err" },
+		{ "\tlocal admission_basis = self.consent_state == \"granted\" and \"consent\" or \"advisory_non_objection\"\n\t-- Keep ASCII-only normalization identical at admission and on the wire.", "\t-- Keep ASCII-only normalization identical at admission and on the wire." },
+	}
+	for _, edit in ipairs(basis_edits) do
+		local first, last = basis_source:find(edit[1], 1, true)
+		assert_true(first ~= nil and not basis_source:find(edit[1], last + 1, true), "one applied inverse edit")
+		basis_source = basis_source:sub(1, first - 1) .. edit[2] .. basis_source:sub(last + 1)
+	end
+	local basis_before = inspect_basis.class(assert((loadstring or load)(basis_source, "@event-basis-reviewed-inverse"))().new)
+	for _, path in ipairs({ "persist_queue", "persist_retained", "persist_owed_direct", "owed_requeue",
+		"transient_failure", "flush_deadline", "shutdown", "shutdown_owed", "bounded_shutdown",
+		"bounded_shutdown_owed", "whole_record", "retry_rewrite", "clock_fence", "basis_only" }) do
+		for _, phase in ipairs({ "before", "fixed", "inverse", "restored" }) do
+			scene("durable basis " .. path .. " " .. phase, function(start, answer, held, stores)
+				local repaired = phase == "fixed" or phase == "restored"
+				for _, name in ipairs(basis_methods) do basis_class[name] = repaired and basis_fixed[name] or basis_before[name] end
+				local ok, err = pcall(function()
+					local is_owed = path == "persist_owed_direct" or path == "owed_requeue"
+						or path == "shutdown_owed" or path == "bounded_shutdown_owed"
+					local h, c = public_client(config({ source = "backend", spool_enabled = true,
+						buffer_size = is_owed and 1 or 20, flush_interval_seconds = 9999 }))
+					local calls, accepted = start(h); assert_true(accepted); answer(1); settled(calls, true)
+					assert_true(h:track("basis_disk_probe")); local a = c.queue.items[1]
+					if is_owed then
+						h:observe_ping_ms(10); c:enqueue_summaries()
+						assert_true(#c.owed_summaries > 0, "real sampling reached the full-queue owed path")
+						a = c.owed_summaries[1].event
+						require("shardpilot.queue").drain(c.queue, #c.queue.items)
+					elseif path == "persist_retained" then
+						assert_true(h:flush(2, function() end)); assert_true(c.publish_in_flight)
+					end
+					assert_true(h:set_consent(true)); assert_equal(h:get_consent_state(), "granted")
+					assert_equal(c.non_objection_admission, nil, "the original client-state guard is bypassed")
+					for index, request in ipairs(requests) do
+						if request.url:find("/v1/consent", 1, true) and index > 1 then answer(index, 200, "{}") end
+					end
+					if path == "basis_only" then
+						assert_equal(h:persist(), not repaired, "an uncaptured basis-only remnant is not durable")
+					end
+					if path == "owed_requeue" then
+						assert_true(c:drain_owed_summaries()); assert_equal(c.queue.items[1], a)
+						assert_true(h:flush(2, function() end)); assert_true(c.publish_in_flight)
+					end
+					assert_true(h:track("grant_disk_control")); local b = c.queue.items[#c.queue.items]
+					local retry = require "shardpilot.analytics_retry"
+					if repaired then
+						assert_true(retry.memory_only(a), "creation stamp survived grant and any re-queue")
+						assert_equal(retry.memory_only(b), false)
+					end
+					local function publish()
+						assert_true(h:flush(1, function() end)); local index = #requests
+						assert_contains(requests[index].url, "/v1/events:batch"); return index
+					end
+					if path == "transient_failure" then
+						answer(publish(), 503, "{}")
+					elseif path == "flush_deadline" then
+						publish(); socket.now = socket.now + 1.1; h:update(0)
+					elseif path == "shutdown" or path == "shutdown_owed" then
+						c:shutdown()
+					elseif path == "bounded_shutdown" or path == "bounded_shutdown_owed" then
+						assert_true(h:shutdown(1, function() end)); socket.now = socket.now + 2; h:update(0)
+					elseif path == "whole_record" then
+						local envelope = require "shardpilot.envelope"
+						assert_true(c:write_spool_record({ envelope.build(c.config, c, a), envelope.build(c.config, c, b) }))
+					else
+						h:persist()
+						if path == "retry_rewrite" then c.spool_rewrite_pending = true; assert_true(c:retry_spool_rewrite()) end
+						if path == "clock_fence" then c.delivery_clock_write_owed = true; assert_true(c:fence_delivery_clocks()) end
+					end
+					local disk = assert(stored_spool_record(stores), "a real spool write reached sys.save")
+					local a_stored, b_stored = false, false
+					for _, event in ipairs(disk.events) do
+						a_stored = a_stored or event.event_id == a.event_id
+						b_stored = b_stored or event.event_id == b.event_id
+						assert_equal(event.admission_basis, nil, "local stamp never changes the wire/storage format")
+					end
+					assert_true(b_stored, "event created after the grant proves the writer works")
+					local claim, cause = pcall(function() assert_equal(a_stored, false, "basis_event_reached_disk") end)
+					print("event basis " .. path .. " " .. phase .. ": A_disk=" .. tostring(a_stored) .. " B_disk=" .. tostring(b_stored))
+					assert_equal(claim, repaired)
+					if not repaired then assert_contains(tostring(cause), "basis_event_reached_disk") end
+					c:finish_teardown()
+				end)
+				for _, name in ipairs(basis_methods) do basis_class[name] = basis_fixed[name] end
+				assert_true(ok, err)
+			end)
+		end
+	end
 	print(string.format("non-objection recording total: %d pass, %d fail", passed, #failures))
 	assert_equal(#failures, 0, table.concat(failures, "; "))
 end)()

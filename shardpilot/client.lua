@@ -2436,9 +2436,31 @@ function Client:get_anonymous_id()
 	return self.anonymous_id
 end
 
--- Kept private until the analytics admission cut exposes the host facade.
 function Client:record_non_objection(record, callback)
 	return non_objection_recording.record(self, record, callback)
+end
+
+function Client:analytics_admitted()
+	return self.consent_state == "granted" or non_objection_recording.admitted(self)
+end
+
+-- A process-local basis never owns a durable event spool. Retiring it loses
+-- only its in-memory ordinary analytics, without writing a consent decision.
+function Client:discard_non_objection_events()
+	self.delivery_epoch = self.delivery_epoch + 1
+	local cleared = queue.size(self.queue)
+	queue.drain(self.queue, cleared)
+	if self.in_flight_batch and not self.publish_in_flight then
+		cleared = cleared + #self.in_flight_batch
+		self.in_flight_batch = nil
+	end
+	self.stats.dropped = self.stats.dropped + cleared + #self.owed_summaries
+	self.owed_summaries = {}
+	self.publish_retry_after_ms, self.publish_server_retry_after_ms = nil, nil
+	self.publish_backoff_attempt = 0
+	self.paused = nil
+	self:close_session()
+	self:reset_samplers()
 end
 
 function Client:get_consent_state()
@@ -3106,9 +3128,9 @@ function Client:session_end(reason)
 		-- first (shutdown ends the session through here).
 		return self:run_boundary(false)
 	end
-	if self.consent_state ~= "granted" then
-		-- Consent denied — or still unknown, which transmits nothing —
-		-- suppress the wire event but still complete the local session
+	if not self:analytics_admitted() then
+		-- Without either admission basis, suppress the wire event but still
+		-- complete the local session
 		-- teardown (the same posture as shutdown) so session state never
 		-- stays stuck active for a consent-blocked user.
 		self:close_session()
@@ -3148,12 +3170,12 @@ end
 -- perf and network summaries are built from its own samplers and stamped from
 -- its own value; one the queue cannot take now is held as an owed snapshot
 -- (the built event), and the samplers leave with the closed value. With
--- consent not granted they are simply dropped with it. `end_ts` and `end_ms`,
+-- no analytics admission they are simply dropped with it. `end_ts` and `end_ms`,
 -- when the session ended at an instant other than now (the session boundary),
 -- stamp them at that instant and end the perf window there, so neither their
 -- time nor their contents fall after their session's end.
 function Client:finalize_session(closing, end_ts, end_ms)
-	if self.consent_state ~= "granted" then
+	if not self:analytics_admitted() then
 		return
 	end
 	self:drain_owed_summaries()
@@ -3251,7 +3273,7 @@ function Client:on_window_event(event)
 		end
 		return self:run_boundary(true)
 	end
-	if signal == "foreground" and self.resume_after_denial and self.consent_state == "granted"
+	if signal == "foreground" and self.resume_after_denial and self:analytics_admitted()
 		and self.session == nil and self.ended_session ~= nil then
 		-- Resume is the next activity after a consent teardown.
 		-- The retryable start path announces a distinct session, and retains
@@ -3286,7 +3308,7 @@ end
 
 -- Ends the paused session at the boundary instant and, when `replace`, starts
 -- the next one at once (a start the queue refuses stays owed, and the next
--- host activity discharges it). With consent not granted it is a local
+-- host activity discharges it). Without analytics admission it is a local
 -- teardown, as session_end is. Returns false only when the end was refused;
 -- the pause is then kept.
 function Client:run_boundary(replace)
@@ -3296,7 +3318,7 @@ function Client:run_boundary(replace)
 		self.paused = nil
 		return true
 	end
-	if self.consent_state ~= "granted" then
+	if not self:analytics_admitted() then
 		self.paused = nil
 		self:close_session()
 		return true
@@ -3694,15 +3716,15 @@ function Client:enqueue_event(event_name, props, context, fact, host_event, opti
 	if consent_denied_state(self.consent_state) then
 		return self:_record_refusal("consent_denied", fact)
 	end
-	-- Consent-first: while the decision is still "unknown" (no persisted
-	-- grant — a fresh install, or an identity record that could not be read)
-	-- the client transmits nothing. A host event is dropped, not held: nothing
-	-- is queued, nothing reaches the durable spool, so no pre-consent data
-	-- exists at rest. set_consent(true) opens the pipeline for FUTURE events
-	-- only.
-	if self.consent_state ~= "granted" then
+	-- A grant or a fresh trusted non-objection ACK permits FUTURE ordinary
+	-- events only. Before either, refuse before session, sample or queue work.
+	-- Protected experiment and ad-revenue producers still require a grant.
+	if not self:analytics_admitted() or (self.consent_state ~= "granted"
+		and (event_name == "ad_impression_revenue" or event_name == "experiment_exposure"
+			or event_name == "experiment_outcome")) then
 		return self:_record_refusal("consent_unknown", fact)
 	end
+	local admission_basis = self.consent_state == "granted" and "consent" or "advisory_non_objection"
 	-- Keep ASCII-only normalization identical at admission and on the wire.
 	-- Only public track calls reject owned names; typed producers bypass that
 	-- predicate while retaining all lifecycle, consent and delivery gates.
@@ -3798,6 +3820,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event, opti
 		context = context_snapshot,
 		schema_version = schema_version,
 	}
+	analytics_retry.admit(event, admission_basis)
 	local admission_err = envelope.admission_error(self.config, self, event)
 	if admission_err then
 		return self:_record_refusal(admission_err, fact)
@@ -3856,7 +3879,7 @@ function Client:update(dt)
 		self.flush_elapsed_seconds = self.flush_elapsed_seconds + dt
 		self.frame_seconds = self.frame_seconds + dt
 	end
-	if self.session_active and self.consent_state == "granted" and type(dt) == "number"
+	if not self.closing and self.session_active and self:analytics_admitted() and type(dt) == "number"
 		and not self:timed_out_in_background() then
 		-- Frame samples are analytics data: a session kept active through a
 		-- denial must not keep feeding the perf sampler, and a session past its
@@ -3930,7 +3953,7 @@ function Client:observe_ping_ms(ms)
 	-- Consent-first: runtime samples are analytics data, dropped at the
 	-- source while the pipeline is closed — they would otherwise surface in
 	-- the first summary emitted after a later grant.
-	if self.consent_state ~= "granted" then
+	if self.closing or not self:analytics_admitted() then
 		return
 	end
 	-- Between an end and the next start a sample belongs to no session: it is
@@ -3943,7 +3966,7 @@ function Client:observe_ping_ms(ms)
 end
 
 function Client:observe_disconnect(reason)
-	if self.consent_state ~= "granted" or not self:sampling_open() then
+	if self.closing or not self:analytics_admitted() or not self:sampling_open() then
 		return
 	end
 	sampling.disconnect(self.network, reason)
@@ -3968,7 +3991,7 @@ function Client:enqueue_owed_summary(entry)
 	if consent_denied_state(self.consent_state) then
 		return false, "consent_denied"
 	end
-	if self.consent_state ~= "granted" then
+	if not self:analytics_admitted() then
 		return false, "consent_unknown"
 	end
 	local admission_err = envelope.admission_error(self.config, self, entry.event)
@@ -4017,7 +4040,7 @@ function Client:enqueue_summaries(flush_ids)
 	-- grant. Owed summaries are analytics data from the same closed window:
 	-- dropped with them (the denial wipe in set_consent counts them; this
 	-- belt-and-suspenders clear is only reachable already-empty).
-	if self.consent_state ~= "granted" then
+	if not self:analytics_admitted() then
 		self:reset_samplers()
 		self.owed_summaries = {}
 		return
@@ -5993,13 +6016,12 @@ end
 -- removal rewrite failed), so any successful write doubles as the deferred
 -- removal; the record also carries the current backpressure deadline.
 function Client:write_spool_record(events)
-	local target = events
-	if next(self.spool_settled) ~= nil then
-		target = {}
-		for i = 1, #events do
-			if not self.spool_settled[events[i].event_id] then
-				target[#target + 1] = events[i]
-			end
+	local target = {}
+	for i = 1, #events do
+		local event = events[i]
+		if type(event) == "table" and not self.spool_settled[event.event_id]
+			and not analytics_retry.memory_only(event) then
+			target[#target + 1] = event
 		end
 	end
 	local saved = storage.save_spool(self.config, target,
@@ -6135,9 +6157,8 @@ end
 -- re-loaded spool batch is never appended again. Returns true when everything
 -- new is durably recorded (vacuously true when nothing new).
 function Client:spool_envelopes(envelopes)
-	-- Only a granted actor's envelopes are ever written to disk: denied purges
-	-- the record, and a consent-first "unknown" client never captured anything
-	-- to spool in the first place.
+	-- A current grant cannot make earlier basis-created events durable.
+	-- Their creation stamp survives batches, envelopes and owed re-queues.
 	if not self.config.spool_enabled or self.consent_state ~= "granted" then
 		return false
 	end
@@ -6152,7 +6173,7 @@ function Client:spool_envelopes(envelopes)
 	for i = 1, #envelopes do
 		local env = envelopes[i]
 		local event_id = type(env) == "table" and env.event_id or nil
-		if type(event_id) == "string" and event_id ~= "" then
+		if type(event_id) == "string" and event_id ~= "" and not analytics_retry.memory_only(env) then
 			if self.spool_settled[event_id] then
 				-- A replacement fact re-derived a deterministic id whose
 				-- prior copy a sentinel purge condemned while the removal
@@ -6195,7 +6216,8 @@ function Client:spool_envelopes(envelopes)
 		end
 	end
 	if #fresh == 0 and not replaced then
-		return not self.delivery_clock_write_owed or self:fence_delivery_clocks()
+		return self:report_spool_capture(envelopes, {})
+			and (not self.delivery_clock_write_owed or self:fence_delivery_clocks())
 	end
 	-- ⚠ THE APPEND PATH, AND WHY IT IS NARROW. Appending one envelope used to
 	-- copy the whole record, re-estimate every entry in it (json.encode per
@@ -6299,7 +6321,7 @@ function Client:report_spool_capture(envelopes, fresh)
 		local env = envelopes[i]
 		local event_id = type(env) == "table" and env.event_id or nil
 		if type(event_id) == "string" and event_id ~= ""
-			and not self.spool_index[event_id] then
+			and (analytics_retry.memory_only(env) or not self.spool_index[event_id]) then
 			return false
 		end
 	end
@@ -6433,11 +6455,9 @@ function Client:persist()
 		return false, "spool_purge_failed"
 	end
 	if self.consent_state ~= "granted" then
-		-- A consent-blocked client leaves nothing spoolable: denied already
-		-- cleared the queue (and the spool stays purged), and a consent-first
-		-- "unknown" client never queued anything to capture. A still-owed
-		-- durable cache sync is the one exception worth reporting: it is
-		-- consent-independent disk state an app death would leave stale.
+		if non_objection_recording.admitted(self) then return false, "non_objection_memory_only" end
+		-- Without either admission basis there is nothing spoolable. Owed
+		-- cache sync is consent-independent state that still needs reporting.
 		if self.declaration_prune_owed or (self.experiments and self.experiments:has_owed_durable_sync()) then
 			return false, "experiments_pending"
 		end
@@ -6587,7 +6607,7 @@ function Client:start_publish_batch(automatic)
 	local epoch, provisional = self.delivery_epoch, {}
 	local attempt_started_ms = clock.unix_ms()
 	local function owns_batch()
-		return self.initialized and self.consent_state == "granted"
+		return self.initialized and self:analytics_admitted()
 			and self.delivery_epoch == epoch and self.in_flight_batch == events
 	end
 	local function fence() return self:fence_delivery_clocks() end
@@ -7490,7 +7510,7 @@ function Client:shutdown()
 	-- teardown (flush below retries it too; a still-failing purge is re-run
 	-- at the next launch by the persisted denial/disabled configuration).
 	self:retry_spool_purge()
-	local suppress_wire = self.consent_state ~= "granted"
+	local suppress_wire = not self:analytics_admitted()
 	local session_end_owed = false
 	if self.session_active then
 		-- session_end completes the local teardown even while consent is
@@ -7644,7 +7664,7 @@ function Client:shutdown()
 				enqueued_any = true
 			end
 		end
-		if self.consent_state == "granted" and self.session_active
+		if self:analytics_admitted() and self.session_active
 			and not owed_session_end then
 			-- The final drain lazily opened a session (a pre-session owed
 			-- fact with no session ever started rides the exit-time
@@ -7661,7 +7681,7 @@ function Client:shutdown()
 		-- granted plane: a non-granted state cannot enqueue them (the
 		-- purge/consent canon governs those snapshots, not the exit path).
 		local still_owed = (owed_session_end and self.session_active)
-			or (self.consent_state == "granted" and #self.owed_summaries > 0)
+			or (self:analytics_admitted() and #self.owed_summaries > 0)
 			or (self.consent_state == "granted" and self.experiments ~= nil
 				and self.experiments:has_owed_exposures())
 		if enqueued_any then
@@ -7721,7 +7741,7 @@ end
 -- events were delivered, refused, or left to the spool by the final flush.
 function Client:finish_teardown()
 	self.non_objection_closing = true
-	non_objection_recording.poll(self, "shutdown")
+	non_objection_recording.poll(self, "shutdown", true)
 	if self.remote_config then
 		self.remote_config:teardown()
 	end
