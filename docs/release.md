@@ -1,7 +1,7 @@
 # Release
 
 The ShardPilot Defold SDK is published as the latest release git tag plus a
-GitHub Release (currently `v0.16.0` for both). This is an early alpha
+GitHub Release (currently `v0.17.0` for both). This is an early alpha
 pre-release: the API is unstable and may change before v1.
 
 **Tag lag is normal, and the version above leads the tag.** In-tree version
@@ -35,6 +35,17 @@ cd /tmp/tagcheck && ./scripts/check_public_surface.sh   # must exit 0
 
 This is a procedure, not a gate, and it is written down here because that is
 the honest description of it — the run before the push is the whole control.
+
+## v0.17.0 release notes
+
+Non-objection recording supports the configured publishable key when no token
+provider is present. It uses the anonymous actor even after `identify()`, while
+token-provider precedence and identity fences remain effective. Before adopting
+this release, enable device recording on the server and ensure the workspace
+owner’s acceptance is active; the server must resolve a matching `SOFT_OPT_OUT`
+country. A recorded ACK opens local ordinary analytics, with consent unknown
+and basis events memory-only. Server event admission still checks the basis.
+The source archive stays pending until owner tagging.
 
 ## v0.16.0 release notes
 

@@ -3716,7 +3716,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event, opti
 	if consent_denied_state(self.consent_state) then
 		return self:_record_refusal("consent_denied", fact)
 	end
-	-- A grant or a fresh trusted non-objection ACK permits FUTURE ordinary
+	-- A grant or a fresh server non-objection ACK permits FUTURE ordinary
 	-- events only. Before either, refuse before session, sample or queue work.
 	-- Protected experiment and ad-revenue producers still require a grant.
 	if not self:analytics_admitted() or (self.consent_state ~= "granted"

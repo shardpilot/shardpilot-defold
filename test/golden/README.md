@@ -120,3 +120,11 @@ matching host attestation. Identity, notice, scope, denial, deadline and shutdow
 scenes fence stale answers. These scenes do not claim event admission.
 The undurable-shutdown scene compiles the actual client with only the retirement
 call removed, exercising before/fixed/inverse/restored methods on fresh clients.
+
+`advisory-non-objection.publishable.v1.json` adds the publishable-key profile
+without changing the base wire shape. SHA-256:
+`4c6acb616831becfa33c56f1e996fcb157defba8145718aadcaf9a2211135c1c`.
+It pins the base bundle above. Its golden uses synthetic scope, actor, notice
+and time with a retained matrix reference; it is a contract vector, not an
+HTTP capture. SDK scenes compare the decoded request and feed the exact ACK
+through the real transport, including after an unverified `identify()`.

@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.17.0 — 2026-10-24
+
+- Record non-objection with the configured publishable key when no token provider
+  is configured. The actor remains anonymous after `identify()`; token providers
+  keep precedence without fallback. Identity changes fence pending and admitted
+  episodes. Consent stays unknown, denial still blocks, and basis events remain
+  memory-only.
+- Device recording requires server enablement, a matching server-resolved
+  `SOFT_OPT_OUT` country, and the workspace owner’s active acceptance. A recording
+  acknowledgement does not promise event admission.
+
 ## v0.16.0 — 2026-10-23
 
 - The non-objection recording basis is accepted only by servers that enable it.

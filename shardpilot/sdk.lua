@@ -169,7 +169,7 @@ function M.set_consent(decision, notice)
 	return with_default("set_consent", decision, notice)
 end
 
--- The host independently establishes eligibility. Only a trusted ACK opens
+-- The host independently establishes eligibility. Only a valid server ACK opens
 -- future ordinary analytics; the consent state and event-spool gate stay separate.
 function M.record_non_objection(record, callback)
 	if not default() then

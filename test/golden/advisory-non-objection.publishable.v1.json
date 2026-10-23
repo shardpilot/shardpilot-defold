@@ -1,0 +1,64 @@
+{
+  "profile": "advisory_non_objection_publishable",
+  "version": 1,
+  "status": "contract_only",
+  "base_contract": {
+    "artifact": "advisory-non-objection.v1.json",
+    "sha256": "9463140ce26330158cee663fe2a11ffe1b601b88001c3562802af6c29cdaabe6"
+  },
+  "method": "POST",
+  "path": "/v1/consent",
+  "authentication": {
+    "header": "Authorization",
+    "scheme": "Bearer",
+    "credential": "workspace_publishable_ingest_key"
+  },
+  "actor": {
+    "kind": "anon",
+    "identifier": "current anonymous actor; never a self-asserted user identifier"
+  },
+  "region": {
+    "authority": "server connection country from a fresh local country database",
+    "forwarded_headers": "only the rightmost entry of the last X-Forwarded-For line from an explicitly trusted socket peer",
+    "request_reference": "must match the server country and retained SOFT_OPT_OUT matrix row; copied advisory fields confer no authority",
+    "unknown_or_strict": "refused"
+  },
+  "conditions": [
+    "recording feature enabled",
+    "workspace owner acceptance live",
+    "server-resolved SOFT_OPT_OUT country matches the submitted advisory reference",
+    "existing scope, capability, quota and kill gates pass",
+    "all base-contract age, notice and non-objection assertions satisfied"
+  ],
+  "refusals": [
+    {
+      "condition": "disabled or malformed basis",
+      "status": 400,
+      "code": "validation_error"
+    },
+    {
+      "condition": "unknown, strict or mismatching server region",
+      "status": 403,
+      "code": "forbidden",
+      "detail_code": "consent_grant_requires_verified_credential"
+    },
+    {
+      "condition": "publishable key claims a verified actor",
+      "status": 403,
+      "code": "forbidden",
+      "detail_code": "consent_kind_requires_verified_credential"
+    },
+    {
+      "condition": "live owner acceptance unavailable or ineligible",
+      "status": 503,
+      "code": "service_unavailable"
+    }
+  ],
+  "receipt_meaning": "recording acknowledgement only; no consent grant and no promise of event admission",
+  "retries": "same bytes and idempotency key; region gate still applies; an original recorded receipt may be acknowledged after acceptance revocation, but event admission requires the original acceptance to remain live",
+  "golden": {
+    "request": "{\"workspace_key\":\"example-workspace\",\"app_key\":\"example-app\",\"environment_key\":\"production\",\"actor_identifier\":\"synthetic-player-001\",\"kind\":\"anon\",\"decided_at\":\"2026-10-22T12:00:00Z\",\"idempotency_key\":\"019a0d25-3600-7000-8000-000000000001\",\"admission_basis\":\"advisory_non_objection\",\"purpose\":\"analytics\",\"advisory\":{\"matrix\":{\"docs_commit\":\"f6b6f0f617d4e15442608fc77be8a5bb40f40e26\",\"file_sha256\":\"370b04f374d0c506b92a003d4c801f450d5e5c45aed369f14a1c9382e3d592cc\",\"date\":\"2026-10-07\"},\"row_id\":\"GB\",\"jurisdiction\":\"GB\"},\"age_evidence_class\":\"eligible_adult\",\"attestation\":{\"notice_provided\":true,\"free_simple_objection_provided\":true,\"did_not_object\":true,\"eligible\":true},\"notice_version\":\"notice-1\",\"notice_locale\":\"en\",\"policy_version\":\"policy-1\"}",
+    "response": "{\"recorded\":true,\"replayed\":false,\"admission_basis\":\"advisory_non_objection\"}\n"
+  },
+  "golden_scope": "synthetic scope, actor, notice and decision time; retained matrix reference; contract vector, not a runtime capture"
+}
