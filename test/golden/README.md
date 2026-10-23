@@ -111,3 +111,10 @@ Its `contract_only` status describes a wire contract, not deployed acceptance.
 The SDK snapshot covers the closed host attestation and notice/provenance fields.
 Locale validation is the structural BCP 47 subset; the server decides registry
 membership. The snapshot is separate from consent and supplies no policy authority.
+
+The private recording scenes also exercise the real client, HTTP transport and
+`sys` storage adapter. They compare the complete decoded request with the golden,
+validate recorded and replayed ACKs, and keep locale refusal terminal. Retries
+retain the same payload, timestamp and key; restored records require a fresh
+matching host attestation. Identity, notice, scope, denial, deadline and shutdown
+scenes fence stale answers. These scenes do not claim event admission.

@@ -18083,3 +18083,218 @@ end)()
 	print(string.format("non-objection validation total: %d pass, %d fail", passed, #failures))
 	assert_equal(#failures, 0, table.concat(failures, "; "))
 end)()
+
+-- Private engine: real client, transport and sys adapter; public admission stays closed.
+;(function()
+	local file = assert(io.open("test/golden/advisory-non-objection.v1.json", "rb"))
+	local bundle = json_decode(file:read("*a")); file:close()
+	local clock, ids = require "shardpilot.clock", require "shardpilot.id"
+	local function record()
+		local request, out = json_decode(bundle.golden.request), {}
+		for _, key in ipairs({ "advisory", "age_evidence_class", "attestation", "notice_version", "notice_locale", "policy_version" }) do out[key] = request[key] end
+		return out
+	end
+	local passed, failures = 0, {}
+	local function scene(name, run)
+		reset(); storage.reset()
+		local previous_socket, previous_request = socket, http.request
+		local previous_iso, previous_uuid = clock.iso_utc, ids.uuid_v7
+		local stores, restore = install_stub_sys_storage()
+		socket = { now = 1000, gettime = function() return socket.now end }
+		local held = hold_http_requests()
+		local function answer(index, status, body)
+			assert_true(held[index] ~= nil, "a real request must precede its response")
+			held[index](nil, nil, { status = status or 200, response = body or bundle.golden.response })
+		end
+		local function start(client, value)
+			local calls = {}
+			local ok, code = client:record_non_objection(value or record(), function(value, err) calls[#calls + 1] = { value, err } end)
+			return calls, ok, code
+		end
+		local ok, err = pcall(run, start, answer, held, stores)
+		storage.reset(); restore(); socket, http.request = previous_socket, previous_request
+		clock.iso_utc, ids.uuid_v7 = previous_iso, previous_uuid
+		print("non-objection recording " .. name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+		if ok then passed = passed + 1 else failures[#failures + 1] = name .. ": " .. tostring(err) end
+	end
+	local function new(options) return assert(sdk.new(options or config({ flush_interval_seconds = 9999 }))) end
+	local function settled(calls, ok, code)
+		assert_equal(#calls, 1, "one bounded answer"); assert_equal(calls[1][1], ok); assert_equal(calls[1][2], code)
+	end
+	scene("decoded golden wire and ACK never grant or open event creation", function(start, answer)
+		local golden = json_decode(bundle.golden.request)
+		local c = new(config({ workspace_key = golden.workspace_key, app_key = golden.app_key,
+			environment_key = golden.environment_key, anonymous_id = golden.actor_identifier,
+			consent_kind_emission_enabled = false, flush_interval_seconds = 9999 }))
+		clock.iso_utc = function() return golden.decided_at end
+		ids.uuid_v7 = function() return golden.idempotency_key end
+		local calls, ok = start(c); assert_true(ok); assert_equal(#requests, 1)
+		assert_equal(encode_value(json_decode(requests[1].body)), encode_value(golden))
+		assert_equal(requests[1].headers.Authorization, "Bearer client-token-placeholder")
+		answer(1); settled(calls, true)
+		assert_equal(c.consent_state, "unknown"); assert_equal(c.consent_decided_at, nil)
+		assert_equal(c:snapshot().consent_recorded, 0); assert_equal(c:snapshot().consent_failed, 0)
+		local accepted, code = c:track("still_closed"); assert_equal(accepted, false); assert_equal(code, "consent_unknown")
+		assert_equal(require("shardpilot.sdk").record_non_objection, nil, "facade is a separate activation")
+		assert_equal(#c.consent_outbox, 0)
+	end)
+	for _, mode in ipairs({ "publishable", "failed mint", "dual failed mint" }) do
+		scene(mode .. " cannot use a publishable fallback", function(start)
+			local opts = config({ publishable_key = "sp_ingest_publishable_key", token_provider = function(cb) cb(nil, nil, "unavailable") end })
+			if mode == "publishable" then opts.token_provider = nil end
+			if mode == "failed mint" then opts.publishable_key = nil end
+			local c = new(opts); local calls, ok = start(c)
+			assert_equal(#requests, 0)
+			if mode == "publishable" then assert_equal(ok, false); settled(calls, false, "non_objection_ineligible")
+			else socket.now = socket.now + 3; c:update(0); settled(calls, false, "non_objection_timeout") end
+		end)
+	end
+	scene("transient retry preserves exact body and key", function(start, answer)
+		local c = new(config({ http_timeout_seconds = 30 })); local calls = start(c)
+		local body = requests[1].body; answer(1, 503); assert_equal(#calls, 0)
+		socket.now = socket.now + 2; c:try_send_consent_outbox()
+		assert_equal(#requests, 2); assert_equal(requests[2].body, body)
+		answer(2, 200, bundle.golden.response:gsub('"replayed":false', '"replayed":true'))
+		settled(calls, true); answer(2); settled(calls, true)
+	end)
+	for _, response in ipairs({ { "locale refusal", 400, '{"error":{"code":"notice_locale_invalid"}}', "http_400" },
+		{ "false ACK", 200, '{"recorded":false,"replayed":false,"admission_basis":"advisory_non_objection"}', "non_objection_response_invalid" },
+		{ "malformed ACK", 200, "garbled", "non_objection_response_invalid" } }) do
+		scene(response[1] .. " is terminal for this record", function(start, answer)
+			local c, value = new(), record(); value.notice_locale = "zz"
+			local calls = start(c, value); answer(1, response[2], response[3]); settled(calls, false, response[4])
+			socket.now = socket.now + 30; c:try_send_consent_outbox()
+			assert_equal(#requests, 1); assert_equal(#c.consent_outbox, 0); assert_equal(c.consent_state, "unknown")
+		end)
+	end
+	scene("restore parks until a fresh matching host call", function(start, answer)
+		local c = new(); local old_calls = start(c); local original = requests[1].body
+		c:finish_teardown(); settled(old_calls, false, "shutdown"); storage.reset()
+		local restored = new(); restored:update(10); restored:try_send_consent_outbox()
+		assert_equal(#requests, 1); assert_equal(#restored.consent_outbox, 1)
+		local fresh_calls = start(restored); assert_equal(#requests, 2); assert_equal(requests[2].body, original)
+		answer(1); assert_equal(#fresh_calls, 0, "old launch ACK has no authority")
+		answer(2); settled(fresh_calls, true)
+	end)
+	scene("failed append persists later but stays parked", function(start)
+		local c, save = new(), sys.save
+		sys.save = function(path, value) if path:find("consent%-outbox$") then return false end; return save(path, value) end
+		local calls, ok, code = start(c); assert_equal(ok, false); assert_equal(code, "consent_outbox_write_failed")
+		settled(calls, false, code); assert_equal(#requests, 0); assert_equal(#c.consent_outbox, 1)
+		sys.save = save; c:try_send_consent_outbox(); assert_equal(#requests, 0)
+		local fresh = start(c); assert_equal(#requests, 1); assert_equal(#fresh, 0)
+	end)
+	for _, decision in ipairs({ false, "denied_forced_minor" }) do
+		scene("prior refusal " .. tostring(decision) .. " wins", function(start)
+			local c = new(); assert_true(c:set_consent(decision))
+			local count = #requests; local calls, ok = start(c)
+			assert_equal(ok, false); settled(calls, false, "non_objection_ineligible"); assert_equal(#requests, count)
+		end)
+		scene("new refusal " .. tostring(decision) .. " fences a late ACK", function(start, answer)
+			local c = new(); local calls = start(c); assert_true(c:set_consent(decision))
+			settled(calls, false, "non_objection_superseded"); assert_equal(#requests, 2, "denial can dispatch after cancellation")
+			assert_equal(json_decode(requests[2].body).categories.analytics, false)
+			answer(1); settled(calls, false, "non_objection_superseded")
+			assert_equal(c.consent_in_flight_key, json_decode(requests[2].body).idempotency_key, "late ACK cannot clear denial in flight")
+			assert_equal(c.consent_state, decision == false and "denied" or decision)
+		end)
+	end
+	scene("capacity never sacrifices a denial", function(start)
+		local c = new()
+		for i = 1, storage.max_consent_outbox_entries do
+			assert_true(storage.append_consent_receipt(c.config, { workspace_id = c.config.workspace_id,
+				app_id = c.config.app_id, environment_id = c.config.environment_id, actor_identifier = "other-actor",
+				kind = "anon", anonymous_id = "other-actor", decided_at = "2026-10-22T12:00:00Z",
+				idempotency_key = "denial-" .. i, categories = { analytics = false } }))
+		end
+		local calls, ok = start(c); assert_equal(ok, false); settled(calls, false, "consent_outbox_full")
+		assert_equal(#storage.consent_outbox_receipts(c.config), 32); assert_equal(#requests, 0)
+	end)
+	for _, fence in ipairs({ "identity", "notice", "deadline", "shutdown" }) do
+		scene(fence .. " fences old completion and allows no stale success", function(start, answer)
+			local c = new(); local calls = start(c)
+			local code = "non_objection_superseded"
+			if fence == "identity" then assert_true(c:identify("new-user"))
+			elseif fence == "notice" then local value = record(); value.notice_version = "notice-2"; start(c, value)
+			elseif fence == "deadline" then socket.now = socket.now + 3; c:update(0); code = "non_objection_timeout"
+			else c:shutdown(); code = "shutdown" end
+			settled(calls, false, code); answer(1); settled(calls, false, code)
+			assert_equal(c.consent_state, "unknown"); assert_equal(c:snapshot().consent_recorded, 0)
+		end)
+	end
+	scene("deadline crossing during a synchronous mint sends nothing", function(start)
+		local c = new(config({ token_provider = function(cb) socket.now = socket.now + 3; cb("client-token-placeholder") end }))
+		local calls, ok, code = start(c)
+		assert_true(ok, code); settled(calls, false, "non_objection_timeout"); assert_equal(#requests, 0)
+	end)
+	scene("asynchronous mint cannot dispatch after deadline", function(start)
+		local mint
+		local c = new(config({ token_provider = function(cb) mint = cb end }))
+		local calls = start(c); assert_true(mint ~= nil); socket.now = socket.now + 3; c:update(0)
+		settled(calls, false, "non_objection_timeout"); mint("client-token-placeholder"); c:try_send_consent_outbox()
+		assert_equal(#requests, 0)
+	end)
+	scene("encoding deadline is checked before the real POST", function(start)
+		local c, encode = new(), json.encode
+		json.encode = function(value) local encoded = encode(value); if value.admission_basis then socket.now = socket.now + 3 end; return encoded end
+		local ok, calls = pcall(start, c); json.encode = encode
+		assert_true(ok, calls); settled(calls, false, "non_objection_timeout"); assert_equal(#requests, 0)
+	end)
+	scene("completion reentrancy and duplicate transport answers", function(start, answer)
+		local c, calls = new(), {}
+		assert_true(c:record_non_objection(record(), function(ok)
+			calls[#calls + 1] = ok; assert_true(c:record_non_objection(record(), function(value) calls[#calls + 1] = value end))
+		end))
+		answer(1); assert_equal(#requests, 2); answer(1); assert_equal(#calls, 1)
+		answer(2); assert_equal(#calls, 2); assert_equal(calls[1], true); assert_equal(calls[2], true)
+	end)
+	scene("historic anonymous records never use the dual-mode key", function(start)
+		local c = new(); start(c); c:finish_teardown(); storage.reset()
+		local restored = new(config({ anonymous_id = "replacement-anon", publishable_key = "sp_ingest_publishable_key" }))
+		restored:try_send_consent_outbox(); assert_equal(#requests, 1); assert_equal(#restored.consent_outbox, 1)
+		assert_true(restored:set_anonymous_id("third-anon"), "parked basis cannot wedge rotation")
+		assert_equal(#requests, 1)
+	end)
+	scene("unknown state cannot supersede a retained refusal", function(start)
+		local c = new()
+		assert_true(storage.append_consent_receipt(c.config, { workspace_id = c.config.workspace_id,
+			app_id = c.config.app_id, environment_id = c.config.environment_id, actor_identifier = c.anonymous_id,
+			kind = "anon", anonymous_id = c.anonymous_id, decided_at = "2026-10-22T12:00:00Z",
+			idempotency_key = "retained-refusal", categories = { analytics = false } }))
+		c.consent_outbox = storage.consent_outbox_receipts(c.config)
+		local calls, ok = start(c); assert_equal(ok, false); settled(calls, false, "non_objection_ineligible")
+		assert_equal(#requests, 0)
+	end)
+	scene("verified actor and anonymous rotation fence", function(start, answer)
+		local c = new(); assert_true(c:identify("verified-example")); local calls = start(c)
+		assert_equal(json_decode(requests[1].body).kind, "user_verified")
+		assert_equal(json_decode(requests[1].body).actor_identifier, "verified-example")
+		assert_true(c:set_anonymous_id("new-anonymous-example")); settled(calls, false, "non_objection_superseded")
+		answer(1); settled(calls, false, "non_objection_superseded")
+	end)
+	scene("scope change and close reject reentrant recording", function(start, answer)
+		local c = new(); local calls = start(c); c.config.environment_id = "different-scope"
+		c:try_send_consent_outbox(); settled(calls, false, "non_objection_superseded"); answer(1)
+		local closed = {}
+		assert_true(c:record_non_objection(record(), function(ok, code)
+			closed[#closed + 1] = { ok, code }
+			local accepted = c:record_non_objection(record()); assert_equal(accepted, false)
+		end))
+		assert_equal(json_decode(requests[2].body).environment_key, "different-scope")
+		c:bounded_shutdown(1, function() end); settled(closed, false, "shutdown")
+		assert_equal(#requests, 2)
+	end)
+	scene("unreadable basis never becomes a consent receipt", function(start, answer, held, stores)
+		local c = new(); start(c); c:finish_teardown()
+		local damaged
+		for path, value in pairs(stores) do
+			if path:find("consent%-outbox$") then value.receipts[1].attestation.eligible = false; damaged = value end
+		end
+		assert_true(damaged ~= nil); storage.reset(); local restored = new()
+		assert_true(restored:outbox_write_held()); local calls, ok = start(restored)
+		assert_equal(ok, false); settled(calls, false, "non_objection_ineligible"); assert_equal(#requests, 1)
+		assert_equal(damaged.receipts[1].attestation.eligible, false, "unaccounted evidence was not overwritten")
+	end)
+	print(string.format("non-objection recording total: %d pass, %d fail", passed, #failures))
+	assert_equal(#failures, 0, table.concat(failures, "; "))
+end)()

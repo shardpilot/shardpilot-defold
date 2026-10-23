@@ -16,6 +16,7 @@ local clock = require "shardpilot.clock"
 local crash_deadline = require "shardpilot.crash.deadline"
 local analytics_retry = require "shardpilot.analytics_retry"
 local consent_notice = require "shardpilot.consent_notice"
+local non_objection = require "shardpilot.non_objection"
 local random = require "shardpilot.random"
 local experiment_facts = require "shardpilot.experiment_facts"
 local experiment_enums = require "shardpilot.experiment_enums"
@@ -1162,6 +1163,8 @@ local function sanitize_outbox_entries(entries)
 	for i = 1, prefix do
 		local entry = entries[i]
 		local notice, notice_error = consent_notice.from_receipt(entry)
+		local basis = type(entry) == "table" and entry.admission_basis ~= nil
+		local captured = basis and non_objection.from_receipt(entry) or nil
 		if not notice_error and type(entry) == "table"
 			and valid_receipt_field(entry.idempotency_key)
 			and valid_receipt_field(entry.workspace_id)
@@ -1170,9 +1173,10 @@ local function sanitize_outbox_entries(entries)
 			and valid_receipt_identifier(entry.actor_identifier)
 			and valid_receipt_kinds[entry.kind] == true
 			and valid_receipt_field(entry.decided_at)
-			and type(entry.categories) == "table"
-			and type(entry.categories.analytics) == "boolean"
-			and (entry.reason == nil or valid_receipt_field(entry.reason))
+			and ((basis and captured and #entry.idempotency_key <= 128)
+				or (not basis and type(entry.categories) == "table"
+					and type(entry.categories.analytics) == "boolean"
+					and (entry.reason == nil or valid_receipt_field(entry.reason))))
 			and valid_receipt_identifier(entry.anonymous_id) then
 			out[#out + 1] = {
 				idempotency_key = entry.idempotency_key,
@@ -1188,13 +1192,18 @@ local function sanitize_outbox_entries(entries)
 				decision_seq = (type(entry.decision_seq) == "number"
 					and entry.decision_seq >= 0)
 					and math.floor(entry.decision_seq) or 0,
-				categories = { analytics = entry.categories.analytics },
+				categories = not basis and { analytics = entry.categories.analytics } or nil,
 				reason = entry.reason,
 				notice_version = notice and notice.notice_version,
 				notice_locale = notice and notice.notice_locale,
 				policy_version = notice and notice.policy_version,
 				anonymous_id = entry.anonymous_id,
 			}
+			if basis then
+				local copy = out[#out]
+				for key, value in pairs(captured) do copy[key] = value end
+				copy.admission_basis, copy.purpose = "advisory_non_objection", "analytics"
+			end
 		else
 			dropped = dropped + 1
 		end
@@ -1202,12 +1211,14 @@ local function sanitize_outbox_entries(entries)
 	return out, dropped
 end
 
--- A receipt counts as a pure grant for eviction purposes when its category
+-- A non-objection is evictable before any denial. An ordinary receipt is
+-- also evictable when its category
 -- map carries NO false value — any false makes it denial-carrying and
 -- eviction-protected (under the default legitimate-interest posture the map
 -- is exactly `analytics: true/false`; the loop keeps the rule correct
 -- should the snapshot ever grow more categories).
-local function receipt_is_pure_grant(receipt)
+local function receipt_is_non_denial(receipt)
+	if receipt.admission_basis == "advisory_non_objection" then return true end
 	for _, value in pairs(receipt.categories) do
 		if value ~= true then
 			return false
@@ -1218,7 +1229,7 @@ end
 -- Exported alongside the cap above: the client's grant-append gate must
 -- predict this store's eviction choices with the SAME predicate the
 -- eviction loop applies.
-M.receipt_is_pure_grant = receipt_is_pure_grant
+M.receipt_is_non_denial = receipt_is_non_denial
 
 local function write_consent_outbox(ns, receipts)
 	local record = { receipts = receipts }
@@ -1551,7 +1562,7 @@ function M.append_consent_receipt(scope, receipt)
 		-- then flips its state on a receipt that is not there.
 		local evict_index = nil
 		for i = 1, #kept - 1 do
-			if receipt_is_pure_grant(kept[i]) then
+			if receipt_is_non_denial(kept[i]) then
 				evict_index = i
 				break
 			end
@@ -1563,7 +1574,7 @@ function M.append_consent_receipt(scope, receipt)
 			-- the trail keeps its most recent refusals. A GRANT does not
 			-- outrank any denial, so it is REFUSED and nothing is written: the
 			-- caller's state must not flip on a receipt that did not land.
-			if receipt_is_pure_grant(one[1]) then
+			if receipt_is_non_denial(one[1]) then
 				return false, "consent_outbox_full"
 			end
 			evict_index = 1
@@ -1669,7 +1680,7 @@ function M.save_consent_outbox(scope, receipts)
 	while #kept > max_consent_outbox_entries do
 		local evict_index = 1
 		for i = 1, #kept do
-			if receipt_is_pure_grant(kept[i]) then
+			if receipt_is_non_denial(kept[i]) then
 				evict_index = i
 				break
 			end

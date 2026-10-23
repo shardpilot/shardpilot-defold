@@ -4,6 +4,7 @@ local envelope_platform = require "shardpilot.envelope_platform"
 local clock = require "shardpilot.clock"
 local compression = require "shardpilot.compression"
 local consent_notice = require "shardpilot.consent_notice"
+local non_objection_recording = require "shardpilot.non_objection_recording"
 local experiments_mod = require "shardpilot.experiments"
 local header_identity = require "shardpilot.header_identity"
 local id = require "shardpilot.id"
@@ -1404,7 +1405,7 @@ local function construct(config, normalized)
 		local mismatched_receipts = 0
 		for i = 1, #client.consent_outbox do
 			local receipt = client.consent_outbox[i]
-			if receipt.kind == "user_verified"
+			if receipt.admission_basis or receipt.kind == "user_verified"
 				or (receipt.anonymous_id == client.anonymous_id
 					and receipt.actor_identifier == client.anonymous_id) then
 				kept_receipts[#kept_receipts + 1] = receipt
@@ -2284,6 +2285,7 @@ function Client:identify(user_id)
 		self.token_expires_at_ms = nil
 		self.token_epoch = self.token_epoch + 1
 	end
+	non_objection_recording.poll(self)
 	if identity_changed and self.consent_deferral_armed_key then
 		-- Consent-plane deferral hygiene for the actor switch: the open
 		-- Retry-After/backoff window was armed by ONE dispatch head. If THIS
@@ -2422,6 +2424,7 @@ function Client:set_anonymous_id(anonymous_id)
 		self.token = nil
 		self.token_expires_at_ms = nil
 	end
+	non_objection_recording.poll(self)
 	return true
 end
 
@@ -2431,6 +2434,11 @@ end
 -- it returns here — but it does not itself verify the bind.
 function Client:get_anonymous_id()
 	return self.anonymous_id
+end
+
+-- Kept private until the analytics admission cut exposes the host facade.
+function Client:record_non_objection(record, callback)
+	return non_objection_recording.record(self, record, callback)
 end
 
 function Client:get_consent_state()
@@ -3835,6 +3843,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event, opti
 end
 
 function Client:update(dt)
+	non_objection_recording.poll(self)
 	if not self.initialized then
 		return
 	end
@@ -4828,7 +4837,8 @@ function Client:consent_outbox_anon_pending()
 		return true
 	end
 	for i = 1, #self.consent_outbox do
-		if self.consent_outbox[i].kind ~= "user_verified" then
+		if self.consent_outbox[i].kind ~= "user_verified"
+			and (not self.consent_outbox[i].admission_basis or not self:receipt_parked(self.consent_outbox[i])) then
 			return true
 		end
 	end
@@ -4859,7 +4869,7 @@ function Client:consent_outbox_denial_full()
 	end
 	local evictable_grants = 0
 	for i = 1, #held do
-		if storage.receipt_is_pure_grant(held[i]) then
+		if storage.receipt_is_non_denial(held[i]) then
 			evictable_grants = evictable_grants + 1
 			if evictable_grants >= overflow then
 				return false
@@ -4936,6 +4946,7 @@ end
 -- lands, a parked receipt's only exits are a vouching Mode B session or
 -- cap eviction.
 function Client:receipt_parked(receipt)
+	if receipt.admission_basis then return not non_objection_recording.active(self, receipt) end
 	if receipt.kind ~= "user_verified" then
 		return false
 	end
@@ -4954,6 +4965,7 @@ end
 -- here by construction: receipt_parked (above) is the vouching gate for
 -- that kind, and only the minted token ever carries it.
 function Client:receipt_credential_available(receipt)
+	if receipt.admission_basis then return non_objection_recording.active(self, receipt) end
 	if receipt.kind == "user_verified" then
 		return true
 	end
@@ -5269,6 +5281,7 @@ end
 -- publishable-key 401 is terminal even in a dual-credential configuration,
 -- and never invalidates the cached Mode B token.
 function Client:try_send_consent_outbox()
+	non_objection_recording.poll(self)
 	-- A torn-down client dispatches nothing: a late async ack from a receipt
 	-- that was in flight at shutdown() must not chain further /v1/consent
 	-- traffic after the host tore the SDK down — the remaining durable
@@ -5293,6 +5306,7 @@ function Client:try_send_consent_outbox()
 	if self:consent_dispatch_blocked() then
 		return false
 	end
+	if payload.admission_basis then return non_objection_recording.send(self, payload) end
 	local credential
 	-- MOST-VOUCHING credential selection: the receipt rides the minted
 	-- Mode B token whenever that token vouches for the receipt's ACTOR —
@@ -7336,6 +7350,7 @@ function Client:bounded_shutdown(timeout_seconds, callback)
 		callbacks = { callback },
 	}
 	self.closing = closing
+	non_objection_recording.poll(self, "shutdown")
 	-- An experiment fetch still in flight is abandoned now: a non-adult age
 	-- declaration riding one ends unanswered, before the final drain.
 	if self.experiments then
@@ -7462,6 +7477,8 @@ end
 -- be made durable yet; bounded_shutdown retries it until its deadline and then
 -- tears down regardless.
 function Client:shutdown()
+	self.non_objection_closing = true
+	non_objection_recording.poll(self, "shutdown")
 	-- Shutdown always uses app_final; caller reasons belong to session_end().
 	-- An experiment fetch still in flight is abandoned here: a non-adult age
 	-- declaration riding one ends now, unanswered, before the final flush.
@@ -7702,6 +7719,8 @@ end
 -- code from now on), and a bounded flush still waiting ends with it: its
 -- events were delivered, refused, or left to the spool by the final flush.
 function Client:finish_teardown()
+	self.non_objection_closing = true
+	non_objection_recording.poll(self, "shutdown")
 	if self.remote_config then
 		self.remote_config:teardown()
 	end

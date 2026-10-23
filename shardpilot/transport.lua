@@ -110,8 +110,8 @@ function M.publish(config, token, payload, callback, compress, before_send)
 	return dispatch(config, token, "/v1/events:batch", payload, callback, compress, before_send)
 end
 
-function M.send_consent(config, token, payload, callback)
-	return dispatch(config, token, "/v1/consent", payload, callback)
+function M.send_consent(config, token, payload, callback, before_send)
+	return dispatch(config, token, "/v1/consent", payload, callback, nil, before_send)
 end
 
 return M

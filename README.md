@@ -2163,6 +2163,16 @@ shapes separately from consent. Its locale check is the structural BCP 47 subset
 the server decides registry membership. A captured attestation supplies no policy
 authority or consent grant.
 
+The private recording engine uses the bounded receipt outbox with a trusted
+current-actor credential; it never falls back to a publishable key. It retains
+retry keys, timestamps and payloads, protects denials at capacity, and parks
+restored requests until a fresh matching host attestation. Its callback deadline
+uses `http_timeout_seconds`, including token acquisition and encoding. Identity,
+notice or scope changes, denial and shutdown fence old callbacks. A valid recorded
+ACK closes the request without setting consent or admitting events. A terminal
+server refusal, including an unrecognized locale, drops that record. Public API
+exposure and analytics admission are separate from this private preparation.
+
 ## Compatibility
 
 - **Engine:** Defold (uses `sys`, `http.request`); degrades to in-memory
