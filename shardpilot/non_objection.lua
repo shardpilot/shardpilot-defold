@@ -70,6 +70,22 @@ function M.snapshot(value)
 	return copy
 end
 
+function M.from_receipt(value)
+	if type(value) ~= "table" or value.admission_basis ~= "advisory_non_objection"
+		or value.purpose ~= "analytics" or value.categories ~= nil or value.reason ~= nil then return nil end
+	return M.snapshot({ advisory = value.advisory, age_evidence_class = value.age_evidence_class,
+		attestation = value.attestation, notice_version = value.notice_version,
+		notice_locale = value.notice_locale, policy_version = value.policy_version })
+end
+
+-- Both inputs are closed snapshots, so recursive equality is bounded.
+function M.equal(left, right)
+	if type(left) ~= "table" or type(right) ~= "table" then return left == right end
+	for key, value in pairs(left) do if not M.equal(value, right[key]) then return false end end
+	for key in pairs(right) do if left[key] == nil then return false end end
+	return true
+end
+
 local response = object({ recorded = literal(true), admission_basis = literal("advisory_non_objection"),
 	replayed = function(value) if type(value) == "boolean" then return value end end })
 

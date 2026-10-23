@@ -35,3 +35,5 @@
 - Enforce consent-outbox capacity at append; preserve held and failed-write behavior for removal and retry.
 - Require receipt kind and anonymous snapshot on restore; preserve unaccounted-trail holds, actor checks and malformed-sequence fallback.
 - Require the values-object wrapper on remote-config replies and cache reads; keep empty objects valid and wrapper metadata separate from config keys.
+- Keep private non-objection recording trusted-only and bounded; park restored records until a fresh matching host call, protect denials at capacity, and fence stale ACKs before callbacks. Recording alone changes no event admission or consent state.
+- Shutdown may retire undurable non-objection records with an explicit diagnostic; preserve denial receipts and exercise the actual shutdown method with and without its retirement call.
