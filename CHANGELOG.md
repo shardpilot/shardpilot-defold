@@ -5,7 +5,9 @@
 - Add trusted non-objection recording on instances and the singleton. A valid ACK
   opens future ordinary analytics in the current process while consent stays
   unknown; experiments, ad revenue and durable event spooling still need a grant.
-- Basis events remain memory-only and can be lost on crash or kill. A new host
+- Basis events remain memory-only after a later grant, including retained and
+  re-queued work during persist, retry and shutdown. Only new grant-created
+  events become spoolable. Basis work can be lost on crash or kill. A new host
   call and ACK are required after relaunch; shutdown drains admitted work within
   its bound, and a denial purges it.
 

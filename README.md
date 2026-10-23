@@ -1948,9 +1948,10 @@ identity/scope change or denial closes the old basis; a denial purges its work.
 Shutdown immediately stops new host activity and drains already-admitted work
 within its bound. Teardown and relaunch require a fresh host call and ACK.
 
-While consent stays unknown, basis events remain memory-only even when
-`spool_enabled = true` and can be lost on
-crash or kill. The separate receipt outbox remains durable, retains retry keys,
+Events created under the basis remain memory-only even after a later explicit
+grant; only events created under that grant become spoolable. This also applies
+to retained batches, owed summaries and shutdown capture. Basis events can be
+lost on crash or kill even with `spool_enabled = true`. The separate receipt outbox remains durable, retains retry keys,
 timestamps and payloads, protects denials at capacity, and parks restored
 requests until a fresh matching host attestation. The callback answers once
 within `http_timeout_seconds`, including token acquisition and encoding. A

@@ -18404,7 +18404,8 @@ end)()
 		start(h); answer(1); assert_true(h:track("basis_memory_probe"))
 		local stored, reason = h:persist(); assert_equal(stored, false); assert_equal(reason, "non_objection_memory_only")
 		assert_not_contains(encode_value(stored_spool_record(stores) or {}), "basis_memory_probe")
-		assert_true(h:set_consent(true)); assert_true(h:track("grant_spool_control")); assert_true(h:persist())
+		assert_true(h:set_consent(true)); assert_true(h:track("grant_spool_control")); assert_equal(h:persist(), false)
+		assert_not_contains(encode_value(stored_spool_record(stores) or {}), "basis_memory_probe")
 		assert_contains(encode_value(stored_spool_record(stores)), "grant_spool_control", "same store can retain granted events")
 		assert_equal(h:get_consent_state(), "granted")
 	end)
@@ -18552,6 +18553,108 @@ end)()
 		event_ack(answer, 2); h:update(0); settled(closed, true); assert_equal(#requests, 2)
 		assert_equal(h:get_consent_state(), "unknown")
 	end)
+	-- Compile the production source with exactly this repair reversed. Local
+	-- byte comparison proves this inverse equals the reviewed client source.
+	local inspect_basis = require "test.inspect_client"
+	local basis_class = inspect_basis.class(require("shardpilot.client").new)
+	local basis_methods = { "enqueue_event", "write_spool_record", "spool_envelopes", "report_spool_capture" }
+	local basis_fixed = {}; for _, name in ipairs(basis_methods) do basis_fixed[name] = basis_class[name] end
+	local basis_file = assert(io.open("shardpilot/client.lua", "rb"))
+	local basis_source = basis_file:read("*a"); basis_file:close()
+	local basis_edits = {
+		{ "\t-- A current grant cannot make earlier basis-created events durable.\n\t-- Their creation stamp survives batches, envelopes and owed re-queues.", "\t-- Only a granted actor's envelopes are ever written to disk: denied purges\n\t-- the record, and a consent-first \"unknown\" client never captured anything\n\t-- to spool in the first place." },
+		{ "\t\t\tand (analytics_retry.memory_only(env) or not self.spool_index[event_id]) then\n\t\t\treturn false", "\t\t\tand not self.spool_index[event_id] then\n\t\t\treturn false" },
+		{ "\t\treturn self:report_spool_capture(envelopes, {})\n\t\t\tand (not self.delivery_clock_write_owed or self:fence_delivery_clocks())", "\t\treturn not self.delivery_clock_write_owed or self:fence_delivery_clocks()" },
+		{ "\t\tif type(event_id) == \"string\" and event_id ~= \"\" and not analytics_retry.memory_only(env) then\n\t\t\tif self.spool_settled[event_id] then", "\t\tif type(event_id) == \"string\" and event_id ~= \"\" then\n\t\t\tif self.spool_settled[event_id] then" },
+		{ "\tlocal target = {}\n\tfor i = 1, #events do\n\t\tlocal event = events[i]\n\t\tif type(event) == \"table\" and not self.spool_settled[event.event_id]\n\t\t\tand not analytics_retry.memory_only(event) then\n\t\t\ttarget[#target + 1] = event\n\t\tend\n\tend", "\tlocal target = events\n\tif next(self.spool_settled) ~= nil then\n\t\ttarget = {}\n\t\tfor i = 1, #events do\n\t\t\tif not self.spool_settled[events[i].event_id] then\n\t\t\t\ttarget[#target + 1] = events[i]\n\t\t\tend\n\t\tend\n\tend" },
+		{ "\t\tschema_version = schema_version,\n\t}\n\tanalytics_retry.admit(event, admission_basis)\n\tlocal admission_err", "\t\tschema_version = schema_version,\n\t}\n\tlocal admission_err" },
+		{ "\tlocal admission_basis = self.consent_state == \"granted\" and \"consent\" or \"advisory_non_objection\"\n\t-- Keep ASCII-only normalization identical at admission and on the wire.", "\t-- Keep ASCII-only normalization identical at admission and on the wire." },
+	}
+	for _, edit in ipairs(basis_edits) do
+		local first, last = basis_source:find(edit[1], 1, true)
+		assert_true(first ~= nil and not basis_source:find(edit[1], last + 1, true), "one applied inverse edit")
+		basis_source = basis_source:sub(1, first - 1) .. edit[2] .. basis_source:sub(last + 1)
+	end
+	local basis_before = inspect_basis.class(assert((loadstring or load)(basis_source, "@event-basis-reviewed-inverse"))().new)
+	for _, path in ipairs({ "persist_queue", "persist_retained", "persist_owed_direct", "owed_requeue",
+		"transient_failure", "flush_deadline", "shutdown", "shutdown_owed", "bounded_shutdown",
+		"bounded_shutdown_owed", "whole_record", "retry_rewrite", "clock_fence", "basis_only" }) do
+		for _, phase in ipairs({ "before", "fixed", "inverse", "restored" }) do
+			scene("durable basis " .. path .. " " .. phase, function(start, answer, held, stores)
+				local repaired = phase == "fixed" or phase == "restored"
+				for _, name in ipairs(basis_methods) do basis_class[name] = repaired and basis_fixed[name] or basis_before[name] end
+				local ok, err = pcall(function()
+					local is_owed = path == "persist_owed_direct" or path == "owed_requeue"
+						or path == "shutdown_owed" or path == "bounded_shutdown_owed"
+					local h, c = public_client(config({ source = "backend", spool_enabled = true,
+						buffer_size = is_owed and 1 or 20, flush_interval_seconds = 9999 }))
+					local calls, accepted = start(h); assert_true(accepted); answer(1); settled(calls, true)
+					assert_true(h:track("basis_disk_probe")); local a = c.queue.items[1]
+					if is_owed then
+						h:observe_ping_ms(10); c:enqueue_summaries()
+						assert_true(#c.owed_summaries > 0, "real sampling reached the full-queue owed path")
+						a = c.owed_summaries[1].event
+						require("shardpilot.queue").drain(c.queue, #c.queue.items)
+					elseif path == "persist_retained" then
+						assert_true(h:flush(2, function() end)); assert_true(c.publish_in_flight)
+					end
+					assert_true(h:set_consent(true)); assert_equal(h:get_consent_state(), "granted")
+					assert_equal(c.non_objection_admission, nil, "the original client-state guard is bypassed")
+					for index, request in ipairs(requests) do
+						if request.url:find("/v1/consent", 1, true) and index > 1 then answer(index, 200, "{}") end
+					end
+					if path == "basis_only" then
+						assert_equal(h:persist(), not repaired, "an uncaptured basis-only remnant is not durable")
+					end
+					if path == "owed_requeue" then
+						assert_true(c:drain_owed_summaries()); assert_equal(c.queue.items[1], a)
+						assert_true(h:flush(2, function() end)); assert_true(c.publish_in_flight)
+					end
+					assert_true(h:track("grant_disk_control")); local b = c.queue.items[#c.queue.items]
+					local retry = require "shardpilot.analytics_retry"
+					if repaired then
+						assert_true(retry.memory_only(a), "creation stamp survived grant and any re-queue")
+						assert_equal(retry.memory_only(b), false)
+					end
+					local function publish()
+						assert_true(h:flush(1, function() end)); local index = #requests
+						assert_contains(requests[index].url, "/v1/events:batch"); return index
+					end
+					if path == "transient_failure" then
+						answer(publish(), 503, "{}")
+					elseif path == "flush_deadline" then
+						publish(); socket.now = socket.now + 1.1; h:update(0)
+					elseif path == "shutdown" or path == "shutdown_owed" then
+						c:shutdown()
+					elseif path == "bounded_shutdown" or path == "bounded_shutdown_owed" then
+						assert_true(h:shutdown(1, function() end)); socket.now = socket.now + 2; h:update(0)
+					elseif path == "whole_record" then
+						local envelope = require "shardpilot.envelope"
+						assert_true(c:write_spool_record({ envelope.build(c.config, c, a), envelope.build(c.config, c, b) }))
+					else
+						h:persist()
+						if path == "retry_rewrite" then c.spool_rewrite_pending = true; assert_true(c:retry_spool_rewrite()) end
+						if path == "clock_fence" then c.delivery_clock_write_owed = true; assert_true(c:fence_delivery_clocks()) end
+					end
+					local disk = assert(stored_spool_record(stores), "a real spool write reached sys.save")
+					local a_stored, b_stored = false, false
+					for _, event in ipairs(disk.events) do
+						a_stored = a_stored or event.event_id == a.event_id
+						b_stored = b_stored or event.event_id == b.event_id
+						assert_equal(event.admission_basis, nil, "local stamp never changes the wire/storage format")
+					end
+					assert_true(b_stored, "event created after the grant proves the writer works")
+					local claim, cause = pcall(function() assert_equal(a_stored, false, "basis_event_reached_disk") end)
+					print("event basis " .. path .. " " .. phase .. ": A_disk=" .. tostring(a_stored) .. " B_disk=" .. tostring(b_stored))
+					assert_equal(claim, repaired)
+					if not repaired then assert_contains(tostring(cause), "basis_event_reached_disk") end
+					c:finish_teardown()
+				end)
+				for _, name in ipairs(basis_methods) do basis_class[name] = basis_fixed[name] end
+				assert_true(ok, err)
+			end)
+		end
+	end
 	print(string.format("non-objection recording total: %d pass, %d fail", passed, #failures))
 	assert_equal(#failures, 0, table.concat(failures, "; "))
 end)()

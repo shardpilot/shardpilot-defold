@@ -3724,6 +3724,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event, opti
 			or event_name == "experiment_outcome")) then
 		return self:_record_refusal("consent_unknown", fact)
 	end
+	local admission_basis = self.consent_state == "granted" and "consent" or "advisory_non_objection"
 	-- Keep ASCII-only normalization identical at admission and on the wire.
 	-- Only public track calls reject owned names; typed producers bypass that
 	-- predicate while retaining all lifecycle, consent and delivery gates.
@@ -3819,6 +3820,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event, opti
 		context = context_snapshot,
 		schema_version = schema_version,
 	}
+	analytics_retry.admit(event, admission_basis)
 	local admission_err = envelope.admission_error(self.config, self, event)
 	if admission_err then
 		return self:_record_refusal(admission_err, fact)
@@ -6014,13 +6016,12 @@ end
 -- removal rewrite failed), so any successful write doubles as the deferred
 -- removal; the record also carries the current backpressure deadline.
 function Client:write_spool_record(events)
-	local target = events
-	if next(self.spool_settled) ~= nil then
-		target = {}
-		for i = 1, #events do
-			if not self.spool_settled[events[i].event_id] then
-				target[#target + 1] = events[i]
-			end
+	local target = {}
+	for i = 1, #events do
+		local event = events[i]
+		if type(event) == "table" and not self.spool_settled[event.event_id]
+			and not analytics_retry.memory_only(event) then
+			target[#target + 1] = event
 		end
 	end
 	local saved = storage.save_spool(self.config, target,
@@ -6156,9 +6157,8 @@ end
 -- re-loaded spool batch is never appended again. Returns true when everything
 -- new is durably recorded (vacuously true when nothing new).
 function Client:spool_envelopes(envelopes)
-	-- Only a granted actor's envelopes are ever written to disk: denied purges
-	-- the record, and a consent-first "unknown" client never captured anything
-	-- to spool in the first place.
+	-- A current grant cannot make earlier basis-created events durable.
+	-- Their creation stamp survives batches, envelopes and owed re-queues.
 	if not self.config.spool_enabled or self.consent_state ~= "granted" then
 		return false
 	end
@@ -6173,7 +6173,7 @@ function Client:spool_envelopes(envelopes)
 	for i = 1, #envelopes do
 		local env = envelopes[i]
 		local event_id = type(env) == "table" and env.event_id or nil
-		if type(event_id) == "string" and event_id ~= "" then
+		if type(event_id) == "string" and event_id ~= "" and not analytics_retry.memory_only(env) then
 			if self.spool_settled[event_id] then
 				-- A replacement fact re-derived a deterministic id whose
 				-- prior copy a sentinel purge condemned while the removal
@@ -6216,7 +6216,8 @@ function Client:spool_envelopes(envelopes)
 		end
 	end
 	if #fresh == 0 and not replaced then
-		return not self.delivery_clock_write_owed or self:fence_delivery_clocks()
+		return self:report_spool_capture(envelopes, {})
+			and (not self.delivery_clock_write_owed or self:fence_delivery_clocks())
 	end
 	-- ⚠ THE APPEND PATH, AND WHY IT IS NARROW. Appending one envelope used to
 	-- copy the whole record, re-estimate every entry in it (json.encode per
@@ -6320,7 +6321,7 @@ function Client:report_spool_capture(envelopes, fresh)
 		local env = envelopes[i]
 		local event_id = type(env) == "table" and env.event_id or nil
 		if type(event_id) == "string" and event_id ~= ""
-			and not self.spool_index[event_id] then
+			and (analytics_retry.memory_only(env) or not self.spool_index[event_id]) then
 			return false
 		end
 	end

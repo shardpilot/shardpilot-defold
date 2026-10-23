@@ -611,10 +611,12 @@ or denial. Teardown clears the episode. Relaunch requires a fresh matching host
 attestation and ACK, even when a pending receipt was restored.
 
 **Durability trade-off:** basis events stay in memory and may be lost on a crash
-or kill, by design. They never enter the durable event spool without an explicit
-grant, including when `spool_enabled` is true. `persist()` reports
-`false, "non_objection_memory_only"` with the spool enabled in this mode; an explicit grant enables
-normal spooling. The receipt outbox is separate:
+or kill, by design. Their creation-time basis follows retained batches and owed
+summaries and never becomes durable after a later explicit grant. Only events
+created under that grant become spoolable, including during retry, persist and
+shutdown capture. `persist()` reports `false, "non_objection_memory_only"` while
+the basis is the current admission; an undelivered basis remnant cannot be
+reported as durably captured after a grant. The receipt outbox is separate:
 its bounded records retain their original payload, time and key across retries.
 A no-storage shutdown explicitly retires undurable non-objection receipts with
 `shutdown_undurable`; it preserves denial receipts and callback fences.

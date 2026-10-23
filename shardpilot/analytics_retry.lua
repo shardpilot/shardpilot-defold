@@ -10,6 +10,16 @@ end
 function M.start(event, prior)
 	clocks[event] = prior or clocks[event] or { intake_ms = clock.unix_ms(), ambiguous_ms = 0 }
 end
+-- Admission belongs to the created event, even after a later consent grant.
+-- bind carries this local stamp to envelopes; snapshot never serializes it.
+function M.admit(event, basis)
+	M.start(event)
+	clocks[event].admission_basis = basis
+end
+function M.memory_only(event)
+	local age = clocks[event]
+	return age ~= nil and age.admission_basis == "advisory_non_objection"
+end
 function M.bind(envelope, event)
 	clocks[envelope] = clocks[event]
 end
