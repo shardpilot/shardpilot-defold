@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.16.0 — 2026-10-23
+
+- The non-objection recording basis is accepted only by servers that enable it.
+  Closed host snapshots and trusted recording preserve current actor, notice
+  and denial checks; a recorded basis never becomes an explicit consent grant.
 
 - Add trusted non-objection recording on instances and the singleton. A valid ACK
   opens future ordinary analytics in the current process while consent stays
