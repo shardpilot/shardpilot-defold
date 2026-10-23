@@ -18140,13 +18140,19 @@ end)()
 	end)
 	for _, mode in ipairs({ "publishable", "failed mint", "dual failed mint" }) do
 		scene(mode .. " cannot use a publishable fallback", function(start)
-			local opts = config({ publishable_key = "sp_ingest_publishable_key", token_provider = function(cb) cb(nil, nil, "unavailable") end })
+			local mints = 0
+			local opts = config({ publishable_key = "sp_ingest_publishable_key", token_provider = function(cb) mints = mints + 1; cb(nil, nil, "unavailable") end })
 			if mode == "publishable" then opts.token_provider = nil end
 			if mode == "failed mint" then opts.publishable_key = nil end
+			if mode == "dual failed mint" then opts.app_url = "https://config.example.invalid" end
 			local c = new(opts); local calls, ok = start(c)
 			assert_equal(#requests, 0)
 			if mode == "publishable" then assert_equal(ok, false); settled(calls, false, "non_objection_ineligible")
-			else socket.now = socket.now + 3; c:update(0); settled(calls, false, "non_objection_timeout") end
+			else
+				assert_true(ok); assert_equal(mints, 1, "the real recording path attempted a trusted mint")
+				assert_true(c.non_objection ~= nil); assert_equal(#c.consent_outbox, 1)
+				socket.now = socket.now + 3; c:update(0); settled(calls, false, "non_objection_timeout")
+			end
 		end)
 	end
 	scene("transient retry preserves exact body and key", function(start, answer)
@@ -18250,8 +18256,12 @@ end)()
 	end)
 	scene("historic anonymous records never use the dual-mode key", function(start)
 		local c = new(); start(c); c:finish_teardown(); storage.reset()
-		local restored = new(config({ anonymous_id = "replacement-anon", publishable_key = "sp_ingest_publishable_key" }))
+		local restored = new(config({ anonymous_id = "replacement-anon", publishable_key = "sp_ingest_publishable_key",
+			app_url = "https://config.example.invalid" }))
 		restored:try_send_consent_outbox(); assert_equal(#requests, 1); assert_equal(#restored.consent_outbox, 1)
+		assert_equal(restored.consent_outbox[1].idempotency_key, json_decode(requests[1].body).idempotency_key)
+		assert_true(restored:receipt_parked(restored.consent_outbox[1]), "the historic record reached the parking gate")
+		assert_equal(restored:receipt_credential_available(restored.consent_outbox[1]), false)
 		assert_true(restored:set_anonymous_id("third-anon"), "parked basis cannot wedge rotation")
 		assert_equal(#requests, 1)
 	end)
