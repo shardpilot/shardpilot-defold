@@ -182,6 +182,7 @@ function M.send(client, receipt)
 		end
 		M.poll(client)
 		if client.non_objection ~= operation then return end
+		if unauthorized and not client.config.token_provider then retryable = false end
 		if ok or not retryable then
 			if ok then
 				local admission = {}

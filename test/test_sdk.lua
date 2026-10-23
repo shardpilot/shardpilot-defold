@@ -18408,6 +18408,32 @@ end)()
 			assert_equal(h:get_consent_state(), "unknown")
 		end)
 	end
+	for _, mode in ipairs({ "publishable", "token", "dual" }) do
+		scene(mode .. " 401 follows credential refresh capability", function(start, answer)
+			local mints = 0
+			local opts = config({ http_timeout_seconds = 30, token_provider = function(cb)
+				mints = mints + 1; cb("client-token-placeholder-" .. mints)
+			end })
+			if mode == "publishable" then opts = config_mode_a({ http_timeout_seconds = 30 }) end
+			if mode == "dual" then opts.publishable_key = "sp_ingest_publishable_key"; opts.app_url = "https://config.example.invalid" end
+			local h, c = public_client(opts); local calls, accepted = start(h, record(publishable)); assert_true(accepted)
+			local body = requests[1].body; answer(1, 401)
+			if mode == "publishable" then
+				settled(calls, false, "unauthorized"); assert_equal(#c.consent_outbox, 0)
+				assert_equal(c.non_objection, nil); assert_equal(h:track("unauthorized_basis"), false)
+				socket.now = socket.now + 2; c:try_send_consent_outbox(); assert_equal(#requests, 1)
+				answer(1, 401); settled(calls, false, "unauthorized")
+			else
+				assert_equal(#calls, 0); assert_equal(#c.consent_outbox, 1)
+				assert_equal(requests[1].headers.Authorization, "Bearer client-token-placeholder-1")
+				socket.now = socket.now + 2; c:try_send_consent_outbox(); assert_equal(#requests, 2)
+				assert_equal(mints, 2); assert_equal(requests[2].headers.Authorization, "Bearer client-token-placeholder-2")
+				assert_equal(requests[2].body, body); answer(2); settled(calls, true)
+				assert_true(h:track("refreshed_basis"))
+			end
+			assert_equal(h:get_consent_state(), "unknown")
+		end)
+	end
 	scene("publishable retry and relaunch require a current ACK", function(start, answer)
 		local opts = config_mode_a({ http_timeout_seconds = 30, flush_interval_seconds = 9999 })
 		local h, c = public_client(opts); local old, accepted = start(h, record(publishable)); assert_true(accepted)

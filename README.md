@@ -1942,6 +1942,7 @@ after `identify()`. A configured token provider retains precedence and never
 falls back to that key. The SDK advisory alone does not establish eligibility.
 The server must enable device recording, resolve a matching `SOFT_OPT_OUT`
 country, and have the workspace owner’s active acceptance for this basis.
+A publishable-key `401` is terminal; a token-provider `401` refreshes and retries.
 Feature-detect admission support with `supports("analytics_non_objection")`.
 
 Only a valid recorded ACK opens future ordinary analytics in the current process.

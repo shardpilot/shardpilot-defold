@@ -2,6 +2,9 @@
 
 ## v0.17.0 — 2026-10-24
 
+- A rejected publishable key settles non-objection recording immediately on 401;
+  token-provider clients keep their refresh-and-retry path.
+
 - Record non-objection with the configured publishable key when no token provider
   is configured. The actor remains anonymous after `identify()`; token providers
   keep precedence without fallback. Identity changes fence pending and admitted

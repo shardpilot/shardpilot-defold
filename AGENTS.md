@@ -37,4 +37,5 @@
 - Require receipt kind and anonymous snapshot on restore; preserve unaccounted-trail holds, actor checks and malformed-sequence fallback.
 - Require the values-object wrapper on remote-config replies and cache reads; keep empty objects valid and wrapper metadata separate from config keys.
 - Keep non-objection recording bounded, with token-provider precedence and anonymous-only publishable-key actors. Preserve identity fences even when an unverified user change leaves that anonymous actor unchanged. Admit only future ordinary analytics after ACK; keep consent unknown and special consumers grant-only. Stamp each event at creation; basis events stay memory-only through later grants, retries, owed re-queues and shutdown, with a fresh host call required after relaunch; preserve bounded shutdown drain and stale-callback fences.
+- Treat a non-objection 401 as terminal without a token provider; keep token-provider refresh-and-retry controls.
 - Shutdown may retire undurable non-objection records with an explicit diagnostic; preserve denial receipts and exercise the actual shutdown method with and without its retirement call.
