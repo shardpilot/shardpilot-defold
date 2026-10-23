@@ -118,3 +118,5 @@ validate recorded and replayed ACKs, and keep locale refusal terminal. Retries
 retain the same payload, timestamp and key; restored records require a fresh
 matching host attestation. Identity, notice, scope, denial, deadline and shutdown
 scenes fence stale answers. These scenes do not claim event admission.
+The undurable-shutdown scene compiles the actual client with only the retirement
+call removed, exercising before/fixed/inverse/restored methods on fresh clients.

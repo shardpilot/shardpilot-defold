@@ -18305,6 +18305,58 @@ end)()
 		assert_equal(ok, false); settled(calls, false, "non_objection_ineligible"); assert_equal(#requests, 1)
 		assert_equal(damaged.receipts[1].attestation.eligible, false, "unaccounted evidence was not overwritten")
 	end)
+	scene("undurable shutdown before fixed inverse restored", function(start)
+		sys.get_save_file, sys.save, sys.load = nil, nil, nil
+		local inspect = require "test.inspect_client"
+		local class = inspect.class(require("shardpilot.client").new)
+		local fixed = class.shutdown
+		local file = assert(io.open("shardpilot/client.lua", "rb")); local source = file:read("*a"); file:close()
+		local call = "\tnon_objection_recording.discard_undurable(self)\n"
+		local first, last = source:find(call, 1, true)
+		assert_true(first ~= nil and not source:find(call, last + 1, true), "one owned retirement call")
+		local inverse = source:sub(1, first - 1) .. source:sub(last + 1)
+		local compiled = assert((loadstring or load)(inverse, "@shutdown-retirement-inverse"))()
+		local before = inspect.class(compiled.new).shutdown
+		assert_true(before ~= fixed, "the actual inverse compiled into a distinct method")
+		local results = {}
+		for _, phase in ipairs({ "before", "fixed", "inverse", "restored" }) do
+			class.shutdown = (phase == "before" or phase == "inverse") and before or fixed
+			results[#results + 1] = { pcall(function()
+				storage.reset(); local recovered, issues = false, {}
+				local c = new(config({ token_provider = function(cb) cb(recovered and "client-token-placeholder" or nil, nil, "unavailable") end,
+					diagnostics = function(issue) issues[#issues + 1] = issue end }))
+				local calls, accepted = start(c); assert_true(accepted); assert_true(c.non_objection ~= nil)
+				assert_equal(#c.consent_outbox, 1); assert_equal(#requests, 0, "setup reached a retained unsent basis")
+				local done, code = c:shutdown(); recovered = true
+				if not done then done, code = c:shutdown() end
+				settled(calls, false, "shutdown"); assert_equal(c.consent_state, "unknown"); assert_equal(#requests, 0)
+				if not done then
+					assert_equal(#c.consent_outbox, 1); error("shutdown_pending_basis:" .. tostring(code), 0)
+				end
+				assert_equal(#c.consent_outbox, 0); assert_equal(c.initialized, false)
+				local dropped = 0
+				for _, issue in ipairs(issues) do if issue.scope == "non_objection" and issue.code == "shutdown_undurable" then dropped = dropped + issue.count end end
+				assert_equal(dropped, 1, "retirement has an explicit reason")
+			end) }
+		end
+		class.shutdown = fixed -- Inverse assignment restores the method before inspecting any result.
+		for index, phase in ipairs({ "before", "fixed", "inverse", "restored" }) do
+			local expected = phase == "fixed" or phase == "restored"
+			print("non-objection shutdown " .. phase .. ": " .. (results[index][1] and "PASS" or "expected FAIL " .. tostring(results[index][2])))
+			assert_equal(results[index][1], expected, phase)
+			if not expected then assert_equal(results[index][2], "shutdown_pending_basis:consent_pending") end
+		end
+		assert_equal(class.shutdown, fixed)
+	end)
+	scene("undurable shutdown preserves denial and ignores late basis ACK", function(start, answer)
+		storage.reset(); sys.get_save_file, sys.save, sys.load = nil, nil, nil
+		local c = new(); local calls = start(c); assert_true(c:set_consent(false))
+		settled(calls, false, "non_objection_superseded"); assert_equal(#requests, 2)
+		local done, code = c:shutdown(); assert_equal(done, false); assert_equal(code, "consent_pending")
+		assert_equal(#c.consent_outbox, 1); assert_equal(c.consent_outbox[1].categories.analytics, false)
+		answer(1); assert_equal(c.consent_state, "denied"); assert_true(c.consent_send_in_flight)
+		settled(calls, false, "non_objection_superseded"); answer(2); assert_true(c:shutdown())
+	end)
 	print(string.format("non-objection recording total: %d pass, %d fail", passed, #failures))
 	assert_equal(#failures, 0, table.concat(failures, "; "))
 end)()

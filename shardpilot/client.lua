@@ -7479,6 +7479,7 @@ end
 function Client:shutdown()
 	self.non_objection_closing = true
 	non_objection_recording.poll(self, "shutdown")
+	non_objection_recording.discard_undurable(self)
 	-- Shutdown always uses app_final; caller reasons belong to session_end().
 	-- An experiment fetch still in flight is abandoned here: a non-adult age
 	-- declaration riding one ends now, unanswered, before the final flush.

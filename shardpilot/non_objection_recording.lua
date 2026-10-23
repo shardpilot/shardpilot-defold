@@ -59,6 +59,18 @@ function M.active(client, receipt)
 		and client.non_objection.idempotency_key == receipt.idempotency_key
 end
 
+function M.discard_undurable(client)
+	if storage.consent_outbox_is_durable(client.config) then return end
+	local keys = {}
+	for _, receipt in ipairs(client.consent_outbox) do
+		if receipt.admission_basis == "advisory_non_objection" then keys[#keys + 1] = receipt.idempotency_key end
+	end
+	if #keys == 0 then return end
+	local ok, reason = storage.drop_consent_receipts(client.config, keys)
+	client:record_outbox_op(ok, reason)
+	client:diagnose({ scope = "non_objection", status = "dropped", code = "shutdown_undurable", count = #keys })
+end
+
 function M.record(client, record, callback)
 	local function refuse(code)
 		if type(callback) == "function" then pcall(callback, false, code) end

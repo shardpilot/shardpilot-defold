@@ -2172,6 +2172,8 @@ notice or scope changes, denial and shutdown fence old callbacks. A valid record
 ACK closes the request without setting consent or admitting events. A terminal
 server refusal, including an unrecognized locale, drops that record. Public API
 exposure and analytics admission are separate from this private preparation.
+Without durable storage, shutdown retires pending non-objection records with a
+`shutdown_undurable` drop diagnostic; denial receipts retain their delivery gate.
 
 ## Compatibility
 
