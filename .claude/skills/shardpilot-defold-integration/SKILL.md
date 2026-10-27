@@ -71,7 +71,7 @@ Two supported paths:
 dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.17.1.zip
 ```
 
-`v0.17.0` is the version this skill matches, and it is the same pin the
+`v0.17.1` is the version this skill matches, and it is the same pin the
 README's Installation section carries.
 
 The earlier off-main `v0.10.1` tag still declares `0.10.0`; see the [changelog](../../../CHANGELOG.md).
