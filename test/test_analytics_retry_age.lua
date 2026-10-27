@@ -116,7 +116,7 @@ local function restart_case(minutes, attempt, eligible)
 	end
 end
 local function spool_record()
-	for name, record in pairs(disk) do if name:sub(-6) == "/spool" then return record end end
+	for name, record in pairs(disk) do if name:sub(-6) == "-spool" then return record end end
 	error("missing spool record")
 end
 local function durable_subject()
@@ -147,7 +147,7 @@ local function delayed_write(minutes, expected)
 	local client, id = durable_subject()
 	local delayed = false
 	save_hook = function(name, record)
-		if name:sub(-6) == "/spool" and record.delivery_age[id]
+		if name:sub(-6) == "-spool" and record.delivery_age[id]
 			and record.delivery_age[id].ambiguous_ms > 0 and not delayed then
 			delayed = true; now = now + minutes * 60000
 		end
@@ -221,7 +221,7 @@ local function preflight_expiry_drain(stage, shutdown)
 	local function delay() reached = true; now = now + 2 * 60000 end
 	if stage == "write" then
 		save_hook = function(name, record)
-			if not reached and name:sub(-6) == "/spool" and record.delivery_age[id]
+			if not reached and name:sub(-6) == "-spool" and record.delivery_age[id]
 				and record.delivery_age[id].ambiguous_ms > 0 then delay() end
 		end
 	else encode_hook = delay end
@@ -251,7 +251,7 @@ local function startup_expiry_rewrite(ambiguous, survivor)
 	now = now + 2 * 60000; requests, response_headers = {}, nil
 	local writes = 0
 	save_hook = function(name)
-		if name:sub(-6) == "/spool" then writes = writes + 1; return false end
+		if name:sub(-6) == "-spool" then writes = writes + 1; return false end
 	end
 	local loaded = restart(); local startup_writes = writes
 	assert(startup_writes > 0, "startup reached the failed cleanup write")
@@ -274,7 +274,7 @@ local cases = {
 	{ "startup_ambiguity_expiry_rewrite_survivor", function() startup_expiry_rewrite(true, true) end },
 	{ "live_expiry_rewrite_already_retries", function()
 		local client = durable_subject(); now = now + 8 * 86400000
-		save_hook = function(name) if name:sub(-6) == "/spool" then return false end end
+		save_hook = function(name) if name:sub(-6) == "-spool" then return false end end
 		client:flush(); eq(#spool_record().events, 1, "failed live cleanup leaves durable bytes")
 		save_hook = nil; client:update(client.config.flush_interval_seconds)
 		eq(#spool_record().events, 0, "live expiry cleanup already retries after recovery")
@@ -342,7 +342,7 @@ local cases = {
 	end },
 	{ "failed_fence_sends_nothing_and_evicts_nothing", function()
 		local client, id = durable_subject()
-		save_hook = function(name) if name:sub(-6) == "/spool" then return false end end
+		save_hook = function(name) if name:sub(-6) == "-spool" then return false end end
 		eq(client:flush(), false, "an unsuccessful clock fence is not a successful drain")
 		eq(#requests, 0, "failed fence never reaches HTTP")
 		eq(#spool_record().events, 1, "failure does not evict durable member")
@@ -365,7 +365,7 @@ local cases = {
 		local attempted = false
 		request_hook = function() attempted = true end
 		save_hook = function(name, record)
-			if attempted and name:sub(-6) == "/spool" and record.delivery_age[id]
+			if attempted and name:sub(-6) == "-spool" and record.delivery_age[id]
 				and record.delivery_age[id].ambiguous_ms == 0 then return false end
 		end
 		response_status = 429; client:flush()
@@ -387,7 +387,7 @@ local cases = {
 		local client, id = durable_subject()
 		local reentered = false
 		save_hook = function(name, record)
-			if name:sub(-6) == "/spool" and record.delivery_age[id]
+			if name:sub(-6) == "-spool" and record.delivery_age[id]
 				and record.delivery_age[id].ambiguous_ms > 0 and not reentered then
 				reentered = true; assert(client:set_consent(false)); assert(client:set_consent(true))
 			end
@@ -430,14 +430,14 @@ local cases = {
 	{ "durable_clock_needs_no_rewrite_for_retry", function()
 		local client, id = durable_subject(); response_status = 0; client:flush()
 		local first = spool_record().delivery_age[id].ambiguous_ms
-		save_hook = function(name) if name:sub(-6) == "/spool" then return false end end
+		save_hook = function(name) if name:sub(-6) == "-spool" then return false end end
 		now = now + 60000; client:flush(); eq(#requests, 2, "already durable clock permits retry")
 		eq(spool_record().delivery_age[id].ambiguous_ms, first, "disk still holds first ambiguity")
 	end },
 	{ "owed_clock_correction_blocks_failed_next_fence", function()
 		local client, id = durable_subject(); response_status = 429
 		request_hook = function()
-			save_hook = function(name) if name:sub(-6) == "/spool" then return false end end
+			save_hook = function(name) if name:sub(-6) == "-spool" then return false end end
 		end
 		client:flush(); eq(#requests, 1, "first request was rejected")
 		assert(spool_record().delivery_age[id].ambiguous_ms > 0, "correction is still owed on disk")

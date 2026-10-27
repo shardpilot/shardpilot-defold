@@ -69,6 +69,24 @@ function M.release_scope(claim)
 	if claim and client_scopes[claim.key] == claim then client_scopes[claim.key] = nil end
 end
 
+local filename_prefixes = {}
+local function filename_prefix(ns)
+	if not filename_prefixes[ns] then
+		-- Bound filenames independently of scope length. These accumulators stay
+		-- exactly representable by Lua 5.1 numbers as well as integer runtimes.
+		local a, b, c, d = 5381, 2166136261, 16777619, 1315423911
+		for i = 1, #ns do
+			local byte = ns:byte(i)
+			a = (a * 131 + byte) % 4294967296
+			b = (b * 65599 + byte) % 4294967296
+			c = (c * 257 + byte) % 4294967296
+			d = (d * 4099 + byte) % 4294967296
+		end
+		filename_prefixes[ns] = string.format("sp-%08x%08x%08x%08x-", a, b, c, d)
+	end
+	return filename_prefixes[ns]
+end
+
 local function save_path(ns, file_name)
 	if type(sys) ~= "table" then
 		return nil
@@ -76,7 +94,7 @@ local function save_path(ns, file_name)
 	if type(sys.get_save_file) ~= "function" or type(sys.save) ~= "function" or type(sys.load) ~= "function" then
 		return nil
 	end
-	local ok, path = pcall(sys.get_save_file, ns, file_name or "identity")
+	local ok, path = pcall(sys.get_save_file, ns, filename_prefix(ns) .. file_name)
 	if not ok or type(path) ~= "string" or path == "" then
 		return nil
 	end
@@ -90,7 +108,7 @@ end
 -- failure here still fails closed end to end.
 function M.load(scope)
 	local ns = namespace(scope)
-	local path = save_path(ns)
+	local path = save_path(ns, "identity")
 	if not path then
 		return clone(memory_records[ns])
 	end
@@ -107,7 +125,7 @@ function M.save(scope, record)
 	end
 	local ns = namespace(scope)
 	memory_records[ns] = clone(record)
-	local path = save_path(ns)
+	local path = save_path(ns, "identity")
 	if not path then
 		return true
 	end
@@ -123,7 +141,7 @@ end
 function M.delete_identity(scope)
 	local ns = namespace(scope)
 	memory_records[ns] = nil
-	local path = save_path(ns)
+	local path = save_path(ns, "identity")
 	if not path then
 		return true
 	end
@@ -347,7 +365,7 @@ local function normalize_items(items, current_ms)
 end
 
 local function load_raw_record(ns)
-	local path = save_path(ns)
+	local path = save_path(ns, "pending-crashes")
 	if not path then
 		return pending_memory[ns]
 	end
@@ -382,7 +400,7 @@ end
 
 function write_pending_list(ns, items, retry_after_until_ms)
 	local record = { items = items, retry_after_until_ms = retry_after_until_ms }
-	local path = save_path(ns)
+	local path = save_path(ns, "pending-crashes")
 	if not path then
 		-- No durable backend: the in-memory record IS the store. Update it and
 		-- report success.
@@ -464,7 +482,7 @@ function M.save_pending_crash(scope, entry, created_at_ms)
 	-- (no token) and the caller degrades to its explicitly non-durable
 	-- in-memory retention — a process-local table must never be counted as
 	-- write-ahead durability.
-	if not save_path(ns) then
+	if not save_path(ns, "pending-crashes") then
 		return nil
 	end
 	-- Read the backlog before assigning the new report's timestamp.
@@ -632,7 +650,7 @@ end
 --     written by a successful save this session — can answer instead.
 function M.load_crash_settings(scope)
 	local ns = crash_settings_namespace(scope)
-	local path = save_path(ns)
+	local path = save_path(ns, "crash-settings")
 	if not path then
 		return clone(crash_settings_memory[ns]), nil
 	end
@@ -659,7 +677,7 @@ function M.save_crash_settings(scope, record)
 		return false
 	end
 	local ns = crash_settings_namespace(scope)
-	local path = save_path(ns)
+	local path = save_path(ns, "crash-settings")
 	if not path then
 		-- No durable backend: the in-memory record IS the store.
 		crash_settings_memory[ns] = clone(record)
@@ -2360,6 +2378,7 @@ end
 
 -- Clears the in-memory fallback records only; intended for tests.
 function M.reset()
+	filename_prefixes = {}
 	analytics_retry.reset()
 	memory_records = {}
 	consent_denial_memory = {}

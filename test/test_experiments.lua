@@ -322,7 +322,7 @@ end
 -- writes (the identity record keeps persisting, so sibling clients share
 -- one subject id).
 local function fail_experiment_saves(path)
-	return path:sub(-#"/experiments") == "/experiments"
+	return path:sub(-#"-experiments") == "-experiments"
 end
 
 -- Token-shaped fixture values are built from obviously synthetic constant
@@ -568,7 +568,7 @@ local function test_flag_off_zero_paths()
 
 	assert_equal(#assignment_requests(), 0, "the dark flag must produce zero assignment requests")
 	for path in pairs(stores) do
-		assert_nil(path:match("/experiments$"), "the dark flag must create no experiments persistence")
+		assert_nil(path:match("%-experiments$"), "the dark flag must create no experiments persistence")
 	end
 	local identity = storage.load(storage_scope)
 	assert_nil(identity.experiments_client_id, "the dark flag must not mint a subject id")
@@ -1284,7 +1284,7 @@ local function test_corrupt_cache_record_is_a_miss()
 	fetch(client, "exp-checkout")
 	local path = nil
 	for key in pairs(stores) do
-		if key:match("/experiments$") then
+		if key:match("%-experiments$") then
 			path = key
 		end
 	end
@@ -3864,7 +3864,7 @@ local function test_persist_spools_owed_exposure_fact()
 		"persist sweeps the owed fact into the queue (its normal emission)")
 	local spooled = false
 	for path, record in pairs(stores) do
-		if path:sub(-#"/spool") == "/spool"
+		if path:sub(-#"-spool") == "-spool"
 			and json.encode(record):find("experiment_exposure", 1, true) then
 			spooled = true
 		end
@@ -4624,7 +4624,7 @@ local function test_marker_survives_unreadable_record()
 
 	local marker_path = nil
 	for key in pairs(stores) do
-		if key:match("/experiments%-clear$") then
+		if key:match("%-experiments%-clear$") then
 			marker_path = key
 		end
 	end
@@ -4649,7 +4649,7 @@ local function test_marker_survives_unreadable_record()
 	state.fail_save = fail_experiment_saves
 	local saved_load = sys.load
 	sys.load = function(path)
-		if path:match("/experiments$") then
+		if path:match("%-experiments$") then
 			error("io_error")
 		end
 		return saved_load(path)
@@ -4740,7 +4740,7 @@ local function test_stale_sentinel_stamp_ignores_post_dispatch_install()
 
 	local record_path = nil
 	for key in pairs(stores) do
-		if key:match("/experiments$") then
+		if key:match("%-experiments$") then
 			record_path = key
 		end
 	end
@@ -5005,7 +5005,7 @@ local function test_condemned_relaunch_filters_spooled_facts()
 	-- window by design.)
 	advance_seconds(2)
 	state.fail_save = function(path)
-		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
+		return path:match("%-experiments$") ~= nil or path:match("%-spool$") ~= nil
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
@@ -5217,8 +5217,8 @@ local function test_stale_marker_does_not_condemn_new_scope_spool()
 	storage.reset()
 	local second = assert(sdk.new(config({ environment_key = "prod" })))
 	state.fail_save = function(path)
-		return path:match("/experiments$") ~= nil
-			or path:match("/experiments%-clear$") ~= nil
+		return path:match("%-experiments$") ~= nil
+			or path:match("%-experiments%-clear$") ~= nil
 	end
 	assert_true(second:session_start())
 	assert_true(second:track("filler-host-event"))
@@ -5266,7 +5266,7 @@ local function test_numeric_payload_counts_toward_record_cap()
 	-- whose entry still carries the huge numeric payload fails (the
 	-- estimator passed what the sys layer cannot store).
 	state.fail_save = function(path, record)
-		if path:sub(-#"/experiments") ~= "/experiments" then
+		if path:sub(-#"-experiments") ~= "-experiments" then
 			return false
 		end
 		local entries = type(record) == "table" and record.entries or nil
@@ -5362,7 +5362,7 @@ local function test_new_application_capture_survives_settled_purge()
 	-- fact settled but the removal rewrite cannot land, so its id stays
 	-- in the capture index.
 	state.fail_save = function(path)
-		return path:match("/spool$") ~= nil
+		return path:match("%-spool$") ~= nil
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
@@ -5440,7 +5440,7 @@ local function test_reissued_fact_key_replaces_settled_spool_copy()
 	-- Sentinel with the spool store failing: the purge marks the spooled
 	-- old-key fact settled but cannot rewrite it away.
 	state.fail_save = function(path)
-		return path:match("/spool$") ~= nil
+		return path:match("%-spool$") ~= nil
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
@@ -5500,7 +5500,7 @@ local function test_condemned_marker_holds_without_subject()
 	-- same-second facts sit in the survive-biased boundary by design.)
 	advance_seconds(2)
 	state.fail_save = function(path)
-		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
+		return path:match("%-experiments$") ~= nil or path:match("%-spool$") ~= nil
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
@@ -5515,7 +5515,7 @@ local function test_condemned_marker_holds_without_subject()
 	storage.reset()
 	local identity_path = nil
 	for key in pairs(stores) do
-		if key:match("/identity$") then
+		if key:match("%-identity$") then
 			identity_path = key
 		end
 	end
@@ -5563,7 +5563,7 @@ local function test_condemnation_survives_failed_spool_clear()
 	-- the capture second: the boundary is survive-biased by design.)
 	advance_seconds(2)
 	state.fail_save = function(path)
-		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
+		return path:match("%-experiments$") ~= nil or path:match("%-spool$") ~= nil
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
@@ -5577,7 +5577,7 @@ local function test_condemnation_survives_failed_spool_clear()
 	-- the stale file would replay the withdrawn fact one launch later.
 	storage.reset()
 	state.fail_save = function(path)
-		return path:match("/spool$") ~= nil
+		return path:match("%-spool$") ~= nil
 	end
 	local second = assert(sdk.new(config()))
 	second:update(0.016)
@@ -5585,7 +5585,7 @@ local function test_condemnation_survives_failed_spool_clear()
 		"the failed condemnation clear is recorded as durable debt")
 	local marker_path = nil
 	for key in pairs(stores) do
-		if key:match("/experiments%-clear$") then
+		if key:match("%-experiments%-clear$") then
 			marker_path = key
 		end
 	end
@@ -5629,7 +5629,7 @@ local function test_evicted_replacement_reports_capture_failure()
 	assert_true(not client:flush({ include_summaries = false }))
 	responder = nil
 	state.fail_save = function(path)
-		return path:match("/spool$") ~= nil
+		return path:match("%-spool$") ~= nil
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
@@ -5668,7 +5668,7 @@ local function test_settled_marker_spares_fresh_facts()
 	-- ...the record store heals but the SIDECAR delete fails: the clear
 	-- fully settles on the first tick while the stale marker file stays.
 	state.fail_save = function(path)
-		return path:match("/experiments%-clear$") ~= nil
+		return path:match("%-experiments%-clear$") ~= nil
 	end
 	client:update(0.016)
 	assert_true(client.experiments.durable_clear_pending == false,
@@ -5778,14 +5778,14 @@ local function test_spool_only_debt_persists_marker()
 	-- withdrawn fact from the stale file.
 	advance_seconds(2)
 	state.fail_save = function(path)
-		return path:match("/spool$") ~= nil
+		return path:match("%-spool$") ~= nil
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	local marker_path = nil
 	for key in pairs(stores) do
-		if key:match("/experiments%-clear$") then
+		if key:match("%-experiments%-clear$") then
 			marker_path = key
 		end
 	end
@@ -5830,7 +5830,7 @@ local function test_same_key_replacement_carries_post_sentinel_identity()
 	-- Sentinel with record AND spool stores down: marker persists, the
 	-- spooled PRE-sentinel copy stays.
 	state.fail_save = function(path)
-		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
+		return path:match("%-experiments$") ~= nil or path:match("%-spool$") ~= nil
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
@@ -5888,7 +5888,7 @@ local function test_same_second_fresh_fact_survives_partition()
 	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
 	extra_tests.fetch_apply(client, "exp-checkout")
 	state.fail_save = function(path)
-		return path:match("/experiments%-clear$") ~= nil
+		return path:match("%-experiments%-clear$") ~= nil
 	end
 	client:update(0.016)
 	assert_true(client.experiments.durable_clear_pending == false)
@@ -6007,7 +6007,7 @@ local function test_corrupt_stored_subject_never_rides_identity_writes()
 	assert_true(client:set_consent(true))
 	local identity_path = nil
 	for key in pairs(stores) do
-		if key:match("/identity$") then
+		if key:match("%-identity$") then
 			identity_path = key
 		end
 	end
@@ -6253,7 +6253,7 @@ function extra_tests.test_restored_client_id_entry_requires_fact_key()
 	-- cleanly.
 	local record_path = nil
 	for key in pairs(stores) do
-		if key:match("/experiments$") then
+		if key:match("%-experiments$") then
 			record_path = key
 		end
 	end
@@ -6321,7 +6321,7 @@ function extra_tests.test_disabled_relaunch_filters_condemned_spool()
 	-- the process dies — the enabled-relaunch filter test's exact staging.
 	advance_seconds(2)
 	state.fail_save = function(path)
-		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
+		return path:match("%-experiments$") ~= nil or path:match("%-spool$") ~= nil
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
@@ -6354,7 +6354,7 @@ function extra_tests.test_disabled_relaunch_filters_condemned_spool()
 	-- record and spool durably clean takes the full machinery.
 	local marker_alive = false
 	for key, value in pairs(stores) do
-		if key:match("/experiments%-clear$") and type(value) == "table"
+		if key:match("%-experiments%-clear$") and type(value) == "table"
 			and value.stamp ~= nil then
 			marker_alive = true
 		end
@@ -6389,7 +6389,7 @@ function extra_tests.test_unreadable_record_read_keeps_kill_drop_owed()
 	-- instead of settling over the blind read.
 	local saved_load = sys.load
 	sys.load = function(path)
-		if path:match("/experiments$") then
+		if path:match("%-experiments$") then
 			error("io_error")
 		end
 		return saved_load(path)
@@ -6437,7 +6437,7 @@ function extra_tests.test_restored_synthetic_fact_key_is_cleared()
 	local corrupted = "spcid_" .. string.rep("c", 34)
 	local tampered = false
 	for key, record in pairs(stores) do
-		if key:match("/experiments$") and type(record) == "table"
+		if key:match("%-experiments$") and type(record) == "table"
 			and type(record.entries) == "table"
 			and record.entries["exp-checkout"] then
 			record.entries["exp-checkout"].subject_fact_key = corrupted
@@ -6487,7 +6487,7 @@ local function stage_condemned_spool_launch(state)
 	responder = nil
 	advance_seconds(2)
 	state.fail_save = function(path)
-		return path:match("/experiments$") ~= nil or path:match("/spool$") ~= nil
+		return path:match("%-experiments$") ~= nil or path:match("%-spool$") ~= nil
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
@@ -6509,7 +6509,7 @@ function extra_tests.test_unreadable_spool_holds_marker_retirement()
 	-- retire on this launch's evidence.
 	local saved_load = sys.load
 	sys.load = function(path)
-		if path:match("/spool$") then
+		if path:match("%-spool$") then
 			error("io_error")
 		end
 		return saved_load(path)
@@ -6519,7 +6519,7 @@ function extra_tests.test_unreadable_spool_holds_marker_retirement()
 	second:update(0.016)
 	local marker_path = nil
 	for key in pairs(stores) do
-		if key:match("/experiments%-clear$") then
+		if key:match("%-experiments%-clear$") then
 			marker_path = key
 		end
 	end
@@ -6604,7 +6604,7 @@ function extra_tests.test_unreadable_marker_fails_closed()
 	-- AND replay the condemned spooled facts — fail closed instead.
 	local saved_load = sys.load
 	sys.load = function(path)
-		if path:match("/experiments%-clear$") then
+		if path:match("%-experiments%-clear$") then
 			error("io_error")
 		end
 		return saved_load(path)
@@ -6644,7 +6644,7 @@ function extra_tests.test_shadow_never_masks_unreadable_record()
 	-- keeps the old object and diverges from the disk).
 	local record_path = nil
 	for key, stored in pairs(stores) do
-		if key:match("/experiments$") and type(stored) == "table"
+		if key:match("%-experiments$") and type(stored) == "table"
 			and type(stored.entries) == "table"
 			and stored.entries["exp-checkout"] then
 			record_path = key
@@ -6680,7 +6680,7 @@ function extra_tests.test_shadow_never_masks_unreadable_record()
 	-- would wipe the sibling's entry from the disk.
 	local saved_load = sys.load
 	sys.load = function(path)
-		if path:match("/experiments$") then
+		if path:match("%-experiments$") then
 			error("io_error")
 		end
 		return saved_load(path)
@@ -6776,7 +6776,7 @@ function extra_tests.test_unreadable_demotion_keeps_clear_owed()
 	-- consume the whole-record clear intent over the unreadable read.
 	local saved_load = sys.load
 	sys.load = function(path)
-		if path:match("/experiments$") then
+		if path:match("%-experiments$") then
 			error("io_error")
 		end
 		return saved_load(path)
@@ -6799,7 +6799,7 @@ function extra_tests.test_unreadable_demotion_keeps_clear_owed()
 		"the kept clear intent demoted and dropped the condemned entry")
 	local marker_path = nil
 	for key in pairs(stores) do
-		if key:match("/experiments%-clear$") then
+		if key:match("%-experiments%-clear$") then
 			marker_path = key
 		end
 	end
@@ -6933,7 +6933,7 @@ function extra_tests.test_spool_shadow_never_masks_unreadable()
 	-- shadow keeps the old, clean object).
 	local spool_path = nil
 	for key, stored in pairs(stores) do
-		if key:match("/spool$") and type(stored) == "table"
+		if key:match("%-spool$") and type(stored) == "table"
 			and type(stored.events) == "table" then
 			spool_path = key
 		end
@@ -6960,7 +6960,7 @@ function extra_tests.test_spool_shadow_never_masks_unreadable()
 	-- snapshot — or the marker retires over the unread withdrawn fact.
 	local saved_load = sys.load
 	sys.load = function(path)
-		if path:match("/spool$") then
+		if path:match("%-spool$") then
 			error("io_error")
 		end
 		return saved_load(path)
@@ -6970,7 +6970,7 @@ function extra_tests.test_spool_shadow_never_masks_unreadable()
 	second:update(0.016)
 	local marker_path = nil
 	for key in pairs(stores) do
-		if key:match("/experiments%-clear$") then
+		if key:match("%-experiments%-clear$") then
 			marker_path = key
 		end
 	end
@@ -7080,7 +7080,7 @@ function extra_tests.test_invalid_cached_version_never_restores()
 	-- integer wire grammar. They must drop at load; the valid one survives.
 	local record_path = nil
 	for key, stored in pairs(stores) do
-		if key:match("/experiments$") and type(stored) == "table"
+		if key:match("%-experiments$") and type(stored) == "table"
 			and type(stored.entries) == "table"
 			and stored.entries["exp-checkout"] then
 			record_path = key
@@ -7150,7 +7150,7 @@ function extra_tests.test_unreadable_record_keeps_whole_clear_owed()
 	-- unreadable disk holds the post-dispatch survivor.
 	local saved_load = sys.load
 	sys.load = function(path)
-		if path:match("/experiments$") then
+		if path:match("%-experiments$") then
 			error("io_error")
 		end
 		return saved_load(path)
@@ -7172,7 +7172,7 @@ function extra_tests.test_unreadable_record_keeps_whole_clear_owed()
 		"the post-dispatch survivor was never blind-cleared")
 	local marker_path = nil
 	for key in pairs(stores) do
-		if key:match("/experiments%-clear$") then
+		if key:match("%-experiments%-clear$") then
 			marker_path = key
 		end
 	end
@@ -7197,7 +7197,7 @@ function extra_tests.test_remint_tombstones_old_scope_durably()
 	-- assignments the server just rejected. (The re-mint retry answers
 	-- transient so no new-scope record replaces the file.)
 	state.fail_save = function(path)
-		return path:match("/identity$") ~= nil
+		return path:match("%-identity$") ~= nil
 	end
 	local answers = 0
 	responder = function(url, _, callback)
@@ -7252,7 +7252,7 @@ function extra_tests.test_latched_remint_tombstones_durable_entries()
 	-- the very assignments the server just rejected. (The re-mint retry
 	-- answers transient so no new-scope record replaces the file.)
 	state.fail_save = function(path)
-		return path:match("/identity$") ~= nil
+		return path:match("%-identity$") ~= nil
 	end
 	local answers = 0
 	responder = function(url, _, callback)
@@ -7406,7 +7406,7 @@ function extra_tests.test_spool_purge_clears_condemnation_debt()
 	-- persisted for the spool's sake.
 	advance_seconds(2)
 	state.fail_save = function(path)
-		return path:match("/spool$") ~= nil
+		return path:match("%-spool$") ~= nil
 	end
 	next_status = 403
 	next_response_body = json.encode({ error = { code = "real_subjects_disabled", message = "synthetic feature refusal" } })
@@ -7415,7 +7415,7 @@ function extra_tests.test_spool_purge_clears_condemnation_debt()
 	next_response_body = nil
 	local marker_path = nil
 	for key in pairs(stores) do
-		if key:match("/experiments%-clear$") then
+		if key:match("%-experiments%-clear$") then
 			marker_path = key
 		end
 	end
@@ -9344,7 +9344,7 @@ function extra_tests.test_restored_key_retires_when_the_disk_no_longer_shows_it(
 	assert_true(live[key_a] == true, "facts under A are live before the republish")
 	local saved_load = sys.load
 	sys.load = function(path)
-		if path:sub(-#"/experiments") == "/experiments" then
+		if path:sub(-#"-experiments") == "-experiments" then
 			return nil
 		end
 		return saved_load(path)
@@ -10652,14 +10652,14 @@ end
 
 -- A predicate for state.fail_save that fails only the spool writes.
 function extra_tests.fail_spool_saves(path)
-	return path:sub(-#"/spool") == "/spool"
+	return path:sub(-#"-spool") == "-spool"
 end
 
 -- The durable withdrawal debts on the fake disk that still name an event.
 function extra_tests.armed_debts(stores)
 	local armed = 0
 	for path, record in pairs(stores) do
-		if path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn"
+		if path:sub(-#"-experiments-withdrawn") == "-experiments-withdrawn"
 			and type(record) == "table" and type(record.events) == "table"
 			and #record.events > 0 then
 			armed = armed + 1
@@ -10768,7 +10768,7 @@ function extra_tests.test_age_refusal_debt_spares_a_replaced_copy()
 	-- The replacement: the stored exposure now carries a later event_ts.
 	local replaced = 0
 	for path, record in pairs(stores) do
-		if path:sub(-#"/spool") == "/spool" and type(record) == "table" then
+		if path:sub(-#"-spool") == "-spool" and type(record) == "table" then
 			for _, env in ipairs(record.events or {}) do
 				if env.event_name == "experiment_exposure" then
 					env.event_ts = "2099-01-01T00:00:00Z"
@@ -10795,7 +10795,7 @@ function extra_tests.test_age_refusal_debt_write_retried_with_the_rewrite()
 	local client, restore, stores, state = extra_tests.spooled_debt_scene()
 	state.fail_save = function(path)
 		return extra_tests.fail_spool_saves(path)
-			or path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn"
+			or path:sub(-#"-experiments-withdrawn") == "-experiments-withdrawn"
 	end
 	extra_tests.refuse(client, "age_ineligible")
 	local after_refusal = extra_tests.armed_debts(stores)
@@ -10821,7 +10821,7 @@ function extra_tests.test_age_refusal_stale_debt_spent_at_relaunch()
 	local client, restore, stores, state = extra_tests.spooled_debt_scene()
 	extra_tests.refuse_through_failing_spool(client, state)
 	state.fail_save = function(path)
-		return path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn"
+		return path:sub(-#"-experiments-withdrawn") == "-experiments-withdrawn"
 	end
 	responder = extra_tests.batch_answer(202)
 	client:flush({ include_summaries = false })
@@ -10851,7 +10851,7 @@ function extra_tests.test_age_refusal_unreadable_debt_fails_closed()
 	local armed = extra_tests.armed_debts(stores)
 	local load = sys.load
 	sys.load = function(path)
-		if path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn" then
+		if path:sub(-#"-experiments-withdrawn") == "-experiments-withdrawn" then
 			error("corrupt save file")
 		end
 		return load(path)
@@ -10962,7 +10962,7 @@ function extra_tests.test_spool_purges_without_a_debt_create_no_debt_file()
 	local relaunch = assert(sdk.new(config({ app_key = "exposure-app" })))
 	local files = 0
 	for path in pairs(stores) do
-		if path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn" then
+		if path:sub(-#"-experiments-withdrawn") == "-experiments-withdrawn" then
 			files = files + 1
 		end
 	end
@@ -11291,7 +11291,7 @@ function extra_tests.deadline_of_a_record_without_restored_facts(label, withdraw
 	local save, failures = sys.save, 0
 	if recovery then
 		sys.save = function(path, record)
-			if path:sub(-#"/spool") == "/spool" then failures = failures + 1; return false end
+			if path:sub(-#"-spool") == "-spool" then failures = failures + 1; return false end
 			return save(path, record)
 		end
 	end
@@ -12507,7 +12507,7 @@ function extra_tests.test_pending_declaration_marker_read_fails_closed()
 			end
 			local original_load, reads = sys.load, 0
 			sys.load = function(path)
-				if path:sub(-#"/experiments-clear") == "/experiments-clear" then
+				if path:sub(-#"-experiments-clear") == "-experiments-clear" then
 					reads = reads + 1
 					if mode == "unreadable" or mode == "disabled" then error("synthetic marker read failure") end
 					if mode == "invalid" then return { declarations = { version = "invalid" } } end
@@ -12546,7 +12546,7 @@ function extra_tests.test_pending_declaration_cache_drop_failure_keeps_witness()
 		assert_true(client:persist(), "setup: accepted facts persist")
 		local save = sys.save
 		sys.save = function(path, record)
-			if path:sub(-#"/experiments") == "/experiments" then return false end
+			if path:sub(-#"-experiments") == "-experiments" then return false end
 			return save(path, record)
 		end
 		local answer = extra_tests.declare_unconfirmed(client)
@@ -12662,7 +12662,7 @@ function extra_tests.test_pending_declaration_disabled_relaunch_keeps_retired_su
 			"setup: the actual remint removed the retired cached assignment")
 		local save = sys.save
 		sys.save = function(path, record)
-			if fail_retirement and path:sub(-#"/experiments-clear") == "/experiments-clear" then return false end
+			if fail_retirement and path:sub(-#"-experiments-clear") == "-experiments-clear" then return false end
 			return save(path, record)
 		end
 		local from = #requests
@@ -12699,8 +12699,8 @@ function extra_tests.test_pending_declaration_disabled_rewrite_creates_no_new_re
 		assert_equal(#held, 1, "setup: real pending declaration")
 		local save, debt_writes = sys.save, 0
 		sys.save = function(path, record)
-			if path:sub(-#"/spool") == "/spool" then return false end
-			if path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn" then debt_writes = debt_writes + 1 end
+			if path:sub(-#"-spool") == "-spool" then return false end
+			if path:sub(-#"-experiments-withdrawn") == "-experiments-withdrawn" then debt_writes = debt_writes + 1 end
 			return save(path, record)
 		end
 		responder = nil; client = nil; held = nil; storage.reset()
@@ -12731,7 +12731,7 @@ function extra_tests.test_pending_declaration_failed_marker_writes_stay_owed()
 			assert_true(client:persist())
 			local save, fail_marker = sys.save, mode == "arm"
 			sys.save = function(path, record)
-				if fail_marker and path:sub(-#"/experiments-clear") == "/experiments-clear" then return false end
+				if fail_marker and path:sub(-#"-experiments-clear") == "-experiments-clear" then return false end
 				return save(path, record)
 			end
 			local held = {}
@@ -12813,7 +12813,7 @@ function extra_tests.test_pending_declaration_unreadable_spool_keeps_witness()
 			assert_equal(#held, 1, "setup: real pending fetch")
 			local load, blocked_reads = sys.load, 0
 			sys.load = function(path)
-				if path:sub(-#"/spool") == "/spool" then blocked_reads = blocked_reads + 1; error("synthetic spool read failure") end
+				if path:sub(-#"-spool") == "-spool" then blocked_reads = blocked_reads + 1; error("synthetic spool read failure") end
 				return load(path)
 			end
 			responder = nil; client = nil; held = nil; storage.reset()
@@ -13255,7 +13255,7 @@ function extra_tests.test_withdrawal_debt_clear_retries_after_spool_purge()
 			assert_equal(extra_tests.armed_debts(stores), 1, "actual refused spooled facts created the debt")
 			local failed_clears = 0
 			state.fail_save = function(path, record)
-				if path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn" and next(record) == nil then
+				if path:sub(-#"-experiments-withdrawn") == "-experiments-withdrawn" and next(record) == nil then
 					failed_clears = failed_clears + 1; return true
 				end
 				return false
@@ -13279,7 +13279,7 @@ function extra_tests.test_new_withdrawal_cancels_a_spent_clear_retry()
 	local client, restore, stores, state = extra_tests.spooled_debt_scene()
 	extra_tests.refuse_through_failing_spool(client, state)
 	state.fail_save = function(path, record)
-		return path:sub(-#"/experiments-withdrawn") == "/experiments-withdrawn" and next(record) == nil
+		return path:sub(-#"-experiments-withdrawn") == "-experiments-withdrawn" and next(record) == nil
 	end
 	assert_true(client:set_consent(false))
 	assert_equal(extra_tests.armed_debts(stores), 1, "the old spent clear remains blocked")
@@ -13334,7 +13334,7 @@ function extra_tests.test_scope_less_clear_marker_is_unreadable()
 	local path, real_get = nil, sys.get_save_file
 	sys.get_save_file = function(ns, name)
 		local value = real_get(ns, name)
-		if name == "experiments-clear" then path = value end
+		if name:match("%-experiments%-clear$") then path = value end
 		return value
 	end
 	assert_true(storage.save_experiments_clear(client.config, stamp, scope))
