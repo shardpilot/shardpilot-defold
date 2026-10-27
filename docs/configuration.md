@@ -133,6 +133,11 @@ Previously persisted envelopes/consent are not migrated or repaired, and crash
 and remote-config paths are outside this change. The rule therefore does not
 guarantee UTF-8 validity for every SDK request or repair an old corrupted identity.
 
+### Stored record filenames
+
+Record filenames combine the record kind with a bounded scope fingerprint.
+Scopes stay separate on Android; earlier record files are not imported.
+
 ## Instance handles
 
 `new(config)` returns a handle exposing the documented module operations with

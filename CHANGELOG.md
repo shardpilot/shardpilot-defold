@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.17.1 — 2026-10-27
+
+- Isolate durable records by scope and kind in bounded filenames, including on Android.
+- Device non-objection still requires server enablement, a server-resolved `SOFT_OPT_OUT` country, and the workspace owner's active acceptance.
+
 ## v0.17.0 — 2026-10-24
 
 - A rejected publishable key settles non-objection recording immediately on 401;

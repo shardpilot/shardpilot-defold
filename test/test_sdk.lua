@@ -1919,10 +1919,13 @@ local function test_storage_uses_app_scoped_save_file()
 	reset()
 	storage.reset()
 	local namespaces = {}
+	local paths = {}
 	local stores = {}
 	sys.get_save_file = function(application_id, file_name)
 		namespaces[#namespaces + 1] = application_id
-		return application_id .. "/" .. file_name
+		local path = application_id .. "/" .. file_name
+		paths[#paths + 1] = path
+		return path
 	end
 	sys.save = function(path, record)
 		stores[path] = record
@@ -1934,13 +1937,13 @@ local function test_storage_uses_app_scoped_save_file()
 
 	local client = assert(sdk.new(config()))
 	storage.load(private_config()) -- observe the selected durable path
-	local record = stores[namespaces[#namespaces] .. "/identity"]
+	local record = stores[paths[#paths]]
 	assert_equal(type(record), "table", "identity must persist under the app-scoped namespace")
 	assert_equal(record.anonymous_id, client.anonymous_id)
 
 	local other = assert(sdk.new(config({ app_key = "app-other" })))
 	storage.load(private_config({ app_id = "app-other" }))
-	local other_record = stores[namespaces[#namespaces] .. "/identity"]
+	local other_record = stores[paths[#paths]]
 	assert_equal(type(other_record), "table")
 	assert_equal(other_record.anonymous_id, other.anonymous_id)
 	assert_not_equal(other.anonymous_id, client.anonymous_id)
@@ -1952,7 +1955,7 @@ local function test_storage_uses_app_scoped_save_file()
 	-- scope segments are encoded before reaching sys.get_save_file
 	assert(sdk.new(config({ workspace_key = "ws/../evil", app_key = "app one" })))
 	storage.load({ workspace_id = "ws/../evil", app_id = "app one" })
-	assert_equal(type(stores[namespaces[#namespaces] .. "/identity"]), "table")
+	assert_equal(type(stores[paths[#paths]]), "table")
 	for _, application_id in ipairs(namespaces) do
 		assert_equal(application_id:find("/", 1, true), nil, "namespace must not contain path separators")
 		assert_equal(application_id:find("..", 1, true), nil, "namespace must not contain dot-dot")
@@ -3440,7 +3443,7 @@ end
 
 local function stored_spool_record(stores)
 	for path, record in pairs(stores) do
-		if path:sub(-6) == "/spool" then
+		if path:sub(-6) == "-spool" then
 			return record, path
 		end
 	end
@@ -3814,7 +3817,7 @@ local function test_identity_read_failure_purges_spool()
 	-- in-process shadow exists to answer for it.
 	local real_load = sys.load
 	sys.load = function(path)
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			error("unreadable identity record")
 		end
 		return real_load(path)
@@ -4463,7 +4466,7 @@ local function test_denial_marker_imposes_over_stale_granted_record()
 	-- The identity write starts failing; the marker file still works.
 	local real_save = sys.save
 	sys.save = function(path, record)
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			return false
 		end
 		return real_save(path, record)
@@ -4474,9 +4477,9 @@ local function test_denial_marker_imposes_over_stale_granted_record()
 	local identity_path = nil
 	local marker_record = nil
 	for path, record in pairs(stores) do
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			identity_path = path
-		elseif path:sub(-15) == "/consent-denial" then
+		elseif path:sub(-15) == "-consent-denial" then
 			marker_record = record
 		end
 	end
@@ -4503,7 +4506,7 @@ local function test_denial_marker_imposes_over_stale_granted_record()
 		"consolidation must converge the identity record")
 	local retired = nil
 	for path, record in pairs(stores) do
-		if path:sub(-15) == "/consent-denial" then
+		if path:sub(-15) == "-consent-denial" then
 			retired = record
 		end
 	end
@@ -4527,7 +4530,7 @@ local function test_denial_marker_preserves_forced_minor_flavor()
 	local client = assert(sdk.new(config({ flush_interval_seconds = 9999 })))
 	local real_save = sys.save
 	sys.save = function(path, record)
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			return false
 		end
 		return real_save(path, record)
@@ -4558,7 +4561,7 @@ local function test_foreign_actor_denial_marker_stays_inert_and_undeleted()
 	local old_anon = client.anonymous_id
 	local real_save = sys.save
 	sys.save = function(path, record)
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			return false
 		end
 		return real_save(path, record)
@@ -4577,7 +4580,7 @@ local function test_foreign_actor_denial_marker_stays_inert_and_undeleted()
 		"a foreign-actor marker must never manufacture a decision")
 	local marker_record = nil
 	for path, record in pairs(stores) do
-		if path:sub(-15) == "/consent-denial" then
+		if path:sub(-15) == "-consent-denial" then
 			marker_record = record
 		end
 	end
@@ -4623,7 +4626,7 @@ local function test_newer_denial_receipt_blocks_granted_restore()
 	assert_equal(terr, "consent_denied")
 	local identity_record = nil
 	for path, record in pairs(stores) do
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			identity_record = record
 		end
 	end
@@ -4686,7 +4689,7 @@ local function test_same_second_denial_tie_imposes_fail_closed()
 	-- receipt append lands.
 	local real_save = sys.save
 	sys.save = function(path, record)
-		if path:sub(-9) == "/identity" or path:sub(-15) == "/consent-denial" then
+		if path:sub(-9) == "-identity" or path:sub(-15) == "-consent-denial" then
 			return false
 		end
 		return real_save(path, record)
@@ -4697,7 +4700,7 @@ local function test_same_second_denial_tie_imposes_fail_closed()
 	sys.save = real_save
 	local identity_path = nil
 	for path in pairs(stores) do
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			identity_path = path
 		end
 	end
@@ -4870,7 +4873,7 @@ local function test_unreadable_marker_fail_closed_stays_transient()
 	assert_equal(terr, "consent_denied")
 	local identity_record = nil
 	for path, record in pairs(stores) do
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			identity_record = record
 		end
 	end
@@ -4912,7 +4915,7 @@ local function test_shutdown_refuses_while_witness_receipt_in_flight()
 	-- and goes IN FLIGHT with no other witness anywhere.
 	local real_save = sys.save
 	sys.save = function(path, record)
-		if path:sub(-9) == "/identity" or path:sub(-15) == "/consent-denial" then
+		if path:sub(-9) == "-identity" or path:sub(-15) == "-consent-denial" then
 			return false
 		end
 		return real_save(path, record)
@@ -4941,7 +4944,7 @@ local function test_shutdown_refuses_while_witness_receipt_in_flight()
 	assert_true(client:shutdown(), "the healed retry persists the denial and finalizes")
 	local identity_record = nil
 	for path, record in pairs(stores) do
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			identity_record = record
 		end
 	end
@@ -4972,7 +4975,7 @@ local function test_ack_prune_hands_witness_to_marker()
 	local client = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
 	local real_save = sys.save
 	sys.save = function(path, record)
-		if path:sub(-9) == "/identity" or path:sub(-15) == "/consent-denial" then
+		if path:sub(-9) == "-identity" or path:sub(-15) == "-consent-denial" then
 			return false
 		end
 		return real_save(path, record)
@@ -4985,7 +4988,7 @@ local function test_ack_prune_hands_witness_to_marker()
 	-- store stays broken): the ack's handoff must land the marker before
 	-- consuming the receipt.
 	sys.save = function(path, record)
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			return false
 		end
 		return real_save(path, record)
@@ -5042,7 +5045,7 @@ local function test_belt_convergence_failure_writes_marker_witness()
 	-- leaves the outbox.
 	local real_save = sys.save
 	sys.save = function(path, record)
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			return false
 		end
 		return real_save(path, record)
@@ -5058,7 +5061,7 @@ local function test_belt_convergence_failure_writes_marker_witness()
 	assert_equal(#outbox, 0, "the delivered receipt left the durable outbox")
 	local identity_record = nil
 	for path, record in pairs(stores) do
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			identity_record = record
 		end
 	end
@@ -5093,7 +5096,7 @@ local function test_shutdown_refuses_denial_with_no_durable_witness()
 	-- witnesses the denial.
 	local real_save = sys.save
 	sys.save = function(path, record)
-		if path:sub(-9) == "/identity" or path:sub(-15) == "/consent-denial" then
+		if path:sub(-9) == "-identity" or path:sub(-15) == "-consent-denial" then
 			return false
 		end
 		return real_save(path, record)
@@ -5116,7 +5119,7 @@ local function test_shutdown_refuses_denial_with_no_durable_witness()
 		"the retried teardown lands the record and completes")
 	local identity_record = nil
 	for path, record in pairs(stores) do
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			identity_record = record
 		end
 	end
@@ -5341,7 +5344,7 @@ local function break_spool_saves()
 	local real_save = sys.save
 	local broken = true
 	sys.save = function(path, record)
-		if broken and path:sub(-6) == "/spool" then
+		if broken and path:sub(-6) == "-spool" then
 			return false
 		end
 		return real_save(path, record)
@@ -5611,7 +5614,7 @@ local function test_init_purge_runs_even_when_record_unreadable()
 	storage.reset()
 	local real_load = sys.load
 	sys.load = function(path)
-		if path:sub(-6) == "/spool" then
+		if path:sub(-6) == "-spool" then
 			error("unreadable spool file")
 		end
 		return real_load(path)
@@ -5714,7 +5717,7 @@ end
 
 local function stored_consent_outbox_record(stores)
 	for path, record in pairs(stores) do
-		if path:sub(-15) == "/consent-outbox" then
+		if path:sub(-15) == "-consent-outbox" then
 			return record, path
 		end
 	end
@@ -6442,7 +6445,7 @@ local function test_rotation_blocked_while_prune_rewrite_owed()
 	local fail_from_second_write = true
 	local plain_save = sys.save
 	sys.save = function(path, record)
-		if path:sub(-15) == "/consent-outbox" then
+		if path:sub(-15) == "-consent-outbox" then
 			outbox_writes = outbox_writes + 1
 			if fail_from_second_write and outbox_writes >= 2 then
 				return false
@@ -7654,7 +7657,7 @@ local function test_set_consent_surfaces_receipt_persist_failure()
 	local outbox_writes_fail = true
 	local plain_save = sys.save
 	sys.save = function(path, record)
-		if outbox_writes_fail and path:sub(-15) == "/consent-outbox" then
+		if outbox_writes_fail and path:sub(-15) == "-consent-outbox" then
 			return false
 		end
 		return plain_save(path, record)
@@ -7707,7 +7710,7 @@ local function test_transient_outbox_save_failure_never_evicts()
 	local fail_next_outbox_write = true
 	local plain_save = sys.save
 	sys.save = function(path, record)
-		if fail_next_outbox_write and path:sub(-15) == "/consent-outbox" then
+		if fail_next_outbox_write and path:sub(-15) == "-consent-outbox" then
 			fail_next_outbox_write = false
 			return false
 		end
@@ -8203,7 +8206,7 @@ local tests = {
 	-- WHOLE-TRAIL: the outbox read throws while every other file reads fine.
 	local real_load = sys.load
 	sys.load = function(path)
-		if path:sub(-15) == "/consent-outbox" then
+		if path:sub(-15) == "-consent-outbox" then
 			error("corrupt consent outbox")
 		end
 		return real_load(path)
@@ -8232,7 +8235,7 @@ local tests = {
 	assert_true(client:persist_identity())
 	local identity_record = nil
 	for path, record in pairs(stores) do
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			identity_record = record
 		end
 	end
@@ -8243,7 +8246,7 @@ local tests = {
 	-- shadowed grant.
 	assert_true(client:set_consent(false))
 	for path, record in pairs(stores) do
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			identity_record = record
 		end
 	end
@@ -8268,7 +8271,7 @@ local tests = {
 	}))
 	assert_true(storage.save_consent_outbox(identity_scope, {}))
 	for path, record in pairs(stores2) do
-		if path:sub(-15) == "/consent-outbox" then
+		if path:sub(-15) == "-consent-outbox" then
 			record.receipts = { "this-entry-is-not-a-table" }
 		end
 	end
@@ -8286,7 +8289,7 @@ local tests = {
 	assert_true(partial.consent_outbox_dirty, "and the held write is recorded as owed")
 	local on_disk = nil
 	for path, record in pairs(stores2) do
-		if path:sub(-15) == "/consent-outbox" then
+		if path:sub(-15) == "-consent-outbox" then
 			on_disk = record
 		end
 	end
@@ -8311,7 +8314,7 @@ local tests = {
 	}))
 	assert_true(storage.save_consent_outbox(identity_scope, {}))
 	for path, record in pairs(stores4) do
-		if path:sub(-15) == "/consent-outbox" then
+		if path:sub(-15) == "-consent-outbox" then
 			-- Index 2 is absent: #receipts is 1, and index 3 lives past it.
 			record.receipts = {
 				[1] = {
@@ -8356,7 +8359,7 @@ local tests = {
 	}))
 	assert_true(storage.save_consent_outbox(identity_scope, {}))
 	for path, record in pairs(stores5) do
-		if path:sub(-15) == "/consent-outbox" then
+		if path:sub(-15) == "-consent-outbox" then
 			record.receipts = nil
 			record.something_else = "a record shape this build does not know"
 		end
@@ -8413,7 +8416,7 @@ local tests = {
 	}))
 	storage.save_consent_outbox(identity_scope, {})
 	for path, record in pairs(stores7) do
-		if path:sub(-15) == "/consent-outbox" then
+		if path:sub(-15) == "-consent-outbox" then
 			record.receipts = { "this-entry-is-not-a-table" }
 		end
 	end
@@ -8446,7 +8449,7 @@ local tests = {
 	}))
 	assert_true(storage.save_consent_outbox(identity_scope, {}))
 	for path, record in pairs(stores8) do
-		if path:sub(-15) == "/consent-outbox" then
+		if path:sub(-15) == "-consent-outbox" then
 			record.receipts = { "this-entry-is-not-a-table" }
 		end
 	end
@@ -8466,7 +8469,7 @@ local tests = {
 	-- before anything can refuse it.
 	local healed_record = nil
 	for path, record in pairs(stores8) do
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			healed_record = record
 		end
 	end
@@ -8493,7 +8496,7 @@ local tests = {
 	}))
 	assert_true(storage.save_consent_outbox(identity_scope, {}))
 	for path, record in pairs(stores3) do
-		if path:sub(-15) == "/consent-outbox" then
+		if path:sub(-15) == "-consent-outbox" then
 			record.receipts = {
 				"this-entry-is-not-a-table",
 				{
@@ -8517,7 +8520,7 @@ local tests = {
 		"the damaged trail refuses either way -- this leg is about what gets WRITTEN")
 	local belt_record = nil
 	for path, record in pairs(stores3) do
-		if path:sub(-9) == "/identity" then
+		if path:sub(-9) == "-identity" then
 			belt_record = record
 		end
 	end
@@ -9733,7 +9736,7 @@ local tests = {
 	function()
 	local function outbox_path(stores)
 		for path in pairs(stores) do
-			if path:sub(-15) == "/consent-outbox" then return path end
+			if path:sub(-15) == "-consent-outbox" then return path end
 		end
 	end
 	local function denial(key)
@@ -9796,7 +9799,7 @@ local tests = {
 	storage.reset()
 	local real_load2 = sys.load
 	sys.load = function(p)
-		if p:sub(-15) == "/consent-outbox" then error("this session cannot read it") end
+		if p:sub(-15) == "-consent-outbox" then error("this session cannot read it") end
 		return real_load2(p)
 	end
 	local client_a = assert(sdk.new(config_mode_a({ flush_interval_seconds = 9999 })))
@@ -9841,7 +9844,7 @@ local tests = {
 	function()
 	local function opath(stores)
 		for p in pairs(stores) do
-			if p:sub(-15) == "/consent-outbox" then return p end
+			if p:sub(-15) == "-consent-outbox" then return p end
 		end
 	end
 	local function rec(key, grant)
@@ -10036,7 +10039,7 @@ local tests = {
 	function()
 	local function opath(stores)
 		for p in pairs(stores) do
-			if p:sub(-15) == "/consent-outbox" then return p end
+			if p:sub(-15) == "-consent-outbox" then return p end
 		end
 	end
 	local function rec(key, grant)
@@ -10178,7 +10181,7 @@ local tests = {
 	assert_true(storage.append_consent_receipt(identity_scope, rec("held-case")))
 	-- a WITHHELD operation: no write attempted, disk deliberately untouched
 	local hp
-	for p in pairs(stores7) do if p:sub(-15) == "/consent-outbox" then hp = p end end
+	for p in pairs(stores7) do if p:sub(-15) == "-consent-outbox" then hp = p end end
 	stores7[hp] = { receipts = { rec("held-case"), "an entry this build cannot read" } }
 	storage.reset()
 	local okh = storage.drop_consent_receipts(identity_scope, { "held-case" })
@@ -10221,7 +10224,7 @@ local tests = {
 	-- the decision. My first version asserted the flag and failed on the fix
 	-- working.
 	local p8
-	for p in pairs(stores8) do if p:sub(-15) == "/consent-outbox" then p8 = p end end
+	for p in pairs(stores8) do if p:sub(-15) == "-consent-outbox" then p8 = p end end
 	local on_disk8 = {}
 	for _, r in ipairs((stores8[p8] or { receipts = {} }).receipts) do
 		on_disk8[r.idempotency_key] = true
@@ -10238,7 +10241,7 @@ local tests = {
 	local stores10, restore10 = install_stub_sys_storage()
 	local p10
 	assert_true(storage.append_consent_receipt(identity_scope, rec("seed10")))
-	for p in pairs(stores10) do if p:sub(-15) == "/consent-outbox" then p10 = p end end
+	for p in pairs(stores10) do if p:sub(-15) == "-consent-outbox" then p10 = p end end
 	stores10[p10] = { receipts = {
 		rec("undelivered-1"), rec("undelivered-2"), "an entry this build cannot read",
 	} }
@@ -11794,12 +11797,12 @@ end)()
 ;(function()
 	local function identity_path(stores)
 		for path in pairs(stores) do
-			if path:sub(-9) == "/identity" then return path end
+			if path:sub(-9) == "-identity" then return path end
 		end
 	end
 	local function outbox_path(stores)
 		for path in pairs(stores) do
-			if path:sub(-15) == "/consent-outbox" then return path end
+			if path:sub(-15) == "-consent-outbox" then return path end
 		end
 	end
 	local function receipt(key, at, analytics, anon)
@@ -11895,7 +11898,7 @@ end)()
 		decided_at = "2026-07-02T00:00:00.000Z", decision_seq = 1,
 	}))
 	for path in pairs(bstores) do
-		if path:sub(-15) == "/consent-denial" then bstores[path] = "garbage" end
+		if path:sub(-15) == "-consent-denial" then bstores[path] = "garbage" end
 	end
 	storage.reset()
 	local belt = assert(sdk.new(config_mode_a({
@@ -12159,7 +12162,7 @@ end)()
 	assert_true(kc.consent_unreadable_imposed, "a REAL imposition, not a poked flag")
 	local real_save = sys.save
 	sys.save = function(path, record)
-		if path:sub(-9) == "/identity" then return false end
+		if path:sub(-9) == "-identity" then return false end
 		return real_save(path, record)
 	end
 	local kok, kerr, warning = kc:set_consent(false)
@@ -12168,7 +12171,7 @@ end)()
 	assert_equal(warning, "consent_persist_failed")
 	local mpath = nil
 	for path in pairs(kstores) do
-		if path:sub(-15) == "/consent-denial" then mpath = path end
+		if path:sub(-15) == "-consent-denial" then mpath = path end
 	end
 	assert_true(mpath ~= nil, "the write-ahead marker landed")
 	assert_equal(kstores[mpath].superseded_unreadable_by, "decision",
@@ -12214,7 +12217,7 @@ end)()
 	assert_true(storage.save(identity_scope, external_identity))
 	local l_real_save = sys.save
 	sys.save = function(path, record)
-		if path:sub(-9) == "/identity" then return false end
+		if path:sub(-9) == "-identity" then return false end
 		return l_real_save(path, record)
 	end
 	local lok, _, lwarning = lb:set_consent(false)
@@ -12223,7 +12226,7 @@ end)()
 	assert_equal(lwarning, "consent_persist_failed", "the identity save failed, which is the path under test")
 	local lmpath = nil
 	for path in pairs(lstores) do
-		if path:sub(-15) == "/consent-denial" then lmpath = path end
+		if path:sub(-15) == "-consent-denial" then lmpath = path end
 	end
 	assert_true(lmpath ~= nil, "the sibling's marker landed")
 	assert_equal(lstores[lmpath].superseded_unreadable_at, newer_at,
@@ -12248,7 +12251,7 @@ end)()
 		decided_at = "2026-07-01T00:00:00.000Z", decision_seq = 1,
 	}))
 	for path in pairs(mstores) do
-		if path:sub(-15) == "/consent-denial" then mstores[path] = "garbage" end
+		if path:sub(-15) == "-consent-denial" then mstores[path] = "garbage" end
 	end
 	storage.reset()
 	local mc = assert(sdk.new(config_mode_a({
@@ -12389,7 +12392,7 @@ end)()
 		decided_at = "1970-01-01T00:00:00Z", decision_seq = 1,
 	}))
 	for path in pairs(qstores) do
-		if path:sub(-15) == "/consent-denial" then qstores[path] = "garbage" end
+		if path:sub(-15) == "-consent-denial" then qstores[path] = "garbage" end
 	end
 	storage.reset()
 	local initial_identity = storage.load(identity_scope)
@@ -12404,7 +12407,7 @@ end)()
 	q1:finish_teardown(); storage.reset()
 	assert_true(storage.save(identity_scope, initial_identity))
 	for path in pairs(qstores) do
-		if path:sub(-15) == "/consent-denial" then qstores[path] = "garbage" end
+		if path:sub(-15) == "-consent-denial" then qstores[path] = "garbage" end
 	end
 	local q2 = assert(sdk.new(config_mode_a({
 		anonymous_id = "anon-marker-shared", flush_interval_seconds = 9999 })))
@@ -12492,7 +12495,7 @@ end)()
 		decision_seq = 1,
 	}))
 	for path in pairs(q4s) do
-		if path:sub(-15) == "/consent-denial" then q4s[path] = "garbage" end
+		if path:sub(-15) == "-consent-denial" then q4s[path] = "garbage" end
 	end
 	storage.reset()
 	local q4c = assert(sdk.new(config_mode_a({
@@ -12697,7 +12700,7 @@ end)()
 	assert_equal(#keeper.spool_record, 6, "the premise: six envelopes are persisted")
 	local persisted = nil
 	for path, record in pairs(fstores) do
-		if path:sub(-6) == "/spool" then persisted = record end
+		if path:sub(-6) == "-spool" then persisted = record end
 	end
 	assert_equal(#persisted.events, 6, "and the file holds them")
 
@@ -12720,7 +12723,7 @@ end)()
 		session_id = "sess-a6", session_sequence = 2, props = {} } }),
 		"once the store recovers the append lands")
 	for path, record in pairs(fstores) do
-		if path:sub(-6) == "/spool" then persisted = record end
+		if path:sub(-6) == "-spool" then persisted = record end
 	end
 	assert_equal(#persisted.events, 7,
 		"and the six previously persisted envelopes are STILL there, not overwritten")
@@ -14250,7 +14253,7 @@ end)()
 						if boot_calls == 1 then
 							next_status = 500
 							sys.save = function(path, value)
-								if path:sub(-6) == "/spool" then return false end
+								if path:sub(-6) == "-spool" then return false end
 								return save(path, value)
 							end
 							first_ok, first_err = facade.shutdown()
@@ -14698,7 +14701,7 @@ end)()
 				next_status = 500
 				local plain_save = sys.save
 				sys.save = function(path, record)
-					if path:sub(-15) == "/consent-outbox" then return false end
+					if path:sub(-15) == "-consent-outbox" then return false end
 					return plain_save(path, record)
 				end
 				result(call, false, true, nil, "consent_outbox_persist_failed")
@@ -15360,7 +15363,7 @@ end)()
 					if fault == "outbox" then
 						next_status = 500; next_response_body = "{}"
 						sys.save = function(path, record)
-							if path:sub(-15) == "/consent-outbox" then return false end
+							if path:sub(-15) == "-consent-outbox" then return false end
 							return disk(path, record)
 						end
 					end
@@ -16643,7 +16646,7 @@ end)()
    hold_http_requests()
    local calls,cb=answers()
    assert_true(client:bounded_flush(1,cb))
-   for path in pairs(stores)do if path:sub(-6)=="/spool" then stores[path]=nil end end
+   for path in pairs(stores)do if path:sub(-6)=="-spool" then stores[path]=nil end end
    if not writes then sys.save=function()return false end end
    socket.now=socket.now+1;client:update(0)
    answered(calls,false,writes and "pending" or "spool_persist_failed","spool")
@@ -17393,7 +17396,7 @@ end)()
   hold_http_requests()
   local save=sys.save
   sys.save=function(path,record)
-   if path:sub(-6)=="/spool" then socket.now=socket.now+2 end
+   if path:sub(-6)=="-spool" then socket.now=socket.now+2 end
    return save(path,record)
   end
   local calls,cb=answers()
@@ -17516,7 +17519,7 @@ end)()
    local save=sys.save
    sys.save=function(path,record)
     if not delete_works then return false end
-    if path:sub(-9)=="/identity" or path:sub(-15)=="/consent-denial" then return false end
+    if path:sub(-9)=="-identity" or path:sub(-15)=="-consent-denial" then return false end
     return save(path,record)
    end
    os.remove=function(path)
@@ -17843,7 +17846,7 @@ end)()
    local writable, writes = mode == "healthy", 0
    local save = sys.save
    sys.save = function(path, record)
-    if path:sub(-6) == "/spool" and not writable then writes = writes + 1; return false end
+    if path:sub(-6) == "-spool" and not writable then writes = writes + 1; return false end
     return save(path, record)
    end
    while held[1] do release_held_request(held); handle:update(0) end

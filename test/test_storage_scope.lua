@@ -130,5 +130,55 @@ scene("closing retains ownership until its callback", function()
 	close(assert(sdk.new(config())))
 end)
 
+local function android_paths()
+	local storage, names = require("shardpilot.storage"), {}
+	storage.reset()
+	-- Android selects the app sandbox independently of application_id.
+	sys.get_save_file = function(_, file)
+		names[#names + 1] = file
+		return "android/" .. file
+	end
+	return storage, names
+end
+
+scene("Android identity survives crash settings and relaunch", function()
+	local storage = android_paths()
+	local scope = { workspace_id = "workspace-a", app_id = "app-a" }
+	assert(storage.save(scope, { anonymous_id = "install-a" }))
+	assert(storage.save_crash_settings({ app_id = scope.app_id }, { crash_enabled = false }))
+	equal(storage.load(scope).anonymous_id, "install-a", "crash settings preserve identity")
+	storage.reset()
+	equal(storage.load(scope).anonymous_id, "install-a", "relaunch retains identity")
+	equal(storage.load_crash_settings({ app_id = scope.app_id }).crash_enabled, false, "crash decision retained")
+end)
+
+scene("Android identity survives pending crash writes", function()
+	local storage = android_paths()
+	local scope = { workspace_id = "workspace-a", app_id = "app-a" }
+	assert(storage.save(scope, { anonymous_id = "install-a" }))
+	assert(storage.save_pending_crash({ app_id = scope.app_id },
+		{ body = "{}", crash_id = "crash-a", fatal = true }, now * 1000))
+	equal(storage.load(scope).anonymous_id, "install-a", "pending crash preserves identity")
+	storage.reset()
+	equal(storage.load(scope).anonymous_id, "install-a", "relaunch retains identity")
+	equal(#storage.load_pending_crashes({ app_id = scope.app_id }), 1, "pending report retained")
+end)
+
+scene("Android separates raw scopes with bounded filenames", function()
+	local storage, names = android_paths()
+	local first = { workspace_id = string.rep("workspace", 100), app_id = "app.a" }
+	local second = { workspace_id = first.workspace_id, app_id = "app_a" }
+	assert(storage.save(first, { anonymous_id = "install-a" }))
+	assert(storage.save(second, { anonymous_id = "install-b" }))
+	storage.reset()
+	equal(storage.load(first).anonymous_id, "install-a", "first scope retains its identity")
+	equal(storage.load(second).anonymous_id, "install-b", "second scope retains its identity")
+	assert(#names > 0, "the filename probe must run")
+	for _, name in ipairs(names) do
+		assert(#name <= 255 and not name:find("/", 1, true) and not name:find("\\", 1, true),
+			"each filename must fit one filesystem component")
+	end
+end)
+
 print(string.format("storage scope: %d pass, %d fail", passed, failed))
 equal(failed, 0, "storage ownership scenes")
