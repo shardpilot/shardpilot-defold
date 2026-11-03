@@ -1,5 +1,9 @@
 # Contributor instructions
 
+- Native context stays default-off; preserve byte-exact native payload controls.
+  Read snapshots from the captured dump, bind scope/app, clear before lifecycle
+  transitions and never borrow the restarting client's identity or build.
+
 - Keep SDK code compatible with Lua 5.1 and LuaJIT.
 - Keep all checked release pins aligned; release notes must state the server enablement prerequisite for non-objection recording.
 - Keep non-objection snapshots separate from consent and policy authority. Assert the vendored contract profile and decoded goldens; local locale validation is structural, with registry membership decided by the server.

@@ -14,6 +14,7 @@ local envelope_platform = require "shardpilot.envelope_platform"
 local clock = require "shardpilot.clock"
 local crash_deadline = require "shardpilot.crash.deadline"
 local random = require "shardpilot.random"
+local native_context = require "shardpilot.crash.native_context"
 
 local M = {}
 
@@ -126,6 +127,8 @@ local config_keys = {
 	app_build = true,
 	app_key = true,
 	app_version = true,
+	native_snapshot_enabled = true,
+	native_snapshot_scope = true,
 	previous_crash_capture_enabled = true,
 	crash_key = true,
 	crash_component = true,
@@ -154,6 +157,12 @@ local function snapshot_config(config)
 end
 
 local function validate_config(config)
+	if config.native_snapshot_enabled ~= nil and type(config.native_snapshot_enabled) ~= "boolean" then
+		return nil, "invalid_native_snapshot_enabled"
+	end
+	if config.native_snapshot_enabled and not native_context.marker(config.app_key, config.native_snapshot_scope) then
+		return nil, "invalid_native_snapshot_scope"
+	end
 	local required = { "crash_url", "app_key" }
 	for _, key in ipairs(required) do
 		if config[key] == nil or config[key] == "" then
@@ -265,6 +274,8 @@ local function validate_config(config)
 		app_id = config.app_key,
 		app_version = config.app_version,
 		app_build = config.app_build,
+		native_snapshot_enabled = config.native_snapshot_enabled == true,
+		native_snapshot_scope = config.native_snapshot_scope,
 		crash_component = crash_component ~= "" and crash_component or nil,
 		platform = resolved_platform,
 		platform_unmapped = platform_unmapped,
@@ -400,6 +411,10 @@ function M.new(config)
 		script_error_reports = 0,
 		initialized = true,
 	}, Client)
+	if normalized.native_snapshot_enabled then
+		local _, native_err = native_context.bind(client)
+		if native_err == "native_snapshot_in_use" then return nil, native_err end
+	end
 	-- script-error auto-capture (opt-in, dark by default): the
 	-- handler installs at construction so an error thrown before the host's
 	-- first frame still reports. Install-only-on-opt-in keeps the dark
@@ -538,6 +553,8 @@ function Client:set_enabled(enabled)
 	end
 	self.enabled = enabled
 	self.enabled_reason = (not enabled) and "opt_out" or nil
+	local native_ok, native_err = true, nil
+	if self.config.native_snapshot_enabled and self.native_engine then native_ok, native_err = native_context.write(self, nil) end
 	if enabled and self.config.crash_hooks_enabled and not self.script_error_handler_installed then
 		-- The script-error handler defers past a disabled boot (see M.new); a
 		-- re-enable is the first enabled instant, so install here. A runtime
@@ -556,7 +573,13 @@ function Client:set_enabled(enabled)
 	if not storage.save_crash_settings(self:pending_scope(), { crash_enabled = enabled }) then
 		return false, "crash_persist_failed"
 	end
-	return true
+	return native_ok, native_err
+end
+
+function Client:set_native_context(context)
+	if not self.initialized then return false, "shutdown" end
+	if not self.config.native_snapshot_enabled then return false, "native_snapshot_disabled" end
+	return native_context.write(self, context)
 end
 
 local max_in_memory_pending = 8
@@ -909,7 +932,7 @@ function Client:capture_previous(crash_module)
 	if not self.enabled then
 		return false, "crash_disabled"
 	end
-	local event = dump.load_previous_event(crash_module)
+	local event, captured = dump.load_previous_event(crash_module, self.config)
 	if not event then
 		-- No new dump: just resend whatever a previous launch left pending.
 		self:resend_pending()
@@ -929,7 +952,8 @@ function Client:capture_previous(crash_module)
 	-- async, so dispatching the dump directly here would race the pass and
 	-- escape the one-at-a-time backpressure discipline.
 	local ok, err = self:emit_internal(event, true, true,
-		{ skip_breadcrumb_ring = true, defer_dispatch = true, skip_identity_stamp = true })
+		{ skip_breadcrumb_ring = true, defer_dispatch = true, skip_identity_stamp = true,
+			native_context = self.config.native_snapshot_enabled and (captured or {}) or nil })
 	if not ok then
 		self:resend_pending()
 		return false, err
@@ -1240,10 +1264,13 @@ end
 -- `initialized` is left true until then so emit() during teardown is not
 -- silently misrouted as a post-shutdown call.
 function Client:shutdown()
+	local cleared, clear_err = native_context.clear(self)
+	if not cleared then return false, clear_err end
 	if self.in_flight > 0 then
 		return false, "pending"
 	end
 	self.initialized = false
+	native_context.release(self)
 	return true
 end
 

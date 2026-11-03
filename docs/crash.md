@@ -50,7 +50,8 @@ crash.init({
 | `crash_url` | yes | The crash ingest **base** URL (no path/query/fragment). `https` is required outside loopback. The `/api/v1/crashes/ingest` route is appended by the SDK. |
 | `crash_key` | yes | A `crash:write` API key, used directly as the `Bearer` credential. |
 | `app_key` | yes | App/project scope; must match the API key's app scope. A product slug such as `user_app` or `customer_portal` is fine; a value carrying real PII (an email, an IP, a token, a digit-bearing raw actor id) fails `crash.init` with `invalid_app_key`. |
-| `app_version`, `app_build` | no | Defaulted onto every report. |
+| `app_version`, `app_build` | no | Defaulted onto live reports and default native replay; opted-in native snapshots use captured values. |
+| `native_snapshot_enabled`, `native_snapshot_scope` | no | Default-off [capture-time context](#optional-capture-time-context); scope is required when enabled. |
 | `platform` | no | One of `windows`, `macos`, `linux`, `android`, `ios`, `tvos`, `web`, `ps4`, `ps5`, `xbox`, `switch` or `other`. Auto-detected from `sys.get_sys_info`; an unrecognized system is `other`. A configured value is folded through the same table as analytics (`Mac` is `macos`, `html5` is `web`); one it cannot map is sent as `other` and reported once as `{ scope = "config", status = "ignored", code = "platform_unmapped" }`. A per-report `platform` is folded the same way and falls back to the configured one; a module's `platform` that cannot be mapped is omitted, so the module takes the crash's own. A crash client is never refused for its platform. |
 | `crash_component` | no | Component slug (see below); no fallback configuration alias. |
 | `crash_sample_every` | no | Every-Nth sampling for **non-fatal** reports (default 10): a deterministic per-process counter transmits calls N, 2N, 3N, … — the first N−1 non-fatals of a process are always dropped, so a process emitting fewer than N non-fatals in its lifetime reports none (set `1` to send every one). Set `0` to disable non-fatal reports, including the custom sampler. Fatal reports are **never** sampled. |
@@ -240,6 +241,43 @@ Return value: `(true, true)` when a dump was found and durably queued for the
 pass, `(true, false)` when there was no dump, `(false, err)` on a forward
 failure.
 
+### Optional capture-time context
+
+`native_snapshot_enabled = true` opts into native dump context. It defaults to false;
+flag-off native JSON bodies retain the v0.17.1 shape and bytes. Also set
+`native_snapshot_scope` to a stable, non-secret workspace/environment identifier.
+Scope and app keys must be 1–96 ASCII letters, digits, dots, underscores, colons or
+hyphens. Never put credentials in this field. Replays from another scope or app
+remain unlinked. The captured app version/build replace the sending launch's values;
+missing, malformed or interrupted snapshots do not inherit the sending build.
+
+After an explicit analytics grant, call:
+
+```lua
+crash.set_native_context({ consent = "granted", anonymous_id = anonymous_id,
+  session_id = session_id })
+```
+
+Call `crash.set_native_context(nil)` **before** withdrawing consent or changing
+identity/scope; submit fresh granted context after a session or identity change.
+Non-objection is not a grant. Nil, denied and unknown contexts contain no identifiers.
+This is the host's synchronous lifecycle responsibility: Lua cannot query consent
+inside a fatal native crash. The dump contains the last successfully submitted
+context, so a host that does not refresh it can leave stale identifiers. Existing
+live-report identity getters are independent and still need the host's consent gate.
+
+The SDK reserves engine user fields **27–31** (255 bytes each), clears before writing
+and commits its marker last. Reserve those slots exclusively; one opted-in client
+may own them per process. Disable and shutdown clear them; re-enable starts without
+identifiers. Finish shutdown before replacing an opted-in client. IDs are scrubbed;
+oversized IDs and build fields are omitted, never truncated. Unreadable dump context
+is omitted. Write failures are returned by
+`set_native_context`; an unsupported engine returns
+`native_snapshot_unavailable` while ordinary crash reporting stays available.
+Native capture still depends on the platform dump writer. These extra values can
+be persisted in the engine dump and the crash retry sidecar; enable only with the
+corresponding host disclosure and lifecycle integration.
+
 ### Limits of native dump forwarding
 
 - **No per-frame module attribution.** The engine exposes a flat backtrace and a
@@ -410,11 +448,12 @@ Details worth knowing:
   bytes is discarded and the crash still ships. A getter that throws is caught
   for the same reason: it is your code running while the process is already
   dying.
-- **A previous-session crash carries no actor key.** The dump forwarded on the
+- **By default a previous-session crash carries no actor key.** The dump forwarded on the
   next launch describes a process that died earlier; the id available now belongs
   to whoever is playing now, which after a rotation is a different person.
   Stamping it would mis-key both consent and deletion, so that report stays
-  device-scoped and anonymous.
+  device-scoped and anonymous. Opted-in [native context](#optional-capture-time-context)
+  restores only the captured, explicitly granted identifiers, never these getters.
 
 ## Privacy
 

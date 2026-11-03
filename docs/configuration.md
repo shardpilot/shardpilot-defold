@@ -1,5 +1,9 @@
 # Configuration
 
+Native crash context is separately opt-in through `native_snapshot_enabled` and
+`native_snapshot_scope` on the crash client. Hosts maintain consent, actor and
+session changes synchronously with `set_native_context`; see [the crash guide](crash.md#optional-capture-time-context).
+
 `consent_policy.prepare` can return `decision.advisory` when the request opted in
 and the response passed shape, scope and time checks. Treat its row, estimate and
 complete matrix version as read-only reference data for the host. It is not

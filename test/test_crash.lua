@@ -5630,7 +5630,115 @@ local platform_vocabulary_tests = (function()
 	}
 end)()
 
+local function test_native_capture_context()
+	local id, clock = require "shardpilot.id", require "shardpilot.clock"
+	local old_id, old_clock, old_engine = id.uuid_v7, clock.unix_ms, _G.crash
+	id.uuid_v7 = function() return "018d5f6a-7b8c-7abc-8123-123456789abc" end
+	clock.unix_ms = function() return 1700000000000 end
+	local golden = '{"app":{"build_id":"100","key":"app-example","version":"0.1.0"},"crash_id":"018d5f6a-7b8c-7abc-8123-123456789abc","exception":{"crashed_thread_id":"main","type":"SIGSEGV"},"fatal":true,"modules":[{"debug_id":"libgame.so","load_address":"0x1000","name":"libgame.so"}],"occurred_at":"2023-11-14T22:13:20Z","os":{"name":"Linux","version":"6"},"platform":"linux","threads":[{"crashed":true,"frames":[{"index":0,"instruction_addr":"0x1010"}],"id":"main"}]}'
+	local function engine()
+		local fields, saved, writes, reads = {}, {}, 0, 0
+		local module = fake_crash_module({handle=7, signum=11, os_name="Linux", os_version="6",
+			modules={{name="libgame.so",address=0x1000}}, backtrace={{address=0x1010}}})
+		module.set_user_field = function(index, value)
+			assert_true(index >= 0 and index < 32 and #value <= 255, "engine field bounds")
+			fields[index], writes = value, writes + 1
+		end
+		module.write_dump = function() saved = {}; for k,v in pairs(fields) do saved[k] = v end end
+		module.get_user_field = function(_, index) reads=reads+1; return saved[index] end
+		_G.crash = module
+		return module, function() return writes + reads end, function() return saved end
+	end
+	-- Captured from the unmodified v0.17.1 client, with only clock/id frozen.
+	for _, options in ipairs({{}, {native_snapshot_enabled=false}}) do
+		reset()
+		local module, writes = engine()
+		local client, err = crash.new(config(options))
+		assert_true(client, "native context flag-off control: " .. tostring(err))
+		assert_true(client:capture_previous(module))
+		assert_equal(requests[1].body, golden, "flag-off native payload must stay byte-identical")
+		assert_equal(writes(), 0, "flag off never touches engine user fields")
+		client:shutdown()
+	end
+	local granted = {consent="granted", anonymous_id="018d5f6a-7b8c-7abc-8123-123456789abc", session_id="018d5f6a-7b8c-7abc-8123-223456789abc"}
+	for _, scene in ipairs({"granted", "denied", "unknown", "cleared", "scope", "app", "disabled", "shutdown", "invalid", "interrupted", "malformed", "oversize_build"}) do
+		reset()
+		local module, _, captured_fields = engine()
+		local options = config({native_snapshot_enabled=true, native_snapshot_scope="workspace:release"})
+		if scene == "oversize_build" then options.app_version, options.app_build = string.rep("x", 256), string.rep("y", 256) end
+		local client, err = crash.new(options)
+		assert_true(client, "native capture context scene " .. scene .. " cannot initialize: " .. tostring(err))
+		assert_true(client:set_native_context(granted))
+		local duplicate, duplicate_err = crash.new(options)
+		assert_equal(duplicate, nil, "only one writer owns the engine fields")
+		assert_equal(duplicate_err, "native_snapshot_in_use")
+		if scene == "denied" or scene == "unknown" then
+			assert_true(client:set_native_context({consent=scene, anonymous_id=granted.anonymous_id, session_id=granted.session_id}))
+		elseif scene == "cleared" or scene == "oversize_build" then assert_true(client:set_native_context(nil))
+		elseif scene == "disabled" then assert_true(client:set_enabled(false))
+		elseif scene == "shutdown" then assert_true(client:shutdown())
+		elseif scene == "invalid" then client:set_native_context({consent="granted", anonymous_id="person@example.test", session_id=string.rep("x", 256)})
+		elseif scene == "interrupted" then
+			local set, copied = module.set_user_field, false
+			module.set_user_field = function(index,value)
+				set(index,value)
+				if index == 28 and value ~= "" and not copied then module.write_dump(); copied=true end
+			end
+			client:set_native_context(nil)
+			module.set_user_field = set
+		end
+		if scene ~= "interrupted" then module.write_dump() end
+		if scene == "denied" or scene == "unknown" or scene == "cleared" or scene == "disabled" or scene == "shutdown" then
+			for _, value in pairs(captured_fields()) do
+				assert_true(value ~= granted.anonymous_id and value ~= granted.session_id, scene .. " dump retained an identifier")
+			end
+		end
+		assert_true(client:shutdown())
+		reset()
+		options.app_version, options.app_build = "9.0.0", "new-build"
+		options.anonymous_id, options.session_id = "restart-actor", "restart-session"
+		if scene == "scope" then options.native_snapshot_scope = "workspace:preview" end
+		if scene == "app" then options.app_key = "other-app" end
+		if scene == "malformed" then
+			local get = module.get_user_field
+			module.get_user_field = function(handle,index) return index == 31 and string.rep("x", 256) or get(handle,index) end
+		end
+		client = assert(crash.new(options))
+		assert_true(client:capture_previous(module))
+		local payload = json.decode(requests[1].body)
+		assert_equal(payload.anonymous_id, scene == "granted" and granted.anonymous_id or nil, scene .. " captured actor")
+		assert_equal(payload.session_id, scene == "granted" and granted.session_id or nil, scene .. " captured session")
+		local valid = scene == "granted" or scene == "denied" or scene == "unknown" or scene == "cleared" or scene == "invalid"
+		assert_equal(payload.app.build_id, valid and "100" or nil, scene .. " captured build")
+		assert_equal(payload.app.version, valid and "0.1.0" or nil, scene .. " captured version")
+		assert_not_contains(requests[1].body, "restart-")
+		assert_true(client:shutdown())
+	end
+	reset()
+	local public_engine = engine()
+	local public = assert(require("shardpilot.crash").new(config({native_snapshot_enabled=true, native_snapshot_scope="workspace:release"})))
+	assert_true(public:set_native_context(granted), "public facade forwards the snapshot")
+	public_engine.write_dump()
+	assert_true(public:capture_previous(public_engine))
+	assert_equal(json.decode(requests[1].body).anonymous_id, granted.anonymous_id, "public facade captured actor")
+	assert_true(public:shutdown())
+	for _, bad in ipairs({{native_snapshot_enabled="yes"}, {native_snapshot_enabled=true},
+		{native_snapshot_enabled=true,native_snapshot_scope=string.rep("x",97)}}) do
+		assert_equal(crash.new(config(bad)), nil, "invalid snapshot configuration refused")
+	end
+	_G.crash = nil
+	local unsupported = assert(crash.new(config({native_snapshot_enabled=true,native_snapshot_scope="workspace:release"})))
+	local ok, why = unsupported:set_native_context(granted)
+	assert_equal(ok, false); assert_equal(why, "native_snapshot_unavailable")
+	assert_true(unsupported:set_enabled(false), "unsupported snapshot writer must not fail ordinary opt-out")
+	assert_true(unsupported:set_enabled(true), "unsupported snapshot writer must not fail ordinary re-enable")
+	assert_true(unsupported:emit_fatal(presymbolicated_event()), "unsupported native writer preserves manual reports")
+	assert_true(unsupported:shutdown())
+	id.uuid_v7, clock.unix_ms, _G.crash = old_id, old_clock, old_engine
+end
+
 local tests = {
+	test_native_capture_context,
 	platform_vocabulary_tests[1],
 	platform_vocabulary_tests[2],
 	platform_vocabulary_tests[3],

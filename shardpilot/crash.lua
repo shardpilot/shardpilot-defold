@@ -15,6 +15,7 @@ local default_client = nil
 local instance_methods = {
 	record_breadcrumb = 1,
 	set_enabled = 1,
+	set_native_context = 1,
 	is_enabled = 0,
 	emit = 1,
 	emit_fatal = 1,
@@ -76,6 +77,10 @@ end
 -- docs/crash.md.
 function M.set_enabled(enabled)
 	return with_default("set_enabled", enabled)
+end
+
+function M.set_native_context(context)
+	return with_default("set_native_context", context)
 end
 
 -- True while crash reporting is enabled on the singleton client. False after
