@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.18.0 — 2026-11-03
+
+- Add default-off native crash context snapshots with captured build/version and
+  explicitly granted pseudonymous identifiers. Hosts maintain lifecycle updates;
+  replay checks app/scope and never substitutes current identity or build.
+- Device non-objection still requires server enablement, a server-resolved
+  `SOFT_OPT_OUT` country and the workspace owner's active acceptance; it is not a grant.
+
 ## v0.17.1 — 2026-10-27
 
 - Isolate durable records by scope and kind in bounded filenames, including on Android.

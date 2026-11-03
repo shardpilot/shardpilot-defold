@@ -1420,6 +1420,10 @@ function M.prepare(client, event, trusted_frame_functions, options)
 	if not non_empty(event.app.build_id) then
 		event.app.build_id = client.config.app_build
 	end
+	if options.native_context then
+		event.app.version = options.native_context.app_version
+		event.app.build_id = options.native_context.app_build
+	end
 	-- A per-report source is an operator-set component slug, so it must be a string.
 	-- A non-string, non-nil value (e.g. a number) is invalid caller input, NOT an
 	-- absent source: it must not silently inherit the configured default and
@@ -1481,7 +1485,10 @@ function M.prepare(client, event, trusted_frame_functions, options)
 	-- both. This mirrors app.id, which is likewise stamped from config over any
 	-- caller value, and it is why the caller-map identity wall can stay name-keyed:
 	-- there is no path — map or top-level — by which caller input reaches this field.
-	if options.skip_identity_stamp then
+	if options.native_context then
+		event.anonymous_id = options.native_context.anonymous_id
+		event.session_id = options.native_context.session_id
+	elseif options.skip_identity_stamp then
 		-- The previous-session dump-forward path. That report describes a process
 		-- that died in an EARLIER launch, so the id resolvable now belongs to
 		-- whoever is present at THIS launch — after a rotation, a different

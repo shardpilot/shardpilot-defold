@@ -12,14 +12,18 @@ not the platform boundary.
 
 ## Status
 
+Native crash context is [opt-in](docs/crash.md#optional-capture-time-context): hosts
+can preserve the crashed build and explicitly granted pseudonymous IDs in the engine
+dump. The default native payload is unchanged; lifecycle updates belong to the host.
+
 - **v0 alpha, pre-1.0, API unstable.** This is public-preview source only. The
   surface may change before v1 with no backward-compatibility guarantee.
 - Point `ingest_url` at a ShardPilot ingest endpoint you have been given, or at
   a local stack you run yourself. Which endpoints are available today is stated
   under Configuration below and in [`docs/configuration.md`](docs/configuration.md);
   read that before configuring a hosted deployment.
-- **Version `0.17.1`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.17.1`; the `v0.17.1` tag
+- **Version `0.18.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.18.0`; the `v0.18.0` tag
   is created by the owner after the version-bump merge (pending until then).
 
 ## What it does
@@ -135,11 +139,11 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — after owner tagging, the latest tag is `v0.17.1`:
+published tag's source archive — after owner tagging, the latest tag is `v0.18.0`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.17.1.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.18.0.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
