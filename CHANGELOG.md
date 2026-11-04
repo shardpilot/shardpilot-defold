@@ -13,6 +13,8 @@
   no identifiers, and a later granted `set_native_context` call tries again. Without
   a usable save-file path (no save-file API, or none resolves) the call succeeds,
   and native reports carry no identifiers.
+- Device non-objection still requires server enablement, a server-resolved
+  `SOFT_OPT_OUT` country and the workspace owner's active acceptance; it is not a grant.
 
 ## v0.18.0 — 2026-11-03
 
