@@ -1454,7 +1454,7 @@ function M.prepare(context, callback)
 		-- surfaced, and its scope is not compared — a refusal carries none, so
 		-- that the response cannot be used to learn which tuples exist.
 		if response.status < 200 or response.status >= 300 or decoded.reason ~= nil then
-			settle(fallback("invalid_response", "the resolver refused"))
+			settle(fallback(error_envelope_reason(decoded), "the resolver refused"))
 			return
 		end
 		local shapes_ok, shape_refusal, present, present_signals = scan_plan_text(body)

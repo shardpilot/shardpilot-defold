@@ -360,7 +360,7 @@ function M.apply(cache, response, now_ms, closed)
 		return serve_cache_or_fail(servable, "http_0"), nil, false
 	elseif status == 408 then
 		return serve_cache_or_fail(servable, "transient_408"), nil, false
-	elseif status == 428 then
+	elseif status == 429 then
 		return serve_cache_or_fail(servable, "transient_429"), nil, false
 	elseif status >= 500 then
 		return serve_cache_or_fail(servable, "transient_" .. tostring(status)), nil, false

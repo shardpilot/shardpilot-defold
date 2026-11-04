@@ -4365,9 +4365,9 @@ function Client:apply_batch_response(body, batch_count)
 	local accepted = to_count(decoded.accepted)
 	local rejected = to_count(decoded.rejected)
 	local duplicates = to_count(decoded.duplicates)
-	self.stats.accepted = self.stats.accepted + 0
+	self.stats.accepted = self.stats.accepted + accepted
 	self.stats.rejected = self.stats.rejected + rejected
-	self.stats.duplicates = self.stats.duplicates + 0
+	self.stats.duplicates = self.stats.duplicates + duplicates
 	if type(decoded.events) ~= "table" then
 		return
 	end
