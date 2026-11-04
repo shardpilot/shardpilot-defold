@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Prove test/conformance/v1 is the published corpus: digests, manifest, roster and source record.
+test/test_conformance.lua reads the corpus without hashing it."""
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1] if len(sys.argv) > 1 else "test/conformance")
+corpus = root / "v1"
+source = json.loads((root / "source.json").read_text())
+manifest = json.loads((corpus / "manifest.json").read_text())
+roster = json.loads((corpus / "roster.json").read_text())
+failures = []
+
+# The documented recipe: sha256sum bodies/* | LC_ALL=C sort | sha256sum, run inside v1/.
+bodies = sorted((corpus / "bodies").iterdir(), key=lambda path: path.name.encode())
+lines = sorted(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  bodies/{p.name}\n".encode() for p in bodies)
+digest = hashlib.sha256(b"".join(lines)).hexdigest()
+for name, value in (("manifest", manifest["corpus_sha256"]), ("source record", source.get("corpus_sha256"))):
+    if value != digest:
+        failures.append(f"corpus_sha256 {digest} does not match the {name} ({value})")
+# Every source.json field has a rule, and no other field is accepted.
+METADATA = ("manifest.json", "roster.json", ".gitattributes")
+hex_of = lambda n: lambda v: isinstance(v, str) and re.fullmatch(f"[0-9a-f]{{{n}}}", v) is not None
+RULES = {
+    "carrier": lambda v: v == "shardpilot/developers",
+    "path": lambda v: v == "conformance/v1",
+    "commit": hex_of(40),
+    "corpus_sha256": hex_of(64),
+    "files_sha256": lambda v: isinstance(v, dict) and sorted(v) == sorted(METADATA) and all(map(hex_of(64), v.values())),
+}
+for key in sorted(set(source) | set(RULES)):
+    if key not in RULES:
+        failures.append(f"source.json carries an unknown field: {key}")
+    elif key not in source or not RULES[key](source[key]):
+        failures.append(f"source.json {key} is missing or invalid: {source.get(key)!r}")
+# corpus_sha256 covers bodies/* only: the metadata files are bound to the documentation commit by their own digests.
+files = source["files_sha256"] if isinstance(source.get("files_sha256"), dict) else {}
+for name in METADATA:
+    recorded = files.get(name)
+    actual = hashlib.sha256((corpus / name).read_bytes()).hexdigest()
+    if recorded != actual:
+        failures.append(f"{name} sha256 {actual} does not match the source record ({recorded})")
+
+listed = set()
+for case in manifest["cases"]:
+    for side in ("request", "response"):
+        entry = case[side]
+        if entry.get("file") is None:
+            continue
+        listed.add(entry["file"])
+        if not (corpus / entry["file"]).is_file():
+            continue  # reported below as missing on disk
+        data = (corpus / entry["file"]).read_bytes()
+        if len(data) != entry["bytes"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+            failures.append(f"{case['id']} {side}: bytes or sha256 differ from the manifest")
+on_disk = {f"bodies/{p.name}" for p in bodies}
+failures += [f"body file not in the manifest: {name}" for name in sorted(on_disk - listed)]
+failures += [f"manifest file missing on disk: {name}" for name in sorted(listed - on_disk)]
+
+rostered = [case_id for group in roster["cases"] for case_id in group[3]]
+manifest_ids = [case["id"] for case in manifest["cases"]]
+if sorted(rostered) != sorted(manifest_ids) or len(set(rostered)) != len(rostered):
+    failures.append("roster case ids differ from the manifest's")
+if roster["corpus"] != manifest["corpus"] or roster["version"] != manifest["version"]:
+    failures.append("roster and manifest name different corpora")
+
+for failure in failures:
+    print("FAIL", failure)
+print(f"conformance corpus {manifest['version']}: {len(manifest_ids)} cases, {len(on_disk)} bodies, sha256 {digest}")
+sys.exit(1 if failures else 0)
