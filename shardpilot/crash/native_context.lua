@@ -103,7 +103,7 @@ function M.read(engine, handle, config, scope)
 			if type(value) ~= "string" or #value > 255 then return nil end
 			values[index] = value
 		end
-		for _, listed in ipairs(token and storage.load_native_links(scope) or {}) do linked = linked or listed == token end
+		for _, listed in ipairs(token and storage.load_native_links(scope, true) or {}) do linked = linked or listed == token end
 		return { app_version=values[28], app_build=values[29],
 			anonymous_id=linked and values[30] or "", session_id=linked and values[31] or "" }
 	end)

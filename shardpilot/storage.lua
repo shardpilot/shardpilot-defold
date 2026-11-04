@@ -712,11 +712,13 @@ local function native_links_path(scope)
 end
 
 -- Load the token list, or nil when it is absent or unreadable.
-function M.load_native_links(scope)
+-- strict: a failed durable read answers nil, never the in-process shadow.
+function M.load_native_links(scope, strict)
 	local ns, path = native_links_path(scope)
 	if path then
 		local ok, record = pcall(sys.load, path)
 		if ok and type(record) == "table" then return record end
+		if strict then return nil end
 	end
 	return clone(native_links_memory[ns])
 end
