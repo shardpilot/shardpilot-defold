@@ -87,13 +87,11 @@ local function filename_prefix(ns)
 	return filename_prefixes[ns]
 end
 
-local function has_save_api()
-	return type(sys) == "table" and type(sys.get_save_file) == "function"
-		and type(sys.save) == "function" and type(sys.load) == "function"
-end
-
 local function save_path(ns, file_name)
-	if not has_save_api() then
+	if type(sys) ~= "table" then
+		return nil
+	end
+	if type(sys.get_save_file) ~= "function" or type(sys.save) ~= "function" or type(sys.load) ~= "function" then
 		return nil
 	end
 	local ok, path = pcall(sys.get_save_file, ns, filename_prefix(ns) .. file_name)
@@ -714,22 +712,20 @@ local function native_links_path(scope)
 end
 
 -- Load the token list, or nil when it is absent or unreadable.
--- strict: with a save-file API only a successful durable read answers; the
--- in-process shadow answers only on hosts that have no such API.
+-- strict: only a successful durable read answers, never the in-process shadow.
 function M.load_native_links(scope, strict)
 	local ns, path = native_links_path(scope)
 	if path then
 		local ok, record = pcall(sys.load, path)
 		if ok and type(record) == "table" then return record end
 	end
-	if strict and has_save_api() then return nil end
+	if strict then return nil end
 	return clone(native_links_memory[ns])
 end
 
 -- Replace the token list. Returns true only when it was stored.
 function M.save_native_links(scope, tokens)
 	local ns, path = native_links_path(scope)
-	if not path and has_save_api() then return false end
 	if path then
 		local ok, saved = pcall(sys.save, path, tokens)
 		if not (ok and saved == true) then return false end

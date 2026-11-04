@@ -5718,12 +5718,14 @@ local function test_native_capture_context()
 		if restore then restore() end
 	end
 	reset()
-	local public_engine = engine()
+	local public_engine, _, public_fields = engine()
 	local public = assert(require("shardpilot.crash").new(config({native_snapshot_enabled=true, native_snapshot_scope="workspace:release"})))
 	assert_true(public:set_native_context(granted), "public facade forwards the snapshot")
 	public_engine.write_dump()
+	assert_equal(public_fields()[30], granted.anonymous_id, "public facade wrote the actor")
 	assert_true(public:capture_previous(public_engine))
-	assert_equal(json.decode(requests[1].body).anonymous_id, granted.anonymous_id, "public facade captured actor")
+	-- No save-file API here, so the link list has no durable store and nothing attaches.
+	assert_equal(json.decode(requests[1].body).anonymous_id, nil, "no durable store attaches no actor")
 	assert_true(public:shutdown())
 	for _, bad in ipairs({{native_snapshot_enabled="yes"}, {native_snapshot_enabled=true},
 		{native_snapshot_enabled=true,native_snapshot_scope=string.rep("x",97)}}) do
@@ -6452,8 +6454,10 @@ end)()
 		assert_true(relaunched:shutdown())
 	end)
 	-- S6 runs once per way the durable list can be unreadable: { sys function, its result }.
+	-- "replaced" sets the function, or sys itself, to false after the grant, as game code could.
 	for _, mode in ipairs({ { "load", "throw" }, { "load", "corrupt" },
-		{ "get_save_file", "throw" }, { "get_save_file", 42 }, { "get_save_file", "" } }) do
+		{ "get_save_file", "throw" }, { "get_save_file", 42 }, { "get_save_file", "" },
+		{ "load", "replaced" }, { "save", "replaced" }, { "get_save_file", "replaced" }, { "sys", "replaced" } }) do
 		local name = mode[1] .. " " .. tostring(mode[2])
 		scene("S6 unreadable link list withholds identifiers (" .. name .. ")", function()
 			local module = engine()
@@ -6464,8 +6468,9 @@ end)()
 			reset()
 			local relaunched = launch()
 			assert_true(relaunched:set_native_context({ consent = "granted", anonymous_id = "next-actor", session_id = "next-session" }))
-			local original = sys[mode[1]]
-			sys[mode[1]] = function(...)
+			local owner = mode[1] == "sys" and _G or sys
+			local original = owner[mode[1]]
+			local function wrapped(...)
 				for _, arg in ipairs({ ... }) do
 					if tostring(arg):find("native%-links") then
 						if mode[2] == "throw" then error("synthetic read failure") end
@@ -6474,8 +6479,9 @@ end)()
 				end
 				return original(...)
 			end
+			owner[mode[1]] = mode[2] ~= "replaced" and wrapped or false
 			assert_true(relaunched:capture_previous(module))
-			sys[mode[1]] = original
+			owner[mode[1]] = original
 			unlinked(json.decode(requests[1].body), "S6 " .. name)
 			assert_true(relaunched:shutdown())
 		end)

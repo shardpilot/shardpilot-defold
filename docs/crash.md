@@ -287,7 +287,9 @@ reads then; an absent or unreadable list attaches none, while the captured versi
 and build still apply. A grant whose token cannot be recorded is written without
 identifiers and returns `native_snapshot_persist_failed`. If both the durable store
 and the engine fail when identifiers are revoked, the revocation cannot be recorded
-and the next native report can still carry the previous identifiers.
+and the next native report can still carry the previous identifiers. The list is
+read only from durable storage, never from memory: on a host without a save-file
+backend, native reports carry no identifiers, and crash delivery is unchanged.
 
 ### Limits of native dump forwarding
 
