@@ -5663,6 +5663,7 @@ local function test_native_capture_context()
 	local granted = {consent="granted", anonymous_id="018d5f6a-7b8c-7abc-8123-123456789abc", session_id="018d5f6a-7b8c-7abc-8123-223456789abc"}
 	for _, scene in ipairs({"granted", "denied", "unknown", "cleared", "scope", "app", "disabled", "shutdown", "invalid", "interrupted", "malformed", "oversize_build"}) do
 		reset()
+		local restore = scene == "granted" and install_fake_sys_storage()
 		local module, _, captured_fields = engine()
 		local options = config({native_snapshot_enabled=true, native_snapshot_scope="workspace:release"})
 		if scene == "oversize_build" then options.app_version, options.app_build = string.rep("x", 256), string.rep("y", 256) end
@@ -5693,7 +5694,8 @@ local function test_native_capture_context()
 				assert_true(value ~= granted.anonymous_id and value ~= granted.session_id, scene .. " dump retained an identifier")
 			end
 		end
-		assert_true(client:shutdown())
+		-- A granted crash ends the process; a shutdown would unlink the snapshot.
+		if restore then require("shardpilot.crash.native_context").release(client) else assert_true(client:shutdown()) end
 		reset()
 		options.app_version, options.app_build = "9.0.0", "new-build"
 		options.anonymous_id, options.session_id = "restart-actor", "restart-session"
@@ -5713,6 +5715,7 @@ local function test_native_capture_context()
 		assert_equal(payload.app.version, valid and "0.1.0" or nil, scene .. " captured version")
 		assert_not_contains(requests[1].body, "restart-")
 		assert_true(client:shutdown())
+		if restore then restore() end
 	end
 	reset()
 	local public_engine = engine()

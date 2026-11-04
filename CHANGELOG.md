@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Native crash context revocation fails closed: a granted snapshot carries a link
+  token recorded durably before its identifiers are written and removed before every
+  clear, and the next launch attaches identifiers only for a recorded link. If both
+  the durable store and the engine fail during revocation, the previous identifiers
+  can still be reported.
+
 ## v0.18.0 — 2026-11-03
 
 - Add default-off native crash context snapshots with captured build/version and

@@ -278,6 +278,17 @@ Native capture still depends on the platform dump writer. These extra values can
 be persisted in the engine dump and the crash retry sidecar; enable only with the
 corresponding host disclosure and lifecycle integration.
 
+Granted identifiers are linked. Before writing them, the SDK records a random link
+token in a small per-app durable list (the last four tokens) and appends that token
+to its marker; a refresh reuses the token. Every revocation (non-granted context,
+`set_enabled(false)` or `shutdown()`) removes the token before clearing the fields.
+The next launch attaches identifiers only when the dump's token is in the list it
+reads then; an absent or unreadable list attaches none, while the captured version
+and build still apply. A grant whose token cannot be recorded is written without
+identifiers and returns `native_snapshot_persist_failed`. If both the durable store
+and the engine fail when identifiers are revoked, the revocation cannot be recorded
+and the next native report can still carry the previous identifiers.
+
 ### Limits of native dump forwarding
 
 - **No per-frame module attribution.** The engine exposes a flat backtrace and a

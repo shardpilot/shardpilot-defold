@@ -255,7 +255,8 @@ end
 -- releasing the handle afterward. Returns the event table, or nil when there is
 -- no dump (or the runtime has no `crash` module / no usable dump). Never raises.
 -- `crash_module` is injectable for testing; defaults to the global `crash`.
-function M.load_previous_event(crash_module, config)
+-- `scope` names the durable link list that native context IDs must appear in.
+function M.load_previous_event(crash_module, config, scope)
 	crash_module = crash_module or _G.crash
 	if type(crash_module) ~= "table" or type(crash_module.load_previous) ~= "function" then
 		return nil
@@ -265,7 +266,7 @@ function M.load_previous_event(crash_module, config)
 		return nil
 	end
 	local built_ok, event = pcall(M.event_from_handle, crash_module, handle)
-	local captured = native_context.read(crash_module, handle, config)
+	local captured = native_context.read(crash_module, handle, config, scope)
 	if type(crash_module.release) == "function" then
 		pcall(crash_module.release, handle)
 	end
