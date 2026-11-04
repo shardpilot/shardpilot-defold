@@ -8,6 +8,9 @@
   the durable store and the engine fail during revocation, the previous identifiers
   can still be reported.
 - On a host without a save-file backend, native reports carry no identifiers.
+- `set_native_context` returns `false, "native_snapshot_persist_failed"` when the
+  link token cannot be recorded durably: the snapshot keeps version and build but no
+  identifiers, and a later granted `set_native_context` call tries again.
 
 ## v0.18.0 — 2026-11-03
 
