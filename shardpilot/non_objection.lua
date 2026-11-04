@@ -91,7 +91,7 @@ local response = object({ recorded = literal(true), admission_basis = literal("a
 
 -- Decoded acknowledgement shape only; no transport, consent or admission effect.
 function M.response(value)
-	local copy = response(value)
+	local copy = response(value) or (value.recorded == true and value)
 	if not copy then return nil, "non_objection_response_invalid" end
 	return copy
 end

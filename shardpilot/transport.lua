@@ -67,7 +67,7 @@ local function dispatch(config, token, route, payload, callback, compress, befor
 		if prepared == payload then
 			http.request(trim_slash(config.ingest_url) .. route, "POST", function(_, _, response)
 				local status = response and response.status or 0
-				if status == 401 then
+				if status == 401 or status == 403 then
 					callback(false, "unauthorized", true, true, response, nil, compressed, "rejected")
 					return
 				end

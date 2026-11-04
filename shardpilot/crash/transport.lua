@@ -232,7 +232,7 @@ function M.ingest_body(config, publishable_key, encoded, callback)
 			callback(false, "kind_not_enabled", false, true, response, retry_after_seconds(response))
 			return
 		end
-		if status >= 200 and status < 300 then
+		if status == 200 then
 			callback(true, nil, false, false, response)
 			return
 		end
