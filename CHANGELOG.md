@@ -9,8 +9,10 @@
   can still be reported.
 - On a host without a save-file backend, native reports carry no identifiers.
 - `set_native_context` returns `false, "native_snapshot_persist_failed"` when the
-  link token cannot be recorded durably: the snapshot keeps version and build but no
-  identifiers, and a later granted `set_native_context` call tries again.
+  save-file write of the link token fails: the snapshot keeps version and build but
+  no identifiers, and a later granted `set_native_context` call tries again. Without
+  a usable save-file path (no save-file API, or none resolves) the call succeeds,
+  and native reports carry no identifiers.
 
 ## v0.18.0 — 2026-11-03
 
