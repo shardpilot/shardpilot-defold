@@ -34,3 +34,7 @@ regexes = [
   '''^sp_ingest_abc123$''',
   '''^receipt-historic-anon-2$''',
 ]
+
+[[allowlists]]
+description = "`synthetic-ws-01` is the synthetic workspace key in the vendored wire-conformance corpus request bodies (test/conformance/v1). It names no workspace and authenticates nothing; anchored, so it excuses that literal only."
+regexes = ['''^synthetic-ws-01$''']

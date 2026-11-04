@@ -2196,6 +2196,14 @@ Changes to CI or validation scripts intentionally fail `gate-integrity` and requ
 
 The non-objection contract scenes in `test/test_sdk.lua` read the exact bundle
 under `test/golden/` and assert its wire validation profile and decoded goldens.
+
+`test/test_conformance.lua` feeds every case of the public wire-conformance corpus,
+vendored whole under `test/conformance/v1/`, to this SDK's own response handlers
+and asserts each outcome class. It compares a request byte for byte only where the
+SDK builds it from the case's own inputs (the remote config GET); every other case
+prints `UNSUPPORTED` with its reason. `scripts/check_conformance_pack.py` verifies
+the copy against `corpus_sha256` and `test/conformance/source.json`, which names the
+documentation commit it was copied from.
 `shardpilot.non_objection` captures closed host attestations and acknowledgement
 shapes separately from consent. Its locale check is the structural BCP 47 subset;
 the server decides registry membership. A captured attestation supplies no policy

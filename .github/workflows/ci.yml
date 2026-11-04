@@ -137,6 +137,9 @@ jobs:
           python3 scripts/test_library_files.py
           python3 scripts/test_library_wire.py
 
+      - name: Wire-conformance corpus matches its published digest
+        run: python3 scripts/check_conformance_pack.py
+
       - name: Headless SDK sender contract fixtures (loopback only)
         run: |
           python3 --version

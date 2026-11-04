@@ -45,3 +45,4 @@
 - Treat a non-objection 401 as terminal without a token provider; keep token-provider refresh-and-retry controls.
 - Shutdown may retire undurable non-objection records with an explicit diagnostic; preserve denial receipts and exercise the actual shutdown method with and without its retirement call.
 - Preserve Android record-kind, scope separation, relaunch and bounded-filename scenes.
+- Never edit `test/conformance/v1/`: re-vendor the whole directory, update `source.json`, and run `scripts/check_conformance_pack.py` and `test/test_conformance.lua`. Review every new `UNSUPPORTED` reason or expected-class exception.
