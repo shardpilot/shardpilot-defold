@@ -1,6 +1,6 @@
 [project]
 title = ShardPilot Defold SDK
-version = 0.18.0
+version = 0.18.1
 
 [bootstrap]
 main_collection = /test/harness.collectionc
