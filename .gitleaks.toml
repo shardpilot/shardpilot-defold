@@ -36,5 +36,9 @@ regexes = [
 ]
 
 [[allowlists]]
-description = "`synthetic-ws-01` is the synthetic workspace key in the vendored wire-conformance corpus request bodies (test/conformance/v1). It names no workspace and authenticates nothing; anchored, so it excuses that literal only."
-regexes = ['''^synthetic-ws-01$''']
+description = "Vendored SDK wire-conformance corpus request bodies (test/conformance/v1/bodies/*.request): the generic-api-key entropy heuristic fires on the synthetic fixture member `workspace_key\":\"synthetic-ws-01` captured from the receiver. It is not a credential. Unlike the literal exceptions above, this one carries `paths`, so it is scoped three ways: condition AND with those paths, targetRules to that one rule, and regexTarget = \"match\" anchored to that exact member and value. Another member, another value or another path is still reported, and dedicated credential rules keep firing. The same block guards the corpus in its own repository. Append-only: the history scan reads old commits."
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''(^|/)test/conformance/v1/bodies/[^/]+\.request$''']
+regexTarget = "match"
+regexes = ['''^workspace_key"\s*:\s*"synthetic-ws-01"$''']
