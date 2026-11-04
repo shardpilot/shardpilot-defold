@@ -6322,3 +6322,132 @@ end)()
 	print("crash scope total: " .. passed .. " pass, " .. failed .. " fail")
 	assert_equal(failed, 0, "crash scope contract scenes")
 end)()
+
+-- Native identifier revocation scenes: a revocation whose engine clear fails
+-- must not let the next launch attach the previous identifiers.
+;(function()
+	local native_context = require "shardpilot.crash.native_context"
+	local passed, failed, live, saved_engine = 0, 0, {}, _G.crash
+	local options = { native_snapshot_enabled = true, native_snapshot_scope = "workspace:release" }
+	local granted = { consent = "granted", anonymous_id = "018d5f6a-7b8c-7abc-8123-323456789abc",
+		session_id = "018d5f6a-7b8c-7abc-8123-423456789abc" }
+	-- The dump copies the engine user fields as they are at the moment of the crash.
+	local function engine()
+		local fields, dumped = {}, {}
+		local module = fake_crash_module({ handle = 7, signum = 11,
+			modules = { { name = "libgame.so", address = 0x1000 } }, backtrace = { { address = 0x1010 } } })
+		module.fields = fields
+		module.set_user_field = function(index, value) fields[index] = value end
+		module.get_user_field = function(_, index) return dumped[index] end
+		module.write_dump = function() for index = 27, 31 do dumped[index] = fields[index] end end
+		_G.crash = module
+		return module
+	end
+	local function launch()
+		live[#live + 1] = assert(crash.new(config(options)))
+		return live[#live]
+	end
+	-- Fail the engine write that clears one field; later writes still land.
+	local function throw_on_clear(module, field)
+		local set = module.set_user_field
+		module.set_user_field = function(index, value)
+			if index == field and value == "" then error("synthetic engine failure") end
+			set(index, value)
+		end
+		return function() module.set_user_field = set end
+	end
+	-- The process dies holding the dump; the next launch forwards it.
+	local function next_report(module, client)
+		module.write_dump()
+		native_context.release(client)
+		reset()
+		local relaunched = launch()
+		assert_true(relaunched:capture_previous(module))
+		assert_equal(#requests, 1, "the native crash is still reported")
+		assert_true(relaunched:shutdown())
+		return json.decode(requests[1].body)
+	end
+	local function unlinked(report, name)
+		assert_equal(report.anonymous_id, nil, name .. " withholds the previous anonymous_id")
+		assert_equal(report.session_id, nil, name .. " withholds the previous session_id")
+	end
+	local function scene(name, run)
+		reset()
+		local restore = install_fake_sys_storage()
+		local ok, err = pcall(run)
+		for _, client in ipairs(live) do native_context.release(client) end
+		live = {}
+		restore(); _G.crash = saved_engine; storage.reset()
+		if ok then passed = passed + 1 else failed = failed + 1 end
+		print("native revocation " .. name .. ": " .. (ok and "PASS" or "FAIL: " .. tostring(err)))
+	end
+	scene("S1 revocation whose marker clear throws", function()
+		local module = engine()
+		local client = launch()
+		assert_true(client:set_native_context(granted))
+		local restore = throw_on_clear(module, 27)
+		local ok, err = client:set_native_context({ consent = "denied" })
+		restore()
+		assert_equal(ok, false, "the failed engine clear is reported")
+		assert_equal(err, "native_snapshot_write_failed")
+		assert_equal(module.fields[30], granted.anonymous_id, "the engine still holds the old identifier")
+		unlinked(next_report(module, client), "S1")
+	end)
+	scene("S2 healthy revocation clear", function()
+		local module = engine()
+		local client = launch()
+		assert_true(client:set_native_context(granted))
+		assert_true(client:set_native_context({ consent = "denied" }))
+		local report = next_report(module, client)
+		unlinked(report, "S2 healthy")
+		assert_equal(report.app.build_id, "100", "the captured build still attaches")
+	end)
+	scene("S2 revocation whose field-28 clear throws", function()
+		local module = engine()
+		local client = launch()
+		assert_true(client:set_native_context(granted))
+		local restore = throw_on_clear(module, 28)
+		assert_equal(client:set_native_context({ consent = "denied" }), false, "the failed engine clear is reported")
+		restore()
+		assert_equal(module.fields[27], "", "the marker was cleared first")
+		unlinked(next_report(module, client), "S2 field 28")
+	end)
+	scene("S3 crash without identifiers is delivered", function()
+		local module = engine()
+		local report = next_report(module, launch())
+		unlinked(report, "S3")
+		assert_equal(report.fatal, true, "the native crash is fatal")
+		assert_equal(report.exception.type, "SIGSEGV")
+		assert_equal(report.app.build_id, "100", "the captured build attaches")
+	end)
+	scene("S4 grant whose link record cannot be saved", function()
+		local module = engine()
+		local client = launch()
+		local save = sys.save
+		sys.save = function() return false end
+		client:set_native_context(granted)
+		sys.save = save
+		for index = 27, 31 do
+			assert_true(module.fields[index] ~= granted.anonymous_id and module.fields[index] ~= granted.session_id,
+				"S4 an unrecorded grant wrote an identifier to field " .. index)
+		end
+		unlinked(next_report(module, client), "S4")
+	end)
+	scene("S5 previous launch's link survives a new grant", function()
+		local module = engine()
+		local client = launch()
+		assert_true(client:set_native_context(granted))
+		module.write_dump()
+		native_context.release(client)
+		reset()
+		local relaunched = launch()
+		assert_true(relaunched:set_native_context({ consent = "granted", anonymous_id = "next-actor", session_id = "next-session" }))
+		assert_true(relaunched:capture_previous(module))
+		local report = json.decode(requests[1].body)
+		assert_equal(report.anonymous_id, granted.anonymous_id, "S5 the crashed launch's actor attaches")
+		assert_equal(report.session_id, granted.session_id, "S5 the crashed launch's session attaches")
+		assert_true(relaunched:shutdown())
+	end)
+	print("native revocation total: " .. passed .. " pass, " .. failed .. " fail")
+	assert_equal(failed, 0, "native revocation scenes")
+end)()
