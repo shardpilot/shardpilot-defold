@@ -284,12 +284,14 @@ to its marker; a refresh reuses the token. Every revocation (non-granted context
 `set_enabled(false)` or `shutdown()`) removes the token before clearing the fields.
 The next launch attaches identifiers only when the dump's token is in the list it
 reads then; an absent or unreadable list attaches none, while the captured version
-and build still apply. A grant whose token cannot be recorded is written without
-identifiers and returns `native_snapshot_persist_failed`. If both the durable store
+and build still apply. A grant whose save-file write of the token fails is written
+without identifiers and returns `native_snapshot_persist_failed`; a later granted
+call tries again. If both the durable store
 and the engine fail when identifiers are revoked, the revocation cannot be recorded
 and the next native report can still carry the previous identifiers. The list is
-read only from durable storage, never from memory: on a host without a save-file
-backend, native reports carry no identifiers, and crash delivery is unchanged.
+read only from durable storage, never from memory: without a usable save-file path
+(no save-file API, or none resolves), a grant succeeds and keeps its token in
+memory only, so native reports carry no identifiers; crash delivery is unchanged.
 
 ### Limits of native dump forwarding
 

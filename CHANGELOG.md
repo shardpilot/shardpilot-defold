@@ -1,12 +1,20 @@
 # Changelog
 
-## Unreleased
+## v0.18.1 — 2026-11-04
 
 - Native crash context revocation fails closed: a granted snapshot carries a link
   token recorded durably before its identifiers are written and removed before every
   clear, and the next launch attaches identifiers only for a recorded link. If both
   the durable store and the engine fail during revocation, the previous identifiers
   can still be reported.
+- On a host without a save-file backend, native reports carry no identifiers.
+- `set_native_context` returns `false, "native_snapshot_persist_failed"` when the
+  save-file write of the link token fails: the snapshot keeps version and build but
+  no identifiers, and a later granted `set_native_context` call tries again. Without
+  a usable save-file path (no save-file API, or none resolves) the call succeeds,
+  and native reports carry no identifiers.
+- Device non-objection still requires server enablement, a server-resolved
+  `SOFT_OPT_OUT` country and the workspace owner's active acceptance; it is not a grant.
 
 ## v0.18.0 — 2026-11-03
 
