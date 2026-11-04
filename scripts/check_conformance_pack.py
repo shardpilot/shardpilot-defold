@@ -4,6 +4,7 @@ test/test_conformance.lua reads the corpus without hashing it."""
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 
 root = Path(sys.argv[1] if len(sys.argv) > 1 else "test/conformance")
@@ -17,14 +18,28 @@ failures = []
 bodies = sorted((corpus / "bodies").iterdir(), key=lambda path: path.name.encode())
 lines = sorted(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  bodies/{p.name}\n".encode() for p in bodies)
 digest = hashlib.sha256(b"".join(lines)).hexdigest()
-for name, value in (("manifest", manifest["corpus_sha256"]), ("source record", source["corpus_sha256"])):
+for name, value in (("manifest", manifest["corpus_sha256"]), ("source record", source.get("corpus_sha256"))):
     if value != digest:
         failures.append(f"corpus_sha256 {digest} does not match the {name} ({value})")
-if source.get("carrier") != "shardpilot/developers" or len(source.get("commit", "")) != 40:
-    failures.append("source.json must name the carrier repository and a full documentation commit")
+# Every source.json field has a rule, and no other field is accepted.
+METADATA = ("manifest.json", "roster.json", ".gitattributes")
+hex_of = lambda n: lambda v: isinstance(v, str) and re.fullmatch(f"[0-9a-f]{{{n}}}", v) is not None
+RULES = {
+    "carrier": lambda v: v == "shardpilot/developers",
+    "path": lambda v: v == "conformance/v1",
+    "commit": hex_of(40),
+    "corpus_sha256": hex_of(64),
+    "files_sha256": lambda v: isinstance(v, dict) and sorted(v) == sorted(METADATA) and all(map(hex_of(64), v.values())),
+}
+for key in sorted(set(source) | set(RULES)):
+    if key not in RULES:
+        failures.append(f"source.json carries an unknown field: {key}")
+    elif key not in source or not RULES[key](source[key]):
+        failures.append(f"source.json {key} is missing or invalid: {source.get(key)!r}")
 # corpus_sha256 covers bodies/* only: the metadata files are bound to the documentation commit by their own digests.
-for name in ("manifest.json", "roster.json", ".gitattributes"):
-    recorded = source.get("files_sha256", {}).get(name)
+files = source["files_sha256"] if isinstance(source.get("files_sha256"), dict) else {}
+for name in METADATA:
+    recorded = files.get(name)
     actual = hashlib.sha256((corpus / name).read_bytes()).hexdigest()
     if recorded != actual:
         failures.append(f"{name} sha256 {actual} does not match the source record ({recorded})")
