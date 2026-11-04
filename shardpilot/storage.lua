@@ -1,8 +1,8 @@
 -- Durable persistence for the identity record (anonymous ID + consent state),
 -- the consent denial marker (the write-ahead witness for a denial whose
 -- identity write failed), the pending-crash sidecar, the crash-reporting
--- settings record (the persisted opt-out), the offline event spool, and the
--- consent-receipt outbox.
+-- settings record (the persisted opt-out), the native context link list, the
+-- offline event spool, and the consent-receipt outbox.
 -- This is the only SDK module allowed to call Defold sys persistence. Every
 -- call is pcall-guarded so plain Lua hosts without the Defold `sys` API
 -- degrade gracefully to in-memory state for the process lifetime.
@@ -694,6 +694,43 @@ function M.save_crash_settings(scope, record)
 		return false
 	end
 	crash_settings_memory[ns] = clone(record)
+	return true
+end
+
+-- ── native context links ─────────────────────────────────────────────────────
+--
+-- The link tokens of granted native crash context snapshots, newest last. Kept
+-- apart from the settings record, which save_crash_settings replaces whole.
+-- Same shadow rules: a failed durable read falls back to the in-process
+-- shadow, and a failed durable save never seeds it.
+
+local native_links_memory = {}
+
+local function native_links_path(scope)
+	local ns = namespace(scope) .. ".native-links"
+	return ns, save_path(ns, "native-links")
+end
+
+-- Load the token list, or nil when it is absent or unreadable.
+-- strict: only a successful durable read answers, never the in-process shadow.
+function M.load_native_links(scope, strict)
+	local ns, path = native_links_path(scope)
+	if path then
+		local ok, record = pcall(sys.load, path)
+		if ok and type(record) == "table" then return record end
+	end
+	if strict then return nil end
+	return clone(native_links_memory[ns])
+end
+
+-- Replace the token list. Returns true only when it was stored.
+function M.save_native_links(scope, tokens)
+	local ns, path = native_links_path(scope)
+	if path then
+		local ok, saved = pcall(sys.save, path, tokens)
+		if not (ok and saved == true) then return false end
+	end
+	native_links_memory[ns] = clone(tokens)
 	return true
 end
 
@@ -2384,6 +2421,7 @@ function M.reset()
 	consent_denial_memory = {}
 	pending_memory = {}
 	crash_settings_memory = {}
+	native_links_memory = {}
 	spool_memory = {}
 	consent_outbox_memory = {}
 	outbox_resolution = {}

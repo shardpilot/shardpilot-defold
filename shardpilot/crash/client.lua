@@ -932,7 +932,7 @@ function Client:capture_previous(crash_module)
 	if not self.enabled then
 		return false, "crash_disabled"
 	end
-	local event, captured = dump.load_previous_event(crash_module, self.config)
+	local event, captured = dump.load_previous_event(crash_module, self.config, self:pending_scope())
 	if not event then
 		-- No new dump: just resend whatever a previous launch left pending.
 		self:resend_pending()

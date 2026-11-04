@@ -3,6 +3,7 @@
 - Native context stays default-off; preserve byte-exact native payload controls.
   Read snapshots from the captured dump, bind scope/app, clear before lifecycle
   transitions and never borrow the restarting client's identity or build.
+  Record a granted link before writing IDs; unlink before every clear; attach only listed links.
 
 - Keep SDK code compatible with Lua 5.1 and LuaJIT.
 - Keep all checked release pins aligned; release notes must state the server enablement prerequisite for non-objection recording.
