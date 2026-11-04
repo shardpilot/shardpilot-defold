@@ -6451,25 +6451,35 @@ end)()
 		assert_equal(report.session_id, granted.session_id, "S5 the crashed launch's session attaches")
 		assert_true(relaunched:shutdown())
 	end)
-	scene("S6 unreadable link list withholds identifiers", function()
-		local module = engine()
-		local client = launch()
-		assert_true(client:set_native_context(granted))
-		module.write_dump()
-		native_context.release(client)
-		reset()
-		local relaunched = launch()
-		assert_true(relaunched:set_native_context({ consent = "granted", anonymous_id = "next-actor", session_id = "next-session" }))
-		local load = sys.load
-		sys.load = function(path)
-			if tostring(path):find("native%-links") then error("synthetic read failure") end
-			return load(path)
-		end
-		assert_true(relaunched:capture_previous(module))
-		sys.load = load
-		unlinked(json.decode(requests[1].body), "S6")
-		assert_true(relaunched:shutdown())
-	end)
+	-- S6 runs once per way the durable list can be unreadable: { sys function, its result }.
+	for _, mode in ipairs({ { "load", "throw" }, { "load", "corrupt" },
+		{ "get_save_file", "throw" }, { "get_save_file", 42 }, { "get_save_file", "" } }) do
+		local name = mode[1] .. " " .. tostring(mode[2])
+		scene("S6 unreadable link list withholds identifiers (" .. name .. ")", function()
+			local module = engine()
+			local client = launch()
+			assert_true(client:set_native_context(granted))
+			module.write_dump()
+			native_context.release(client)
+			reset()
+			local relaunched = launch()
+			assert_true(relaunched:set_native_context({ consent = "granted", anonymous_id = "next-actor", session_id = "next-session" }))
+			local original = sys[mode[1]]
+			sys[mode[1]] = function(...)
+				for _, arg in ipairs({ ... }) do
+					if tostring(arg):find("native%-links") then
+						if mode[2] == "throw" then error("synthetic read failure") end
+						return mode[2]
+					end
+				end
+				return original(...)
+			end
+			assert_true(relaunched:capture_previous(module))
+			sys[mode[1]] = original
+			unlinked(json.decode(requests[1].body), "S6 " .. name)
+			assert_true(relaunched:shutdown())
+		end)
+	end
 	print("native revocation total: " .. passed .. " pass, " .. failed .. " fail")
 	assert_equal(failed, 0, "native revocation scenes")
 end)()
