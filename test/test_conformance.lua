@@ -85,6 +85,7 @@ local function read(path)
 	return data
 end
 local manifest, roster = decode(read("manifest.json")), decode(read("roster.json"))
+assert(manifest.schema_version == 1 and manifest.byte_exact == true, "unknown corpus schema")
 -- Every request but the remote config GET has a JSON body encoded by the
 -- engine's json.encode, so none of them can be compared byte for byte here.
 local UNSUPPORTED = {
@@ -187,16 +188,30 @@ function drive.ingestCrash(case, request)
 	end)
 	return outcome
 end
--- The remote config GET is built from the case's own inputs: path, identity header and cached ETag.
+-- The credential kinds this SDK sends per operation (crash: its crash:write API key).
+local CREDENTIALS = {
+	batchIngestEvents = { publishable_key = true, client_jwt = true }, recordConsent = { publishable_key = true, client_jwt = true },
+	resolveConsentPolicy = { none = true }, fetchRemoteConfigSDKConfigByKeys = { publishable_key = true }, ingestCrash = { api_key = true },
+}
+-- Byte-exact needs every part: request line, approved headers, credential kind and body. The
+-- remote config GET is built from the case's own inputs: path, identity header and cached ETag.
 local function compare_request(case)
-	local q = case.request
-	if case.id == "batch-malformed-json" then return false, "the captured body is not JSON, which this SDK never emits" end
-	if case.operation ~= "fetchRemoteConfigSDKConfigByKeys" then return false, UNSUPPORTED[case.operation] end
-	assert(sent.method == q.method and sent.url == BASE .. q.path, "request line " .. sent.method .. " " .. sent.url)
+	local q, reasons = case.request, {}
 	for _, name in ipairs(roster.approved_headers) do
 		assert(sent.headers[name] == q.headers[name], "header " .. name .. " sent " .. tostring(sent.headers[name]))
 	end
-	return true
+	if case.byte_exact ~= true then reasons[#reasons + 1] = "the corpus does not mark this case byte-exact" end
+	if CREDENTIALS[case.operation][q.credential] then
+		local auth = sent.headers.Authorization
+		assert(q.credential == "none" and auth == nil or q.credential ~= "none" and tostring(auth):match("^Bearer %S+$"),
+			"credential " .. q.credential .. " not sent as declared: " .. tostring(auth))
+	else
+		reasons[#reasons + 1] = "credential " .. q.credential .. " is not how this SDK sends this request"
+	end
+	if case.id == "batch-malformed-json" then reasons[#reasons + 1] = "the captured body is not JSON, which this SDK never emits"
+	elseif q.file then reasons[#reasons + 1] = UNSUPPORTED[case.operation]
+	else assert(q.bytes == 0 and (sent.body == nil or sent.body == ""), "a body was sent where the case has none") end
+	return #reasons == 0, table.concat(reasons, "; ")
 end
 local failures, counts = 0, { PASS = 0, UNSUPPORTED = 0 }
 for _, case in ipairs(manifest.cases) do
@@ -221,5 +236,7 @@ for _, case in ipairs(manifest.cases) do
 		print(string.format("FAIL %s %s", case.id, tostring(err)))
 	end
 end
+-- Reviewed: the 11 remote config GETs sent with a publishable key are the byte-exact requests.
+if counts.PASS ~= 11 then failures = failures + 1; print("FAIL expected 11 byte-exact requests, got " .. counts.PASS) end
 print(string.format("%d cases: %d request PASS, %d request UNSUPPORTED, %d FAIL", #manifest.cases, counts.PASS, counts.UNSUPPORTED, failures))
 if failures > 0 or #manifest.cases == 0 then os.exit(1) end

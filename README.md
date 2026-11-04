@@ -2200,10 +2200,11 @@ under `test/golden/` and assert its wire validation profile and decoded goldens.
 `test/test_conformance.lua` feeds every case of the public wire-conformance corpus,
 vendored whole under `test/conformance/v1/`, to this SDK's own response handlers
 and asserts each outcome class. It compares a request byte for byte only where the
-SDK builds it from the case's own inputs (the remote config GET); every other case
-prints `UNSUPPORTED` with its reason. `scripts/check_conformance_pack.py` verifies
-the copy against `corpus_sha256` and `test/conformance/source.json`, which names the
-documentation commit it was copied from.
+SDK builds it from the case's own inputs with the declared credential (the remote
+config GET with a publishable key); every other case prints `UNSUPPORTED` with its
+reasons. `scripts/check_conformance_pack.py` verifies the bodies against
+`corpus_sha256`, and `manifest.json`, `roster.json` and `.gitattributes` against the
+digests `test/conformance/source.json` records from the documentation commit it names.
 `shardpilot.non_objection` captures closed host attestations and acknowledgement
 shapes separately from consent. Its locale check is the structural BCP 47 subset;
 the server decides registry membership. A captured attestation supplies no policy

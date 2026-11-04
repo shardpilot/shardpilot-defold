@@ -22,6 +22,12 @@ for name, value in (("manifest", manifest["corpus_sha256"]), ("source record", s
         failures.append(f"corpus_sha256 {digest} does not match the {name} ({value})")
 if source.get("carrier") != "shardpilot/developers" or len(source.get("commit", "")) != 40:
     failures.append("source.json must name the carrier repository and a full documentation commit")
+# corpus_sha256 covers bodies/* only: the metadata files are bound to the documentation commit by their own digests.
+for name in ("manifest.json", "roster.json", ".gitattributes"):
+    recorded = source.get("files_sha256", {}).get(name)
+    actual = hashlib.sha256((corpus / name).read_bytes()).hexdigest()
+    if recorded != actual:
+        failures.append(f"{name} sha256 {actual} does not match the source record ({recorded})")
 
 listed = set()
 for case in manifest["cases"]:
