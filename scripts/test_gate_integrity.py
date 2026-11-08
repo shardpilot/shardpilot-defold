@@ -23,8 +23,10 @@ class Fixture:
         self.root = pathlib.Path(self.temp.name)
         self.repo = self.root / 'repo'
         self.repo.mkdir()
+        config = self.root / 'gitconfig'
+        config.touch(exist_ok=False)
         self.env = dict(os.environ, GIT_CONFIG_NOSYSTEM='1',
-                        GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0')
+                        GIT_CONFIG_GLOBAL=str(config), GIT_TERMINAL_PROMPT='0')
         self.git('init', '-q')
         self.git('symbolic-ref', 'HEAD', 'refs/heads/main')
         self.write('scripts/check_public_surface.sh', '#!/bin/sh\ntrue\n')
@@ -133,6 +135,9 @@ def scenario(fixture, name, program=SUBJECT):
 
 
 class GateIntegrityTests(unittest.TestCase):
+    def test_git_config_paths(self):
+        subprocess.run(['bash', 'test/check_git_config_isolation.sh'], cwd=ROOT, check=True)
+
     def test_existing_workflow_control(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         self.assertIn('  static:\n', workflow)
