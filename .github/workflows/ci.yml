@@ -393,6 +393,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Check dependency server isolation
+        run: python3 -B scripts/test_bob_dependency.py
+
       # Defold 1.12.0 and newer require OpenJDK 25 (docs/release.md).
       - name: Set up Java
         uses: actions/setup-java@v5
