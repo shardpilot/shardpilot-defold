@@ -25,8 +25,8 @@ IDs attach only while their durable link is recorded; revocation removes it firs
   a local stack you run yourself. Which endpoints are available today is stated
   under Configuration below and in [`docs/configuration.md`](docs/configuration.md);
   read that before configuring a hosted deployment.
-- **Version `0.18.1`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.18.1`; the `v0.18.1` tag
+- **Version `0.18.2`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.18.2`; the `v0.18.2` tag
   is created by the owner after the version-bump merge (pending until then).
 
 ## What it does
@@ -142,11 +142,11 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — after owner tagging, the latest tag is `v0.18.1`:
+published tag's source archive — after owner tagging, the latest tag is `v0.18.2`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.18.1.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.18.2.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
