@@ -7,8 +7,8 @@ set -euo pipefail
 #
 #   1. scripts/package_release.sh packages the working tree into the exact
 #      ZIP layout a tagged release ships.
-#   2. A localhost HTTP server serves that ZIP at the dependency URL that
-#      test/bob-harness/game.project declares.
+#   2. A loopback server serves that ZIP. Its bound address supplies the
+#      dependency URL in a private copy of the harness project.
 #   3. Defold's command-line builder (bob.jar — pinned and sha256-verified)
 #      runs `resolve build` on the harness, so bob fetches the library ZIP
 #      like any consumer project would and compiles the shardpilot.* modules
@@ -30,8 +30,6 @@ DEFOLD_SHA1="f735c12192bf95684e6ae1ae27c400b8170fc6d8"
 BOB_URL="https://d.defold.com/archive/${DEFOLD_SHA1}/bob/bob.jar"
 BOB_SHA256="22e651025834603794ba6873b09924f11412dff66eee0e38aaef8955eb534655"
 
-# Must match dependencies#0 in test/bob-harness/game.project.
-HARNESS_PORT=8910
 ZIP_NAME="shardpilot-defold-workingtree.zip"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,13 +44,14 @@ done
 
 # --- bob.jar: cached, always sha256-verified before use --------------------
 bob_cache_dir="${BOB_CACHE_DIR:-$repo_root/.ci-cache/bob}"
+mkdir -p "$bob_cache_dir"
+bob_cache_dir="$(cd "$bob_cache_dir" && pwd -P)"
 bob_jar="$bob_cache_dir/bob-${DEFOLD_VERSION}-${DEFOLD_SHA1}.jar"
 
 verify_bob() {
   echo "${BOB_SHA256}  ${bob_jar}" | sha256sum -c - >/dev/null
 }
 
-mkdir -p "$bob_cache_dir"
 if [[ -f "$bob_jar" ]] && verify_bob; then
   echo "bob.jar ${DEFOLD_VERSION}: cache hit (sha256 verified)"
 else
@@ -86,50 +85,7 @@ for entry in game.project shardpilot/sdk.lua shardpilot/crash.lua; do
   }
 done
 
-# --- serve the ZIP where the harness dependency URL expects it -------------
-python3 -m http.server "$HARNESS_PORT" --bind 127.0.0.1 --directory dist &
-server_pid=$!
-trap 'kill "$server_pid" 2>/dev/null || true' EXIT
-
-dep_url="http://127.0.0.1:${HARNESS_PORT}/${ZIP_NAME}"
-curl -fsS --retry 20 --retry-delay 1 --retry-connrefused -o /dev/null "$dep_url" || {
-  echo "local dependency server never became ready at ${dep_url}" >&2
-  exit 1
-}
-grep -qx "dependencies#0 = ${dep_url}" test/bob-harness/game.project || {
-  echo "test/bob-harness/game.project dependencies#0 does not match ${dep_url}" >&2
-  exit 1
-}
-
-# --- resolve + build the harness against the working tree ------------------
-rm -rf test/bob-harness/.internal test/bob-harness/build
-(
-  cd test/bob-harness
+python3 scripts/bob_dependency.py "$zip_path" \
   java -Xmx2g -jar "$bob_jar" --platform=x86_64-linux --variant=release --archive resolve build
-)
-
-# Resolution proof: bob stored the fetched library ZIP under .internal/lib.
-resolved_zip="$(find test/bob-harness/.internal/lib -type f -name '*.zip' -print -quit 2>/dev/null || true)"
-[[ -n "$resolved_zip" ]] || {
-  echo "bob resolve did not fetch the library ZIP into .internal/lib" >&2
-  exit 1
-}
-
-# Compilation proof: the harness bootstrap chain and the required
-# shardpilot.* modules were compiled into the build output.
-for built in \
-  build/default/main/harness.collectionc \
-  build/default/main/harness.scriptc \
-  build/default/shardpilot/sdk.luac \
-  build/default/shardpilot/crash.luac \
-  build/default/shardpilot/remote_config.luac \
-  build/default/game.arcd; do
-  test -f "test/bob-harness/${built}" || {
-    echo "expected build output missing: test/bob-harness/${built}" >&2
-    echo "build tree contents:" >&2
-    find test/bob-harness/build -type f >&2 || true
-    exit 1
-  }
-done
 
 echo "bob-build gate passed: working tree resolved and compiled as a Defold library dependency (Defold ${DEFOLD_VERSION}; build-time proof only, no engine runtime)"

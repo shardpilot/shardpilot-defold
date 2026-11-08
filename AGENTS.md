@@ -9,6 +9,7 @@
   Record a granted link before writing IDs; unlink before every clear; attach only listed links.
 
 - Keep SDK code compatible with Lua 5.1 and LuaJIT.
+- Build Bob's fixture in a private directory and derive its dependency URL from the job's bound loopback socket.
 - Keep all checked release pins aligned; release notes must state the server enablement prerequisite for non-objection recording.
 - Keep non-objection snapshots separate from consent and policy authority. Assert the vendored contract profile and decoded goldens; local locale validation is structural, with registry membership decided by the server.
 - Consent advisory references are detached host data, never SDK authority or cache. Preserve validation and every strict fallback field.

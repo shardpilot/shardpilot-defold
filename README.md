@@ -2133,6 +2133,8 @@ CI jobs on `main` use the organization's restricted `public-sdks` self-hosted Li
 
 Changes to CI or validation scripts intentionally fail `gate-integrity` and require explicit maintainer review under the gate-change procedure. Every other CI check must pass. After a reviewed workflow change lands, verify the complete CI run on `main`, including the Lua matrix and Bob build.
 
+The Bob build uses a private fixture project and a dependency server on a kernel-assigned loopback port.
+
 Git fixtures use private temporary configuration files. Run
 `bash test/check_git_config_isolation.sh` to check for direct assignments to the null device, including wrapped and commented assignments.
 

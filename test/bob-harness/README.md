@@ -1,13 +1,9 @@
 # bob-build harness
 
-Minimal Defold consumer project for the CI `bob-build` job. Its
-`game.project` declares the ShardPilot library as a normal Defold
-dependency, but the dependency URL points at `127.0.0.1:8910`: the lane
-driver (`scripts/ci_bob_build.sh`) packages the WORKING TREE with
-`scripts/package_release.sh` and serves that ZIP locally, so
-`java -jar bob.jar resolve build` proves the current tree — not a
-published tag — still resolves and compiles as a real library dependency
-(`main/harness.script` requires the `shardpilot.*` modules).
+The CI `bob-build` job packages the working tree, serves its ZIP on a
+kernel-assigned loopback port, and writes the bound URL into a private copy
+of this consumer project. Bob resolves the dependency and compiles the
+`shardpilot.*` modules required by `main/harness.script`.
 
 Run it locally from the repository root (needs OpenJDK 25, `python3`,
 `curl`, `zip`, `unzip`):
