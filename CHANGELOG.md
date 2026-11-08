@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.18.2 — 2026-11-08
+
+### Tests
+
+- Replay the public wire-conformance corpus through the SDK response handlers.
+  Verify the pinned fixture bytes and report request coverage for every case.
+- Align consent-policy fixture notices with the published text after removal of
+  the legacy prefix.
+- Use private temporary Git configuration files with scoped cleanup in test
+  fixtures.
+
+### CI
+
+- Give each Bob dependency build its own temporary server and bound loopback port.
+
+### Server requirements
+
+- Device non-objection recording requires server enablement, a server-resolved
+  `SOFT_OPT_OUT` country, and the workspace owner's active acceptance. Consent
+  stays unknown after recording.
+
 ## v0.18.1 — 2026-11-04
 
 - Native crash context revocation fails closed: a granted snapshot carries a link
