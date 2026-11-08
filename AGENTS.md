@@ -1,5 +1,8 @@
 # Contributor instructions
 
+- Keep Git fixture configuration in private temporary files with scoped cleanup.
+  Preserve `GIT_CONFIG_NOSYSTEM=1` where it is set.
+
 - Native context stays default-off; preserve byte-exact native payload controls.
   Read snapshots from the captured dump, bind scope/app, clear before lifecycle
   transitions and never borrow the restarting client's identity or build.
