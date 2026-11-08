@@ -136,7 +136,7 @@ def scenario(fixture, name, program=SUBJECT):
 
 class GateIntegrityTests(unittest.TestCase):
     def test_git_config_paths(self):
-        subprocess.run(['sh', 'test/check_git_config_isolation.sh'], cwd=ROOT, check=True)
+        subprocess.run(['bash', 'test/check_git_config_isolation.sh'], cwd=ROOT, check=True)
 
     def test_existing_workflow_control(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
