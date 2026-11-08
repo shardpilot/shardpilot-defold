@@ -273,8 +273,7 @@ end
 --
 -- `flags` MERGES rather than replaces, so a scene can change one restriction
 -- without restating the other three.
-local NOTICE = "AI draft — owner-confirmed; counsel confirmation pending (Stage B): " ..
-	"The consent-policy resolver provides informational reference output based on " ..
+local NOTICE = "The consent-policy resolver provides informational reference output based on " ..
 	"AI-collected jurisdiction data, not legal advice."
 
 local function plan(overrides)

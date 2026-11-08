@@ -12,6 +12,8 @@ not the platform boundary.
 
 ## Status
 
+Consent-policy fixtures preserve the informational disclaimer from the resolver response.
+
 Native crash context is [opt-in](docs/crash.md#optional-capture-time-context): hosts
 can preserve the crashed build and explicitly granted pseudonymous IDs in the engine
 dump. The default native payload is unchanged; lifecycle updates belong to the host.

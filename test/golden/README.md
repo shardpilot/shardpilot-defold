@@ -1,7 +1,7 @@
 # Golden bodies — the resolver's actual bytes
 
-These are not hand-written fixtures. They are the **exact JSON the consent
-policy handler emits**, recorded by the resolver's own golden test.
+These fixtures start from recorded resolver responses. The `basis.notice`
+value follows the published disclaimer and the remaining capture bytes are retained.
 
 | file | what it is |
 |---|---|
@@ -33,7 +33,7 @@ Recorded from the resolver service's own test at commit `d26a56f5284bf233cc0f8ca
 `internal/httpserver/testdata/consent_policy_resolved_strict.json` (blob
 `ba2795a09d6a591e2904b4d23f9aa81bef5b8ce3`) and `consent_policy_refusal_invalid_scope.json` (blob
 `ec6eb6c293b1d28f1b250c4a23058570755d04a6`); those are the stored review forms, and the `.indented.json` files
-here are copies of them. The resolved body answers the
+here derive from them. The resolved body answers the
 request `{workspace_key: ws_1, app_key: app_1, environment_key: env_1,
 app_version: 1.2.3, store: steam, store_region: null, locale: en-GB,
 platform: windows}`; the refusal is the same request with an invalid
@@ -45,7 +45,7 @@ through a renamed tag, a re-nesting, or a `null` where an empty array was.
 
 The advisory pair was recorded the same way, from
 `internal/httpserver/testdata/consent_policy_resolved_strict_with_advisory.json`
-(blob `915ea00fc4cb461f0e9b96299a3e6a91c0167c51`), which the `.indented.json` here copies byte for byte. It
+(blob `915ea00fc4cb461f0e9b96299a3e6a91c0167c51`). It
 answers the same request with `advisory: true` added, for a workspace admitted
 to the advisory, from a connection the resolver located in GB. Its plan is the
 resolved plan above, unchanged; the advisory sits beside it and does not alter
