@@ -51,3 +51,6 @@
 - Preserve Android record-kind, scope separation, relaunch and bounded-filename scenes.
 - Never edit `test/conformance/v1/`: re-vendor the whole directory, update `source.json`, and run `scripts/check_conformance_pack.py` and `test/test_conformance.lua`. Review every new `UNSUPPORTED` reason or expected-class exception.
 - Keep consent-policy fixture notices aligned with the published disclaimer.
+- Keep activity clocks separate from event stamps. Passive telemetry and window
+  signals cannot renew or open a session. An owed start and its triggering
+  track need room for both events.

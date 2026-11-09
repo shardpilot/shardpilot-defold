@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.19.0 — 2026-11-09
+
+- Foreground sessions end after 1800 seconds of inactivity by default. Set
+  `foreground_idle_timeout_seconds` to change the deadline.
+- Resuming after an idle boundary defers the next start until a meaningful
+  event. Runtime summaries, sampling and retries never renew or reopen it.
+- Call `mark_activity()` for input without an event. Pass
+  `{ session_activity = false }` to `track()` for passive telemetry.
+- Device non-objection recording requires server-side enablement.
+
 ## v0.18.2 — 2026-11-08
 
 ### Tests

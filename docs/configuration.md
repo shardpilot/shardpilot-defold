@@ -60,6 +60,9 @@ not select the SDK's HTTP transport. A non-string value returns
   -- waits before publishing, not a heartbeat: update(dt) publishes nothing
   -- when the queue is empty. Set it explicitly only if you want a different
   -- cadence -- pinning it to 1 here is what stopped batching from happening.
+  -- Session idle defaults. Both values are positive, finite seconds.
+  foreground_idle_timeout_seconds = 1800,
+  session_timeout_seconds = 30, -- when the host forwards window events
   http_timeout_seconds = 2,
   -- Offline event spool (durable, per app). See "Offline event spool" below.
   spool_enabled = true,
@@ -74,6 +77,15 @@ not select the SDK's HTTP transport. A non-string value returns
 `ingest.shardpilot.com` is a planned public ingest domain and is not provisioned
 in this release. Use non-production endpoints for source evaluation until a later
 release explicitly publishes production infrastructure.
+
+### Session activity
+
+Call `update(dt)` each frame and forward window events through `on_window_event`.
+After an idle boundary, the next meaningful event starts a new session.
+Use `mark_activity()` for player input without an event. It refreshes an active
+session only. For periodic host telemetry, use the fourth argument of `track()`
+with `session_activity = false`. You can include `schema_version` in that same
+table. SDK sampling, summaries and delivery retries do not count as activity.
 
 Canonical analytics scope configuration was introduced in `v0.13.0` and requires an
 ingest consumer that accepts it. Source releases are published after owner tagging. Its values

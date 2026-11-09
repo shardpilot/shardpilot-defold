@@ -464,6 +464,9 @@ local function test_config_validation()
 		{ { session_timeout_seconds = 0 }, "invalid_session_timeout_seconds" },
 		{ { session_timeout_seconds = 0 / 0 }, "invalid_session_timeout_seconds" },
 		{ { session_timeout_seconds = math.huge }, "invalid_session_timeout_seconds" },
+		{ { foreground_idle_timeout_seconds = 0 }, "invalid_foreground_idle_timeout_seconds" },
+		{ { foreground_idle_timeout_seconds = 0 / 0 }, "invalid_foreground_idle_timeout_seconds" },
+		{ { foreground_idle_timeout_seconds = math.huge }, "invalid_foreground_idle_timeout_seconds" },
 		{ { http_timeout_seconds = -1 }, "invalid_http_timeout_seconds" },
 		{ { token_refresh_lead_seconds = -1 }, "invalid_token_refresh_lead_seconds" },
 		{ { spool_enabled = "yes" }, "invalid_spool_enabled" },
@@ -3715,7 +3718,8 @@ local function test_blocked_period_samples_never_summarized()
 		assert_not_contains(request.body, '"event_name":"network_summary"')
 	end
 
-	-- observed under the grant: summarized normally
+	-- observed in a session under the grant: summarized normally
+	assert_true(client:session_start())
 	client:observe_ping_ms(60)
 	assert_true(client:flush())
 	local summarized = false
@@ -9023,53 +9027,117 @@ local tests = {
 	assert_equal(client.session_sequence, 3, "and the new session's counter did not move")
 	end,
 	function()
-	-- BOUNDARY: FOREGROUND SILENCE DOES NOT END A SESSION. Both clocks pass the
-	-- timeout while frames run, without activity or a background notification.
-	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2 }
-	window = W
+	-- Passive telemetry does not renew the foreground deadline or reopen it.
 	reset()
 	seed_granted_consent()
-	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999,
-		spool_enabled = false })))
+	local client = assert(sdk.new(config({ platform = "linux", flush_interval_seconds = 9999 })))
+	local ticking, started = socket.gettime, socket.now
+	socket.gettime = function() return socket.now end
 	assert_true(client:session_start())
 	local original = client:get_session_id()
-	local seconds = client.config.session_timeout_seconds + 10
-	socket.now = socket.now + seconds
-	client:update(seconds)
-	assert_equal(client:get_session_id(), original, "foreground silence keeps the open session")
-	assert_equal(client.paused, nil, "foreground frames do not invent a pause")
-	assert_equal(#client.queue.items, 1, "foreground silence emits no end or replacement start")
-	assert_equal(client.queue.items[1].event_name, "app.session_started")
-	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
-	assert_true(client:track("after_foreground_silence"))
-	assert_equal(#client.queue.items, 2, "the next activity emits no lifecycle boundary")
-	assert_equal(client.queue.items[2].session_id, original)
-	assert_equal(client.queue.items[2].session_sequence, 2, "the original sequence continues")
-
-	-- Positive control: the same timeout after a real pause does end it.
-	local ok, err = client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
-	assert_equal(ok, false)
-	assert_equal(err, "spool_disabled", "the fixture uses only the memory queue")
-	assert_true(client.paused ~= nil, "the host notification recorded a real pause")
-	socket.now = socket.now + seconds
-	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
-	local replacement = client:get_session_id()
-	assert_true(type(replacement) == "string" and replacement ~= "", "the background control opens a replacement")
-	assert_true(replacement ~= original, "the background control starts a distinct session")
-	local ends, starts = 0, 0
+	socket.now = socket.now + 900
+	client:update(0.016)
+	client:observe_ping_ms(32)
+	client:enqueue_summaries()
+	assert_true(client:track("heartbeat", {}, nil, { session_activity = false, schema_version = 2 }))
+	assert_equal(client:get_session_id(), original, "open before the foreground deadline")
+	socket.now = started + 1799
+	client:update(0.016)
+	assert_equal(client:get_session_id(), original, "open one second before expiry")
+	socket.now = started + 1800
+	client:update(0.016)
+	assert_equal(client:get_session_id(), nil, "passive events cannot defer foreground expiry")
+	client:update(0.016)
+	client:observe_ping_ms(33)
+	client:enqueue_summaries()
+	local accepted, err = client:track("heartbeat", {}, nil, { session_activity = false })
+	assert_equal(accepted, false)
+	assert_equal(err, "session_inactive")
+	assert_equal(client:get_session_id(), nil, "passive events cannot reopen an idle session")
+	local ends = 0
 	for _, event in ipairs(client.queue.items) do
 		if event.event_name == "app.session_ended" then
 			ends = ends + 1
 			assert_equal(event.session_id, original)
 			assert_equal(event.props.reason, "idle_timeout")
-		elseif event.event_name == "app.session_started" and event.session_id == replacement then
-			starts = starts + 1
-			assert_equal(event.session_sequence, 1)
+			assert_equal(event.event_ts, os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor(started + 1800)))
 		end
 	end
-	assert_equal(ends, 1, "the background control emits exactly one end")
-	assert_equal(starts, 1, "the background control announces exactly one replacement")
-	window = nil
+	assert_equal(ends, 1)
+	assert_true(client:track("player_action"))
+	local start, action = client.queue.items[#client.queue.items - 1], client.queue.items[#client.queue.items]
+	assert_equal(start.event_name, "app.session_started")
+	assert_equal(start.session_id, action.session_id)
+	assert_equal(action.session_sequence, 2)
+	assert_true(action.session_id ~= original)
+	socket.gettime = ticking
+	end,
+	function()
+	-- Activity during a wall-clock rollback survives the correction, and
+	-- still expires on frame time if the wall clock moves backward again.
+	local inspect = require "test.inspect_client"
+	local public = inspect.wrap(require "shardpilot.sdk", true)
+	local ticking = socket.gettime
+	socket.gettime = function() return socket.now end
+	for _, action in ipairs({ "track", "mark_activity" }) do
+		reset()
+		seed_granted_consent()
+		local client = assert(public.new(config({ foreground_idle_timeout_seconds = 10, flush_interval_seconds = 9999 })))
+		assert_true(client:session_start())
+		local original = client:get_session_id()
+		socket.now = socket.now + 6
+		client:update(6)
+		local recovery = socket.now
+		socket.now = recovery - 60
+		if action == "track" then
+			assert_true(client:track("player_action"))
+		else
+			assert_true(client:mark_activity())
+			assert_equal(#inspect.state(client).queue.items, 1, "an activity marker emits nothing")
+		end
+		socket.now = recovery
+		client:update(0)
+		assert_equal(client:get_session_id(), original, action .. " survives wall-clock recovery")
+		socket.now = recovery - 60
+		client:update(9)
+		assert_equal(client:get_session_id(), original, "host input moved the frame deadline")
+		client:update(1)
+		assert_equal(client:get_session_id(), nil, "frame time reached the configured deadline")
+		assert_equal(client:mark_activity(), false, "a marker cannot reopen an ended session")
+		inspect.state(client):finish_teardown()
+	end
+	socket.gettime = ticking
+	end,
+	function()
+	-- A refused end stays owed. Neither input markers nor passive tracks can
+	-- refresh it while the queue is full.
+	reset()
+	seed_granted_consent()
+	local client = assert(sdk.new(config({ foreground_idle_timeout_seconds = 10, buffer_size = 1,
+		batch_size = 100, flush_interval_seconds = 9999 })))
+	assert_true(client:session_start())
+	local original = client:get_session_id()
+	client:update(10)
+	assert_equal(#client.queue.items, 1)
+	assert_equal(client:mark_activity(), false)
+	local ok, err = client:track("network_summary", {}, nil)
+	assert_equal(ok, false)
+	assert_equal(err, "session_inactive")
+	assert_true(client:flush({ include_summaries = false }))
+	client:update(0)
+	client:update(0)
+	assert_equal(client:get_session_id(), nil)
+	assert_true(client:flush({ include_summaries = false }))
+	local ends = 0
+	for _, request in ipairs(requests) do
+		for _, event in ipairs(json_decode(request.body).events or {}) do
+			if event.event_name == "app.session_ended" then
+				ends = ends + 1
+				assert_equal(event.session_id, original)
+			end
+		end
+	end
+	assert_equal(ends, 1, "exactly one end reached the wire after retry")
 	end,
 	function()
 	-- BOUNDARY: A RESUME BELOW THE TIMEOUT CHANGES NOTHING. The session paused
@@ -9100,8 +9168,8 @@ local tests = {
 	end,
 	function()
 	-- BOUNDARY: A RESUME AT OR PAST THE TIMEOUT ENDS THE PAUSED SESSION AT THE
-	-- LOGICAL BOUNDARY (pause + 30 s, reason idle_timeout) AND STARTS THE NEXT ONE
-	-- AT ONCE, before anything the host does after the resume.
+	-- LOGICAL BOUNDARY (pause + 30 s, reason idle_timeout). Activity opens the
+	-- replacement. Repeated desktop deiconify signals cannot discharge it.
 	local W = { WINDOW_EVENT_FOCUS_LOST = 1, WINDOW_EVENT_FOCUS_GAINED = 2,
 		WINDOW_EVENT_ICONFIED = 3, WINDOW_EVENT_DEICONIFIED = 4 }
 	local function named(client, name)
@@ -9114,16 +9182,17 @@ local tests = {
 	window = W
 	reset()
 	seed_granted_consent()
-	local client = assert(sdk.new(config({ platform = "android", flush_interval_seconds = 9999 })))
+	local client = assert(sdk.new(config({ platform = "linux", flush_interval_seconds = 9999 })))
 	assert_true(client:session_start())
 	local a = client.session_id
 	assert_true(client:track("before"))
-	client:on_window_event(W.WINDOW_EVENT_FOCUS_LOST)
+	client:on_window_event(W.WINDOW_EVENT_ICONFIED)
 	local paused_ms = client.paused.wall_ms
 	socket.now = socket.now + 40
-	assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
-	assert_equal(#named(client, "app.session_started"), 2,
-		"the next session starts at the resume, not at the next event")
+	assert_true(client:on_window_event(W.WINDOW_EVENT_DEICONIFIED))
+	assert_true(client:on_window_event(W.WINDOW_EVENT_DEICONIFIED))
+	assert_equal(#named(client, "app.session_started"), 1, "deiconify owes a start until activity")
+	assert_equal(client:get_session_id(), nil)
 	assert_true(client:track("after"))
 	local ends = named(client, "app.session_ended")
 	assert_equal(#ends, 1, "one end")
@@ -9439,8 +9508,8 @@ local tests = {
 		assert_equal(last.props.reason, "idle_timeout", path[1])
 		assert_equal(last.event_ts, iso(opened_at + 30),
 			path[1] .. ": at its own boundary, 30 s after it opened")
-		assert_true(client.session_id ~= b, path[1] .. ": and the next one starts at the resume")
-		assert_true(client.paused == nil, path[1] .. ": the session opened in front is not paused")
+		assert_equal(client:get_session_id(), nil, path[1] .. ": the next start is owed")
+		assert_true(client.paused == nil, path[1] .. ": the old pause is cleared")
 	end
 	window = nil
 	end,
@@ -10725,6 +10794,8 @@ end)()
 	assert_true(looping:track("always_401"))
 	assert_equal(looping:flush(), false)
 	local after_flush = #requests
+	local ticking = socket.gettime
+	socket.gettime = function() return socket.now end
 	looping:update(0)
 	local after_nudge = #requests
 	assert_equal(after_nudge, after_flush + 1, "the nudge is worth one attempt")
@@ -10732,6 +10803,7 @@ end)()
 	looping:update(0)
 	looping:update(0)
 	looping:update(0)
+	socket.gettime = ticking
 	assert_equal(#requests, after_nudge, "and only one: the armed window holds the rest")
 
 	-- ...and the same batch under an ASYNCHRONOUS token_provider, which is the
@@ -11214,9 +11286,10 @@ end)()
 	assert_true(hammering:publish_deferred(), "the failed mint armed the queue-only window")
 	assert_true(hammering:has_pending_publish_work(), "and the queue that armed it is still pending")
 
-	hammering:update(0.1)
-	hammering:update(0.1)
-	hammering:update(0.1)
+	local ticking = socket.gettime
+	socket.gettime = function() return socket.now end
+	for _ = 1, 3 do hammering:update(0.1) end
+	socket.gettime = ticking
 	assert_equal(hammer_calls, 1,
 		"the full-queue trigger must respect a queue-only window, or a failing provider is called once per frame")
 	assert_true(hammering.flush_elapsed_seconds > 0.29, "and flush() is not run every frame either")
@@ -12982,13 +13055,13 @@ end)()
 	end
 
 	function cases.automatic_async_publish_retains_before_next_flush()
-		with_scene(nil, function(client, warnings)
+		with_scene({ flush_interval_seconds = 1 }, function(client, warnings)
 			assert_true(client:track("async_rejection"))
 			assert_true(client:track("async_sibling"))
 			assert_true(client:persist())
 			local held, restore_http = hold_http_requests()
 			local ok, failure = pcall(function()
-				client:update(10000)
+				client:update(1)
 				assert_equal(#held, 1, "automatic update dispatched a real request into the held transport")
 				assert_equal(#client:get_rejections(), 0, "there is no verdict before callback")
 				local events = json_decode(requests[#requests].body).events
@@ -13071,14 +13144,14 @@ end)()
 				local regrant = clock.iso_utc()
 				assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
 				assert_equal(#named(client, "app.session_ended"), 0, "no end for the denied interval")
+				assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+				assert_equal(#named(client, "app.session_started"), 0, "resumes alone announce nothing")
+				assert_true(client:track("after_regrant"))
 				local starts = named(client, "app.session_started")
-				assert_equal(#starts, 1, "resume announces exactly one fresh session")
+				assert_equal(#starts, 1, "activity announces exactly one fresh session")
 				assert_true(starts[1].session_id ~= old, "the pre-denial session cannot continue")
 				assert_equal(starts[1].session_sequence, 1)
 				assert_true(starts[1].event_ts >= regrant, "start belongs to the new grant")
-				assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
-				assert_equal(#named(client, "app.session_started"), 1, "duplicate resume is harmless")
-				assert_true(client:track("after_regrant"))
 				assert_equal(named(client, "after_regrant")[1].session_id, starts[1].session_id)
 			end
 		end
@@ -13095,6 +13168,8 @@ end)()
 			assert_equal(#client.queue.items, 0, "denied resume emits nothing")
 			if not regrant(client, deny) then return end
 			assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+			assert_equal(#named(client, "app.session_started"), 0, "resume emits nothing")
+			assert_true(client:track("after_repeated_denial"))
 			assert_equal(#named(client, "app.session_started"), 1, "repeated denial preserves the fresh-start obligation")
 		end
 		cases[tostring(deny) .. " foreground activity"] = function()
@@ -13198,25 +13273,18 @@ end)()
 			pause(client)
 			assert_true(client:set_consent(false))
 			assert_true(client:set_consent(true))
-			client.queue.limit = 0
+			client.queue.limit = 1
 			local dropped = client:snapshot().dropped
-			local ok, err = client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED)
-			assert_equal(ok, false)
-			assert_equal(err, "queue_full")
-			assert_equal(client:get_session_id(), nil, "refused start does not open a session")
-			assert_equal(client:snapshot().dropped, dropped, "an owed resume is not a dropped event")
-			for _ = 1, 3 do
-				ok, err = client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED)
-				assert_equal(ok, false)
-				assert_equal(err, "queue_full")
-			end
+			for _ = 1, 3 do assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED)) end
 			assert_equal(client:snapshot().dropped, dropped, "resume retries do not invent event losses")
-			ok, err = client:track("refused_host_event")
+			local ok, err = client:track("refused_host_event")
 			assert_equal(ok, false)
 			assert_equal(err, "queue_full")
+			assert_equal(client:get_session_id(), nil, "one free slot cannot announce a lone start")
+			assert_equal(#client.queue.items, 0, "both the start and action stay out of the queue")
 			assert_equal(client:snapshot().dropped, dropped + 1, "a refused host event still counts")
-			client.queue.limit = 100
-			assert_true(client:on_window_event(W.WINDOW_EVENT_FOCUS_GAINED))
+			client.queue.limit = 2
+			assert_true(client:track("accepted_host_event"))
 			assert_equal(#named(client, "app.session_started"), 1)
 			assert_equal(#named(client, "app.session_ended"), 0)
 		end
@@ -15688,6 +15756,8 @@ end)()
 		for i, entry in ipairs(names) do
 			scene(api .. " name " .. i, function()
 				fresh(api, function(call)
+					local summary = entry[1] == "perf_summary" or entry[1] == "network_summary"
+					if summary then assert_true(call("session_start")) end
 					local before = call("snapshot")
 					local session = call("get_session_id")
 					local ok, code = call("track", entry[1], { probe = true })
@@ -15708,8 +15778,8 @@ end)()
 						call("flush")
 						assert_equal(#requests, 1, "ordinary event must reach transport")
 						local events = json.decode(requests[1].body).events
-						assert_equal(#events, 1)
-						assert_equal(events[1].event_name, entry[3], "exact normalized wire name")
+						assert_equal(#events, summary and 2 or 1)
+						assert_equal(events[#events].event_name, entry[3], "exact normalized wire name")
 						assert_equal(call("snapshot").dropped, before.dropped)
 					end
 				end)
@@ -16484,13 +16554,12 @@ end)()
    end)
   end
  end
- for _,entry in ipairs({"resume","start","end","consent_resume"})do
+ for _,entry in ipairs({"resume","start","end"})do
   for _,failure in ipairs({"missing","throws","oversize"})do
    scene("retained lifecycle "..entry.." "..failure,function()
     local c=fresh({source="client",platform="android",session_timeout_seconds=10})
     assert_true(c:session_start());local session=c.session
-    if entry=="consent_resume" then assert_true(c:set_consent(false));assert_true(c:set_consent(true))
-    else c.backgrounded=true;c.paused={session=session,wall_ms=clock.unix_ms()-11000,frames=c.frame_seconds}end
+    c.backgrounded=true;c.paused={session=session,wall_ms=clock.unix_ms()-11000,frames=c.frame_seconds}
     local before,dropped,paused=#c.queue.items,c.stats.dropped,c.paused
     local saved_window=window;window={WINDOW_EVENT_FOCUS_GAINED=901,WINDOW_EVENT_FOCUS_LOST=902}
     local function attempt()
@@ -17056,7 +17125,7 @@ end)()
   local bad={
    {schema_version=0},{schema_version=65536},{schema_version=-1},{schema_version=1.5},
    {schema_version="2"},{schema_version=true},{schema_version=0/0},{schema_version=math.huge},
-   {schema_version={}},{schemaVersion=2},{schema_version=2,extra=1},{[1]=2},"options",5,true,
+   {schema_version={}},{schemaVersion=2},{session_activity="false"},{schema_version=2,extra=1},{[1]=2},"options",5,true,
   }
   local dropped=client:snapshot().dropped
   for i,options in ipairs(bad)do

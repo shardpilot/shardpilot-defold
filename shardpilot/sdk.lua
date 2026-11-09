@@ -71,6 +71,7 @@ local instance_methods = {
 	track_outcome = 3,
 	session_start = 1,
 	session_end = 1,
+	mark_activity = 0,
 	screen_view = 2,
 	track = 4,
 	track_level_start = 3,
@@ -325,6 +326,10 @@ function M.session_end(reason)
 	return with_default("session_end", reason)
 end
 
+function M.mark_activity()
+	return with_default("mark_activity")
+end
+
 function M.screen_view(screen_name, props)
 	return with_default("screen_view", screen_name, props)
 end
@@ -410,7 +415,7 @@ end
 -- Forward every window event the host's listener receives (the engine allows
 -- one listener). A background signal snapshots like persist() and records a
 -- pause; a foreground signal ends a session paused for session_timeout_seconds
--- or longer and starts the next one.
+-- or longer. Activity can open the next one.
 function M.on_window_event(event)
 	return with_default("on_window_event", event)
 end
