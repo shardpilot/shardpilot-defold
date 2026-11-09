@@ -3252,8 +3252,13 @@ end
 
 function Client:begin_session_clock(session)
 	local now = clock.unix_ms()
-	session.activity_ms, session.activity_frames = now, self.frame_seconds
+	self:record_activity(now)
 	self.paused = self.backgrounded and { session = session, wall_ms = now, frames = self.frame_seconds } or nil
+end
+
+function Client:record_activity(now)
+	self.wall_high_water_ms = math.max(self.wall_high_water_ms or now, now)
+	self.session.activity_ms, self.session.activity_frames = self.wall_high_water_ms, self.frame_seconds
 end
 
 -- Player input can renew an open session even when there is no event to
@@ -3262,7 +3267,7 @@ function Client:mark_activity()
 	if self.closing or not self.initialized then return false, "shutdown" end
 	local now = clock.unix_ms()
 	if not self.session or self:session_deadline(now) then return false, "session_inactive" end
-	self.session.activity_ms, self.session.activity_frames = now, self.frame_seconds
+	self:record_activity(now)
 	return true
 end
 
@@ -3277,6 +3282,8 @@ function Client:session_deadline(now)
 	local session = self.session
 	if not session then return nil end
 	now = now or clock.unix_ms()
+	-- Remember the wall value without renewing the activity deadline.
+	self.wall_high_water_ms = math.max(self.wall_high_water_ms or now, now)
 	local frames = self.frame_seconds
 	local idle = expired_deadline(now, frames, session.activity_ms, session.activity_frames,
 		self.config.foreground_idle_timeout_seconds)
@@ -3823,7 +3830,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event, opti
 		self:renew_sessionless_samplers()
 	end
 	if active_event and self.session == stream and not (opens_lazy or opens_owed) then
-		stream.activity_ms, stream.activity_frames = now_ms, self.frame_seconds
+		self:record_activity(now_ms)
 	end
 	self:mirror_session()
 	return true

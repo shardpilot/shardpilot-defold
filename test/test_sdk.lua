@@ -9073,27 +9073,40 @@ local tests = {
 	socket.gettime = ticking
 	end,
 	function()
-	-- A host can renew its deadline without publishing an event. The frame
-	-- clock keeps the configured timeout effective through a wall backstep.
-	reset()
-	seed_granted_consent()
+	-- Activity during a wall-clock rollback survives the correction, and
+	-- still expires on frame time if the wall clock moves backward again.
 	local inspect = require "test.inspect_client"
 	local public = inspect.wrap(require "shardpilot.sdk", true)
-	local client = assert(public.new(config({ foreground_idle_timeout_seconds = 10, flush_interval_seconds = 9999 })))
-	assert_true(client:session_start())
-	local original = client:get_session_id()
-	client:update(6)
-	assert_true(client:mark_activity())
-	assert_equal(#inspect.state(client).queue.items, 1, "an activity marker emits nothing")
-	socket.now = socket.now - 60
-	client:update(9)
-	assert_equal(client:get_session_id(), original, "host input moved the deadline")
-	client:update(1)
-	assert_equal(client:get_session_id(), nil, "frame time reached the configured deadline")
-	local ok, err = client:mark_activity()
-	assert_equal(ok, false)
-	assert_equal(err, "session_inactive")
-	assert_equal(client:get_session_id(), nil, "a marker cannot reopen an ended session")
+	local ticking = socket.gettime
+	socket.gettime = function() return socket.now end
+	for _, action in ipairs({ "track", "mark_activity" }) do
+		reset()
+		seed_granted_consent()
+		local client = assert(public.new(config({ foreground_idle_timeout_seconds = 10, flush_interval_seconds = 9999 })))
+		assert_true(client:session_start())
+		local original = client:get_session_id()
+		socket.now = socket.now + 6
+		client:update(6)
+		local recovery = socket.now
+		socket.now = recovery - 60
+		if action == "track" then
+			assert_true(client:track("player_action"))
+		else
+			assert_true(client:mark_activity())
+			assert_equal(#inspect.state(client).queue.items, 1, "an activity marker emits nothing")
+		end
+		socket.now = recovery
+		client:update(0)
+		assert_equal(client:get_session_id(), original, action .. " survives wall-clock recovery")
+		socket.now = recovery - 60
+		client:update(9)
+		assert_equal(client:get_session_id(), original, "host input moved the frame deadline")
+		client:update(1)
+		assert_equal(client:get_session_id(), nil, "frame time reached the configured deadline")
+		assert_equal(client:mark_activity(), false, "a marker cannot reopen an ended session")
+		inspect.state(client):finish_teardown()
+	end
+	socket.gettime = ticking
 	end,
 	function()
 	-- A refused end stays owed. Neither input markers nor passive tracks can

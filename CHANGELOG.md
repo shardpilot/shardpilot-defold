@@ -8,6 +8,7 @@
   event. Runtime summaries, sampling and retries never renew or reopen it.
 - Call `mark_activity()` for input without an event. Pass
   `{ session_activity = false }` to `track()` for passive telemetry.
+- Device non-objection recording requires server-side enablement.
 
 ## v0.18.2 — 2026-11-08
 
