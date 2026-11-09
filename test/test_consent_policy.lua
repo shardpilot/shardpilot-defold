@@ -2607,6 +2607,8 @@ local function test_the_resolvers_advisory_bytes_are_understood()
 		print("advisory golden reached validation")
 		assert_true(decision.advisory ~= nil, "advisory golden reaches the host")
 		local expected = json.decode(next_response_body).advisory
+		assert_equal(decision.advisory.matrix.docs_commit, string.rep("1", 40), "captured matrix revision")
+		assert_equal(decision.advisory.matrix.file_sha256, string.rep("2", 64), "captured matrix digest")
 		for _, key in ipairs(ADVISORY_MEMBERS) do
 			if key ~= "matrix" then assert_equal(decision.advisory[key], expected[key], key) end
 		end
@@ -2817,14 +2819,14 @@ local function test_the_advisory_vocabulary_is_closed()
 		{ "basis with U+0085 NEXT LINE", set("advisory_basis", '"estimate\194\133forged: everything is fine"') },
 		{ "basis with U+0080", set("advisory_basis", '"a\194\128b"') },
 		{ "basis with U+009F", set("advisory_basis", '"a\194\159b"') },
-		{ "docs_commit in upper case", set("docs_commit", '"F6B6F0F617D4E15442608FC77BE8A5BB40F40E26"', true) },
-		{ "docs_commit one character short", set("docs_commit", '"f6b6f0f617d4e15442608fc77be8a5bb40f40e2"', true) },
+		{ "docs_commit in upper case", set("docs_commit", json.encode(string.rep("A", 40)), true) },
+		{ "docs_commit one character short", set("docs_commit", json.encode(string.rep("a", 39)), true) },
 		{ "file_sha256 one character short",
-			set("file_sha256", '"370b04f374d0c506b92a003d4c801f450d5e5c45aed369f14a1c9382e3d592c"', true) },
+			set("file_sha256", json.encode(string.rep("b", 63)), true) },
 		{ "date without leading zeros", set("date", '"2026-10-7"', true) },
 		{ "date that does not exist", set("date", '"2026-02-30"', true) },
 		{ "date as a timestamp", set("date", '"2026-10-07T00:00:00Z"', true) },
-		{ "matrix as a string", set("matrix", '"f6b6f0f6"') },
+		{ "matrix as a string", set("matrix", json.encode("deadbeef")) },
 		{ "matrix as a list", set("matrix", "[]") },
 		{ "an unknown advisory member", advisory_body('"advisory":{', '"advisory":{"note":"x",') },
 		{ "an unknown matrix member", advisory_body('"matrix":{', '"matrix":{"branch":"main",') },
