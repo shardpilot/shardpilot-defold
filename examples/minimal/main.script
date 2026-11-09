@@ -538,8 +538,8 @@ function init(self)
 				-- snapshots undelivered events to the durable spool (on mobile
 				-- an iconified app can be killed without final() ever running)
 				-- and pauses the session; a foreground signal ends a session
-				-- that stayed away session_timeout_seconds or longer and starts
-				-- the next one. The SDK picks the signals for the platform.
+				-- that stayed away session_timeout_seconds or longer. The
+				-- next meaningful event opens the next session.
 				shardpilot.on_window_event(event)
 			end
 		end)

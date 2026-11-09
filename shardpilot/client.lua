@@ -545,6 +545,7 @@ local config_keys = {
 	remote_config_enabled = true,
 	request_compression_enabled = true,
 	session_timeout_seconds = true,
+	foreground_idle_timeout_seconds = true,
 	source = true,
 	spool_enabled = true,
 	spool_max_bytes = true,
@@ -698,6 +699,11 @@ local function validate_config(config, diagnostics)
 	if session_timeout_seconds ~= session_timeout_seconds or session_timeout_seconds == math.huge then
 		return nil, "invalid_session_timeout_seconds"
 	end
+	local foreground_idle_timeout_seconds = normalize_positive_number(config.foreground_idle_timeout_seconds, 1800)
+	if not foreground_idle_timeout_seconds or foreground_idle_timeout_seconds ~= foreground_idle_timeout_seconds
+		or foreground_idle_timeout_seconds == math.huge then
+		return nil, "invalid_foreground_idle_timeout_seconds"
+	end
 	local http_timeout_seconds, publish_timeout_err =
 		normalize_positive_number(config.http_timeout_seconds, 2, "invalid_http_timeout_seconds")
 	if not http_timeout_seconds then
@@ -773,6 +779,7 @@ local function validate_config(config, diagnostics)
 		buffer_size = buffer_size,
 		flush_interval_seconds = flush_interval_seconds,
 		session_timeout_seconds = session_timeout_seconds,
+		foreground_idle_timeout_seconds = foreground_idle_timeout_seconds,
 		http_timeout_seconds = http_timeout_seconds,
 		token_refresh_lead_seconds = token_refresh_lead_seconds,
 		spool_enabled = config.spool_enabled ~= false,
@@ -1655,7 +1662,7 @@ local function construct(config, normalized)
 				-- The CURRENT session, so nil after an end as before the first
 				-- one: the background sweep's pre-session hold then holds after
 				-- an end too, and no SDK tick opens the next session.
-				return client.session_active and client.session_id or nil
+				return client.session_active and not client:session_deadline() and client.session_id or nil
 			end,
 			analytics_anonymous_id = function()
 				return client.anonymous_id
@@ -2503,8 +2510,8 @@ end
 -- sessionless samplers, which the first session adopts; a backend source has
 -- no sessions and keeps its samples sessionless.
 function Client:sampling_open()
-	if self:timed_out_in_background() then
-		-- Past the paused session's deadline: a sample now belongs to no
+	if self:session_deadline() then
+		-- Past the session's deadline: a sample now belongs to no
 		-- session, and its summary must not cover time after its own end.
 		return false
 	end
@@ -2809,7 +2816,6 @@ function Client:set_consent(decision, notice)
 	if not granted then
 		-- Denial ends attribution locally, without an end event. Discard the
 		-- pause so a later grant cannot emit an end inside the denied interval.
-		self.resume_after_denial = self.resume_after_denial or self.session ~= nil
 		self.paused = nil
 		self:close_session()
 		local cleared = queue.size(self.queue)
@@ -3039,12 +3045,9 @@ function Client:session_start(props)
 	if self.closing then
 		return false, "shutdown"
 	end
-	if self.initialized and self:timed_out_in_background() then
-		-- ⚠ A START PAST THE DEADLINE ENDS THE TIMED-OUT SESSION FIRST, at the
-		-- boundary instant. As a live renewal it would replace that session
-		-- with no end and finalize its samples now, after its own deadline.
-		-- The host's start is then the one next session.
-		local ended, end_err = self:run_boundary(false)
+	local deadline = self:session_deadline()
+	if deadline then
+		local ended, end_err = self:run_boundary(deadline)
 		if not ended then
 			return false, end_err
 		end
@@ -3095,9 +3098,8 @@ function Client:start_session(props, fact)
 	end
 	self.session = fresh
 	self.ended_session = nil
-	self.resume_after_denial = nil
 	self:mirror_session()
-	self:pause_if_backgrounded(fresh)
+	self:begin_session_clock(fresh)
 	if replaced then
 		-- A LIVE RENEWAL ENDS the session it replaces: its samples leave with
 		-- it, under its own id, now that the renewal has been accepted.
@@ -3114,19 +3116,13 @@ function Client:session_end(reason)
 	if not self.initialized then
 		return false, "shutdown"
 	end
-	-- An explicit host end cancels any consent-resume obligation, including
-	-- when denial already closed the session and this call is idempotent.
-	self.resume_after_denial = nil
 	if self.session == nil then
 		-- An end never opens a session, including before the first activity.
 		return true
 	end
-	if self:timed_out_in_background() then
-		-- ⚠ AN EXPIRED PAUSE IS THIS SESSION'S END: the boundary's, at its
-		-- instant, and no replacement is opened only for this call to end it.
-		-- One end per session, whichever of the boundary and this end comes
-		-- first (shutdown ends the session through here).
-		return self:run_boundary(false)
+	local deadline = self:session_deadline()
+	if deadline then
+		return self:run_boundary(deadline)
 	end
 	if not self:analytics_admitted() then
 		-- Without either admission basis, suppress the wire event but still
@@ -3158,6 +3154,7 @@ function Client:close_session(end_ts, end_ms)
 		return
 	end
 	self.session = nil
+	self.paused = nil
 	self.ended_session = closing
 	self:mirror_session()
 	self:finalize_session(closing, end_ts, end_ms)
@@ -3195,25 +3192,8 @@ function Client:finalize_session(closing, end_ts, end_ms)
 	end
 end
 
--- ⚠ THE AUTOMATIC SESSION BOUNDARY. The engine allows ONE window listener, so
--- the SDK cannot install its own: the host forwards its listener's events to
--- on_window_event. A background signal records a PAUSE of the open session
--- (and snapshots like persist(), so one call does both); a foreground signal
--- evaluates it. A stay of session_timeout_seconds or longer ends the paused
--- session at the logical boundary and starts the next one at once.
---
--- The pause holds the session by REFERENCE, so a session the host ended or
--- replaced meanwhile is never ended by it. ⚠ A SESSION THAT OPENS WHILE THE APP
--- IS STILL IN THE BACKGROUND OPENS PAUSED, from its own start: the rotation's
--- replacement, a host session_start(), an owed start or a lazy open. Otherwise
--- the rotation clears the only pause, and a second background stay ends
--- nothing. `backgrounded` records the signal apart from the pause, because the
--- pause holds a session and the app can be in the background without one. Elapsed is the larger of wall time
--- and summed update(dt): pure Lua reaches no monotonic clock, and the frame
--- time covers a backward wall-clock correction only while frames run
--- (a minimised desktop game). ⚠ ACCEPTED LIMIT: during a mobile background
--- stay no frames run, so a backward correction there can hide an expired
--- boundary and the two sessions merge; closing it needs a native clock.
+-- The host forwards its window events. A pause belongs to the session it
+-- captured. Expiry closes that session; only a later host action opens one.
 local DESKTOP_PLATFORMS = { windows = true, macos = true, linux = true }
 
 local function window_signal(event, platform_name)
@@ -3262,84 +3242,66 @@ function Client:on_window_event(event)
 		return self:persist()
 	end
 	if signal == "foreground" then
-		-- Cleared BEFORE the boundary, so the session it starts in front is
-		-- not paused.
 		self.backgrounded = false
-	end
-	if signal == "foreground" and self.paused ~= nil then
-		if not self:pause_expired() then
-			self.paused = nil
-			return true
-		end
-		return self:run_boundary(true)
-	end
-	if signal == "foreground" and self.resume_after_denial and self:analytics_admitted()
-		and self.session == nil and self.ended_session ~= nil then
-		-- Resume is the next activity after a consent teardown.
-		-- The retryable start path announces a distinct session, and retains
-		-- the obligation if the queue cannot accept it yet.
-		return self:start_session(nil, { retryable = true })
+		local deadline = self:session_deadline()
+		if deadline then return self:run_boundary(deadline) end
+		self.paused = nil
 	end
 	return true
 end
 
--- A session opened while the app is in the background is paused from its own
--- start (see on_window_event).
-function Client:pause_if_backgrounded(session)
-	if self.backgrounded then
-		self.paused = { session = session, wall_ms = clock.unix_ms(), frames = self.frame_seconds }
+function Client:begin_session_clock(session)
+	local now = clock.unix_ms()
+	session.activity_ms, session.activity_frames = now, self.frame_seconds
+	self.paused = self.backgrounded and { session = session, wall_ms = now, frames = self.frame_seconds } or nil
+end
+
+-- Player input can renew an open session even when there is no event to
+-- publish. A late input cannot bring an expired session back.
+function Client:mark_activity()
+	if self.closing or not self.initialized then return false, "shutdown" end
+	local now = clock.unix_ms()
+	if not self.session or self:session_deadline(now) then return false, "session_inactive" end
+	self.session.activity_ms, self.session.activity_frames = now, self.frame_seconds
+	return true
+end
+
+local function expired_deadline(now, frames, anchor_ms, anchor_frames, timeout_seconds)
+	local timeout_ms = timeout_seconds * 1000
+	if math.max(now - anchor_ms, (frames - anchor_frames) * 1000) >= timeout_ms then
+		return anchor_ms + timeout_ms
 	end
 end
 
--- True while the open session is paused past its deadline: it timed out in the
--- background and the boundary has not run yet. From that instant nothing new
--- belongs to it — no activity, no summary built now, no samples.
-function Client:timed_out_in_background()
-	return self.paused ~= nil and self.session ~= nil
-		and self.paused.session == self.session and self:pause_expired()
-end
-
-function Client:pause_expired()
+function Client:session_deadline(now)
+	local session = self.session
+	if not session then return nil end
+	now = now or clock.unix_ms()
+	local frames = self.frame_seconds
+	local idle = expired_deadline(now, frames, session.activity_ms, session.activity_frames,
+		self.config.foreground_idle_timeout_seconds)
 	local paused = self.paused
-	local wall_ms = clock.unix_ms() - paused.wall_ms
-	local frame_ms = (self.frame_seconds - paused.frames) * 1000
-	return math.max(wall_ms, frame_ms) >= self.config.session_timeout_seconds * 1000
-end
-
--- Ends the paused session at the boundary instant and, when `replace`, starts
--- the next one at once (a start the queue refuses stays owed, and the next
--- host activity discharges it). Without analytics admission it is a local
--- teardown, as session_end is. Returns false only when the end was refused;
--- the pause is then kept.
-function Client:run_boundary(replace)
-	local paused = self.paused
-	local closing = paused.session
-	if closing ~= self.session then
-		self.paused = nil
-		return true
+	if paused and paused.session == session then
+		local background = expired_deadline(now, frames, paused.wall_ms, paused.frames,
+			self.config.session_timeout_seconds)
+		if background then return idle and math.min(idle, background) or background end
 	end
+	return idle
+end
+
+-- A refusal keeps the clocks and the session intact for the next attempt.
+function Client:run_boundary(deadline)
 	if not self:analytics_admitted() then
-		self.paused = nil
 		self:close_session()
 		return true
 	end
-	-- The end is stamped at pause + timeout, or now if that is still ahead
-	-- (a frame-time expiry under a backward correction), and never before the
-	-- session's own last event: that is the one rule kept when a backward
-	-- correction makes it later than now.
-	local deadline_ms = paused.wall_ms + self.config.session_timeout_seconds * 1000
-	local stamp_ms = session_boundary_ms(closing, math.min(deadline_ms, clock.unix_ms()))
+	local closing = self.session
+	local stamp_ms = session_boundary_ms(closing, math.min(deadline, clock.unix_ms()))
 	local end_ts = clock.iso_utc(stamp_ms)
 	local ok, err = self:enqueue_event("app.session_ended", { reason = "idle_timeout" }, nil,
 		{ session_table = closing, event_ts = end_ts, retryable = true })
-	if not ok then
-		return false, err
-	end
-	self.paused = nil
+	if not ok then return false, err end
 	self:close_session(end_ts, stamp_ms)
-	if replace then
-		self:start_session(nil, { retryable = true })
-	end
 	return true
 end
 
@@ -3618,7 +3580,7 @@ function Client:track_ad_impression_revenue(
 			end
 		end
 	end
-	return self:enqueue_event("ad_impression_revenue", out)
+	return self:enqueue_event("ad_impression_revenue", out, nil, { activity = true })
 end
 
 local reserved_event_names = {
@@ -3629,7 +3591,7 @@ local reserved_event_names = {
 	session_started = true, session_ended = true,
 }
 
--- `options` is the per-event options table; see envelope.selected_schema_version.
+-- `options` is the per-event options table; see envelope.track_options.
 function Client:track(event_name, props, context, options)
 	return self:enqueue_event(event_name, props, context, nil, true, options)
 end
@@ -3660,27 +3622,16 @@ local function activity_carries_session(client, fact)
 		or client.config.source == "backend")
 end
 
-local function activity_owes_session(client, fact)
-	return not activity_carries_session(client, fact)
-		and (client:timed_out_in_background()
-			or (client.session == nil and client.ended_session ~= nil))
-end
-
-function Client:open_owed_session(fact, prepared_session)
-	if activity_carries_session(self, fact) then
-		return true
-	end
-	-- ⚠ AN EXPIRED PAUSE IS RESOLVED FIRST. Activity past the deadline, before
-	-- the resume, used to land in the session that had already timed out; the
-	-- boundary ends it and starts the next one before this activity is placed.
-	if self:timed_out_in_background() then
-		local ended, end_err = self:run_boundary(false)
-		if not ended then
-			return self:_record_refusal(end_err, fact)
-		end
+function Client:open_owed_session(fact, prepared_session, deadline)
+	if deadline then
+		local ended, end_err = self:run_boundary(deadline)
+		if not ended then return self:_record_refusal(end_err, fact) end
 	end
 	if self.session ~= nil or self.ended_session == nil then
 		return true
+	end
+	if prepared_session and queue.size(self.queue) + 2 > self.queue.limit then
+		return self:_record_refusal("queue_full", fact)
 	end
 	local started, start_err = self:start_session(nil, { retryable = true, prepared_session = prepared_session })
 	if not started then
@@ -3694,17 +3645,18 @@ end
 -- An explicit application is host activity even before its fact is sealed.
 -- Pin the initial lazy session now; background delivery must not choose it.
 function Client:open_experiment_application_session()
-	local opened, err = self:open_owed_session({ omit_user_id = true })
+	if self.config.source == "backend" then return true end
+	local opened, err = self:open_owed_session({ omit_user_id = true }, nil, self:session_deadline())
 	if not opened then return false, err end
-	if self.session == nil and self.ended_session == nil and self.config.source ~= "backend" then
+	if self.session == nil and self.ended_session == nil then
 		local lazy = new_session("session-" .. id.uuid())
 		self:adopt_sessionless_samplers(lazy)
 		self.session = lazy
 		self:mirror_session()
-		self:pause_if_backgrounded(lazy)
+		self:begin_session_clock(lazy)
 		self:renew_sessionless_samplers()
 	end
-	return true
+	return self:mark_activity()
 end
 
 function Client:enqueue_event(event_name, props, context, fact, host_event, options)
@@ -3741,7 +3693,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event, opti
 		end
 	end
 	-- After the consent and name gates, before any session or queue effect.
-	local schema_version = envelope.selected_schema_version(options)
+	local schema_version, session_activity = envelope.track_options(options)
 	if schema_version == false then
 		return self:_record_refusal("schema_version_invalid", fact)
 	end
@@ -3757,10 +3709,19 @@ function Client:enqueue_event(event_name, props, context, fact, host_event, opti
 		return self:_record_refusal(context_err, fact)
 	end
 	-- Build the exact prospective stream before any automatic lifecycle effect.
-	-- A refusal cannot announce an owed start or expire the previous session.
-	local opens_owed = activity_owes_session(self, fact)
-	local opens_lazy = not activity_carries_session(self, fact)
-		and self.session == nil and self.ended_session == nil and self.config.source ~= "backend"
+	-- An invalid envelope cannot announce an owed start or expire the previous session.
+	local managed = not activity_carries_session(self, fact)
+		and (self.config.source ~= "backend" or self.session ~= nil or self.ended_session ~= nil)
+	local passive_summary = event_name == "perf_summary" or event_name == "network_summary"
+	local active_event = (host_event and session_activity ~= false and not passive_summary) or (fact and fact.activity)
+	local event_ms = managed and clock.unix_ms()
+	local deadline = managed and self:session_deadline(event_ms)
+	local inactive = managed and (deadline or self.session == nil)
+	if inactive and not active_event then
+		return self:_record_refusal("session_inactive", fact)
+	end
+	local opens_owed = inactive and (deadline or self.ended_session ~= nil)
+	local opens_lazy = inactive and not opens_owed
 	local prepared_session
 	if opens_owed or opens_lazy then
 		prepared_session = new_session("session-" .. id.uuid())
@@ -3805,7 +3766,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event, opti
 	-- comes from that value, or from the stream the client last numbered.
 	local own = fact ~= nil and fact.session_table or nil
 	local stream = own or prepared_session or self:sequence_stream()
-	local now_ms = ts_override == nil and clock.unix_ms() or nil
+	local now_ms = ts_override == nil and (event_ms or clock.unix_ms()) or nil
 	local event = {
 		event_id = event_id or id.uuid(),
 		event_name = utf8.repair(event_name),
@@ -3826,7 +3787,7 @@ function Client:enqueue_event(event_name, props, context, fact, host_event, opti
 		return self:_record_refusal(admission_err, fact)
 	end
 	if opens_owed then
-		local opened, open_err = self:open_owed_session(fact, prepared_session)
+		local opened, open_err = self:open_owed_session(fact, prepared_session, deadline)
 		if not opened then return false, open_err end
 		if now_ms then
 			now_ms = session_boundary_ms(prepared_session, now_ms)
@@ -3858,8 +3819,11 @@ function Client:enqueue_event(event_name, props, context, fact, host_event, opti
 	end
 	if opens_lazy then
 		self.session = prepared_session
-		self:pause_if_backgrounded(prepared_session)
+		self:begin_session_clock(prepared_session)
 		self:renew_sessionless_samplers()
+	end
+	if active_event and self.session == stream and not (opens_lazy or opens_owed) then
+		stream.activity_ms, stream.activity_frames = now_ms, self.frame_seconds
 	end
 	self:mirror_session()
 	return true
@@ -3879,11 +3843,15 @@ function Client:update(dt)
 		self.flush_elapsed_seconds = self.flush_elapsed_seconds + dt
 		self.frame_seconds = self.frame_seconds + dt
 	end
-	if not self.closing and self.session_active and self:analytics_admitted() and type(dt) == "number"
-		and not self:timed_out_in_background() then
+	local deadline = self:session_deadline()
+	if deadline and not self.backgrounded and not self.closing then
+		self:run_boundary(deadline)
+	end
+	if not self.closing and self.session_active and self:analytics_admitted()
+		and type(dt) == "number" and not deadline then
 		-- Frame samples are analytics data: a session kept active through a
 		-- denial must not keep feeding the perf sampler, and a session past its
-		-- background deadline (a minimised desktop game still ticks) has ended.
+		-- idle deadline no longer owns samples.
 		sampling.sample_frame(self.perf, dt)
 	end
 	if self.experiments then
@@ -4049,10 +4017,9 @@ function Client:enqueue_summaries(flush_ids)
 	-- its sampler window is consumed — so it re-enqueues ahead of any fresh
 	-- one (older window first), envelope preserved.
 	self:drain_owed_summaries()
-	if self:timed_out_in_background() then
-		-- The open session timed out in the background: these samples are its
-		-- own, and the boundary finalizes them under its id at its end
-		-- instant. Built now they would be stamped after that end.
+	if (not self.session and self.config.source ~= "backend") or self:session_deadline() then
+		-- Keep pre-session samples for the first client session. A due
+		-- boundary finalizes its samples under the closing session's ID.
 		return
 	end
 	if #self.owed_summaries > 0 then
@@ -4070,11 +4037,8 @@ function Client:enqueue_summaries(flush_ids)
 	-- published. The terminal loss point — the denial wipe of owed
 	-- snapshots — counts instead.
 	--
-	-- An ordinary summary point summarizes the OPEN session's samples (or,
-	-- before any session, the ones the first session will adopt; for a
-	-- backend source, its sessionless ones), and is stamped like any event
-	-- from the open session. A CLOSING session's are built by
-	-- finalize_session from its own value.
+	-- Summarize the open session or a backend's sessionless samples.
+	-- finalize_session builds a closing session's summaries separately.
 	local perf = sampling.perf_summary(self.perf)
 	if perf then
 		local ok, err, refused, stream = self:enqueue_event("perf_summary", perf, nil,
@@ -5924,9 +5888,9 @@ function Client:capture_experiment_fact(event_name, props, event_id, overrides)
 	end
 	overrides = overrides or {}
 	-- A background capture may keep its arm-time session, but may not borrow
-	-- one whose pause expired. Like capture after an end, refuse without
+	-- one whose deadline passed. Like capture after an end, refuse without
 	-- opening a replacement; the live owed snapshot remains for its sweep.
-	if not overrides.session_id and self:timed_out_in_background() then
+	if not overrides.session_id and self:session_deadline() then
 		return false
 	end
 	-- The CURRENT session only: an ended session is not one to capture into.

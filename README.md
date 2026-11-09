@@ -25,8 +25,8 @@ IDs attach only while their durable link is recorded; revocation removes it firs
   a local stack you run yourself. Which endpoints are available today is stated
   under Configuration below and in [`docs/configuration.md`](docs/configuration.md);
   read that before configuring a hosted deployment.
-- **Version `0.18.2`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.18.2`; the `v0.18.2` tag
+- **Version `0.19.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.19.0`; the `v0.19.0` tag
   is created by the owner after the version-bump merge (pending until then).
 
 ## What it does
@@ -43,11 +43,10 @@ IDs attach only while their durable link is recorded; revocation removes it firs
   later launch with their original `event_id`, so the ingest service
   de-duplicates re-sends. See [Offline durability](#offline-durability-event-spool).
 - Emits canonical helpers: `session_start()` → `app.session_started`,
-  `session_end([reason])` → `app.session_ended` (the next event after an end
-  opens a new session; **New in `v0.11.0`:** a background stay of
-  `session_timeout_seconds` or longer ends the session at the resume, when the
-  host forwards its window events to `on_window_event` — see
-  [Offline durability](#offline-durability-event-spool)), `screen_view(name)` → `app.screen_view`, the typed
+  `session_end([reason])` → `app.session_ended` (the next meaningful event
+  opens a new session after an explicit end or an idle boundary), and
+  `screen_view(name)` → `app.screen_view`. See
+  [session boundaries](#offline-durability-event-spool). The typed
   progression verbs
   *(new in `v0.10.2`)*
   `track_level_start(level_id, attempt)` → `level_start`,
@@ -142,11 +141,11 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — after owner tagging, the latest tag is `v0.18.2`:
+published tag's source archive — after owner tagging, the latest tag is `v0.19.0`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.18.2.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.19.0.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
@@ -675,7 +674,8 @@ initialization attempt. `new(config)` creates an independent client instance.
 | `rejection_capacity` | `64` *(new in `v0.10.2`)* | Retained per-event rejection entries (positive integer); see [Batch verdicts](#batch-verdicts). |
 | `buffer_size` | `1000` | Max queued events (≥1); cross-SDK canonical default |
 | `flush_interval_seconds` | `15` (was `1`) *(new in `v0.10.2`)* | How long a **partial** batch waits before publishing (>0). Not a heartbeat — an empty queue publishes nothing. A full `batch_size` publishes immediately and `flush()` on demand; retry pacing runs on its own clock and does not follow this value *(new in `v0.10.2`)*. |
-| `session_timeout_seconds` | `30` **New in `v0.11.0`** | A background stay this long or longer (>0, finite) ends the session at the resume, stamped at the moment the stay reached it (`reason = "idle_timeout"`), and starts the next session. Needs the host to forward window events to `on_window_event`. |
+| `session_timeout_seconds` | `30` | Background timeout in seconds (>0, finite). Forward window events to `on_window_event` to enable it. |
+| `foreground_idle_timeout_seconds` | `1800` | Inactivity timeout in seconds (>0, finite). Advance the SDK with `update(dt)`. |
 | `http_timeout_seconds` | `2` | Per-request timeout (>0) |
 | `request_compression_enabled` | `true` *(new in `v0.10.2`)* | Compress analytics batch bodies over 1 KiB with `Content-Encoding: deflate` (RFC 1950 zlib — see [Request compression](#request-compression)). Sub-threshold bodies go uncompressed: zlib framing makes a single-event batch bigger, not smaller. No-op on engine versions without the `zlib` module. |
 | `token_refresh_lead_seconds` | `60` | Refresh lead before token expiry (≥0) |
@@ -950,21 +950,30 @@ window.set_listener(function(self, event, data)
 end)
 ```
 
-**New in `v0.11.0`.** `on_window_event` does what `persist()` does on a background
-signal (and returns its result), and it drives the automatic session boundary:
+`on_window_event` snapshots like `persist()` on a background signal and
+returns its result. Session boundaries work as follows.
 
 - **Which events count.** On mobile and web, focus lost and gained. On desktop,
   only iconify and deiconify: a focus loss there is alt-tab, and the game keeps
   running. The engine exports the iconify constant as `WINDOW_EVENT_ICONFIED`,
   while its documentation spells `WINDOW_EVENT_ICONIFIED`; either is accepted.
   Other events are ignored.
-- **The boundary.** A background signal records a pause of the open session.
-  On the foreground signal, a stay of `session_timeout_seconds` (30 s) or
-  longer ends that session with `reason = "idle_timeout"`. The end is stamped
-  at pause + timeout, never before the session's own last event. The next
-  session starts at once. Host activity that arrives past the deadline, before
-  the foreground signal, runs the boundary first. Below the timeout, nothing
-  happens. The startup focus gain is nothing.
+- **Idle boundaries.** `update(dt)` closes a foreground session after
+  `foreground_idle_timeout_seconds` without activity. A pause of at least
+  `session_timeout_seconds` closes the session on resume. The first due
+  deadline wins. The end has reason `idle_timeout` and is stamped at the
+  deadline, clamped to now on a clock rollback and to the last event if later.
+- **Activity.** An accepted host `track()` call refreshes the idle clock by
+  default. Use `mark_activity()` for player input that has no event. It emits
+  nothing and returns `false, "session_inactive"` if the session is absent or
+  expired. Use `track(name, props, context, { session_activity = false })` for
+  periodic telemetry. Passive tracks and summaries neither refresh nor start a
+  session. A client-source passive track without a live session returns
+  `false, "session_inactive"`.
+- **Resuming.** A resume by itself queues no start. The next accepted
+  meaningful event queues one start and then the event under the new ID.
+  If fewer than two queue slots are free, the pair stays owed. With a
+  one-slot queue, use an explicit `session_start()` and flush before tracking.
 - **Replacing an open session.** `session_start()` first queues its
   `app.session_ended` with reason `session_start`, then the new session's start.
   Both events share the boundary timestamp, never before the old session's
@@ -978,14 +987,13 @@ signal (and returns its result), and it drives the automatic session boundary:
   `session_start()`, and a session the next event opens. A second stay of
   `session_timeout_seconds` or longer therefore ends it too, stamped
   `session_timeout_seconds` after it opened and never before its own last
-  event. A session started by the foreground signal is not paused.
-- **Nothing after the deadline belongs to the paused session.** Frames and
-  network samples observed after it, while still in the background, are
-  dropped, and its perf summary's duration ends at the end instant.
+  event.
+- **Sampling.** Frames and network observations after an idle deadline stay
+  outside that session. Its final summaries use its ID and end timestamp.
 - **What it never does.** A session you ended or replaced during the stay is
-  not ended by it. `session_end()` or `shutdown()` over an expired pause gives
+  not ended by it. `session_end()` or `shutdown()` over an expired deadline gives
   that single end, and opens no session only to end it. A `session_start()`
-  over an expired pause ends the timed-out session first, then starts the one
+  over an expired deadline ends the timed-out session first, then starts the one
   next session. Without an analytics admission basis, it closes the session
   locally and sends nothing.
 - **Elapsed time** is the larger of wall time and the summed `update(dt)`, so
