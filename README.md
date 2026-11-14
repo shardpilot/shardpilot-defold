@@ -94,8 +94,10 @@ IDs attach only while their durable link is recorded; revocation removes it firs
   `observe_disconnect(reason)`.
 - Reports **crashes** through a separate `require "shardpilot.crash"`
   module to a dedicated crash ingest endpoint with a `crash:write` key — never as
-  an analytics event. Stamps a component-slug `component`, scrubs PII, samples
-  non-fatal reports while **always** sending fatal ones, and forwards a
+  an analytics event. Stamps a component-slug `component`, scrubs PII, sends
+  every non-fatal report by default (`crash_sample_every = 1`, capped at
+  `crash_session_max_reports`, default 100, per crash client) while **always**
+  sending fatal ones, and forwards a
   previous-session native crash dump on next launch — automatically from
   `crash.init` (disable with `previous_crash_capture_enabled = false`), with the
   engine module's symbol identity synthesized as `dmengine-<version_sha1>`
@@ -1648,7 +1650,10 @@ the `Bearer`, carrying the crash report JSON body: `crash_id`
 `platform`, `os`, `exception`, `modules[]`, `threads[]`/`frames[]`,
 `breadcrumbs[]`, `fingerprint_components[]`, and `metadata`. A crash is **never**
 wrapped as a `mobile_crash` analytics event on `/v1/events:batch`. Fatal reports
-bypass sampling; a previous-session native crash dump is forwarded on next launch
+bypass sampling and the cap. Since `v0.20.0` every non-fatal report is sent by
+default (`crash_sample_every = 1`; it was `10`), and at most
+`crash_session_max_reports` (default 100) are admitted per crash client; later
+ones are dropped and counted as `session_capped`; a previous-session native crash dump is forwarded on next launch
 via `crash.capture_previous()`, which first re-sends any reports whose earlier
 delivery was never confirmed — every dispatched report is persisted write-ahead
 to a bounded per-app sidecar (exact wire bytes, replayed without decoding or

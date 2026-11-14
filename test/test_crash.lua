@@ -310,6 +310,7 @@ local function test_config_validation()
 		{ { crash_sample_every = 1.5 }, "invalid_crash_sample_every" },
 		{ { crash_session_max_reports = 0 }, "invalid_crash_session_max_reports" },
 		{ { crash_session_max_reports = 1.5 }, "invalid_crash_session_max_reports" },
+		{ { crash_session_max_reports = math.huge }, "invalid_crash_session_max_reports" },
 		{ { crash_http_timeout_seconds = -1 }, "invalid_crash_http_timeout_seconds" },
 		{ { crash_component = "Bad_Slug" }, "invalid_crash_component" },
 		{ { crash_component = "-leadinghyphen" }, "invalid_crash_component" },

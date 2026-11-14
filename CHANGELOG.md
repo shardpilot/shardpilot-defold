@@ -9,6 +9,7 @@
 - `crash_sample_every` now defaults to `1`, so every admitted non-fatal report
   is sent with `non_fatal_sample_one_in = 1`. The previous default was `10`;
   set `crash_sample_every = 10` to keep it.
+- Device non-objection recording requires server-side enablement.
 
 ## v0.19.0 — 2026-11-09
 

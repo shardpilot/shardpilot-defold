@@ -210,8 +210,8 @@ local function validate_config(config)
 	end
 	local crash_session_max_reports, cap_err = normalize_integer(config.crash_session_max_reports,
 		default_crash_session_max_reports, 1, "invalid_crash_session_max_reports")
-	if not crash_session_max_reports then
-		return nil, cap_err
+	if not crash_session_max_reports or crash_session_max_reports == math.huge then
+		return nil, cap_err or "invalid_crash_session_max_reports"
 	end
 	local crash_http_timeout_seconds, timeout_err = normalize_positive_number(
 		config.crash_http_timeout_seconds, default_crash_http_timeout_seconds, "invalid_crash_http_timeout_seconds")
