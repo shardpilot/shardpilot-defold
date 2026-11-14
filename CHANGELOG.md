@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.20.0 — 2026-11-14
 
 - Non-fatal crash reports are capped per crash client by
   `crash_session_max_reports` (default 100, an integer of at least 1). The
