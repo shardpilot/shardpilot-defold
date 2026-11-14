@@ -384,22 +384,26 @@ local function read_pending_record(ns)
 	local raw = load_raw_record(ns)
 	local raw_items = type(raw) == "table" and raw.items or nil
 	local raw_deadline = type(raw) == "table" and raw.retry_after_until_ms or nil
+	local raw_reserve = type(raw) == "table" and raw.reserve_until_ms or nil
 	local items, changed = normalize_items(raw_items, current_ms)
 	local deadline = crash_deadline.normalize(raw_deadline, current_ms, max_pending_retry_after_ms)
-	if deadline ~= raw_deadline and raw_deadline ~= nil then
+	local reserve = crash_deadline.normalize(raw_reserve, current_ms, max_pending_retry_after_ms)
+	if (deadline ~= raw_deadline and raw_deadline ~= nil) or (reserve ~= raw_reserve and raw_reserve ~= nil) then
 		-- A spent or absurd stored deadline self-cleans with the rewrite.
 		changed = true
 	end
 	if changed then
 		-- Persist pruned entries and the cleaned deadline. A write failure is
 		-- non-fatal: the normalized view is still returned.
-		write_pending_list(ns, items, deadline)
+		write_pending_list(ns, items, deadline, reserve)
 	end
-	return items, deadline
+	return items, deadline, reserve
 end
 
-function write_pending_list(ns, items, retry_after_until_ms)
-	local record = { items = items, retry_after_until_ms = retry_after_until_ms }
+-- `reserve_until_ms` is the fatal-reserve window: it holds handled reports
+-- only, and every write of the record carries it over.
+function write_pending_list(ns, items, retry_after_until_ms, reserve_until_ms)
+	local record = { items = items, retry_after_until_ms = retry_after_until_ms, reserve_until_ms = reserve_until_ms }
 	local path = save_path(ns, "pending-crashes")
 	if not path then
 		-- No durable backend: the in-memory record IS the store. Update it and
@@ -486,7 +490,7 @@ function M.save_pending_crash(scope, entry, created_at_ms)
 		return nil
 	end
 	-- Read the backlog before assigning the new report's timestamp.
-	local items, deadline = read_pending_record(ns)
+	local items, deadline, reserve = read_pending_record(ns)
 	local stamp = type(created_at_ms) == "number" and created_at_ms or now_ms()
 	-- Defensive copy so a later caller mutation cannot reach the stored snapshot.
 	local stored = {}
@@ -534,7 +538,7 @@ function M.save_pending_crash(scope, entry, created_at_ms)
 	-- FATAL report always persistable and therefore removable, while a
 	-- non-fatal newcomer never costs a fatal report its slot.
 	while true do
-		if write_pending_list(ns, stored, deadline) then
+		if write_pending_list(ns, stored, deadline, reserve) then
 			return token
 		end
 		if not evict_one_pending(stored, token, new_entry.fatal) then
@@ -557,7 +561,7 @@ function M.remove_pending_crash(scope, token, clear_retry_after)
 		return false
 	end
 	local ns = pending_namespace(scope)
-	local items, deadline = read_pending_record(ns)
+	local items, deadline, reserve = read_pending_record(ns)
 	local kept = {}
 	for i = 1, #items do
 		if items[i].token ~= token then
@@ -567,7 +571,7 @@ function M.remove_pending_crash(scope, token, clear_retry_after)
 	if clear_retry_after == true then
 		deadline = nil
 	end
-	return write_pending_list(ns, kept, deadline)
+	return write_pending_list(ns, kept, deadline, reserve)
 end
 
 -- Persist (or clear, with nil/non-positive seconds) the resend-backpressure
@@ -576,9 +580,9 @@ end
 -- keeps waiting it out instead of hammering a rate-limited endpoint. The
 -- deadline is clamped to at most one day ahead. Best-effort: a failed write
 -- only costs one early retry the server can re-throttle.
-function M.set_pending_crash_retry_after(scope, seconds)
+function M.set_pending_crash_retry_after(scope, seconds, fatal_reserve)
 	local ns = pending_namespace(scope)
-	local items, _ = read_pending_record(ns)
+	local items, kept_deadline, kept_reserve = read_pending_record(ns)
 	local deadline = nil
 	if type(seconds) == "number" and seconds > 0 then
 		local clamped_ms = math.floor(seconds * 1000)
@@ -587,7 +591,10 @@ function M.set_pending_crash_retry_after(scope, seconds)
 		end
 		deadline = now_ms() + clamped_ms
 	end
-	return write_pending_list(ns, items, deadline)
+	if fatal_reserve == true then
+		return write_pending_list(ns, items, kept_deadline, deadline)
+	end
+	return write_pending_list(ns, items, deadline, kept_reserve)
 end
 
 -- Return the exact encoded pending crash bodies for this app (possibly empty).
@@ -608,7 +615,7 @@ end
 -- reports, plus the stored resend-backpressure deadline (ms epoch, or nil).
 function M.load_pending_entries(scope)
 	local ns = pending_namespace(scope)
-	local items, deadline = read_pending_record(ns)
+	local items, deadline, reserve = read_pending_record(ns)
 	local out = {}
 	for i = 1, #items do
 		out[i] = {
@@ -619,7 +626,7 @@ function M.load_pending_entries(scope)
 			created_at = items[i].created_at,
 		}
 	end
-	return out, deadline
+	return out, deadline, reserve
 end
 
 -- ── crash-reporting settings ─────────────────────────────────────────────────
