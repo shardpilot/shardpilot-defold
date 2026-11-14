@@ -6519,3 +6519,93 @@ end)()
 	print("native revocation total: " .. passed .. " pass, " .. failed .. " fail")
 	assert_equal(failed, 0, "native revocation scenes")
 end)()
+
+-- A 429 crash_monthly_quota_fatal_reserve holds handled reports only. In a
+-- function scope: the main chunk is at Lua 5.1's local-variable limit.
+;(function()
+	local clock = require "shardpilot.clock"
+	local FATAL_RESERVE_BODY = '{"error":{"code":"crash_monthly_quota_fatal_reserve"}}'
+
+	local function reserve_event(reason)
+		return presymbolicated_event({ exception = { type = "lua_error", reason = reason } })
+	end
+
+	-- A 429 crash_monthly_quota_fatal_reserve refuses handled reports only: the
+	-- pass moves past it so a retained fatal report still goes out, a live fatal
+	-- is sent at once, and the accepted fatal does not end the handled window.
+	local function test_fatal_reserve_refusal_lets_fatal_reports_through()
+		reset()
+		local restore = install_fake_sys_storage()
+		local scope = { app_id = "reserve-app" }
+		next_status = 500
+		local seeder = assert(crash.new(config({ app_key = "reserve-app", crash_sample_every = 1 })))
+		assert_true(seeder:emit(reserve_event("H1")))
+		assert_true(seeder:emit_fatal(reserve_event("F1")))
+		assert_equal(#storage.load_pending_entries(scope), 2, "both reports are pending")
+
+		reset()
+		local restore_http = install_scripted_http({
+			{ status = 429, headers = { ["retry-after"] = "600" }, body = FATAL_RESERVE_BODY },
+			{ status = 202 },
+		})
+		local client = assert(crash.new(config({ app_key = "reserve-app", crash_sample_every = 1 })))
+		client:resend_pending()
+		assert_equal(#requests, 2, "the pass moves past the reserve refusal to the fatal report")
+		assert_contains(requests[#requests].body, '"F1"')
+		local entries = storage.load_pending_entries(scope)
+		assert_equal(#entries, 1, "only the handled report stays durable")
+		assert_contains(entries[1].body, '"H1"')
+		client:resend_pending()
+		assert_equal(#requests, 2, "a pass inside the window skips handled reports")
+		assert_true(client:emit_fatal(reserve_event("F2")))
+		assert_equal(#requests, 3, "a live fatal report is sent at once")
+		assert_true(client:emit(reserve_event("H2")))
+		assert_equal(#requests, 3, "an accepted fatal does not end the handled window")
+		restore_http()
+		restore()
+		storage.reset()
+	end
+
+	local function test_fatal_reserve_holds_handled_reports_until_the_window_ends()
+		reset()
+		local restore = install_fake_sys_storage()
+		local restore_http = install_scripted_http({
+			{ status = 429, headers = { ["retry-after"] = "30" }, body = FATAL_RESERVE_BODY },
+			{ status = 202 },
+		})
+		local client = assert(crash.new(config({ app_key = "reserve-wait-app", crash_sample_every = 1 })))
+		assert_true(client:emit(reserve_event("H1")))
+		assert_true(client:emit(reserve_event("H2")))
+		assert_equal(#requests, 1, "a handled report waits for the reserve window")
+		client:resend_pending()
+		assert_equal(#requests, 1, "the pass skips handled reports inside the window")
+		local real_now = clock.unix_ms
+		clock.unix_ms = function() return real_now() + 31000 end
+		client:resend_pending()
+		assert_equal(#requests, 3, "both handled reports are sent after the window")
+		assert_equal(#storage.load_pending_entries({ app_id = "reserve-wait-app" }), 0, "and pruned")
+		clock.unix_ms = real_now
+		restore_http()
+		restore()
+		storage.reset()
+	end
+
+	local function test_plain_429_still_defers_a_retained_fatal_report()
+		reset()
+		local restore = install_fake_sys_storage()
+		local restore_http = install_scripted_http({ { status = 429, headers = { ["retry-after"] = "600" } } })
+		local client = assert(crash.new(config({ app_key = "plain-429-app", crash_sample_every = 1 })))
+		assert_true(client:emit_fatal(reserve_event("F1")))
+		assert_equal(#requests, 1, "the fatal report met a plain 429")
+		client:resend_pending()
+		assert_equal(#requests, 1, "a plain 429 still defers the whole pass, fatal reports included")
+		restore_http()
+		restore()
+		storage.reset()
+	end
+
+	test_fatal_reserve_refusal_lets_fatal_reports_through()
+	test_fatal_reserve_holds_handled_reports_until_the_window_ends()
+	test_plain_429_still_defers_a_retained_fatal_report()
+	print("fatal reserve scenes passed")
+end)()
