@@ -18,7 +18,9 @@ local native_context = require "shardpilot.crash.native_context"
 
 local M = {}
 
-local default_crash_sample_every = 10
+local default_crash_sample_every = 1
+-- Admitted non-fatal reports per client session; never unlimited.
+local default_crash_session_max_reports = 100
 local default_crash_http_timeout_seconds = 30
 
 -- Reuse the analytics URL shape rules: absolute http(s) base, https required
@@ -137,6 +139,7 @@ local config_keys = {
 	platform = true,
 	crash_http_timeout_seconds = true,
 	crash_sample_every = true,
+	crash_session_max_reports = true,
 	sampler = true,
 	crash_hooks_enabled = true,
 	session_id = true,
@@ -204,6 +207,11 @@ local function validate_config(config)
 		normalize_integer(config.crash_sample_every, default_crash_sample_every, 0, "invalid_crash_sample_every")
 	if not crash_sample_every then
 		return nil, sample_err
+	end
+	local crash_session_max_reports, cap_err = normalize_integer(config.crash_session_max_reports,
+		default_crash_session_max_reports, 1, "invalid_crash_session_max_reports")
+	if not crash_session_max_reports then
+		return nil, cap_err
 	end
 	local crash_http_timeout_seconds, timeout_err = normalize_positive_number(
 		config.crash_http_timeout_seconds, default_crash_http_timeout_seconds, "invalid_crash_http_timeout_seconds")
@@ -280,6 +288,7 @@ local function validate_config(config)
 		platform = resolved_platform,
 		platform_unmapped = platform_unmapped,
 		crash_sample_every = crash_sample_every,
+		crash_session_max_reports = crash_session_max_reports,
 		crash_http_timeout_seconds = crash_http_timeout_seconds,
 		diagnostics = config.diagnostics,
 		sampler = config.sampler,
@@ -347,6 +356,7 @@ function M.new(config)
 		enabled_reason = enabled_reason,
 		breadcrumbs = breadcrumbs.new(),
 		sample_counter = 0,
+		non_fatal_admitted = 0,
 		-- A best-effort, in-session-only fallback store of encoded report bodies that
 		-- could not be persisted to the on-disk sidecar (storage quota / failure /
 		-- oversize). Keyed by an in-memory token, it lets an in-session resend pass
@@ -382,6 +392,7 @@ function M.new(config)
 		stats = {
 			emitted = 0,
 			sampled_out = 0,
+			session_capped = 0,
 			accepted = 0,
 			-- Crashes the server ACCEPTED (2xx) but did NOT store because the actor
 			-- withheld consent; counted separately from accepted-and-stored.
@@ -833,6 +844,11 @@ function Client:emit_internal(event, fatal, trusted_frame_functions, prepare_opt
 			self.stats.sampled_out = self.stats.sampled_out + 1
 			return true
 		end
+		if self.non_fatal_admitted >= self.config.crash_session_max_reports then
+			self.stats.session_capped = self.stats.session_capped + 1
+			return true
+		end
+		self.non_fatal_admitted = self.non_fatal_admitted + 1
 	end
 	-- SDK-owned annotations are fixed by this admission decision before the
 	-- body is encoded/persisted. Custom samplers return no known rate.

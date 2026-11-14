@@ -1121,8 +1121,9 @@ crash.record_breadcrumb("menu.open")
   `crash.is_enabled()` returns `enabled, reason`
   (`"opt_out" | "settings_read_failed" | "not_initialized"`).
 - **Fatal is never sampled**; non-fatal `emit` is sampled deterministically
-  1-in-N (`crash_sample_every`, default 10 — the first N−1 non-fatals of a process
-  are dropped; set `1` to send every one). `crash_sample_every = 0` disables
+  1-in-N (`crash_sample_every`, default 1 sends every one; at N the first N−1
+  non-fatals of a process are dropped), then capped per client
+  (`crash_session_max_reports`, default 100, at least 1). `crash_sample_every = 0` disables
   all non-fatal reports, including a custom `sampler`; at a positive rate,
   a custom sampler returning `true` admits every non-fatal.
 - **Write-ahead durability (best-effort)**: before its send attempt, every
