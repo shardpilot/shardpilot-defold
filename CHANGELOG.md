@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.20.0 — 2026-11-14
+
+- Non-fatal crash reports are capped per crash client by
+  `crash_session_max_reports` (default 100, an integer of at least 1). The
+  cap counts after sampling, never applies to fatal reports, and refused
+  reports are counted as `session_capped` in `snapshot()`.
+- `crash_sample_every` now defaults to `1`, so every admitted non-fatal report
+  is sent with `non_fatal_sample_one_in = 1`. The previous default was `10`;
+  set `crash_sample_every = 10` to keep it.
+- Device non-objection recording requires server-side enablement.
+
 ## v0.19.0 — 2026-11-09
 
 - Foreground sessions end after 1800 seconds of inactivity by default. Set

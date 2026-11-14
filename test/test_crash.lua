@@ -308,6 +308,9 @@ local function test_config_validation()
 		{ { app_key = false }, "invalid_app_key" },
 		{ { crash_sample_every = -1 }, "invalid_crash_sample_every" },
 		{ { crash_sample_every = 1.5 }, "invalid_crash_sample_every" },
+		{ { crash_session_max_reports = 0 }, "invalid_crash_session_max_reports" },
+		{ { crash_session_max_reports = 1.5 }, "invalid_crash_session_max_reports" },
+		{ { crash_session_max_reports = math.huge }, "invalid_crash_session_max_reports" },
 		{ { crash_http_timeout_seconds = -1 }, "invalid_crash_http_timeout_seconds" },
 		{ { crash_component = "Bad_Slug" }, "invalid_crash_component" },
 		{ { crash_component = "-leadinghyphen" }, "invalid_crash_component" },
@@ -342,7 +345,8 @@ local function test_config_validation()
 	-- A bare-app (no source) config defaults crash_component to nil.
 	local bare = assert(crash.new(config()))
 	assert_equal(bare.config.crash_component, nil)
-	assert_equal(bare.config.crash_sample_every, 10)
+	assert_equal(bare.config.crash_sample_every, 1)
+	assert_equal(bare.config.crash_session_max_reports, 100)
 end
 
 -- ── source slug stamping ─────────────────────────────────────────────────────
@@ -527,6 +531,29 @@ local function test_non_fatal_is_sampled()
 	end
 	assert_equal(#requests, 2, "1-in-5 sampling keeps 2 of 10 non-fatal reports")
 	assert_equal(client:snapshot().sampled_out, 8)
+end
+
+local function test_session_cap_bounds_non_fatal_reports()
+	reset()
+	local client = assert(crash.new(config({ crash_sample_every = 2, crash_session_max_reports = 2 })))
+	for _ = 1, 6 do
+		assert_true(client:emit(presymbolicated_event()))
+	end
+	assert_equal(#requests, 2, "the per-session cap bounds admitted non-fatal reports")
+	assert_equal(client:snapshot().sampled_out, 3, "a sampled-out report spends no cap")
+	assert_equal(client:snapshot().session_capped, 1)
+	assert_true(client:emit_fatal(presymbolicated_event()))
+	assert_equal(#requests, 3, "a fatal report is never capped")
+end
+
+local function test_session_cap_defaults_to_one_hundred()
+	reset()
+	local client = assert(crash.new(config()))
+	for _ = 1, 101 do
+		assert_true(client:emit(presymbolicated_event()))
+	end
+	assert_equal(#requests, 100, "default: every non-fatal is sent, at most 100 per session")
+	assert_equal(client:snapshot().session_capped, 1)
 end
 
 local function test_custom_sampler_does_not_affect_fatal()
@@ -5764,6 +5791,8 @@ local tests = {
 	test_fatal_dotted_module_name_reaches_wire,
 	test_fatal_long_build_id_reaches_wire,
 	test_non_fatal_is_sampled,
+	test_session_cap_bounds_non_fatal_reports,
+	test_session_cap_defaults_to_one_hundred,
 	test_custom_sampler_does_not_affect_fatal,
 	test_sampler_mutation_does_not_reach_wire,
 	test_pii_scrubbed_from_wire,
@@ -5922,14 +5951,15 @@ print("shardpilot defold crash tests passed")
 	local failed = 0
 	local cases = {
 		{ name = "fatal", fatal = true, custom = "reject" },
-		{ name = "default tenth", rate = 10, calls = 10 },
+		{ name = "default every report", rate = 1 },
+		{ name = "every tenth", every = 10, rate = 10, calls = 10 },
 		{ name = "every report", every = 1, rate = 1 },
 		{ name = "maximum rate", every = 1000000, counter = 999999, rate = 1000000 },
 		{ name = "unrepresentable rate", every = 1000001, counter = 1000000 },
 		{ name = "custom keep", custom = "keep" },
 		{ name = "custom throws", custom = "throws" },
 		{ name = "custom changes config", custom = "changes" },
-		{ name = "first nine sampled out", calls = 9, dropped = true },
+		{ name = "first nine sampled out", every = 10, calls = 9, dropped = true },
 		{ name = "custom rejects", custom = "reject", dropped = true },
 		{ name = "old serialized body", legacy = true },
 	}

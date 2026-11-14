@@ -36,7 +36,8 @@ crash.init({
   app_version      = "1.4.2",
   app_build        = "4201",
   crash_component  = "game-client",                  -- component slug (optional)
-  -- crash_sample_every      = 10,  -- every-Nth NON-fatal is sent (deterministic counter; fatal always sent)
+  -- crash_sample_every      = 1,   -- every-Nth NON-fatal is sent (deterministic counter; fatal always sent)
+  -- crash_session_max_reports = 100, -- admitted NON-fatal reports per client (at least 1)
   -- crash_http_timeout_seconds = 30,
   -- sampler = function(event) return true end,       -- custom NON-fatal sampler
   -- diagnostics = function(issue) ... end,            -- per-report failure hook
@@ -54,7 +55,8 @@ crash.init({
 | `native_snapshot_enabled`, `native_snapshot_scope` | no | Default-off [capture-time context](#optional-capture-time-context); scope is required when enabled. |
 | `platform` | no | One of `windows`, `macos`, `linux`, `android`, `ios`, `tvos`, `web`, `ps4`, `ps5`, `xbox`, `switch` or `other`. Auto-detected from `sys.get_sys_info`; an unrecognized system is `other`. A configured value is folded through the same table as analytics (`Mac` is `macos`, `html5` is `web`); one it cannot map is sent as `other` and reported once as `{ scope = "config", status = "ignored", code = "platform_unmapped" }`. A per-report `platform` is folded the same way and falls back to the configured one; a module's `platform` that cannot be mapped is omitted, so the module takes the crash's own. A crash client is never refused for its platform. |
 | `crash_component` | no | Component slug (see below); no fallback configuration alias. |
-| `crash_sample_every` | no | Every-Nth sampling for **non-fatal** reports (default 10): a deterministic per-process counter transmits calls N, 2N, 3N, … — the first N−1 non-fatals of a process are always dropped, so a process emitting fewer than N non-fatals in its lifetime reports none (set `1` to send every one). Set `0` to disable non-fatal reports, including the custom sampler. Fatal reports are **never** sampled. |
+| `crash_sample_every` | no | Every-Nth sampling for **non-fatal** reports (default 1, every report). Above 1, a deterministic per-process counter transmits calls N, 2N, 3N, … — the first N−1 non-fatals of a process are always dropped, so a process emitting fewer than N non-fatals in its lifetime reports none. Set `0` to disable non-fatal reports, including the custom sampler. Fatal reports are **never** sampled. |
+| `crash_session_max_reports` | no | Admitted **non-fatal** reports per crash client, from `init` to `shutdown` (default 100; an integer of at least 1, so it cannot be removed). It counts after sampling: a sampled-out report spends none, and a report over the cap is dropped and counted as `session_capped` in `snapshot()`. Fatal reports are **never** capped. |
 | `crash_http_timeout_seconds` | no | Per-request timeout (default 30). |
 | `sampler` | no | A custom `function(event) -> boolean` for non-fatal reports when `crash_sample_every` is positive. Zero disables non-fatals before this callback; fatal reports bypass it. |
 | `diagnostics` | no | A hook invoked with `{ scope, status, code, retryable, response }` when a report is rejected or unauthorized. |
@@ -136,8 +138,8 @@ A fatal crash is reported **every time**, regardless of `crash_sample_every` or 
 custom `sampler` — `emit_fatal` (and the dump-forward path) bypass the sampler
 entirely. Only `emit` (non-fatal) is sampled, and the default sampler is
 **deterministic, not probabilistic**: a per-process counter transmits every
-Nth call (10th, 20th, … at the default), so the first N−1 non-fatals of any
-process are always dropped. A sampled-out `emit` looks exactly like a sent
+Nth call (every call at the default `1`; the 10th, 20th, … at `10`), so the
+first N−1 non-fatals of any process are always dropped. A sampled-out `emit` looks exactly like a sent
 one at the call site. `crash_sample_every = 0` disables every non-fatal report
 before the custom `sampler` runs. At a positive rate, a custom `sampler`
 (e.g. `function() return true end`) can admit every non-fatal.

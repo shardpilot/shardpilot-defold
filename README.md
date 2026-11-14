@@ -25,8 +25,8 @@ IDs attach only while their durable link is recorded; revocation removes it firs
   a local stack you run yourself. Which endpoints are available today is stated
   under Configuration below and in [`docs/configuration.md`](docs/configuration.md);
   read that before configuring a hosted deployment.
-- **Version `0.19.0`.** `game.project`, `shardpilot/version.lua`, and the top
-  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.19.0`; the `v0.19.0` tag
+- **Version `0.20.0`.** `game.project`, `shardpilot/version.lua`, and the top
+  [`CHANGELOG.md`](CHANGELOG.md) entry all report `v0.20.0`; the `v0.20.0` tag
   is created by the owner after the version-bump merge (pending until then).
 
 ## What it does
@@ -94,8 +94,10 @@ IDs attach only while their durable link is recorded; revocation removes it firs
   `observe_disconnect(reason)`.
 - Reports **crashes** through a separate `require "shardpilot.crash"`
   module to a dedicated crash ingest endpoint with a `crash:write` key — never as
-  an analytics event. Stamps a component-slug `component`, scrubs PII, samples
-  non-fatal reports while **always** sending fatal ones, and forwards a
+  an analytics event. Stamps a component-slug `component`, scrubs PII, sends
+  every non-fatal report by default (`crash_sample_every = 1`, capped at
+  `crash_session_max_reports`, default 100, per crash client) while **always**
+  sending fatal ones, and forwards a
   previous-session native crash dump on next launch — automatically from
   `crash.init` (disable with `previous_crash_capture_enabled = false`), with the
   engine module's symbol identity synthesized as `dmengine-<version_sha1>`
@@ -141,11 +143,11 @@ include_dirs = shardpilot
 
 The recommended path today is to vendor the `shardpilot/` directory into your
 project. Alternatively, pin the repo as a Defold library dependency to a
-published tag's source archive — after owner tagging, the latest tag is `v0.19.0`:
+published tag's source archive — after owner tagging, the latest tag is `v0.20.0`:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.19.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.20.0.zip
 ```
 
 Note that no packaged release ZIP asset is attached to any GitHub Release yet —
@@ -1648,7 +1650,10 @@ the `Bearer`, carrying the crash report JSON body: `crash_id`
 `platform`, `os`, `exception`, `modules[]`, `threads[]`/`frames[]`,
 `breadcrumbs[]`, `fingerprint_components[]`, and `metadata`. A crash is **never**
 wrapped as a `mobile_crash` analytics event on `/v1/events:batch`. Fatal reports
-bypass sampling; a previous-session native crash dump is forwarded on next launch
+bypass sampling and the cap. Since `v0.20.0` every non-fatal report is sent by
+default (`crash_sample_every = 1`; it was `10`), and at most
+`crash_session_max_reports` (default 100) are admitted per crash client; later
+ones are dropped and counted as `session_capped`; a previous-session native crash dump is forwarded on next launch
 via `crash.capture_previous()`, which first re-sends any reports whose earlier
 delivery was never confirmed — every dispatched report is persisted write-ahead
 to a bounded per-app sidecar (exact wire bytes, replayed without decoding or

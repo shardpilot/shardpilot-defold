@@ -14,7 +14,10 @@ ShardPilot Defold SDK v0 is configured with a Lua table. Unsupported keys,
 including misspellings, return `unknown_config_key`: `new()` returns `nil, code`
 and `init()` returns `false, code`. Validation happens before storage, token
 callbacks or HTTP requests. Pass analytics options only to the analytics client;
-crash has its own configuration. An already initialized analytics facade still
+crash has its own configuration. Since `v0.20.0` the crash client sends every
+non-fatal report by default (`crash_sample_every = 1`; it was `10`) and admits
+at most `crash_session_max_reports` (default 100) per client, dropping later
+ones as `session_capped`; see [the crash guide](crash.md). An already initialized analytics facade still
 returns `already_initialized` before attempting replacement.
 
 Constructors capture the table's raw entries once before validation or host

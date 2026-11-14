@@ -53,7 +53,7 @@ the deeper reference.
 
 ## Install
 
-Version pin (CI-checked): this skill matches shardpilot-defold `v0.19.0`.
+Version pin (CI-checked): this skill matches shardpilot-defold `v0.20.0`.
 
 This version includes request compression, a 15-second flush default, independent retry pacing, typed progression/ad verbs, and terminal rejection history; these were absent from `v0.10.1`.
 
@@ -68,10 +68,10 @@ Two supported paths:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.19.0.zip
+dependencies#0 = https://github.com/shardpilot/shardpilot-defold/archive/refs/tags/v0.20.0.zip
 ```
 
-`v0.19.0` is the version this skill matches, and it is the same pin the
+`v0.20.0` is the version this skill matches, and it is the same pin the
 README's Installation section carries.
 
 The earlier off-main `v0.10.1` tag still declares `0.10.0`; see the [changelog](../../../CHANGELOG.md).
@@ -1121,8 +1121,9 @@ crash.record_breadcrumb("menu.open")
   `crash.is_enabled()` returns `enabled, reason`
   (`"opt_out" | "settings_read_failed" | "not_initialized"`).
 - **Fatal is never sampled**; non-fatal `emit` is sampled deterministically
-  1-in-N (`crash_sample_every`, default 10 — the first N−1 non-fatals of a process
-  are dropped; set `1` to send every one). `crash_sample_every = 0` disables
+  1-in-N (`crash_sample_every`, default 1 sends every one; at N the first N−1
+  non-fatals of a process are dropped), then capped per client
+  (`crash_session_max_reports`, default 100, at least 1). `crash_sample_every = 0` disables
   all non-fatal reports, including a custom `sampler`; at a positive rate,
   a custom sampler returning `true` admits every non-fatal.
 - **Write-ahead durability (best-effort)**: before its send attempt, every
