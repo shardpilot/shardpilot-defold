@@ -395,6 +395,10 @@ the body.
   newer failure's window. Non-fatal live reports join the paced backlog; fatal
   live sends retain their existing immediate-attempt behavior. Opt-out, purge
   and retention limits still apply.
+- A `429` with the error code `crash_monthly_quota_fatal_reserve` (the rest of
+  the monthly quota is kept for fatal reports) holds only non-fatal reports for
+  its `Retry-After`: the pass skips them and still sends fatal ones, and an
+  accepted fatal send does not end that window.
 - **Bounds.** At most **8 reports**, each at most **64 KB** encoded, at most
   **384 KB** total (Defold documents a 512 KB `sys.save` cap; the budget stays
   well under it). When a bound is exceeded the oldest **non-fatal** reports

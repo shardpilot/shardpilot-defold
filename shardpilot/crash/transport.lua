@@ -160,7 +160,7 @@ end
 -- Only an exact typed code in a bounded, complete, unambiguous object is
 -- authoritative. Missing decoding, malformed JSON and unknown codes keep the
 -- ordinary status classification; message text never changes retry policy.
-local function disabled_kind(response)
+local function error_code(response)
 	local body=type(response)=="table" and response.response
 	if type(body)~="string" or #body>65536 or not json or type(json.decode)~="function" then return false end
 	local start=skip_space(body,1)
@@ -168,7 +168,7 @@ local function disabled_kind(response)
 	local after=skip_value(body,start,0)
 	if not after or skip_space(body,after)<=#body then return false end
 	local ok, value=pcall(json.decode,body)
-	return ok and type(value)=="table" and type(value.error)=="table" and value.error.code=="kind_not_enabled"
+	return ok and type(value)=="table" and type(value.error)=="table" and value.error.code or nil
 end
 
 -- Encode one crash report to its wire body. Returns the JSON string, or
@@ -228,7 +228,7 @@ function M.ingest_body(config, publishable_key, encoded, callback)
 			callback(false, "unauthorized", true, false, response)
 			return
 		end
-		if (status == 400 or status == 404) and disabled_kind(response) then
+		if (status == 400 or status == 404) and error_code(response) == "kind_not_enabled" then
 			callback(false, "kind_not_enabled", false, true, response, retry_after_seconds(response))
 			return
 		end
@@ -245,7 +245,10 @@ function M.ingest_body(config, publishable_key, encoded, callback)
 			return
 		end
 		if status == 429 then
-			callback(false, "transient_429", false, true, response, retry_after_seconds(response))
+			-- The fatal reserve refuses handled reports only; fatal ones keep their quota.
+			local reserve = error_code(response) == "crash_monthly_quota_fatal_reserve"
+			callback(false, reserve and "crash_fatal_reserve" or "transient_429", false, true, response,
+				retry_after_seconds(response))
 			return
 		end
 		if status >= 500 then

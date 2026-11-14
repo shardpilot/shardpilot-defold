@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.20.1 — 2026-11-14
+
+- A `429` crash response with error code `crash_monthly_quota_fatal_reserve`
+  now holds only non-fatal reports for its `Retry-After`: the resend pass
+  skips them and still sends fatal reports, and they are sent after the
+  window. Any other `429` keeps pacing every crash report as before.
+- Device non-objection recording requires server-side enablement.
+
 ## v0.20.0 — 2026-11-14
 
 - Non-fatal crash reports are capped per crash client by

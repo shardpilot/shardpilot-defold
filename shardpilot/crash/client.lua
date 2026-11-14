@@ -386,6 +386,8 @@ function M.new(config)
 		retry_attempt = 0,
 		retry_deadline_ms = nil,
 		retry_after_deadline_ms = nil,
+		-- The fatal-reserve window: it holds handled reports only.
+		reserve_deadline_ms = nil,
 		-- True while a serial resend pass over the pending sidecar is running
 		-- (one pass at a time; each pass sends strictly one report at a time).
 		resend_active = false,
@@ -749,6 +751,27 @@ function Client:retry_deadline(stored)
 	return nil
 end
 
+-- The handled-only deferral: the stored fatal-reserve deadline folded with
+-- the one this session learned (it still holds when the record write fails).
+function Client:reserve_deadline(stored)
+	local now = clock.unix_ms()
+	stored = crash_deadline.normalize(stored, now, crash_deadline.server_limit_ms)
+	self.reserve_deadline_ms = crash_deadline.normalize(self.reserve_deadline_ms, now, crash_deadline.server_limit_ms)
+	self.reserve_deadline_ms = math.max(stored or 0, self.reserve_deadline_ms or 0)
+	if self.reserve_deadline_ms > now then return self.reserve_deadline_ms end
+	return nil
+end
+
+-- A fatal-reserve refusal opens the handled-only window; the shared pacing,
+-- which also holds fatal reports, stays untouched.
+function Client:hold_handled(retry_after)
+	local now = clock.unix_ms()
+	self:reserve_deadline(nil)
+	self.reserve_deadline_ms = math.max(self.reserve_deadline_ms, now + math.min(crash_deadline.server_limit_ms, retry_after * 1000))
+	storage.set_pending_crash_retry_after(self:pending_scope(), (self.reserve_deadline_ms - now) / 1000, true)
+	self.stats.last_retry_after = retry_after
+end
+
 function Client:pace_retry(retry_after)
 	self.retry_attempt = math.min(self.retry_attempt + 1, 7)
 	local ceiling = math.min(60, 2 ^ (self.retry_attempt - 1))
@@ -911,8 +934,8 @@ function Client:emit_internal(event, fatal, trusted_frame_functions, prepare_opt
 			self.resend_followup_wanted = true
 			return true
 		end
-		local _, window = storage.load_pending_entries(self:pending_scope())
-		window = self:retry_deadline(window)
+		local _, window, reserve = storage.load_pending_entries(self:pending_scope())
+		window = self:retry_deadline(window) or self:reserve_deadline(reserve)
 		if type(window) == "number" then
 			self.stats.resend_deferred_until_ms = window
 			return true
@@ -1011,7 +1034,8 @@ function Client:resend_pending()
 	-- memory tokens before dispatching: a synchronous transport stub may
 	-- settle and remove an entry mid-iteration.
 	local queue = {}
-	local entries, deadline = storage.load_pending_entries(self:pending_scope())
+	local entries, deadline, reserve = storage.load_pending_entries(self:pending_scope())
+	self:reserve_deadline(reserve)
 	if type(entries) == "table" then
 		for i, entry in ipairs(entries) do
 			if type(entry) == "table" and type(entry.token) == "string" and
@@ -1095,6 +1119,10 @@ function Client:resend_pending()
 			return
 		end
 		local entry = queue[index]
+		if entry.fatal ~= true and self:reserve_deadline(nil) then
+			-- A handled report waits out the fatal-reserve window; fatal ones go on.
+			return step()
+		end
 		-- A send OUTSIDE this pass (a fatal live emit bypassing the queue)
 		-- can hit a 429 while the pass is mid-record: its persisted window
 		-- raises the backpressure flag, and the pass must stop before its
@@ -1224,7 +1252,10 @@ function Client:dispatch_pending(entry, on_settled)
 		-- backpressure flag stops any ACTIVE pass before its next dispatch.
 		-- A non-retryable reject is terminal: remove the pending copy so it
 		-- is not retried forever.
-		if retryable then
+		local fatal_reserve = transport_err == "crash_fatal_reserve" and type(retry_after) == "number" and retry_after > 0
+		if fatal_reserve then
+			self:hold_handled(retry_after)
+		elseif retryable then
 			self:pace_retry(retry_after)
 		elseif pending_token then
 			self:remove_pending(pending_token)
@@ -1238,7 +1269,7 @@ function Client:dispatch_pending(entry, on_settled)
 			response = type(response) == "table" and response.status or nil,
 		})
 		if on_settled then
-			on_settled(retryable == true)
+			on_settled(retryable == true and not fatal_reserve)
 		end
 	end
 
