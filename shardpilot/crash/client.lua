@@ -762,14 +762,15 @@ function Client:reserve_deadline(stored)
 	return nil
 end
 
--- A fatal-reserve refusal opens the handled-only window; the shared pacing,
--- which also holds fatal reports, stays untouched.
+-- A fatal-reserve refusal opens the handled-only window (none for a zero-second
+-- one); the shared pacing, which also holds fatal reports, stays untouched.
 function Client:hold_handled(retry_after)
+	self.stats.last_retry_after = retry_after
+	if retry_after <= 0 then return end
 	local now = clock.unix_ms()
 	self:reserve_deadline(nil)
 	self.reserve_deadline_ms = math.max(self.reserve_deadline_ms, now + math.min(crash_deadline.server_limit_ms, retry_after * 1000))
 	storage.set_pending_crash_retry_after(self:pending_scope(), (self.reserve_deadline_ms - now) / 1000, true)
-	self.stats.last_retry_after = retry_after
 end
 
 function Client:pace_retry(retry_after)
@@ -1252,7 +1253,7 @@ function Client:dispatch_pending(entry, on_settled)
 		-- backpressure flag stops any ACTIVE pass before its next dispatch.
 		-- A non-retryable reject is terminal: remove the pending copy so it
 		-- is not retried forever.
-		local fatal_reserve = transport_err == "crash_fatal_reserve" and type(retry_after) == "number" and retry_after > 0
+		local fatal_reserve = transport_err == "crash_fatal_reserve" and type(retry_after) == "number" and retry_after >= 0
 		if fatal_reserve then
 			self:hold_handled(retry_after)
 		elseif retryable then

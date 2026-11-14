@@ -6566,6 +6566,31 @@ end)()
 		storage.reset()
 	end
 
+	-- A valid Retry-After of 0 is a reserve with no window: the pass still goes on.
+	local function test_zero_second_fatal_reserve_still_lets_the_pass_reach_the_fatal()
+		reset()
+		local restore = install_fake_sys_storage()
+		local scope = { app_id = "reserve-zero-app" }
+		next_status = 500
+		local seeder = assert(crash.new(config({ app_key = "reserve-zero-app", crash_sample_every = 1 })))
+		assert_true(seeder:emit(reserve_event("H1")))
+		assert_true(seeder:emit_fatal(reserve_event("F1")))
+		reset()
+		local restore_http = install_scripted_http({
+			{ status = 429, headers = { ["retry-after"] = "0" }, body = FATAL_RESERVE_BODY },
+			{ status = 202 },
+		})
+		local client = assert(crash.new(config({ app_key = "reserve-zero-app", crash_sample_every = 1 })))
+		client:resend_pending()
+		assert_equal(#requests, 2, "a zero-second reserve still moves the pass on to the fatal report")
+		local entries = storage.load_pending_entries(scope)
+		assert_equal(#entries, 1, "only the handled report stays durable")
+		assert_contains(entries[1].body, '"H1"')
+		restore_http()
+		restore()
+		storage.reset()
+	end
+
 	local function test_fatal_reserve_holds_handled_reports_until_the_window_ends()
 		reset()
 		local restore = install_fake_sys_storage()
@@ -6605,6 +6630,7 @@ end)()
 	end
 
 	test_fatal_reserve_refusal_lets_fatal_reports_through()
+	test_zero_second_fatal_reserve_still_lets_the_pass_reach_the_fatal()
 	test_fatal_reserve_holds_handled_reports_until_the_window_ends()
 	test_plain_429_still_defers_a_retained_fatal_report()
 	print("fatal reserve scenes passed")
