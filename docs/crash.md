@@ -398,7 +398,8 @@ the body.
 - A `429` with the error code `crash_monthly_quota_fatal_reserve` (the rest of
   the monthly quota is kept for fatal reports) holds only non-fatal reports for
   its `Retry-After`: the pass skips them and still sends fatal ones, and an
-  accepted fatal send does not end that window.
+  accepted fatal send does not end that window. Its deadline is surfaced as
+  `snapshot().resend_deferred_until_ms`.
 - **Bounds.** At most **8 reports**, each at most **64 KB** encoded, at most
   **384 KB** total (Defold documents a 512 KB `sys.save` cap; the budget stays
   well under it). When a bound is exceeded the oldest **non-fatal** reports

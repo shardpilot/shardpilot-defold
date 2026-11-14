@@ -17,7 +17,10 @@ callbacks or HTTP requests. Pass analytics options only to the analytics client;
 crash has its own configuration. Since `v0.20.0` the crash client sends every
 non-fatal report by default (`crash_sample_every = 1`; it was `10`) and admits
 at most `crash_session_max_reports` (default 100) per client, dropping later
-ones as `session_capped`; see [the crash guide](crash.md). An already initialized analytics facade still
+ones as `session_capped`; see [the crash guide](crash.md). A `429` coded
+`crash_monthly_quota_fatal_reserve` holds only non-fatal crash reports for its
+`Retry-After`, surfaced as `snapshot().resend_deferred_until_ms`; fatal reports
+are still sent. An already initialized analytics facade still
 returns `already_initialized` before attempting replacement.
 
 Constructors capture the table's raw entries once before validation or host

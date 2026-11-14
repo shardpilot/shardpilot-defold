@@ -1658,7 +1658,9 @@ via `crash.capture_previous()`, which first re-sends any reports whose earlier
 delivery was never confirmed — every dispatched report is persisted write-ahead
 to a bounded per-app sidecar (exact wire bytes, replayed without decoding or
 re-encoding and de-duplicated by `crash_id`; a `429 Retry-After` window persists across
-relaunches and stops the serial resend pass). See [`docs/crash.md`](docs/crash.md).
+relaunches and stops the serial resend pass, except that a `429` coded
+`crash_monthly_quota_fatal_reserve` holds only non-fatal reports, with the deadline in
+`snapshot().resend_deferred_until_ms`). See [`docs/crash.md`](docs/crash.md).
 
 ## Consent regime
 

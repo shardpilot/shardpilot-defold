@@ -771,6 +771,7 @@ function Client:hold_handled(retry_after)
 	self:reserve_deadline(nil)
 	self.reserve_deadline_ms = math.max(self.reserve_deadline_ms, now + math.min(crash_deadline.server_limit_ms, retry_after * 1000))
 	storage.set_pending_crash_retry_after(self:pending_scope(), (self.reserve_deadline_ms - now) / 1000, true)
+	self.stats.resend_deferred_until_ms = math.max(self.stats.resend_deferred_until_ms or 0, self.reserve_deadline_ms)
 end
 
 function Client:pace_retry(retry_after)
@@ -1099,7 +1100,8 @@ function Client:resend_pending()
 		self.stats.resend_deferred_until_ms = deadline
 		return true
 	end
-	self.stats.resend_deferred_until_ms = nil
+	-- Handled reports held by a fatal-reserve window stay deferred until it ends.
+	self.stats.resend_deferred_until_ms = self:reserve_deadline(nil)
 	-- The stored-window gate above just passed: any older in-session
 	-- backpressure signal is spent.
 	self.backpressure_hit = false
@@ -1232,7 +1234,7 @@ function Client:dispatch_pending(entry, on_settled)
 				self.retry_deadline_ms = nil
 				self.retry_after_deadline_ms = nil
 				self.retry_attempt = 0
-				self.stats.resend_deferred_until_ms = nil
+				self.stats.resend_deferred_until_ms = self:reserve_deadline(nil)
 				self.backpressure_hit = false
 			end
 			if on_settled then
