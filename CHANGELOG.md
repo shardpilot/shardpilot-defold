@@ -4,9 +4,10 @@
 
 - `consent_policy.prepare` takes `age_ads_rules = true` (off by default) to ask
   for the version 1 age and ads rules, and returns them as
-  `decision.age_ads_rules`. Such a request sends no age band. A malformed or
-  unknown-version rules part makes the reply `invalid_response`. Without the
-  option the request and the decision are unchanged.
+  `decision.age_ads_rules`, including `personalised_ads_mode`. Such a request
+  sends no age band. A malformed or unknown-version rules part makes the reply
+  `invalid_response`. Without the option the request and the decision are
+  unchanged.
 
 ## v0.20.1 — 2026-11-14
 

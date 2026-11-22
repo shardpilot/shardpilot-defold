@@ -1194,8 +1194,9 @@ end
 local RULES_KEYS = {
 	schema_version = true, rules_version = true, minimum_admission_age = true,
 	minimum_personalised_ads_age = true, ad_sdk_consent_window_required = true,
-	ad_sdk_separate_consent_age_ranges = true, text_ids = true,
+	ad_sdk_separate_consent_age_ranges = true, personalised_ads_mode = true, text_ids = true,
 }
+local RULES_MODES = { consent_window = true, opt_out = true, opt_in = true }
 local RULES_TEXT_SLOTS = { admission = true, consent_window = true, separate_ads_consent = true }
 
 local function whole(value, low, high)
@@ -1218,6 +1219,9 @@ local function rules_refusal(rules)
 	if not whole(rules.minimum_admission_age, 13, 150) or not whole(rules.minimum_personalised_ads_age, 18, 150)
 		or type(rules.ad_sdk_consent_window_required) ~= "boolean" then
 		return "an age or the consent window in age_ads_rules is out of shape"
+	end
+	if not RULES_MODES[rules.personalised_ads_mode] then
+		return "age_ads_rules.personalised_ads_mode is missing or outside the closed vocabulary"
 	end
 	if type(ranges) ~= "table" or #ranges > 69 or not is_sequence(ranges) then
 		return "age_ads_rules ranges are not a list of at most 69"

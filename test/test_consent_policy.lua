@@ -2880,14 +2880,16 @@ local function test_a_refusal_never_carries_an_advisory()
 	assert_true(decision.advisory == nil, "and no advisory reaches the host from it")
 end
 
--- The contract's version 1 age and ads rules, byte for byte: the European
--- Economic Area, the United Kingdom (Switzerland is identical), New York (also
--- a US state without its own row) and a country without its own row.
+-- The contract's version 1 age and ads rules, byte for byte, one per distinct
+-- rule set: the European Economic Area, the United Kingdom (also Switzerland),
+-- New York (also a US state without its own row), an opt-out country and an
+-- opt-in country.
 local AGE_ADS_RULES = {
-	'{"ad_sdk_consent_window_required":true,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":16,"minimum_personalised_ads_age":18,"rules_version":"sha256:55c92680ea0efdea5391b58da61c0ccdb1434715861463d4bd5d5331ba0ed3f7","schema_version":1,"text_ids":{"admission":"admission_minimum_16_v1","consent_window":"ads_consent_window_v1"}}',
-	'{"ad_sdk_consent_window_required":true,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"rules_version":"sha256:69a75304494dd0989102a9bc3de69aa4687e1980abc36a7edba44952bf0cddac","schema_version":1,"text_ids":{"consent_window":"ads_consent_window_v1"}}',
-	'{"ad_sdk_consent_window_required":false,"ad_sdk_separate_consent_age_ranges":[{"max_age_exclusive":18,"min_age":13}],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"rules_version":"sha256:3829d033130ff0ae1d1e2c6d29055695d2693e50c35f542e477debef6bcbb7fa","schema_version":1,"text_ids":{"separate_ads_consent":"separate_ads_consent_v1"}}',
-	'{"ad_sdk_consent_window_required":false,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"rules_version":"sha256:a5f4914351d946b8064de05f48a37ba532a9dd319d7f6de19665e1a047136b86","schema_version":1,"text_ids":{}}',
+	'{"ad_sdk_consent_window_required":true,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":16,"minimum_personalised_ads_age":18,"personalised_ads_mode":"consent_window","rules_version":"sha256:71b58e36cb9f3ed745e5e3128ea7727fe88699d60bd3903c3989ee0b58167ead","schema_version":1,"text_ids":{"admission":"admission_minimum_16_v1","consent_window":"ads_consent_window_v1"}}',
+	'{"ad_sdk_consent_window_required":true,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"consent_window","rules_version":"sha256:3d22bac866bf7d55647a249fa11b64cd59647bc4ebcfe9a18b5fc01352338ba5","schema_version":1,"text_ids":{"consent_window":"ads_consent_window_v1"}}',
+	'{"ad_sdk_consent_window_required":false,"ad_sdk_separate_consent_age_ranges":[{"max_age_exclusive":18,"min_age":13}],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"opt_out","rules_version":"sha256:659ea445cf86d65ddde41cc24204f801c75327789624d601b8d1e794ac9fb673","schema_version":1,"text_ids":{"separate_ads_consent":"separate_ads_consent_v1"}}',
+	'{"ad_sdk_consent_window_required":false,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"opt_out","rules_version":"sha256:7caf123d8384c99ebd3648f655fc7b24c088f80cd2c4d3f485f7dc2ca37694d3","schema_version":1,"text_ids":{}}',
+	'{"ad_sdk_consent_window_required":false,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"opt_in","rules_version":"sha256:3ee0551a8bb53edacf1070320f24877dd28b4d39be5f54ecbbfebfff5c9d8cc6","schema_version":1,"text_ids":{}}',
 }
 local AGE_ADS_REQUEST = '{"age_ads_rules_schema":1,"app_key":"app_1","app_version":"1.2.3","environment_key":"env_1","locale":"en-GB","platform":"android","workspace_key":"ws_1"}'
 
@@ -2924,9 +2926,11 @@ local function test_each_age_ads_fixture_parses_into_the_rules()
 		assert_unsigned(decision, "fixture " .. index .. ": " .. tostring(decision.detail))
 		local wire, rules = json.decode(text), decision.age_ads_rules
 		assert_true(rules ~= nil, "fixture " .. index .. " reaches the host")
-		for key, value in pairs(rules) do
+		for key in pairs(rules) do
 			assert_true(key ~= "schema_version" and wire[key] ~= nil, "only the rules: " .. tostring(key))
-			if type(value) ~= "table" then assert_equal(value, wire[key], key) end
+		end
+		for key, value in pairs(wire) do
+			if key ~= "schema_version" and type(value) ~= "table" then assert_equal(rules[key], value, key) end
 		end
 		assert_equal(#rules.ad_sdk_separate_consent_age_ranges, #wire.ad_sdk_separate_consent_age_ranges, "ranges")
 		for i, range in ipairs(wire.ad_sdk_separate_consent_age_ranges) do
@@ -2959,6 +2963,8 @@ local function test_malformed_or_unknown_age_ads_rules_yield_none()
 		{ '"admission_minimum_16_v1"', "null" }, { '"admission_minimum_16_v1"', '"Admission"' },
 		{ '{"admission":"admission_minimum_16_v1","consent_window":"ads_consent_window_v1"}', "[]" },
 		{ '"schema_version":1', '"schema_version":1,"schema_version":1' },
+		{ '"personalised_ads_mode":"consent_window",', "" }, { '"consent_window","rules', '"opt_maybe","rules' },
+		{ '"consent_window","rules', '1,"rules' },
 	}) do
 		local at = eea:find(edit[1], 1, true)
 		assert_true(at ~= nil, "the edit applies: " .. edit[1])
