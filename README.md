@@ -1692,7 +1692,10 @@ sent as `other`), and optionally
 `store` and `age_band` — which is accepted, sent as given, and **ignored by
 the resolver in this release** — and `advisory`, which must be `true` or
 `false`: `true` asks the resolver for the advisory part, and without it the
-version 3 request asks for the plan alone. The scope uses public keys; retired
+version 3 request asks for the plan alone. `age_ads_rules` (default off) must
+also be `true` or `false`: `true` sends `age_ads_rules_schema: 1` to ask for the
+version 1 age and ads rules, and such a request cannot carry `age_band` (it is
+refused locally). Without it the request is unchanged. The scope uses public keys; retired
 `workspace_id`, `app_id`, and `environment_id` fields, including mixed contexts,
 are refused locally. `store_region` is **not accepted** in this release: a
 non-null value carries a country claim, and refusing it here is what stops it
@@ -1713,6 +1716,7 @@ The callback receives **exactly one decision, exactly once**:
 | `operation_blocks_source` | `none` |
 | `notice`, `policy_version`, `consent_text_version`, `presented_language`, `band_vocabulary`, `band_vocabulary_version` | `nil`; unsigned plan content is not forwarded as authority |
 | `advisory` | Detached reference data when requested and fully validated; otherwise `nil`. The host decides how to use it; the SDK never applies or caches it. |
+| `age_ads_rules` | When requested, the version 1 rules of a resolved reply as a detached table: `rules_version`, `minimum_admission_age`, `minimum_personalised_ads_age`, `ad_sdk_consent_window_required`, `ad_sdk_separate_consent_age_ranges` (half-open `{ min_age, max_age_exclusive }` ranges), `personalised_ads_mode` (`consent_window`, `opt_out` or `opt_in`) and `text_ids` (`admission`, `consent_window`, `separate_ads_consent`, each optional). Otherwise `nil`. A missing part means no rules, and a host without rules treats the mode as `opt_in`; a malformed or unknown-version part, an unknown mode included, makes the reply `invalid_response`. The SDK neither stores nor applies them. `shardpilot.supports("consent_policy_age_ads_rules")` detects this. |
 | `valid_for_seconds` | `nil`; no authenticated plan lifetime was established |
 
 **Local strict fallback.** Missing, unreadable, out-of-scope, expired and
