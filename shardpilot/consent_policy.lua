@@ -184,6 +184,7 @@ local SCHEMA_KEYS = {
 	basis = true,
 	reason = true,
 	advisory = true,
+	age_ads_rules = true,
 }
 
 -- ⚠ THE ADVISORY PART HAS ITS OWN EXACT KEY SETS, and it is NOT in
@@ -206,8 +207,8 @@ local NULLABLE_KEYS = { signature = true }
 
 -- ⚠ REQUIRED IS THE DEFAULT, AND THAT DIRECTION IS THE WHOLE POINT. The
 -- contract of record sends every name in SCHEMA_KEYS on every plan; only
--- `reason` and `advisory` are conditional: one marks a refusal rather than a
--- plan, and the other is present only when the request asked for it. So the
+-- `reason`, `advisory` and `age_ads_rules` are conditional: the first marks a
+-- refusal rather than a plan, and the others are present only when asked for. So the
 -- required roster is DERIVED from the schema roster minus those explicit
 -- exceptions, which means a key added to SCHEMA_KEYS becomes required without
 -- anyone remembering to require it. The other direction — a roster of
@@ -215,7 +216,7 @@ local NULLABLE_KEYS = { signature = true }
 -- to be optional here: absent was read as "no restrictions", so a malformed
 -- plan could drop every restriction it carried by leaving the key out and
 -- still be USED. That was one key; the shape of the mistake was the roster.
-local OPTIONAL_KEYS = { reason = true, advisory = true }
+local OPTIONAL_KEYS = { reason = true, advisory = true, age_ads_rules = true }
 
 -- Sorted, so a plan missing several keys names the same one every run. A
 -- refusal reason that varies between runs is a refusal nobody can test.
@@ -623,6 +624,21 @@ local function scan_plan_text(body)
 			handled = true
 		end
 
+		-- ⚠ THE AGE AND ADS RULES, CHECKED WHERE THE RAW TEXT STILL KNOWS THEM.
+		-- Lua drops a null, and an empty list and an empty object decode alike. Its
+		-- strings are hex digests and [a-z0-9_] ids, so no match below is inside one;
+		-- an escaped key name is refused rather than read.
+		if key == "age_ads_rules" then
+			local stop = skip_value(body, pos, 1)
+			local raw = stop and body:sub(pos, stop - 1) or ""
+			if raw:find("[:,%[]%s*null")
+				or not raw:find('"ad_sdk_separate_consent_age_ranges"%s*:%s*%[')
+				or not raw:find('"text_ids"%s*:%s*{') then
+				return false, "age_ads_rules is unreadable, carries a null, or a list or object of the wrong kind",
+					present, present_signals
+			end
+		end
+
 		if not handled then
 			local members = nil
 			if NESTED_OBJECT_KEYS[key] and body:sub(pos, pos) == "{" then
@@ -954,6 +970,7 @@ local CONTEXT_KEYS = {
 	platform = true,
 	age_band = true,
 	advisory = true,
+	age_ads_rules = true,
 }
 
 function M.validate_context(context)
@@ -1014,6 +1031,14 @@ function M.validate_context(context)
 	if context.advisory ~= nil and type(context.advisory) ~= "boolean" then
 		return false, "advisory must be true or false"
 	end
+	-- The age and ads rules are asked for the same way, and the request that
+	-- asks for them carries no age: the resolver refuses one that does.
+	if context.age_ads_rules ~= nil and type(context.age_ads_rules) ~= "boolean" then
+		return false, "age_ads_rules must be true or false"
+	end
+	if context.age_ads_rules == true and context.age_band ~= nil then
+		return false, "a request for the age and ads rules carries no age_band"
+	end
 	if context.age_band ~= nil then
 		local band = context.age_band
 		if type(band) ~= "table" or not bounded_string(band.vocabulary, MAX_BAND)
@@ -1055,6 +1080,9 @@ local function request_body(context)
 	-- plan alone, without an advisory member.
 	if context.advisory == true then
 		body.advisory = true
+	end
+	if context.age_ads_rules == true then
+		body.age_ads_rules_schema = 1
 	end
 	return body
 end
@@ -1161,6 +1189,61 @@ end
 -- `now` is seconds since the epoch. It is what makes expiry enforceable here
 -- rather than merely described; a caller with no clock passes nothing and
 -- prepare refuses before it ever reaches this point.
+-- The rules part's values; the raw walk has settled its nulls and its lists.
+-- The SDK checks the shape the contract states and never applies the rules.
+local RULES_KEYS = {
+	schema_version = true, rules_version = true, minimum_admission_age = true,
+	minimum_personalised_ads_age = true, ad_sdk_consent_window_required = true,
+	ad_sdk_separate_consent_age_ranges = true, text_ids = true,
+}
+local RULES_TEXT_SLOTS = { admission = true, consent_window = true, separate_ads_consent = true }
+
+local function whole(value, low, high)
+	return type(value) == "number" and value % 1 == 0 and value >= low and value <= high
+end
+
+local function rules_refusal(rules)
+	for key in pairs(rules) do
+		if not RULES_KEYS[key] then
+			return "age_ads_rules carries an unknown key"
+		end
+	end
+	local version, ranges, texts = rules.rules_version, rules.ad_sdk_separate_consent_age_ranges, rules.text_ids
+	if rules.schema_version ~= 1 then
+		return "age_ads_rules is not schema version 1"
+	end
+	if type(version) ~= "string" or version:sub(1, 7) ~= "sha256:" or not lower_hex(version:sub(8), 64) then
+		return "age_ads_rules.rules_version is not a sha256 digest"
+	end
+	if not whole(rules.minimum_admission_age, 13, 150) or not whole(rules.minimum_personalised_ads_age, 18, 150)
+		or type(rules.ad_sdk_consent_window_required) ~= "boolean" then
+		return "an age or the consent window in age_ads_rules is out of shape"
+	end
+	if type(ranges) ~= "table" or #ranges > 69 or not is_sequence(ranges) then
+		return "age_ads_rules ranges are not a list of at most 69"
+	end
+	for _, range in ipairs(ranges) do
+		if type(range) ~= "table" or not whole(range.min_age, 13, 150) or not whole(range.max_age_exclusive, 14, 151)
+			or range.min_age >= range.max_age_exclusive then
+			return "an age_ads_rules range is not a half-open range of two ages"
+		end
+		for key in pairs(range) do
+			if key ~= "min_age" and key ~= "max_age_exclusive" then
+				return "an age_ads_rules range carries an unknown key"
+			end
+		end
+	end
+	if type(texts) ~= "table" then
+		return "age_ads_rules.text_ids is not an object"
+	end
+	for slot, id in pairs(texts) do
+		if not RULES_TEXT_SLOTS[slot] or type(id) ~= "string" or #id > 64 or not id:match("^[a-z][a-z0-9_]*$") then
+			return "age_ads_rules.text_ids carries an unknown slot or a malformed id"
+		end
+	end
+	return nil
+end
+
 local function parse_plan(plan, context, now)
 	if type(plan) ~= "table" then
 		return nil, "the plan is not an object"
@@ -1304,6 +1387,15 @@ local function parse_plan(plan, context, now)
 			return nil, "the plan carries an advisory part this request did not ask for"
 		end
 		local refusal = advisory_refusal(plan.advisory)
+		if refusal then
+			return nil, refusal
+		end
+	end
+	if plan.age_ads_rules ~= nil then
+		if context.age_ads_rules ~= true then
+			return nil, "the plan carries age and ads rules this request did not ask for"
+		end
+		local refusal = rules_refusal(plan.age_ads_rules)
 		if refusal then
 			return nil, refusal
 		end
@@ -1509,6 +1601,11 @@ function M.prepare(context, callback)
 		local decision = fallback("plan_unsigned", "this build cannot authenticate a consent plan")
 		-- Read-only reference data: the host decides; the SDK never uses or caches it.
 		decision.advisory = copy_value(plan.advisory, 0)
+		-- The rules alone, detached: read-only data for the host, never kept here.
+		decision.age_ads_rules = copy_value(plan.age_ads_rules, 0)
+		if decision.age_ads_rules then
+			decision.age_ads_rules.schema_version = nil
+		end
 		settle(decision)
 	end, { ["Content-Type"] = "application/json", [sdk_header.NAME] = sdk_header.VALUE, }, encoded, { timeout = DEADLINE_SECONDS })
 end

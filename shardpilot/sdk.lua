@@ -40,6 +40,9 @@ local capabilities = {
 	-- the event's contract version, kept through serialization and retry.
 	event_schema_version = true,
 	analytics_non_objection = true,
+	-- consent_policy.prepare takes `age_ads_rules = true` and returns the
+	-- version 1 age and ads rules as decision.age_ads_rules.
+	consent_policy_age_ads_rules = true,
 }
 
 function M.supports(capability)

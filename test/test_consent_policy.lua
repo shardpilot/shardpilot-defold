@@ -2880,6 +2880,94 @@ local function test_a_refusal_never_carries_an_advisory()
 	assert_true(decision.advisory == nil, "and no advisory reaches the host from it")
 end
 
+-- The contract's version 1 age and ads rules, byte for byte: the European
+-- Economic Area, the United Kingdom (Switzerland is identical), New York (also
+-- a US state without its own row) and a country without its own row.
+local AGE_ADS_RULES = {
+	'{"ad_sdk_consent_window_required":true,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":16,"minimum_personalised_ads_age":18,"rules_version":"sha256:55c92680ea0efdea5391b58da61c0ccdb1434715861463d4bd5d5331ba0ed3f7","schema_version":1,"text_ids":{"admission":"admission_minimum_16_v1","consent_window":"ads_consent_window_v1"}}',
+	'{"ad_sdk_consent_window_required":true,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"rules_version":"sha256:69a75304494dd0989102a9bc3de69aa4687e1980abc36a7edba44952bf0cddac","schema_version":1,"text_ids":{"consent_window":"ads_consent_window_v1"}}',
+	'{"ad_sdk_consent_window_required":false,"ad_sdk_separate_consent_age_ranges":[{"max_age_exclusive":18,"min_age":13}],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"rules_version":"sha256:3829d033130ff0ae1d1e2c6d29055695d2693e50c35f542e477debef6bcbb7fa","schema_version":1,"text_ids":{"separate_ads_consent":"separate_ads_consent_v1"}}',
+	'{"ad_sdk_consent_window_required":false,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"rules_version":"sha256:a5f4914351d946b8064de05f48a37ba532a9dd319d7f6de19665e1a047136b86","schema_version":1,"text_ids":{}}',
+}
+local AGE_ADS_REQUEST = '{"age_ads_rules_schema":1,"app_key":"app_1","app_version":"1.2.3","environment_key":"env_1","locale":"en-GB","platform":"android","workspace_key":"ws_1"}'
+
+local function age_ads_decision(rules, ask)
+	reset()
+	next_response_body = rules and raw_field('"age_ads_rules"', rules) or plan()
+	return prepare(context({ age_ads_rules = ask ~= false }))
+end
+
+-- OFF BY DEFAULT, AND THEN THE REQUEST IS TODAY'S, BYTE FOR BYTE. Asked for,
+-- it is the contract's own request; it never travels with an age.
+local function test_the_age_ads_rules_are_asked_for_only_when_requested()
+	for _, ask in ipairs({ "__nil__", false, true }) do
+		reset()
+		prepare(context({ workspace_key = "ws_1", app_key = "app_1", environment_key = "env_1",
+			locale = "en-GB", platform = "android", age_ads_rules = ask }))
+		local expected = ask == true and AGE_ADS_REQUEST or (AGE_ADS_REQUEST:gsub('"age_ads_rules_schema":1,', "", 1))
+		assert_equal(requests[1] and requests[1].body, expected, "the request bytes, asked " .. tostring(ask))
+	end
+	for _, extra in ipairs({ { age_band = { vocabulary = "coarse", band = "adult" } }, { age_ads_rules = "true" }, { age_ads_rules = 1 } }) do
+		reset()
+		local ctx = context({ age_ads_rules = true })
+		for key, value in pairs(extra) do ctx[key] = value end
+		local decision, calls = prepare(ctx)
+		assert_equal(calls, 1, "exactly one callback")
+		assert_equal(#requests, 0, "a refused context costs no request")
+		assert_equal(decision.reason, "invalid_request")
+	end
+end
+
+local function test_each_age_ads_fixture_parses_into_the_rules()
+	for index, text in ipairs(AGE_ADS_RULES) do
+		local decision = age_ads_decision(text)
+		assert_unsigned(decision, "fixture " .. index .. ": " .. tostring(decision.detail))
+		local wire, rules = json.decode(text), decision.age_ads_rules
+		assert_true(rules ~= nil, "fixture " .. index .. " reaches the host")
+		for key, value in pairs(rules) do
+			assert_true(key ~= "schema_version" and wire[key] ~= nil, "only the rules: " .. tostring(key))
+			if type(value) ~= "table" then assert_equal(value, wire[key], key) end
+		end
+		assert_equal(#rules.ad_sdk_separate_consent_age_ranges, #wire.ad_sdk_separate_consent_age_ranges, "ranges")
+		for i, range in ipairs(wire.ad_sdk_separate_consent_age_ranges) do
+			assert_equal(rules.ad_sdk_separate_consent_age_ranges[i].min_age, range.min_age, "min_age")
+			assert_equal(rules.ad_sdk_separate_consent_age_ranges[i].max_age_exclusive, range.max_age_exclusive, "max_age_exclusive")
+		end
+		for _, slot in ipairs({ "admission", "consent_window", "separate_ads_consent" }) do
+			assert_equal(rules.text_ids[slot], wire.text_ids[slot], "text_ids." .. slot)
+		end
+	end
+end
+
+-- Taken only whole, and only on a resolved reply to a request that asked.
+local function test_malformed_or_unknown_age_ads_rules_yield_none()
+	local absent = age_ads_decision(nil)
+	assert_unsigned(absent, "the control: a plan without the rules")
+	assert_true(absent.age_ads_rules == nil, "an absent part is no rules")
+	assert_equal(age_ads_decision(AGE_ADS_RULES[1], false).reason, "invalid_response", "rules nobody asked for")
+	assert_equal(age_ads_decision("null").reason, "invalid_response", "a null part")
+	reset()
+	next_status, next_response_body = 503, raw_field('"age_ads_rules"', AGE_ADS_RULES[1], { reason = "policy_unavailable" })
+	assert_true(prepare(context({ age_ads_rules = true })).age_ads_rules == nil, "a refusal carries no rules")
+	local eea = AGE_ADS_RULES[1]
+	for _, edit in ipairs({
+		{ '"schema_version":1', '"schema_version":2' }, { ',"schema_version":1', "" },
+		{ '"schema_version":1', '"schema_version":1,"extra":1' }, { '"sha256:', '"sha512:' },
+		{ ":16,", ":12," }, { ":16,", ':"16",' }, { ":16,", ":16.5," }, { ":18,", ":17," },
+		{ ":true,", ":null," }, { "[]", '[{"max_age_exclusive":16,"min_age":16}]' }, { "[]", '[{"min_age":13}]' }, { "[]", '[{"max_age_exclusive":152,"min_age":13}]' },
+		{ "[]", "[null]" }, { "[]", "{}" }, { '"text_ids":{', '"text_ids":{"other":"x",' },
+		{ '"admission_minimum_16_v1"', "null" }, { '"admission_minimum_16_v1"', '"Admission"' },
+		{ '{"admission":"admission_minimum_16_v1","consent_window":"ads_consent_window_v1"}', "[]" },
+		{ '"schema_version":1', '"schema_version":1,"schema_version":1' },
+	}) do
+		local at = eea:find(edit[1], 1, true)
+		assert_true(at ~= nil, "the edit applies: " .. edit[1])
+		local decision = age_ads_decision(eea:sub(1, at - 1) .. edit[2] .. eea:sub(at + #edit[1]))
+		assert_equal(decision.reason, "invalid_response", "refused: " .. edit[2])
+		assert_true(decision.age_ads_rules == nil, "no rules: " .. edit[2])
+	end
+end
+
 
 local function test_scope_key_wire_contract()
 	local passed, failed = 0, 0
@@ -3071,6 +3159,9 @@ local tests = {
 	test_the_advisory_shapes_the_contract_permits,
 	test_the_advisory_vocabulary_is_closed,
 	test_a_refusal_never_carries_an_advisory,
+	test_the_age_ads_rules_are_asked_for_only_when_requested,
+	test_each_age_ads_fixture_parses_into_the_rules,
+	test_malformed_or_unknown_age_ads_rules_yield_none,
 }
 
 -- ⚠ ipairs STOPS AT A NIL HOLE, SILENTLY. A scene renamed or deleted but left

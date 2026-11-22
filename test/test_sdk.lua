@@ -8038,6 +8038,7 @@ end
 local function test_supports_capability_discovery()
 	assert_equal(sdk.supports("consent_receipt_outbox"), true)
 	assert_equal(sdk.supports("consent_state_denied_forced_minor"), true)
+	assert_equal(sdk.supports("consent_policy_age_ads_rules"), true)
 	assert_equal(sdk.supports("schema_revision_declaration"), false)
 	assert_equal(sdk.supports("time_travel"), false)
 	assert_equal(sdk.supports(nil), false)
