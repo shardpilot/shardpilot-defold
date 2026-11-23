@@ -2881,15 +2881,19 @@ local function test_a_refusal_never_carries_an_advisory()
 end
 
 -- The contract's version 1 age and ads rules, byte for byte, one per distinct
--- rule set: the European Economic Area, the United Kingdom (also Switzerland),
--- New York (also a US state without its own row), an opt-out country and an
--- opt-in country.
+-- rule set: the European Economic Area at each digital consent age (16, 13, 14
+-- and 15), the United Kingdom (also Switzerland), New York (also a US state
+-- without its own row), an opt-out country and an opt-in country. The first
+-- four carry the EEA teen rule; the other four carry teen_ads as null.
 local AGE_ADS_RULES = {
-	'{"ad_sdk_consent_window_required":true,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":16,"minimum_personalised_ads_age":18,"personalised_ads_mode":"consent_window","rules_version":"sha256:71b58e36cb9f3ed745e5e3128ea7727fe88699d60bd3903c3989ee0b58167ead","schema_version":1,"text_ids":{"admission":"admission_minimum_16_v1","consent_window":"ads_consent_window_v1"}}',
-	'{"ad_sdk_consent_window_required":true,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"consent_window","rules_version":"sha256:3d22bac866bf7d55647a249fa11b64cd59647bc4ebcfe9a18b5fc01352338ba5","schema_version":1,"text_ids":{"consent_window":"ads_consent_window_v1"}}',
-	'{"ad_sdk_consent_window_required":false,"ad_sdk_separate_consent_age_ranges":[{"max_age_exclusive":18,"min_age":13}],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"opt_out","rules_version":"sha256:659ea445cf86d65ddde41cc24204f801c75327789624d601b8d1e794ac9fb673","schema_version":1,"text_ids":{"separate_ads_consent":"separate_ads_consent_v1"}}',
-	'{"ad_sdk_consent_window_required":false,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"opt_out","rules_version":"sha256:7caf123d8384c99ebd3648f655fc7b24c088f80cd2c4d3f485f7dc2ca37694d3","schema_version":1,"text_ids":{}}',
-	'{"ad_sdk_consent_window_required":false,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"opt_in","rules_version":"sha256:3ee0551a8bb53edacf1070320f24877dd28b4d39be5f54ecbbfebfff5c9d8cc6","schema_version":1,"text_ids":{}}',
+	'{"ad_sdk_consent_window_required":true,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"consent_window","rules_version":"sha256:9109f07143ec4d752f82b90b284a2065d6276e89852c52e7681804e99adf5dd1","schema_version":1,"teen_ads":{"below_digital_consent_mode":"no_consent_only","digital_consent_age":16},"text_ids":{"consent_window":"ads_consent_window_v1"}}',
+	'{"ad_sdk_consent_window_required":true,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"consent_window","rules_version":"sha256:09e85f4b1731714b17bf0ab84177e2c5faf87f8feb923a39c26c2ab83dcf6af5","schema_version":1,"teen_ads":{"below_digital_consent_mode":"no_consent_only","digital_consent_age":13},"text_ids":{"consent_window":"ads_consent_window_v1"}}',
+	'{"ad_sdk_consent_window_required":true,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"consent_window","rules_version":"sha256:bc84ce1fe093a57171dbe20da6ea235ced8b30623ca3e5c4d2860bd4169da1cf","schema_version":1,"teen_ads":{"below_digital_consent_mode":"no_consent_only","digital_consent_age":14},"text_ids":{"consent_window":"ads_consent_window_v1"}}',
+	'{"ad_sdk_consent_window_required":true,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"consent_window","rules_version":"sha256:18757db221885328a03df9676a6980bfeb5414dba19b778a03b8dd664581b5ae","schema_version":1,"teen_ads":{"below_digital_consent_mode":"no_consent_only","digital_consent_age":15},"text_ids":{"consent_window":"ads_consent_window_v1"}}',
+	'{"ad_sdk_consent_window_required":true,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"consent_window","rules_version":"sha256:b23e7c848f6a49eee096f1db73d9d2d104030a73d67e33dd8f2c8911245e6bb4","schema_version":1,"teen_ads":null,"text_ids":{"consent_window":"ads_consent_window_v1"}}',
+	'{"ad_sdk_consent_window_required":false,"ad_sdk_separate_consent_age_ranges":[{"max_age_exclusive":18,"min_age":13}],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"opt_out","rules_version":"sha256:b8c10795e3e0927b735df08b9a6cf950fa2c8617abd857291765043c3816d9c4","schema_version":1,"teen_ads":null,"text_ids":{"separate_ads_consent":"separate_ads_consent_v1"}}',
+	'{"ad_sdk_consent_window_required":false,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"opt_out","rules_version":"sha256:d0f3f1c4058e52cd7642fb35852f48d9bdb72b81cc5c565b296b0c5d951f2548","schema_version":1,"teen_ads":null,"text_ids":{}}',
+	'{"ad_sdk_consent_window_required":false,"ad_sdk_separate_consent_age_ranges":[],"minimum_admission_age":13,"minimum_personalised_ads_age":18,"personalised_ads_mode":"opt_in","rules_version":"sha256:f030b9261ff2469c465284d0d21d46a3e007f2e0ebb2e12f42e521f1ff83249b","schema_version":1,"teen_ads":null,"text_ids":{}}',
 }
 local AGE_ADS_REQUEST = '{"age_ads_rules_schema":1,"app_key":"app_1","app_version":"1.2.3","environment_key":"env_1","locale":"en-GB","platform":"android","workspace_key":"ws_1"}'
 
@@ -2933,6 +2937,15 @@ local function test_each_age_ads_fixture_parses_into_the_rules()
 			if key ~= "schema_version" and type(value) ~= "table" then assert_equal(rules[key], value, key) end
 		end
 		assert_equal(#rules.ad_sdk_separate_consent_age_ranges, #wire.ad_sdk_separate_consent_age_ranges, "ranges")
+		if text:find('"teen_ads":null', 1, true) then
+			assert_true(rules.teen_ads == nil, "fixture " .. index .. ": a null teen rule reaches the host as nil")
+		else
+			local count = 0
+			for _ in pairs(rules.teen_ads) do count = count + 1 end
+			assert_equal(count, 2, "fixture " .. index .. ": the teen rule's two members")
+			assert_equal(rules.teen_ads.digital_consent_age, wire.teen_ads.digital_consent_age, "digital_consent_age")
+			assert_equal(rules.teen_ads.below_digital_consent_mode, "no_consent_only", "below_digital_consent_mode")
+		end
 		for i, range in ipairs(wire.ad_sdk_separate_consent_age_ranges) do
 			assert_equal(rules.ad_sdk_separate_consent_age_ranges[i].min_age, range.min_age, "min_age")
 			assert_equal(rules.ad_sdk_separate_consent_age_ranges[i].max_age_exclusive, range.max_age_exclusive, "max_age_exclusive")
@@ -2953,18 +2966,33 @@ local function test_malformed_or_unknown_age_ads_rules_yield_none()
 	reset()
 	next_status, next_response_body = 503, raw_field('"age_ads_rules"', AGE_ADS_RULES[1], { reason = "policy_unavailable" })
 	assert_true(prepare(context({ age_ads_rules = true })).age_ads_rules == nil, "a refusal carries no rules")
-	local eea = AGE_ADS_RULES[1]
+	local eea, uk = AGE_ADS_RULES[1], AGE_ADS_RULES[5]
 	for _, edit in ipairs({
 		{ '"schema_version":1', '"schema_version":2' }, { ',"schema_version":1', "" },
 		{ '"schema_version":1', '"schema_version":1,"extra":1' }, { '"sha256:', '"sha512:' },
-		{ ":16,", ":12," }, { ":16,", ':"16",' }, { ":16,", ":16.5," }, { ":18,", ":17," },
+		{ ":13,", ":12," }, { ":13,", ':"13",' }, { ":13,", ":13.5," }, { ":18,", ":17," },
 		{ ":true,", ":null," }, { "[]", '[{"max_age_exclusive":16,"min_age":16}]' }, { "[]", '[{"min_age":13}]' }, { "[]", '[{"max_age_exclusive":152,"min_age":13}]' },
 		{ "[]", "[null]" }, { "[]", "{}" }, { '"text_ids":{', '"text_ids":{"other":"x",' },
-		{ '"admission_minimum_16_v1"', "null" }, { '"admission_minimum_16_v1"', '"Admission"' },
-		{ '{"admission":"admission_minimum_16_v1","consent_window":"ads_consent_window_v1"}', "[]" },
+		{ '"ads_consent_window_v1"', "null" }, { '"ads_consent_window_v1"', '"Consent"' },
+		{ '{"consent_window":"ads_consent_window_v1"}', "[]" },
 		{ '"schema_version":1', '"schema_version":1,"schema_version":1' },
 		{ '"personalised_ads_mode":"consent_window",', "" }, { '"consent_window","rules', '"opt_maybe","rules' },
 		{ '"consent_window","rules', '1,"rules' },
+		-- The EEA teen rule: required, closed, and only with the consent window.
+		{ ',"teen_ads":{"below_digital_consent_mode":"no_consent_only","digital_consent_age":16}', "" },
+		{ '"digital_consent_age":16', '"digital_consent_age":12' }, { '"digital_consent_age":16', '"digital_consent_age":17' },
+		{ '"digital_consent_age":16', '"digital_consent_age":"16"' }, { '"digital_consent_age":16', '"digital_consent_age":15.5' },
+		{ '"digital_consent_age":16', '"digital_consent_age":null' },
+		{ '"no_consent_only"', '"consent_only"' }, { '"no_consent_only"', "null" },
+		{ '"below_digital_consent_mode":"no_consent_only",', "" },
+		{ '{"below_digital_consent_mode"', '{"extra":1,"below_digital_consent_mode"' },
+		{ '{"below_digital_consent_mode":"no_consent_only","digital_consent_age":16}', "[]" },
+		{ '{"below_digital_consent_mode":"no_consent_only","digital_consent_age":16}', "{}" },
+		{ '{"below_digital_consent_mode":"no_consent_only","digital_consent_age":16}', '"no_consent_only"' },
+		{ '"ad_sdk_consent_window_required":true', '"ad_sdk_consent_window_required":false' },
+		{ '"personalised_ads_mode":"consent_window"', '"personalised_ads_mode":"opt_out"' },
+		{ '"teen_ads":', '"teen_ads":null,"teen_ads":' },
+		{ '"text_ids":{', '"text_ids":{"teen_ads":null,' },
 	}) do
 		local at = eea:find(edit[1], 1, true)
 		assert_true(at ~= nil, "the edit applies: " .. edit[1])
@@ -2972,6 +3000,23 @@ local function test_malformed_or_unknown_age_ads_rules_yield_none()
 		assert_equal(decision.reason, "invalid_response", "refused: " .. edit[2])
 		assert_true(decision.age_ads_rules == nil, "no rules: " .. edit[2])
 	end
+	-- teen_ads is the one null admitted, and only as the rules object's own
+	-- member: absent, doubled, or written inside another object, it is refused.
+	for _, edit in ipairs({
+		{ '"teen_ads":null,', "" }, { '"teen_ads":null,', '"teen_ads":null,"teen_ads":null,' },
+		{ '"text_ids":{', '"text_ids":{"teen_ads":null,' },
+		{ '"teen_ads":null,"text_ids":{', '"text_ids":{"teen_ads":null,' },
+		{ '"ad_sdk_separate_consent_age_ranges":[]', '"ad_sdk_separate_consent_age_ranges":[null]' },
+	}) do
+		local at = uk:find(edit[1], 1, true)
+		assert_true(at ~= nil, "the edit applies: " .. edit[1])
+		local decision = age_ads_decision(uk:sub(1, at - 1) .. edit[2] .. uk:sub(at + #edit[1]))
+		assert_equal(decision.reason, "invalid_response", "refused: " .. edit[2])
+		assert_true(decision.age_ads_rules == nil, "no rules: " .. edit[2])
+	end
+	-- The control: the same null, spaced, is still the teen rule's own.
+	local spaced = uk:gsub('"teen_ads":null', '"teen_ads" : null', 1)
+	assert_unsigned(age_ads_decision(spaced), "a spaced null teen rule")
 end
 
 
