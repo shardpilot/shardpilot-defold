@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.21.0 — 2026-11-23
 
 - `consent_policy.prepare` takes `age_ads_rules = true` (off by default) to ask
   for the version 1 age and ads rules, and returns them as
@@ -15,6 +15,7 @@
   requires the consent window in the `consent_window` mode carries it. A
   missing `teen_ads`, or a teen rule with another age, mode or key, makes the
   reply `invalid_response`.
+- Device non-objection recording requires server-side enablement.
 
 ## v0.20.1 — 2026-11-14
 
