@@ -520,6 +520,39 @@ scan_advisory_object = function(body, pos, keys, nullable, where)
 	return true, nil, pos + 1
 end
 
+-- Where the rules object's OWN teen_ads member holds null, as an offset into
+-- the rules text, or nil. teen_ads is the one member whose null is a value:
+-- outside the European Economic Area the rules carry no teen rule. Found by
+-- walking the object's members, so a teen_ads name inside a nested object is
+-- never taken for it.
+local function teen_ads_null_at(body, start)
+	local pos = skip_space(body, start + 1)
+	while body:sub(pos, pos) == '"' do
+		local key, after = read_string(body, pos)
+		if not key then
+			return nil
+		end
+		pos = skip_space(body, after)
+		if body:sub(pos, pos) ~= ":" then
+			return nil
+		end
+		pos = skip_space(body, pos + 1)
+		if key == "teen_ads" and body:sub(pos, pos + 3) == "null" then
+			return pos - start + 1
+		end
+		local stop = skip_value(body, pos, 2)
+		if not stop then
+			return nil
+		end
+		pos = skip_space(body, stop)
+		if body:sub(pos, pos) ~= "," then
+			return nil
+		end
+		pos = skip_space(body, pos + 1)
+	end
+	return nil
+end
+
 local function scan_plan_text(body)
 	local present = {}
 	local present_signals = {}
@@ -628,13 +661,24 @@ local function scan_plan_text(body)
 		-- Lua drops a null, and an empty list and an empty object decode alike. Its
 		-- strings are hex digests and [a-z0-9_] ids, so no match below is inside one;
 		-- an escaped key name is refused rather than read.
+		-- teen_ads is required and may be null, so it is the one null admitted,
+		-- and only as the rules object's own member: a null anywhere else, or a
+		-- missing teen_ads (which decodes exactly like its null), is refused here.
 		if key == "age_ads_rules" then
-			local stop = skip_value(body, pos, 1)
+			local rules_members = {}
+			local stop = skip_value(body, pos, 1, rules_members)
 			local raw = stop and body:sub(pos, stop - 1) or ""
-			if raw:find("[:,%[]%s*null")
+			local teen_null = stop and teen_ads_null_at(body, pos)
+			local stray_null = false
+			for at in raw:gmatch("[:,%[]%s*()null") do
+				if at ~= teen_null then
+					stray_null = true
+				end
+			end
+			if stray_null or not rules_members.teen_ads
 				or not raw:find('"ad_sdk_separate_consent_age_ranges"%s*:%s*%[')
 				or not raw:find('"text_ids"%s*:%s*{') then
-				return false, "age_ads_rules is unreadable, carries a null, or a list or object of the wrong kind",
+				return false, "age_ads_rules is unreadable, carries a null or lacks teen_ads, or a list or object of the wrong kind",
 					present, present_signals
 			end
 		end
@@ -1194,7 +1238,7 @@ end
 local RULES_KEYS = {
 	schema_version = true, rules_version = true, minimum_admission_age = true,
 	minimum_personalised_ads_age = true, ad_sdk_consent_window_required = true,
-	ad_sdk_separate_consent_age_ranges = true, personalised_ads_mode = true, text_ids = true,
+	ad_sdk_separate_consent_age_ranges = true, personalised_ads_mode = true, teen_ads = true, text_ids = true,
 }
 local RULES_MODES = { consent_window = true, opt_out = true, opt_in = true }
 local RULES_TEXT_SLOTS = { admission = true, consent_window = true, separate_ads_consent = true }
@@ -1235,6 +1279,23 @@ local function rules_refusal(rules)
 			if key ~= "min_age" and key ~= "max_age_exclusive" then
 				return "an age_ads_rules range carries an unknown key"
 			end
+		end
+	end
+	-- teen_ads arrives here as nil (its null; the raw walk proved it present)
+	-- or as the closed EEA teen rule, which only a consent-window rule carries.
+	local teen = rules.teen_ads
+	if teen ~= nil then
+		if type(teen) ~= "table" or not whole(teen.digital_consent_age, 13, 16)
+			or teen.below_digital_consent_mode ~= "no_consent_only" then
+			return "age_ads_rules.teen_ads is not the closed teen rule"
+		end
+		for key in pairs(teen) do
+			if key ~= "digital_consent_age" and key ~= "below_digital_consent_mode" then
+				return "age_ads_rules.teen_ads carries an unknown key"
+			end
+		end
+		if rules.ad_sdk_consent_window_required ~= true or rules.personalised_ads_mode ~= "consent_window" then
+			return "age_ads_rules.teen_ads comes without the consent window"
 		end
 	end
 	if type(texts) ~= "table" then
