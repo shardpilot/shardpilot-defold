@@ -8,6 +8,13 @@
   sends no age band. A malformed or unknown-version rules part makes the reply
   `invalid_response`. Without the option the request and the decision are
   unchanged.
+- The version 1 rules carry the required member `teen_ads`, returned as
+  `decision.age_ads_rules.teen_ads`. It is `nil` outside the European Economic
+  Area. Inside it, it is the teen rule `digital_consent_age` (13 to 16) with
+  `below_digital_consent_mode = "no_consent_only"`, and only a rules part that
+  requires the consent window in the `consent_window` mode carries it. A
+  missing `teen_ads`, or a teen rule with another age, mode or key, makes the
+  reply `invalid_response`.
 - Device non-objection recording requires server-side enablement.
 
 ## v0.20.1 — 2026-11-14
